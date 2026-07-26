@@ -178,12 +178,15 @@ Human-formatted tracing events remain diagnostic corroboration only. `CVR-EO-REJ
 observable, but its independent runner and frozen attempt contract do not yet exist, so it remains
 ineligible and unexecuted.
 
-Before any CVR dispatch, add a bounded versioned local-node evidence view, a bounded versioned
-checkpoint-attempt/outcome view over the existing authority, and exact per-process-generation
-maximum/deadline counters or events for the five checkpoint latency families. The sourceful path
+Cycle 57 supplies a bounded stable-serving local-adoption view but not exact current recovery phase
+or committed-`Release` consumption. Cycle 59 supplies local exact evidence for three of five
+checkpoint latency families, but not full checkpoint or restorable-gate timing. Before any CVR
+dispatch, complete those local facts, add a bounded versioned checkpoint-attempt/outcome view over
+the existing durable authority, and make the independent runner consume them. The sourceful path
 additionally requires the already-specified broker-enforced writer fence and record/marker
 provenance. Missing evidence is `INVALID`; complete evidence showing malformed, conflicting, or
-stale output is product `FAIL`. No Cycle 50 soak ran and `certification_eligible` remains `false`.
+stale output is product `FAIL`. No independent CVR soak has run and `certification_eligible`
+remains `false`.
 
 ### Cycle 51 evidence disposition
 
@@ -324,6 +327,34 @@ both complete tests still failed the existing terminal profile gate. The meaning
 measured 98.81% rather than the required 99.00% of node1 checkpoint stalls within 1024 ms. It is
 retained as a red engineering result, not retried until a favourable aggregate ratio appears, and
 does not satisfy any CVR scenario.
+
+### Cycle 59 evidence disposition
+
+Cycle 59 adds a second engineering-only projection:
+`GET /api/v1/cluster/local-checkpoint-barrier-timings`. It is bearer-protected, cache-disabled,
+bounded by record count and response bytes, process-bound after the first page, and exposes only a
+preallocated local ledger for pipeline stall, local barrier, and aligned resume. The collector
+rejects unread-window overwrite, gaps, recording loss, metadata exhaustion, authority drift, and
+exact count/diagnostic-bucket disagreement at a coherent observed Prometheus cut. Eviction after
+successful export is allowed. Records through each observed cut stream to per-generation JSONL;
+RAM remains bounded by fixed counters, maxima, assignment samples, and diagnostic witnesses, while
+disk usage intentionally grows with observations.
+
+The corrected optimized Windows/WSL2 run at `7782a032` passed its engineering gate after one
+in-checkpoint leader kill. It reconciled 392 records across four process generations, found no
+deadline exhaustion or three-family observation above 1024 ms, and accounted for all 79,996 input
+IDs. Its engineering oracle tolerated and counted 2,758 duplicate output IDs without checking byte
+identity or sealed-cut replay legality; this is neither the charter's at-least-once duplicate proof
+nor exactly-once evidence. Authority was sampled at converged harness cuts, not for every unsampled
+historical assignment version. The later `1a6dff80` substitution defense has focused deterministic
+coverage but was not empirically rerun.
+
+This endpoint and run do not satisfy this charter. The binary was built by the implementer from a
+test target; the run had no frozen charter/independent operator, immutable retained evidence store,
+qualified keyed backend/operator, production source/state/sink composition, or external fault
+controller. Full-checkpoint/restorable-gate exact evidence and an instrumentation A/B remain open.
+All CVR scenarios remain **BLOCKED**, no Cycle 59 independent soak ran, and
+`certification_eligible` remains `false`.
 
 ## Frozen numerical contract
 

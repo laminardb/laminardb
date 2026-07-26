@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 58
+- **Last reconciled:** 2026-07-26 during Cycle 59
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-57.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-59.md)
 
 ## Decision
 
@@ -1291,11 +1291,31 @@ racing reads. They contain no stage timing. Aggregate Prometheus histograms cann
 attempts, maxima, process generations, or loss detection. Timing must not be added to recovery-
 critical outcome/capsule wire formats or unbounded per-attempt metric labels.
 
-The required first slice is instead a preallocated process-local ledger with one bounded record per
-pipeline-stall observation, exact attempt/assignment/process authority and stage nanoseconds, plus
-sequence, overwrite, and recording-loss evidence. It covers pipeline stall, local barrier, and
-aligned resume only; exact full-checkpoint and restorable-gate evidence remain open. Its consumer
-performs no shared-store read.
+The first required slice was therefore a preallocated process-local ledger with one bounded record
+per pipeline-stall observation, exact attempt/assignment/process authority and stage nanoseconds,
+plus sequence, overwrite, and recording-loss evidence. It covers pipeline stall, local barrier,
+and aligned resume only; exact full-checkpoint and restorable-gate evidence remain open. Its
+consumer performs no shared-store read.
+Cycle 59 implements that bounded first slice. The checkpoint-control path writes one preallocated,
+nonblocking record under the same guard scope as its three histogram observations; the protected
+local endpoint is bounded, cache-disabled, process-bound, and paginated. The existing engineering
+harness streams every record collected through each coherent observed cut to per-generation JSONL,
+retains fixed diagnostic memory, rejects unread loss, and reconciles exact integer counts and
+diagnostic buckets against the corresponding observed Prometheus cut.
+Its assignment authority uses the full certificate digest after independently proving the local
+owner-map adoption against the same converged fence. It observes only process generations and
+assignment versions sampled at converged harness cuts; it is not a complete historical audit.
+
+The corrected one-kill Windows/WSL2 engineering run at `7782a032` passed with 392 exact records
+across four process generations, zero deadline exhaustion, a passing existing pipeline-stall gate,
+and 100% of each three-family diagnostic `le=1.024` bucket. Its oracle accounted for all 79,996
+expected IDs while tolerating and counting 2,758 duplicates; it did not prove duplicate byte
+identity or sealed-cut replay legality and supplies no exactly-once evidence. The later
+substitution-defense change in `1a6dff80` has focused deterministic coverage but was not part of
+that empirical subject. The instrumentation A/B, exact full-checkpoint/restorable-gate
+families, and read-only same-snapshot outcome/capsule audit remain open. `[LDB-4007]`,
+`[LDB-0013]`, and the production **NO-GO** verdict are unchanged.
+
 Selected attempts may then be joined at low cadence only through a new read-only, same-snapshot
 core audit of the exact outcome, both retention floors, and validated live capsule reference;
 compacted continuity must remain explicit and no later outcome may be relabelled as the requested

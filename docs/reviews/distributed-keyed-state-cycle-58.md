@@ -49,8 +49,9 @@ later-outcome inference, or connector-offset mislabeling.
    allocation after construction, and explicit nonblocking loss.
 3. **Unused code:** make the existing three-node harness consume every exposed field in the same
    cycle.
-4. **Production readiness:** fail the engineering run on sequence gaps, overwrite, loss, identity
-   drift, or histogram disagreement; preserve all delivery, backend, and independent-soak gates.
+4. **Production readiness:** fail the engineering run on sequence gaps, unread-window overwrite,
+   loss, identity drift, or histogram disagreement; physical eviction after successful export is
+   valid. Preserve all delivery, backend, and independent-soak gates.
 5. **Documentation:** keep the ledger schema normative in one location and report measured results
    without copying endpoint mechanics across every plan.
 6. **Tests:** cover capacity and wrap, pagination, early exits, all three timer scopes, authority

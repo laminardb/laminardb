@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 58
+- **Last reconciled:** 2026-07-26 during Cycle 59
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -210,9 +210,16 @@ recorded 98.81% rather than 99.00% of one node's checkpoint stalls within 1024 m
 as NO-GO evidence; aggregate metrics cannot identify its exact attempts or establish cause.
 
 The [Cycle 58 checkpoint-attempt evidence audit](../reports/checkpoint-attempt-evidence-audit-2026-07-26.md)
-timeboxes the gap without adding an endpoint. The next slice is the bounded three-family local
-barrier-pause ledger and existing-harness consumer; full-checkpoint/restorable-gate evidence and a
-read-only same-snapshot durable audit remain separate blockers.
+timeboxed the gap without adding an endpoint. Cycle 59 implements the bounded three-family local
+barrier-pause ledger and protected existing-harness consumer. Its exact process binding, sampled-
+converged-version certificate binding, loss detection, fixed-memory diagnostics, streamed artifacts
+through each coherent observed cut, and Prometheus reconciliation passed a one-kill engineering run
+at `7782a032` over 392 records. The engineering oracle tolerated and counted 2,758 duplicate output
+IDs but did not verify byte identity or sealed-cut replay legality, so it proves neither charter-
+level at-least-once duplicate legality nor exactly-once composition. The post-run `1a6dff80`
+defense has focused deterministic coverage only. Instrumentation A/B, exact full-checkpoint/
+restorable-gate evidence, and a read-only same-snapshot durable audit remain separate blockers;
+this is not the independent immutable release-binary soak.
 
 ## Scope and non-goals
 
@@ -382,12 +389,12 @@ Work:
    plus partition fence markers bound to the exact recovery-base attempt, capsule digest, and
    assignment certificate; the source oracle derives its ledger by reconciling durable intents
    with actual broker records rather than acknowledgement callbacks. Cycle 57 freezes and consumes
-   the supported stable-serving local-adoption projection. Cycle 58 freezes the three-family local
-   barrier-pause ledger requirements but stops durable projection until one read-only core audit can
-   return exact retained authority and both floors from a stable snapshot. Full-checkpoint and
-   restorable-gate evidence plus provider-neutral source-cut normalization remain open. Polling the
-   shared durable `/vnodes` head, aggregate histograms, private object paths, or text-log substrings
-   is not proof.
+   the supported stable-serving local-adoption projection. Cycle 58 freezes, and Cycle 59 implements,
+   the bounded three-family local barrier-pause ledger and engineering consumer. Durable projection
+   still waits for one read-only core audit that can return exact retained authority and both floors
+   from a stable snapshot. Full-checkpoint and restorable-gate evidence plus provider-neutral
+   source-cut normalization remain open. Polling the shared durable `/vnodes` head, aggregate
+   histograms, private object paths, or text-log substrings is not proof.
 8. Freeze a fault-point vocabulary and output-oracle format shared by later phases. Cross source
    drain/replay, state mutation/freeze, timer fire, output enqueue, sink flush, durable decision,
    external publication, assignment rotation, and ambiguous commit.

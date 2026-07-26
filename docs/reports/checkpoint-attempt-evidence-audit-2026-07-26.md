@@ -2,12 +2,13 @@
 
 ## Decision
 
-LaminarDB already retains strong recovery authority for a terminal cluster checkpoint, but it does
-not retain exact per-process checkpoint-stall observations. Cycle 58 therefore stops before adding
-another HTTP route. An endpoint assembled from the current histograms, logs, or latest-manifest
-view would look useful while being unable to identify the two Cycle 57 latency violations.
+Cycle 58 found that LaminarDB retained strong recovery authority for a terminal cluster checkpoint
+but no exact per-process checkpoint-stall observations. Cycle 59 implements only the first bounded
+observability slice: a process-local ledger and protected engineering endpoint for pipeline stall,
+local barrier, and aligned resume. It does not add the durable exact-outcome/capsule audit described
+below, and it does not widen cluster admission or delivery guarantees.
 
-The next implementation slice must keep two kinds of evidence separate:
+The program keeps two kinds of evidence separate:
 
 1. a bounded, process-local timing ledger that records the exact attempts observed by the existing
    pipeline-stall timers, including sequence continuity and explicit loss; and
@@ -16,8 +17,8 @@ The next implementation slice must keep two kinds of evidence separate:
 
 Timing must not be added to the recovery-critical outcome or capsule formats. It is
 participant-local, nondeterministic evidence, whereas those records are deterministic cluster
-authority. No state backend, cluster admission, source/sink guarantee, or runtime data path changes
-in this cycle.
+authority. Cycle 59 changes checkpoint-control instrumentation only; it adds no row-path work,
+state backend, cluster admission, or source/sink guarantee.
 
 ## What is authoritative today
 
@@ -30,8 +31,8 @@ in this cycle.
 | Recovery contents | `ClusterRecoveryCapsule` binds pipeline identity, assignment, participant readiness/manifests/portable state, seal inventory, connector offset/metadata maps, assignment versions, and watermarks | Canonical body is capped at 8 MiB and verified against digest, length, deployment, attempt, and fence; connector maps are not provider-neutral exclusive cuts |
 | Outcome history | Live authority links are bounded at 4096; compaction has separate artifact and terminal-history floors | When present, the committed and terminal anchors each preserve an exact cloned outcome body and may coincide; an anchor need not retain its capsule/artifacts and is not by itself a live recovery cut, while most other old exact outcomes disappear |
 | Full checkpoint duration | `CheckpointResult` carries attempt, success, duration, error, and failure disposition | Ephemeral; a success log and aggregate histogram consume it, but no durable/bounded attempt inventory does |
-| Pipeline pause | Pipeline-stall, local-barrier, aligned-resume, and restorable-gate histograms observe durations | Aggregate counts/sums/buckets only; no attempt, assignment, process generation, exact maximum, or complete deadline-exhaustion identity |
-| Early failures | Drop-observing barrier timers record early returns | They remain anonymous histogram observations |
+| Pipeline pause | Pipeline-stall, local-barrier, aligned-resume, and restorable-gate histograms observe durations; Cycle 59 additionally retains a fixed-capacity process-local ledger for the first three | The ledger names process, assignment certificate, attempt, role, exact nanoseconds, handoff, and deadline status with sequence/overwrite/loss evidence; restorable-gate and full-checkpoint exact inventories remain absent |
+| Early failures | One drop guard closes the local/aligned/stall histogram scope and attempts the corresponding exact ledger record | Early returns after guard construction remain exact when canonical context exists; missing/invalid context, duration overflow, contention, or counter exhaustion increments fail-closed loss evidence |
 | Public checkpoint view | `/api/v1/cluster/checkpoints` reads the latest manifest and lists checkpoints | Coarse latest ID/epoch/time/source/sink/count metadata; it is not immutable outcome or capsule authority |
 | Local assignment view | Cycle 57's `/api/v1/cluster/local-evidence` binds the live process to its current audited assignment adoption | It does not retain checkpoint phase, terminal settlement, or stage timing |
 
@@ -49,12 +50,16 @@ Primary code evidence:
 - [`checkpoint_coordinator.rs`](../../crates/laminar-db/src/checkpoint_coordinator.rs) defines the
   ephemeral `CheckpointResult` around lines 927–970 and records only aggregate checkpoint/gate
   duration metrics around lines 3556–3574 and 7015–7027.
-- [`pipeline_callback.rs`](../../crates/laminar-db/src/pipeline_callback.rs) starts the three
-  drop-observing barrier timer scopes around lines 2960, 3176, and 5539.
+- [`checkpoint_timing.rs`](../../crates/laminar-db/src/checkpoint_timing.rs) defines the preallocated,
+  nonblocking ledger, drop guard, loss metadata, and bounded snapshots.
+- [`pipeline_callback.rs`](../../crates/laminar-db/src/pipeline_callback.rs) samples exact process,
+  attempt, role, and assignment-certificate context for the three barrier routes.
 - [`engine_metrics.rs`](../../crates/laminar-db/src/engine_metrics.rs) defines aggregate checkpoint
   histograms around lines 79–95 and 297–330.
-- [`cluster_soak.rs`](../../crates/laminar-server/tests/cluster_soak.rs) currently derives its SLO
-  only from Prometheus aggregates around lines 954–1002 and 1267–1536.
+- [`http.rs`](../../crates/laminar-server/src/http.rs) exposes the protected, cache-disabled,
+  byte/record-capped process-local page without shared-storage reads.
+- [`cluster_soak.rs`](../../crates/laminar-server/tests/cluster_soak.rs) streams exact records,
+  validates ring algebra and authority, and reconciles each coherent observed ledger/Prometheus cut.
 
 ## Exact missing capability
 
@@ -69,11 +74,11 @@ local process authority + exact assignment + checkpoint attempt
        -> validated live capsule reference for an exact Commit
 ```
 
-Today the left side and the durable right side exist independently. The middle observation is
-anonymous and aggregate, so a test cannot name the attempt that exceeded 1024 ms, determine which
-local stage dominated it, or prove that every observation in its measurement window was retained.
-The lack of correlation also prevents assigning or excluding Cycle 57's 500-ms diagnostic polling
-as a contributor to the 98.81% result.
+After Cycle 59, the left-to-middle link exists for the process generations and converged assignment
+cuts observed by the engineering harness. Sequence continuity, explicit loss, and exact histogram
+reconciliation make those three timing families auditable. The durable right-hand join is still
+missing, as are exact full-checkpoint and restorable-gate observations. The new passing run does not
+retroactively identify Cycle 57's two slow attempts or assign causality to its 500-ms polling.
 
 The capsule's connector maps are opaque provider values, not a normalized exclusive-cut contract.
 For example, Kafka persists a last-consumed inclusive offset and connector code converts it to the
@@ -86,7 +91,7 @@ has its own cursor/reconciliation lifecycle, and the current Kafka path remains 
 Joining an attempt to a live Commit capsule therefore proves a recovery cut, not source/state/sink
 atomicity or exactly-once delivery.
 
-## Frozen requirements for the next slice
+## Frozen requirements and implementation boundary
 
 ### Process-local barrier-pause timing ledger
 
@@ -130,17 +135,20 @@ caller-supplied sequence, with a fixed record count and response-byte cap. It mu
 storage read. Process authority is sampled around the snapshot so records cannot be relabelled after
 a lease/term change.
 
-The harness captures every process generation before kill and at the end, incrementally if the ring
-would otherwise wrap. It rejects gaps and checks exact record counts/SLO classification against the
-existing histogram deltas. It must report the exact violating attempt(s), maximum, local-barrier
-duration, aligned-resume duration, role, and process generation.
+The harness captures every expected process generation before kill and at the end, incrementally before any
+unread record can leave the ring. Physical eviction after a record was exported is safe; a stale
+cursor, unread-window overwrite, gap, recording loss, or metadata exhaustion is not. It checks exact
+record counts and diagnostic `le=1.024` classifications against the existing histogram deltas and
+reports bounded console witnesses plus per-generation JSONL containing every record collected
+through the coherent observed cut. Assignment anchoring covers versions independently observed at
+converged cuts, not unsampled historical versions.
 
 ### On-demand exact-outcome audit
 
 No current single API is sufficient for an external route. `cluster_outcome_with_recovery_capsule`
 does not return the retention floors, a separate floor read can race, and
 `cluster_attempt_settlement` infers closure from the highest later outcome rather than returning the
-requested body. Cycle 59 must not expose either as a stable classifier.
+requested body. Cycle 59 does not expose either as a stable classifier.
 
 First add one bounded core result from one audited authority head. It must carry the requested
 canonical attempt, the exact admission link when retained, both retention floors, and exactly one
@@ -173,19 +181,22 @@ separate connector-contract blocker.
 
 Before this evidence can support a production soak:
 
-1. Unit tests prove monotonic sequences, fixed capacity, overwrite/loss reporting, nanosecond
-   overflow handling, exact pagination, and fail-closed authority changes.
+1. Unit tests prove monotonic sequences, fixed capacity, physical overwrite-count/ring algebra,
+   unread-window loss reporting, nanosecond overflow handling, exact pagination, and fail-closed
+   authority changes.
 2. Each of the leader, immediate-follower, deferred-follower, early-error, cancel, abort, inline
    tail, and aligned-resume paths produces exactly one ledger record per stall histogram sample.
 3. HTTP tests cover bearer reload, startup/recovery/terminal gates, caps, stale generation,
    malformed cursors, pagination, and slow/oversized framing.
-4. Harness tests reject gaps, duplicates, regressions, overwritten windows, histogram disagreement,
-   inferred later-outcome settlement, both kinds of compacted history, orphan/missing capsules, and
-   capsule mismatch.
-5. A controlled engineering A/B compares identical fixed workloads with the Cycle 57 shared-store
+4. Harness tests reject gaps, duplicates, regressions, unread-window overwrite, and histogram
+   disagreement. Physical eviction after successful export is allowed and checked against exact
+   ring algebra.
+5. The future exact-outcome audit tests reject inferred later-outcome settlement, both kinds of
+   compacted history, orphan/missing capsules, and capsule mismatch.
+6. A controlled engineering A/B compares identical fixed workloads with the Cycle 57 shared-store
    polling disabled and enabled. It diagnoses perturbation; it cannot convert either earlier red run
    into a pass.
-6. The independently operated immutable release-binary soak remains mandatory after the complete
+7. The independently operated immutable release-binary soak remains mandatory after the complete
    state/backend/rebalance/source/sink vertical is ready.
 
 ## Cycle 58 disposition
@@ -194,3 +205,34 @@ Cycle 58 is an audit/design cycle. It adds no runtime recorder or endpoint becau
 retained facts cannot support a truthful exact-timing response. Cluster keyed/stateful admission
 remains fail-closed under `[LDB-4007]`/`[LDB-0013]`; TidesDB remains stopped before runtime
 integration; bounded memory remains reference-only; and production remains **NO-GO**.
+
+## Cycle 59 disposition
+
+Cycle 59 implements the bounded three-family ledger, protected paginated endpoint, and real-harness
+consumer. The recorder is preallocated and nonblocking on the checkpoint-control path; it performs
+no row-path, network, filesystem, object-store, serialization, or backend work. Histogram samples
+and the corresponding ledger record close under the same guard scope. The consumer binds records
+to the exact live process and independently binds each sampled converged assignment version to its
+full certificate digest. It streams every collected record to JSONL while retaining fixed-size
+diagnostics in memory and finalizes each process generation at a coherent observed
+ledger/Prometheus cut.
+
+A Windows/WSL2 engineering run of the optimized test binary at commit `7782a032` used static
+three-node discovery, MinIO, Redpanda, 96 Kafka partitions, 400 records/s, one in-checkpoint leader
+`kill -9`, and a 90-second configured tail. It passed in 207.20 s: all 79,996 acknowledged IDs were
+observed. The engineering oracle tolerated and counted 2,758 duplicate output IDs but did not prove
+their byte identity or sealed-cut replay legality. Exact reconciliation covered 392 barrier-pause
+timing records across four process generations; the diagnostic `le=1.024` bucket contained 100%
+of samples for all three families and the existing pipeline-stall gate passed. No record reported
+deadline exhaustion or missing handoff, and the collector observed no recording loss, gap, or
+unread-window overwrite. Artifacts through each observed cut remain in the run directory named in
+the Cycle 59 review.
+
+This is engineering evidence only. The real run predates `1a6dff80`, whose substitution-defense
+change has focused deterministic test/lint coverage but was not empirically rerun. The protected
+route still lacks a direct nonempty paginated HTTP test, the instrumentation needs a controlled A/B,
+and exact full-checkpoint/restorable-gate plus
+same-snapshot durable outcome/capsule evidence remain open. The run used the current nontransactional
+Kafka path and therefore establishes no exactly-once claim. No keyed runtime, state backend,
+admission flag, source/sink capability, or independent immutable release-binary soak changed;
+production remains **NO-GO**.

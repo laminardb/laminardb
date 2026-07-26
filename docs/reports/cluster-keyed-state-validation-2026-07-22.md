@@ -55,10 +55,19 @@ The new convergence assertions passed twice against real processes, Kafka, and M
 encompassing Windows/WSL2 engineering tests remained red on their existing latency-profile terminal
 gate; details are retained below and in the Cycle 57 review.
 [Cycle 58](checkpoint-attempt-evidence-audit-2026-07-26.md) audits the resulting exact-attempt gap
-and deliberately adds no endpoint. Current recovery outcomes/capsules and anonymous aggregate
-timing cannot form a truthful stable response. The next slice is a bounded process-local timing
-three-family barrier-pause ledger consumed by the existing harness. Exact full-checkpoint and
-restorable-gate evidence plus a non-creating, read-only same-snapshot durable audit remain open.
+and deliberately adds no endpoint. Recovery outcomes/capsules and anonymous aggregate timing could
+not form a truthful stable response, so it froze a bounded process-local three-family barrier-pause
+ledger consumed by the existing harness. That slice was then implemented in Cycle 59. Exact full-
+checkpoint and restorable-gate evidence plus a non-creating, read-only same-snapshot durable audit
+remain open.
+[Cycle 59](../reviews/distributed-keyed-state-cycle-59.md) implements that bounded first slice and
+passes a corrected one-kill engineering run: 392 exact records across four process generations,
+zero deadline exhaustion, 100% membership in each three-family diagnostic `le=1.024` bucket, a
+passing existing pipeline-stall gate, loss-detecting JSONL through each observed cut, and exact
+reconciliation with the corresponding observed Prometheus cut. It anchors sampled converged
+assignment versions rather than unsampled history, still needs an instrumentation A/B and direct
+nonempty paginated HTTP test, and adds no full-checkpoint/restorable-gate, durable outcome/capsule,
+exactly-once, backend, admission, or independent-soak authority.
 
 ## Verdict
 
@@ -450,7 +459,7 @@ The exact evidence inventory is:
 | Legal replay interval | Committed recovery capsule binds connector-specific retained positions and assignment | Engineering soak observes advisory consumer-group commits | The provider-specific recovery position is authoritative, but no provider-neutral exclusive-cut projection exists and the current oracle consumes neither form |
 | Checkpoint terminal/assignment evidence | Create-once outcome, seal inventory, and recovery capsule bind the exact attempt and assignment | `/api/v1/cluster/checkpoints` exposes only the latest ID/epoch/time/names/count; current internal reads cannot supply one read-only same-snapshot outcome/floors/capsule classification | Partially observable; no stable per-attempt evidence view |
 | Local assignment convergence | Each assignment participant durably publishes a boot-bound canonical `CheckpointAssignmentAdoption`, while the watcher separately maintains the current locally audited assignment fence | Cycle 57's authenticated `/api/v1/cluster/local-evidence` reads the exact local adoption through one bounded checked-KV operation, requires it to match that live fence, rechecks fence/process authority, caps/no-stores the response, and is compared with a durable-before/after assignment sandwich by the engineering harness | Stable-serving local adoption is now observable; zero-vnode nonparticipants have no current matching adoption evidence and are outside the positive-evidence set, while recovery phase and committed-`Release` consumption remain absent |
-| Latency attempt/max evidence | Aggregate histograms and selected lifecycle logs exist; `CheckpointResult` is exact but ephemeral | Prometheus supports distributions, but not an exact per-attempt maximum, process generation, loss detection, or complete stage/terminal correlation | Cycle 58 freezes a bounded ledger only for pipeline stall, local barrier, and aligned resume; exact full-checkpoint/restorable-gate evidence and every implementation remain open |
+| Latency attempt/max evidence | Cycle 59's preallocated process-local ledger retains exact pipeline-stall, local-barrier, and optional aligned-resume records with process, attempt, assignment-certificate, sequence, overwrite/loss, handoff, and deadline fields | A protected bounded/paginated local route is consumed by the engineering harness and reconciled at coherent observed Prometheus cuts; records through each cut stream to per-generation JSONL while memory remains bounded | Implemented and green for those three families on one engineering run only; exact full-checkpoint/restorable-gate evidence, instrumentation A/B, complete historical assignment coverage, durable attempt/outcome correlation, and independent qualification remain open |
 
 The live engineering oracle currently accepts any number of duplicate `seq` values once the
 expected set is present. It does not compare bytes for repeated IDs, bind a duplicate to the sealed
@@ -526,7 +535,8 @@ recovery provenance lives in the marker. The reader hashes the raw payload bytes
 expected vnode from the canonical key and frozen ABI rather than trusting duplicated row metadata.
 Cycle 57 closes the public stable-serving local-adoption identity only. Cycle 58 proves that
 per-attempt timing must first come from a bounded local ledger and that durable joining cannot use
-the current racy/inferred lookup composition; both remain required for the rotation charter. The
+the current racy/inferred lookup composition. Cycle 59 implements and exercises the bounded
+three-family ledger; the durable same-snapshot join remains required for the rotation charter. The
 initial interval must first
 reference a zero-input bootstrap checkpoint/capsule created
 from exact pre-delivery source baselines while readiness, graph work, and sink writes remain closed;
@@ -632,6 +642,8 @@ The current branch's admission-neutral hardening was then checked separately:
 | Cycle 57 real static run, one leader kill, zero-second tail | **FAIL terminal gate** | Exact survivor/rejoin convergence passed in 44.95/34.21 s and all 43,473 IDs reached the ALO sink; only 72 node0 latency observations were available versus the existing minimum 100 |
 | Cycle 57 real static run, one leader kill, 90-second tail | **FAIL terminal gate** | Exact survivor/rejoin convergence passed in 43.46/37.53 s and all 80,260 IDs reached the ALO sink; node1 met the 1024-ms stall bound for 98.81% of 168 observations versus the required 99.00% |
 | Cycle 58 checkpoint-attempt authority audit | PASS for design boundary; no runtime claim | Exact outcome/capsule retention, two-floor compaction, orphan-capsule, source-offset, lookup-side-effect, timing, and response-bound limits were mapped; implementation stopped before an untruthful route |
+| Cycle 59 exact barrier-timing implementation | PASS, focused/unit/lint gates | Preallocated three-family ledger, protected bounded route, exact process plus sampled-converged-version certificate binding, bounded-memory collector, JSONL streaming through coherent observed cuts, safe exported eviction, unread-loss rejection, and exact Prometheus reconciliation |
+| Cycle 59 real static run, one leader kill, 90-second tail | **PASS engineering gate** | All 79,996 IDs present; 2,758 duplicate IDs tolerated/counted but not proven byte-identical legal replay; 392 exact records across four process generations; zero deadline exhaustion and 100% membership in all three diagnostic `le=1.024` buckets; existing pipeline-stall gate passed; 43.43-s failover and 34.51-s rejoin; not an instrumentation A/B or independent release soak |
 
 Both cluster and no-feature `cargo check` and `cargo clippy -D warnings` configurations passed, as
 did formatting and diff checks. These focused results do not exercise keyed cluster restore.
@@ -642,6 +654,16 @@ S3-compatible state/checkpoint prefixes, and 400 rps. They are engineering evide
 independent immutable release subject. The second run's aggregate histogram cannot identify the two
 violating attempts or correlate their stages with assignment and terminal outcome; rerunning merely
 to dilute the ratio was rejected.
+
+Cycle 59 retained the earlier failures and corrected the missing measurement authority instead of
+changing the threshold. Its optimized Windows/WSL2 engineering subject at `7782a032` used the same
+static three-node/MinIO/Redpanda class of environment with a unique S3 prefix. It passed exact
+ledger/Prometheus reconciliation and emitted four per-generation JSONL files (392 records total).
+The current Kafka sink remained nontransactional and the oracle tolerated and counted 2,758
+duplicate output IDs without proving their byte identity or sealed-cut replay legality. The result
+therefore does not satisfy the charter's at-least-once duplicate-legality oracle and does not close
+`[LDB-0013]`. The later `1a6dff80` substitution defense has focused deterministic test/lint
+coverage but was not part of the empirical subject.
 
 These are admission and focused operator tests, not a production certification. No existing test
 demonstrates a distributed keyed operator processing remote rows through crash, restore, and

@@ -5,7 +5,7 @@
   pending a new official package; no runtime
   dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 58
+- **Last reconciled:** 2026-07-26 during Cycle 59
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -426,18 +426,26 @@ rerun measured 98.81% rather than the required 99.00% of node1 checkpoint stalls
 This result is retained; aggregate histograms cannot identify the exact violating attempts, so
 exact attempt/timing projection is the next authority audit rather than a threshold adjustment.
 
-The [Cycle 58 audit](../reports/checkpoint-attempt-evidence-audit-2026-07-26.md) adds no route. The next
-slice is a process-local ledger for pipeline-stall, local-barrier, and aligned-resume evidence,
-consumed by the existing harness without shared-store reads. Full-checkpoint/restorable-gate
-evidence and a non-creating, read-only same-snapshot durable audit remain separate blockers.
+The [Cycle 58 audit](../reports/checkpoint-attempt-evidence-audit-2026-07-26.md) added no route.
+Cycle 59 implements its bounded process-local ledger for pipeline stall, local barrier, and aligned
+resume plus the protected existing-harness consumer. Exact records are process- and assignment-
+bound and loss-detecting; assignment-certificate authority covers sampled converged versions. They
+are reconciled at coherent observed Prometheus cuts, streamed through each observed cut to
+per-generation JSONL, and bounded in memory. A corrected one-kill engineering run at `7782a032`
+reconciled 392 records across four process generations with no deadline exhaustion; the existing
+pipeline-stall gate passed and every three-family diagnostic `le=1.024`
+bucket contained 100% of its samples. The post-run `1a6dff80` defense has focused deterministic
+coverage only. This was not an instrumentation A/B or an independent immutable release-binary soak.
+Full-checkpoint/restorable-gate evidence and a non-creating, read-only same-snapshot durable audit
+remain separate blockers.
 
 The existing output path satisfies none of the new provenance/fence fields: it passes only a batch
 and deadline and uses an idempotent, non-transactional Kafka producer. The supported evidence APIs
-still need the frozen local barrier-pause ledger, exact full-checkpoint/restorable-gate evidence,
-and, later, the same-snapshot immutable outcome/capsule projection. Raw object-store records,
-provider-specific connector offsets, and
-tracing fields are implementation evidence, not a frozen external API. These tasks do not depend on
-which local working-state engine eventually qualifies.
+now include the three-family local barrier-pause ledger, but still need exact full-checkpoint/
+restorable-gate evidence and, later, the same-snapshot immutable outcome/capsule projection. Raw
+object-store records, provider-specific connector offsets, and tracing fields are implementation
+evidence, not a frozen external API. These tasks do not depend on which local working-state engine
+eventually qualifies.
 
 The expected checkpoint order is source position capture followed by a FIFO sink synchronization
 fence and successful durable flush before manifest readiness, durable decision, and external source
