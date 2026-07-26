@@ -1,0 +1,27 @@
+[package]
+name = "distributed-state-ab"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+publish = false
+license = "Apache-2.0"
+autobins = false
+
+# Keep engineering A/B tooling outside LaminarDB's runtime workspace and dependency graph.
+[workspace]
+
+[[bin]]
+name = "distributed-state-ab-driver"
+path = "src/driver_main.rs"
+
+[[bin]]
+name = "distributed-state-ab-observer"
+path = "src/observer_main.rs"
+
+[dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
