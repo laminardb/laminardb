@@ -40,8 +40,12 @@
 //!   observed `leader` or a `follower`
 //! - `LAMINAR_SOAK_MAX_RECOVERY_MS`  maximum time for each failover or restarted-node recovery
 //!   phase (default and upper bound 90s, matching the liveness window)
+//! - `LAMINAR_SOAK_LAMINARDB_EXE` / `LAMINAR_SOAK_LAMINARDB_SHA256`  optional all-or-nothing
+//!   absolute prebuilt server path and exact lowercase SHA-256; invalid overrides fail before the
+//!   soak creates dependencies
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write as _};
 #[cfg(feature = "kafka")]
 use std::io::{Seek as _, SeekFrom};
@@ -50,11 +54,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 #[cfg(feature = "kafka")]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(feature = "kafka")]
 use std::sync::Arc;
 #[cfg(feature = "kafka")]
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+use sha2::{Digest as _, Sha256};
 
 #[cfg(feature = "kafka")]
 use laminar_core::cluster::control::{
@@ -126,6 +131,8 @@ const RECOVERY_LIVENESS_WINDOW: Duration = Duration::from_secs(90);
 const DEFAULT_MAX_RECOVERY_MS: u64 = 90_000;
 const LOCAL_EXACT_PREFIX_CYCLES: u64 = 4;
 const HARD_KILL_TIMEOUT: Duration = Duration::from_secs(10);
+const SOAK_LAMINARDB_EXE_ENV: &str = "LAMINAR_SOAK_LAMINARDB_EXE";
+const SOAK_LAMINARDB_SHA256_ENV: &str = "LAMINAR_SOAK_LAMINARDB_SHA256";
 #[cfg(feature = "kafka")]
 const OUTPUT_BOUNDARY_STABILITY: Duration = Duration::from_secs(3);
 
@@ -147,6 +154,193 @@ fn soak_run_id() -> String {
         .expect("system clock is before the Unix epoch")
         .as_nanos();
     format!("{}-{nonce}", std::process::id())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutableOrigin {
+    CargoBuilt,
+    Override,
+}
+
+impl ExecutableOrigin {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::CargoBuilt => "cargo-built",
+            Self::Override => "prebuilt-override",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedExecutable {
+    path: PathBuf,
+    sha256: [u8; 32],
+    byte_len: u64,
+    origin: ExecutableOrigin,
+}
+
+impl ResolvedExecutable {
+    fn from_environment() -> Result<Self, String> {
+        resolve_laminardb_executable(
+            std::env::var_os(SOAK_LAMINARDB_EXE_ENV),
+            std::env::var_os(SOAK_LAMINARDB_SHA256_ENV),
+            Path::new(env!("CARGO_BIN_EXE_laminardb")),
+        )
+    }
+
+    fn describe(&self) {
+        eprintln!(
+            "soak: laminardb executable origin={} path={} sha256={} bytes={}",
+            self.origin.label(),
+            self.path.display(),
+            encode_sha256(self.sha256),
+            self.byte_len
+        );
+    }
+
+    fn verify_unchanged(&self) -> Result<(), String> {
+        let current = resolve_executable(&self.path, Some(self.sha256), self.origin)?;
+        if current.byte_len != self.byte_len {
+            return Err(format!(
+                "executable length changed for {}: expected {}, got {}",
+                self.path.display(),
+                self.byte_len,
+                current.byte_len
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn resolve_laminardb_executable(
+    configured_path: Option<OsString>,
+    configured_sha256: Option<OsString>,
+    cargo_fallback: &Path,
+) -> Result<ResolvedExecutable, String> {
+    match (configured_path, configured_sha256) {
+        (None, None) => resolve_executable(cargo_fallback, None, ExecutableOrigin::CargoBuilt),
+        (Some(path), Some(sha256)) => {
+            if path.is_empty() {
+                return Err(format!("{SOAK_LAMINARDB_EXE_ENV} must not be empty"));
+            }
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err(format!(
+                    "{SOAK_LAMINARDB_EXE_ENV} must be an absolute path, got {}",
+                    path.display()
+                ));
+            }
+            let expected_sha256 = parse_sha256(&sha256)?;
+            resolve_executable(&path, Some(expected_sha256), ExecutableOrigin::Override)
+        }
+        (Some(_), None) => Err(format!(
+            "{SOAK_LAMINARDB_EXE_ENV} requires {SOAK_LAMINARDB_SHA256_ENV}"
+        )),
+        (None, Some(_)) => Err(format!(
+            "{SOAK_LAMINARDB_SHA256_ENV} requires {SOAK_LAMINARDB_EXE_ENV}"
+        )),
+    }
+}
+
+fn resolve_executable(
+    path: &Path,
+    expected_sha256: Option<[u8; 32]>,
+    origin: ExecutableOrigin,
+) -> Result<ResolvedExecutable, String> {
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize executable {}: {error}", path.display()))?;
+    let mut file = std::fs::File::open(&canonical_path).map_err(|error| {
+        format!(
+            "cannot open executable {}: {error}",
+            canonical_path.display()
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "cannot inspect executable {}: {error}",
+            canonical_path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "executable path is not a regular file: {}",
+            canonical_path.display()
+        ));
+    }
+    let actual_sha256 = sha256_reader(&mut file).map_err(|error| {
+        format!(
+            "cannot hash executable {}: {error}",
+            canonical_path.display()
+        )
+    })?;
+    if let Some(expected_sha256) = expected_sha256 {
+        if actual_sha256 != expected_sha256 {
+            return Err(format!(
+                "executable SHA-256 mismatch for {}: expected {}, got {}",
+                canonical_path.display(),
+                encode_sha256(expected_sha256),
+                encode_sha256(actual_sha256)
+            ));
+        }
+    }
+    Ok(ResolvedExecutable {
+        path: canonical_path,
+        sha256: actual_sha256,
+        byte_len: metadata.len(),
+        origin,
+    })
+}
+
+fn sha256_reader(reader: &mut impl Read) -> std::io::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1_024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn parse_sha256(value: &OsStr) -> Result<[u8; 32], String> {
+    let value = value.to_str().ok_or_else(|| {
+        format!("{SOAK_LAMINARDB_SHA256_ENV} must be valid Unicode lowercase hex")
+    })?;
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "{SOAK_LAMINARDB_SHA256_ENV} must contain exactly 64 lowercase hexadecimal characters"
+        ));
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = (lower_hex_nibble(pair[0]) << 4) | lower_hex_nibble(pair[1]);
+    }
+    Ok(decoded)
+}
+
+const fn lower_hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => unreachable!(),
+    }
+}
+
+fn encode_sha256(value: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in value {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 #[cfg(feature = "kafka")]
@@ -221,6 +415,7 @@ fn validate_local_source_liveness(
 
 struct Node {
     id: usize,
+    executable: Arc<ResolvedExecutable>,
     config_path: PathBuf,
     log_path: PathBuf,
     child: Option<Child>,
@@ -232,6 +427,8 @@ struct Node {
     /// Debug checkpoint handshake used to prove a hard kill landed inside an active phase.
     checkpoint_gate_path: Option<PathBuf>,
 }
+
+struct VerifiedExecutable(Arc<ResolvedExecutable>);
 
 #[cfg(feature = "kafka")]
 #[derive(Debug)]
@@ -644,13 +841,30 @@ fn prometheus_histogram_bucket_value(body: &str, metric: &str, upper_bound: f64)
 }
 
 impl Node {
-    fn spawn(&mut self) {
+    /// Hash before the caller starts a recovery timer; consuming the permit in `spawn` makes every
+    /// process generation reuse the resolved executable identity without charging hash I/O to RTO.
+    fn verify_executable_for_spawn(&self) -> VerifiedExecutable {
+        self.executable.verify_unchanged().unwrap_or_else(|error| {
+            panic!(
+                "refusing to spawn node{} from a changed soak executable: {error}",
+                self.id
+            )
+        });
+        VerifiedExecutable(Arc::clone(&self.executable))
+    }
+
+    fn spawn(&mut self, verified: VerifiedExecutable) {
+        assert!(
+            Arc::ptr_eq(&self.executable, &verified.0),
+            "node{} spawn permit belongs to a different executable",
+            self.id
+        );
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.log_path)
             .expect("node log file");
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_laminardb"));
+        let mut cmd = Command::new(&verified.0.path);
         cmd.arg("--config")
             .arg(&self.config_path)
             .env(
@@ -658,6 +872,8 @@ impl Node {
                 "laminardb=info,laminar_server=info,laminar_db=info,laminar_core=info",
             )
             .env("NO_COLOR", "1")
+            .env_remove(SOAK_LAMINARDB_EXE_ENV)
+            .env_remove(SOAK_LAMINARDB_SHA256_ENV)
             .stdout(Stdio::from(log.try_clone().expect("clone log handle")))
             .stderr(Stdio::from(log));
         match &self.fault_trigger_path {
@@ -676,15 +892,34 @@ impl Node {
                 cmd.env_remove("LAMINAR_CHECKPOINT_KILL_GATE_FILE");
             }
         }
-        let child = cmd.spawn().expect("spawn laminardb");
+        let child = cmd.spawn().unwrap_or_else(|error| {
+            panic!(
+                "spawn laminardb from {} (sha256={}): {error}",
+                verified.0.path.display(),
+                encode_sha256(verified.0.sha256)
+            )
+        });
+        let pid = child.id();
+        self.child = Some(child);
         #[cfg(feature = "kafka")]
         {
             self.process_generation = self
                 .process_generation
                 .checked_add(1)
                 .expect("soak process generation overflow");
+            eprintln!(
+                "soak: node{} generation={} pid={pid} executable_sha256={}",
+                self.id,
+                self.process_generation,
+                encode_sha256(verified.0.sha256)
+            );
         }
-        self.child = Some(child);
+        #[cfg(not(feature = "kafka"))]
+        eprintln!(
+            "soak: node{} pid={pid} executable_sha256={}",
+            self.id,
+            encode_sha256(verified.0.sha256)
+        );
     }
 
     /// `kill -9` equivalent: no shutdown hooks, no final checkpoint.
@@ -4599,6 +4834,11 @@ fn local_exact_source_state_kill9_soak() {
         "local exact-state kill injection requires `cargo test --profile soak`; the release \
          profile excludes the test-only checkpoint gate"
     );
+    let executable = Arc::new(
+        ResolvedExecutable::from_environment()
+            .unwrap_or_else(|error| panic!("invalid soak server executable: {error}")),
+    );
+    executable.describe();
     let steady_seconds = env_u64("LAMINAR_SOAK_SECONDS", 60);
     let interval_ms = env_u64("LAMINAR_SOAK_INTERVAL_MS", 300);
     assert!(
@@ -4633,6 +4873,7 @@ fn local_exact_source_state_kill9_soak() {
 
     let mut node = Node {
         id: 0,
+        executable,
         config_path: write_local_exact_config(
             dir.path(),
             interval_ms,
@@ -4652,7 +4893,8 @@ fn local_exact_source_state_kill9_soak() {
         // configuration dimension.
         checkpoint_gate_path: Some(dir.path().join("checkpoint-local-exact.arm")),
     };
-    node.spawn();
+    let initial_spawn = node.verify_executable_for_spawn();
+    node.spawn(initial_spawn);
     let mut initial_checkpoint = None;
     wait_for(
         "local exact node to commit its first checkpoint",
@@ -4701,12 +4943,13 @@ fn local_exact_source_state_kill9_soak() {
         moving_ingested > 0.0 && moving_ingested < prefix_rows as f64,
         "moving-source fault did not land inside the finite prefix: ingested={moving_ingested}, prefix={prefix_rows}"
     );
+    let moving_restart = node.verify_executable_for_spawn();
     let moving_recovery_started = Instant::now();
     let moving_recovery_deadline = moving_recovery_started + recovery_ceiling;
     node.kill9();
     node.disarm_checkpoint_kill();
     let moving_recovery_log_offset = node.log_len();
-    node.spawn();
+    node.spawn(moving_restart);
     wait_for(
         "local node to recover the exact moving-source predecessor",
         remaining_progress_window(moving_recovery_deadline, "moving local exact recovery"),
@@ -4790,12 +5033,13 @@ fn local_exact_source_state_kill9_soak() {
              durable epoch {} checkpoint {} covered the frozen {prefix_rows}-row prefix",
             durable_checkpoint.epoch, durable_checkpoint.checkpoint_id,
         );
+        let restart = node.verify_executable_for_spawn();
         let recovery_started = Instant::now();
         let recovery_deadline = recovery_started + recovery_ceiling;
         node.kill9();
         node.disarm_checkpoint_kill();
         let recovery_log_offset = node.log_len();
-        node.spawn();
+        node.spawn(restart);
         wait_for(
             "local node to report recovery from the exact durable checkpoint",
             remaining_progress_window(recovery_deadline, "local exact source/state recovery"),
@@ -4857,6 +5101,11 @@ fn local_exact_source_state_kill9_soak() {
 #[ignore = "spawns 3 real laminardb processes; run with --ignored"]
 #[cfg(feature = "kafka")]
 fn three_node_kill9_soak() {
+    let executable = Arc::new(
+        ResolvedExecutable::from_environment()
+            .unwrap_or_else(|error| panic!("invalid soak server executable: {error}")),
+    );
+    executable.describe();
     let soak_secs = env_u64("LAMINAR_SOAK_SECONDS", 90);
     let interval_ms = env_u64("LAMINAR_SOAK_INTERVAL_MS", 500);
     assert!(
@@ -4921,6 +5170,7 @@ fn three_node_kill9_soak() {
     let mut nodes: Vec<Node> = (0..NODES)
         .map(|id| Node {
             id,
+            executable: Arc::clone(&executable),
             config_path: write_config(
                 dir.path(),
                 id,
@@ -4947,7 +5197,8 @@ fn three_node_kill9_soak() {
     let mut exact_timing_evidence =
         CheckpointBarrierTimingEvidence::with_artifact_directory(log_dir.clone());
     for n in &mut nodes {
-        n.spawn();
+        let initial_spawn = n.verify_executable_for_spawn();
+        n.spawn(initial_spawn);
         // Stagger process startup to reduce formation churn; role is observed from the API below.
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -5313,9 +5564,10 @@ fn three_node_kill9_soak() {
 
         // Restart it under a separate SLO: serving metrics, rejoining membership, ingesting owned
         // work, and participating in durable progress all share one recovery deadline.
+        let restart = nodes[victim].verify_executable_for_spawn();
         let rejoin_started = Instant::now();
         let rejoin_deadline = rejoin_started + recovery_ceiling;
-        nodes[victim].spawn();
+        nodes[victim].spawn(restart);
         wait_for(
             "killed node serving /metrics again",
             remaining_progress_window(rejoin_deadline, "restarted-node recovery"),
@@ -5730,6 +5982,113 @@ fn produce_seq(
             elapsed: start.elapsed(),
         }
     })
+}
+
+#[test]
+fn executable_resolution_binds_and_revalidates_the_cargo_fallback() {
+    let directory = tempfile::tempdir().unwrap();
+    let fallback = directory.path().join("cargo laminardb fixture");
+    std::fs::write(&fallback, b"cargo-built-server").unwrap();
+
+    let resolved = resolve_laminardb_executable(None, None, &fallback).unwrap();
+    assert_eq!(resolved.path, fallback.canonicalize().unwrap());
+    assert_eq!(resolved.origin, ExecutableOrigin::CargoBuilt);
+    assert_eq!(resolved.byte_len, 18);
+    assert_eq!(
+        encode_sha256(resolved.sha256),
+        "d5f410d6aca92063263450e616c8afc1ceb27f116414112a5bd5666e93bbc22a"
+    );
+
+    std::fs::write(&fallback, b"substituted-server").unwrap();
+    let error = resolved.verify_unchanged().unwrap_err();
+    assert!(error.contains("SHA-256 mismatch"), "{error}");
+}
+
+#[test]
+fn executable_resolution_accepts_an_exact_absolute_override() {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("prebuilt laminardb with spaces");
+    std::fs::write(&executable, b"prebuilt-server").unwrap();
+    let expected = "f400c41753421ae14bceac6e85510f006306066e3d09fd75a7c144daa58ef321";
+
+    let resolved = resolve_laminardb_executable(
+        Some(executable.clone().into_os_string()),
+        Some(OsString::from(expected)),
+        Path::new("unused-fallback"),
+    )
+    .unwrap();
+    assert_eq!(resolved.path, executable.canonicalize().unwrap());
+    assert_eq!(resolved.origin, ExecutableOrigin::Override);
+    assert_eq!(encode_sha256(resolved.sha256), expected);
+}
+
+#[test]
+fn executable_resolution_rejects_partial_or_noncanonical_digest_configuration() {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("laminardb");
+    std::fs::write(&executable, b"prebuilt-server").unwrap();
+    let path = executable.into_os_string();
+    let valid = OsString::from("f400c41753421ae14bceac6e85510f006306066e3d09fd75a7c144daa58ef321");
+
+    assert!(resolve_laminardb_executable(Some(path.clone()), None, Path::new("unused")).is_err());
+    assert!(resolve_laminardb_executable(None, Some(valid.clone()), Path::new("unused")).is_err());
+    assert!(resolve_laminardb_executable(
+        Some(OsString::new()),
+        Some(valid.clone()),
+        Path::new("unused")
+    )
+    .is_err());
+    for malformed in [
+        "",
+        "1ef4",
+        "F400C41753421AE14BCEAC6E85510F006306066E3D09FD75A7C144DAA58EF321",
+        "f400c41753421ae14bceac6e85510f006306066e3d09fd75a7c144daa58ef321 ",
+        "z400c41753421ae14bceac6e85510f006306066e3d09fd75a7c144daa58ef321",
+    ] {
+        assert!(resolve_laminardb_executable(
+            Some(path.clone()),
+            Some(OsString::from(malformed)),
+            Path::new("unused")
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn executable_resolution_rejects_unusable_paths_and_digest_mismatch() {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("laminardb");
+    std::fs::write(&executable, b"prebuilt-server").unwrap();
+    let expected =
+        OsString::from("f400c41753421ae14bceac6e85510f006306066e3d09fd75a7c144daa58ef321");
+
+    assert!(resolve_laminardb_executable(
+        Some(OsString::from("relative-laminardb")),
+        Some(expected.clone()),
+        Path::new("unused")
+    )
+    .is_err());
+    assert!(resolve_laminardb_executable(
+        Some(directory.path().join("missing").into_os_string()),
+        Some(expected.clone()),
+        Path::new("unused")
+    )
+    .is_err());
+    assert!(resolve_laminardb_executable(
+        Some(directory.path().as_os_str().to_os_string()),
+        Some(expected.clone()),
+        Path::new("unused")
+    )
+    .is_err());
+
+    std::fs::write(&executable, b"substituted-server").unwrap();
+    let error = resolve_laminardb_executable(
+        Some(executable.into_os_string()),
+        Some(expected),
+        Path::new("unused"),
+    )
+    .unwrap_err();
+    assert!(error.contains("SHA-256 mismatch"), "{error}");
 }
 
 #[test]
@@ -6939,6 +7298,12 @@ fn exact_timing_completeness_covers_every_spawned_generation() {
     let nodes = [
         Node {
             id: 0,
+            executable: Arc::new(ResolvedExecutable {
+                path: PathBuf::new(),
+                sha256: [0; 32],
+                byte_len: 0,
+                origin: ExecutableOrigin::CargoBuilt,
+            }),
             config_path: PathBuf::new(),
             log_path: PathBuf::new(),
             child: None,
@@ -6949,6 +7314,12 @@ fn exact_timing_completeness_covers_every_spawned_generation() {
         },
         Node {
             id: 1,
+            executable: Arc::new(ResolvedExecutable {
+                path: PathBuf::new(),
+                sha256: [0; 32],
+                byte_len: 0,
+                origin: ExecutableOrigin::CargoBuilt,
+            }),
             config_path: PathBuf::new(),
             log_path: PathBuf::new(),
             child: None,
