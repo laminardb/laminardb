@@ -443,6 +443,29 @@ pub enum LocalProcessAuthorityEvidenceError {
     Invalid(String),
 }
 
+/// One non-durable identity sample for the exact local process generation.
+///
+/// This value names process authority; it does not prove assignment adoption or grant future
+/// authority. Callers that expose it must sample a live identity around their in-memory read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalProcessAuthorityIdentity {
+    /// Stable node slot and boot incarnation.
+    pub participant: CheckpointParticipant,
+    /// Stable-node process term bound to `participant`.
+    pub process_term: u64,
+}
+
+impl LocalProcessAuthorityIdentity {
+    /// Whether every process-identity field has its canonical production shape.
+    #[must_use]
+    pub fn is_canonical(self) -> bool {
+        self.participant.node_id != 0
+            && !self.participant.boot_incarnation.is_nil()
+            && self.process_term != 0
+    }
+}
+
 /// One bounded, current-process view of locally retained cluster-control evidence.
 ///
 /// A successful read samples the lease as live before and after the durable point read; it is not
@@ -2088,6 +2111,25 @@ impl ClusterController {
         self.recovery_incarnation
     }
 
+    /// Try to capture this process's live local identity without waiting or performing I/O.
+    ///
+    /// The process-authority transition lock is acquired with `try_lock`; checkpoint timing
+    /// instrumentation can therefore fail closed instead of extending the measured pause. The
+    /// lease is checked before and after the atomic identity load.
+    ///
+    /// # Errors
+    /// Returns an error when an authority transition is in progress, the local lease is not live,
+    /// or the installed process identity is non-canonical.
+    pub fn try_live_local_process_authority_identity(
+        &self,
+    ) -> Result<LocalProcessAuthorityIdentity, String> {
+        let _transition = self
+            .process_authority_transition
+            .try_lock()
+            .ok_or_else(|| "local process authority transition is in progress".to_string())?;
+        self.capture_live_local_process_authority_locked()
+    }
+
     /// Read this process's exact local assignment evidence with one bounded checked-KV operation.
     ///
     /// Only the local stable-node slot is read; this method never scans shared assignment or
@@ -2316,8 +2358,16 @@ impl ClusterController {
         Ok(publisher)
     }
 
-    fn capture_live_local_process_authority(&self) -> Result<RecoveryFaultPublisher, String> {
+    fn capture_live_local_process_authority(
+        &self,
+    ) -> Result<LocalProcessAuthorityIdentity, String> {
         let _transition = self.process_authority_transition.lock();
+        self.capture_live_local_process_authority_locked()
+    }
+
+    fn capture_live_local_process_authority_locked(
+        &self,
+    ) -> Result<LocalProcessAuthorityIdentity, String> {
         if !self.recovery_process_lease_is_live() {
             return Err("local process lease authority is not live".into());
         }
@@ -2325,7 +2375,10 @@ impl ClusterController {
         if !self.recovery_process_lease_is_live() {
             return Err("local process lease authority changed while sampling identity".into());
         }
-        Ok(publisher)
+        Ok(LocalProcessAuthorityIdentity {
+            participant: publisher.participant,
+            process_term: publisher.process_term,
+        })
     }
 
     async fn recovery_fault_publisher_is_current(

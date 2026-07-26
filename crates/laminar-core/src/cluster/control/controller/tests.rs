@@ -2149,12 +2149,32 @@ async fn local_process_authority_evidence_is_exact_compact_and_round_trips() {
     assert_eq!(evidence.process_term, proof.owner.process_term);
     assert_eq!(evidence.adopted_assignment, adoption);
 
+    let identity = controller
+        .try_live_local_process_authority_identity()
+        .unwrap();
+    assert!(identity.is_canonical());
+    assert_eq!(identity.participant, evidence.participant);
+    assert_eq!(identity.process_term, evidence.process_term);
+
+    let transition = controller.process_authority_transition.lock();
+    let error = controller
+        .try_live_local_process_authority_identity()
+        .expect_err("the nonblocking sampler must not wait behind an authority transition");
+    assert!(error.contains("transition is in progress"), "{error}");
+    drop(transition);
+
     let encoded = serde_json::to_vec(&evidence).unwrap();
     assert!(encoded.len() <= 4 * 1_024, "{} bytes", encoded.len());
     assert_eq!(
         serde_json::from_slice::<LocalProcessAuthorityEvidence>(&encoded).unwrap(),
         evidence
     );
+
+    controller.fence_process_lease();
+    let error = controller
+        .try_live_local_process_authority_identity()
+        .expect_err("a terminally fenced process must not expose live identity");
+    assert!(error.contains("not live"), "{error}");
 }
 
 #[cfg(feature = "cluster")]
