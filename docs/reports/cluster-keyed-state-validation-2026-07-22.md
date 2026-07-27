@@ -101,6 +101,10 @@ Restart-loss rejection also covers only unread records advertised by the last ob
 old process can lose records appended after that poll without the client knowing, so durable
 continuity/handoff or an explicitly reviewed bounded observation interpretation remains a live
 integration blocker.
+[Cycle 66](../reviews/distributed-keyed-state-cycle-66.md) adds only the sealed driver's fake-only
+consumer. Fresh invocation/result binding, bounded supervision, strict aggregate validation, and
+post-end-seal outcome consumption preserve byte-identical C/D plans and traces across success and
+hostile child paths. No live pacing, LaminarDB request, A/B, backend, delivery change, or soak ran.
 
 ## Verdict
 
@@ -684,6 +688,7 @@ The current branch's admission-neutral hardening was then checked separately:
 | Cycle 63 diagnostic-read authority | DESIGN ONLY; no runtime or empirical sample | Selects a disjoint startup-bound credential on exactly two loopback diagnostic GETs; rejects the unrestricted-bearer broker and identifies parse-error disclosure plus restart-only reload publication as prerequisites |
 | Cycle 64 diagnostic-read boundary | PASS for in-process configuration, route, race, and reload tests; no real-process sample | Implements the disjoint immutable credential, exact two-route allowlist, post-auth permit/rate/deadline bounds, route-template logs, parse-input redaction, and restart-only reload retention; 238 no-cluster and 316 cluster tests pass |
 | Cycle 65 standalone observer protocol | PASS for the bounded fake-only component; live/driver integration blocked | Result v2 binds sanitized plan v2; bootstrap v3, strict direct HTTP/cursor/identity validation, explicit incomplete exit, and cancellation pass. Owned child-process tests prove zero C connections and 348 parsed D responses; no LaminarDB process was contacted |
+| Cycle 66 sealed fake-protocol supervisor | PASS for bounded fake-only consumption; live/production blocked | Bootstrap v4/result v3 add fresh invocation binding; the manifest-pinned child is captured, cancelled, and reaped within bounds, and its result is consumed only after the identical common end seal. 38 tests pass; no LaminarDB request or measurement ran |
 
 Both cluster and no-feature `cargo check` and `cargo clippy -D warnings` configurations passed, as
 did formatting and diff checks. These focused results do not exercise keyed cluster restore.
@@ -758,6 +763,12 @@ The accelerated 58-slot execution is not evidence for the 0..285-second cadence 
 start-rate limit; those require a separately versioned paced integration path.
 Likewise, the process-local timing ledger cannot reveal records appended after the last poll and
 lost at restart; the fake result is not a durable-tail continuity certificate.
+
+Cycle 66 also adds no empirical product sample. Owned local children prove fresh replay-resistant
+fake result consumption after the same sealed trace, bounded failure cleanup, partial-secret
+bootstrap deadlines, and absence of raw child streams from artifacts. Loopback ownership remains a
+harness property, the path still accelerates all slots, and no LaminarDB server, workload, fault,
+latency A/B, backend, delivery composition, or independent soak was exercised.
 
 These are admission and focused operator tests, not a production certification. No existing test
 demonstrates a distributed keyed operator processing remote rows through crash, restore, and

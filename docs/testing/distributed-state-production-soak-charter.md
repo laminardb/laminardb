@@ -817,6 +817,53 @@ Live use must also close the between-poll restart gap with durable continuity/ha
 an explicitly reviewed bounded observation interpretation; this fake result is not proof that an
 unobserved old-process tail was preserved.
 
+### Cycle 66 sealed fake-protocol supervisor
+
+Cycle 66 adds only the fake consumer in `4a95a3db`, `76c43064`, and `8108966c`. A distinct driver
+stdin frame contains canonical unique loopback endpoints plus the diagnostic secret. The driver
+builds sanitized plan v2 from its already sealed base plan. Bootstrap v4 adds a driver-generated
+RFC-4122 UUIDv4 invocation identity, and canonical result v3 must echo it together with the exact
+arm and plan/base-plan/schedule hashes. This freshness check rejects an exact older result from an
+otherwise identical run; it is not a durable nonce registry or protection from a malicious pinned
+child that observes the current value.
+
+The child is rehashed immediately before spawn, runs with only the reviewed Windows `SystemRoot`
+exception, verifies its current executable and base-plan binding, and receives no credential in
+arguments, general environment, manifest, plan, or file. IPv6 loopback endpoints require zero
+flowinfo and scope ID, avoiding aliased or non-round-tripping socket identities. Verify-then-spawn
+and child self-checks are operational controls, not signed or atomic process attestation; the owned
+test harness, not the address alone, establishes fake-listener identity.
+
+The supervisor cannot inspect status, bootstrap delivery, captured streams, or disposition until
+the common 104-action trace has been persisted, file-synced, reread, and consumed through its exact
+logical 290-second end seal. Fake stdout is capped at 64 KiB and stderr at the manifest's bounded
+cap; both are drained but never persisted raw. The record retains only fixed dispositions, byte
+counts/hashes, and a validated result DTO. Completion uses the validated manifest timeout, then a
+250-ms cancellation-frame write, 500-ms grace, and 500-ms kill/reap bound; one cleanup retry and a
+fixed manual-cleanup marker follow an unconfirmed termination. A missed completion/status deadline
+remains sticky if the process exits later. Closing the supervisor pipe also cancels fail-closed.
+
+Strict result validation enforces all producer-necessary aggregate bounds over 174 node-slots,
+including full 384-record deferrals, transient/deferral exclusion, response/probe/timing lower and
+upper bounds, unresolved support, process-transition limits, and legal ordering for the retained
+32-event prefix. Dropped events retain aggregate counts but not coordinates, so their exact
+per-node-slot placement is not proven. A future result treated as independently untrusted evidence
+needs a compact complete slot vector or transcript.
+
+Serial formatting, all-target check, warnings-denied Clippy, and all-target tests pass: 38 tests
+pass and one subprocess fixture is intentionally ignored and invoked by its parent. Real-child
+coverage includes complete C/D, incomplete exit 2, stale invocation, wrong bearer, injected exit,
+hang, malformed output, cancellation frame, supervisor EOF, stalled read, hostile framing, open or
+partial-secret bootstrap, exact plan/trace non-interference, raw-output non-persistence, and clean
+post-test process inspection. A blocked partial-secret reader cannot zeroize its stack scratch until
+the dedicated process exits; the tests prove bounded process exit, not in-thread cancellation. This
+design must not be reused by a long-lived in-process secret reader.
+
+The component is approved only for accelerated owned-fake-server supervision. It still executes all
+58 slots immediately, cannot satisfy the real 0..285-second cadence or diagnostic rate limiter,
+does not close process-local timing-tail loss, and makes no LaminarDB, A/B, latency, backend,
+delivery, exactly-once, admission, multi-host-security, or independent-soak claim.
+
 ## Frozen numerical contract
 
 An eligible machine-readable charter contains no `TBD`, zero, or results-derived threshold. It

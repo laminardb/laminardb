@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 65
+- **Last reconciled:** 2026-07-27 during Cycle 66
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -276,6 +276,12 @@ the live server's per-process start limiter. A separately versioned paced integr
 therefore required before any live request. Restart detection covers only unread records already
 advertised by the last observed page; an unobserved process-local tail requires durable
 continuity/handoff or an explicitly reviewed bounded observation interpretation before live use.
+
+Cycle 66 closes only the next fake-only gate. The sealed driver now provisions and supervises the
+manifest-pinned child, binds each canonical result to a fresh invocation, and consumes it only after
+the identical common trace has been file-synced and end-sealed. Bounded hostile child/input/output
+tests pass without persisting raw streams. The accelerated 58-slot path remains ineligible for live
+or A/B use; a separately versioned paced contract and an honest timing-tail decision are next.
 
 ## Scope and non-goals
 

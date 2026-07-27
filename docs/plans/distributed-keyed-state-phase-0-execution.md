@@ -5,7 +5,7 @@
   pending a new official package; no runtime
   dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 65
+- **Last reconciled:** 2026-07-27 during Cycle 66
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -503,6 +503,15 @@ separately versioned paced integration path must honor `at_ns` and the server st
 before live polling can be authorized. Because the ledger is process-local, records appended after
 the last poll and then lost at restart remain unknowable; live integration also needs durable
 continuity/handoff or an explicitly reviewed bounded observation interpretation.
+
+Cycle 66 connects only that accelerated fake protocol to the sealed driver in `4a95a3db`,
+`76c43064`, and `8108966c`. A typed
+endpoint/secret ingress, fresh UUIDv4 bootstrap/result binding, manifest-pinned child, bounded
+capture/cancel/kill/reap, strict result equations, and post-end-seal-only consumption pass 38 tests.
+C/D common plan and trace bytes remain identical and raw child streams are not persisted. This
+closes the fake-only consuming-supervisor gate, not the live observer: `at_ns`, the server start-rate
+limit, durable timing-tail authority, multi-host transport, effect estimation, powered A/B,
+backend qualification, delivery, admission, and independent soak remain blocked.
 
 The existing output path satisfies none of the new provenance/fence fields: it passes only a batch
 and deadline and uses an idempotent, non-transactional Kafka producer. The supported evidence APIs

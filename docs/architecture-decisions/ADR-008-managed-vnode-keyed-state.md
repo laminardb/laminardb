@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 65
+- **Last reconciled:** 2026-07-27 during Cycle 66
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-65.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-66.md)
 
 ## Decision
 
@@ -1380,6 +1380,15 @@ Restart-loss detection is limited to unread records advertised by the last obser
 Records appended to the process-local ledger after that poll and lost with the process are
 unknowable to this client. Live integration therefore also requires a durable continuity/handoff
 proof or an explicitly reviewed bounded interpretation of that observation gap.
+
+Cycle 66 implements the fake-only sealed-driver consumer in `4a95a3db`, `76c43064`, and
+`8108966c`. Bootstrap v4 and result v3 bind a fresh UUIDv4 invocation; manifest-pinned child
+supervision, canonical loopback endpoints, strict result equations, bounded capture/cancel/
+termination, and post-end-seal-only consumption preserve identical C/D common artifacts across
+hostile outcomes. This does not authorize a live request or change this ADR's runtime decision.
+Pacing/rate-limit compatibility, durable tail authority, multi-host security, A/B evidence,
+backend qualification, delivery, admission, and independent soak remain open; `[LDB-4007]`,
+`[LDB-0013]`, and production **NO-GO** are unchanged.
 
 Selected attempts may then be joined at low cadence only through a new read-only, same-snapshot
 core audit of the exact outcome, both retention floors, and validated live capsule reference;
