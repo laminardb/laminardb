@@ -391,6 +391,52 @@ async fn rehydrate_resolves_sealed_full_delta_delta_chain() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn conflicting_parent_reseal_cannot_change_retained_child_restore() {
+    let backend = InProcessBackend::new(1);
+    let parent = CheckpointAttempt::canonical(1);
+    let child = CheckpointAttempt::canonical(2);
+    write_and_seal_partial(
+        &backend,
+        parent,
+        crate::vnode_partial::VnodePartial {
+            operators: vec![("agg".into(), b"full".to_vec())],
+            base: None,
+            deltas: Vec::new(),
+        },
+    )
+    .await;
+    write_and_seal_partial(
+        &backend,
+        child,
+        crate::vnode_partial::VnodePartial {
+            operators: Vec::new(),
+            base: Some(parent),
+            deltas: vec![("agg".into(), b"delta".to_vec())],
+        },
+    )
+    .await;
+
+    let conflict = backend
+        .seal_checkpoint(parent, None, &[], &[])
+        .await
+        .unwrap_err();
+    assert!(matches!(conflict, StateBackendError::Conflict { .. }));
+
+    let loaded = SealedVnodeChainReader::new(&backend)
+        .load_at(&[0], child)
+        .await
+        .unwrap();
+    let decoded: Vec<_> = loaded.chains[&0]
+        .iter()
+        .map(|bytes| crate::vnode_partial::VnodePartial::decode(bytes).unwrap())
+        .collect();
+    let (base, deltas) = resolve_op_chain(&decoded, "agg").unwrap();
+    assert_eq!(base, b"full");
+    assert_eq!(deltas, vec![b"delta".as_slice()]);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn retention_keeps_fallback_delta_ancestors_until_rebase() {
     let backend = InProcessBackend::new(1);
     let attempts = [

@@ -30,6 +30,9 @@ struct StoredCommitDescriptor {
 #[derive(Debug)]
 pub struct InProcessBackend {
     namespace: RwLock<Option<StateNamespaceBinding>>,
+    /// Monotonic retirement boundary. Attempt operations hold a read guard while touching their
+    /// maps; pruning takes the write guard before publishing a new floor and deleting entries.
+    retired_before_epoch: RwLock<u64>,
     partials: RwLock<FxHashMap<(CheckpointAttempt, u32), StoredPartial>>,
     /// `attempt -> key -> descriptor`, mirroring the durable attempt namespace.
     descriptors: RwLock<FxHashMap<CheckpointAttempt, FxHashMap<String, StoredCommitDescriptor>>>,
@@ -45,6 +48,7 @@ impl InProcessBackend {
     pub fn new(vnode_capacity: u32) -> Self {
         Self {
             namespace: RwLock::new(None),
+            retired_before_epoch: RwLock::new(0),
             partials: RwLock::new(FxHashMap::default()),
             descriptors: RwLock::new(FxHashMap::default()),
             sealed: RwLock::new(FxHashMap::default()),
@@ -78,6 +82,36 @@ impl InProcessBackend {
         }
     }
 
+    fn live_attempt_guard(
+        &self,
+        attempt: CheckpointAttempt,
+    ) -> Result<parking_lot::RwLockReadGuard<'_, u64>, StateBackendError> {
+        Self::ensure_canonical_attempt(attempt)?;
+        let guard = self.retired_before_epoch.read();
+        if attempt.epoch < *guard {
+            return Err(StateBackendError::Conflict {
+                resource: format!(
+                    "state-v2/epoch={}/checkpoint={}",
+                    attempt.epoch, attempt.checkpoint_id
+                ),
+                message: format!(
+                    "checkpoint epoch {} is below the irreversible in-process prune floor {}",
+                    attempt.epoch, *guard
+                ),
+            });
+        }
+        Ok(guard)
+    }
+
+    fn readable_attempt_guard(
+        &self,
+        attempt: CheckpointAttempt,
+    ) -> Result<Option<parking_lot::RwLockReadGuard<'_, u64>>, StateBackendError> {
+        Self::ensure_canonical_attempt(attempt)?;
+        let guard = self.retired_before_epoch.read();
+        Ok((attempt.epoch >= *guard).then_some(guard))
+    }
+
     fn store_partial(
         &self,
         attempt: CheckpointAttempt,
@@ -86,7 +120,7 @@ impl InProcessBackend {
         writer: Option<SealedVnodeWriter>,
         bytes: Bytes,
     ) -> Result<(), StateBackendError> {
-        Self::ensure_canonical_attempt(attempt)?;
+        let _live_attempt = self.live_attempt_guard(attempt)?;
         self.check_vnode(vnode)?;
         let stored = StoredPartial {
             attestation: SealedVnodePartial::new(vnode, assignment_version, writer, &bytes),
@@ -117,7 +151,7 @@ impl InProcessBackend {
         writer: Option<SealedCommitDescriptorWriter>,
         bytes: Bytes,
     ) -> Result<(), StateBackendError> {
-        Self::ensure_canonical_attempt(attempt)?;
+        let _live_attempt = self.live_attempt_guard(attempt)?;
         if key.is_empty() {
             return Err(StateBackendError::Conflict {
                 resource: format!(
@@ -239,7 +273,9 @@ impl StateBackend for InProcessBackend {
         attempt: CheckpointAttempt,
         vnode: u32,
     ) -> Result<Option<Bytes>, StateBackendError> {
-        Self::ensure_canonical_attempt(attempt)?;
+        let Some(_live_attempt) = self.readable_attempt_guard(attempt)? else {
+            return Ok(None);
+        };
         self.check_vnode(vnode)?;
         Ok(self
             .partials
@@ -254,7 +290,9 @@ impl StateBackend for InProcessBackend {
         sealed: &SealedVnodePartial,
         max_bytes: u64,
     ) -> Result<Option<Bytes>, StateBackendError> {
-        Self::ensure_canonical_attempt(attempt)?;
+        let Some(_live_attempt) = self.readable_attempt_guard(attempt)? else {
+            return Ok(None);
+        };
         self.check_vnode(sealed.vnode)?;
         let resource = format!(
             "state-v2/epoch={}/checkpoint={}/vnode={}/partial.bin",
@@ -335,7 +373,9 @@ impl StateBackend for InProcessBackend {
         attempt: CheckpointAttempt,
         key: &str,
     ) -> Result<Option<Bytes>, StateBackendError> {
-        Self::ensure_canonical_attempt(attempt)?;
+        let Some(_live_attempt) = self.readable_attempt_guard(attempt)? else {
+            return Ok(None);
+        };
         Ok(self
             .descriptors
             .read()
@@ -350,7 +390,9 @@ impl StateBackend for InProcessBackend {
         sealed: &SealedCommitDescriptor,
         max_bytes: u64,
     ) -> Result<Option<Bytes>, StateBackendError> {
-        Self::ensure_canonical_attempt(attempt)?;
+        let Some(_live_attempt) = self.readable_attempt_guard(attempt)? else {
+            return Ok(None);
+        };
         let resource = format!(
             "state-v2/epoch={}/checkpoint={}/commit/{}",
             attempt.epoch, attempt.checkpoint_id, sealed.key
@@ -396,7 +438,7 @@ impl StateBackend for InProcessBackend {
         vnodes: &[u32],
         required_descriptors: &[String],
     ) -> Result<bool, StateBackendError> {
-        Self::ensure_canonical_attempt(attempt)?;
+        let _live_attempt = self.live_attempt_guard(attempt)?;
         if assignment_fence.is_some_and(|fence| !fence.is_canonical()) {
             return Err(StateBackendError::Conflict {
                 resource: format!(
@@ -488,7 +530,9 @@ impl StateBackend for InProcessBackend {
         &self,
         attempt: CheckpointAttempt,
     ) -> Result<Option<CheckpointSealInventory>, StateBackendError> {
-        Self::ensure_canonical_attempt(attempt)?;
+        let Some(_live_attempt) = self.readable_attempt_guard(attempt)? else {
+            return Ok(None);
+        };
         Ok(self
             .sealed
             .read()
@@ -501,7 +545,7 @@ impl StateBackend for InProcessBackend {
         inventory: &CheckpointSealInventory,
     ) -> Result<(), StateBackendError> {
         let attempt = inventory.attempt;
-        Self::ensure_canonical_attempt(attempt)?;
+        let _live_attempt = self.live_attempt_guard(attempt)?;
         let resource = format!(
             "state-v2/epoch={}/checkpoint={}",
             attempt.epoch, attempt.checkpoint_id
@@ -575,8 +619,11 @@ impl StateBackend for InProcessBackend {
     }
 
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
-        // Without this, every checkpoint leaks one Bytes per vnode
-        // forever.
+        // Publish the correctness boundary while excluding every attempt operation, then delete.
+        // No writer can pass the old floor and republish an attempt after this sweep.
+        let mut floor = self.retired_before_epoch.write();
+        *floor = (*floor).max(before);
+        let before = *floor;
         self.sealed
             .write()
             .retain(|attempt, _| attempt.epoch >= before);
@@ -955,5 +1002,68 @@ mod tests {
             assert!(b.read_partial(attempt(epoch), 0).await.unwrap().is_some());
             assert!(b.read_partial(attempt(epoch), 1).await.unwrap().is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn prune_floor_irreversibly_retires_attempt_name() {
+        let b = InProcessBackend::new(1);
+        let retired = attempt(1);
+        b.write_partial(retired, 0, 0, Bytes::from_static(b"original"))
+            .await
+            .unwrap();
+        b.write_commit_descriptor(retired, "ready", Bytes::from_static(b"ready"))
+            .await
+            .unwrap();
+        assert!(b
+            .seal_checkpoint(retired, None, &[0], &["ready".into()])
+            .await
+            .unwrap());
+        let sealed = b.checkpoint_seal_inventory(retired).await.unwrap().unwrap();
+
+        b.prune_before(2).await.unwrap();
+        b.prune_before(1).await.unwrap();
+
+        assert!(b
+            .checkpoint_seal_inventory(retired)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(b
+            .read_sealed_partial_bounded(retired, &sealed.sealed_partials[0], u64::MAX)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(b
+            .read_sealed_commit_descriptor_bounded(retired, &sealed.sealed_descriptors[0], u64::MAX)
+            .await
+            .unwrap()
+            .is_none());
+        let retry_error = b
+            .write_partial(retired, 0, 0, Bytes::from_static(b"original"))
+            .await
+            .unwrap_err();
+        assert!(matches!(retry_error, StateBackendError::Conflict { .. }));
+        let write_error = b
+            .write_partial(retired, 0, 0, Bytes::from_static(b"replacement"))
+            .await
+            .unwrap_err();
+        assert!(matches!(write_error, StateBackendError::Conflict { .. }));
+        let descriptor_error = b
+            .write_commit_descriptor(retired, "ready", Bytes::from_static(b"ready"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            descriptor_error,
+            StateBackendError::Conflict { .. }
+        ));
+        let seal_error = b
+            .seal_checkpoint(retired, None, &[0], &["ready".into()])
+            .await
+            .unwrap_err();
+        assert!(matches!(seal_error, StateBackendError::Conflict { .. }));
+
+        b.write_partial(attempt(2), 0, 0, Bytes::from_static(b"live"))
+            .await
+            .unwrap();
     }
 }

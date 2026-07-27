@@ -60,8 +60,9 @@ impl StateNamespaceBinding {
 /// Exact identity of one checkpoint attempt.
 ///
 /// Runtime-generated and persisted attempts use one durable order: `epoch == checkpoint_id`.
-/// The duplicated fields remain in the current wire/storage layout and are validated at every
-/// boundary.
+/// IDs are never reused within a bound deployment/state namespace; a new namespace may start its
+/// own order. The duplicated fields remain in the current wire/storage layout and are validated at
+/// every boundary.
 #[derive(
     Debug,
     Clone,
@@ -740,6 +741,15 @@ pub enum StateBackendError {
 /// [`write_partial`](Self::write_partial) must be idempotent for a given
 /// `(attempt, vnode)` pair. An identical retry succeeds; conflicting bytes
 /// return [`StateBackendError::Conflict`] and must never overwrite the winner.
+/// Once [`seal_checkpoint`](Self::seal_checkpoint) succeeds, that attempt permanently names one
+/// exact [`CheckpointSealInventory`] in the bound state namespace. The inventory must remain
+/// stable until the attempt is retired; an implementation must never make the same attempt name
+/// resolve to a different inventory. Retirement is irreversible: after
+/// [`prune_before`](Self::prune_before) publishes a floor, reads below it return no live attempt and
+/// later artifact writes or seal publication below it must fail. Durable implementations persist
+/// both the create-once seal and monotonic retirement floor across restarts. These rules let an
+/// incremental partial name its parent by a namespace-scoped, never-reused [`CheckpointAttempt`]
+/// without allowing the parent to be substituted later.
 #[async_trait]
 pub trait StateBackend: Send + Sync + 'static {
     /// Number of stable key groups this backend can address.
@@ -939,6 +949,8 @@ pub trait StateBackend: Send + Sync + 'static {
 
     /// Durability barrier: true once every `vnode` partial and every
     /// `required_descriptors` key for `attempt` is persisted, sealing that exact attempt.
+    /// The first successful seal fixes the attempt's complete inventory for its lifetime;
+    /// identical retries may succeed, while any different inventory must conflict.
     /// Sinks do not commit until it returns `Ok(true)`. In cluster mode,
     /// `required_descriptors` also binds every participant's final readiness attestation,
     /// including participants with no vnodes or coordinated sinks.
@@ -951,7 +963,9 @@ pub trait StateBackend: Send + Sync + 'static {
     ) -> Result<bool, StateBackendError>;
 
     /// Read the canonical artifact inventory for an exact sealed attempt.
-    /// Returns `None` when that attempt has no live seal or is below the durable prune floor.
+    /// Repeated reads of a live attempt return the exact inventory fixed by its first successful
+    /// seal. Returns `None` when that attempt has no live seal or is below the durable prune floor;
+    /// a retired attempt must never become live again under the same name.
     async fn checkpoint_seal_inventory(
         &self,
         attempt: CheckpointAttempt,
@@ -984,8 +998,10 @@ pub trait StateBackend: Send + Sync + 'static {
     /// in-memory backend leaks a `Bytes` per vnode per checkpoint
     /// forever, and an object-store backend leaves `state-v2/epoch=N/…` objects
     /// forever. Implementations must durably make the retired attempt unreadable before deleting
-    /// any artifact it attests. Test backends that truly do not accumulate state should
-    /// implement `Ok(())` explicitly so the choice is visible.
+    /// any artifact it attests. The retirement floor is monotonic and irreversible: all later
+    /// writes and seal attempts below it must fail, preventing a deleted attempt from being
+    /// republished with a different inventory. Test backends that truly do not accumulate state
+    /// should implement `Ok(())` explicitly so the choice is visible.
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError>;
 
     /// Failure scope survived by this backend.

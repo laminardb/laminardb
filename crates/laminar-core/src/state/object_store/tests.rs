@@ -747,7 +747,7 @@ async fn checkpoint_attempts_are_isolated() {
 }
 
 #[tokio::test]
-async fn seal_checkpoint_cas_is_idempotent_for_same_execution() {
+async fn seal_checkpoint_cas_fixes_attempt_inventory() {
     let dir = tempdir().unwrap();
     let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
     let vnodes = [0u32, 1, 2];
@@ -766,11 +766,25 @@ async fn seal_checkpoint_cas_is_idempotent_for_same_execution() {
         .seal_checkpoint(attempt(1), None, &vnodes, &[])
         .await
         .unwrap());
+    let inventory = backend
+        .checkpoint_seal_inventory(attempt(1))
+        .await
+        .unwrap()
+        .unwrap();
     // Idempotent — same committer id in the audit body.
     assert!(backend
         .seal_checkpoint(attempt(1), None, &vnodes, &[])
         .await
         .unwrap());
+    let conflict = backend
+        .seal_checkpoint(attempt(1), None, &[0, 1], &[])
+        .await
+        .unwrap_err();
+    assert!(matches!(conflict, StateBackendError::Conflict { .. }));
+    assert_eq!(
+        backend.checkpoint_seal_inventory(attempt(1)).await.unwrap(),
+        Some(inventory)
+    );
 }
 
 #[tokio::test]
