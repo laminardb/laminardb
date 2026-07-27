@@ -443,6 +443,220 @@ fn successor_checkpoint_roster_contains_only_successor_owners() {
 }
 
 #[tokio::test]
+async fn recovery_suspension_waits_for_unapplied_vnode_transition() {
+    let self_id = NodeId(1);
+    let controller = test_cluster_controller(self_id, uuid::Uuid::from_u128(11), None);
+    let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
+        .state_backend(Arc::new(InProcessBackend::new(1)))
+        .vnode_registry(Arc::clone(&registry))
+        .build()
+        .await
+        .unwrap();
+    db.set_source_gate(false);
+    registry.mark_restoring(&[0]);
+    db.rehydrated_vnode_state.lock().insert(
+        0,
+        crate::db::RehydratedVnode {
+            epoch: 7,
+            chain: vec![bytes::Bytes::from_static(b"pending")],
+        },
+    );
+    let authority_revision = db
+        .assignment_authority_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+
+    let suspended = suspend_recovery_assignment_after_vnode_transition(
+        &db,
+        &controller,
+        &registry,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+
+    assert!(!suspended);
+    assert!(!db.cluster_intake_fenced());
+    assert_eq!(
+        db.assignment_authority_revision
+            .load(std::sync::atomic::Ordering::Acquire),
+        authority_revision
+    );
+    assert_eq!(db.rehydrated_vnode_state.lock().len(), 1);
+    assert!(registry.is_restoring(0));
+
+    db.rehydrated_vnode_state.lock().clear();
+    registry.mark_active(&[0]);
+    let suspended = suspend_recovery_assignment_after_vnode_transition(
+        &db,
+        &controller,
+        &registry,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+
+    assert!(suspended);
+    assert!(db.cluster_intake_fenced());
+    assert!(
+        db.assignment_authority_revision
+            .load(std::sync::atomic::Ordering::Acquire)
+            > authority_revision
+    );
+}
+
+struct PendingPredecessorAuthorityFixture {
+    watcher: SnapshotWatcher,
+    db: Arc<LaminarDB>,
+    controller: Arc<ClusterController>,
+    registry: Arc<VnodeRegistry>,
+    sender: Arc<laminar_core::shuffle::ShuffleSender>,
+    receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
+    _leader_lease: tokio::sync::watch::Sender<Option<laminar_core::cluster::control::LeaderLease>>,
+    current: AssignmentSnapshot,
+    successor: AssignmentSnapshot,
+}
+
+async fn pending_predecessor_authority_fixture(
+    recovering: bool,
+) -> PendingPredecessorAuthorityFixture {
+    let self_id = NodeId(1);
+    let boot = uuid::Uuid::from_u128(1);
+    let durable = Arc::new(store());
+    let current = snapshot(BTreeMap::from([(0, self_id)]));
+    let successor = current
+        .next_for_participants(BTreeMap::from([(0, self_id)]), current.participants.clone())
+        .unwrap();
+    durable.save_if_absent(&current).await.unwrap();
+    durable
+        .save_if_version(&successor, current.version)
+        .await
+        .unwrap();
+
+    let controller = test_cluster_controller(self_id, boot, Some(Arc::clone(&durable)));
+    install_test_process_authority(&controller, &current.participants).await;
+    let leader_lease = grant_test_leadership(&controller).await;
+    controller.set_active(true);
+    controller.set_recovering(recovering);
+    let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
+    let receiver = Arc::new(
+        laminar_core::shuffle::ShuffleReceiver::bind(
+            self_id.0,
+            "127.0.0.1:0".parse().unwrap(),
+            boot,
+        )
+        .await
+        .unwrap(),
+    );
+    let sender = Arc::new(laminar_core::shuffle::ShuffleSender::new(self_id.0, boot));
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
+        .state_backend(Arc::new(InProcessBackend::new(1)))
+        .vnode_registry(Arc::clone(&registry))
+        .shuffle_sender(Arc::clone(&sender))
+        .shuffle_receiver(Arc::clone(&receiver))
+        .build()
+        .await
+        .unwrap();
+    db.set_source_gate(true);
+    registry.mark_restoring(&[0]);
+    db.rehydrated_vnode_state.lock().insert(
+        0,
+        crate::db::RehydratedVnode {
+            epoch: 7,
+            chain: vec![bytes::Bytes::from_static(b"pending-current-assignment")],
+        },
+    );
+    let watcher = SnapshotWatcher::new(
+        Arc::clone(&db),
+        durable,
+        Arc::clone(&registry),
+        CancellationToken::new(),
+        RebalanceConfig::test_defaults(),
+        Some(Arc::clone(&controller)),
+    );
+    PendingPredecessorAuthorityFixture {
+        watcher,
+        db,
+        controller,
+        registry,
+        sender,
+        receiver,
+        _leader_lease: leader_lease,
+        current,
+        successor,
+    }
+}
+
+async fn assert_pending_predecessor_authority_is_repaired(recovering: bool) {
+    let mut fixture = pending_predecessor_authority_fixture(recovering).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let error = fixture
+        .db
+        .adopt_assignment_snapshot(fixture.successor.clone(), deadline)
+        .await
+        .expect_err("the successor must wait for staged predecessor state");
+    assert!(error.is_shuffle_not_ready(), "{error}");
+    assert!(fixture.watcher.durable_snapshot.is_none());
+
+    fixture
+        .watcher
+        .ensure_current_assignment_authority_cached(deadline)
+        .await
+        .expect("the exact predecessor must be recoverable from durable history");
+    assert_eq!(
+        fixture
+            .watcher
+            .durable_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.version),
+        Some(fixture.current.version)
+    );
+    assert_eq!(
+        fixture.registry.assignment_version(),
+        fixture.current.version
+    );
+
+    let authority_revision = fixture
+        .db
+        .assignment_authority_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+    fixture
+        .watcher
+        .publish_authority(authority_revision, deadline)
+        .await;
+
+    assert_eq!(fixture.sender.assignment_version(), fixture.current.version);
+    assert_eq!(
+        fixture.receiver.assignment_version(),
+        fixture.current.version
+    );
+    assert_eq!(
+        fixture
+            .controller
+            .checkpoint_assignment_fence(fixture.current.version)
+            .map(|fence| fence.assignment_version),
+        Some(fixture.current.version)
+    );
+    assert_eq!(fixture.db.cluster_intake_fenced(), recovering);
+    assert_eq!(fixture.db.rehydrated_vnode_state.lock().len(), 1);
+    assert!(fixture.registry.is_restoring(0));
+}
+
+#[tokio::test]
+async fn watcher_repairs_uncached_predecessor_authority_before_successor_adoption() {
+    assert_pending_predecessor_authority_is_repaired(false).await;
+}
+
+#[tokio::test]
+async fn recovering_watcher_repairs_uncached_predecessor_without_opening_intake() {
+    assert_pending_predecessor_authority_is_repaired(true).await;
+}
+
+#[tokio::test]
 async fn failure_recovery_retains_a_healthy_predecessor_with_no_rendezvous_share() {
     let healthy = CheckpointParticipant {
         node_id: 3,

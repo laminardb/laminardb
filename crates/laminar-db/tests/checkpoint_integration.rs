@@ -283,6 +283,10 @@ mod exactly_once {
             Ok(CycleOutcome::clean(FxHashMap::default()))
         }
 
+        async fn complete_pending_vnode_transition(&mut self) -> Result<bool, CycleError> {
+            Ok(false)
+        }
+
         async fn drain_checkpoint_edges_until(
             &mut self,
             _deadline: tokio::time::Instant,

@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU16;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use parking_lot::{RwLock, RwLockReadGuard};
@@ -197,13 +197,6 @@ pub enum VnodeLifecycleState {
 impl VnodeLifecycleState {
     const ACTIVE: u8 = 0;
     const RESTORING: u8 = 1;
-
-    const fn to_u8(self) -> u8 {
-        match self {
-            Self::Active => Self::ACTIVE,
-            Self::Restoring => Self::RESTORING,
-        }
-    }
 }
 
 enum SourceHandoffPublication {
@@ -343,6 +336,10 @@ pub struct VnodeRegistry {
     /// serialized — rebuilt (all `Active`) from the `AssignmentSnapshot`
     /// on boot, so adding it never touches a wire format.
     lifecycle: Arc<[AtomicU8]>,
+    /// Conservative O(1) gate for the hot path. A transition reserves the count before publishing
+    /// `Restoring` and removes it only after publishing `Active`, so concurrent readers can see a
+    /// temporary false positive but never a false zero.
+    restoring_count: AtomicU32,
 }
 
 impl std::fmt::Debug for VnodeRegistry {
@@ -352,6 +349,10 @@ impl std::fmt::Debug for VnodeRegistry {
             .field(
                 "assignment_version",
                 &self.assignment_version.load(Ordering::Relaxed),
+            )
+            .field(
+                "restoring_count",
+                &self.restoring_count.load(Ordering::Relaxed),
             )
             .finish_non_exhaustive()
     }
@@ -383,6 +384,7 @@ impl VnodeRegistry {
             }),
             assignment_version: AtomicU64::new(1),
             lifecycle: new_lifecycle(vnode_count),
+            restoring_count: AtomicU32::new(0),
         }
     }
 
@@ -430,6 +432,7 @@ impl VnodeRegistry {
             }),
             assignment_version: AtomicU64::new(1),
             lifecycle: new_lifecycle(vnode_count),
+            restoring_count: AtomicU32::new(0),
         }
     }
 
@@ -609,11 +612,54 @@ impl VnodeRegistry {
     }
 
     fn set_lifecycle(&self, vnodes: &[u32], state: VnodeLifecycleState) {
-        let byte = state.to_u8();
         for &v in vnodes {
             if let Some(slot) = self.lifecycle.get(v as usize) {
-                slot.store(byte, Ordering::Release);
+                match state {
+                    VnodeLifecycleState::Restoring => self.mark_one_restoring(slot),
+                    VnodeLifecycleState::Active => self.mark_one_active(slot),
+                }
             }
+        }
+    }
+
+    fn mark_one_restoring(&self, slot: &AtomicU8) {
+        loop {
+            if slot.load(Ordering::Acquire) == VnodeLifecycleState::RESTORING {
+                return;
+            }
+            self.restoring_count
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_add(1)
+                })
+                .expect("restoring reservations cannot exceed u32::MAX");
+            if slot
+                .compare_exchange(
+                    VnodeLifecycleState::ACTIVE,
+                    VnodeLifecycleState::RESTORING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return;
+            }
+            let reserved = self.restoring_count.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(reserved > 0, "restoring reservation underflow");
+        }
+    }
+
+    fn mark_one_active(&self, slot: &AtomicU8) {
+        if slot
+            .compare_exchange(
+                VnodeLifecycleState::RESTORING,
+                VnodeLifecycleState::ACTIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let restoring = self.restoring_count.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(restoring > 0, "restoring count underflow");
         }
     }
 
@@ -626,13 +672,13 @@ impl VnodeRegistry {
             .is_some_and(|s| s.load(Ordering::Acquire) == VnodeLifecycleState::RESTORING)
     }
 
-    /// Whether any vnode is currently restoring. Cheap pre-check the
-    /// emission gate uses to skip per-row work in the common case.
+    /// Whether any vnode is restoring or has reserved a transition to `Restoring`.
+    ///
+    /// This O(1) conservative pre-check can briefly return `true` before a concurrent per-vnode
+    /// publication, but never returns `false` for a published `Restoring` vnode.
     #[must_use]
     pub fn any_restoring(&self) -> bool {
-        self.lifecycle
-            .iter()
-            .any(|s| s.load(Ordering::Acquire) == VnodeLifecycleState::RESTORING)
+        self.restoring_count.load(Ordering::Acquire) != 0
     }
 
     /// Vnodes currently [`Restoring`](VnodeLifecycleState::Restoring), ascending.
@@ -1266,6 +1312,80 @@ mod tests {
 
         r.mark_active(&[3]);
         assert!(!r.any_restoring());
+    }
+
+    #[test]
+    fn lifecycle_updates_are_idempotent_for_duplicate_vnodes() {
+        let r = VnodeRegistry::new(2);
+        r.mark_restoring(&[1, 1, 1]);
+        assert_eq!(r.restoring_count.load(Ordering::Acquire), 1);
+        assert_eq!(r.restoring_vnodes(), vec![1]);
+
+        r.mark_active(&[1, 1, 1]);
+        assert_eq!(r.restoring_count.load(Ordering::Acquire), 0);
+        assert!(!r.any_restoring());
+    }
+
+    #[test]
+    fn concurrent_same_vnode_lifecycle_updates_keep_count_consistent() {
+        let registry = Arc::new(VnodeRegistry::new(1));
+        let restoring_workers: Vec<_> = (0..8)
+            .map(|_| {
+                let registry = Arc::clone(&registry);
+                std::thread::spawn(move || registry.mark_restoring(&[0]))
+            })
+            .collect();
+        for worker in restoring_workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(registry.restoring_count.load(Ordering::Acquire), 1);
+        assert!(registry.is_restoring(0));
+
+        let active_workers: Vec<_> = (0..8)
+            .map(|_| {
+                let registry = Arc::clone(&registry);
+                std::thread::spawn(move || registry.mark_active(&[0]))
+            })
+            .collect();
+        for worker in active_workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(registry.restoring_count.load(Ordering::Acquire), 0);
+        assert!(!registry.is_restoring(0));
+        assert!(!registry.any_restoring());
+    }
+
+    #[test]
+    fn opposing_concurrent_lifecycle_updates_keep_count_consistent() {
+        let registry = Arc::new(VnodeRegistry::new(4));
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|worker| {
+                let registry = Arc::clone(&registry);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    for round in 0..10_000 {
+                        let vnode = (round + worker) % 4;
+                        if (round + worker) % 2 == 0 {
+                            registry.mark_restoring(&[vnode]);
+                        } else {
+                            registry.mark_active(&[vnode]);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let restoring = registry.restoring_vnodes();
+        assert_eq!(
+            usize::try_from(registry.restoring_count.load(Ordering::Acquire)).unwrap(),
+            restoring.len()
+        );
+        assert_eq!(registry.any_restoring(), !restoring.is_empty());
     }
 
     #[test]

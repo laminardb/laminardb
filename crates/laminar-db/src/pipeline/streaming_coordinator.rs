@@ -4794,6 +4794,26 @@ impl StreamingCoordinator {
                     }
                     self.parked_source_msg = Some(message);
                 }
+                #[cfg(feature = "cluster")]
+                if let Err(error) =
+                    self.require_process_authority("fenced vnode transition completion")
+                {
+                    state.fault = Some(error.to_string());
+                    break;
+                }
+                match callback.complete_pending_vnode_transition().await {
+                    Ok(_) => {}
+                    Err(CycleError::Halt(reason)) => {
+                        tracing::warn!(%reason, "[LDB-3022] fenced vnode transition halted");
+                        break;
+                    }
+                    Err(CycleError::Recovery(reason) | CycleError::Fatal(reason)) => {
+                        state.fault = Some(format!(
+                            "fenced vnode transition completion failed: {reason}"
+                        ));
+                        break;
+                    }
+                }
                 continue;
             }
 

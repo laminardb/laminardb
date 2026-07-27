@@ -267,6 +267,8 @@ struct MockCallback {
     barrier_control_installed: Arc<AtomicBool>,
     intake_gate: Arc<AtomicBool>,
     intake_pause_call_audit: Arc<AtomicU64>,
+    pending_vnode_transition: bool,
+    vnode_transition_completions: Arc<AtomicU64>,
     #[cfg(feature = "cluster")]
     process_authority_fence:
         Arc<Mutex<Option<(ProcessAuthorityFencePoint, Arc<ClusterController>)>>>,
@@ -339,6 +341,8 @@ impl MockCallback {
             barrier_control_installed: Arc::new(AtomicBool::new(false)),
             intake_gate: Arc::new(AtomicBool::new(false)),
             intake_pause_call_audit: Arc::new(AtomicU64::new(0)),
+            pending_vnode_transition: false,
+            vnode_transition_completions: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "cluster")]
             process_authority_fence: Arc::new(Mutex::new(None)),
             control_checkpoint_outcome: None,
@@ -440,6 +444,16 @@ impl PipelineCallback for MockCallback {
             });
         self.results.push(results.clone());
         Ok(CycleOutcome::clean(results))
+    }
+
+    async fn complete_pending_vnode_transition(&mut self) -> Result<bool, CycleError> {
+        if !self.pending_vnode_transition {
+            return Ok(false);
+        }
+        self.pending_vnode_transition = false;
+        self.vnode_transition_completions
+            .fetch_add(1, Ordering::Release);
+        Ok(true)
     }
 
     async fn drain_checkpoint_edges_until(
@@ -1313,6 +1327,45 @@ async fn recovery_intake_gate_blocks_compute_and_discards_shutdown_open_epoch() 
         1,
         "a recovery-fenced shutdown must discard the open epoch"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_intake_gate_allows_control_only_vnode_transition_completion() {
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+    let coordinator = test_coordinator(
+        rx,
+        control_rx,
+        Arc::clone(&shutdown),
+        DeliveryGuarantee::AtLeastOnce,
+        None,
+    );
+    let mut callback = MockCallback::new();
+    callback.runtime.recovering = true;
+    callback.intake_gate.store(true, Ordering::Release);
+    callback.pending_vnode_transition = true;
+    let completions = Arc::clone(&callback.vnode_transition_completions);
+    let written_rows = Arc::clone(&callback.written_rows);
+
+    let run = tokio::spawn(async move { coordinator.run(callback).await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(IDLE_TIMEOUT).await;
+    for _ in 0..64 {
+        if completions.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        completions.load(Ordering::Acquire),
+        1,
+        "a fenced idle wake must complete assignment-scoped vnode work"
+    );
+    assert_eq!(written_rows.load(Ordering::Acquire), 0);
+    shutdown.notify_one();
+    assert!(matches!(run.await.unwrap(), ExitReason::Shutdown));
 }
 
 #[tokio::test]
@@ -8115,6 +8168,10 @@ impl PipelineCallback for BackpressuredCallback {
             .sum();
         self.events_per_cycle.lock().push(total);
         self.inner.execute_cycle(source_batches, watermark).await
+    }
+
+    async fn complete_pending_vnode_transition(&mut self) -> Result<bool, CycleError> {
+        self.inner.complete_pending_vnode_transition().await
     }
 
     async fn drain_checkpoint_edges_until(

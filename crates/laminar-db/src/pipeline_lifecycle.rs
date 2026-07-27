@@ -1146,6 +1146,121 @@ fn publish_runtime_fault_state(state: &std::sync::atomic::AtomicU8) -> bool {
 }
 
 impl LaminarDB {
+    #[cfg(feature = "cluster")]
+    fn reset_staged_vnode_transition_for_startup(&self) {
+        self.pending_revoke_vnodes.lock().clear();
+        self.rehydrated_vnode_state.lock().clear();
+        if let Some(registry) = self.vnode_registry.lock().as_ref() {
+            registry.mark_active(&registry.restoring_vnodes());
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn validate_boot_vnode_recovery_target(
+        &self,
+        recovered_attempt: laminar_core::state::CheckpointAttempt,
+        recovered_assignment_version: u64,
+    ) -> Result<Option<u64>, DbError> {
+        let registry = self
+            .vnode_registry
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                DbError::Checkpoint("[LDB-6031] cluster recovery has no vnode registry".into())
+            })?;
+        let assignment = registry.versioned_snapshot();
+        let Some(handoff_attempt) = assignment.source_handoff_attempt() else {
+            return Ok(None);
+        };
+        if handoff_attempt != recovered_attempt
+            || assignment.source_handoff_assignment_version() != Some(recovered_assignment_version)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6031] recovered vnode attempt {recovered_attempt:?} at assignment \
+                 {recovered_assignment_version} does not match installed source handoff \
+                 {handoff_attempt:?} at assignment {:?}",
+                assignment.source_handoff_assignment_version()
+            )));
+        }
+        Ok(assignment.source_handoff_installed_version())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn validate_fresh_cluster_vnode_start(&self) -> Result<(), DbError> {
+        let registry = self
+            .vnode_registry
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                DbError::Checkpoint("[LDB-6031] cluster recovery has no vnode registry".into())
+            })?;
+        if self.has_unapplied_vnode_transition(&registry)
+            || registry.versioned_snapshot().has_committed_handoff()
+        {
+            return Err(DbError::Checkpoint(
+                "[LDB-6031] cluster startup found committed or staged vnode state but no exact \
+                 recovered checkpoint; refusing a fresh graph"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn publish_boot_vnode_rehydration(
+        &self,
+        registry: &laminar_core::state::VnodeRegistry,
+        target_assignment: &laminar_core::state::VnodeAssignmentSnapshot,
+        owned: &[u32],
+        attempt: laminar_core::state::CheckpointAttempt,
+        report: crate::recovery_manager::VnodeRehydration,
+    ) -> Result<usize, DbError> {
+        // Pin the registry publication through staging. The startup assignment lock prevents a
+        // competing adopter from beginning, while this read guard also makes the helper itself
+        // reject a target that changed during the backend read.
+        let current_assignment = registry.read_assignment();
+        if current_assignment.version() != target_assignment.version()
+            || current_assignment.owners() != target_assignment.owners()
+        {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6031] boot vnode recovery target assignment {} changed to {} before \
+                 publication",
+                target_assignment.version(),
+                current_assignment.version()
+            )));
+        }
+        if report.attempt != Some(attempt) {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6031] boot vnode recovery report {:?} does not match recovered attempt \
+                 {attempt:?}",
+                report.attempt
+            )));
+        }
+        let mut restored_vnodes: Vec<u32> = report.restored.keys().copied().collect();
+        restored_vnodes.sort_unstable();
+        if restored_vnodes != owned {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6031] boot vnode recovery roster {restored_vnodes:?} does not match owned \
+                 roster {owned:?}"
+            )));
+        }
+
+        let mut staged = self.rehydrated_vnode_state.lock();
+        registry.mark_restoring(owned);
+        for (vnode, chain) in report.restored {
+            staged.insert(
+                vnode,
+                crate::db::RehydratedVnode {
+                    epoch: attempt.epoch,
+                    chain,
+                },
+            );
+        }
+        Ok(staged.len())
+    }
+
     /// Fence new work and wake the running pipeline without waiting for teardown.
     pub fn close(&self) {
         let runtime_shutdown = self.runtime_shutdown.write();
@@ -1172,14 +1287,16 @@ impl LaminarDB {
                 "[LDB-6031] cluster recovery has no live cluster controller".into(),
             ));
         };
-        let owned = match self.vnode_registry.lock().as_ref() {
-            Some(registry) => laminar_core::state::owned_vnodes(registry, self_id),
+        let registry = match self.vnode_registry.lock().as_ref() {
+            Some(registry) => Arc::clone(registry),
             None => {
                 return Err(DbError::Checkpoint(
                     "[LDB-6031] cluster recovery has no vnode registry".into(),
                 ));
             }
         };
+        let target_assignment = registry.versioned_snapshot();
+        let owned = laminar_core::state::owned_vnodes(&registry, self_id);
         tracing::info!(
             owned = owned.len(),
             epoch = attempt.epoch,
@@ -1199,21 +1316,18 @@ impl LaminarDB {
         let report = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
             .rehydrate_at(&owned, attempt)
             .await?;
-        let mut staged = self.rehydrated_vnode_state.lock();
-        for (vnode, chain) in report.restored {
-            staged.insert(
-                vnode,
-                crate::db::RehydratedVnode {
-                    epoch: attempt.epoch,
-                    chain,
-                },
-            );
-        }
+        let staged = self.publish_boot_vnode_rehydration(
+            &registry,
+            &target_assignment,
+            &owned,
+            attempt,
+            report,
+        )?;
         tracing::info!(
-            staged = staged.len(),
+            staged,
             epoch = attempt.epoch,
             checkpoint_id = attempt.checkpoint_id,
-            "cluster recovery: staged boot-owned vnodes for aggregate recovery"
+            "cluster recovery: staged boot-owned vnodes for operator recovery"
         );
         Ok(())
     }
@@ -3918,6 +4032,22 @@ impl LaminarDB {
                         // cut — the same epoch the source offsets resume from.
                         #[cfg(feature = "cluster")]
                         if runtime_mode == RuntimeMode::Cluster {
+                            let recovered_assignment_version = recovered_assignment
+                                .ok_or_else(|| {
+                                    DbError::Checkpoint(
+                                        "[LDB-6031] cluster checkpoint has no assignment version"
+                                            .into(),
+                                    )
+                                })?
+                                .get();
+                            startup_reconciled_source_handoff_version = self
+                                .validate_boot_vnode_recovery_target(
+                                    recovered_attempt,
+                                    recovered_assignment_version,
+                                )?;
+                            // The exact recovered cut now supersedes any stopped generation's
+                            // process-local staging. Replace it before publishing fresh chains.
+                            self.reset_staged_vnode_transition_for_startup();
                             self.stage_owned_vnodes_from_chains(recovered_attempt)
                                 .await?;
                         }
@@ -3935,6 +4065,10 @@ impl LaminarDB {
                         );
                     }
                     Ok(None) => {
+                        #[cfg(feature = "cluster")]
+                        if runtime_mode == RuntimeMode::Cluster {
+                            self.validate_fresh_cluster_vnode_start()?;
+                        }
                         source_watermark_recovery_selected = true;
                         tracing::info!("No checkpoint found, starting fresh");
                     }
@@ -3942,16 +4076,12 @@ impl LaminarDB {
                         return Err(e);
                     }
                 }
-                #[cfg(feature = "cluster")]
-                if source_watermark_recovery_selected {
-                    startup_reconciled_source_handoff_version =
-                        self.vnode_registry.lock().as_ref().and_then(|registry| {
-                            registry
-                                .versioned_snapshot()
-                                .source_handoff_installed_version()
-                        });
-                }
             }
+        }
+
+        #[cfg(feature = "cluster")]
+        if runtime_mode == RuntimeMode::Cluster && self.coordinator.lock().await.is_none() {
+            self.validate_fresh_cluster_vnode_start()?;
         }
 
         Ok(PipelineRecoveryState {
@@ -4870,12 +5000,17 @@ impl LaminarDB {
         let runtime_mode = self.runtime_mode();
 
         #[cfg(feature = "cluster")]
+        let startup_assignment_guard = if runtime_mode == RuntimeMode::Cluster {
+            Some(self.assignment_adoption_lock.lock().await)
+        } else {
+            None
+        };
+
+        #[cfg(feature = "cluster")]
         let startup_generation_fence = if runtime_mode == RuntimeMode::Cluster {
             let generation_fence = Arc::clone(&self.rotation_execution_fence)
                 .write_owned()
                 .await;
-            self.rehydrated_vnode_state.lock().clear();
-            self.pending_revoke_vnodes.lock().clear();
             Some(generation_fence)
         } else {
             None
@@ -5040,6 +5175,11 @@ impl LaminarDB {
             startup_generation_fence,
         )
         .await?;
+
+        // Readiness has transferred the exact captured assignment and its staged state to the
+        // live graph. A watcher may now prepare a successor generation.
+        #[cfg(feature = "cluster")]
+        drop(startup_assignment_guard);
 
         self.start_coordinated_committer(coordinated_committer, committer_poll, committer_notify)
             .await
@@ -5369,6 +5509,9 @@ mod mv_recovery_lifecycle_tests;
 
 #[cfg(all(test, feature = "cluster"))]
 mod cluster_fault_watcher_tests;
+
+#[cfg(all(test, feature = "cluster"))]
+mod boot_vnode_recovery_tests;
 
 #[cfg(test)]
 mod reference_table_recovery_tests;

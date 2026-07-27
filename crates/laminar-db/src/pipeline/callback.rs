@@ -453,6 +453,13 @@ pub trait PipelineCallback: Send + 'static {
         watermark: i64,
     ) -> Result<CycleOutcome, CycleError>;
 
+    /// Complete assignment-scoped vnode lifecycle work without admitting source input.
+    ///
+    /// Recovery can close intake before a predecessor transition has run. Implementations return
+    /// `true` only when pending work completed; `false` means idle or waiting for its exact
+    /// assignment certificate.
+    async fn complete_pending_vnode_transition(&mut self) -> Result<bool, CycleError>;
+
     /// Drain every graph input that belongs to the frozen checkpoint cut.
     ///
     /// Implementations must deliver each drain pass's outputs before returning. The returned

@@ -4688,6 +4688,24 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         })
     }
 
+    async fn complete_pending_vnode_transition(
+        &mut self,
+    ) -> Result<bool, crate::pipeline::CycleError> {
+        #[cfg(feature = "cluster")]
+        {
+            match self.graph.complete_pending_vnode_transition().await {
+                Ok(completed) => Ok(completed),
+                Err(error) if error.is_shuffle_not_ready() => Ok(false),
+                Err(error) => Err(Self::map_graph_error(&error, &self.shutdown_signal)),
+            }
+        }
+
+        #[cfg(not(feature = "cluster"))]
+        {
+            Ok(false)
+        }
+    }
+
     async fn drain_checkpoint_edges_until(
         &mut self,
         deadline: tokio::time::Instant,

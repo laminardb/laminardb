@@ -108,11 +108,13 @@ pub(crate) trait GraphOperator: Send {
     #[cfg(feature = "cluster")]
     fn apply_vnode_chain(
         &mut self,
-        _vnode: u32,
+        vnode: u32,
         _base: &[u8],
         _deltas: &[&[u8]],
     ) -> Result<(), DbError> {
-        Ok(())
+        Err(DbError::Checkpoint(format!(
+            "operator does not accept vnode checkpoint state for vnode {vnode}"
+        )))
     }
 
     /// Drop in-memory state for vnodes this node lost on a rebalance, before a later authoritative
@@ -145,8 +147,9 @@ enum GraphExecutionMode {
 }
 
 const GRAPH_EXECUTION_POISON_REASON: &str =
-    "operator graph execution was cancelled or panicked after potentially mutating state; recovery \
-     from the last committed checkpoint is required";
+    "operator graph execution was cancelled or panicked after potentially mutating state, or a \
+     vnode lifecycle callback returned an indeterminate outcome; recovery from the last committed \
+     checkpoint is required";
 
 /// A graph cycle may hold operator mutation and graph-owned input in different futures. Only an
 /// explicit `Result` proves that the cycle reached its classification/cleanup boundary; unwind or
@@ -229,6 +232,104 @@ impl GraphNode {
             "replaced physical operator capability inventory"
         );
         self.operator = operator;
+    }
+}
+
+#[cfg(feature = "cluster")]
+struct VnodeTransitionFence {
+    registry: Arc<laminar_core::state::VnodeRegistry>,
+    self_id: laminar_core::state::NodeId,
+    assignment: laminar_core::state::VnodeAssignmentSnapshot,
+    sender: Arc<laminar_core::shuffle::ShuffleSender>,
+    receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
+    transport_digest: [u8; 32],
+}
+
+#[cfg(feature = "cluster")]
+impl VnodeTransitionFence {
+    fn capture(config: &crate::operator::sql_query::ClusterShuffleConfig) -> Result<Self, DbError> {
+        let assignment = config.registry.versioned_snapshot();
+        if config.sender.assignment_version() != assignment.version()
+            || config.receiver.assignment_version() != assignment.version()
+        {
+            return Err(DbError::ShuffleNotReady(format!(
+                "[LDB-6051] vnode transition transport does not match assignment {}",
+                assignment.version()
+            )));
+        }
+        let transport_digest = match (
+            config.sender.active_assignment_digest(),
+            config.receiver.active_assignment_digest(),
+        ) {
+            (Some(sender), Some(receiver)) if sender == receiver => sender,
+            _ => {
+                return Err(DbError::ShuffleNotReady(
+                    "[LDB-6051] vnode transition requires matching active sender and receiver \
+                     assignment certificates"
+                        .into(),
+                ));
+            }
+        };
+        Ok(Self {
+            registry: Arc::clone(&config.registry),
+            self_id: config.self_id,
+            assignment,
+            sender: Arc::clone(&config.sender),
+            receiver: Arc::clone(&config.receiver),
+            transport_digest,
+        })
+    }
+
+    fn owns(&self, vnode: u32) -> bool {
+        self.assignment.owners().get(vnode as usize).copied() == Some(self.self_id)
+    }
+
+    fn contains_vnode(&self, vnode: u32) -> bool {
+        self.assignment.owners().get(vnode as usize).is_some()
+    }
+
+    fn restoring_vnodes_by_ownership(&self) -> (Vec<u32>, Vec<u32>) {
+        self.registry
+            .restoring_vnodes()
+            .into_iter()
+            .partition(|vnode| self.owns(*vnode))
+    }
+
+    fn revalidate_after_callbacks(&self, expected_vnodes: &[u32]) -> Result<(), DbError> {
+        if self.sender.assignment_version() != self.assignment.version()
+            || self.receiver.assignment_version() != self.assignment.version()
+            || self.sender.active_assignment_digest() != Some(self.transport_digest)
+            || self.receiver.active_assignment_digest() != Some(self.transport_digest)
+        {
+            return Err(DbError::StatefulOperatorPartialApply(
+                "[LDB-6051] shuffle assignment certificate changed after vnode lifecycle \
+                 callbacks; recovery is required"
+                    .into(),
+            ));
+        }
+        let current = self.registry.versioned_snapshot();
+        if current.version() != self.assignment.version()
+            || current.owners() != self.assignment.owners()
+        {
+            return Err(DbError::StatefulOperatorPartialApply(format!(
+                "[LDB-6051] vnode assignment changed from {} after lifecycle callbacks; recovery \
+                 is required",
+                self.assignment.version()
+            )));
+        }
+        let current_expected: Vec<u32> = self
+            .registry
+            .restoring_vnodes()
+            .into_iter()
+            .filter(|vnode| self.owns(*vnode))
+            .collect();
+        if current_expected != expected_vnodes {
+            return Err(DbError::StatefulOperatorPartialApply(format!(
+                "[LDB-6051] owned/restoring vnode roster changed from {expected_vnodes:?} to \
+                 {current_expected:?} after lifecycle callbacks; recovery is required"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -831,7 +932,7 @@ impl OperatorGraph {
         self.last_execution_assignment_version
     }
 
-    /// Share the staged per-vnode rehydration map; drained at the top of each cycle.
+    /// Share the staged per-vnode rehydration map; consumed after a complete successful batch.
     #[cfg(feature = "cluster")]
     #[allow(clippy::disallowed_types)] // shares the DB's std-HashMap-typed handle
     pub fn set_rehydration_handle(
@@ -841,7 +942,7 @@ impl OperatorGraph {
         self.rehydrated_vnode_state = Some(staged);
     }
 
-    /// Share the staged revoked-vnode set; drained at the top of each cycle to drop lost state.
+    /// Share the staged revoked-vnode set; consumed after a complete successful batch.
     #[cfg(feature = "cluster")]
     pub fn set_revoke_handle(&mut self, staged: Arc<parking_lot::Mutex<FxHashSet<u32>>>) {
         self.pending_revoke_vnodes = Some(staged);
@@ -875,68 +976,156 @@ impl OperatorGraph {
             })
     }
 
-    /// Drop in-memory state for vnodes lost since the last cycle, before `apply_rehydrated_vnodes`
-    /// merges any re-acquired ones — so a lose-then-reacquire merges into empty state. Disjoint from
-    /// the rehydrated set per rotation; the ordering is defensive against rapid cross-rotation churn.
+    /// Apply one caller-staged revoke/rehydration batch at the top of a graph cycle.
+    ///
+    /// Structural validation covers the exact owned/restoring vnode roster and every operator
+    /// chain before any callback. Existing callbacks still combine preparation with mutation, so a
+    /// callback error has an indeterminate live outcome: the whole graph generation is poisoned,
+    /// all owned current-target staging is retained, and no vnode is activated. Fresh graph
+    /// recovery must retry the complete batch. Successful callbacks finish before the
+    /// acquired-vnode activation phase begins and staging is removed. Per-vnode lifecycle stores
+    /// are not an atomic batch.
     #[cfg(feature = "cluster")]
-    fn apply_revoked_vnodes(&mut self) -> Result<(), DbError> {
-        let Some(handle) = self.pending_revoke_vnodes.as_ref().map(Arc::clone) else {
-            return Ok(());
-        };
-        let revoked: FxHashSet<u32> = {
-            let guard = handle.lock();
-            if guard.is_empty() {
-                return Ok(());
-            }
-            guard.clone()
-        };
-        for node in &mut self.nodes {
-            if node.removed {
-                continue;
-            }
-            node.operator.drop_owned_vnodes(&revoked).map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "[LDB-6051] failed to revoke vnode state for operator '{}': {error}",
-                    node.name
-                ))
-            })?;
+    fn apply_staged_vnode_transition(&mut self) -> Result<(), DbError> {
+        struct DecodedVnode {
+            vnode: u32,
+            epoch: u64,
+            chain: Vec<crate::vnode_partial::VnodePartial>,
+            operators: Vec<(usize, String)>,
         }
-        handle.lock().retain(|vnode| !revoked.contains(vnode));
-        Ok(())
-    }
 
-    #[cfg(feature = "cluster")]
-    fn apply_rehydrated_vnodes(&mut self) -> Result<(), DbError> {
-        // Clone owned handles out so no borrow of `self` survives into the
-        // `self.nodes.iter_mut()` dispatch below.
-        let (registry, self_id, staged_arc) = match (
-            self.cluster_shuffle.as_ref(),
-            self.rehydrated_vnode_state.as_ref(),
-        ) {
-            (Some(cfg), Some(staged)) => {
-                (Arc::clone(&cfg.registry), cfg.self_id, Arc::clone(staged))
-            }
-            _ => return Ok(()),
-        };
+        struct ResolvedOperator<'a> {
+            node_idx: usize,
+            name: &'a str,
+            base: &'a [u8],
+            deltas: Vec<&'a [u8]>,
+        }
 
-        // Ownership may have changed again since staging; evict chains for vnodes we no longer own
-        // so an acquire→lose race cannot resurrect stale state, then drain the currently owned set.
-        let drained: Vec<(u32, crate::db::RehydratedVnode)> = {
-            let mut guard = staged_arc.lock();
-            if guard.is_empty() {
-                return Ok(());
+        struct ResolvedVnode<'a> {
+            vnode: u32,
+            epoch: u64,
+            links: usize,
+            operators: Vec<ResolvedOperator<'a>>,
+        }
+
+        fn callback_error(poisoned: &AtomicBool, phase: &str, error: DbError) -> DbError {
+            poisoned.store(true, Ordering::Release);
+            match error {
+                DbError::BackpressureFail(reason) => DbError::BackpressureFail(format!(
+                    "[LDB-6051] vnode transition {phase} failed terminally: {reason}"
+                )),
+                DbError::ShuffleTerminal(reason) => DbError::ShuffleTerminal(format!(
+                    "[LDB-6051] vnode transition {phase} failed terminally: {reason}"
+                )),
+                error => DbError::StatefulOperatorPartialApply(format!(
+                    "[LDB-6051] vnode transition {phase} returned an indeterminate outcome: \
+                     {error}"
+                )),
             }
-            let owned: FxHashSet<u32> = laminar_core::state::owned_vnodes(&registry, self_id)
-                .into_iter()
+        }
+
+        if !self.has_pending_vnode_transition()
+            && self
+                .cluster_shuffle
+                .as_ref()
+                .is_none_or(|config| !config.registry.any_restoring())
+        {
+            return Ok(());
+        }
+
+        let revoke_handle = self.pending_revoke_vnodes.as_ref().map(Arc::clone);
+        let staged_handle = self.rehydrated_vnode_state.as_ref().map(Arc::clone);
+
+        let revoked = revoke_handle
+            .as_ref()
+            .map_or_else(FxHashSet::default, |handle| handle.lock().clone());
+        let transition_fence = self
+            .cluster_shuffle
+            .as_ref()
+            .map(VnodeTransitionFence::capture)
+            .transpose()?;
+
+        // Discard only chains that are definitively outside the pinned owner map. Owned chains stay
+        // staged until the complete callback batch and activation succeed.
+        let mut staged: Vec<(u32, crate::db::RehydratedVnode)> =
+            if let Some(handle) = &staged_handle {
+                let mut guard = handle.lock();
+                if let Some(fence) = &transition_fence {
+                    guard.retain(|vnode, _| fence.owns(*vnode));
+                }
+                guard
+                    .iter()
+                    .map(|(vnode, state)| (*vnode, state.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        staged.sort_unstable_by_key(|(vnode, _)| *vnode);
+
+        if transition_fence.is_none() && (!staged.is_empty() || !revoked.is_empty()) {
+            return Err(DbError::Checkpoint(
+                "[LDB-6051] staged vnode transition has no cluster ownership scope".into(),
+            ));
+        }
+
+        if let Some(fence) = &transition_fence {
+            let mut invalid_revokes: Vec<u32> = revoked
+                .iter()
+                .copied()
+                .filter(|vnode| !fence.contains_vnode(*vnode))
                 .collect();
-            guard.retain(|v, _| owned.contains(v));
-            guard.drain().collect()
-        };
-        if drained.is_empty() {
+            invalid_revokes.sort_unstable();
+            if !invalid_revokes.is_empty() {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6051] revoked vnode ids {invalid_revokes:?} are outside the pinned \
+                     assignment cardinality"
+                )));
+            }
+        }
+
+        let (expected_vnodes, unowned_restoring_vnodes) = transition_fence.as_ref().map_or_else(
+            || (Vec::new(), Vec::new()),
+            |fence| fence.restoring_vnodes_by_ownership(),
+        );
+        // Ownership is the serving authority. A stale lifecycle bit on an unowned vnode cannot
+        // authorize output, but clearing it prevents a discarded acquire from pinning the common
+        // path in its conservative restoring slow path forever.
+        if let Some(fence) = &transition_fence {
+            fence.registry.mark_active(&unowned_restoring_vnodes);
+        }
+        let staged_vnodes: Vec<u32> = staged.iter().map(|(vnode, _)| *vnode).collect();
+        if staged_vnodes != expected_vnodes {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6051] staged vnode roster {staged_vnodes:?} does not match the exact \
+                 owned/restoring roster {expected_vnodes:?}"
+            )));
+        }
+        if let Some(fence) = &transition_fence {
+            let mut owned_revokes_without_restore: Vec<u32> = revoked
+                .iter()
+                .copied()
+                .filter(|vnode| fence.owns(*vnode) && staged_vnodes.binary_search(vnode).is_err())
+                .collect();
+            owned_revokes_without_restore.sort_unstable();
+            if !owned_revokes_without_restore.is_empty() {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6051] currently owned revoked vnodes {owned_revokes_without_restore:?} \
+                     have no matching restoring state"
+                )));
+            }
+        }
+        if revoked.is_empty() && staged.is_empty() {
             return Ok(());
         }
 
-        for (vnode, rehydrated) in drained {
+        // Decode, resolve and bind every participant before the first revoke or restore callback.
+        let mut decoded = Vec::with_capacity(staged.len());
+        for (vnode, rehydrated) in &staged {
+            if rehydrated.chain.is_empty() {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6051] vnode {vnode} rehydration chain has no links"
+                )));
+            }
             let chain: Vec<crate::vnode_partial::VnodePartial> = rehydrated
                 .chain
                 .iter()
@@ -950,68 +1139,152 @@ impl OperatorGraph {
                     })
                 })
                 .collect::<Result<_, _>>()?;
-            // Every operator present anywhere in the chain (full or delta), resolved independently.
-            let mut op_names: Vec<String> = Vec::new();
-            for p in &chain {
-                for (n, _) in &p.operators {
-                    if !op_names.iter().any(|o| o == n) {
-                        op_names.push(n.clone());
+            let mut names = std::collections::BTreeSet::new();
+            for (link, partial) in chain.iter().enumerate() {
+                let mut link_names = std::collections::BTreeSet::new();
+                for name in partial
+                    .operators
+                    .iter()
+                    .map(|(name, _)| name)
+                    .chain(partial.deltas.iter().map(|(name, _)| name))
+                {
+                    if name.is_empty() {
+                        return Err(DbError::Checkpoint(format!(
+                            "[LDB-6051] vnode {vnode} rehydration chain link {link} has an empty \
+                             operator name"
+                        )));
                     }
-                }
-                for (n, _) in &p.deltas {
-                    if !op_names.iter().any(|o| o == n) {
-                        op_names.push(n.clone());
+                    if !link_names.insert(name.as_str()) {
+                        return Err(DbError::Checkpoint(format!(
+                            "[LDB-6051] vnode {vnode} rehydration chain link {link} repeats \
+                             operator '{name}'"
+                        )));
                     }
+                    names.insert(name.clone());
                 }
             }
 
-            // Resolve and validate every required slice before mutating any operator. A missing
-            // FULL base or topology drift must fault the cycle; consuming the staged chain and
-            // starting fresh would silently lose committed state.
-            let mut resolved = Vec::with_capacity(op_names.len());
-            for op_name in &op_names {
-                let (base, deltas) = crate::recovery_manager::resolve_op_chain(&chain, op_name)
-                    .ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "[LDB-6051] vnode {vnode} rehydration chain has no FULL base for \
-                             operator '{op_name}'"
-                        ))
-                    })?;
+            let mut operators = Vec::with_capacity(names.len());
+            for name in names {
                 let node_idx = self
                     .nodes
                     .iter()
-                    .position(|node| !node.removed && &*node.name == op_name.as_str())
+                    .position(|node| !node.removed && &*node.name == name.as_str())
                     .ok_or_else(|| {
                         DbError::Checkpoint(format!(
                             "[LDB-6051] vnode {vnode} rehydration requires missing operator \
-                             '{op_name}' (topology drift)"
+                             '{name}' (topology drift)"
                         ))
                     })?;
-                resolved.push((node_idx, op_name, base, deltas));
+                operators.push((node_idx, name));
             }
+            decoded.push(DecodedVnode {
+                vnode: *vnode,
+                epoch: rehydrated.epoch,
+                chain,
+                operators,
+            });
+        }
 
-            let operator_count = resolved.len();
-            for (node_idx, op_name, base, deltas) in resolved {
-                self.nodes[node_idx]
-                    .operator
-                    .apply_vnode_chain(vnode, base, &deltas)
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "[LDB-6051] failed to apply vnode {vnode} rehydration chain for \
-                             operator '{op_name}': {error}"
-                        ))
-                    })?;
+        let resolved: Vec<ResolvedVnode<'_>> = decoded
+            .iter()
+            .map(|vnode| {
+                let operators = vnode
+                    .operators
+                    .iter()
+                    .map(|(node_idx, name)| {
+                        let (base, deltas) =
+                            crate::recovery_manager::resolve_op_chain(&vnode.chain, name)
+                                .ok_or_else(|| {
+                                    DbError::Checkpoint(format!(
+                                "[LDB-6051] vnode {} rehydration chain has no FULL base for \
+                                 operator '{name}'",
+                                vnode.vnode
+                            ))
+                                })?;
+                        Ok(ResolvedOperator {
+                            node_idx: *node_idx,
+                            name,
+                            base,
+                            deltas,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, DbError>>()?;
+                Ok(ResolvedVnode {
+                    vnode: vnode.vnode,
+                    epoch: vnode.epoch,
+                    links: vnode.chain.len(),
+                    operators,
+                })
+            })
+            .collect::<Result<_, DbError>>()?;
+
+        if !revoked.is_empty() {
+            let mut node_indices: Vec<usize> = self
+                .nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| (!node.removed).then_some(index))
+                .collect();
+            node_indices.sort_unstable_by(|left, right| {
+                self.nodes[*left]
+                    .name
+                    .cmp(&self.nodes[*right].name)
+                    .then_with(|| left.cmp(right))
+            });
+            for node_idx in node_indices {
+                let node = &mut self.nodes[node_idx];
+                if let Err(error) = node.operator.drop_owned_vnodes(&revoked) {
+                    let phase = format!("revoke callback for operator '{}'", node.name);
+                    return Err(callback_error(&self.execution_poisoned, &phase, error));
+                }
             }
+        }
+
+        for vnode in &resolved {
+            for operator in &vnode.operators {
+                if let Err(error) = self.nodes[operator.node_idx].operator.apply_vnode_chain(
+                    vnode.vnode,
+                    operator.base,
+                    &operator.deltas,
+                ) {
+                    let phase = format!(
+                        "restore callback for vnode {} operator '{}'",
+                        vnode.vnode, operator.name
+                    );
+                    return Err(callback_error(&self.execution_poisoned, &phase, error));
+                }
+            }
+        }
+
+        // The normal rotation read fence prevents this change. Revalidation also fails closed for
+        // direct/test callers that omit that fence and for a callback that mutates cluster scope.
+        if let Some(fence) = &transition_fence {
+            if let Err(error) = fence.revalidate_after_callbacks(&expected_vnodes) {
+                self.execution_poisoned.store(true, Ordering::Release);
+                return Err(error);
+            }
+            // Activation starts only after every callback and revalidation succeeds. Individual
+            // lifecycle slots are sequential atomics, not one atomic batch publication.
+            fence.registry.mark_active(&expected_vnodes);
+        }
+
+        let applied: FxHashSet<u32> = staged_vnodes.iter().copied().collect();
+        if let Some(handle) = &revoke_handle {
+            handle.lock().retain(|vnode| !revoked.contains(vnode));
+        }
+        if let Some(handle) = &staged_handle {
+            handle.lock().retain(|vnode, _| !applied.contains(vnode));
+        }
+
+        for vnode in resolved {
             tracing::info!(
-                vnode,
-                epoch = rehydrated.epoch,
-                operators = operator_count,
-                links = chain.len(),
-                "applied rehydrated vnode chain"
+                vnode = vnode.vnode,
+                epoch = vnode.epoch,
+                operators = vnode.operators.len(),
+                links = vnode.links,
+                "completed vnode recovery-chain callbacks"
             );
-            // This is the only Restoring→Active transition: every named operator slice above
-            // resolved to a FULL base and applied successfully.
-            registry.mark_active(&[vnode]);
         }
         Ok(())
     }
@@ -2356,6 +2629,53 @@ impl OperatorGraph {
         .await
     }
 
+    /// Complete only staged vnode revoke/restore work, without stepping operators on source or
+    /// buffered graph input. This lets a fenced recovery drain the predecessor transition before
+    /// adopting a newer assignment without reopening source intake.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn complete_pending_vnode_transition(&mut self) -> Result<bool, DbError> {
+        let pending = self.has_pending_vnode_transition()
+            || self
+                .cluster_shuffle
+                .as_ref()
+                .is_some_and(|config| config.registry.any_restoring());
+        if !pending {
+            return Ok(false);
+        }
+        self.ensure_execution_not_poisoned()?;
+        let _rotation_guard = match self.rotation_execution_fence.as_ref() {
+            Some(fence) => Some(Arc::clone(fence).read_owned().await),
+            None => None,
+        };
+
+        // Waiting for assignment publication has not touched operator state. Cancellation after
+        // this point is indeterminate for the same reason as a normal graph cycle.
+        let mut attempt = GraphExecutionAttemptGuard::new(Arc::clone(&self.execution_poisoned));
+        self.whole_restore_open = false;
+        self.last_execution_assignment_version = None;
+        let result = (|| {
+            let execution_assignment_version = if let Some(config) = &self.cluster_shuffle {
+                let version = config.registry.versioned_snapshot().version();
+                if config.sender.assignment_version() != version
+                    || config.receiver.assignment_version() != version
+                {
+                    return Err(DbError::ShuffleNotReady(format!(
+                        "shuffle transport assignment does not match execution assignment \
+                         {version}"
+                    )));
+                }
+                Some(version)
+            } else {
+                None
+            };
+            self.apply_staged_vnode_transition()?;
+            self.last_execution_assignment_version = execution_assignment_version;
+            Ok(true)
+        })();
+        attempt.complete();
+        result
+    }
+
     /// Execute one aligned-checkpoint drain pass. This shares the normal cycle path but does not
     /// defer operators because the interactive query budget elapsed; backpressure gates and all
     /// operator error, watermark, state-limit, and routing behavior remain unchanged.
@@ -2423,8 +2743,7 @@ impl OperatorGraph {
             } else {
                 None
             };
-            self.apply_revoked_vnodes()?;
-            self.apply_rehydrated_vnodes()?;
+            self.apply_staged_vnode_transition()?;
             self.last_execution_assignment_version = execution_assignment_version;
         }
 

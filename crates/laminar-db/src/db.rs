@@ -914,6 +914,18 @@ impl LaminarDB {
         self.pending_revoke_vnodes.lock().len()
     }
 
+    /// Whether operator execution has not yet completed the prior assignment's vnode lifecycle
+    /// work. Lock order matches assignment publication and graph checkpoint inspection.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn has_unapplied_vnode_transition(
+        &self,
+        registry: &laminar_core::state::VnodeRegistry,
+    ) -> bool {
+        let revoked = self.pending_revoke_vnodes.lock();
+        let rehydrated = self.rehydrated_vnode_state.lock();
+        !revoked.is_empty() || !rehydrated.is_empty() || registry.any_restoring()
+    }
+
     /// Create an embedded in-memory database with default settings.
     ///
     /// # Errors
@@ -2160,6 +2172,18 @@ impl LaminarDB {
                 ..SnapshotAdoption::default()
             });
         }
+        // Staging does not carry a successor assignment certificate. Do not let a later owner map
+        // reinterpret bytes prepared for the prior target; graph execution must first consume or
+        // fail-stop that complete transition while its original authority remains active.
+        if self.has_unapplied_vnode_transition(&registry) {
+            return Err(DbError::ShuffleNotReady(format!(
+                "[LDB-6053] assignment {} cannot overtake an unapplied vnode transition for \
+                 assignment {}; retry after graph execution completes it or an explicitly fenced \
+                 replacement graph restores the committed cut",
+                snapshot.version,
+                registry.assignment_version()
+            )));
+        }
         // The target is now durable-authority-audited and still newer. Close every predecessor
         // admission path before reading its process roster, source handoff, or vnode state. Scope
         // cancellation releases compute cycles blocked in shuffle so the final write fence can
@@ -2464,6 +2488,12 @@ impl LaminarDB {
         let mut staged_rehydration = self.rehydrated_vnode_state.lock();
         pending_revoke.extend(revoked);
         staged_rehydration.retain(|vnode, _| new_set.contains(vnode));
+        let unowned_restoring: Vec<u32> = registry
+            .restoring_vnodes()
+            .into_iter()
+            .filter(|vnode| !new_set.contains(vnode))
+            .collect();
+        registry.mark_active(&unowned_restoring);
         if let Some(attempt) = rehydration_attempt {
             for vnode in &newly_acquired {
                 staged_rehydration.insert(

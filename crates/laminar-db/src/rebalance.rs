@@ -152,8 +152,17 @@ async fn suspend_local_assignment_authority(
     let _adoption = tokio::time::timeout_at(deadline, db.assignment_adoption_lock.lock())
         .await
         .map_err(|_| "timed out serializing assignment authority suspension".to_string())?;
-    // A watcher that already owned the adoption lock could have republished and resumed after
-    // the first cancellation. Reassert the full suspension while serialized, before draining it.
+    suspend_local_assignment_authority_locked(db, controller, deadline).await
+}
+
+/// Suspend authority after the caller has serialized assignment adoption.
+async fn suspend_local_assignment_authority_locked(
+    db: &Arc<LaminarDB>,
+    controller: Option<&ClusterController>,
+    deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    // A watcher that owned the adoption lock before the first cancellation could have republished
+    // and resumed. Reassert the full suspension while serialized, before draining execution.
     db.set_source_gate(true);
     if let Some(controller) = controller {
         controller.publish_checkpoint_assignment_fence(None);
@@ -167,6 +176,25 @@ async fn suspend_local_assignment_authority(
     .await
     .map_err(|_| "timed out draining assignment execution after suspension".to_string())?;
     Ok(())
+}
+
+/// Recovery heads must not suspend the predecessor graph while that graph still owns an
+/// unapplied vnode transition. Holding the adoption lock makes the preflight stable against both
+/// assignment adoption and startup staging; the graph may only finish (not create) that work.
+async fn suspend_recovery_assignment_after_vnode_transition(
+    db: &Arc<LaminarDB>,
+    controller: &ClusterController,
+    registry: &VnodeRegistry,
+    deadline: tokio::time::Instant,
+) -> Result<bool, String> {
+    let _adoption = tokio::time::timeout_at(deadline, db.assignment_adoption_lock.lock())
+        .await
+        .map_err(|_| "timed out serializing recovery assignment suspension".to_string())?;
+    if db.has_unapplied_vnode_transition(registry) {
+        return Ok(false);
+    }
+    suspend_local_assignment_authority_locked(db, Some(controller), deadline).await?;
+    Ok(true)
 }
 
 async fn hold_terminal_source_resolution(
@@ -254,6 +282,52 @@ impl SnapshotWatcher {
             installed_authority_revision: 0,
             assignment_authority_dirty: false,
         }
+    }
+
+    async fn ensure_current_assignment_authority_cached(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        let assignment = self.registry.versioned_snapshot();
+        let version = assignment.version();
+        let cache_is_exact = self.durable_snapshot.as_ref().is_some_and(|snapshot| {
+            !snapshot.draining
+                && snapshot.version == version
+                && snapshot.has_canonical_participants()
+                && snapshot
+                    .to_vnode_vec(self.registry.vnode_count())
+                    .is_ok_and(|owners| owners.as_slice() == assignment.owners())
+        });
+        if cache_is_exact {
+            return Ok(());
+        }
+
+        let snapshot = tokio::time::timeout_at(deadline, self.store.load_version(version))
+            .await
+            .map_err(|_| format!("assignment {version} history read timed out"))?
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("assignment {version} is absent from durable history"))?;
+        if snapshot.draining
+            || !snapshot.has_canonical_participants()
+            || snapshot
+                .to_vnode_vec(self.registry.vnode_count())
+                .map_err(|error| error.to_string())?
+                .as_slice()
+                != assignment.owners()
+        {
+            return Err(format!(
+                "assignment {version} durable history does not match the current registry"
+            ));
+        }
+        tokio::time::timeout_at(
+            deadline,
+            audit_assignment_snapshot_authority(&self.store, self.controller.as_deref(), &snapshot),
+        )
+        .await
+        .map_err(|_| format!("assignment {version} authority audit timed out"))??;
+        self.durable_drain_transition = None;
+        self.durable_snapshot = Some(snapshot);
+        Ok(())
     }
 
     async fn publish_authority(
@@ -784,16 +858,39 @@ impl SnapshotWatcher {
                             );
                             continue;
                         };
-                        if let Err(error) = suspend_local_assignment_authority(
+                        match suspend_recovery_assignment_after_vnode_transition(
                             &self.db,
-                            Some(controller),
+                            controller,
+                            &self.registry,
                             head_deadline,
                         )
                         .await
                         {
-                            self.assignment_authority_dirty = true;
-                            warn!(%error, version = snap.version, "snapshot watcher: could not suspend recovery assignment");
-                            continue;
+                            Ok(true) => {}
+                            Ok(false) => {
+                                debug!(
+                                    version = snap.version,
+                                    "snapshot watcher: recovery assignment waits for local vnode transition"
+                                );
+                                if let Err(error) = self
+                                    .ensure_current_assignment_authority_cached(head_deadline)
+                                    .await
+                                {
+                                    warn!(%error, version = snap.version, "snapshot watcher: could not audit predecessor authority for pending vnode transition");
+                                    continue;
+                                }
+                                // The transition may have been staged before its predecessor
+                                // transport certificate became active. Repair that exact audited
+                                // authority before waiting for the newer durable head.
+                                self.publish_authority(authority_revision, head_deadline)
+                                    .await;
+                                continue;
+                            }
+                            Err(error) => {
+                                self.assignment_authority_dirty = true;
+                                warn!(%error, version = snap.version, "snapshot watcher: could not suspend recovery assignment");
+                                continue;
+                            }
                         }
                         if let Err(error) = ensure_local_recovery_fault(&self.db, controller).await
                         {
@@ -807,8 +904,6 @@ impl SnapshotWatcher {
                             .load(std::sync::atomic::Ordering::Acquire);
                         self.assignment_authority_dirty = true;
                     }
-                    self.durable_drain_transition = None;
-                    self.durable_snapshot = Some(snap.clone());
                     let resolved_local = self.registry.assignment_version();
                     if snap.version > resolved_local {
                         debug!(
@@ -816,16 +911,45 @@ impl SnapshotWatcher {
                             remote = snap.version,
                             "adopting newer assignment"
                         );
-                        match self.db.adopt_assignment_snapshot(snap, head_deadline).await {
+                        match self
+                            .db
+                            .adopt_assignment_snapshot(snap.clone(), head_deadline)
+                            .await
+                        {
                             Ok(adoption) => {
+                                self.durable_drain_transition = None;
+                                self.durable_snapshot = Some(snap.clone());
                                 authority_revision = self
                                     .db
                                     .assignment_authority_revision
                                     .load(std::sync::atomic::Ordering::Acquire);
                                 log_adoption("watcher", &adoption);
                             }
+                            Err(error) if error.is_shuffle_not_ready() => {
+                                // The local graph still needs the installed predecessor authority
+                                // to consume its staged vnode transition. Keep the prior audited
+                                // snapshot/certificate cached and retry this successor next tick.
+                                debug!(
+                                    error = %error,
+                                    version = snap.version,
+                                    "snapshot watcher: successor waits for local vnode transition"
+                                );
+                                if let Err(cache_error) = self
+                                    .ensure_current_assignment_authority_cached(head_deadline)
+                                    .await
+                                {
+                                    warn!(%cache_error, version = snap.version, "snapshot watcher: could not audit predecessor authority for pending vnode transition");
+                                    continue;
+                                }
+                                // Fall through to predecessor authority publication below. A
+                                // staged transition cannot complete if its retained certificate
+                                // was suspended or its first activation previously timed out.
+                            }
                             Err(e) => warn!(error = %e, "snapshot watcher: adoption failed"),
                         }
+                    } else {
+                        self.durable_drain_transition = None;
+                        self.durable_snapshot = Some(snap);
                     }
                 }
                 Ok(Ok(Some(snap))) => {
