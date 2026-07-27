@@ -607,7 +607,6 @@ fn collect_fake_spawned(
     completion_timeout: Duration,
     events: &mut Vec<String>,
 ) -> FakeCollected {
-    events.push("observer_status_checked_post_end".to_owned());
     let sanitized_plan_sha256 = Some(observer.expectation.sanitized_plan_sha256().to_owned());
     let invocation_id = Some(observer.expectation.invocation_id());
     let bootstrap_delivered = observer
@@ -620,6 +619,7 @@ fn collect_fake_spawned(
     } else {
         "observer_bootstrap_delivery_failure_post_end".to_owned()
     });
+    events.push("observer_status_checked_post_end".to_owned());
     let mut wait = wait_fake_after_end(
         &mut observer.child,
         completion_timeout,

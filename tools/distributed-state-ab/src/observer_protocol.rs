@@ -1,4 +1,4 @@
-//! Bounded observer protocol exercised only against loopback fake servers in Cycle 65.
+//! Bounded observer protocol exercised only against owned loopback fake servers.
 //!
 //! This module is deliberately separate from LaminarDB's runtime and from the dry-run driver.
 //! It proves request construction, authority delivery, response validation, and cursor behavior;
@@ -456,18 +456,12 @@ fn is_canonical_loopback_endpoint(address: SocketAddr) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretSourceError {
-    Unavailable,
     Invalid,
-    AlreadyConsumed,
 }
 
 impl fmt::Display for SecretSourceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Unavailable => "diagnostic secret source is unavailable",
-            Self::Invalid => "diagnostic secret source is invalid",
-            Self::AlreadyConsumed => "diagnostic secret source was already consumed",
-        })
+        formatter.write_str("diagnostic secret source is invalid")
     }
 }
 
@@ -528,7 +522,7 @@ impl<R: Read> SupervisorBootstrapSource<R> {
         }
         let invocation_id = Uuid::from_bytes(invocation_bytes);
         invocation_bytes.zeroize();
-        if !is_random_invocation_id(invocation_id) {
+        if !is_rfc4122_v4_invocation_id(invocation_id) {
             return Err(invalid());
         }
 
@@ -539,17 +533,8 @@ impl<R: Read> SupervisorBootstrapSource<R> {
         }
         let secret_result = DiagnosticReadSecret::from_provisioned_bytes(&secret_bytes);
         secret_bytes.zeroize();
-        let secret = secret_result.map_err(|error| match error {
-            SecretSourceError::Unavailable => {
-                ObserverProtocolError::new(ProtocolFailureKind::SecretUnavailable)
-            }
-            SecretSourceError::Invalid => {
-                ObserverProtocolError::new(ProtocolFailureKind::InvalidSecret)
-            }
-            SecretSourceError::AlreadyConsumed => {
-                ObserverProtocolError::new(ProtocolFailureKind::SecretAlreadyConsumed)
-            }
-        })?;
+        let secret = secret_result
+            .map_err(|_| ObserverProtocolError::new(ProtocolFailureKind::InvalidSecret))?;
         let mut terminator = [0_u8; 1];
         if reader.read_exact(&mut terminator).is_err() || terminator != [b'\n'] {
             return Err(invalid());
@@ -569,7 +554,7 @@ pub fn write_supervisor_bootstrap<W: Write>(
     secret: &DiagnosticReadSecret,
 ) -> Result<(), ObserverProtocolError> {
     let plan = validate_sanitized_plan(plan.clone())?;
-    if !is_random_invocation_id(invocation_id) {
+    if !is_rfc4122_v4_invocation_id(invocation_id) {
         return Err(ObserverProtocolError::new(
             ProtocolFailureKind::InvalidBootstrap,
         ));
@@ -589,7 +574,7 @@ pub fn write_supervisor_bootstrap<W: Write>(
         .map_err(|_| ObserverProtocolError::new(ProtocolFailureKind::SecretUnavailable))
 }
 
-fn is_random_invocation_id(invocation_id: Uuid) -> bool {
+fn is_rfc4122_v4_invocation_id(invocation_id: Uuid) -> bool {
     invocation_id.get_version_num() == 4 && invocation_id.get_variant() == uuid::Variant::RFC4122
 }
 
@@ -692,7 +677,7 @@ pub fn bind_observer_protocol_plan(
     arm: Arm,
     invocation_id: Uuid,
 ) -> Result<ObserverProtocolResultExpectationV3, ObserverProtocolError> {
-    if !is_random_invocation_id(invocation_id) {
+    if !is_rfc4122_v4_invocation_id(invocation_id) {
         return Err(ObserverProtocolError::new(ProtocolFailureKind::InvalidPlan));
     }
     let bytes = serde_json::to_vec(plan)
