@@ -178,10 +178,10 @@ async fn suspend_local_assignment_authority_locked(
     Ok(())
 }
 
-/// Recovery heads must not suspend the predecessor graph while that graph still owns an
-/// unapplied vnode transition. Holding the adoption lock makes the preflight stable against both
+/// Recovery heads must not suspend predecessor assignment authority while the graph still owns a
+/// pending vnode transition. Holding the adoption lock makes the preflight stable against both
 /// assignment adoption and startup staging; the graph may only finish (not create) that work.
-async fn suspend_recovery_assignment_after_vnode_transition(
+async fn try_suspend_recovery_assignment_authority(
     db: &Arc<LaminarDB>,
     controller: &ClusterController,
     registry: &VnodeRegistry,
@@ -858,7 +858,7 @@ impl SnapshotWatcher {
                             );
                             continue;
                         };
-                        match suspend_recovery_assignment_after_vnode_transition(
+                        match try_suspend_recovery_assignment_authority(
                             &self.db,
                             controller,
                             &self.registry,

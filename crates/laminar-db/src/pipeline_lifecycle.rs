@@ -1209,14 +1209,14 @@ impl LaminarDB {
     }
 
     #[cfg(feature = "cluster")]
-    fn publish_boot_vnode_rehydration(
+    fn stage_boot_vnode_rehydration(
         &self,
         registry: &laminar_core::state::VnodeRegistry,
         target_assignment: &laminar_core::state::VnodeAssignmentSnapshot,
         owned: &[u32],
         attempt: laminar_core::state::CheckpointAttempt,
         report: crate::recovery_manager::VnodeRehydration,
-    ) -> Result<usize, DbError> {
+    ) -> Result<(), DbError> {
         // Pin the registry publication through staging. The startup assignment lock prevents a
         // competing adopter from beginning, while this read guard also makes the helper itself
         // reject a target that changed during the backend read.
@@ -1226,7 +1226,7 @@ impl LaminarDB {
         {
             return Err(DbError::Checkpoint(format!(
                 "[LDB-6031] boot vnode recovery target assignment {} changed to {} before \
-                 publication",
+                 staging",
                 target_assignment.version(),
                 current_assignment.version()
             )));
@@ -1258,7 +1258,7 @@ impl LaminarDB {
                 },
             );
         }
-        Ok(staged.len())
+        Ok(())
     }
 
     /// Fence new work and wake the running pipeline without waiting for teardown.
@@ -1316,15 +1316,9 @@ impl LaminarDB {
         let report = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
             .rehydrate_at(&owned, attempt)
             .await?;
-        let staged = self.publish_boot_vnode_rehydration(
-            &registry,
-            &target_assignment,
-            &owned,
-            attempt,
-            report,
-        )?;
+        self.stage_boot_vnode_rehydration(&registry, &target_assignment, &owned, attempt, report)?;
         tracing::info!(
-            staged,
+            staged = owned.len(),
             epoch = attempt.epoch,
             checkpoint_id = attempt.checkpoint_id,
             "cluster recovery: staged boot-owned vnodes for operator recovery"

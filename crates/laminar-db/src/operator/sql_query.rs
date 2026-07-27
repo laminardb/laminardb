@@ -1004,6 +1004,37 @@ impl SqlQueryOperator {
             .push(Bytes::copy_from_slice(bytes));
         Ok(())
     }
+
+    fn apply_vnode_state(&mut self, vnode: u32, bytes: &[u8]) -> Result<(), DbError> {
+        let cp: AggStateCheckpoint = rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(
+            bytes,
+        )
+        .map_err(|error| {
+            DbError::Pipeline(format!(
+                "per-vnode state deserialization for '{}' vnode {vnode}: {error}",
+                self.op_name
+            ))
+        })?;
+        match self.state {
+            QueryState::Agg(ref mut agg_state) => {
+                let merged = agg_state.merge_groups(&cp)?;
+                tracing::debug!(
+                    query = %self.op_name, vnode, groups = merged,
+                    "applied rehydrated vnode aggregate state"
+                );
+            }
+            QueryState::Uninit => {
+                self.stage_uninit_vnode_slice(vnode, &cp, bytes)?;
+            }
+            _ => {
+                return Err(DbError::Pipeline(format!(
+                    "per-vnode aggregate state for '{}' vnode {vnode} targeted a non-aggregate query",
+                    self.op_name
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1358,36 +1389,6 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
-    fn apply_vnode_state(&mut self, vnode: u32, bytes: &[u8]) -> Result<(), DbError> {
-        let cp: AggStateCheckpoint =
-            rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(bytes).map_err(|e| {
-                DbError::Pipeline(format!(
-                    "per-vnode state deserialization for '{}' vnode {vnode}: {e}",
-                    self.op_name
-                ))
-            })?;
-        match self.state {
-            QueryState::Agg(ref mut agg_state) => {
-                let merged = agg_state.merge_groups(&cp)?;
-                tracing::debug!(
-                    query = %self.op_name, vnode, groups = merged,
-                    "applied rehydrated vnode aggregate state"
-                );
-            }
-            QueryState::Uninit => {
-                self.stage_uninit_vnode_slice(vnode, &cp, bytes)?;
-            }
-            _ => {
-                return Err(DbError::Pipeline(format!(
-                    "per-vnode aggregate state for '{}' vnode {vnode} targeted a non-aggregate query",
-                    self.op_name
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "cluster")]
     fn apply_vnode_chain(
         &mut self,
         vnode: u32,
@@ -1426,8 +1427,7 @@ impl GraphOperator for SqlQueryOperator {
         match self.state {
             QueryState::Agg(ref mut agg_state) => {
                 let merged = agg_state.apply_vnode_chain(&base_cp, &delta_objs)?;
-                // Info so a soak can compare the merged baseline against expectations per vnode.
-                tracing::info!(
+                tracing::debug!(
                     query = %self.op_name, vnode, groups = merged, deltas = delta_objs.len(),
                     "applied rehydrated vnode chain"
                 );

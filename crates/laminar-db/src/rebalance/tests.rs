@@ -443,7 +443,7 @@ fn successor_checkpoint_roster_contains_only_successor_owners() {
 }
 
 #[tokio::test]
-async fn recovery_suspension_waits_for_unapplied_vnode_transition() {
+async fn recovery_suspension_is_deferred_for_pending_vnode_transition() {
     let self_id = NodeId(1);
     let controller = test_cluster_controller(self_id, uuid::Uuid::from_u128(11), None);
     let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
@@ -468,7 +468,7 @@ async fn recovery_suspension_waits_for_unapplied_vnode_transition() {
         .assignment_authority_revision
         .load(std::sync::atomic::Ordering::Acquire);
 
-    let suspended = suspend_recovery_assignment_after_vnode_transition(
+    let suspended = try_suspend_recovery_assignment_authority(
         &db,
         &controller,
         &registry,
@@ -489,7 +489,7 @@ async fn recovery_suspension_waits_for_unapplied_vnode_transition() {
 
     db.rehydrated_vnode_state.lock().clear();
     registry.mark_active(&[0]);
-    let suspended = suspend_recovery_assignment_after_vnode_transition(
+    let suspended = try_suspend_recovery_assignment_authority(
         &db,
         &controller,
         &registry,

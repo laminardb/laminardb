@@ -93,11 +93,9 @@ async fn boot_report_marks_and_stages_the_exact_owned_roster() {
     };
     let target_assignment = registry.versioned_snapshot();
 
-    let staged = db
-        .publish_boot_vnode_rehydration(&registry, &target_assignment, &[0, 1], attempt, report)
+    db.stage_boot_vnode_rehydration(&registry, &target_assignment, &[0, 1], attempt, report)
         .unwrap();
 
-    assert_eq!(staged, 2);
     assert_eq!(registry.restoring_vnodes(), vec![0, 1]);
     let staged = db.rehydrated_vnode_state.lock();
     assert_eq!(staged.len(), 2);
@@ -119,7 +117,7 @@ async fn invalid_boot_report_changes_neither_staging_nor_lifecycle() {
     let target_assignment = registry.versioned_snapshot();
 
     let error = db
-        .publish_boot_vnode_rehydration(&registry, &target_assignment, &[0, 1], attempt, report)
+        .stage_boot_vnode_rehydration(&registry, &target_assignment, &[0, 1], attempt, report)
         .unwrap_err();
 
     assert!(error.to_string().contains("does not match owned roster"));
@@ -143,7 +141,7 @@ async fn changed_boot_assignment_rejects_report_without_mutation() {
     };
 
     let error = db
-        .publish_boot_vnode_rehydration(&registry, &target_assignment, &[0, 1], attempt, report)
+        .stage_boot_vnode_rehydration(&registry, &target_assignment, &[0, 1], attempt, report)
         .unwrap_err();
 
     assert!(error.to_string().contains("changed"), "{error}");
@@ -166,7 +164,7 @@ async fn wrong_boot_attempt_rejects_report_without_mutation() {
     };
 
     let error = db
-        .publish_boot_vnode_rehydration(&registry, &target_assignment, &[0, 1], attempt, report)
+        .stage_boot_vnode_rehydration(&registry, &target_assignment, &[0, 1], attempt, report)
         .unwrap_err();
 
     assert!(error.to_string().contains("does not match"), "{error}");

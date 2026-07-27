@@ -409,14 +409,14 @@ impl GraphOperator for RecordingOperator {
 }
 
 #[cfg(feature = "cluster")]
-struct RehydrationApplyOperator {
+struct RecordingVnodeRestoreOperator {
     applied: Arc<parking_lot::Mutex<Vec<u32>>>,
     failure_on_vnode: Option<(u32, &'static str)>,
 }
 
 #[cfg(feature = "cluster")]
 #[async_trait]
-impl GraphOperator for RehydrationApplyOperator {
+impl GraphOperator for RecordingVnodeRestoreOperator {
     fn cluster_capability(&self) -> OperatorCapability {
         OperatorCapability::test_probe()
     }
@@ -454,7 +454,7 @@ impl GraphOperator for RehydrationApplyOperator {
 }
 
 #[cfg(feature = "cluster")]
-struct LifecycleObservingOperator {
+struct RestoringRosterProbe {
     label: &'static str,
     registry: Arc<laminar_core::state::VnodeRegistry>,
     observations: Arc<parking_lot::Mutex<Vec<(&'static str, u32, Vec<u32>)>>>,
@@ -462,7 +462,7 @@ struct LifecycleObservingOperator {
 
 #[cfg(feature = "cluster")]
 #[async_trait]
-impl GraphOperator for LifecycleObservingOperator {
+impl GraphOperator for RestoringRosterProbe {
     fn cluster_capability(&self) -> OperatorCapability {
         OperatorCapability::test_probe()
     }
@@ -495,16 +495,6 @@ impl GraphOperator for LifecycleObservingOperator {
 #[cfg(feature = "cluster")]
 fn encoded_vnode_partial(partial: &crate::vnode_partial::VnodePartial) -> bytes::Bytes {
     bytes::Bytes::from(partial.encode().expect("encode test vnode partial"))
-}
-
-#[cfg(feature = "cluster")]
-async fn rehydration_test_graph(
-    chain: Vec<bytes::Bytes>,
-) -> (OperatorGraph, Arc<laminar_core::state::VnodeRegistry>) {
-    let VnodeTransitionHarness {
-        graph, registry, ..
-    } = vnode_transition_harness(1, &[0], vec![(0, chain)]).await;
-    (graph, registry)
 }
 
 #[cfg(feature = "cluster")]
@@ -2670,7 +2660,7 @@ async fn successful_revoke_batch_consumes_handle() {
         [0u32].into_iter().collect::<FxHashSet<u32>>(),
     ));
     graph.set_revoke_handle(Arc::clone(&handle));
-    graph.apply_staged_vnode_transition().unwrap();
+    graph.complete_staged_vnode_transition().unwrap();
     assert!(
         handle.lock().is_empty(),
         "the revoke handle is consumed only after the complete batch succeeds",
@@ -2715,7 +2705,7 @@ async fn out_of_range_revoke_is_rejected_before_callbacks() {
     ));
     graph.set_revoke_handle(Arc::clone(&handle));
 
-    let error = graph.apply_staged_vnode_transition().unwrap_err();
+    let error = graph.complete_staged_vnode_transition().unwrap_err();
 
     assert!(error.to_string().contains("outside the pinned assignment"));
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -2763,7 +2753,7 @@ fn revoke_without_cluster_scope_is_rejected_before_callbacks() {
     ));
     graph.set_revoke_handle(Arc::clone(&handle));
 
-    let error = graph.apply_staged_vnode_transition().unwrap_err();
+    let error = graph.complete_staged_vnode_transition().unwrap_err();
 
     assert!(error.to_string().contains("no cluster ownership scope"));
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -2845,7 +2835,7 @@ async fn vnode_revoke_failure_faults_and_retains_pending_work() {
     ));
     graph.set_revoke_handle(Arc::clone(&handle));
 
-    let error = graph.apply_staged_vnode_transition().unwrap_err();
+    let error = graph.complete_staged_vnode_transition().unwrap_err();
     assert!(matches!(error, DbError::StatefulOperatorPartialApply(_)));
     assert!(error.to_string().contains("z-revoke-failure"));
     assert_eq!(&*calls.lock(), &["success", "failure"]);
@@ -2895,11 +2885,15 @@ async fn checkpoint_quiescence_requires_staged_vnode_transitions_to_apply() {
         base: None,
         deltas: Vec::new(),
     };
-    let (mut graph, registry) = rehydration_test_graph(vec![encoded_vnode_partial(&partial)]).await;
+    let VnodeTransitionHarness {
+        mut graph,
+        registry,
+        ..
+    } = vnode_transition_harness(1, &[0], vec![(0, vec![encoded_vnode_partial(&partial)])]).await;
     let applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
     graph.push_test_node(
         "global",
-        Box::new(RehydrationApplyOperator {
+        Box::new(RecordingVnodeRestoreOperator {
             applied: Arc::clone(&applied),
             failure_on_vnode: None,
         }),
@@ -2979,8 +2973,16 @@ async fn checkpoint_quiescence_requires_staged_vnode_transitions_to_apply() {
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn corrupt_rehydration_chain_faults_and_keeps_vnode_restoring() {
-    let (mut graph, registry) =
-        rehydration_test_graph(vec![bytes::Bytes::from_static(b"not-rkyv")]).await;
+    let VnodeTransitionHarness {
+        mut graph,
+        registry,
+        ..
+    } = vnode_transition_harness(
+        1,
+        &[0],
+        vec![(0, vec![bytes::Bytes::from_static(b"not-rkyv")])],
+    )
+    .await;
 
     let error = graph
         .execute_cycle(&FxHashMap::default(), i64::MAX, None)
@@ -3000,7 +3002,11 @@ async fn corrupt_rehydration_chain_faults_and_keeps_vnode_restoring() {
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn execution_assignment_is_not_published_when_transport_scope_is_stale() {
-    let (mut graph, registry) = rehydration_test_graph(Vec::new()).await;
+    let VnodeTransitionHarness {
+        mut graph,
+        registry,
+        ..
+    } = vnode_transition_harness(1, &[0], vec![(0, Vec::new())]).await;
     registry.set_assignment(vec![laminar_core::state::NodeId(1)].into());
 
     let error = graph
@@ -3014,17 +3020,21 @@ async fn execution_assignment_is_not_published_when_transport_scope_is_stale() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn rehydration_delta_without_full_base_faults_before_apply() {
+async fn rehydration_delta_without_full_base_is_rejected_before_callbacks() {
     let partial = crate::vnode_partial::VnodePartial {
         operators: Vec::new(),
         base: Some(laminar_core::state::CheckpointAttempt::new(1, 1)),
         deltas: vec![("agg".to_string(), vec![1])],
     };
-    let (mut graph, registry) = rehydration_test_graph(vec![encoded_vnode_partial(&partial)]).await;
+    let VnodeTransitionHarness {
+        mut graph,
+        registry,
+        ..
+    } = vnode_transition_harness(1, &[0], vec![(0, vec![encoded_vnode_partial(&partial)])]).await;
     let applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
     graph.push_test_node(
         "agg",
-        Box::new(RehydrationApplyOperator {
+        Box::new(RecordingVnodeRestoreOperator {
             applied: Arc::clone(&applied),
             failure_on_vnode: None,
         }),
@@ -3043,17 +3053,21 @@ async fn rehydration_delta_without_full_base_faults_before_apply() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn duplicate_operator_in_one_partial_is_rejected_before_apply() {
+async fn duplicate_operator_in_one_partial_is_rejected_before_callbacks() {
     let partial = crate::vnode_partial::VnodePartial {
         operators: vec![("agg".to_string(), vec![1]), ("agg".to_string(), vec![2])],
         base: None,
         deltas: Vec::new(),
     };
-    let (mut graph, registry) = rehydration_test_graph(vec![encoded_vnode_partial(&partial)]).await;
+    let VnodeTransitionHarness {
+        mut graph,
+        registry,
+        ..
+    } = vnode_transition_harness(1, &[0], vec![(0, vec![encoded_vnode_partial(&partial)])]).await;
     let applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
     graph.push_test_node(
         "agg",
-        Box::new(RehydrationApplyOperator {
+        Box::new(RecordingVnodeRestoreOperator {
             applied: Arc::clone(&applied),
             failure_on_vnode: None,
         }),
@@ -3078,7 +3092,11 @@ async fn operator_without_vnode_restore_contract_cannot_silently_accept_state() 
         base: None,
         deltas: Vec::new(),
     };
-    let (mut graph, registry) = rehydration_test_graph(vec![encoded_vnode_partial(&partial)]).await;
+    let VnodeTransitionHarness {
+        mut graph,
+        registry,
+        ..
+    } = vnode_transition_harness(1, &[0], vec![(0, vec![encoded_vnode_partial(&partial)])]).await;
     graph.push_test_node("stateless", Box::new(SourcePassthrough));
 
     let error = graph
@@ -3095,7 +3113,7 @@ async fn operator_without_vnode_restore_contract_cannot_silently_accept_state() 
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn missing_rehydration_operator_faults_before_any_apply() {
+async fn missing_rehydration_operator_is_rejected_before_callbacks() {
     let partial = crate::vnode_partial::VnodePartial {
         operators: vec![
             ("present".to_string(), vec![1]),
@@ -3104,11 +3122,15 @@ async fn missing_rehydration_operator_faults_before_any_apply() {
         base: None,
         deltas: Vec::new(),
     };
-    let (mut graph, registry) = rehydration_test_graph(vec![encoded_vnode_partial(&partial)]).await;
+    let VnodeTransitionHarness {
+        mut graph,
+        registry,
+        ..
+    } = vnode_transition_harness(1, &[0], vec![(0, vec![encoded_vnode_partial(&partial)])]).await;
     let present_applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
     graph.push_test_node(
         "present",
-        Box::new(RehydrationApplyOperator {
+        Box::new(RecordingVnodeRestoreOperator {
             applied: Arc::clone(&present_applied),
             failure_on_vnode: None,
         }),
@@ -3234,7 +3256,7 @@ async fn exact_owned_restoring_roster_is_required_before_callbacks() {
     let applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
     graph.push_test_node(
         "agg",
-        Box::new(RehydrationApplyOperator {
+        Box::new(RecordingVnodeRestoreOperator {
             applied: Arc::clone(&applied),
             failure_on_vnode: None,
         }),
@@ -3274,7 +3296,7 @@ async fn owned_non_restoring_staged_vnode_is_rejected_before_callbacks() {
     let applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
     graph.push_test_node(
         "agg",
-        Box::new(RehydrationApplyOperator {
+        Box::new(RecordingVnodeRestoreOperator {
             applied: Arc::clone(&applied),
             failure_on_vnode: None,
         }),
@@ -3418,7 +3440,7 @@ async fn later_restore_callback_failure_poisons_and_retains_complete_transition(
     let applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
     graph.push_test_node(
         "agg",
-        Box::new(RehydrationApplyOperator {
+        Box::new(RecordingVnodeRestoreOperator {
             applied: Arc::clone(&applied),
             failure_on_vnode: Some((1, "injected vnode apply failure")),
         }),
@@ -3618,7 +3640,7 @@ async fn revoke_then_reacquire_overlap_drops_before_restore() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn acquire_then_lose_before_apply_clears_unowned_restoring_state() {
+async fn acquire_then_lose_before_completion_clears_unowned_restoring_state() {
     use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
     use laminar_core::state::NodeId;
 
@@ -3661,7 +3683,7 @@ async fn acquire_then_lose_before_apply_clears_unowned_restoring_state() {
         .unwrap();
 
     graph
-        .apply_staged_vnode_transition()
+        .complete_staged_vnode_transition()
         .expect("the pinned owner map may discard an obsolete unowned acquire");
 
     assert!(staged.lock().is_empty());
@@ -3696,7 +3718,7 @@ async fn successful_rehydration_delays_all_activation_until_callbacks_finish() {
     let observations = Arc::new(parking_lot::Mutex::new(Vec::new()));
     graph.push_test_node(
         "right",
-        Box::new(LifecycleObservingOperator {
+        Box::new(RestoringRosterProbe {
             label: "right",
             registry: Arc::clone(&registry),
             observations: Arc::clone(&observations),
@@ -3704,7 +3726,7 @@ async fn successful_rehydration_delays_all_activation_until_callbacks_finish() {
     );
     graph.push_test_node(
         "left",
-        Box::new(LifecycleObservingOperator {
+        Box::new(RestoringRosterProbe {
             label: "left",
             registry: Arc::clone(&registry),
             observations: Arc::clone(&observations),
@@ -3750,7 +3772,7 @@ async fn control_only_completion_applies_transition_without_source_cycle() {
     let applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
     graph.push_test_node(
         "agg",
-        Box::new(RehydrationApplyOperator {
+        Box::new(RecordingVnodeRestoreOperator {
             applied: Arc::clone(&applied),
             failure_on_vnode: None,
         }),
