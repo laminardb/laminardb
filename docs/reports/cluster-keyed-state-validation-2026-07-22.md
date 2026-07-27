@@ -83,6 +83,10 @@ driver/observer schedule scaffold. Its Windows matrix proves byte-identical comm
 across C/D and observer success, exit, hang, and malformed output, with bounded capture and process
 cleanup. The driver only materializes a static schedule and D only emits planned probes: no SUT,
 HTTP, workload, fault, latency, A/B, backend, or soak was executed.
+Cycle 63 then audits the current HTTP/reload boundary and selects a server-enforced, disjoint,
+startup-bound, loopback-only diagnostic credential instead of a console-bearer broker. It is a
+design decision only: no credential, router split, observer, HTTP request, or empirical result has
+landed.
 
 ## Verdict
 
@@ -663,6 +667,7 @@ The current branch's admission-neutral hardening was then checked separately:
 | Cycle 60 instrumentation A/B | DESIGN ONLY; not run | Frozen v1 separates recorder installation from polling with common metrics and fixed workload/fault anchors; it estimates effects only and still needs a separate driver plus powered v2 |
 | Cycle 61 executable provenance seam | PASS, focused/full/lint gates; no real-process run | Canonical regular-file path plus exact SHA-256 fail closed on partial configuration, relative/missing/unreadable/non-regular paths, malformed or mismatched digest, and post-resolution mutation; executable permission/format/architecture remain OS spawn checks |
 | Cycle 62 schedule scaffold | PASS for logical schedule isolation; 10 tests passed, one ignored subprocess fixture; no real-process run | Separate driver/observer bytes, raw-manifest-bound common plan, exact file-synced end seal, capped pipe retention, bounded kill/reap, and identical C/D traces across four observer outcomes; static planned probes only, with no HTTP, SUT, workload execution, timing, or A/B evidence |
+| Cycle 63 diagnostic-read authority | DESIGN ONLY; no runtime or empirical sample | Selects a disjoint startup-bound credential on exactly two loopback diagnostic GETs; rejects the unrestricted-bearer broker and identifies parse-error disclosure plus restart-only reload publication as prerequisites |
 
 Both cluster and no-feature `cargo check` and `cargo clippy -D warnings` configurations passed, as
 did formatting and diff checks. These focused results do not exercise keyed cluster restore.
@@ -704,6 +709,16 @@ schedule serialization and supervisor failure isolation only. The
 keeps live HTTP blocked because the current console bearer grants both diagnostic-read and
 checkpoint/pipeline mutation authority. The independent immutable release-binary soak has still
 not run.
+
+Cycle 63 adds no empirical product sample either. Source inspection confirms that one protected
+router currently grants the console bearer access to diagnostics and mutations; `[server]` is
+labelled restart-only but can be republished by successful reload, while checkpoint forwarding
+retains the startup console token; and TOML parse errors can preserve substituted source text before
+`Secret` redaction exists. The
+[selected contract](../testing/distributed-state-production-soak-charter.md#cycle-63-diagnostic-read-authority-decision)
+requires parse-error redaction, reloadable-section-only commits, and a disjoint immutable
+diagnostic policy before a live observer can be written. No route or guarantee changed, and the
+independent immutable release-binary soak has still not run.
 
 These are admission and focused operator tests, not a production certification. No existing test
 demonstrates a distributed keyed operator processing remote rows through crash, restore, and

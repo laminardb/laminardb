@@ -5,7 +5,7 @@
   pending a new official package; no runtime
   dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 62
+- **Last reconciled:** 2026-07-27 during Cycle 63
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -462,6 +462,20 @@ hang, and malformed output and bounded kill/reap. This is logical schedule non-f
 not execution of the opaque trace/control artifacts, a live observer, A/B, or a real-process soak.
 Live work remains blocked until diagnostic reads can be delegated without also delegating the
 console bearer's checkpoint/pipeline mutation authority.
+
+Cycle 63 resolves that design choice without adding code. The
+[diagnostic-read authority decision](../testing/distributed-state-production-soak-charter.md#cycle-63-diagnostic-read-authority-decision)
+selects a disjoint, startup-bound, loopback-only server credential for exactly the two local
+diagnostic GETs and rejects a broker holding the console bearer. Console fallback, query-token
+authentication, implicit `HEAD`, CORS access, remote plaintext exposure, and live rotation are
+prohibited for the observer; the console bearer retains administrator access to the GETs. Before
+enabling that credential, the implementation must redact substituted TOML input
+from parse errors and make both reload paths retain all restart-only active configuration rather
+than republishing changed server secrets. The bounded implementation cycle includes the auth policy,
+router split, and exhaustive route/config/reload tests only; the observer client and any live run
+remain blocked. Since the main HTTP address is also advertised for checkpoint RPC, this loopback
+slice cannot support a multi-host A/B or production soak; that later gate needs a separate local
+diagnostic listener or native TLS/mTLS design.
 
 The existing output path satisfies none of the new provenance/fence fields: it passes only a batch
 and deadline and uses an idempotent, non-transactional Kafka producer. The supported evidence APIs

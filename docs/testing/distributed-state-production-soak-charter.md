@@ -593,6 +593,128 @@ claim changed. Powered instrumentation equivalence, exactly-once composition, ba
 qualification, and the independently operated immutable release-binary soak remain separate open
 gates. `certification_eligible` remains `false`.
 
+### Cycle 63 diagnostic-read authority decision
+
+Cycle 63 is a code-free security and lifecycle decision. The live observer, HTTP client, broker,
+cluster execution, and A/B remain blocked. The current tree has one protected router: its console
+bearer covers the two local diagnostic GETs as well as checkpoint, SQL, reload, pipeline start/stop,
+other console reads, and WebSocket access. A process holding that bearer is therefore a control
+principal, regardless of which requests its source code intends to send.
+
+LaminarDB will add a server-enforced, startup-bound `server.diagnostic_read_token`. A separate
+diagnostic router will accept that credential only as an `Authorization: Bearer` header on these
+two exact routes:
+
+- `GET /api/v1/cluster/local-evidence`; and
+- `GET /api/v1/cluster/local-checkpoint-barrier-timings` with its existing strict cursor query.
+
+The two configured values are deliberately distinct. The existing console bearer remains accepted
+on the two routes as the administrator credential; denying a principal that already has mutation
+authority would not make an observer holding that credential safe. The meaningful boundary is the
+opposite direction: the diagnostic bearer never authenticates a console, mutation, query-token,
+cookie, WebSocket, or public-probe path. A live observer must receive the diagnostic secret and
+must never fall back to the console secret. With no diagnostic token, the console bearer preserves
+current engineering access, but that configuration is ineligible for live instrumentation; with
+neither token the sensitive handlers retain their current `503` behavior.
+Because the administrator bearer is a deliberate superset, a successful response alone cannot
+prove which credential the caller held. The later supervisor must obtain a typed diagnostic secret
+from its dedicated provisioning channel, refuse to start when that source is absent, and expose no
+console-secret source or fallback to the observer. That provenance—not the HTTP status—is the
+evidence-integrity check.
+
+A configured diagnostic credential is admitted only when all of the following hold:
+
+- server mode is `cluster`, `server.console_token` is also configured, and the two secrets differ;
+- one shared auth validator runs both during file loading and at programmatic `run_server` entry,
+  before cluster leases, listeners, or other startup side effects;
+- the diagnostic value is exactly the canonical unpadded base64url encoding
+  `[A-Za-z0-9_-]{43}` of 32 bytes. When diagnostic mode is enabled, the console value must satisfy
+  the same rule; legacy console-only configurations retain their existing minimum. Decoding,
+  canonical re-encoding, exact byte count, and distinctness are enforceable, while random
+  generation remains an operator/provisioner obligation;
+- the HTTP `server.bind` address is loopback. The current HTTP listener is plaintext and has no
+  peer-address extractor or native TLS, so a non-loopback token would make a false transport claim;
+  this also restricts v1 to co-located, single-host engineering clusters because the same HTTP port
+  is advertised for inter-node checkpoint RPC. Multi-host A/B and production-soak use remain
+  blocked pending a separately reviewed local diagnostic listener or native TLS/mTLS design; and
+- the value appears only in server-side secret configuration or its supported environment
+  substitution. It is never passed in the observer's URL, command line, environment, manifest,
+  plan, log, evidence artifact, token digest, or non-secret key identifier.
+
+The eventual router/auth matrix is normative. Statuses below assume the outer startup/recovery
+serving gate is open; that gate may return `503` first and remains authoritative.
+
+| Request | Diagnostic credential result | Other authority/result |
+|---|---|---|
+| Exact `GET` local-evidence, with no query | Authenticates; handler retains its state/fence checks and bounded `no-store` response | Console bearer remains an administrator credential; missing, wrong, duplicated, comma-joined, query, and cookie credentials do not authenticate |
+| Exact `GET` local-checkpoint-barrier-timings with the existing strict query schema | Authenticates; existing cursor/process, loss, page, response, and fence checks remain | Unknown, missing, duplicate, or malformed query fields still fail closed |
+| Either exact `GET` path when the diagnostic token is not configured | No diagnostic authority exists; a live observer is ineligible | A valid console bearer preserves current access; with no console token the handler returns `503` |
+| `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `CONNECT`, or `TRACE` on either path | Never invokes an evidence handler; a valid diagnostic bearer receives a method rejection | A valid console bearer receives the same method rejection; diagnostic CORS/preflight is not enabled; Axum's implicit GET-to-HEAD behavior must be overridden |
+| Checkpoint, SQL, reload, pipeline start/stop/status, other console GETs, or `/ws/*` | `401` before the target handler; no mutation or upgrade | Existing console rules remain confined to the console router |
+| Trailing/double slash, ASCII case change, percent-encoded separator/backslash/dot segment, or unknown path | No diagnostic route match and no target-handler call | No redirect or normalization fallback is introduced |
+| Absolute-form URI carrying an otherwise exact path | Rejected before the handler when URI scheme or authority is present | Only origin-form requests are admissible |
+| `/health`, `/ready`, `/metrics` | No new authority; these remain the existing public probes | They expose no diagnostic body and accept no diagnostic query-token meaning |
+| Either diagnostic path in single-node or feature-disabled mode | No diagnostic auth decision or handler work | Preserve the current ready-state `404`; diagnostic configuration itself is cluster-only |
+
+The middleware uses one immutable startup policy, rejects a presented diagnostic credential unless
+its length matches one configured secret before constant-time comparison, and inserts a private
+typed principal for the handler. Immutable credentials make a second post-capture token comparison
+meaningless; the handlers instead retain their post-capture serving/process-fence checks. Successful
+and rejected requests log path/method/status/latency only; no header, query string, credential, or
+digest is logged. Diagnostic routes sit outside the console's permissive CORS layer. Existing
+response caps and `Cache-Control: no-store` remain.
+
+Availability is also server-enforced before live use. One non-queuing permit is shared by the two
+diagnostic handlers per process; contention returns `429` without entering either handler. A fixed,
+allocation-free rolling window admits at most eight handler starts per process per second, after
+successful authentication, and excess returns `429`. Every admitted handler has a two-second
+server deadline and timeout returns `504`; releasing the permit and accounting the start are tested
+under success, rejection, timeout, and cancellation. These limits permit the two scheduled reads
+and bounded cursor catch-up while containing a buggy or compromised credential holder. They are
+route-local control-plane mechanisms, not a generic RBAC/rate-limit service, and add no row, state,
+checkpoint-capture, source, or sink hot-path operation. The later A/B still measures their actual
+cost.
+
+Two existing reload behaviors must be corrected before the credential is enabled. The diff engine
+labels `[server]` restart-only, but successful explicit reload currently republishes the entire new
+configuration, and a file-watcher reload does the same when any reloadable DDL is also present.
+That can rotate/remove HTTP authority while LaminarDB's checkpoint forwarder retains its startup
+console token. In addition, a TOML parse error can retain substituted source text and the reload API
+logs/returns that error, so a malformed secret line can be disclosed before `Secret` redaction is
+constructed.
+
+The implementation must therefore (1) strip TOML source input from parse errors before logging or
+returning them, (2) have both reload entry points commit only the four reloadable named sections
+(`source`, `lookup`, `pipeline`, and `sink`) while retaining every restart-only active value, and
+(3) snapshot console and diagnostic auth policy at startup. Adding, removing, or rotating either
+credential requires restart; there is no old/new grace overlap or live-reload fallback.
+A configuration-file or executable change also invalidates a frozen A/B or soak attempt.
+
+Tests cover pure restart-only changes and mixed DDL plus restart-only changes through both explicit
+POST and file-watcher reload, including successful and failed DDL. Only `source`, `lookup`,
+`pipeline`, and `sink` may change; the active console/diagnostic policy and the checkpoint
+forwarder's startup credential remain unchanged. A sentinel substituted secret must be absent from
+parse-error `Display`, `Debug`, source chains, startup output, watcher logs, and reload API bodies.
+The shared validator is exercised through file loading and programmatic startup before side
+effects. Route tests cover both credentials, every row above, absent CORS, duplicate and wrong-size
+headers, immutable policy, limiter/deadline release, zero mutation side effects, and default-deny
+behavior when a new console route is added.
+
+A hashed external GET-only broker is rejected. Hashing binds which binary was selected but cannot
+stop that binary, a dependency, or an exploit from spending its unrestricted console bearer on a
+mutation. L3/L4 isolation cannot distinguish HTTP methods and paths on one origin. A genuinely
+least-authority broker would still require server-side authorization, while adding IPC framing,
+secret delivery, redirect/proxy/DNS defenses, lifecycle failure, copying, and measurement
+perturbation.
+
+The next implementation cycle is limited to parse-error redaction, reload commit semantics, the
+startup auth policy, split routers, and their exhaustive configuration/route/race tests. It adds no
+observer client or live request. Only after those gates pass may a loopback fake-server cycle define
+sanitized-plan/secret delivery, exact origin and request construction, disabled redirects/proxies,
+deadlines, retry/page/cursor state, response bounds, cancellation, and zero C connections. Live
+effect-estimation, a powered equivalence experiment, and the independent immutable release-binary
+soak remain later and separate.
+
 ## Frozen numerical contract
 
 An eligible machine-readable charter contains no `TBD`, zero, or results-derived threshold. It

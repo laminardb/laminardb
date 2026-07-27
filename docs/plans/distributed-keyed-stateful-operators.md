@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 62
+- **Last reconciled:** 2026-07-27 during Cycle 63
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -240,6 +240,17 @@ review a route-scoped read-only credential or a content-bound GET-only broker; t
 bearer also authorizes checkpoint and pipeline control. Then add a loopback fake-server state
 machine for exact method/path/origin, deadline, retry, page, cursor, identity, and response-bound
 behavior before any real cluster is contacted.
+
+Cycle 63 chooses the [server-enforced diagnostic-read credential](../testing/distributed-state-production-soak-charter.md#cycle-63-diagnostic-read-authority-decision)
+and rejects the bearer-holding broker. The credential is disjoint from the console bearer,
+startup-bound, loopback-only, and valid solely for exact `GET` access to the two local evidence
+routes. The next bounded cycle first removes substituted TOML input from parse errors and fixes both
+reload commit paths so restart-only server authority cannot change, then adds the split auth/router
+boundary and its route matrix. It does not add the observer or run the experiment. The fake-server
+observer protocol, live effect-estimation, powered equivalence, and independent release-binary soak
+remain ordered gates after that control-plane work. The main HTTP port is also the advertised
+checkpoint-RPC port, so the loopback slice is single-host engineering support only; multi-host and
+production-soak use need a later separate local listener or native TLS/mTLS design.
 
 ## Scope and non-goals
 

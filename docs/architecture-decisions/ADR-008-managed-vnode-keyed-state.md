@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 62
+- **Last reconciled:** 2026-07-27 during Cycle 63
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -1337,6 +1337,20 @@ observer also cannot receive the current console bearer: that token authenticate
 and checkpoint/pipeline control POSTs on one protected router. Route-scoped read-only authority or
 a separately hashed GET-only broker is required first. The independent immutable release-binary
 soak and the **NO-GO** verdict remain unchanged.
+
+Cycle 63 selects the route-scoped option and rejects the broker. The
+[normative authority contract and route matrix](../testing/distributed-state-production-soak-charter.md#cycle-63-diagnostic-read-authority-decision)
+use a disjoint, startup-bound `server.diagnostic_read_token` on only the two exact diagnostic GETs.
+The console bearer retains administrator access, but the observer has no fallback to it; the
+diagnostic bearer cannot reach console or mutation routes, and v1 is loopback-only because
+LaminarDB's HTTP listener has no native TLS. Because that listener also carries inter-node
+checkpoint RPC, v1 enables only the co-located engineering A/B; a separate local listener or
+native TLS/mTLS design remains mandatory for multi-host and production-soak use. This
+also exposes two prerequisites: reload must stop publishing restart-only server secrets while the
+checkpoint forwarder retains its startup token, and substituted TOML input must be removed from
+parse errors before those errors are logged or returned. The next cycle may implement only that
+control-plane boundary and its tests; no observer, A/B, backend, delivery, admission, or production
+claim is authorized by this decision.
 
 Selected attempts may then be joined at low cadence only through a new read-only, same-snapshot
 core audit of the exact outcome, both retention floors, and validated live capsule reference;
