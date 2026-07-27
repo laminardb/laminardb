@@ -688,7 +688,7 @@ struct AuthorityState {
     process: ProcessIdentity,
     assignment_version: u64,
     vnode_count: u32,
-    assignment_digest: [u8; 32],
+    owner_map_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -705,6 +705,7 @@ struct TimingMetadata {
 struct TimingState {
     cursor: u64,
     metadata: Option<TimingMetadata>,
+    assignment_floor: Option<u64>,
     last_assignment_version: Option<u64>,
 }
 
@@ -829,7 +830,7 @@ impl NodeProtocolState {
             process,
             assignment_version: adoption.assignment_version,
             vnode_count: adoption.vnode_count,
-            assignment_digest: adoption.assignment_digest,
+            owner_map_digest: adoption.assignment_digest,
         };
         if self
             .greatest_observed_assignment_version
@@ -843,7 +844,7 @@ impl NodeProtocolState {
                 if next.assignment_version < previous.assignment_version
                     || (next.assignment_version == previous.assignment_version
                         && (next.vnode_count != previous.vnode_count
-                            || next.assignment_digest != previous.assignment_digest))
+                            || next.owner_map_digest != previous.owner_map_digest))
                 {
                     return Err(ProtocolFailureKind::InvalidLocalEvidence);
                 }
@@ -879,11 +880,16 @@ impl NodeProtocolState {
             next.assignment_version,
             OwnerMapIdentity {
                 vnode_count: next.vnode_count,
-                digest: next.assignment_digest,
+                digest: next.owner_map_digest,
             },
         )?;
         if transition == AuthorityTransition::Restarted {
+            let assignment_floor = self
+                .greatest_observed_assignment_version
+                .and_then(|version| version.checked_add(1))
+                .ok_or(ProtocolFailureKind::EvidenceLoss)?;
             self.timing.reset();
+            self.timing.assignment_floor = Some(assignment_floor);
         }
         self.seen_boot_incarnations.insert(process.boot_incarnation);
         self.greatest_observed_assignment_version = Some(
@@ -977,6 +983,10 @@ impl NodeProtocolState {
                     .is_some_and(|previous| record.attempt.checkpoint_id <= previous)
                 || record.assignment_version == 0
                 || record.assignment_digest == [0; 32]
+                || self
+                    .timing
+                    .assignment_floor
+                    .is_some_and(|floor| record.assignment_version < floor)
                 || self
                     .timing
                     .last_assignment_version
@@ -2988,6 +2998,19 @@ mod tests {
         assert_eq!(
             state
                 .apply_timing_page(reused_checkpoint, &mut history)
+                .unwrap_err(),
+            ProtocolFailureKind::InvalidTimingPage
+        );
+
+        let mut old_certificate = timing_record(1, 2, 2);
+        old_certificate["sequence"] = json!(1);
+        old_certificate["assignment_version"] = json!(1);
+        old_certificate["assignment_digest"] = json!(vec![0x81; 32]);
+        let old_certificate: TimingEnvelopeWire =
+            serde_json::from_slice(&timing_page(1, 2, 0, vec![old_certificate], 2, false)).unwrap();
+        assert_eq!(
+            state
+                .apply_timing_page(old_certificate, &mut history)
                 .unwrap_err(),
             ProtocolFailureKind::InvalidTimingPage
         );
