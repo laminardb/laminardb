@@ -91,6 +91,16 @@ landed.
 slice: shared startup validation, immutable split authority, exact diagnostic routing and
 availability bounds, parse-error redaction, and reloadable-section-only publication. In-process
 route/config/reload matrices pass, but no live observer, networked A/B, backend trial, or soak ran.
+[Cycle 65](../reviews/distributed-keyed-state-cycle-65.md) implements only the standalone loopback
+fake-server protocol. Canonical plan/secret framing, bounded direct HTTP, restart/cursor/assignment
+validation, explicit incompleteness, bootstrap timeout, and cancellation pass unit and real-child
+tests; C opens zero sockets and D parses 348 owned fake responses. The sealed driver does not yet
+consume this network mode. The fake path also accelerates all slots rather than exercising the
+wall-clock cadence or server rate limiter; no LaminarDB request, A/B, backend trial, or soak ran.
+Restart-loss rejection also covers only unread records advertised by the last observed page. An
+old process can lose records appended after that poll without the client knowing, so durable
+continuity/handoff or an explicitly reviewed bounded observation interpretation remains a live
+integration blocker.
 
 ## Verdict
 
@@ -673,6 +683,7 @@ The current branch's admission-neutral hardening was then checked separately:
 | Cycle 62 schedule scaffold | PASS for logical schedule isolation; 10 tests passed, one ignored subprocess fixture; no real-process run | Separate driver/observer bytes, raw-manifest-bound common plan, exact file-synced end seal, capped pipe retention, bounded kill/reap, and identical C/D traces across four observer outcomes; static planned probes only, with no HTTP, SUT, workload execution, timing, or A/B evidence |
 | Cycle 63 diagnostic-read authority | DESIGN ONLY; no runtime or empirical sample | Selects a disjoint startup-bound credential on exactly two loopback diagnostic GETs; rejects the unrestricted-bearer broker and identifies parse-error disclosure plus restart-only reload publication as prerequisites |
 | Cycle 64 diagnostic-read boundary | PASS for in-process configuration, route, race, and reload tests; no real-process sample | Implements the disjoint immutable credential, exact two-route allowlist, post-auth permit/rate/deadline bounds, route-template logs, parse-input redaction, and restart-only reload retention; 238 no-cluster and 316 cluster tests pass |
+| Cycle 65 standalone observer protocol | PASS for the bounded fake-only component; live/driver integration blocked | Result v2 binds sanitized plan v2; bootstrap v3, strict direct HTTP/cursor/identity validation, explicit incomplete exit, and cancellation pass. Owned child-process tests prove zero C connections and 348 parsed D responses; no LaminarDB process was contacted |
 
 Both cluster and no-feature `cargo check` and `cargo clippy -D warnings` configurations passed, as
 did formatting and diff checks. These focused results do not exercise keyed cluster restore.
@@ -734,6 +745,19 @@ logging, and stripped TOML input keeps substituted sentinels out of all downstre
 No socket-level observer, real cluster, workload, fault, latency A/B, backend, or independent soak
 was exercised. Loopback still limits this slice to co-located engineering use, and
 `certification_eligible` remains `false`.
+
+Cycle 65 also adds no empirical product sample. The root-workspace-excluded observer and owned
+Windows listeners exercised six bounded child-process cases: C with an open supervisor pipe and no
+connections; complete D with 348 parsed responses; incomplete D with serialized disposition and
+nonzero exit; bootstrap deadline; stalled-read cancellation; and unsupported-environment redaction.
+Loopback addressing is enforced, but fake-process identity is a property of the test-owned setup,
+not an executable attestation. The common sealed driver still uses its legacy dry-run observer, so
+network-mode non-feedback and result consumption remain open. No LaminarDB server, workload, fault,
+latency A/B, backend, or independent soak was exercised; `certification_eligible` remains `false`.
+The accelerated 58-slot execution is not evidence for the 0..285-second cadence or live diagnostic
+start-rate limit; those require a separately versioned paced integration path.
+Likewise, the process-local timing ledger cannot reveal records appended after the last poll and
+lost at restart; the fake result is not a durable-tail continuity certificate.
 
 These are admission and focused operator tests, not a production certification. No existing test
 demonstrates a distributed keyed operator processing remote rows through crash, restore, and

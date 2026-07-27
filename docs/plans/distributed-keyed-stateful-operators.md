@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 64
+- **Last reconciled:** 2026-07-27 during Cycle 65
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -261,6 +261,21 @@ changes. The no-cluster and cluster server matrices pass (238/238 and 316/316), 
 credential/alias/method matrix and reload success/failure paths. No observer or real-process HTTP
 run exists yet. The next bounded gate is a loopback fake-server observer protocol; multi-host
 transport, effect-estimation, powered equivalence, and the independent release soak remain later.
+
+Cycle 65 completes only that root-workspace-excluded loopback fake-protocol component. Typed stdin
+bootstrap, exact bounded HTTP parsing, restart/cursor/assignment validation, explicit
+incompleteness, cancellation, zero C sockets, and 348 successful D fake responses pass in unit and
+real-child tests. No LaminarDB process or workload was used, and configured loopback alone is not
+fake-process attestation. The sealed common driver has not yet been upgraded to launch and consume
+the network-mode observer; that fake-only non-feedback proof is the next gate. Runtime admission,
+TidesDB qualification, source/state/sink delivery, multi-host security, latency A/B, and the
+independent release soak remain open.
+
+The fake path accelerates all 58 logical slots and does not validate the 0..285-second cadence or
+the live server's per-process start limiter. A separately versioned paced integration contract is
+therefore required before any live request. Restart detection covers only unread records already
+advertised by the last observed page; an unobserved process-local tail requires durable
+continuity/handoff or an explicitly reviewed bounded observation interpretation before live use.
 
 ## Scope and non-goals
 

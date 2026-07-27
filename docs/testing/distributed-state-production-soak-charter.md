@@ -756,12 +756,66 @@ measurement, backend qualification, multi-host transport result, or independent 
 HTTP/checkpoint-RPC listener is still loopback-only when diagnostic authority is enabled, so only a
 co-located engineering topology is possible. `certification_eligible` remains `false`.
 
-Cycle 65 is limited to the observer's loopback fake-server protocol and secret-delivery boundary:
-a sanitized plan, a typed secret source with no console fallback, exact origin-form request
-construction, disabled proxy/redirect behavior, bounded connect/read/total deadlines and retries,
-strict response sizes/schemas, timing-page cursor/process transitions, cancellation, and proof that
-arm C opens zero connections. It must not contact LaminarDB or run an A/B. Native TLS/mTLS or a
-separate diagnostic listener remains a later prerequisite for multi-host and production-soak use.
+### Cycle 65 standalone loopback observer protocol
+
+Cycle 65 implements only the root-workspace-excluded fake-server protocol in `46b9c3fd` through
+`553c933d`. Sanitized-plan v2 is canonical JSON, capped at 64 KiB, and binds the base plan, exact
+58-slot schedule, three unique literal loopback socket addresses, and the frozen protocol policy.
+Result v2 carries a domain-separated hash of those exact canonical bytes. Bootstrap v3 reads one
+self-delimiting plan/secret frame rather than waiting for EOF; the executable bounds acquisition at
+two seconds. The 32-byte diagnostic secret is canonical unpadded base64url and exists only in that
+typed stdin channel and zeroized secret/request storage—not arguments, general environment, URL/query,
+plan, file, manifest, result, log, or fallback. On Windows the child retains only a nonempty
+absolute `SystemRoot`, empirically required for cross-process Winsock; every other environment entry
+is rejected without printing its name or value. Non-Windows children retain no environment.
+
+D uses direct `TcpStream` connections to the sanitized `SocketAddr`, so no DNS, proxy discovery, or
+redirect follow exists. It emits only the two exact origin-form GETs with one bearer header and
+`Connection: close`. Connect/write are capped at 250 ms, read idle at 2.25 s with 50 ms read polls,
+one logical request at 2.5 s across at most two attempts, one node/slot at 4.5 s and eight starts,
+and the fake run at 60 s. Timing collection permits six pages, 384 records, and 384 KiB per
+node/slot; headers are capped at 4 KiB, local evidence at 4 KiB, timing bodies at 64 KiB, and only 32
+detail events are retained. Redirects, transfer encoding, truncation, oversize data, unknown JSON,
+authority conflicts, cursor gaps, and eviction fail closed. A process restart also fails closed
+when the last observed page advertised an unread range. Records appended after the last poll and
+lost with the old process are unknowable from this process-local ledger. Run-global
+history keeps the owner-map/ABI digest plus vnode count separate from the
+complete assignment-certificate digest; conflicts fail within either domain, including across
+nodes, while intentional cross-domain inequality is accepted. Per-node assignment-version and
+checkpoint-ID high-water marks survive restart, every new process strictly advances assignment
+version, and a node cannot reuse an observed boot UUID within the bounded run.
+
+Exhausted transient probes and unread final pages produce a machine-readable `incomplete` result;
+page deferrals, unresolved nodes, transient failures, and dropped detail events have separate
+aggregate counters not limited by 32-event detail retention. The executable writes that result and
+then exits nonzero. A post-bootstrap stdin
+frame cancels the run; any complete same-length control word cancels fail-closed, and its content is
+not authenticated. Read cancellation is polled at 50 ms, while connect/write may defer observation
+up to their 250 ms caps. The generic framed-reader type has no clock; the two-second bootstrap bound
+belongs to the executable wrapper.
+
+Owned Windows loopback servers and the real observer child prove C completes with its supervisor
+pipe still open and makes zero connections; D completes 348 parsed responses, exactly 116 per
+endpoint, with exact alternating request bytes. Separate children prove serialized incomplete/nonzero
+behavior, an open-pipe bootstrap timeout, cancellation during one stalled connection, and redacted
+rejection of unsupported environment. Together with unit and supervisor tests, 31 tests pass and
+one subprocess fixture is intentionally ignored; formatting, warnings-denied Clippy, duplicate-
+dependency, and diff checks pass.
+
+This is fake-server protocol evidence, not a LaminarDB network sample. Loopback is enforced, but
+the executable cannot attest which process owns a supplied loopback address; the test harness owns
+the listeners used here. The sealed common driver still launches only the legacy dry-run observer,
+so it does not yet provision, cancel, validate, or consume result v2. The next gate is a fake-only
+consuming supervisor which proves network-mode observer outcomes cannot change the already sealed
+driver schedule. No live request is authorized before that passes. Native TLS/mTLS or a separate
+diagnostic listener remains required for multi-host and production-soak use, and no A/B, backend,
+runtime admission, delivery, latency, or certification status changes. The fake protocol also
+executes all 58 slots immediately and does not honor `at_ns`; it neither tests the 0..285-second
+wall-clock cadence nor LaminarDB's eight-starts-per-process/second diagnostic limiter. A separately
+versioned paced integration path is mandatory before any live request.
+Live use must also close the between-poll restart gap with durable continuity/handoff evidence or
+an explicitly reviewed bounded observation interpretation; this fake result is not proof that an
+unobserved old-process tail was preserved.
 
 ## Frozen numerical contract
 

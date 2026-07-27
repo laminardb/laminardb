@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 64
+- **Last reconciled:** 2026-07-27 during Cycle 65
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-64.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-65.md)
 
 ## Decision
 
@@ -1362,6 +1362,24 @@ passed with and without `cluster` (316 and 238 tests), as did warnings-denied Cl
 in-process boundary tests, not a live observer, A/B sample, backend result, multi-host transport, or
 production soak. The loopback fake-server observer protocol is the next gate; `[LDB-4007]`,
 `[LDB-0013]`, and production **NO-GO** remain unchanged.
+
+Cycle 65 implements only the standalone, root-workspace-excluded loopback protocol component in
+`46b9c3fd` through `553c933d`. A canonical sanitized-plan hash, typed stdin-only diagnostic secret,
+direct origin-form HTTP, strict bounded response/cursor validation, cross-restart identity history,
+explicit complete/incomplete results, a two-second bootstrap deadline, and supervisor cancellation
+are covered by owned fake servers and real child processes. D completed 348 parsed fake requests
+(116 per endpoint); C opened none. No LaminarDB process was contacted, and loopback addressing does
+not itself attest that a configured process is fake. The sealed common driver does not yet launch or
+consume this network-mode observer, so fake-protocol non-feedback is the next gate. No runtime,
+backend, admission, delivery, multi-host, A/B, latency, or soak conclusion changes; `[LDB-4007]`,
+`[LDB-0013]`, and production **NO-GO** remain unchanged. This fake path accelerates all 58 slots
+instead of honoring `at_ns`; a separately versioned paced integration path is required before any
+live request or server rate-limit claim.
+
+Restart-loss detection is limited to unread records advertised by the last observed timing page.
+Records appended to the process-local ledger after that poll and lost with the process are
+unknowable to this client. Live integration therefore also requires a durable continuity/handoff
+proof or an explicitly reviewed bounded interpretation of that observation gap.
 
 Selected attempts may then be joined at low cadence only through a new read-only, same-snapshot
 core audit of the exact outcome, both retention floors, and validated live capsule reference;

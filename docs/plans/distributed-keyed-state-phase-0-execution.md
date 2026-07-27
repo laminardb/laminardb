@@ -5,7 +5,7 @@
   pending a new official package; no runtime
   dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 64
+- **Last reconciled:** 2026-07-27 during Cycle 65
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -486,6 +486,23 @@ and watcher paths now retain every restart-only value across pure and mixed succ
 reloads. Full no-cluster and cluster server tests pass (238 and 316), with warnings-denied Clippy in
 both configurations. This authorizes only the next fake-server observer-protocol cycle: no live
 request, A/B, backend package, admission, delivery, multi-host transport, or soak gate changed.
+
+Cycle 65 completes that standalone fake-server protocol component in `46b9c3fd` through
+`553c933d`, still outside the root workspace and product runtime. It binds a canonical sanitized
+plan and stdin-provisioned diagnostic authority to bounded direct loopback requests, validates
+process/cursor/assignment history, rejects restart when the last observed timing page advertised
+unread evidence, reports
+incomplete collection explicitly, and supports bounded bootstrap and cancellation. Owned Windows
+fake servers prove zero C connections and a complete 348-response D child. This is not a LaminarDB
+HTTP sample: the tests own the loopback listeners, while the implementation enforces loopback but
+cannot attest process identity. The sealed driver still consumes only its old dry-run observer, so
+network-mode non-feedback and result consumption remain the next fake-only gate before any live
+request. Backend qualification, delivery, admission, multi-host transport, A/B, and independent
+soak status are unchanged. The fake path deliberately runs its 58 logical slots immediately; a
+separately versioned paced integration path must honor `at_ns` and the server start-rate limit
+before live polling can be authorized. Because the ledger is process-local, records appended after
+the last poll and then lost at restart remain unknowable; live integration also needs durable
+continuity/handoff or an explicitly reviewed bounded observation interpretation.
 
 The existing output path satisfies none of the new provenance/fence fields: it passes only a batch
 and deadline and uses an idempotent, non-transactional Kafka producer. The supported evidence APIs
