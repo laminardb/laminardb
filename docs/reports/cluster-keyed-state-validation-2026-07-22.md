@@ -105,6 +105,9 @@ integration blocker.
 consumer. Fresh invocation/result binding, bounded supervision, strict aggregate validation, and
 post-end-seal outcome consumption preserve byte-identical C/D plans and traces across success and
 hostile child paths. No live pacing, LaminarDB request, A/B, backend, delivery change, or soak ran.
+[Cycle 67](../reviews/distributed-keyed-state-cycle-67.md) is design-only. It freezes a distinct
+monotonic paced protocol, complete slot/transcript evidence, an observed-prefix timing claim, and
+separate single-host versus multi-host transport profiles. It runs no request or experiment.
 
 ## Verdict
 
@@ -689,6 +692,7 @@ The current branch's admission-neutral hardening was then checked separately:
 | Cycle 64 diagnostic-read boundary | PASS for in-process configuration, route, race, and reload tests; no real-process sample | Implements the disjoint immutable credential, exact two-route allowlist, post-auth permit/rate/deadline bounds, route-template logs, parse-input redaction, and restart-only reload retention; 238 no-cluster and 316 cluster tests pass |
 | Cycle 65 standalone observer protocol | PASS for the bounded fake-only component; live/driver integration blocked | Result v2 binds sanitized plan v2; bootstrap v3, strict direct HTTP/cursor/identity validation, explicit incomplete exit, and cancellation pass. Owned child-process tests prove zero C connections and 348 parsed D responses; no LaminarDB process was contacted |
 | Cycle 66 sealed fake-protocol supervisor | PASS for bounded fake-only consumption; live/production blocked | Bootstrap v4/result v3 add fresh invocation binding; the manifest-pinned child is captured, cancelled, and reaped within bounds, and its result is consumed only after the identical common end seal. 38 tests pass; no LaminarDB request or measurement ran |
+| Cycle 67 paced observer/evidence contract | DESIGN ONLY; live/production blocked | Freezes absolute monotonic pacing, parallel node lanes, cross-slot rate shaping, complete transcript evidence, observed-prefix timing coverage, launcher-prebound loopback sockets, and a separate future mTLS listener; no code, request, or measurement |
 
 Both cluster and no-feature `cargo check` and `cargo clippy -D warnings` configurations passed, as
 did formatting and diff checks. These focused results do not exercise keyed cluster restore.
@@ -769,6 +773,15 @@ fake result consumption after the same sealed trace, bounded failure cleanup, pa
 bootstrap deadlines, and absence of raw child streams from artifacts. Loopback ownership remains a
 harness property, the path still accelerates all slots, and no LaminarDB server, workload, fault,
 latency A/B, backend, delivery composition, or independent soak was exercised.
+
+Cycle 67 adds no empirical sample. Source audit shows that serial 4.5-second node budgets cannot fit
+the five-second cadence, per-slot connection caps do not protect the server's rolling window across
+slot boundaries, and a drained process-local timing page cannot reveal a later record/loss/in-flight
+guard erased by process death. The accepted contract uses parallel absolute node lanes, a persistent
+client rate shaper, and explicitly open/unsealed process-prefix coverage. It also rejects loopback
+address, gossip RPC address, current shared-name cluster mTLS, DNS, or PID alone as endpoint
+identity. No code, LaminarDB request, workload, fault, A/B, backend, delivery change, or independent
+soak ran; `certification_eligible` remains `false`.
 
 These are admission and focused operator tests, not a production certification. No existing test
 demonstrates a distributed keyed operator processing remote rows through crash, restore, and
