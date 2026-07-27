@@ -3,7 +3,7 @@
 - **Status:** Core reference implementation resumed; production qualification/certification paused;
   exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster operator is admitted
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Core Cycle 2
+- **Last reconciled:** 2026-07-27 during Core Cycle 3
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -40,28 +40,46 @@ through every phase; they are not a final cleanup sprint.
 
 The owner reset is recorded normatively in
 [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset).
-Cycle 69 and later certification work are paused. Core Cycles 1–2 add a private reference shard and
+Cycle 69 and later certification work are paused. Core Cycles 1–3 add a private reference shard and
 a fail-closed graph containment path: exact local lifecycle-roster and chain preflight,
 deterministic callbacks, delayed activation, sticky poison after indeterminate mutation, boot-cut
-validation, predecessor-authority repair, and control-only completion while source intake is
-closed. They do not change runtime admission.
+validation, predecessor-authority repair, control-only completion while source intake is closed,
+and an audited committed final-owner exit that does not invent a target participant. They do not
+change runtime admission.
 
-The next core lifecycle slice must replace the split staging maps with one complete transition
-identity and an authoritative operator/state-table roster, add prepare/publish/abort shadows and a
-real semantic install boundary for the SQL operator's `QueryState::Uninit` path, and authorize
-cleanup when a node loses its final vnode without inventing a target-assignment participant. It
-must also bound restore memory and pause time. Backend work does not block this slice. TidesDB
-re-entry and the upstream-contribution boundary are owned by the
+The next core lifecycle slice must replace the remaining split acquire/partial-revoke records with
+one complete transition identity and an authoritative operator/state-table roster, add
+prepare/publish/abort shadows and a real semantic install boundary for the SQL operator's
+`QueryState::Uninit` path, and bound restore memory and pause time. Backend work does not block this
+slice. TidesDB re-entry and the upstream-contribution boundary are owned by the
 [TidesDB design](../architecture-decisions/tidesdb-local-state-successor-design.md).
 
 **DKS-CLEANUP-001 — final maintainability gate.** The distributed keyed-state feature maintainer
-owns this gate. Trigger it after the core lifecycle and backend implementation are functionally
-complete and before any stateful admission or production qualification. Completion requires
-removing or explicitly product-owning paused soak/evidence surfaces, obsolete candidate jobs/tools
-and stale research narrative; splitting oversized production/test modules along runtime ownership;
-correcting ambiguous names; wiring or deleting release-dead state modules; and passing both feature
-matrices, warnings-denied Clippy, focused fault tests, dead-code search, and independent human
-review. This gate does not resume paused certification or soak execution.
+owns this gate. Low-risk cleanup lands as each core slice stabilizes; the final sweep runs after the
+core lifecycle and backend implementation are functionally complete and before any stateful
+admission or production qualification. Its ordered inventory is:
+
+1. remove the parked redb prescreen/qualification lane, required-CI dependency, and oversized
+   parked protocol document, retaining only a short alternatives-considered decision;
+2. remove or explicitly product-own the excluded `distributed-state-ab` fake observer and the
+   certification-only collectors mixed into `cluster_soak.rs`; preserve the independent soak as a
+   later release gate, not production helper code;
+3. decide the checkpoint timing ledger, diagnostic credential, and HTTP evidence routes as one
+   operational product surface—either give the whole slice stable security/operations ownership or
+   remove it;
+4. wire into a real runtime consumer or delete the release-dead `artifact_v1`, `managed_v1`,
+   `vnode_partial/v2`, and unused partition-schema models before admission;
+5. make the operator capability inventory authoritative or remove its duplicate SQL classification;
+6. rename rehydration/staging and dry-run/legacy APIs by actual semantics, narrow test-only public
+   hooks, and split DB assignment, graph transition, and their large test modules by runtime owner;
+7. benchmark the empty transition path and cache shuffle routing codecs/schema work before changing
+   hot-path locking or allocation.
+
+Completion requires both feature matrices, warnings-denied Clippy, focused fault tests, dead/public
+API search, documentation-link checks, latency/resource evidence for touched hot paths, and
+independent human review for AI slop, overengineering, unused code, production readiness,
+documentation, and tests. Git preserves discarded experiments; maintained documentation keeps only
+current decisions and evidence. This gate does not resume paused certification or soak execution.
 
 The Cycle 20 [working-state placement analysis](../reports/state-working-state-options-2026-07-24.md)
 separates the capability from a named engine but does not change sequencing authority. Phase 1

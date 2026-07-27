@@ -9,10 +9,13 @@
 **2026-07-27 core update:** The
 [ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset)
 pauses later certification tooling. Core Cycle 1 adds a private reference managed vnode shard and
-caller-supplied lifecycle publication. Core Cycle 2 contains the existing runtime staging path with
-exact local roster/chain preflight, deterministic callbacks, delayed activation, sticky poison,
-boot-target validation, and predecessor-authority repair. It does not consume the managed
-reference, add TidesDB, make SQL restore atomically publishable, or relax `[LDB-4007]`.
+caller-supplied lifecycle publication. Core Cycles 2–3 contain the existing runtime staging path
+with exact local roster/chain preflight, deterministic callbacks, delayed activation, sticky
+poison, boot-target validation, predecessor-authority repair, and an audited committed final-owner
+revoke when the live local process has the committed predecessor boot incarnation and is absent
+from the target assignment. Recovery authority, no-store adoption, abort, and unaudited
+transitions cannot authorize that cleanup. These cycles do not consume the managed reference, add
+TidesDB, make SQL restore atomically publishable, or relax `[LDB-4007]`.
 
 **Current authority:** the [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
 selects the official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb`, as the intended
@@ -671,6 +674,10 @@ The current branch's admission-neutral hardening was then checked separately:
 
 | Current-branch check | Result | Evidence |
 |---|---:|---|
+| Core Cycle 3 `operator_graph::tests` with cluster | PASS, 111/111 | Full graph unit module after opaque final-exit authority, rotation-fence, endpoint, restore-drift, assignment-drift, callback-failure, and sticky-poison checks |
+| Core Cycle 3 `final_owner_exit` focused filter | PASS, 8/8 | Audited committed last-vnode cleanup succeeds only for the exact predecessor/target identity and retains staging on every indeterminate result |
+| `snapshot_watcher_handles_draining_phase` multi-node integration | PASS, 1/1 | A zero-vnode follower completes committed revoke without polling its source, remains intake-fenced and non-authoritative, and exposes inactive transport endpoints; not an independent soak |
+| Core Cycle 3 feature/lint matrices | PASS | `cargo check` and warnings-denied Clippy pass with no default features and with `cluster`; formatting and diff checks pass |
 | `state::partition_key::tests` | PASS, 15/15 | Typed row/hash/vnode ABI plus bounded routing-only schema identity, every admitted family golden, alias/order/nullability policy, dictionary hydration, and exact resource/type gates |
 | `cargo test -p laminar-core --lib` | PASS, 562/562 | Complete core library regression set after the Cycle 3 safety follow-up |
 | Generic strict IPC experiment | REMOVED after review | Arrow 57.2 parses attacker-declared lengths too early; artifact-specific preflight, a global encoded-byte charge, and separate task/global scratch charges remain explicit Phase 0 blockers |
