@@ -28,6 +28,7 @@ mod artifact_v1;
 mod checkpoints;
 mod compile;
 mod keys;
+mod managed_v1;
 mod scalar_ipc;
 pub(crate) use checkpoints::{
     query_fingerprint, query_fingerprint_with_config, AggStateCheckpoint, EmittedCheckpoint,

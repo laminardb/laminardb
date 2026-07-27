@@ -5,7 +5,13 @@
 
 // Temporary reader-first compatibility seam. DKS-P1-001 owns removal of this allowance in the
 // first trusted manifest-selected restore-composition commit, before any capability advertisement.
-#![cfg_attr(not(test), allow(dead_code))]
+#![cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "DKS-P1-001: remove at trusted manifest-selected restore integration"
+    )
+)]
 
 use std::num::NonZeroU32;
 
@@ -24,7 +30,7 @@ const ARTIFACT_HEADER_LEN: usize = 384;
 const STATE_CODEC_ID: u32 = 1;
 const STATE_CODEC_VERSION: u16 = 1;
 const KEY_MODE_VNODE_KEYED: u8 = 1;
-const STATE_WIDTH: usize = 24;
+pub(super) const STATE_WIDTH: usize = 24;
 const MAX_SQL_COUNT: u64 = i64::MAX.unsigned_abs();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,7 +62,6 @@ pub(super) enum ArtifactError {
     Limit(&'static str),
     #[error("managed aggregate artifact arithmetic overflow")]
     ArithmeticOverflow,
-    #[cfg(test)]
     #[error("managed aggregate artifact allocation failed")]
     Allocation,
     #[error("COUNT(*) overflow")]
@@ -157,7 +162,6 @@ impl CountSumStateV1 {
         Ok(())
     }
 
-    #[cfg(test)]
     fn encode(self) -> Result<[u8; STATE_WIDTH], ArtifactError> {
         self.validate_persisted()?;
         let mut bytes = [0; STATE_WIDTH];
@@ -194,6 +198,10 @@ impl AggregateContractV1 {
         }
     }
 
+    pub(super) fn matches_routing_schema(self, routing_schema: &PartitionKeySchemaV1) -> bool {
+        self.routing_schema_sha256 == routing_schema.sha256()
+    }
+
     fn encode(self) -> [u8; CONTRACT_LEN] {
         let mut bytes = [0; CONTRACT_LEN];
         bytes[0..8].copy_from_slice(CONTRACT_MAGIC);
@@ -217,7 +225,7 @@ impl AggregateContractV1 {
         bytes
     }
 
-    fn validate_state(self, state: CountSumStateV1) -> Result<(), ArtifactError> {
+    pub(super) fn validate_state(self, state: CountSumStateV1) -> Result<(), ArtifactError> {
         state.validate_persisted()?;
         if !self.sum_input_nullable && state.sum_non_null_count != state.count {
             return Err(ArtifactError::Invalid("non-null SUM count"));
@@ -387,7 +395,6 @@ impl<'a> Iterator for DecodedRows<'a> {
     }
 }
 
-#[cfg(test)]
 pub(super) fn encode(
     context: ArtifactContext<'_>,
     rows: &[AggregateRow<'_>],
@@ -518,7 +525,6 @@ pub(super) fn encode(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(test)]
 fn write_header(
     output: &mut [u8],
     context: ArtifactContext<'_>,
@@ -867,7 +873,6 @@ fn field<const N: usize>(bytes: &[u8], start: usize) -> Result<[u8; N], Artifact
         .ok_or(ArtifactError::Truncated)
 }
 
-#[cfg(test)]
 fn put(output: &mut [u8], start: usize, value: &[u8]) -> Result<(), ArtifactError> {
     let end = start
         .checked_add(value.len())

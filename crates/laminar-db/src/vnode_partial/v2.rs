@@ -6,7 +6,13 @@
 
 // Temporary reader-first compatibility seam. DKS-P1-001 owns removal of this allowance in the
 // first trusted manifest-selected restore-composition commit, before any capability advertisement.
-#![cfg_attr(not(test), allow(dead_code))]
+#![cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "DKS-P1-001: remove at trusted manifest-selected restore integration"
+    )
+)]
 
 use std::cmp::Ordering;
 
