@@ -3,7 +3,7 @@
 - **Status:** Core reference implementation resumed; production qualification/certification paused;
   exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster operator is admitted
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Core Cycle 1
+- **Last reconciled:** 2026-07-27 during Core Cycle 2
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -40,18 +40,28 @@ through every phase; they are not a final cleanup sprint.
 
 The owner reset is recorded normatively in
 [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset).
-Cycle 69 and later certification work are paused; Core Cycle 1 is limited to a private,
-reference-only managed vnode shard plus caller-supplied lifecycle-batch publication and does not
-change runtime admission.
+Cycle 69 and later certification work are paused. Core Cycles 1–2 add a private reference shard and
+a fail-closed graph containment path: exact local lifecycle-roster and chain preflight,
+deterministic callbacks, delayed activation, sticky poison after indeterminate mutation, boot-cut
+validation, predecessor-authority repair, and control-only completion while source intake is
+closed. They do not change runtime admission.
 
-The next core lifecycle slice integrates complete-batch multi-vnode restore preparation and
-activation into the graph. The private reference validates every supplied participant before an
-allocation-free publication loop, but it has no authoritative roster and the current graph still
-drains and applies staged vnodes sequentially. Until the graph owner validates roster completeness
-and uses this lifecycle shape, a post-mutation apply failure remains recovery-required. Backend
-work does not block this slice. TidesDB re-entry and the upstream-contribution boundary are owned by
-the
+The next core lifecycle slice must replace the split staging maps with one complete transition
+identity and an authoritative operator/state-table roster, add prepare/publish/abort shadows and a
+real semantic install boundary for the SQL operator's `QueryState::Uninit` path, and authorize
+cleanup when a node loses its final vnode without inventing a target-assignment participant. It
+must also bound restore memory and pause time. Backend work does not block this slice. TidesDB
+re-entry and the upstream-contribution boundary are owned by the
 [TidesDB design](../architecture-decisions/tidesdb-local-state-successor-design.md).
+
+**DKS-CLEANUP-001 — final maintainability gate.** The distributed keyed-state feature maintainer
+owns this gate. Trigger it after the core lifecycle and backend implementation are functionally
+complete and before any stateful admission or production qualification. Completion requires
+removing or explicitly product-owning paused soak/evidence surfaces, obsolete candidate jobs/tools
+and stale research narrative; splitting oversized production/test modules along runtime ownership;
+correcting ambiguous names; wiring or deleting release-dead state modules; and passing both feature
+matrices, warnings-denied Clippy, focused fault tests, dead-code search, and independent human
+review. This gate does not resume paused certification or soak execution.
 
 The Cycle 20 [working-state placement analysis](../reports/state-working-state-options-2026-07-24.md)
 separates the capability from a named engine but does not change sequencing authority. Phase 1

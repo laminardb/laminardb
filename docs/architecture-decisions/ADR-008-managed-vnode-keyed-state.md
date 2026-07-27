@@ -3,7 +3,7 @@
 - **Status:** Proposed; core reference implementation resumed, production qualification paused,
   and cluster admission unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Core Cycle 1
+- **Last reconciled:** 2026-07-27 during Core Cycle 2
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -14,7 +14,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-66.md)
+  [latest core review](../reviews/distributed-keyed-state-core-cycle-02.md)
 
 ## Decision
 
@@ -53,6 +53,21 @@ upstream to the official repository; PR-local build/tests are permitted only ins
 one-local-machine-hour cap and are not candidate qualification. LaminarDB does not depend on that
 fork. The canonical contribution and re-entry rules live in the
 [TidesDB design](tidesdb-local-state-successor-design.md).
+
+Core Cycle 2 adds runtime containment, not operator admission. Assignment adoption and startup now
+stage vnode work under the assignment/rotation fences; the graph preflights the complete locally
+owned/restoring batch before deterministic callbacks, delays activation until callbacks and exact
+assignment/transport revalidation succeed, and poisons the graph generation after an indeterminate
+callback. A fenced coordinator may run only this control transition without admitting source rows,
+and the watcher repairs an audited predecessor certificate before a newer assignment can proceed.
+
+This is still not the Phase 1 lifecycle. The staged record lacks a complete attempt/target
+certificate and authoritative operator/state-table roster; callbacks are not prepare/publish/abort;
+the SQL operator's `QueryState::Uninit` path has no semantic install boundary; full-batch decode has
+no production memory/pause bound; and a node losing its final vnode cannot use the target owner-only
+transport certificate to authorize local revoke cleanup. These gaps, source/state/sink delivery composition,
+tail-latency evidence, backend qualification, and independent soak keep `[LDB-4007]`, `[LDB-0013]`,
+and production **NO-GO** unchanged.
 
 The provider-neutral Rust `object_store` path retains local file, S3, GCS, and Azure builders.
 Cluster authority comes only from the exact checkpoint/state handles admitted by verified namespace

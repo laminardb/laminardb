@@ -8,9 +8,11 @@
 
 **2026-07-27 core update:** The
 [ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset)
-pauses later certification tooling. Core Cycle 1 adds only a private reference managed vnode shard
-and caller-supplied lifecycle-batch publication; it does not add TidesDB, wire a graph operator, or
-relax `[LDB-4007]`.
+pauses later certification tooling. Core Cycle 1 adds a private reference managed vnode shard and
+caller-supplied lifecycle publication. Core Cycle 2 contains the existing runtime staging path with
+exact local roster/chain preflight, deterministic callbacks, delayed activation, sticky poison,
+boot-target validation, and predecessor-authority repair. It does not consume the managed
+reference, add TidesDB, make SQL restore atomically publishable, or relax `[LDB-4007]`.
 
 **Current authority:** the [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
 selects the official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb`, as the intended

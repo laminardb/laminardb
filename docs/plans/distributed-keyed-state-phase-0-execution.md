@@ -6,7 +6,7 @@
   dependency, backend qualification evidence, independent production-soak result, or admission
   change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Core Cycle 1
+- **Last reconciled:** 2026-07-27 during Core Cycle 2
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -27,6 +27,10 @@ smaller owner-approved entry gate. This phase does not add a state backend to th
 The [2026-07-27 ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset)
 pauses Cycle 69 and later certification work and authorizes only the private reference core slice.
 It is not Phase 0 completion, backend qualification, or permission to execute a candidate.
+
+Core Cycle 2 adds a fail-closed runtime containment path for staged local vnode transitions. It
+does not consume the managed reference, provide atomic shadow publication, bind artifacts to the
+complete target certificate/roster, solve final-vnode-loss cleanup, or authorize a stateful query.
 
 The phase is complete only when maintainers can answer, with versioned evidence:
 
