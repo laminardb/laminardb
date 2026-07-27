@@ -4,7 +4,7 @@
 //! It proves request construction, authority delivery, response validation, and cursor behavior;
 //! it does not authorize a live cluster request or produce A/B evidence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -26,6 +26,7 @@ use crate::{
 pub const SANITIZED_PLAN_SCHEMA: &str = "laminardb-observer-sanitized-plan/v2";
 pub const PROTOCOL_RESULT_SCHEMA: &str = "laminardb-observer-loopback-fake-protocol/v1";
 pub const SUPERVISOR_BOOTSTRAP_PREFIX: &[u8] = b"LAMINARDB_AB_OBSERVER_BOOTSTRAP_V2\n";
+pub const SUPERVISOR_CANCEL_BYTES: &[u8] = b"LAMINARDB_AB_OBSERVER_CANCEL_V1\n";
 
 const MAX_SANITIZED_PLAN_BYTES: usize = 64 * 1_024;
 const DIAGNOSTIC_SECRET_ENCODED_BYTES: usize = 43;
@@ -37,7 +38,8 @@ const TIMING_SCHEMA: &str = "laminardb-local-checkpoint-barrier-timings/v1";
 const PARTITIONING_ABI_VERSION: u16 = 1;
 const TIMING_LEDGER_CAPACITY: usize = 1_024;
 const MAX_TIMING_PAGE_RECORDS: usize = 64;
-const MAX_ASSIGNMENT_DIGESTS_PER_PROCESS: usize = 1_024;
+const MAX_ASSIGNMENT_DIGESTS_PER_NODE_RUN: usize = 1_024;
+const MAX_PROCESS_GENERATIONS_PER_NODE_RUN: usize = EXPECTED_OBSERVER_SLOTS * 2;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
@@ -123,11 +125,16 @@ pub struct SanitizedObserverPlanV2 {
 #[derive(Debug, Clone)]
 pub struct ValidatedSanitizedObserverPlanV2 {
     plan: SanitizedObserverPlanV2,
+    canonical_sha256: String,
 }
 
 impl ValidatedSanitizedObserverPlanV2 {
     pub fn plan(&self) -> &SanitizedObserverPlanV2 {
         &self.plan
+    }
+
+    pub fn canonical_sha256(&self) -> &str {
+        &self.canonical_sha256
     }
 }
 
@@ -166,7 +173,10 @@ pub fn validate_sanitized_plan_bytes(
     if canonical != bytes {
         return Err(ObserverProtocolError::new(ProtocolFailureKind::InvalidPlan));
     }
-    validate_sanitized_plan(plan).map(|plan| ValidatedSanitizedObserverPlanV2 { plan })
+    validate_sanitized_plan(plan).map(|plan| ValidatedSanitizedObserverPlanV2 {
+        plan,
+        canonical_sha256: domain_hash(b"laminardb-observer-sanitized-plan/v2\0", &canonical),
+    })
 }
 
 fn validate_sanitized_plan(
@@ -327,68 +337,58 @@ pub struct ProvisionedObserverInput {
 
 impl<R: Read> SupervisorBootstrapSource<R> {
     pub fn take(&mut self) -> Result<ProvisionedObserverInput, ObserverProtocolError> {
-        let reader = self.reader.take().ok_or_else(|| {
+        let mut reader = self.reader.take().ok_or_else(|| {
             ObserverProtocolError::new(ProtocolFailureKind::SecretAlreadyConsumed)
         })?;
-        let maximum = SUPERVISOR_BOOTSTRAP_PREFIX
-            .len()
-            .checked_add(4)
-            .and_then(|size| size.checked_add(MAX_SANITIZED_PLAN_BYTES))
-            .and_then(|size| size.checked_add(DIAGNOSTIC_SECRET_ENCODED_BYTES + 1))
-            .ok_or_else(|| ObserverProtocolError::new(ProtocolFailureKind::InvalidBootstrap))?;
-        let mut frame = Vec::with_capacity(maximum.min(8 * 1_024));
-        let read_result = reader.take((maximum + 1) as u64).read_to_end(&mut frame);
-        if read_result.is_err() || frame.len() > maximum {
-            frame.zeroize();
-            return Err(ObserverProtocolError::new(
-                ProtocolFailureKind::InvalidBootstrap,
-            ));
+        let invalid = || ObserverProtocolError::new(ProtocolFailureKind::InvalidBootstrap);
+        let mut prefix = vec![0_u8; SUPERVISOR_BOOTSTRAP_PREFIX.len()];
+        if reader.read_exact(&mut prefix).is_err() || prefix != SUPERVISOR_BOOTSTRAP_PREFIX {
+            prefix.zeroize();
+            return Err(invalid());
         }
-        let parsed = parse_bootstrap_frame(&frame);
-        frame.zeroize();
-        parsed
-    }
-}
+        prefix.zeroize();
 
-fn parse_bootstrap_frame(frame: &[u8]) -> Result<ProvisionedObserverInput, ObserverProtocolError> {
-    let invalid = || ObserverProtocolError::new(ProtocolFailureKind::InvalidBootstrap);
-    if !frame.starts_with(SUPERVISOR_BOOTSTRAP_PREFIX) {
-        return Err(invalid());
-    }
-    let length_start = SUPERVISOR_BOOTSTRAP_PREFIX.len();
-    let length_end = length_start.checked_add(4).ok_or_else(invalid)?;
-    let length_bytes: [u8; 4] = frame
-        .get(length_start..length_end)
-        .ok_or_else(invalid)?
-        .try_into()
-        .map_err(|_| invalid())?;
-    let plan_len = usize::try_from(u32::from_be_bytes(length_bytes)).map_err(|_| invalid())?;
-    if plan_len == 0 || plan_len > MAX_SANITIZED_PLAN_BYTES {
-        return Err(invalid());
-    }
-    let plan_end = length_end.checked_add(plan_len).ok_or_else(invalid)?;
-    let secret_end = plan_end
-        .checked_add(DIAGNOSTIC_SECRET_ENCODED_BYTES)
-        .ok_or_else(invalid)?;
-    if frame.len() != secret_end + 1 || frame.get(secret_end) != Some(&b'\n') {
-        return Err(invalid());
-    }
-    let plan = validate_sanitized_plan_bytes(frame.get(length_end..plan_end).ok_or_else(invalid)?)?;
-    let secret = DiagnosticReadSecret::from_provisioned_bytes(
-        frame.get(plan_end..secret_end).ok_or_else(invalid)?,
-    )
-    .map_err(|error| match error {
-        SecretSourceError::Unavailable => {
-            ObserverProtocolError::new(ProtocolFailureKind::SecretUnavailable)
+        let mut length_bytes = [0_u8; 4];
+        if reader.read_exact(&mut length_bytes).is_err() {
+            return Err(invalid());
         }
-        SecretSourceError::Invalid => {
-            ObserverProtocolError::new(ProtocolFailureKind::InvalidSecret)
+        let plan_len = usize::try_from(u32::from_be_bytes(length_bytes)).map_err(|_| invalid())?;
+        if plan_len == 0 || plan_len > MAX_SANITIZED_PLAN_BYTES {
+            return Err(invalid());
         }
-        SecretSourceError::AlreadyConsumed => {
-            ObserverProtocolError::new(ProtocolFailureKind::SecretAlreadyConsumed)
+        let mut plan_bytes = vec![0_u8; plan_len];
+        if reader.read_exact(&mut plan_bytes).is_err() {
+            plan_bytes.zeroize();
+            return Err(invalid());
         }
-    })?;
-    Ok(ProvisionedObserverInput { plan, secret })
+        let plan_result = validate_sanitized_plan_bytes(&plan_bytes);
+        plan_bytes.zeroize();
+        let plan = plan_result?;
+
+        let mut secret_bytes = [0_u8; DIAGNOSTIC_SECRET_ENCODED_BYTES];
+        if reader.read_exact(&mut secret_bytes).is_err() {
+            secret_bytes.zeroize();
+            return Err(invalid());
+        }
+        let secret_result = DiagnosticReadSecret::from_provisioned_bytes(&secret_bytes);
+        secret_bytes.zeroize();
+        let secret = secret_result.map_err(|error| match error {
+            SecretSourceError::Unavailable => {
+                ObserverProtocolError::new(ProtocolFailureKind::SecretUnavailable)
+            }
+            SecretSourceError::Invalid => {
+                ObserverProtocolError::new(ProtocolFailureKind::InvalidSecret)
+            }
+            SecretSourceError::AlreadyConsumed => {
+                ObserverProtocolError::new(ProtocolFailureKind::SecretAlreadyConsumed)
+            }
+        })?;
+        let mut terminator = [0_u8; 1];
+        if reader.read_exact(&mut terminator).is_err() || terminator != [b'\n'] {
+            return Err(invalid());
+        }
+        Ok(ProvisionedObserverInput { plan, secret })
+    }
 }
 
 pub fn write_supervisor_bootstrap<W: Write>(
@@ -461,6 +461,7 @@ pub struct ObserverProtocolResultV1 {
     pub notice: String,
     pub execution_eligible: bool,
     pub arm: Arm,
+    pub sanitized_plan_sha256: String,
     pub base_plan_sha256: String,
     pub observer_schedule_sha256: String,
     pub scheduled_slots: u32,
@@ -471,7 +472,18 @@ pub struct ObserverProtocolResultV1 {
     pub transient_failures: u32,
     pub process_transitions: u32,
     pub timing_records: u64,
+    pub page_budget_deferrals: u32,
+    pub unresolved_timing_nodes: u8,
+    pub retained_events_dropped: u32,
+    pub disposition: ProtocolDispositionV1,
     pub retained_events: Vec<ObserverProtocolEventV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolDispositionV1 {
+    Complete,
+    Incomplete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -695,7 +707,6 @@ struct TimingState {
     metadata: Option<TimingMetadata>,
     last_checkpoint_id: Option<u64>,
     last_assignment_version: Option<u64>,
-    assignment_digests: BTreeMap<u64, [u8; 32]>,
 }
 
 impl TimingState {
@@ -708,6 +719,8 @@ impl TimingState {
 struct NodeProtocolState {
     stable_node_id: Option<u64>,
     authority: Option<AuthorityState>,
+    seen_boot_incarnations: BTreeSet<Uuid>,
+    assignment_digests: BTreeMap<u64, [u8; 32]>,
     timing: TimingState,
 }
 
@@ -767,15 +780,46 @@ impl NodeProtocolState {
                 AuthorityTransition::Stable
             }
             Some(previous) => {
-                if process.boot_incarnation == previous.process.boot_incarnation
+                if self
+                    .seen_boot_incarnations
+                    .contains(&process.boot_incarnation)
                     || process.process_term <= previous.process.process_term
                 {
                     return Err(ProtocolFailureKind::ProcessIdentityConflict);
                 }
-                self.timing.reset();
+                if next.assignment_version < previous.assignment_version {
+                    return Err(ProtocolFailureKind::InvalidLocalEvidence);
+                }
                 AuthorityTransition::Restarted
             }
         };
+        let new_boot = !self
+            .seen_boot_incarnations
+            .contains(&process.boot_incarnation);
+        if new_boot && self.seen_boot_incarnations.len() == MAX_PROCESS_GENERATIONS_PER_NODE_RUN {
+            return Err(ProtocolFailureKind::EvidenceLoss);
+        }
+        if self
+            .assignment_digests
+            .get(&next.assignment_version)
+            .is_some_and(|digest| digest != &next.assignment_digest)
+        {
+            return Err(ProtocolFailureKind::InvalidLocalEvidence);
+        }
+        if !self
+            .assignment_digests
+            .contains_key(&next.assignment_version)
+            && self.assignment_digests.len() == MAX_ASSIGNMENT_DIGESTS_PER_NODE_RUN
+        {
+            return Err(ProtocolFailureKind::EvidenceLoss);
+        }
+        if transition == AuthorityTransition::Restarted {
+            self.timing.reset();
+        }
+        self.seen_boot_incarnations.insert(process.boot_incarnation);
+        self.assignment_digests
+            .entry(next.assignment_version)
+            .or_insert(next.assignment_digest);
         self.stable_node_id.get_or_insert(process.node_id);
         self.authority = Some(next);
         Ok(transition)
@@ -880,7 +924,6 @@ impl NodeProtocolState {
             let _role = record.role;
             let _deadline_exhausted = record.deadline_exhausted;
             if self
-                .timing
                 .assignment_digests
                 .get(&record.assignment_version)
                 .is_some_and(|digest| digest != &record.assignment_digest)
@@ -888,10 +931,9 @@ impl NodeProtocolState {
                 return Err(ProtocolFailureKind::InvalidTimingPage);
             }
             if !self
-                .timing
                 .assignment_digests
                 .contains_key(&record.assignment_version)
-                && self.timing.assignment_digests.len() == MAX_ASSIGNMENT_DIGESTS_PER_PROCESS
+                && self.assignment_digests.len() == MAX_ASSIGNMENT_DIGESTS_PER_NODE_RUN
             {
                 return Err(ProtocolFailureKind::EvidenceLoss);
             }
@@ -900,8 +942,7 @@ impl NodeProtocolState {
             {
                 return Err(ProtocolFailureKind::InvalidTimingPage);
             }
-            self.timing
-                .assignment_digests
+            self.assignment_digests
                 .entry(record.assignment_version)
                 .or_insert(record.assignment_digest);
             self.timing.last_assignment_version = Some(record.assignment_version);
@@ -974,6 +1015,7 @@ fn run_observer_protocol_inner(
     slot_limit: usize,
 ) -> Result<ObserverProtocolResultV1, ObserverProtocolError> {
     let ProvisionedObserverInput { plan, secret } = input;
+    let sanitized_plan_sha256 = plan.canonical_sha256().to_owned();
     let plan = plan.plan();
     let scheduled_slots = u32::try_from(plan.observer_schedule.slots.len())
         .map_err(|_| ObserverProtocolError::new(ProtocolFailureKind::InvalidPlan))?;
@@ -986,6 +1028,7 @@ fn run_observer_protocol_inner(
         notice: NOTICE.to_owned(),
         execution_eligible: false,
         arm,
+        sanitized_plan_sha256,
         base_plan_sha256: plan.base_plan_sha256.clone(),
         observer_schedule_sha256: plan.observer_schedule_sha256.clone(),
         scheduled_slots,
@@ -996,6 +1039,10 @@ fn run_observer_protocol_inner(
         transient_failures: 0,
         process_transitions: 0,
         timing_records: 0,
+        page_budget_deferrals: 0,
+        unresolved_timing_nodes: 0,
+        retained_events_dropped: 0,
+        disposition: ProtocolDispositionV1::Complete,
         retained_events: Vec::new(),
     };
     if arm.observer_mode() == crate::ObserverMode::Suppress {
@@ -1018,6 +1065,21 @@ fn run_observer_protocol_inner(
             )?;
             validate_distinct_node_ids(slot, endpoint.node_ordinal, &states)?;
         }
+    }
+    result.unresolved_timing_nodes = u8::try_from(
+        states
+            .iter()
+            .filter(|state| {
+                state
+                    .timing
+                    .metadata
+                    .is_some_and(|metadata| state.timing.cursor < metadata.next_sequence - 1)
+            })
+            .count(),
+    )
+    .map_err(|_| ObserverProtocolError::new(ProtocolFailureKind::EvidenceLoss))?;
+    if result.transient_failures != 0 || result.unresolved_timing_nodes != 0 {
+        result.disposition = ProtocolDispositionV1::Incomplete;
     }
     Ok(result)
 }
@@ -1075,6 +1137,7 @@ fn observe_node_slot(
     let mut conflict_recovered = false;
     loop {
         if pages == MAX_TIMING_PAGES_PER_SLOT {
+            result.page_budget_deferrals += 1;
             retain_event(
                 result,
                 slot,
@@ -1372,6 +1435,8 @@ fn retain_event(
             route,
             kind,
         });
+    } else {
+        result.retained_events_dropped += 1;
     }
 }
 
@@ -1997,9 +2062,8 @@ mod tests {
             endpoints,
             protocol: ObserverProtocolPolicyV2::FROZEN,
         };
-        ValidatedSanitizedObserverPlanV2 {
-            plan: validate_sanitized_plan(plan).unwrap(),
-        }
+        let bytes = serde_json::to_vec(&validate_sanitized_plan(plan).unwrap()).unwrap();
+        validate_sanitized_plan_bytes(&bytes).unwrap()
     }
 
     fn secret() -> DiagnosticReadSecret {
@@ -2154,6 +2218,7 @@ mod tests {
         let plan = validated_plan([servers[0].address, servers[1].address, servers[2].address]);
         let mut frame = Vec::new();
         write_supervisor_bootstrap(&mut frame, plan.plan(), &secret()).unwrap();
+        frame.extend_from_slice(SUPERVISOR_CANCEL_BYTES);
         let mut source = SupervisorBootstrapSource::new(frame.as_slice());
         let provisioned = source.take().unwrap();
         assert_eq!(
@@ -2174,6 +2239,8 @@ mod tests {
         assert_eq!(result.suppressed_probes, 348);
         assert_eq!(result.connection_attempts, 0);
         assert_eq!(result.parsed_responses, 0);
+        assert_eq!(result.disposition, ProtocolDispositionV1::Complete);
+        assert_eq!(result.sanitized_plan_sha256, plan.canonical_sha256());
         std::thread::sleep(Duration::from_millis(20));
         assert!(servers.iter().all(|server| server.connection_count() == 0));
 
@@ -2226,6 +2293,8 @@ mod tests {
         );
         assert_eq!(result.retries, 0);
         assert_eq!(result.timing_records, 0);
+        assert_eq!(result.disposition, ProtocolDispositionV1::Complete);
+        assert_eq!(result.unresolved_timing_nodes, 0);
         for (index, server) in servers.iter().enumerate() {
             assert_eq!(server.connection_count(), 116);
             let requests = server.requests();
@@ -2292,6 +2361,7 @@ mod tests {
             boot(1, 1)
         )));
         assert!(result.retained_events.is_empty());
+        assert_eq!(result.disposition, ProtocolDispositionV1::Complete);
     }
 
     #[test]
@@ -2516,6 +2586,8 @@ mod tests {
         assert_eq!(result.transient_failures, 1);
         assert_eq!(servers[0].connection_count(), 2);
         assert_eq!(result.retained_events.len(), 1);
+        assert_eq!(result.disposition, ProtocolDispositionV1::Incomplete);
+        assert_eq!(result.unresolved_timing_nodes, 0);
         drop(servers);
 
         let paging = FakeServer::spawn(move |_ordinal, request| {
@@ -2542,6 +2614,9 @@ mod tests {
         .unwrap();
         assert_eq!(result.timing_records, 384);
         assert_eq!(servers[0].connection_count(), 7);
+        assert_eq!(result.page_budget_deferrals, 1);
+        assert_eq!(result.unresolved_timing_nodes, 1);
+        assert_eq!(result.disposition, ProtocolDispositionV1::Incomplete);
         assert!(result
             .retained_events
             .iter()
@@ -2607,6 +2682,92 @@ mod tests {
     }
 
     #[test]
+    fn authority_history_rejects_digest_conflicts_regressions_and_reused_boots() {
+        let parse_local = |bytes: Vec<u8>| serde_json::from_slice(&bytes).unwrap();
+        let mut state = NodeProtocolState::default();
+        assert_eq!(
+            state
+                .apply_local_evidence(parse_local(local_evidence(1, 1)))
+                .unwrap(),
+            AuthorityTransition::Initial
+        );
+
+        let mut adoption_v2: Value = serde_json::from_slice(&local_evidence(1, 1)).unwrap();
+        adoption_v2["evidence"]["adopted_assignment"]["assignment_version"] = json!(2);
+        adoption_v2["evidence"]["adopted_assignment"]["assignment_digest"] = json!(vec![2; 32]);
+        state
+            .apply_local_evidence(serde_json::from_value(adoption_v2).unwrap())
+            .unwrap();
+        let mut conflicting_record = timing_record(1, 1, 1);
+        conflicting_record["assignment_digest"] = json!(vec![9; 32]);
+        let conflict: TimingEnvelopeWire =
+            serde_json::from_slice(&timing_page(1, 1, 0, vec![conflicting_record], 2, false))
+                .unwrap();
+        assert_eq!(
+            state.apply_timing_page(conflict).unwrap_err(),
+            ProtocolFailureKind::InvalidTimingPage
+        );
+
+        let mut state = NodeProtocolState::default();
+        state
+            .apply_local_evidence(parse_local(local_evidence(1, 1)))
+            .unwrap();
+        state
+            .apply_local_evidence(parse_local(local_evidence(1, 2)))
+            .unwrap();
+        let reused_boot = boot(1, 1);
+        let mut third: Value = serde_json::from_slice(&local_evidence(1, 3)).unwrap();
+        third["evidence"]["participant"]["boot_incarnation"] = json!(reused_boot);
+        third["evidence"]["adopted_assignment"]["participant"]["boot_incarnation"] =
+            json!(reused_boot);
+        assert_eq!(
+            state
+                .apply_local_evidence(serde_json::from_value(third).unwrap())
+                .unwrap_err(),
+            ProtocolFailureKind::ProcessIdentityConflict
+        );
+
+        let mut state = NodeProtocolState::default();
+        let mut first: Value = serde_json::from_slice(&local_evidence(1, 1)).unwrap();
+        first["evidence"]["adopted_assignment"]["assignment_version"] = json!(3);
+        first["evidence"]["adopted_assignment"]["assignment_digest"] = json!(vec![3; 32]);
+        state
+            .apply_local_evidence(serde_json::from_value(first).unwrap())
+            .unwrap();
+        assert_eq!(
+            state
+                .apply_local_evidence(parse_local(local_evidence(1, 2)))
+                .unwrap_err(),
+            ProtocolFailureKind::InvalidLocalEvidence
+        );
+    }
+
+    #[test]
+    fn retained_event_truncation_is_counted_without_changing_control_behavior() {
+        let servers = [success_server(1), success_server(2), success_server(3)];
+        let mut result = run_with_servers(
+            &servers,
+            Arm::PollingControl,
+            &ProtocolCancellation::default(),
+        )
+        .unwrap();
+        let slot = &observer_schedule().slots[0];
+        for _ in 0..MAX_RETAINED_EVENTS + 3 {
+            retain_event(
+                &mut result,
+                slot,
+                0,
+                DiagnosticRouteV1::LocalEvidence,
+                ProtocolEventKindV1::TransportUnavailable,
+            );
+        }
+        assert_eq!(result.retained_events.len(), MAX_RETAINED_EVENTS);
+        assert_eq!(result.retained_events_dropped, 3);
+        assert_eq!(result.disposition, ProtocolDispositionV1::Complete);
+        assert!(servers.iter().all(|server| server.connection_count() == 0));
+    }
+
+    #[test]
     fn bootstrap_and_endpoint_validation_have_no_secret_fallback() {
         assert_eq!(
             DiagnosticReadSecret::from_provisioned_bytes(b"console-token").unwrap_err(),
@@ -2616,9 +2777,9 @@ mod tests {
         let plan = validated_plan([servers[0].address, servers[1].address, servers[2].address]);
         let mut frame = Vec::new();
         write_supervisor_bootstrap(&mut frame, plan.plan(), &secret()).unwrap();
-        frame.push(b'x');
+        *frame.last_mut().unwrap() = b'x';
         let error = match SupervisorBootstrapSource::new(frame.as_slice()).take() {
-            Ok(_) => panic!("bootstrap with trailing bytes was accepted"),
+            Ok(_) => panic!("bootstrap with an invalid terminator was accepted"),
             Err(error) => error,
         };
         assert_eq!(error.kind, ProtocolFailureKind::InvalidBootstrap);

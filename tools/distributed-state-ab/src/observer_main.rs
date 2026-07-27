@@ -4,10 +4,12 @@ use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr as _;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use distributed_state_ab::observer_protocol::{
-    run_observer_protocol, ProtocolCancellation, SupervisorBootstrapSource,
+    run_observer_protocol, ProtocolCancellation, ProtocolDispositionV1, ProvisionedObserverInput,
+    SupervisorBootstrapSource, SUPERVISOR_CANCEL_BYTES,
 };
 use distributed_state_ab::{
     build_observer_result, seal_base_plan, validate_manifest_path, verify_current_executable, Arm,
@@ -15,10 +17,16 @@ use distributed_state_ab::{
 };
 
 fn main() -> ExitCode {
+    let failure_marker =
+        if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("fake-protocol")) {
+            "INVALID_OBSERVER_FAKE_PROTOCOL"
+        } else {
+            "INVALID_OBSERVER_DRY_RUN"
+        };
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{NOTICE}: INVALID_OBSERVER_DRY_RUN {error}");
+            eprintln!("{NOTICE}: {failure_marker} {error}");
             ExitCode::from(2)
         }
     }
@@ -101,16 +109,70 @@ fn run_fake_protocol(
             .ok_or_else(|| "arm is not valid Unicode".to_owned())?,
     )
     .map_err(|error| error.to_string())?;
-    let stdin = std::io::stdin();
-    let mut source = SupervisorBootstrapSource::new(stdin.lock());
-    let input = source.take().map_err(|error| error.to_string())?;
-    let result = run_observer_protocol(input, arm, &ProtocolCancellation::default())
-        .map_err(|error| error.to_string())?;
+    let input = receive_supervisor_bootstrap()?;
+    let cancellation = ProtocolCancellation::default();
+    spawn_cancellation_listener(cancellation.clone())?;
+    let result =
+        run_observer_protocol(input, arm, &cancellation).map_err(|error| error.to_string())?;
     serde_json::to_writer(std::io::stdout().lock(), &result)
         .map_err(|error| format!("write observer protocol result: {error}"))?;
     std::io::stdout()
         .flush()
-        .map_err(|error| format!("flush observer protocol result: {error}"))
+        .map_err(|error| format!("flush observer protocol result: {error}"))?;
+    if result.disposition == ProtocolDispositionV1::Incomplete {
+        return Err("observer protocol collection was incomplete".to_owned());
+    }
+    Ok(())
+}
+
+fn receive_supervisor_bootstrap() -> Result<ProvisionedObserverInput, String> {
+    const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("observer-bootstrap".to_owned())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            let mut source = SupervisorBootstrapSource::new(stdin.lock());
+            let _ignored = sender.send(source.take());
+        })
+        .map_err(|_| "start supervisor bootstrap reader".to_owned())?;
+    match receiver.recv_timeout(BOOTSTRAP_TIMEOUT) {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(RecvTimeoutError::Timeout) => Err("supervisor bootstrap deadline exceeded".to_owned()),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err("supervisor bootstrap reader terminated".to_owned())
+        }
+    }
+}
+
+fn spawn_cancellation_listener(cancellation: ProtocolCancellation) -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("observer-cancellation".to_owned())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            let mut reader = stdin.lock();
+            let mut control = [0_u8; SUPERVISOR_CANCEL_BYTES.len()];
+            let mut observed = 0_usize;
+            while observed < control.len() {
+                match reader.read(&mut control[observed..]) {
+                    Ok(0) if observed == 0 => return,
+                    Ok(0) => {
+                        cancellation.cancel();
+                        return;
+                    }
+                    Ok(read) => observed += read,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => {
+                        cancellation.cancel();
+                        return;
+                    }
+                }
+            }
+            // The documented frame cancels; any same-length invalid control also cancels fail-closed.
+            cancellation.cancel();
+        })
+        .map(|_handle| ())
+        .map_err(|_| "start supervisor cancellation reader".to_owned())
 }
 
 fn wait_for_start_signal() -> Result<(), String> {
