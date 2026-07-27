@@ -10,6 +10,10 @@
 
 ### Removed
 
+- Removed the public `VnodeRehydrator` and `VnodeRehydration` APIs. Direct callers could restore
+  from a backend-selected seal without the committed recovery-capsule authority used by cluster
+  recovery. Vnode restore is now an internal, authority-pinned lifecycle operation; there is no
+  public replacement in 0.28.
 - Removed the experimental tiered-state feature and configuration. Its demotion path could clear
   vnode dirtiness before a checkpoint was durable, then replace newer live groups with bytes from
   the prior durable checkpoint after an attempt failed. It is not a safe keyed-state foundation.

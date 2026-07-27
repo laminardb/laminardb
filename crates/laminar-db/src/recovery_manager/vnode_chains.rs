@@ -6,138 +6,12 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
-use laminar_core::state::{
-    CheckpointAttempt, CheckpointSealInventory, SealedVnodePartial, StateBackend,
-};
+use laminar_core::state::{CheckpointAttempt, CheckpointSealInventory, StateBackend};
 use tracing::{debug, info};
 
 use crate::error::DbError;
 
 const VNODE_CHAIN_LOAD_CONCURRENCY: usize = 32;
-
-type SealedPartialKey = (CheckpointAttempt, u32);
-
-#[derive(Debug)]
-struct SealedPartialRead {
-    attestation: SealedVnodePartial,
-    bytes: tokio::sync::OnceCell<Bytes>,
-}
-
-#[derive(Default)]
-struct PayloadBudgetState {
-    reserved_bytes: u64,
-    reads: HashMap<SealedPartialKey, Arc<SealedPartialRead>>,
-}
-
-/// Reader-local admission budget for unique sealed payloads.
-///
-/// This bounds the sum of sealed payload lengths admitted by one chain load. It is not an RSS
-/// bound: object envelopes, decoded values, allocator overhead, and alignment copies are outside
-/// this accounting.
-struct UniquePayloadBudget {
-    limit_bytes: u64,
-    state: parking_lot::Mutex<PayloadBudgetState>,
-}
-
-impl UniquePayloadBudget {
-    fn new(limit_bytes: u64) -> Self {
-        Self {
-            limit_bytes,
-            state: parking_lot::Mutex::new(PayloadBudgetState::default()),
-        }
-    }
-
-    fn reserve(
-        &self,
-        attempt: CheckpointAttempt,
-        attestation: &SealedVnodePartial,
-    ) -> Result<Arc<SealedPartialRead>, DbError> {
-        let key = (attempt, attestation.vnode);
-        let mut state = self.state.lock();
-        if let Some(existing) = state.reads.get(&key) {
-            if existing.attestation != *attestation {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6051] sealed vnode {:?} was observed with conflicting attestations during one chain load",
-                    key
-                )));
-            }
-            return Ok(Arc::clone(existing));
-        }
-
-        let reserved_bytes = state
-            .reserved_bytes
-            .checked_add(attestation.payload_len)
-            .ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "[LDB-6050] unique sealed vnode payload accounting overflowed while reserving vnode {} at {attempt:?}",
-                    attestation.vnode
-                ))
-            })?;
-        if reserved_bytes > self.limit_bytes {
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6050] unique sealed vnode payloads require at least {reserved_bytes} bytes; recovery budget is {} bytes",
-                self.limit_bytes
-            )));
-        }
-
-        let read = Arc::new(SealedPartialRead {
-            attestation: attestation.clone(),
-            bytes: tokio::sync::OnceCell::new(),
-        });
-        state.reserved_bytes = reserved_bytes;
-        state.reads.insert(key, Arc::clone(&read));
-        Ok(read)
-    }
-
-    /// Atomically reserve a known set before any associated body read starts.
-    fn reserve_batch(
-        &self,
-        attempt: CheckpointAttempt,
-        attestations: &[&SealedVnodePartial],
-    ) -> Result<(), DbError> {
-        let mut state = self.state.lock();
-        let mut additions = Vec::new();
-        let mut reserved_bytes = state.reserved_bytes;
-        for attestation in attestations {
-            let key = (attempt, attestation.vnode);
-            if let Some(existing) = state.reads.get(&key) {
-                if existing.attestation != **attestation {
-                    return Err(DbError::Checkpoint(format!(
-                        "[LDB-6051] sealed vnode {key:?} was observed with conflicting attestations during one chain load"
-                    )));
-                }
-                continue;
-            }
-            reserved_bytes = reserved_bytes
-                .checked_add(attestation.payload_len)
-                .ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6050] unique sealed vnode payload accounting overflowed while reserving vnode {} at {attempt:?}",
-                        attestation.vnode
-                    ))
-                })?;
-            additions.push((*attestation).clone());
-        }
-        if reserved_bytes > self.limit_bytes {
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6050] unique sealed vnode payloads require at least {reserved_bytes} bytes; recovery budget is {} bytes",
-                self.limit_bytes
-            )));
-        }
-        for attestation in additions {
-            let key = (attempt, attestation.vnode);
-            state.reads.insert(
-                key,
-                Arc::new(SealedPartialRead {
-                    attestation,
-                    bytes: tokio::sync::OnceCell::new(),
-                }),
-            );
-        }
-        state.reserved_bytes = reserved_bytes;
-        Ok(())
-    }
-}
 
 /// Vnode recovery chains loaded from one exact sealed attempt.
 #[derive(Debug, Default)]
@@ -162,7 +36,7 @@ pub(crate) struct SealedVnodeChainReader<'a> {
     backend: &'a dyn StateBackend,
     seal_cache: tokio::sync::Mutex<HashMap<CheckpointAttempt, Arc<CheckpointSealInventory>>>,
     validated_head_attempt: Option<CheckpointAttempt>,
-    payload_budget: UniquePayloadBudget,
+    max_partial_bytes: u64,
 }
 
 impl<'a> SealedVnodeChainReader<'a> {
@@ -174,7 +48,7 @@ impl<'a> SealedVnodeChainReader<'a> {
             backend,
             seal_cache: tokio::sync::Mutex::new(HashMap::new()),
             validated_head_attempt: None,
-            payload_budget: UniquePayloadBudget::new(u64::MAX),
+            max_partial_bytes: u64::MAX,
         }
     }
 
@@ -183,11 +57,11 @@ impl<'a> SealedVnodeChainReader<'a> {
     pub(crate) fn from_validated_head(
         backend: &'a dyn StateBackend,
         head: &crate::checkpoint_coordinator::ValidatedVnodeRestoreHead,
-        max_payload_bytes: u64,
+        max_partial_bytes: u64,
     ) -> Result<Self, DbError> {
-        if max_payload_bytes == 0 {
+        if max_partial_bytes == 0 {
             return Err(DbError::Checkpoint(
-                "[LDB-6050] vnode restore payload budget must be nonzero".into(),
+                "[LDB-6050] vnode partial artifact limit must be nonzero".into(),
             ));
         }
         let attempt = head.attempt();
@@ -204,7 +78,7 @@ impl<'a> SealedVnodeChainReader<'a> {
             backend,
             seal_cache: tokio::sync::Mutex::new(seal_cache),
             validated_head_attempt: Some(attempt),
-            payload_budget: UniquePayloadBudget::new(max_payload_bytes),
+            max_partial_bytes,
         })
     }
 
@@ -213,7 +87,7 @@ impl<'a> SealedVnodeChainReader<'a> {
             return Ok(());
         }
         Err(DbError::Checkpoint(format!(
-            "[LDB-6050] vnode rehydration requires one nonzero canonical checkpoint ID; received epoch {} checkpoint {}",
+            "[LDB-6050] vnode chain load requires one nonzero canonical checkpoint ID; received epoch {} checkpoint {}",
             attempt.epoch, attempt.checkpoint_id
         )))
     }
@@ -266,7 +140,6 @@ impl<'a> SealedVnodeChainReader<'a> {
         &self,
         attempt: CheckpointAttempt,
         vnode: u32,
-        parent_link: Option<crate::vnode_partial::SealedVnodeParentLink>,
     ) -> Result<Bytes, DbError> {
         let inventory = self.sealed_inventory(attempt).await?;
         let index = inventory
@@ -279,47 +152,29 @@ impl<'a> SealedVnodeChainReader<'a> {
                 ))
         })?;
         let attestation = &inventory.sealed_partials[index];
-        if let Some(link) = parent_link {
-            if !link.matches(attempt, attestation)? {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6051] vnode {vnode} parent attestation does not match its sealed link at {attempt:?}"
-                )));
-            }
+        let bytes = self
+            .backend
+            .read_sealed_partial_bounded(attempt, attestation, self.max_partial_bytes)
+            .await
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6051] failed to read vnode {vnode} at sealed epoch {} checkpoint {}: {error}",
+                    attempt.epoch, attempt.checkpoint_id
+                ))
+            })?
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6051] vnode {vnode} is missing at sealed epoch {} checkpoint {}",
+                    attempt.epoch, attempt.checkpoint_id
+                ))
+            })?;
+        if u64::try_from(bytes.len()).ok() != Some(attestation.payload_len) {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6051] vnode {vnode} backend returned {} bytes for a sealed {}-byte payload at {attempt:?}",
+                bytes.len(), attestation.payload_len
+            )));
         }
-        let read = self.payload_budget.reserve(attempt, attestation)?;
-        let bytes = read
-            .bytes
-            .get_or_try_init(|| async {
-                let bytes = self
-                    .backend
-                    .read_sealed_partial_bounded(
-                        attempt,
-                        &read.attestation,
-                        read.attestation.payload_len,
-                    )
-                    .await
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "[LDB-6051] failed to read vnode {vnode} at sealed epoch {} checkpoint {}: {error}",
-                            attempt.epoch, attempt.checkpoint_id
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "[LDB-6051] vnode {vnode} is missing at sealed epoch {} checkpoint {}",
-                            attempt.epoch, attempt.checkpoint_id
-                        ))
-                    })?;
-                if u64::try_from(bytes.len()).ok() != Some(read.attestation.payload_len) {
-                    return Err(DbError::Checkpoint(format!(
-                        "[LDB-6051] vnode {vnode} backend returned {} bytes for a sealed {}-byte payload at {attempt:?}",
-                        bytes.len(), read.attestation.payload_len
-                    )));
-                }
-                Ok(bytes)
-            })
-            .await?;
-        Ok(bytes.clone())
+        Ok(bytes)
     }
 
     /// Load each vnode's partial chain pinned at `attempt`, a committed cut chosen by the caller.
@@ -360,19 +215,6 @@ impl<'a> SealedVnodeChainReader<'a> {
                 attempt.checkpoint_id, attempt.epoch
             )));
         }
-        let head_attestations = requested_vnodes
-            .iter()
-            .map(|vnode| {
-                inventory.sealed_vnode_partial(*vnode).ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6050] vnode {vnode} has no attestation in the exact state seal for {attempt:?}"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        // Reserve every known head atomically so a head-total overflow performs no body reads.
-        self.payload_budget
-            .reserve_batch(attempt, &head_attestations)?;
         loaded.attempt = Some(attempt);
 
         let chains = futures::stream::iter(requested_vnodes.into_iter().map(|vnode| async move {
@@ -426,7 +268,7 @@ impl<'a> SealedVnodeChainReader<'a> {
                     "[LDB-6051] vnode {vnode} delta chain has no FULL base for operators {need:?}"
                 )));
             };
-            let parent_attempt = parent.attempt;
+            let parent_attempt = parent;
             if parent_attempt.epoch >= current.epoch
                 || parent_attempt.checkpoint_id >= current.checkpoint_id
             {
@@ -436,7 +278,7 @@ impl<'a> SealedVnodeChainReader<'a> {
                 )));
             }
             let parent_bytes = self
-                .read_verified_partial(parent_attempt, vnode, Some(parent))
+                .read_verified_partial(parent_attempt, vnode)
                 .await
                 .map_err(|error| {
                     DbError::Checkpoint(format!(
@@ -468,7 +310,7 @@ impl<'a> SealedVnodeChainReader<'a> {
     ) -> Result<(Bytes, CheckpointAttempt, crate::vnode_partial::VnodePartial), DbError> {
         use crate::vnode_partial::VnodePartial;
 
-        let mut bytes = self.read_verified_partial(attempt, vnode, None).await?;
+        let mut bytes = self.read_verified_partial(attempt, vnode).await?;
         let mut current = attempt;
         loop {
             let partial = VnodePartial::decode(&bytes).map_err(|error| {
@@ -484,7 +326,7 @@ impl<'a> SealedVnodeChainReader<'a> {
             let Some(base) = partial.base else {
                 return Ok((bytes, current, partial));
             };
-            let base_attempt = base.attempt;
+            let base_attempt = base;
             if base_attempt.epoch >= current.epoch
                 || base_attempt.checkpoint_id >= current.checkpoint_id
             {
@@ -494,7 +336,7 @@ impl<'a> SealedVnodeChainReader<'a> {
                 )));
             }
             bytes = self
-                .read_verified_partial(base_attempt, vnode, Some(base))
+                .read_verified_partial(base_attempt, vnode)
                 .await
                 .map_err(|error| {
                     DbError::Checkpoint(format!(
@@ -532,109 +374,4 @@ pub(crate) fn resolve_op_chain<'a>(
         }
     }
     Some((base, deltas))
-}
-
-#[cfg(test)]
-mod budget_tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::*;
-
-    fn attestation(vnode: u32, payload_len: u64) -> SealedVnodePartial {
-        SealedVnodePartial {
-            vnode,
-            assignment_version: 1,
-            writer: None,
-            payload_len,
-            payload_sha256: "00".repeat(32),
-        }
-    }
-
-    #[test]
-    fn unique_payload_budget_counts_once_and_rejects_conflicts_and_overflow() {
-        let attempt = CheckpointAttempt::canonical(7);
-        let budget = UniquePayloadBudget::new(5);
-        let sealed = attestation(0, 5);
-
-        let first = budget.reserve(attempt, &sealed).unwrap();
-        let duplicate = budget.reserve(attempt, &sealed).unwrap();
-        assert!(Arc::ptr_eq(&first, &duplicate));
-        assert_eq!(budget.state.lock().reserved_bytes, 5);
-
-        let mut conflicting = sealed;
-        conflicting.payload_sha256 = "11".repeat(32);
-        let error = budget.reserve(attempt, &conflicting).unwrap_err();
-        assert!(error.to_string().contains("conflicting attestations"));
-
-        let error = budget.reserve(attempt, &attestation(1, 1)).unwrap_err();
-        assert!(error.to_string().contains("recovery budget is 5 bytes"));
-
-        let overflow = UniquePayloadBudget::new(u64::MAX);
-        overflow
-            .reserve(attempt, &attestation(0, u64::MAX))
-            .unwrap();
-        let error = overflow.reserve(attempt, &attestation(1, 1)).unwrap_err();
-        assert!(error.to_string().contains("accounting overflowed"));
-    }
-
-    #[tokio::test]
-    async fn sealed_payload_read_is_single_flight_and_retryable_after_failure_or_cancellation() {
-        let attempt = CheckpointAttempt::canonical(7);
-        let budget = UniquePayloadBudget::new(5);
-        let read = budget.reserve(attempt, &attestation(0, 5)).unwrap();
-        let duplicate = budget.reserve(attempt, &attestation(0, 5)).unwrap();
-        let calls = AtomicUsize::new(0);
-
-        let first = read.bytes.get_or_try_init(|| async {
-            calls.fetch_add(1, Ordering::AcqRel);
-            tokio::task::yield_now().await;
-            Ok::<Bytes, DbError>(Bytes::from_static(b"state"))
-        });
-        let second = duplicate.bytes.get_or_try_init(|| async {
-            calls.fetch_add(1, Ordering::AcqRel);
-            Ok::<Bytes, DbError>(Bytes::from_static(b"state"))
-        });
-        let (first, second) = tokio::join!(first, second);
-        assert_eq!(first.unwrap(), &Bytes::from_static(b"state"));
-        assert_eq!(second.unwrap(), &Bytes::from_static(b"state"));
-        assert_eq!(calls.load(Ordering::Acquire), 1);
-
-        let retry_budget = UniquePayloadBudget::new(5);
-        let retry = retry_budget.reserve(attempt, &attestation(0, 5)).unwrap();
-        let error = retry
-            .bytes
-            .get_or_try_init(|| async {
-                Err::<Bytes, DbError>(DbError::Checkpoint("transient read failure".into()))
-            })
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("transient read failure"));
-        assert!(retry.bytes.get().is_none());
-
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let cancelled_read = Arc::clone(&retry);
-        let cancelled = tokio::spawn(async move {
-            cancelled_read
-                .bytes
-                .get_or_try_init(|| async move {
-                    let _ = started_tx.send(());
-                    std::future::pending::<Result<Bytes, DbError>>().await
-                })
-                .await
-                .map(Bytes::clone)
-        });
-        started_rx.await.unwrap();
-        cancelled.abort();
-        assert!(cancelled.await.unwrap_err().is_cancelled());
-        assert!(retry.bytes.get().is_none());
-        assert_eq!(retry_budget.state.lock().reserved_bytes, 5);
-
-        let bytes = retry
-            .bytes
-            .get_or_try_init(|| async { Ok::<Bytes, DbError>(Bytes::from_static(b"state")) })
-            .await
-            .unwrap();
-        assert_eq!(bytes, &Bytes::from_static(b"state"));
-        assert_eq!(retry_budget.state.lock().reserved_bytes, 5);
-    }
 }

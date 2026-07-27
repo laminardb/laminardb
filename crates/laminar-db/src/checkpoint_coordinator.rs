@@ -16,9 +16,9 @@ use laminar_core::checkpoint::{
     PreparedCheckpointWitness, RecoveryCapsuleRef, MAX_PREPARED_CHECKPOINT_WITNESSES,
 };
 use laminar_core::checkpoint::{CheckpointWatermark, LeaderProof};
-use laminar_core::state::{
-    CheckpointAttempt, CheckpointSealInventory, StateBackend, StateBackendError,
-};
+#[cfg(feature = "cluster")]
+use laminar_core::state::CheckpointSealInventory;
+use laminar_core::state::{CheckpointAttempt, StateBackend, StateBackendError};
 use laminar_core::storage::checkpoint_manifest::{
     CheckpointManifest, ConnectorCheckpoint, PipelineIdentity,
 };
@@ -1546,11 +1546,9 @@ pub struct CheckpointCoordinator {
     last_partial_delta_depth: std::collections::HashMap<u32, u32>,
     // Candidates above advance after all writes land. Reuse is allowed only after the exact
     // state seal proves that the candidate is durable for this vnode.
-    last_sealed_partial_link:
-        std::collections::HashMap<u32, crate::vnode_partial::SealedVnodeParentLink>,
+    last_sealed_partial_attempt: std::collections::HashMap<u32, CheckpointAttempt>,
     last_sealed_delta_depth: std::collections::HashMap<u32, u32>,
-    last_sealed_upload_link:
-        std::collections::HashMap<u32, crate::vnode_partial::SealedVnodeParentLink>,
+    last_sealed_upload_attempt: std::collections::HashMap<u32, CheckpointAttempt>,
     #[cfg(feature = "cluster")]
     cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
     // A single watch slot coalesces checkpoint retention requests at a monotonically advancing
@@ -1722,9 +1720,9 @@ impl CheckpointCoordinator {
             last_vnode_uploads: std::collections::HashMap::new(),
             last_partial_attempt: std::collections::HashMap::new(),
             last_partial_delta_depth: std::collections::HashMap::new(),
-            last_sealed_partial_link: std::collections::HashMap::new(),
+            last_sealed_partial_attempt: std::collections::HashMap::new(),
             last_sealed_delta_depth: std::collections::HashMap::new(),
-            last_sealed_upload_link: std::collections::HashMap::new(),
+            last_sealed_upload_attempt: std::collections::HashMap::new(),
             #[cfg(feature = "cluster")]
             cluster_controller: None,
             retention_requests,
@@ -2859,11 +2857,11 @@ impl CheckpointCoordinator {
         self.last_partial_attempt.retain(|v, _| vnodes.contains(v));
         self.last_partial_delta_depth
             .retain(|v, _| vnodes.contains(v));
-        self.last_sealed_partial_link
+        self.last_sealed_partial_attempt
             .retain(|v, _| vnodes.contains(v));
         self.last_sealed_delta_depth
             .retain(|v, _| vnodes.contains(v));
-        self.last_sealed_upload_link
+        self.last_sealed_upload_attempt
             .retain(|v, _| vnodes.contains(v));
         self.vnode_set = vnodes;
     }
@@ -4196,7 +4194,7 @@ impl CheckpointCoordinator {
         &self,
         vnode: u32,
         epoch: u64,
-    ) -> Result<(crate::vnode_partial::SealedVnodeParentLink, u32), DbError> {
+    ) -> Result<(CheckpointAttempt, u32), DbError> {
         let parent = self
             .last_partial_attempt
             .get(&vnode)
@@ -4207,17 +4205,12 @@ impl CheckpointCoordinator {
                      (epoch={epoch}); a just-acquired vnode must re-base FULL first"
                 ))
             })?;
-        let sealed_parent = self
-            .last_sealed_partial_link
-            .get(&vnode)
-            .copied()
-            .filter(|link| link.attempt == parent)
-            .ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "[LDB-6025] delta partial for vnode {vnode} would reference unsealed attempt \
-                     {parent:?} from epoch {epoch}; the next capture must re-base FULL"
-                ))
-            })?;
+        if self.last_sealed_partial_attempt.get(&vnode) != Some(&parent) {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6025] delta partial for vnode {vnode} would reference unsealed attempt \
+                 {parent:?} from epoch {epoch}; the next capture must re-base FULL"
+            )));
+        }
         if parent.epoch.checked_add(1) != Some(epoch) {
             return Err(DbError::Checkpoint(format!(
                 "[LDB-6025] delta partial for vnode {vnode} at epoch {epoch} would cross a \
@@ -4253,7 +4246,7 @@ impl CheckpointCoordinator {
                  runtime-derived chain bound {bound}; the next capture must re-base FULL"
             )));
         }
-        Ok((sealed_parent, depth))
+        Ok((parent, depth))
     }
 
     fn validate_staged_delta_parents(&self, epoch: u64) -> Result<(), DbError> {
@@ -4268,55 +4261,22 @@ impl CheckpointCoordinator {
         Ok(())
     }
 
-    fn mark_vnode_partials_sealed(
-        &mut self,
-        inventory: &CheckpointSealInventory,
-    ) -> Result<(), DbError> {
-        inventory.validate_vnode_partials().map_err(|error| {
-            DbError::Checkpoint(format!(
-                "[LDB-6025] state seal cannot authorize future vnode parents: {error}"
-            ))
-        })?;
-        let mut expected_vnodes = self.gate_vnode_set.clone();
-        expected_vnodes.sort_unstable();
-        expected_vnodes.dedup();
-        if inventory.required_vnodes != expected_vnodes {
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6025] state seal vnode roster {:?} does not match the durability gate {:?}",
-                inventory.required_vnodes, expected_vnodes
-            )));
-        }
-
-        let attempt = inventory.attempt;
-        let mut links = Vec::new();
+    fn mark_vnode_partials_sealed(&mut self, attempt: CheckpointAttempt) {
         for &vnode in &self.vnode_set {
-            let seals_current_partial = self.last_partial_attempt.get(&vnode) == Some(&attempt);
-            let seals_current_upload = self
-                .last_vnode_uploads
-                .get(&vnode)
-                .is_some_and(|(base, _)| *base == attempt);
-            if seals_current_partial || seals_current_upload {
-                let sealed = inventory.sealed_vnode_partial(vnode).ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6025] exact state seal for {attempt:?} omits local vnode {vnode}"
-                    ))
-                })?;
-                let link = crate::vnode_partial::SealedVnodeParentLink::new(attempt, sealed)?;
-                links.push((vnode, link, seals_current_partial, seals_current_upload));
-            }
-        }
-        for (vnode, link, seals_current_partial, seals_current_upload) in links {
-            if seals_current_partial {
-                self.last_sealed_partial_link.insert(vnode, link);
+            if self.last_partial_attempt.get(&vnode) == Some(&attempt) {
+                self.last_sealed_partial_attempt.insert(vnode, attempt);
                 if let Some(depth) = self.last_partial_delta_depth.get(&vnode).copied() {
                     self.last_sealed_delta_depth.insert(vnode, depth);
                 }
             }
-            if seals_current_upload {
-                self.last_sealed_upload_link.insert(vnode, link);
+            if self
+                .last_vnode_uploads
+                .get(&vnode)
+                .is_some_and(|(base, _)| *base == attempt)
+            {
+                self.last_sealed_upload_attempt.insert(vnode, attempt);
             }
         }
-        Ok(())
     }
 
     /// Write each owned vnode's `partial.bin` to seal the durability gate.
@@ -4489,7 +4449,7 @@ impl CheckpointCoordinator {
     }
 
     fn prepare_delta_vnode_partial(
-        parent: crate::vnode_partial::SealedVnodeParentLink,
+        parent: CheckpointAttempt,
         ops: Option<&HashMap<String, StagedSlice>>,
     ) -> (crate::vnode_partial::VnodePartial, VnodeUploadUpdate) {
         let mut operators = Vec::new();
@@ -4530,9 +4490,7 @@ impl CheckpointCoordinator {
             self.last_vnode_uploads
                 .get(&vnode)
                 .filter(|(base, last)| {
-                    self.last_sealed_upload_link
-                        .get(&vnode)
-                        .is_some_and(|link| link.attempt == *base)
+                    self.last_sealed_upload_attempt.get(&vnode) == Some(base)
                         && epoch
                             .checked_sub(base.epoch)
                             .is_some_and(|age| age > 0 && age < max_ref_age)
@@ -4541,12 +4499,7 @@ impl CheckpointCoordinator {
                             .iter()
                             .all(|(name, slice)| last.get(name).is_some_and(|p| p.matches(slice)))
                 })
-                .and_then(|(base, _)| {
-                    self.last_sealed_upload_link
-                        .get(&vnode)
-                        .copied()
-                        .filter(|link| link.attempt == *base)
-                })
+                .map(|(base, _)| *base)
         });
         if let Some(base) = reusable_base {
             return Ok((
@@ -4729,38 +4682,15 @@ impl CheckpointCoordinator {
         None
     }
 
-    async fn read_exact_seal_inventory(
-        &self,
-        attempt: CheckpointAttempt,
-    ) -> Result<CheckpointSealInventory, String> {
-        let backend = self
-            .state_backend
-            .as_ref()
-            .ok_or_else(|| "state seal inventory requested without a state backend".to_string())?;
-        let inventory = backend
-            .checkpoint_seal_inventory(attempt)
-            .await
-            .map_err(|error| format!("read exact state seal inventory: {error}"))?
-            .ok_or_else(|| format!("exact state seal for {attempt:?} is missing"))?;
-        if inventory.attempt != attempt {
-            return Err(format!(
-                "state seal inventory names {:?}, expected {attempt:?}",
-                inventory.attempt
-            ));
-        }
-        Ok(inventory)
-    }
-
     /// Poll until every vnode in `gate_vnode_set` has its partial for the exact attempt, or the
-    /// gate timeout expires. Transient I/O errors retry; immutable conflicts abort. A successful
-    /// gate returns the exact immutable inventory used to authorize future parent links.
+    /// gate timeout expires. Transient I/O errors retry; immutable conflicts abort.
     async fn await_restorable_gate(
         &self,
         attempt: CheckpointAttempt,
         participants: &[QuorumPeer],
         assignment_fence: Option<&laminar_core::cluster::control::CheckpointAssignmentFence>,
         deadline: tokio::time::Instant,
-    ) -> Result<Option<CheckpointSealInventory>, String> {
+    ) -> Result<(), String> {
         use laminar_core::state::StateBackendError;
         // Back off exponentially from the configured initial to the cap. Clamp to a
         // 1ms floor (cap >= initial) so a 0ms config can't spin the gate under the mutex.
@@ -4768,7 +4698,7 @@ impl CheckpointCoordinator {
         let max_poll = RESTORABLE_GATE_POLL_MAX.max(initial_poll);
 
         let Some(ref backend) = self.state_backend else {
-            return Ok(None);
+            return Ok(());
         };
         // Every quorum participant/sink marker joins the same exact-attempt
         // `_SEAL`; the seal body binds this canonical inventory permanently.
@@ -4776,7 +4706,7 @@ impl CheckpointCoordinator {
             .required_descriptor_keys(participants)
             .map_err(|error| error.to_string())?;
         if self.gate_vnode_set.is_empty() && required_descriptors.is_empty() {
-            return Ok(None);
+            return Ok(());
         }
 
         let mut interval = initial_poll;
@@ -4815,7 +4745,7 @@ impl CheckpointCoordinator {
                 )
                 .await?;
             match seal_result {
-                Ok(true) => return self.read_exact_seal_inventory(attempt).await.map(Some),
+                Ok(true) => return Ok(()),
                 Ok(false) => {}
                 Err(e @ StateBackendError::Conflict { .. }) => {
                     return Err(format!("state durability gate: {e}"));
@@ -6713,24 +6643,8 @@ impl CheckpointCoordinator {
         )?;
         let clean = if committed {
             // A valid Commit can only be published after the leader created the exact state seal.
-            // Re-read its exact inventory before this follower admits a successor parent link;
-            // the decision alone does not bind an in-memory bare attempt to a vnode artifact.
-            if self
-                .vnode_set
-                .iter()
-                .any(|vnode| self.last_partial_attempt.get(vnode) == Some(&attempt))
-            {
-                let inventory = self
-                    .read_exact_seal_inventory(attempt)
-                    .await
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "[LDB-6048] follower cannot authorize sealed vnode ancestry for \
-                             {attempt:?}: {error}"
-                        ))
-                    })?;
-                self.mark_vnode_partials_sealed(&inventory)?;
-            }
+            // Record that durable fact before this follower admits a successor delta/reference.
+            self.mark_vnode_partials_sealed(attempt);
             // Followers never publish external sink state. The exact decision makes their
             // prepared state recoverable; finalization merely publishes the local recovery cut.
             self.finalize_manifest(checkpoint_id).await.map_err(|e| {
@@ -7149,28 +7063,19 @@ impl CheckpointCoordinator {
             m.checkpoint_restorable_gate_wait
                 .observe(gate_start.elapsed().as_secs_f64());
         }
-        let seal_inventory = match gate_result {
-            Ok(inventory) => inventory,
-            Err(gate_err) => {
-                warn!(
-                    checkpoint_id,
-                    epoch,
-                    vnodes = self.gate_vnode_set.len(),
-                    error = %gate_err,
-                    "[LDB-6020] state durability gate failed — rolling back sinks",
-                );
-                return Ok(self.fail_epoch(checkpoint_id, epoch, start, gate_err).await);
-            }
-        };
+        if let Err(gate_err) = gate_result {
+            warn!(
+                checkpoint_id,
+                epoch,
+                vnodes = self.gate_vnode_set.len(),
+                error = %gate_err,
+                "[LDB-6020] state durability gate failed — rolling back sinks",
+            );
+            return Ok(self.fail_epoch(checkpoint_id, epoch, start, gate_err).await);
+        }
         // Only the exact immutable seal, never a completed callback or a successful upload, makes
         // this attempt eligible as a future delta/reference parent.
-        if let Some(inventory) = seal_inventory {
-            if let Err(error) = self.mark_vnode_partials_sealed(&inventory) {
-                return Ok(self
-                    .fail_epoch(checkpoint_id, epoch, start, error.to_string())
-                    .await);
-            }
-        }
+        self.mark_vnode_partials_sealed(CheckpointAttempt::new(epoch, checkpoint_id));
 
         // The durable decision is the sole commit point. External sinks publish later from the
         // exact sealed descriptor inventory; no connector phase-2 mutation occurs inline here.

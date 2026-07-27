@@ -383,15 +383,6 @@ impl CheckpointSealInventory {
         )
     }
 
-    /// Find the exact attestation for `vnode` in a validated canonical inventory.
-    #[must_use]
-    pub fn sealed_vnode_partial(&self, vnode: u32) -> Option<&SealedVnodePartial> {
-        self.sealed_partials
-            .binary_search_by_key(&vnode, |partial| partial.vnode)
-            .ok()
-            .map(|index| &self.sealed_partials[index])
-    }
-
     /// Attestation for one exact descriptor key.
     #[must_use]
     pub fn sealed_descriptor(&self, key: &str) -> Option<&SealedCommitDescriptor> {

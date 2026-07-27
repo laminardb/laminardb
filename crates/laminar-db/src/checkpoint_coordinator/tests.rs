@@ -5142,11 +5142,7 @@ async fn unchanged_vnode_state_becomes_reference_partial() {
         &backend.read_partial(a2, 0).await.unwrap().unwrap(),
     )
     .unwrap();
-    assert_eq!(
-        p2.base.map(|link| link.attempt),
-        Some(a1),
-        "unchanged slice must reference its base"
-    );
+    assert_eq!(p2.base, Some(a1), "unchanged slice must reference its base");
     assert!(p2.operators.is_empty());
 
     // Another successful no-change checkpoint points directly to the same sealed FULL. Reference
@@ -5162,7 +5158,7 @@ async fn unchanged_vnode_state_becomes_reference_partial() {
         &backend.read_partial(a3, 0).await.unwrap().unwrap(),
     )
     .unwrap();
-    assert_eq!(p3.base.map(|link| link.attempt), Some(a1));
+    assert_eq!(p3.base, Some(a1));
     assert!(p3.operators.is_empty());
     let loaded =
         crate::recovery_manager::vnode_chains::SealedVnodeChainReader::new(backend.as_ref())
@@ -5406,7 +5402,7 @@ async fn reference_resets_bounded_delta_depth_without_hiding_its_root() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(reference.base.map(|link| link.attempt), Some(full_attempt));
+    assert_eq!(reference.base, Some(full_attempt));
     assert!(reference.operators.is_empty());
     assert!(reference.deltas.is_empty());
 
@@ -5425,10 +5421,7 @@ async fn reference_resets_bounded_delta_depth_without_hiding_its_root() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(
-        delta.base.map(|link| link.attempt),
-        Some(referenced_attempt)
-    );
+    assert_eq!(delta.base, Some(referenced_attempt));
 
     coord.set_pending_vnode_states(one_vnode_delta_state(b"too-deep"));
     let rejected = coord
@@ -5591,9 +5584,9 @@ async fn mixed_delta_partial_cannot_seed_a_reference_chain() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(reference.base.map(|link| link.attempt), Some(attempt));
+    assert_eq!(reference.base, Some(attempt));
     assert_ne!(
-        reference.base.map(|link| link.attempt),
+        reference.base,
         Some(CheckpointAttempt::canonical(delta.checkpoint_id)),
         "a reference must never target a DELTA partial",
     );
@@ -6100,7 +6093,7 @@ async fn overlapping_epoch_failure_is_isolated() {
         &backend.read_partial(attempt_b, 0).await.unwrap().unwrap(),
     )
     .unwrap();
-    assert_eq!(p_b.base.map(|link| link.attempt), Some(attempt_a));
+    assert_eq!(p_b.base, Some(attempt_a));
     for vnode in [0u32, 1] {
         let p_d = crate::vnode_partial::VnodePartial::decode(
             &backend
