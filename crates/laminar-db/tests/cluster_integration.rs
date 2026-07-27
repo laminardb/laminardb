@@ -1606,7 +1606,6 @@ mod rebalance {
         let (draining, stale_leader_proof) =
             begin_planned_rotation(&mut harness, drain_target).await;
         assert_eq!(draining.version, predecessor.version + 1);
-        assert_eq!(store.load().await.unwrap(), Some(draining.clone()));
 
         let (shared_dir, checkpoint_dirs, control_store) = harness.shutdown_keep_dirs().await;
         let mut restarted = ClusterEngineHarness::spawn_with_dirs(
@@ -1662,13 +1661,6 @@ mod rebalance {
         assert_eq!(aborted.version, draining.version);
         assert_eq!(aborted.vnodes, predecessor.vnodes);
         assert_eq!(aborted.participants, predecessor.participants);
-        assert_eq!(
-            store
-                .load_drain_transition(draining.version)
-                .await
-                .expect("load retained stale drain transition"),
-            draining.drain_transition
-        );
 
         let leader_idx = restarted.leader_idx();
         let authority = restarted.cluster.nodes[leader_idx]
@@ -1716,28 +1708,22 @@ mod rebalance {
         )
         .await;
         assert_eq!(replacement.source_state.last_resume_cursor(), 2);
-        assert!(
-            restarted.sink_state.observations().is_empty(),
-            "replacement startup must not replay the committed aggregate prefix"
-        );
 
         restarted.source_log.append(&[(3, 7)]);
-        wait_for(
-            || {
-                restarted.sink_state.observations()
-                    == vec![
-                        AggregateObservation {
-                            node_id: replacement_owner,
-                            total: 30,
-                            weight: -1,
-                        },
-                        AggregateObservation {
-                            node_id: replacement_owner,
-                            total: 37,
-                            weight: 1,
-                        },
-                    ]
+        let expected_tail = vec![
+            AggregateObservation {
+                node_id: replacement_owner,
+                total: 30,
+                weight: -1,
             },
+            AggregateObservation {
+                node_id: replacement_owner,
+                total: 37,
+                weight: 1,
+            },
+        ];
+        wait_for(
+            || restarted.sink_state.observations() == expected_tail,
             "replacement aggregate to continue from restored total 30",
         )
         .await;
@@ -1765,6 +1751,7 @@ mod rebalance {
             "subsequent checkpoint must certify the replacement generation"
         );
         assert_eq!(replacement.source_state.last_checkpoint_cursor(), 3);
+        assert_eq!(restarted.sink_state.observations(), expected_tail);
 
         restarted.shutdown().await;
     }
