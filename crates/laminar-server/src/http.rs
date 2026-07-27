@@ -1628,8 +1628,10 @@ async fn cluster_local_checkpoint_barrier_timings(
 
         let Query(query) = match query {
             Ok(query) => query,
-            Err(error) => {
-                warn!(%error, "rejected local checkpoint barrier timing query");
+            Err(_) => {
+                // Query rejections can echo attacker-controlled field names. Keep access logs
+                // limited to the fixed route/method/status/latency contract.
+                warn!("rejected malformed local checkpoint barrier timing query");
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     LOCAL_CHECKPOINT_BARRIER_TIMINGS_QUERY_MSG,

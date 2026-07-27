@@ -4,6 +4,43 @@ use axum::http::Request;
 #[cfg(feature = "cluster")]
 use base64::Engine as _;
 use tower::ServiceExt;
+#[cfg(feature = "cluster")]
+use tracing::instrument::WithSubscriber as _;
+
+#[cfg(feature = "cluster")]
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(feature = "cluster")]
+struct CapturedLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(feature = "cluster")]
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = CapturedLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturedLogWriter(Arc::clone(&self.0))
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl std::io::Write for CapturedLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl CapturedLogs {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
 
 #[test]
 fn cap_result_trims_and_flags() {
@@ -2951,6 +2988,38 @@ async fn cluster_local_checkpoint_barrier_timings_rejects_closed_or_noncanonical
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
     }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn malformed_timing_query_does_not_log_attacker_controlled_field_names() {
+    const SENTINEL: &str = "LDB_QUERY_SECRET_SENTINEL_518ae69b";
+    let fixture =
+        local_checkpoint_barrier_timings_fixture(Some("supersecret-token"), ready_serving_gate())
+            .await;
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(logs.clone())
+        .finish();
+    let request = local_checkpoint_barrier_timings_request(&format!(
+        "/api/v1/cluster/local-checkpoint-barrier-timings?after_sequence=0&{SENTINEL}=1"
+    ));
+
+    let response = build_router(fixture.state)
+        .oneshot(request)
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let logs = logs.text();
+    assert!(!logs.contains(SENTINEL), "query field leaked: {logs}");
+    assert!(
+        logs.contains("rejected malformed local checkpoint barrier timing query"),
+        "fixed rejection event missing: {logs}"
+    );
 }
 
 #[cfg(feature = "cluster")]
