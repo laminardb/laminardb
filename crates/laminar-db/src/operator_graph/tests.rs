@@ -600,7 +600,15 @@ async fn vnode_transition_harness_for_assignment(
     let staged = Arc::new(parking_lot::Mutex::new(
         chains
             .into_iter()
-            .map(|(vnode, chain)| (vnode, crate::db::RehydratedVnode { epoch: 7, chain }))
+            .map(|(vnode, chain)| {
+                (
+                    vnode,
+                    crate::db::RehydratedVnode {
+                        attempt: laminar_core::state::CheckpointAttempt::canonical(7),
+                        chain,
+                    },
+                )
+            })
             .collect(),
     ));
     graph.set_rehydration_handle(Arc::clone(&staged));
@@ -3005,7 +3013,7 @@ async fn final_owner_exit_rejects_restore_work_before_revoke_callbacks() {
         .insert(
             0,
             crate::db::RehydratedVnode {
-                epoch: 7,
+                attempt: laminar_core::state::CheckpointAttempt::canonical(7),
                 chain: vec![bytes::Bytes::from_static(b"unexpected-restore")],
             },
         );
@@ -3119,7 +3127,7 @@ async fn final_owner_exit_restore_drift_after_callback_poisons_and_retains_autho
             self.staged.lock().insert(
                 0,
                 crate::db::RehydratedVnode {
-                    epoch: 7,
+                    attempt: laminar_core::state::CheckpointAttempt::canonical(7),
                     chain: vec![bytes::Bytes::from_static(b"injected-restore")],
                 },
             );
@@ -3847,6 +3855,61 @@ async fn later_vnode_structural_failure_runs_no_callbacks_and_retains_batch() {
     assert_eq!(
         staged_revoke_vnodes(&revoked),
         Some([2u32].into_iter().collect::<FxHashSet<_>>())
+    );
+    assert!(graph.execution_poison_reason().is_none());
+    assert_eq!(graph.last_execution_assignment_version(), None);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn mixed_checkpoint_attempts_run_no_callbacks_and_retain_batch() {
+    let partial = crate::vnode_partial::VnodePartial {
+        operators: vec![("agg".to_string(), vec![1])],
+        base: None,
+        deltas: Vec::new(),
+    };
+    let encoded = encoded_vnode_partial(&partial);
+    let VnodeTransitionHarness {
+        mut graph,
+        registry,
+        staged,
+    } = vnode_transition_harness(
+        2,
+        &[0, 1],
+        vec![(0, vec![encoded.clone()]), (1, vec![encoded])],
+    )
+    .await;
+    staged
+        .lock()
+        .get_mut(&1)
+        .expect("second vnode is staged")
+        .attempt = laminar_core::state::CheckpointAttempt::new(7, 8);
+    let applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    graph.push_test_node(
+        "agg",
+        Box::new(RecordingVnodeRestoreOperator {
+            applied: Arc::clone(&applied),
+            failure_on_vnode: None,
+        }),
+    );
+
+    let error = graph
+        .execute_cycle(&FxHashMap::default(), i64::MAX, None)
+        .await
+        .expect_err("one transition cannot mix committed checkpoint attempts");
+
+    assert!(error
+        .to_string()
+        .contains("one canonical checkpoint attempt"));
+    assert!(
+        applied.lock().is_empty(),
+        "attempt validation ran a callback"
+    );
+    assert_eq!(registry.restoring_vnodes(), vec![0, 1]);
+    assert_eq!(
+        staged.lock().len(),
+        2,
+        "attempt validation consumed staging"
     );
     assert!(graph.execution_poison_reason().is_none());
     assert_eq!(graph.last_execution_assignment_version(), None);

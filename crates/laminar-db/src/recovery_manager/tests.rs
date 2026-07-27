@@ -3,6 +3,8 @@ use laminar_core::storage::checkpoint_manifest::OperatorCheckpoint;
 use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
 #[cfg(feature = "cluster")]
 use laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore;
+#[cfg(feature = "cluster")]
+use sha2::{Digest, Sha256};
 
 fn make_store(dir: &std::path::Path) -> FileSystemCheckpointStore {
     FileSystemCheckpointStore::new(dir)

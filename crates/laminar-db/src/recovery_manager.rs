@@ -19,7 +19,6 @@ use laminar_core::storage::checkpoint_manifest::{
 use laminar_core::storage::checkpoint_store::{
     CheckpointArtifacts, CheckpointStore, CheckpointStoreError,
 };
-use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use crate::error::DbError;
@@ -34,6 +33,8 @@ pub struct RecoveredState {
     outcome: Option<CheckpointOutcome>,
     #[cfg(feature = "cluster")]
     cluster_capsule: Option<ClusterRecoveryCapsule>,
+    #[cfg(feature = "cluster")]
+    vnode_restore_head: Option<crate::checkpoint_coordinator::ValidatedVnodeRestoreHead>,
 }
 
 impl RecoveredState {
@@ -56,6 +57,21 @@ impl RecoveredState {
     #[cfg(feature = "cluster")]
     pub(crate) fn cluster_capsule(&self) -> Option<&ClusterRecoveryCapsule> {
         self.cluster_capsule.as_ref()
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn set_vnode_restore_head(
+        &mut self,
+        head: crate::checkpoint_coordinator::ValidatedVnodeRestoreHead,
+    ) {
+        self.vnode_restore_head = Some(head);
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn vnode_restore_head(
+        &self,
+    ) -> Option<&crate::checkpoint_coordinator::ValidatedVnodeRestoreHead> {
+        self.vnode_restore_head.as_ref()
     }
 }
 
@@ -81,6 +97,8 @@ impl VnodeRehydration {
 pub struct VnodeRehydrator<'a> {
     backend: &'a dyn StateBackend,
     seal_cache: tokio::sync::Mutex<HashMap<CheckpointAttempt, Arc<CheckpointSealInventory>>>,
+    validated_head_attempt: Option<CheckpointAttempt>,
+    max_partial_bytes: u64,
 }
 
 impl<'a> VnodeRehydrator<'a> {
@@ -90,7 +108,33 @@ impl<'a> VnodeRehydrator<'a> {
         Self {
             backend,
             seal_cache: tokio::sync::Mutex::new(HashMap::new()),
+            validated_head_attempt: None,
+            max_partial_bytes: u64::MAX,
         }
+    }
+
+    /// Create a reader pinned to the exact seal already validated with the committed source cut.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn from_validated_head(
+        backend: &'a dyn StateBackend,
+        head: &crate::checkpoint_coordinator::ValidatedVnodeRestoreHead,
+        max_partial_bytes: u64,
+    ) -> Result<Self, DbError> {
+        if max_partial_bytes == 0 {
+            return Err(DbError::Checkpoint(
+                "[LDB-6050] vnode restore artifact limit must be nonzero".into(),
+            ));
+        }
+        let attempt = head.attempt();
+        Self::require_canonical_attempt(attempt)?;
+        let mut seal_cache = HashMap::new();
+        seal_cache.insert(attempt, head.inventory());
+        Ok(Self {
+            backend,
+            seal_cache: tokio::sync::Mutex::new(seal_cache),
+            validated_head_attempt: Some(attempt),
+            max_partial_bytes,
+        })
     }
 
     fn require_canonical_attempt(attempt: CheckpointAttempt) -> Result<(), DbError> {
@@ -179,7 +223,7 @@ impl<'a> VnodeRehydrator<'a> {
         let attestation = &inventory.sealed_partials[index];
         let bytes = self
             .backend
-            .read_partial(attempt, vnode)
+            .read_sealed_partial_bounded(attempt, attestation, self.max_partial_bytes)
             .await
             .map_err(|error| {
                 DbError::Checkpoint(format!(
@@ -193,15 +237,6 @@ impl<'a> VnodeRehydrator<'a> {
                     attempt.epoch, attempt.checkpoint_id
                 ))
             })?;
-        let actual_digest = format!("{:x}", Sha256::digest(&bytes));
-        if u64::try_from(bytes.len()).ok() != Some(attestation.payload_len)
-            || actual_digest != attestation.payload_sha256
-        {
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6051] vnode {vnode} payload does not match the exact state seal for checkpoint {} epoch {}",
-                attempt.checkpoint_id, attempt.epoch
-            )));
-        }
         Ok(bytes)
     }
 
@@ -216,6 +251,13 @@ impl<'a> VnodeRehydrator<'a> {
         attempt: CheckpointAttempt,
     ) -> Result<VnodeRehydration, DbError> {
         Self::require_canonical_attempt(attempt)?;
+        if let Some(validated) = self.validated_head_attempt {
+            if validated != attempt {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6050] requested vnode restore attempt {attempt:?} does not match the validated committed head {validated:?}"
+                )));
+            }
+        }
         let mut report = VnodeRehydration::default();
         if vnodes.is_empty() {
             return Ok(report);
@@ -1659,6 +1701,8 @@ impl<'a> RecoveryManager<'a> {
             outcome: None,
             #[cfg(feature = "cluster")]
             cluster_capsule: None,
+            #[cfg(feature = "cluster")]
+            vnode_restore_head: None,
         })
     }
 

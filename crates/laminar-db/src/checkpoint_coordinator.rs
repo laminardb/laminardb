@@ -738,12 +738,44 @@ impl<'a> PrepareQuorum<'a> {
     }
 }
 
-/// One validated durable source cut selected for an assignment acquisition.
+/// Exact vnode-state seal already validated against one committed recovery capsule.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedVnodeRestoreHead {
+    inventory: Arc<CheckpointSealInventory>,
+}
+
+#[cfg(feature = "cluster")]
+impl ValidatedVnodeRestoreHead {
+    fn new(inventory: CheckpointSealInventory) -> Self {
+        Self {
+            inventory: Arc::new(inventory),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_inventory_for_test(inventory: CheckpointSealInventory) -> Self {
+        Self::new(inventory)
+    }
+
+    #[must_use]
+    pub(crate) fn attempt(&self) -> CheckpointAttempt {
+        self.inventory.attempt
+    }
+
+    #[must_use]
+    pub(crate) fn inventory(&self) -> Arc<CheckpointSealInventory> {
+        Arc::clone(&self.inventory)
+    }
+}
+
+/// One validated durable source and vnode-state cut selected for assignment acquisition.
 #[cfg(feature = "cluster")]
 #[derive(Debug)]
 pub(crate) struct AcquiredClusterHandoff {
     pub(crate) outcome: laminar_core::checkpoint_decision::CheckpointOutcome,
     pub(crate) sources: Arc<CommittedSourceHandoff>,
+    pub(crate) vnode_restore_head: ValidatedVnodeRestoreHead,
 }
 
 /// Immutable handles needed to read one cluster recovery cut without holding the checkpoint
@@ -829,13 +861,18 @@ impl ClusterHandoffReader {
                 "[LDB-6041] recovery capsule source handoff is invalid: {error}"
             ))
         })?);
+        let vnode_restore_head = ValidatedVnodeRestoreHead::new(inventory);
         info!(
             epoch = attempt.epoch,
             checkpoint_id = attempt.checkpoint_id,
             sources = sources.source_count(),
             "decision-bound source handoff staged for acquire"
         );
-        Ok(Some(AcquiredClusterHandoff { outcome, sources }))
+        Ok(Some(AcquiredClusterHandoff {
+            outcome,
+            sources,
+            vnode_restore_head,
+        }))
     }
 
     pub(crate) fn same_namespace(&self, other: &Self) -> bool {
@@ -1084,6 +1121,7 @@ async fn preflight_cluster_retention_cut(
         &capsule.pipeline_identity,
     )
     .await
+    .map(|_| ())
 }
 
 async fn authorize_retention_horizon(
@@ -7462,7 +7500,7 @@ impl CheckpointCoordinator {
         capsule: &ClusterRecoveryCapsule,
         expected_deployment: &str,
         expected_identity: &PipelineIdentity,
-    ) -> Result<(), DbError> {
+    ) -> Result<ValidatedVnodeRestoreHead, DbError> {
         let attempt = CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id);
         let inventory = backend
             .checkpoint_seal_inventory(attempt)
@@ -7506,7 +7544,7 @@ impl CheckpointCoordinator {
                 outcome.epoch, outcome.checkpoint_id
             )));
         }
-        Ok(())
+        Ok(ValidatedVnodeRestoreHead::new(inventory))
     }
 
     #[cfg(feature = "cluster")]
@@ -7573,14 +7611,16 @@ impl CheckpointCoordinator {
                 outcome.epoch, outcome.checkpoint_id
             ))
         })?;
-        Self::validate_cluster_cut_metadata(
+        let vnode_restore_head = Self::validate_cluster_cut_metadata(
             backend.as_ref(),
             outcome,
             capsule,
             self.expected_deployment_id()?,
             &self.expected_pipeline_identity(),
         )
-        .await
+        .await?;
+        recovered.set_vnode_restore_head(vnode_restore_head);
+        Ok(())
     }
 
     #[cfg(feature = "cluster")]

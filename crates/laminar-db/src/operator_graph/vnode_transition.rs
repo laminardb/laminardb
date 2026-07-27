@@ -257,7 +257,7 @@ struct StagedFinalOwnerExit {
 
 struct DecodedVnode {
     vnode: u32,
-    epoch: u64,
+    attempt: laminar_core::state::CheckpointAttempt,
     chain: Vec<VnodePartial>,
     operators: Vec<(usize, String)>,
 }
@@ -271,7 +271,7 @@ struct ResolvedOperator<'a> {
 
 struct ResolvedVnode<'a> {
     vnode: u32,
-    epoch: u64,
+    attempt: laminar_core::state::CheckpointAttempt,
     links: usize,
     operators: Vec<ResolvedOperator<'a>>,
 }
@@ -456,6 +456,15 @@ impl OperatorGraph {
         };
         staged.sort_unstable_by_key(|(vnode, _)| *vnode);
 
+        let staged_attempt = staged.first().map(|(_, state)| state.attempt);
+        if let Some(attempt) = staged_attempt {
+            if !attempt.is_canonical() || staged.iter().any(|(_, state)| state.attempt != attempt) {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6051] staged vnode chains do not share one canonical checkpoint attempt; first attempt is {attempt:?}"
+                )));
+            }
+        }
+
         if authority.is_none() && (!staged.is_empty() || !revoked.is_empty()) {
             return Err(DbError::Checkpoint(
                 "[LDB-6051] staged vnode transition has no cluster ownership scope".into(),
@@ -596,7 +605,7 @@ impl OperatorGraph {
             }
             decoded.push(DecodedVnode {
                 vnode: *vnode,
-                epoch: rehydrated.epoch,
+                attempt: rehydrated.attempt,
                 chain,
                 operators,
             });
@@ -634,7 +643,7 @@ impl OperatorGraph {
                     .collect::<Result<Vec<_>, DbError>>()?;
                 Ok(ResolvedVnode {
                     vnode: vnode.vnode,
-                    epoch: vnode.epoch,
+                    attempt: vnode.attempt,
                     links: vnode.chain.len(),
                     operators,
                 })
@@ -734,7 +743,8 @@ impl OperatorGraph {
         for vnode in resolved {
             tracing::debug!(
                 vnode = vnode.vnode,
-                epoch = vnode.epoch,
+                epoch = vnode.attempt.epoch,
+                checkpoint_id = vnode.attempt.checkpoint_id,
                 operators = vnode.operators.len(),
                 links = vnode.links,
                 "completed vnode recovery-chain callbacks"

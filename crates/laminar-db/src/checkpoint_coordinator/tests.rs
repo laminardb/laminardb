@@ -4290,6 +4290,13 @@ async fn source_offset_handoff_round_trip() {
     assert_eq!(acquired.outcome.epoch, attempt.epoch);
     assert_eq!(acquired.outcome.checkpoint_id, attempt.checkpoint_id);
     assert_eq!(acquired.sources.attempt(), attempt);
+    assert_eq!(acquired.vnode_restore_head.attempt(), attempt);
+    let restore_inventory = acquired.vnode_restore_head.inventory();
+    assert_eq!(restore_inventory.attempt, attempt);
+    assert_eq!(
+        restore_inventory.assignment_fence.as_ref(),
+        coord.active_assignment_fence.as_ref()
+    );
     assert_eq!(acquired.sources.checkpoint_assignment_version(), 1);
     assert_eq!(
         acquired.sources.cluster_watermark(),

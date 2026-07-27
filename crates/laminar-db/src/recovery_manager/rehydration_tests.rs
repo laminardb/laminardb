@@ -5,13 +5,12 @@ use laminar_core::state::{
     InProcessBackend, ObjectStoreBackend, StateBackendDurability, StateBackendError,
 };
 
-struct CorruptReadBackend {
+struct LegacyPartialReadBackend {
     inner: InProcessBackend,
-    corrupt_attempt: CheckpointAttempt,
 }
 
 #[async_trait]
-impl StateBackend for CorruptReadBackend {
+impl StateBackend for LegacyPartialReadBackend {
     fn key_group_capacity(&self) -> u32 {
         self.inner.key_group_capacity()
     }
@@ -33,15 +32,7 @@ impl StateBackend for CorruptReadBackend {
         attempt: CheckpointAttempt,
         vnode: u32,
     ) -> Result<Option<Bytes>, StateBackendError> {
-        let Some(bytes) = self.inner.read_partial(attempt, vnode).await? else {
-            return Ok(None);
-        };
-        if attempt != self.corrupt_attempt || bytes.is_empty() {
-            return Ok(Some(bytes));
-        }
-        let mut corrupt = bytes.to_vec();
-        corrupt[0] ^= 0xff;
-        Ok(Some(Bytes::from(corrupt)))
+        self.inner.read_partial(attempt, vnode).await
     }
 
     async fn write_commit_descriptor(
@@ -188,14 +179,47 @@ async fn rehydrate_reads_committed_partials_and_rejects_missing_vnodes() {
         .contains("absent from the exact state seal"));
 }
 
+#[cfg(feature = "cluster")]
 #[tokio::test]
-async fn rehydrate_rejects_payload_that_no_longer_matches_seal_digest() {
+async fn validated_head_is_reused_and_rejects_attempt_substitution() {
+    let backend = InProcessBackend::new(4);
+    let committed = CheckpointAttempt::canonical(7);
+    let substitute = CheckpointAttempt::canonical(8);
+    seal_epoch(&backend, committed.epoch, &[0], b"committed").await;
+    seal_epoch(&backend, substitute.epoch, &[0], b"substitute").await;
+    let inventory = backend
+        .checkpoint_seal_inventory(committed)
+        .await
+        .unwrap()
+        .expect("committed attempt is sealed");
+    let head = crate::checkpoint_coordinator::ValidatedVnodeRestoreHead::from_inventory_for_test(
+        inventory,
+    );
+    let expected_inventory = head.inventory();
+    let reader = VnodeRehydrator::from_validated_head(&backend, &head, u64::MAX).unwrap();
+
+    let cached_inventory = reader.sealed_inventory(committed).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&cached_inventory, &expected_inventory),
+        "the reader must retain the exact validated seal rather than reread an equal value"
+    );
+    let report = reader.rehydrate_at(&[0], committed).await.unwrap();
+    assert_eq!(operator_payload(&report, 0), b"committed");
+
+    let error = reader
+        .rehydrate_at(&[0], substitute)
+        .await
+        .expect_err("a different sealed attempt cannot replace the validated head");
+    assert!(error.to_string().contains("validated committed head"));
+}
+
+#[tokio::test]
+async fn rehydrate_rejects_backend_without_sealed_bounded_partial_reads() {
     let attempt = CheckpointAttempt::canonical(7);
-    let backend = CorruptReadBackend {
+    let backend = LegacyPartialReadBackend {
         inner: InProcessBackend::new(4),
-        corrupt_attempt: attempt,
     };
-    seal_epoch(&backend, 7, &[0], b"original").await;
+    seal_epoch(&backend, 7, &[0], b"state").await;
 
     let error = VnodeRehydrator::new(&backend)
         .rehydrate_at(&[0], attempt)
@@ -203,7 +227,7 @@ async fn rehydrate_rejects_payload_that_no_longer_matches_seal_digest() {
         .unwrap_err();
     assert!(error
         .to_string()
-        .contains("payload does not match the exact state seal"));
+        .contains("cannot read checkpoint-sealed vnode partials"));
 }
 
 /// Boot recovery pins the read to the recovered manifest's epoch so state and source offsets

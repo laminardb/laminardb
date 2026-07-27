@@ -1252,13 +1252,7 @@ impl LaminarDB {
         let mut staged = self.rehydrated_vnode_state.lock();
         registry.mark_restoring(owned);
         for (vnode, chain) in report.restored {
-            staged.insert(
-                vnode,
-                crate::db::RehydratedVnode {
-                    epoch: attempt.epoch,
-                    chain,
-                },
-            );
+            staged.insert(vnode, crate::db::RehydratedVnode { attempt, chain });
         }
         Ok(())
     }
@@ -1278,6 +1272,7 @@ impl LaminarDB {
     async fn stage_owned_vnodes_from_chains(
         &self,
         attempt: laminar_core::state::CheckpointAttempt,
+        restore_head: &crate::checkpoint_coordinator::ValidatedVnodeRestoreHead,
     ) -> Result<(), DbError> {
         let Some(self_id) = self
             .cluster_controller
@@ -1315,9 +1310,14 @@ impl LaminarDB {
                     .to_string(),
             ));
         };
-        let report = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
-            .rehydrate_at(&owned, attempt)
-            .await?;
+        let max_partial_bytes = self.checkpoint_state_artifact_cap_bytes()?;
+        let report = crate::recovery_manager::VnodeRehydrator::from_validated_head(
+            backend.as_ref(),
+            restore_head,
+            max_partial_bytes,
+        )?
+        .rehydrate_at(&owned, attempt)
+        .await?;
         self.stage_boot_vnode_rehydration(&registry, &target_assignment, &owned, attempt, report)?;
         tracing::info!(
             staged = owned.len(),
@@ -4041,10 +4041,16 @@ impl LaminarDB {
                                     recovered_attempt,
                                     recovered_assignment_version,
                                 )?;
+                            let restore_head = recovered.vnode_restore_head().ok_or_else(|| {
+                                DbError::Checkpoint(format!(
+                                    "[LDB-6041] recovered checkpoint {} has no validated vnode-state seal",
+                                    recovered.manifest.checkpoint_id
+                                ))
+                            })?;
                             // The exact recovered cut now supersedes any stopped generation's
                             // process-local staging. Replace it before publishing fresh chains.
                             self.reset_staged_vnode_transition_for_startup();
-                            self.stage_owned_vnodes_from_chains(recovered_attempt)
+                            self.stage_owned_vnodes_from_chains(recovered_attempt, restore_head)
                                 .await?;
                         }
 

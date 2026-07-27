@@ -460,7 +460,7 @@ async fn recovery_suspension_is_deferred_for_pending_vnode_transition() {
     db.rehydrated_vnode_state.lock().insert(
         0,
         crate::db::RehydratedVnode {
-            epoch: 7,
+            attempt: laminar_core::state::CheckpointAttempt::canonical(7),
             chain: vec![bytes::Bytes::from_static(b"pending")],
         },
     );
@@ -566,7 +566,7 @@ async fn pending_predecessor_authority_fixture(
     db.rehydrated_vnode_state.lock().insert(
         0,
         crate::db::RehydratedVnode {
-            epoch: 7,
+            attempt: laminar_core::state::CheckpointAttempt::canonical(7),
             chain: vec![bytes::Bytes::from_static(b"pending-current-assignment")],
         },
     );

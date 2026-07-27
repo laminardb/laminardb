@@ -99,9 +99,9 @@ async fn boot_report_marks_and_stages_the_exact_owned_roster() {
     assert_eq!(registry.restoring_vnodes(), vec![0, 1]);
     let staged = db.rehydrated_vnode_state.lock();
     assert_eq!(staged.len(), 2);
-    assert_eq!(staged[&0].epoch, attempt.epoch);
+    assert_eq!(staged[&0].attempt, attempt);
     assert_eq!(staged[&0].chain, vec![Bytes::from_static(b"vnode-0")]);
-    assert_eq!(staged[&1].epoch, attempt.epoch);
+    assert_eq!(staged[&1].attempt, attempt);
     assert_eq!(staged[&1].chain, vec![Bytes::from_static(b"vnode-1")]);
 }
 
@@ -184,7 +184,7 @@ async fn startup_reset_clears_stale_staging_and_lifecycle() {
     db.rehydrated_vnode_state.lock().insert(
         1,
         crate::db::RehydratedVnode {
-            epoch: 7,
+            attempt: CheckpointAttempt::canonical(7),
             chain: vec![Bytes::from_static(b"stale")],
         },
     );
@@ -205,7 +205,7 @@ async fn fresh_cluster_start_rejects_staged_vnode_state_without_clearing_it() {
     db.rehydrated_vnode_state.lock().insert(
         1,
         crate::db::RehydratedVnode {
-            epoch: 7,
+            attempt: CheckpointAttempt::canonical(7),
             chain: vec![Bytes::from_static(b"must-not-be-discarded")],
         },
     );
@@ -237,7 +237,7 @@ async fn assert_boot_recovery_target_mismatch_is_non_mutating(
     db.rehydrated_vnode_state.lock().insert(
         0,
         crate::db::RehydratedVnode {
-            epoch: committed_attempt.epoch,
+            attempt: committed_attempt,
             chain: vec![Bytes::from_static(b"existing-stage")],
         },
     );

@@ -1860,7 +1860,7 @@ async fn assignment_adoption_cannot_overtake_unapplied_vnode_state() {
     db.rehydrated_vnode_state.lock().insert(
         0,
         RehydratedVnode {
-            epoch: 7,
+            attempt: laminar_core::state::CheckpointAttempt::canonical(7),
             chain: vec![bytes::Bytes::from_static(b"staged-for-current")],
         },
     );
@@ -2164,7 +2164,7 @@ async fn recovering_flag_does_not_authorize_unapplied_vnode_state_discard() {
     db.rehydrated_vnode_state.lock().insert(
         0,
         RehydratedVnode {
-            epoch: 7,
+            attempt: laminar_core::state::CheckpointAttempt::canonical(7),
             chain: vec![bytes::Bytes::from_static(b"superseded")],
         },
     );
@@ -2285,7 +2285,7 @@ async fn assignment_publication_clears_restoring_state_for_a_vnode_lost_after_pr
     db.rehydrated_vnode_state.lock().insert(
         0,
         RehydratedVnode {
-            epoch: 7,
+            attempt: laminar_core::state::CheckpointAttempt::canonical(7),
             chain: vec![bytes::Bytes::from_static(b"acquired-before-loss")],
         },
     );

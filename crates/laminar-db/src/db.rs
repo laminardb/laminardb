@@ -829,8 +829,8 @@ pub(crate) use laminar_core::time::parse_duration_str;
 #[cfg(feature = "cluster")]
 #[derive(Debug, Clone)]
 pub struct RehydratedVnode {
-    /// Committed epoch the chain head was read from.
-    pub epoch: u64,
+    /// Exact committed checkpoint attempt the chain head was read from.
+    pub attempt: laminar_core::state::CheckpointAttempt,
     /// Recovery chain (oldest→newest decoded-as-bytes partials): a FULL base plus any delta partials.
     pub chain: Vec<bytes::Bytes>,
 }
@@ -2572,9 +2572,14 @@ impl LaminarDB {
                 handoff.outcome.epoch,
                 handoff.outcome.checkpoint_id,
             );
-            crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
-                .rehydrate_at(&newly_acquired, attempt)
-                .await?
+            let max_partial_bytes = self.checkpoint_state_artifact_cap_bytes()?;
+            crate::recovery_manager::VnodeRehydrator::from_validated_head(
+                backend.as_ref(),
+                &handoff.vnode_restore_head,
+                max_partial_bytes,
+            )?
+            .rehydrate_at(&newly_acquired, attempt)
+            .await?
         } else {
             crate::recovery_manager::VnodeRehydration::default()
         };
@@ -2741,7 +2746,7 @@ impl LaminarDB {
                 staged_rehydration.insert(
                     *vnode,
                     RehydratedVnode {
-                        epoch: attempt.epoch,
+                        attempt,
                         chain: rehydration.restored.remove(vnode).unwrap_or_default(),
                     },
                 );
@@ -4540,6 +4545,23 @@ impl LaminarDB {
             .map_or(runtime_default, |registry| {
                 laminar_core::state::KeyGroupCount::try_from(registry.vnode_count())
                     .expect("builder validated the vnode registry key-group count")
+            })
+    }
+
+    /// Conservative cap for one vnode-state artifact read during restore.
+    ///
+    /// This is deliberately not described as a total restore-memory bound: a recovery chain can
+    /// retain multiple individually bounded artifacts until graph publication.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn checkpoint_state_artifact_cap_bytes(&self) -> Result<u64, DbError> {
+        self.config
+            .checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.max_staged_bytes)
+            .ok_or_else(|| {
+                DbError::Config(
+                    "checkpoint.max_staged_bytes was not resolved for vnode-state restore".into(),
+                )
             })
     }
 
