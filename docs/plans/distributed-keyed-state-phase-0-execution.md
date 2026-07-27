@@ -5,7 +5,7 @@
   pending a new official package; no runtime
   dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 67
+- **Last reconciled:** 2026-07-27 during Cycle 68
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -531,6 +531,21 @@ provider-neutral diagnostics-only TLS 1.3 mTLS listener and hostile identity tes
 and (5) powered equivalence and the independently operated production soak only after their own
 frozen inputs. None authorizes a TidesDB package attempt, runtime backend dependency, keyed-state
 admission, or delivery-guarantee change.
+
+Cycle 68 completes only the control-primitives prefix of step (1), in `1b6a06ed`. The isolated tool
+now has externally bound `paced-owned-fake` plan/READY fixtures, byte-golden START/ACK frames,
+post-decode monotonic anchoring, 49/50/51-ms release and ACK classification, absolute 4.5/4.75-
+second cuts, and atomic seven-start rolling admission. The full suite has 58 active passing tests
+and one intentionally ignored subprocess fixture on Windows. No executable mode, evidence stream,
+result, transcript, lane, HTTP interaction, or real-time 290-second test exists, so step (1) remains
+open.
+
+Cycle 69 is limited to library-level owned-fake evidence contracts: bounded sequenced framing,
+supervisor-spool-compatible transcript validation, a complete ordered 174-node-slot result, checked
+totals, and honest open/unsealed generation coverage. It must remain incapable of contacting
+LaminarDB. Transport delivery-stage extraction, persistent lanes, child/supervisor integration, the
+actual-limiter test, and the 290-second pair follow as separately reviewed gates rather than one
+large rewrite.
 
 The existing output path satisfies none of the new provenance/fence fields: it passes only a batch
 and deadline and uses an idempotent, non-transactional Kafka producer. The supported evidence APIs

@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 67
+- **Last reconciled:** 2026-07-27 during Cycle 68
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -291,12 +291,20 @@ timing prefixes with explicit unsealed restart gaps; it does not add checkpoint-
 claim an unknown old-process tail is complete. A future exact option requires a fenced durable
 intent/terminal/generation-seal journal and its own checkpoint-latency/outage decision.
 
-The next bounded implementation gate is owned-fake only: build paced schemas, clock abstraction,
-three lanes, rate shaping, full transcript validation, hidden-tail classification, and deterministic
-boundary tests plus one real-time 290-second C/D pair. Ambiguous post-delivery I/O quarantines its
-process lane; actual-limiter tests must prove no overlap or paced 429 retry. Then prove launcher-
-prebound socket adoption, trusted release-process descriptors, and nonce-bound v2 responses in a
-non-measurement loopback preflight before any A/B. Multi-host work remains a
+Cycle 68 completes the first, deliberately smaller owned-fake slice in `1b6a06ed`: externally bound
+canonical fixture plans, distinct fixture descriptor identities, fixed nonce-bound START/ACK,
+anchor-after-decode ordering, absolute timing classifiers, and atomic cross-slot rate admission. Its
+`paced-owned-fake-*` names cannot be relabelled as live readiness, and it has no executable, network,
+lane, result, transcript, or timing-coverage path.
+
+The next bounded implementation gate remains owned-fake only: add a separately versioned bounded
+frame stream, complete 174-node-slot result validation, append-only transcript validation, and
+open/unsealed timing-generation classification without a CLI or socket. Then extract delivery-stage
+HTTP behavior with accelerated-v3 regression coverage; implement three persistent lanes and
+supervisor spooling; prove ambiguous post-delivery quarantine and the actual limiter; and run the
+manual 290-second C/D pair. Only after those gates may work prove launcher-prebound socket adoption,
+trusted release-process descriptors, and nonce-bound v2 responses in a non-measurement loopback
+preflight before any A/B. Multi-host work remains a
 separate diagnostics-only TLS 1.3 mTLS listener with signed node-specific roster/identity and
 attempt-bound credentials; it cannot reuse current cluster mTLS as HTTP evidence. Live A/B,
 powered equivalence, TidesDB qualification, runtime admission, delivery/exactly-once work, and the

@@ -108,6 +108,10 @@ hostile child paths. No live pacing, LaminarDB request, A/B, backend, delivery c
 [Cycle 67](../reviews/distributed-keyed-state-cycle-67.md) is design-only. It freezes a distinct
 monotonic paced protocol, complete slot/transcript evidence, an observed-prefix timing claim, and
 separate single-host versus multi-host transport profiles. It runs no request or experiment.
+[Cycle 68](../reviews/distributed-keyed-state-cycle-68.md) implements only domain-separated
+owned-fake control primitives: exact external plan binding, fixed START/ACK framing, post-frame
+monotonic anchoring, absolute deadline classifiers, and atomic cross-slot rate admission. The path
+has no executable, socket, result/transcript, live schema, LaminarDB request, or empirical sample.
 
 ## Verdict
 
@@ -693,6 +697,7 @@ The current branch's admission-neutral hardening was then checked separately:
 | Cycle 65 standalone observer protocol | PASS for the bounded fake-only component; live/driver integration blocked | Result v2 binds sanitized plan v2; bootstrap v3, strict direct HTTP/cursor/identity validation, explicit incomplete exit, and cancellation pass. Owned child-process tests prove zero C connections and 348 parsed D responses; no LaminarDB process was contacted |
 | Cycle 66 sealed fake-protocol supervisor | PASS for bounded fake-only consumption; live/production blocked | Bootstrap v4/result v3 add fresh invocation binding; the manifest-pinned child is captured, cancelled, and reaped within bounds, and its result is consumed only after the identical common end seal. 38 tests pass; no LaminarDB request or measurement ran |
 | Cycle 67 paced observer/evidence contract | DESIGN ONLY; live/production blocked | Freezes absolute monotonic pacing, parallel node lanes, cross-slot rate shaping, complete transcript evidence, observed-prefix timing coverage, launcher-prebound loopback sockets, and a separate future mTLS listener; no code, request, or measurement |
+| Cycle 68 paced owned-fake primitives | PASS for the partial library boundary; live/production blocked | Externally bound fake plan/READY, byte-golden START/ACK, anchor-after-decode ordering, absolute timing cuts, and atomic seven-start shaping pass 20 focused tests; no executable, network, evidence/result framing, lane, or measurement |
 
 Both cluster and no-feature `cargo check` and `cargo clippy -D warnings` configurations passed, as
 did formatting and diff checks. These focused results do not exercise keyed cluster restore.
@@ -782,6 +787,15 @@ client rate shaper, and explicitly open/unsealed process-prefix coverage. It als
 address, gossip RPC address, current shared-name cluster mTLS, DNS, or PID alone as endpoint
 identity. No code, LaminarDB request, workload, fault, A/B, backend, delivery change, or independent
 soak ran; `certification_eligible` remains `false`.
+
+Cycle 68 also adds no empirical product sample. The root-workspace-excluded tool gains a library-
+only `paced-owned-fake` contract and clock/rate primitives in `1b6a06ed`; it cannot open a socket.
+All 58 active standalone tests pass on Windows (one subprocess fixture remains intentionally
+ignored), along with warnings-denied Clippy and formatting. Three independent reviews approve the
+bounded primitive slice and explicitly exclude result/transcript validation, HTTP delivery-stage
+handling, three persistent lanes, child/supervisor spooling, the 290-second C/D pair, release-
+process preflight, A/B, backend, delivery, admission, and independent soak. Fixture READY is not
+launcher listener-adoption evidence, and `certification_eligible` remains `false`.
 
 These are admission and focused operator tests, not a production certification. No existing test
 demonstrates a distributed keyed operator processing remote rows through crash, restore, and

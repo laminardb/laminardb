@@ -1121,6 +1121,47 @@ roster/rotation tests. No live request, A/B, latency result, backend qualificati
 distributed-state admission, delivery/exactly-once change, or independent soak occurred in Cycle
 67; `certification_eligible` remains `false`.
 
+### Cycle 68 paced owned-fake control primitives
+
+Cycle 68 implements only the first reviewable owned-fake prerequisite in `1b6a06ed`. It does not
+implement the normative live `paced-observer-*` result/evidence contracts above. The standalone,
+root-workspace-excluded tool instead uses domain-separated `paced-owned-fake-plan/v1`,
+`paced-owned-fake-ready/v1`, and `paced-owned-fake-diagnostic-policy/v1` fixtures plus fixed binary
+owned-fake START/ACK frames. These names are intentional: fixture READY only acknowledges a plan
+and three distinct fixture descriptor identities. It is not launcher socket-adoption evidence and
+must never be promoted to live readiness by relabelling it.
+
+Plan parsing is not self-authorizing. The validating caller/future supervisor contract constructs
+an expectation from the sealed base plan, exact arm, fresh UUIDv4 invocation, three distinct
+fixture descriptor identities, and
+server/configuration artifact digests. Candidate canonical bytes must match that complete external
+expectation before they become a validated plan. READY, START, and ACK then bind the resulting plan
+digest and invocation; START additionally carries a nonzero 128-bit nonce. The observer's only
+public START-receive operation validates the complete fixed frame and then captures the monotonic
+anchor, and ACK construction requires that anchored state. Fixed golden bytes and hostile
+truncation, extension, mutation, nonce, replay, duplicate-field, unknown-field, noncanonical, and
+size-cap tests protect this boundary.
+
+The implemented pacing primitives classify the 49/50/51-ms release and acknowledgement boundary,
+derive the 4.5-second node and 4.75-second quiescence cuts from the absolute target, retain the
+289.75/290-second final constants, and expose a cancellable system monotonic clock plus injected
+clock seam. A standalone shaper intended for future per-lane ownership atomically decides and
+records each admitted physical start:
+seven equal-time starts are allowed, the eighth waits, a timestamp exactly one second old is outside
+the open lower bound, history persists across logical slots, and deadline, rate deferral, clock
+regression, and arithmetic overflow are distinct fail-closed outcomes. The split check/record API
+was rejected because it could admit a socket after the absolute cut.
+
+This slice has no executable command, child-process IPC, output spool, transcript/result DTO,
+three-lane coordinator, HTTP request, response parser, timing-generation classifier, or 290-second
+test. It cannot open a socket or contact LaminarDB, and every serialized object keeps
+`execution_eligible = false`. On Windows, 39 library tests, three active supervisor tests, and 16
+CLI tests pass (58 active total; one subprocess fixture remains intentionally ignored), as do
+warnings-denied Clippy, formatting, and diff checks. Independent code, test, and design reviews
+approve only this partial owned-fake primitive boundary. No empirical sample or production claim is
+created; all live, A/B, backend, delivery/exactly-once, admission, and independent-soak gates remain
+blocked.
+
 ## Frozen numerical contract
 
 An eligible machine-readable charter contains no `TBD`, zero, or results-derived threshold. It

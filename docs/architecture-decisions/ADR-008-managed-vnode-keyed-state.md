@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 67
+- **Last reconciled:** 2026-07-27 during Cycle 68
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -1420,6 +1420,24 @@ than coupled to S3, TidesDB object storage, or any cloud-specific identity API. 
 fake-paced tests, a release-binary preflight, live A/B, multi-host security, and the independent soak
 remain ordered later gates. `[LDB-4007]`, `[LDB-0013]`, backend status, and production **NO-GO** are
 unchanged.
+
+Cycle 68 lands only the first owned-fake control-plane primitive in `1b6a06ed`. A new isolated
+module validates an externally bound canonical fake plan, three distinct fixture descriptor
+identities, fixture READY, fixed invocation/plan/nonce START and ACK frames, post-frame monotonic
+anchor capture, absolute release/deadline classification, and an atomic cross-slot seven-start
+rolling shaper. The
+schemas and frame magic say `paced-owned-fake`; they are deliberately not the future live
+`paced-observer-*` or `diagnostic-request-response/v2` contracts. This prevents a fixture
+acknowledgement or limits-only hash from being mistaken for launcher socket adoption or authenticated
+server response identity.
+
+The accelerated protocol remains unchanged, and the new module has no CLI wiring, network call,
+result/transcript, lanes, timing-coverage reducer, or real-time run. Its 20 focused tests and the
+unchanged standalone suite pass on Windows, with three independent reviews approving only this
+partial boundary. Cycle 69 may add bounded owned-fake evidence/result framing; HTTP delivery-stage
+classification, lane execution, supervisor spooling, the manual 290-second pair, release-process
+preflight, live A/B, backend qualification, delivery, admission, and independent soak remain later
+gates. `[LDB-4007]`, `[LDB-0013]`, and production **NO-GO** are unchanged.
 
 Selected attempts may then be joined at low cadence only through a new read-only, same-snapshot
 core audit of the exact outcome, both retention floors, and validated live capsule reference;
