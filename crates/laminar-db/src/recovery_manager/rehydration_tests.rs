@@ -220,7 +220,7 @@ async fn validated_head_is_reused_and_rejects_attempt_substitution() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn validated_reader_enforces_the_per_artifact_limit() {
+async fn validated_reader_enforces_artifact_size_and_chain_count_limits() {
     let backend = InProcessBackend::new(1);
     let attempt = CheckpointAttempt::canonical(7);
     seal_epoch(&backend, attempt.epoch, &[0], b"state").await;
@@ -681,6 +681,82 @@ async fn retention_keeps_reference_then_delta_ancestry() {
         .expect_err("reader must independently reject lineage beyond the writer-derived bound");
     assert!(
         error.to_string().contains("limit of 3 artifacts"),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn validated_reader_enforces_current_six_artifact_boundary() {
+    let backend = InProcessBackend::new(1);
+    let full = CheckpointAttempt::canonical(100);
+    let reference = CheckpointAttempt::canonical(102);
+    write_and_seal_partial(
+        &backend,
+        full,
+        crate::vnode_partial::VnodePartial {
+            operators: vec![("agg".into(), b"full".to_vec())],
+            base: None,
+            deltas: Vec::new(),
+        },
+    )
+    .await;
+    write_and_seal_partial(
+        &backend,
+        reference,
+        crate::vnode_partial::VnodePartial {
+            operators: Vec::new(),
+            base: Some(full),
+            deltas: Vec::new(),
+        },
+    )
+    .await;
+    let mut head_attempt = reference;
+    for checkpoint_id in 103..=106 {
+        let attempt = CheckpointAttempt::canonical(checkpoint_id);
+        write_and_seal_partial(
+            &backend,
+            attempt,
+            crate::vnode_partial::VnodePartial {
+                operators: Vec::new(),
+                base: Some(head_attempt),
+                deltas: vec![("agg".into(), format!("delta-{checkpoint_id}").into_bytes())],
+            },
+        )
+        .await;
+        head_attempt = attempt;
+    }
+    let inventory = backend
+        .checkpoint_seal_inventory(head_attempt)
+        .await
+        .unwrap()
+        .unwrap();
+    let head =
+        crate::checkpoint_coordinator::ValidatedVnodeRestoreHead::from_unchecked_inventory_for_test(
+            inventory,
+        );
+    let production_limit = crate::pipeline_lifecycle::MAX_ARTIFACTS_PER_CLUSTER_VNODE_CHAIN;
+
+    let loaded =
+        SealedVnodeChainReader::from_validated_head(&backend, &head, u64::MAX, production_limit)
+            .unwrap()
+            .load_at(&[0], head_attempt)
+            .await
+            .unwrap();
+    assert_eq!(loaded.chains[&0].len(), production_limit);
+
+    let error = SealedVnodeChainReader::from_validated_head(
+        &backend,
+        &head,
+        u64::MAX,
+        production_limit - 1,
+    )
+    .unwrap()
+    .load_at(&[0], head_attempt)
+    .await
+    .expect_err("the artifact immediately beyond the production limit must fail closed");
+    assert!(
+        error.to_string().contains("limit of 5 artifacts"),
         "{error}"
     );
 }

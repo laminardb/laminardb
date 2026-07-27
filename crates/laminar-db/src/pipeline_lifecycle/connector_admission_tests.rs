@@ -7,8 +7,8 @@ use super::{
 };
 #[cfg(feature = "cluster")]
 use super::{
-    cluster_delta_chain_bound, cluster_vnode_chain_artifact_limit,
-    MAX_CLUSTER_VNODE_CHAIN_ARTIFACTS,
+    cluster_delta_chain_bound, max_artifacts_per_cluster_vnode_chain,
+    MAX_ARTIFACTS_PER_CLUSTER_VNODE_CHAIN,
 };
 use crate::db::DbState;
 use crate::pipeline::PipelineConfig;
@@ -33,7 +33,7 @@ use std::time::Duration;
 
 #[cfg(feature = "cluster")]
 #[test]
-fn cluster_delta_chain_bound_is_derived_from_retention() {
+fn cluster_vnode_lineage_limits_are_derived_from_retention() {
     assert_eq!(cluster_delta_chain_bound(0), None);
     assert_eq!(cluster_delta_chain_bound(1), None);
     assert_eq!(cluster_delta_chain_bound(2), Some(1));
@@ -42,14 +42,14 @@ fn cluster_delta_chain_bound_is_derived_from_retention() {
     assert_eq!(cluster_delta_chain_bound(5), Some(4));
     assert_eq!(cluster_delta_chain_bound(usize::MAX), Some(4));
 
-    assert_eq!(cluster_vnode_chain_artifact_limit(0), 1);
-    assert_eq!(cluster_vnode_chain_artifact_limit(1), 1);
-    assert_eq!(cluster_vnode_chain_artifact_limit(2), 3);
-    assert_eq!(cluster_vnode_chain_artifact_limit(3), 4);
-    assert_eq!(cluster_vnode_chain_artifact_limit(4), 5);
-    assert_eq!(cluster_vnode_chain_artifact_limit(5), 6);
-    assert_eq!(cluster_vnode_chain_artifact_limit(usize::MAX), 6);
-    assert_eq!(MAX_CLUSTER_VNODE_CHAIN_ARTIFACTS, 6);
+    assert_eq!(max_artifacts_per_cluster_vnode_chain(0), 1);
+    assert_eq!(max_artifacts_per_cluster_vnode_chain(1), 1);
+    assert_eq!(max_artifacts_per_cluster_vnode_chain(2), 3);
+    assert_eq!(max_artifacts_per_cluster_vnode_chain(3), 4);
+    assert_eq!(max_artifacts_per_cluster_vnode_chain(4), 5);
+    assert_eq!(max_artifacts_per_cluster_vnode_chain(5), 6);
+    assert_eq!(max_artifacts_per_cluster_vnode_chain(usize::MAX), 6);
+    assert_eq!(MAX_ARTIFACTS_PER_CLUSTER_VNODE_CHAIN, 6);
 }
 
 struct RetiringQuiesceSink {

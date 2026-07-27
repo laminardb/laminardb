@@ -79,7 +79,7 @@ impl StateNamespaceBinding {
 pub struct CheckpointAttempt {
     /// Logical pipeline epoch represented by this checkpoint.
     pub epoch: u64,
-    /// Globally unique, never-reused checkpoint attempt ID.
+    /// Never-reused checkpoint attempt ID within the bound deployment/state namespace.
     pub checkpoint_id: u64,
 }
 

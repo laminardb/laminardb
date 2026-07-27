@@ -37,7 +37,7 @@ pub(crate) struct SealedVnodeChainReader<'a> {
     seal_cache: tokio::sync::Mutex<HashMap<CheckpointAttempt, Arc<CheckpointSealInventory>>>,
     validated_head_attempt: Option<CheckpointAttempt>,
     max_partial_bytes: u64,
-    max_chain_artifacts: usize,
+    max_artifacts_per_vnode_chain: usize,
 }
 
 impl<'a> SealedVnodeChainReader<'a> {
@@ -50,7 +50,7 @@ impl<'a> SealedVnodeChainReader<'a> {
             seal_cache: tokio::sync::Mutex::new(HashMap::new()),
             validated_head_attempt: None,
             max_partial_bytes: u64::MAX,
-            max_chain_artifacts: usize::MAX,
+            max_artifacts_per_vnode_chain: usize::MAX,
         }
     }
 
@@ -60,14 +60,14 @@ impl<'a> SealedVnodeChainReader<'a> {
         backend: &'a dyn StateBackend,
         head: &crate::checkpoint_coordinator::ValidatedVnodeRestoreHead,
         max_partial_bytes: u64,
-        max_chain_artifacts: usize,
+        max_artifacts_per_vnode_chain: usize,
     ) -> Result<Self, DbError> {
         if max_partial_bytes == 0 {
             return Err(DbError::Checkpoint(
                 "[LDB-6050] vnode partial artifact limit must be nonzero".into(),
             ));
         }
-        if max_chain_artifacts == 0 {
+        if max_artifacts_per_vnode_chain == 0 {
             return Err(DbError::Checkpoint(
                 "[LDB-6050] vnode chain artifact limit must be nonzero".into(),
             ));
@@ -87,7 +87,7 @@ impl<'a> SealedVnodeChainReader<'a> {
             seal_cache: tokio::sync::Mutex::new(seal_cache),
             validated_head_attempt: Some(attempt),
             max_partial_bytes,
-            max_chain_artifacts,
+            max_artifacts_per_vnode_chain,
         })
     }
 
@@ -197,10 +197,10 @@ impl<'a> SealedVnodeChainReader<'a> {
                 "[LDB-6051] vnode {vnode} chain artifact count overflow"
             ))
         })?;
-        if next > self.max_chain_artifacts {
+        if next > self.max_artifacts_per_vnode_chain {
             return Err(DbError::Checkpoint(format!(
                 "[LDB-6051] vnode {vnode} recovery chain exceeds the writer-derived limit of {} artifacts",
-                self.max_chain_artifacts
+                self.max_artifacts_per_vnode_chain
             )));
         }
         *artifact_count = next;

@@ -39,7 +39,7 @@ const fn cluster_delta_chain_bound(max_retained: usize) -> Option<u32> {
 /// One FULL is always required; retention of two or more cuts permits one direct REFERENCE edge,
 /// and the remaining edges are the independently bounded consecutive DELTAs.
 #[cfg(feature = "cluster")]
-pub(crate) const fn cluster_vnode_chain_artifact_limit(max_retained: usize) -> usize {
+pub(crate) const fn max_artifacts_per_cluster_vnode_chain(max_retained: usize) -> usize {
     let reference_edge = if max_retained >= 2 { 1 } else { 0 };
     let delta_edges = match cluster_delta_chain_bound(max_retained) {
         Some(bound) => bound as usize,
@@ -52,8 +52,8 @@ pub(crate) const fn cluster_vnode_chain_artifact_limit(max_retained: usize) -> u
 /// `max_retained` value is not yet part of cluster identity, so using its narrower limit could
 /// strand a valid checkpoint produced by a differently configured participant.
 #[cfg(feature = "cluster")]
-pub(crate) const MAX_CLUSTER_VNODE_CHAIN_ARTIFACTS: usize =
-    cluster_vnode_chain_artifact_limit(usize::MAX);
+pub(crate) const MAX_ARTIFACTS_PER_CLUSTER_VNODE_CHAIN: usize =
+    max_artifacts_per_cluster_vnode_chain(usize::MAX);
 
 const fn required_recovery_scope(runtime: RuntimeMode) -> StateBackendDurability {
     match runtime {
@@ -1336,7 +1336,7 @@ impl LaminarDB {
                 backend.as_ref(),
                 restore_head,
                 max_partial_bytes,
-                MAX_CLUSTER_VNODE_CHAIN_ARTIFACTS,
+                MAX_ARTIFACTS_PER_CLUSTER_VNODE_CHAIN,
             )?
             .load_at(&owned, attempt)
             .await?;
