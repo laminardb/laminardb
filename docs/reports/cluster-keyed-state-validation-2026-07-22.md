@@ -9,13 +9,18 @@
 **2026-07-27 core update:** The
 [ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset)
 pauses later certification tooling. Core Cycle 1 adds a private reference managed vnode shard and
-caller-supplied lifecycle publication. Core Cycles 2–3 contain the existing runtime staging path
+caller-supplied lifecycle publication. Core Cycles 2–4 contain the existing runtime staging path
 with exact local roster/chain preflight, deterministic callbacks, delayed activation, sticky
 poison, boot-target validation, predecessor-authority repair, and an audited committed final-owner
 revoke when the live local process has the committed predecessor boot incarnation and is absent
 from the target assignment. Recovery authority, no-store adoption, abort, and unaudited
-transitions cannot authorize that cleanup. These cycles do not consume the managed reference, add
-TidesDB, make SQL restore atomically publishable, or relax `[LDB-4007]`.
+transitions cannot authorize that cleanup. Cycle 4 also proves and closes a head-seal substitution
+window between source/capsule validation and vnode loading, requires exact attestation and a
+per-artifact bound on built-in backend reads, and rejects mixed full-attempt staging before
+callbacks. The corrective scope preserves the admitted global vnode-0 aggregate's established raw
+rkyv FULL/reference/DELTA wire. Transitive parent substitution, aggregate chain/RSS/decode limits,
+and publication pause remain open. These cycles do not consume the managed reference, add TidesDB,
+make SQL restore atomically publishable, or relax `[LDB-4007]`.
 
 **Current authority:** the [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
 selects the official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb`, as the intended
@@ -674,6 +679,13 @@ The current branch's admission-neutral hardening was then checked separately:
 
 | Current-branch check | Result | Evidence |
 |---|---:|---|
+| Core Cycle 4 corrective-tree feature checks | PASS | `cargo check -p laminar-db --no-default-features` and the same command with `--features cluster` passed |
+| Core Cycle 4 raw vnode-partial wire tests | PASS, 7/7 | Includes a frozen established global-aggregate DELTA fixture that must remain byte-exact until a version-fenced reader/writer migration exists |
+| Core Cycle 4 sealed chain/backend tests | PASS, 15/15 DB and 3/3 core | Exact validated-head reuse, attempt substitution rejection, per-artifact read bounds, full/reference/delta chains, missing seals, retention, and built-in exact sealed reads |
+| Core Cycle 4 graph and boot staging tests | PASS, 112/112 graph and 8/8 boot | Complete-attempt preflight, mixed-attempt rejection, callback/activation containment, and exact boot roster/attempt/assignment staging |
+| Core Cycle 4 focused coordinator regressions | PASS, 4/4 | Reference reuse, bounded delta depth, mixed-delta reference exclusion, and overlapping-attempt isolation retain the established raw wire |
+| Core Cycle 4 warnings-denied Clippy and formatting gates | PASS | Both no-default and cluster Clippy matrices plus `cargo fmt --all -- --check`, current diff, and five-file relative-link checks pass |
+| Core Cycle 4 full DB/default-feature suite | **NOT RUN / NO PASS CLAIM** | A broad Windows invocation did not yield a suite result; it timed out/broke its pipe only after the test binary linked. No full-suite, latency, RSS, backend, or soak evidence follows |
 | Core Cycle 3 `operator_graph::tests` with cluster | PASS, 111/111 | Full graph unit module after opaque final-exit authority, rotation-fence, endpoint, restore-drift, assignment-drift, callback-failure, and sticky-poison checks |
 | Core Cycle 3 `final_owner_exit` focused filter | PASS, 8/8 | Audited committed last-vnode cleanup succeeds only for the exact predecessor/target identity and retains staging on every indeterminate result |
 | `snapshot_watcher_handles_draining_phase` multi-node integration | PASS, 1/1 | A zero-vnode follower completes committed revoke without polling its source, remains intake-fenced and non-authoritative, and exposes inactive transport endpoints; not an independent soak |
@@ -714,8 +726,10 @@ The current branch's admission-neutral hardening was then checked separately:
 | Cycle 67 paced observer/evidence contract | DESIGN ONLY; live/production blocked | Freezes absolute monotonic pacing, parallel node lanes, cross-slot rate shaping, complete transcript evidence, observed-prefix timing coverage, launcher-prebound loopback sockets, and a separate future mTLS listener; no code, request, or measurement |
 | Cycle 68 paced owned-fake primitives | PASS for the partial library boundary; live/production blocked | Externally bound fake plan/READY, byte-golden START/ACK, anchor-after-decode ordering, absolute timing cuts, and atomic seven-start shaping pass 20 focused tests; no executable, network, evidence/result framing, lane, or measurement |
 
-Both cluster and no-feature `cargo check` and `cargo clippy -D warnings` configurations passed, as
-did formatting and diff checks. These focused results do not exercise keyed cluster restore.
+Both corrective-tree feature checks, the focused test record above, both warnings-denied Clippy
+matrices, formatting, the current diff check, and the five-file relative-link scan passed. No
+Cycle 4 result exercises an admitted distributed keyed SQL operator, a local-spill backend,
+production latency/RSS, delivery composition, or an independent soak.
 
 Cycle 57's real commands used a Windows optimized soak-profile binary with Docker Desktop's WSL2
 engine, static discovery, MinIO, Redpanda v26.1.13, 64 key groups, 96 input partitions, shared

@@ -3,7 +3,7 @@
 - **Status:** Core reference implementation resumed; production qualification/certification paused;
   exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster operator is admitted
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Core Cycle 3
+- **Last reconciled:** 2026-07-27 during Core Cycle 4
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -40,24 +40,33 @@ through every phase; they are not a final cleanup sprint.
 
 The owner reset is recorded normatively in
 [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset).
-Cycle 69 and later certification work are paused. Core Cycles 1–3 add a private reference shard and
+Cycle 69 and later certification work are paused. Core Cycles 1–4 add a private reference shard and
 a fail-closed graph containment path: exact local lifecycle-roster and chain preflight,
 deterministic callbacks, delayed activation, sticky poison after indeterminate mutation, boot-cut
 validation, predecessor-authority repair, control-only completion while source intake is closed,
-and an audited committed final-owner exit that does not invent a target participant. They do not
-change runtime admission.
+an audited committed final-owner exit that does not invent a target participant. Cycle 4 also
+retains the exact capsule-validated head seal through boot/adoption, requires built-in backends to
+read exact sealed partials under a per-artifact bound, and carries the full attempt through graph
+preflight. Its corrective scope leaves the admitted global vnode-0 aggregate's raw rkyv
+FULL/reference/DELTA wire unchanged and freezes a representative DELTA fixture. Transitive parent
+attestations and aggregate restore-resource accounting remain open. They do not change runtime
+admission.
 
-The next core lifecycle slice must replace the remaining split acquire/partial-revoke records with
-one complete transition identity and an authoritative operator/state-table roster, add
-prepare/publish/abort shadows and a real semantic install boundary for the SQL operator's
-`QueryState::Uninit` path, and bound restore memory and pause time. Backend work does not block this
-slice. TidesDB re-entry and the upstream-contribution boundary are owned by the
+The next checkpoint slice must define the version-fenced upgrade/rollback path that can bind every
+transitive parent attestation without stranding established global-aggregate checkpoints. It must
+also define aggregate chain/concurrency accounting; Cycle 4's per-artifact limit is not an RSS,
+decoded-expansion, or apply-pause bound. The following lifecycle slice adds an authoritative
+operator/state-table roster and binds predecessor/target/pipeline transition identity before
+prepare/publish/abort shadows and a real semantic install boundary for `QueryState::Uninit`.
+Backend work does not block these slices. TidesDB re-entry and the upstream-contribution boundary
+are owned by the
 [TidesDB design](../architecture-decisions/tidesdb-local-state-successor-design.md).
 
 **DKS-CLEANUP-001 — final maintainability gate.** The distributed keyed-state feature maintainer
 owns this gate. Low-risk cleanup lands as each core slice stabilizes; the final sweep runs after the
 core lifecycle and backend implementation are functionally complete and before any stateful
-admission or production qualification. Its ordered inventory is:
+admission. The independent soak must exercise the cleaned release candidate, so the final sweep
+also precedes that soak and any production-readiness claim. Its ordered inventory is:
 
 1. remove the parked redb prescreen/qualification lane, required-CI dependency, and oversized
    parked protocol document, retaining only a short alternatives-considered decision;
@@ -71,9 +80,41 @@ admission or production qualification. Its ordered inventory is:
    `vnode_partial/v2`, and unused partition-schema models before admission;
 5. make the operator capability inventory authoritative or remove its duplicate SQL classification;
 6. rename rehydration/staging and dry-run/legacy APIs by actual semantics, narrow test-only public
-   hooks, and split DB assignment, graph transition, and their large test modules by runtime owner;
-7. benchmark the empty transition path and cache shuffle routing codecs/schema work before changing
-   hot-path locking or allocation.
+   hooks, delete zero-consumer façade methods, and split DB assignment, graph transition, soak, and
+   their large test modules by coherent runtime/test ownership rather than line count;
+7. remove or isolate debug filesystem fault-injection polling (`checkpoint_kill_gate` and
+   `LAMINAR_FAULT_INJECT_TRIGGER_FILE`) behind an explicit test-only feature, then benchmark the
+   empty transition path and cache shuffle routing codecs/schema work before changing hot-path
+   locking or allocation;
+8. revalidate generated research against current primary sources and the accepted ADRs, then delete
+   superseded, irrelevant, or duplicated research/cycle prose instead of maintaining it as product
+   documentation; and
+9. finish with compiler/Clippy feature matrices plus reachability, public-API, naming, module-size,
+   and dependency scans; every retained helper/config/model must have a human-identifiable owner and
+   runtime, conformance, test, or operations consumer.
+
+**DKS-OPS-001 — minimum maintenance and error signals before admission.** Keep labels bounded;
+checkpoint IDs, assignment versions, vnode/operator names, digests, SQL, and error text belong in
+structured logs, not metric labels.
+
+| Signal | Required semantics |
+|---|---|
+| `vnode_transitions_total{kind,outcome}` | One terminal increment per startup, rebalance, or final-exit attempt; outcomes are `completed`, `failed_before_publish`, or `recovery_required` |
+| `vnode_transition_duration_seconds{kind,outcome}` | End-to-end durable read through publication latency |
+| `vnode_transition_apply_duration_seconds{outcome}` | Only graph preflight/callback/publication time while normal execution is withheld; the product latency budget must set the p99/p99.9 gate |
+| `vnode_transition_started_timestamp_seconds` and `vnode_restoring_vnodes` | Zero timestamp when idle and an atomic locally owned restoring count, sufficient to detect an abandoned transition without hot-path polling |
+| `vnode_restore_bytes_total` and `vnode_checkpoint_payload_bytes_total` | Physical verified bytes read and partial payload bytes written; retries count again |
+| `vnode_retention_lag_epochs` and `vnode_retention_failures_total{component,reason}` | Difference between authorized and applied prune horizons, with bounded component/reason categories |
+
+Liveness stays independent. Readiness closes while a managed transition is active, any locally
+owned vnode is `Restoring`, or graph state is poisoned/recovery-required. Emit one structured start
+and terminal event with stable code, phase/disposition, assignment version, full checkpoint attempt,
+vnode count, verified bytes, and duration; never log keys or state bytes. An increase in
+`recovery_required`, or owned `Restoring` vnodes without an active transition, is immediately
+critical. Repeated pre-publish failure and retention lag use deployment-specific time windows; no
+universal apply-pause SLO is invented before the latency budget is approved. The current
+`checkpoint_size_bytes` excludes separately written vnode partials and must be corrected or renamed
+before it can support this operator family.
 
 Completion requires both feature matrices, warnings-denied Clippy, focused fault tests, dead/public
 API search, documentation-link checks, latency/resource evidence for touched hot paths, and

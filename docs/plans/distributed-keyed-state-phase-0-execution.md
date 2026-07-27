@@ -6,7 +6,7 @@
   dependency, backend qualification evidence, independent production-soak result, or admission
   change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Core Cycle 3
+- **Last reconciled:** 2026-07-27 during Core Cycle 4
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -28,12 +28,17 @@ The [2026-07-27 ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed
 pauses Cycle 69 and later certification work and authorizes only the private reference core slice.
 It is not Phase 0 completion, backend qualification, or permission to execute a candidate.
 
-Core Cycles 2–3 add a fail-closed runtime containment path for staged local vnode transitions and a
+Core Cycles 2–4 add a fail-closed runtime containment path for staged local vnode transitions and a
 narrow audited, committed final-owner revoke path. The latter binds predecessor/target versions and
 owner-map digests, local process incarnation, target absence, and the exact lost-vnode roster; it
-cannot be minted from recovery authority, no-store adoption, or an unaudited transition. These
-cycles do not consume the managed reference, provide prepare/publish/abort shadow publication, bind
-general restore artifacts to a complete transition/operator roster, or authorize a stateful query.
+cannot be minted from recovery authority, no-store adoption, or an unaudited transition.
+Cycle 4 pins restore reads to the capsule-validated head seal, adds exact per-artifact bounded reads
+for the built-in backends, and retains full attempt identity through graph preflight. Its corrective
+scope preserves the established raw rkyv FULL/reference/DELTA wire used by the admitted global
+vnode-0 aggregate. These cycles do not bind transitive parent attestations, impose an aggregate
+chain/RSS/decode/publication bound, consume the managed reference, provide prepare/publish/abort
+shadow publication, bind the remaining transition authority to a complete operator/table roster,
+or authorize a stateful query.
 
 The phase is complete only when maintainers can answer, with versioned evidence:
 

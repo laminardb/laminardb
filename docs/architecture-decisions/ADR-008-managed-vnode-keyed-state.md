@@ -3,7 +3,7 @@
 - **Status:** Proposed; core reference implementation resumed, production qualification paused,
   and cluster admission unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Core Cycle 3
+- **Last reconciled:** 2026-07-27 during Core Cycle 4
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -14,7 +14,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest core review](../reviews/distributed-keyed-state-core-cycle-03.md)
+  [latest core review](../reviews/distributed-keyed-state-core-cycle-04.md)
 
 ## Decision
 
@@ -54,7 +54,7 @@ one-local-machine-hour cap and are not candidate qualification. LaminarDB does n
 fork. The canonical contribution and re-entry rules live in the
 [TidesDB design](tidesdb-local-state-successor-design.md).
 
-Core Cycles 2–3 add runtime containment, not operator admission. Assignment adoption and startup
+Core Cycles 2–4 add runtime containment, not operator admission. Assignment adoption and startup
 stage vnode work under the assignment/rotation fences; the graph preflights the complete locally
 owned/restoring batch before deterministic callbacks, delays activation until callbacks and exact
 assignment/transport revalidation succeed, and poisons the graph generation after an indeterminate
@@ -73,10 +73,28 @@ registry, or staging mutation. The multi-node Windows path also now gives cluste
 explicit 4 MiB stack; this prevents the reproduced default-stack overflow but is not latency or RSS
 qualification.
 
-This is still not the Phase 1 lifecycle. General acquire and partial-revoke staging lack one complete
-attempt/artifact/pipeline transition identity and an authoritative operator/state-table roster;
+Cycle 4 binds the restore head to the exact seal inventory already validated with the committed
+recovery capsule and source handoff. Assignment acquisition and boot recovery no longer validate
+one head and then reread a substitutable equal-attempt inventory. Built-in backends read each
+partial through its sealed assignment/writer/length/digest attestation and one per-artifact byte
+limit; object-store reads reject an impossible or oversized envelope from metadata before polling
+the body. Staging retains the full checkpoint attempt, and a mixed-attempt batch is rejected before
+callbacks or owned-vnode activation.
+
+The corrective Cycle 4 scope deliberately preserves the established raw rkyv `VnodePartial` wire
+used by the admitted global vnode-0 aggregate, including its reference and delta shapes. A frozen
+delta fixture guards that layout. Consequently, a child still names an ancestor by bare checkpoint
+attempt: a self-consistent replacement of a transitive parent seal and body is not yet bound by the
+child and remains open design work that blocks production. The per-artifact limit is not an
+aggregate chain, concurrent-read, RSS, decoded-expansion, alignment-copy, or publication-pause
+bound.
+
+This is still not the Phase 1 lifecycle. General acquire and partial-revoke staging lack one
+transition envelope binding predecessor/target assignment, pipeline identity, and an authoritative
+operator/state-table roster; the sealed head and full attempt do not supply that semantic roster;
 callbacks are not prepare/publish/abort; the SQL operator's `QueryState::Uninit` path has no semantic
-install boundary; and full-batch decode has no production memory/pause bound. These gaps,
+install boundary; and ancestry, aggregate restore accounting, decode scratch, total process memory,
+and publication work have no production memory/pause bound. These gaps,
 source/state/sink delivery composition, tail-latency and memory evidence, backend qualification, and
 independent soak keep `[LDB-4007]`, `[LDB-0013]`, and production **NO-GO** unchanged.
 
