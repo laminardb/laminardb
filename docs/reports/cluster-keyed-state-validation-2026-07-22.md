@@ -6,7 +6,7 @@
 
 **Scope:** admission and lifecycle validation only; no cluster capability is enabled by this work.
 
-**2026-07-27 core update:** The
+**2026-07-27 core update (through Core Cycle 5):** The
 [ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset)
 pauses later certification tooling. Core Cycle 1 adds a private reference managed vnode shard and
 caller-supplied lifecycle publication. Core Cycles 2–4 contain the existing runtime staging path
@@ -18,8 +18,12 @@ transitions cannot authorize that cleanup. Cycle 4 also proves and closes a head
 window between source/capsule validation and vnode loading, requires exact attestation and a
 per-artifact bound on built-in backend reads, and rejects mixed full-attempt staging before
 callbacks. The corrective scope preserves the admitted global vnode-0 aggregate's established raw
-rkyv FULL/reference/DELTA wire. Transitive parent substitution, aggregate chain/RSS/decode limits,
-and publication pause remain open. These cycles do not consume the managed reference, add TidesDB,
+rkyv FULL/reference/DELTA wire. Cycle 5 contains transitive parent substitution while artifacts
+remain under the built-ins' or a conforming backend's immutable namespace/retirement contract, and
+bounds each vnode chain to the current writer maximum of six artifacts. External deletion of a live
+seal and mixed/future writer-policy compatibility remain production gates. Aggregate encoded bytes,
+RSS/decode limits, and publication pause remain open. These cycles do not consume the managed
+reference, add TidesDB,
 make SQL restore atomically publishable, or relax `[LDB-4007]`.
 
 **Current authority:** the [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
@@ -686,6 +690,10 @@ The current branch's admission-neutral hardening was then checked separately:
 | Core Cycle 4 focused coordinator regressions | PASS, 4/4 | Reference reuse, bounded delta depth, mixed-delta reference exclusion, and overlapping-attempt isolation retain the established raw wire |
 | Core Cycle 4 warnings-denied Clippy and formatting gates | PASS | Both no-default and cluster Clippy matrices plus `cargo fmt --all -- --check`, current diff, and five-file relative-link checks pass |
 | Core Cycle 4 full DB/default-feature suite | **NOT RUN / NO PASS CLAIM** | A broad Windows invocation did not yield a suite result; it timed out/broke its pipe only after the test binary linked. No full-suite, latency, RSS, backend, or soak evidence follows |
+| Core Cycle 5 immutable-attempt contract | PASS for Laminar-controlled built-in lifecycle | The trait fixes one inventory per namespace-scoped attempt and makes retirement irreversible; object-store CAS/floor regressions and the in-process reference floor reject reseal/republish. External live-seal deletion and custom-backend conformance remain production gates |
+| Core Cycle 5 sealed lineage reader | PASS, 17/17 | Includes retained-child restore after a conflicting parent reseal, exact FULL/reference/delta recovery, missing/pruned-parent failure, max-four/max-three artifact enforcement, and the current six/seven production boundary |
+| Core Cycle 5 feature/lint checks | PASS | Cluster test targets compile; warnings-denied cluster Clippy, focused policy tests, formatting, and diff checks pass |
+| Core Cycle 5 aggregate restore bytes/RSS/latency/soak | **OPEN / NO PASS CLAIM** | No public cap was added because current seal metadata cannot prove transitive bytes; no full suite, latency, RSS, backend qualification, or independent soak ran |
 | Core Cycle 3 `operator_graph::tests` with cluster | PASS, 111/111 | Full graph unit module after opaque final-exit authority, rotation-fence, endpoint, restore-drift, assignment-drift, callback-failure, and sticky-poison checks |
 | Core Cycle 3 `final_owner_exit` focused filter | PASS, 8/8 | Audited committed last-vnode cleanup succeeds only for the exact predecessor/target identity and retains staging on every indeterminate result |
 | `snapshot_watcher_handles_draining_phase` multi-node integration | PASS, 1/1 | A zero-vnode follower completes committed revoke without polling its source, remains intake-fenced and non-authoritative, and exposes inactive transport endpoints; not an independent soak |

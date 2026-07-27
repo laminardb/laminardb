@@ -3,7 +3,7 @@
 - **Status:** Proposed; core reference implementation resumed, production qualification paused,
   and cluster admission unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Core Cycle 4
+- **Last reconciled:** 2026-07-27 during Core Cycle 5
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -83,17 +83,59 @@ callbacks or owned-vnode activation.
 
 The corrective Cycle 4 scope deliberately preserves the established raw rkyv `VnodePartial` wire
 used by the admitted global vnode-0 aggregate, including its reference and delta shapes. A frozen
-delta fixture guards that layout. Consequently, a child still names an ancestor by bare checkpoint
-attempt: a self-consistent replacement of a transitive parent seal and body is not yet bound by the
-child and remains open design work that blocks production. The per-artifact limit is not an
-aggregate chain, concurrent-read, RSS, decoded-expansion, alignment-copy, or publication-pause
-bound.
+delta fixture guards that layout. Cycle 5 establishes the missing identity rule without changing
+that wire: within one create-once deployment/state namespace, an attempt fixes one exact seal
+inventory while live and can never be republished after retirement. Exact sealed-body reads and
+strictly decreasing links therefore make a bare parent attempt a sufficient transitive content
+identity under LaminarDB's non-Byzantine storage model. A missing/pruned parent fails closed; the
+retention policy remains responsible for keeping every admitted ancestor available. Custom
+backends that violate the trait contract are non-conforming.
+
+That contract is not yet durably self-proving after out-of-band deletion. If an administrator,
+provider lifecycle rule, or storage-loss event deletes an unretired seal and its artifacts, the
+current create-once key plus prune floor does not retain an ever-sealed tombstone for an attempt
+above the floor. Production qualification must therefore prove that the live state namespace is
+not externally deleted or replaced, including provider lifecycle/IAM controls, or a later protocol
+must add a durable ever-sealed ledger or parent content identity. Cycle 5 closes the normal
+Laminar-controlled lifecycle on the built-ins; this storage prerequisite remains a production gate.
+
+The reader also reserves one slot before each physical-artifact lookup and rejects more
+than six artifacts per vnode, the maximum this binary's writer policy can produce. It does
+not use the narrower local retention setting because that setting is not yet certified in cluster
+identity. The per-artifact byte limit and per-vnode artifact-count limit are not aggregate concurrent-read,
+RSS, decoded-expansion, alignment-copy, or publication-pause bounds.
+
+Artifact count is not object-store request count. An uncached parent may require one seal-inventory
+GET plus one body GET, and concurrent vnode loads can race the current check-then-fetch seal cache
+and duplicate metadata reads. Cycle 5 adds no single-flight/cache abstraction without measurement;
+restore request distributions and tail latency remain qualification gates.
+
+Six is defensive current-policy containment, not a persisted compatibility invariant. Before a
+mixed-version deployment or future writer can emit a longer compatible raw chain, its maximum must
+be bound into durable cluster capability/format policy and every reader must advertise support.
+Until then rolling-upgrade compatibility for a changed writer policy remains closed.
+
+An aggregate restore-byte gate is deferred until it can be enforced on both sides of Commit.
+Summing `sealed_partials.payload_len` covers only heads; REFERENCE/DELTA parents remain inside the
+raw bodies. Rereading and decoding all bodies before every Commit would duplicate restore I/O on the
+checkpoint latency path. The future contract therefore attests each vnode's transitive encoded
+size in versioned lineage metadata, checks the cluster-global sum after exact seal/readiness
+validation and before capsule persistence/Commit, and makes the target reserve its acquired subset
+before the first GET. A violation must Abort before sink phase 2. Encoded fetch, retained/spooled
+bytes, decoder scratch, decoded state/RSS, and apply pause have separate reservations and evidence.
+No release-dead `max_restore_encoded_bytes` setting is added in Cycle 5.
+
+If the raw payload eventually changes to carry that metadata, rollout is reader-first: one release
+reads both formats while writing legacy, a durable cluster capability/format policy selects the
+writer only after every exact participant can read it, activation forces a FULL cut and forbids
+cross-format parents, and rollback is limited to a dual-reader release. Gossip version strings are
+not writer authority. This migration is a future compatibility requirement, not Cycle 5 runtime.
 
 This is still not the Phase 1 lifecycle. General acquire and partial-revoke staging lack one
 transition envelope binding predecessor/target assignment, pipeline identity, and an authoritative
 operator/state-table roster; the sealed head and full attempt do not supply that semantic roster;
 callbacks are not prepare/publish/abort; the SQL operator's `QueryState::Uninit` path has no semantic
-install boundary; and ancestry, aggregate restore accounting, decode scratch, total process memory,
+install boundary; and aggregate restore accounting, decode scratch, total process memory,
 and publication work have no production memory/pause bound. These gaps,
 source/state/sink delivery composition, tail-latency and memory evidence, backend qualification, and
 independent soak keep `[LDB-4007]`, `[LDB-0013]`, and production **NO-GO** unchanged.

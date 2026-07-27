@@ -3,7 +3,7 @@
 - **Status:** Core reference implementation resumed; production qualification/certification paused;
   exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster operator is admitted
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Core Cycle 4
+- **Last reconciled:** 2026-07-27 during Core Cycle 5
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -40,7 +40,7 @@ through every phase; they are not a final cleanup sprint.
 
 The owner reset is recorded normatively in
 [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset).
-Cycle 69 and later certification work are paused. Core Cycles 1–4 add a private reference shard and
+Cycle 69 and later certification work are paused. Core Cycles 1–5 add a private reference shard and
 a fail-closed graph containment path: exact local lifecycle-roster and chain preflight,
 deterministic callbacks, delayed activation, sticky poison after indeterminate mutation, boot-cut
 validation, predecessor-authority repair, control-only completion while source intake is closed,
@@ -48,16 +48,28 @@ an audited committed final-owner exit that does not invent a target participant.
 retains the exact capsule-validated head seal through boot/adoption, requires built-in backends to
 read exact sealed partials under a per-artifact bound, and carries the full attempt through graph
 preflight. Its corrective scope leaves the admitted global vnode-0 aggregate's raw rkyv
-FULL/reference/DELTA wire unchanged and freezes a representative DELTA fixture. Transitive parent
-attestations and aggregate restore-resource accounting remain open. They do not change runtime
-admission.
+FULL/reference/DELTA wire unchanged and freezes a representative DELTA fixture. Cycle 5, recorded
+in the [cycle review](../reviews/distributed-keyed-state-core-cycle-05.md), makes a checkpoint
+attempt an immutable, never-reused name within its bound deployment/state namespace:
+the seal inventory is create-once while live and retirement is irreversible. A parent attempt
+therefore binds one exact seal and digest-checked body without a payload-wire change. The reader
+also rejects more than this binary's current writer maximum of six physical artifacts per vnode.
+This prevents transitive substitution for retained artifacts on the built-ins and conforming
+backends, and bounds traversal for the current writer policy. It is not a durable-format proof:
+external deletion of a live seal or a mixed/future writer policy remains a backend-qualification or
+version-fencing blocker. Ancestor retention still determines availability.
 
-The next checkpoint slice must define the version-fenced upgrade/rollback path that can bind every
-transitive parent attestation without stranding established global-aggregate checkpoints. It must
-also define aggregate chain/concurrency accounting; Cycle 4's per-artifact limit is not an RSS,
-decoded-expansion, or apply-pause bound. The following lifecycle slice adds an authoritative
-operator/state-table roster and binds predecessor/target/pipeline transition identity before
-prepare/publish/abort shadows and a real semantic install boundary for `QueryState::Uninit`.
+Cycle 5 deliberately does not add `max_restore_encoded_bytes`. Current seals expose head sizes,
+not transitive lineage totals, and a reader-only cap could make a valid committed cut unrestorable.
+The later resource slice must attest per-vnode transitive sizes, validate the cluster-global total
+after exact seal/readiness validation but before capsule persistence and Commit, and reserve the
+target subset before GET. Encoded fetch, retained/spooled bytes, decode scratch, decoded state/RSS,
+and publication pause remain separate limits. A future payload-wire change, if needed for those
+attestations, requires a reader-first, capability-fenced rollout; Cycle 5 does not start one. The
+following lifecycle slice replaces the split mutable staging maps with one immutable record binding
+predecessor/target assignment, pipeline identity, exact committed restore cut, and acquired/revoked
+vnode rosters. The authoritative operator/state-table roster, prepare/publish/abort shadows, and a
+real semantic install boundary for `QueryState::Uninit` remain subsequent gates.
 Backend work does not block these slices. TidesDB re-entry and the upstream-contribution boundary
 are owned by the
 [TidesDB design](../architecture-decisions/tidesdb-local-state-successor-design.md).
