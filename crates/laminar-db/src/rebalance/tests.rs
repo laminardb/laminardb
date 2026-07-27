@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use laminar_core::state::InProcessBackend;
 use object_store::memory::InMemory;
@@ -89,6 +89,38 @@ fn store() -> AssignmentSnapshotStore {
 
 fn test_cluster_checkpoint_store() -> Arc<dyn ObjectStore> {
     Arc::new(InMemory::new())
+}
+
+async fn install_running_test_vnode_state(
+    db: &LaminarDB,
+    assignment: &AssignmentSnapshot,
+) -> tempfile::TempDir {
+    let pipeline_identity = laminar_core::checkpoint::PipelineIdentity::empty();
+    *db.installed_vnode_state.lock() = Some(
+        crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
+            assignment.assignment_fence().unwrap(),
+            pipeline_identity.clone(),
+        )
+        .unwrap(),
+    );
+
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
+        crate::checkpoint_coordinator::CheckpointConfig::default(),
+        Box::new(
+            laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
+                checkpoint_dir.path(),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    coordinator
+        .bind_pipeline_identity(pipeline_identity)
+        .unwrap();
+    *db.coordinator.lock().await = Some(coordinator);
+    crate::db::DbState::Running.store(&db.state);
+    checkpoint_dir
 }
 
 fn test_cluster_controller(
@@ -223,6 +255,48 @@ fn snapshot(vnodes: BTreeMap<u32, NodeId>) -> AssignmentSnapshot {
         .unwrap()
 }
 
+fn synthetic_pending_boot_transition(
+    assignment_version: u64,
+    owners: &[NodeId],
+    participant: CheckpointParticipant,
+    attempt: laminar_core::state::CheckpointAttempt,
+    chains: HashMap<u32, Vec<bytes::Bytes>>,
+) -> Arc<crate::vnode_transition_staging::PendingVnodeTransition> {
+    let owner_ids: Vec<u64> = owners.iter().map(|owner| owner.0).collect();
+    let target = CheckpointAssignmentFence::from_owner_map(
+        assignment_version,
+        &owner_ids,
+        vec![participant],
+    )
+    .unwrap();
+    let identity = laminar_core::checkpoint::PipelineIdentity::empty();
+    let mut required_vnodes: Vec<u32> = chains.keys().copied().collect();
+    required_vnodes.sort_unstable();
+    let restore_cut =
+        crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut::synthetic_for_transition_test(
+            attempt,
+            identity.clone(),
+            target.clone(),
+            &owner_ids,
+            &required_vnodes,
+        )
+        .unwrap();
+    Arc::new(
+        crate::vnode_transition_staging::PendingVnodeTransition::boot_recovery(
+            target,
+            owners,
+            participant,
+            identity,
+            restore_cut,
+            crate::recovery_manager::vnode_chains::LoadedVnodeChains {
+                attempt: Some(attempt),
+                chains,
+            },
+        )
+        .unwrap(),
+    )
+}
+
 fn draining_snapshot(
     committed: &AssignmentSnapshot,
     vnodes: BTreeMap<u32, NodeId>,
@@ -272,6 +346,7 @@ async fn predecessor_failure_fixture(
     Arc<VnodeRegistry>,
     AssignmentSnapshot,
     Arc<laminar_core::cluster::control::ProcessLeaseAuthority>,
+    tempfile::TempDir,
 ) {
     use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
     use laminar_core::cluster::discovery::NodeState;
@@ -402,6 +477,7 @@ async fn predecessor_failure_fixture(
         .build()
         .await
         .unwrap();
+    let checkpoint_dir = install_running_test_vnode_state(&db, &current).await;
     (
         db,
         controller,
@@ -409,6 +485,7 @@ async fn predecessor_failure_fixture(
         registry,
         current,
         process_authority,
+        checkpoint_dir,
     )
 }
 
@@ -419,6 +496,7 @@ async fn dead_predecessor_fixture() -> (
     Arc<VnodeRegistry>,
     AssignmentSnapshot,
     Arc<laminar_core::cluster::control::ProcessLeaseAuthority>,
+    tempfile::TempDir,
 ) {
     predecessor_failure_fixture(
         CheckpointParticipant {
@@ -456,14 +534,18 @@ async fn recovery_suspension_is_deferred_for_pending_vnode_transition() {
         .await
         .unwrap();
     db.set_source_gate(false);
-    registry.mark_restoring(&[0]);
-    db.rehydrated_vnode_state.lock().insert(
-        0,
-        crate::db::RehydratedVnode {
-            attempt: laminar_core::state::CheckpointAttempt::canonical(7),
-            chain: vec![bytes::Bytes::from_static(b"pending")],
+    let pending = synthetic_pending_boot_transition(
+        registry.assignment_version(),
+        &[self_id],
+        CheckpointParticipant {
+            node_id: self_id.0,
+            boot_incarnation: controller.recovery_incarnation(),
         },
+        laminar_core::state::CheckpointAttempt::canonical(7),
+        HashMap::from([(0, vec![bytes::Bytes::from_static(b"pending")])]),
     );
+    *db.pending_vnode_transition.lock() = Some(Arc::clone(&pending));
+    registry.mark_restoring(pending.acquired_vnodes());
     let authority_revision = db
         .assignment_authority_revision
         .load(std::sync::atomic::Ordering::Acquire);
@@ -484,10 +566,20 @@ async fn recovery_suspension_is_deferred_for_pending_vnode_transition() {
             .load(std::sync::atomic::Ordering::Acquire),
         authority_revision
     );
-    assert_eq!(db.rehydrated_vnode_state.lock().len(), 1);
+    let retained = db
+        .pending_vnode_transition
+        .lock()
+        .clone()
+        .expect("suspension must retain pending work");
+    assert!(Arc::ptr_eq(&pending, &retained));
     assert!(registry.is_restoring(0));
 
-    db.rehydrated_vnode_state.lock().clear();
+    let removed = db
+        .pending_vnode_transition
+        .lock()
+        .take()
+        .expect("test transition must still be installed");
+    assert!(Arc::ptr_eq(&pending, &removed));
     registry.mark_active(&[0]);
     let suspended = try_suspend_recovery_assignment_authority(
         &db,
@@ -515,6 +607,7 @@ struct PendingPredecessorAuthorityFixture {
     sender: Arc<laminar_core::shuffle::ShuffleSender>,
     receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
     _leader_lease: tokio::sync::watch::Sender<Option<laminar_core::cluster::control::LeaderLease>>,
+    pending_transition: Arc<crate::vnode_transition_staging::PendingVnodeTransition>,
     current: AssignmentSnapshot,
     successor: AssignmentSnapshot,
 }
@@ -562,14 +655,19 @@ async fn pending_predecessor_authority_fixture(
         .await
         .unwrap();
     db.set_source_gate(true);
-    registry.mark_restoring(&[0]);
-    db.rehydrated_vnode_state.lock().insert(
-        0,
-        crate::db::RehydratedVnode {
-            attempt: laminar_core::state::CheckpointAttempt::canonical(7),
-            chain: vec![bytes::Bytes::from_static(b"pending-current-assignment")],
-        },
+    let current_owners = current.to_vnode_vec(1).unwrap();
+    let pending_transition = synthetic_pending_boot_transition(
+        current.version,
+        &current_owners,
+        current.participants[0],
+        laminar_core::state::CheckpointAttempt::canonical(7),
+        HashMap::from([(
+            0,
+            vec![bytes::Bytes::from_static(b"pending-current-assignment")],
+        )]),
     );
+    *db.pending_vnode_transition.lock() = Some(Arc::clone(&pending_transition));
+    registry.mark_restoring(pending_transition.acquired_vnodes());
     let watcher = SnapshotWatcher::new(
         Arc::clone(&db),
         durable,
@@ -586,6 +684,7 @@ async fn pending_predecessor_authority_fixture(
         sender,
         receiver,
         _leader_lease: leader_lease,
+        pending_transition,
         current,
         successor,
     }
@@ -642,7 +741,13 @@ async fn assert_pending_predecessor_authority_is_repaired(recovering: bool) {
         Some(fixture.current.version)
     );
     assert_eq!(fixture.db.cluster_intake_fenced(), recovering);
-    assert_eq!(fixture.db.rehydrated_vnode_state.lock().len(), 1);
+    let retained = fixture
+        .db
+        .pending_vnode_transition
+        .lock()
+        .clone()
+        .expect("predecessor repair must retain pending work");
+    assert!(Arc::ptr_eq(&fixture.pending_transition, &retained));
     assert!(fixture.registry.is_restoring(0));
 }
 
@@ -678,7 +783,7 @@ async fn failure_recovery_retains_a_healthy_predecessor_with_no_rendezvous_share
         rendezvous_assignment(2, &[NodeId(3), NodeId(5), NodeId(7)]).as_ref(),
         &[NodeId(5), NodeId(7)]
     );
-    let (db, controller, durable, registry, current, _process_authority) =
+    let (db, controller, durable, registry, current, _process_authority, _checkpoint_dir) =
         predecessor_failure_fixture(
             healthy,
             failed,
@@ -892,7 +997,7 @@ async fn at_least_once_live_rotation_uses_the_global_drain_protocol() {
 #[tokio::test]
 async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
     let self_id = NodeId(1);
-    let (db, controller, durable, registry, current, _process_authority) =
+    let (db, controller, durable, registry, current, _process_authority, _checkpoint_dir) =
         dead_predecessor_fixture().await;
     controller.note_unresponsive(&[NodeId(2)]);
 
@@ -905,8 +1010,11 @@ async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("the unstarted successor cannot restore the acquired state");
-    assert!(error.contains("cannot acquire 1 vnodes"), "{error}");
+    .expect_err("the successor cannot restore acquired state without a recovery namespace");
+    assert!(
+        error.contains("requires an active cluster recovery namespace"),
+        "{error}"
+    );
     let successor = durable.load().await.unwrap().unwrap();
     assert_eq!(successor.version, current.version + 1);
     assert!(!successor.draining);
@@ -959,7 +1067,7 @@ async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
 #[tokio::test]
 async fn renewing_predecessor_cannot_be_removed_by_failure_recovery() {
     let self_id = NodeId(1);
-    let (db, controller, durable, registry, current, process_authority) =
+    let (db, controller, durable, registry, current, process_authority, _checkpoint_dir) =
         dead_predecessor_fixture().await;
     let predecessor = current.participants[1];
     let predecessor_store = process_authority.store_for(NodeId(predecessor.node_id));
@@ -2103,6 +2211,7 @@ async fn recovery_settles_drain_before_reusing_process_local_source_cuts() {
         .build()
         .await
         .unwrap();
+    let _checkpoint_dir = install_running_test_vnode_state(&db, &committed).await;
 
     assert_eq!(
         settle_source_drain_before_recovery(&db, &controller, RebalanceConfig::test_defaults(),)
@@ -2184,6 +2293,7 @@ async fn recovery_release_reapplies_a_committed_drain_to_replacement_sources() {
         .build()
         .await
         .unwrap();
+    let _checkpoint_dir = install_running_test_vnode_state(&db, &committed).await;
     assert_eq!(
         finalize_drain_snapshot(
             &db,

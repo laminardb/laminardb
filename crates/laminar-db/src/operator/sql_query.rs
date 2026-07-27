@@ -1005,6 +1005,7 @@ impl SqlQueryOperator {
         Ok(())
     }
 
+    #[cfg(test)]
     fn apply_vnode_state(&mut self, vnode: u32, bytes: &[u8]) -> Result<(), DbError> {
         let cp: AggStateCheckpoint = rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(
             bytes,
@@ -1395,11 +1396,6 @@ impl GraphOperator for SqlQueryOperator {
         base: &[u8],
         deltas: &[&[u8]],
     ) -> Result<(), DbError> {
-        // No deltas → the base alone is the recovered state (full / reference / simple acquire).
-        if deltas.is_empty() {
-            self.apply_vnode_state(vnode, base)?;
-            return Ok(());
-        }
         // Deserialize the chain before touching `self.state` (avoids borrowing `self` twice).
         let base_cp: AggStateCheckpoint =
             rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(base).map_err(|e| {
@@ -1423,13 +1419,24 @@ impl GraphOperator for SqlQueryOperator {
                 Ok(crate::aggregate_state::AggVnodeDelta { changed: cp })
             })
             .collect::<Result<_, DbError>>()?;
+        let vnode_count = self
+            .cluster_shuffle
+            .as_ref()
+            .map(|config| config.registry.vnode_count());
 
         match self.state {
             QueryState::Agg(ref mut agg_state) => {
-                let merged = agg_state.apply_vnode_chain(&base_cp, &delta_objs)?;
+                let vnode_count = vnode_count.ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "aggregate '{}' cannot replace vnode state without cluster ownership",
+                        self.op_name
+                    ))
+                })?;
+                let merged =
+                    agg_state.replace_vnode_chain(vnode, vnode_count, &base_cp, &delta_objs)?;
                 tracing::debug!(
                     query = %self.op_name, vnode, groups = merged, deltas = delta_objs.len(),
-                    "applied rehydrated vnode chain"
+                    "replaced vnode state from its authoritative recovery chain"
                 );
             }
             QueryState::Uninit => {
@@ -2280,7 +2287,7 @@ mod delta_primary_tests {
     // to remove the vnode immediately so this node does not expose state it no longer owns.
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn full_vnode_replay_is_idempotent_and_reacquire_restores_revoked_state() {
+    async fn authoritative_full_vnode_restore_replaces_stale_keys_and_restores_revoked_state() {
         async fn populated_op() -> SqlQueryOperator {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("key", DataType::Utf8, false),
@@ -2405,6 +2412,32 @@ mod delta_primary_tests {
             total_sum(&mut fixed),
             3,
             "re-acquiring the vnode restores the committed aggregate"
+        );
+
+        // The graph callback consumes an authoritative chain, not a merge patch. A key written
+        // after the durable cut must disappear even when ownership of the vnode was retained.
+        let extra_key = (0..1_024)
+            .map(|candidate| format!("post-cut-{candidate}"))
+            .find(|candidate| {
+                let candidate_batch = batch(&[candidate.as_str()], &[100]);
+                hash_rows_to_vnodes(&candidate_batch, 1, 8).unwrap()[0] == v
+            })
+            .expect("one candidate key must hash to the restored vnode");
+        let mut replaced = populated_op().await;
+        replaced
+            .process(&[vec![batch(&["a", "b"], &[1, 2])]], &[i64::MIN])
+            .await
+            .unwrap();
+        replaced
+            .process(&[vec![batch(&[extra_key.as_str()], &[100])]], &[i64::MIN])
+            .await
+            .unwrap();
+        assert!(total_sum(&mut replaced) > 3);
+        replaced.apply_vnode_chain(v, &slice_bytes, &[]).unwrap();
+        assert_eq!(
+            total_sum(&mut replaced),
+            3,
+            "authoritative restore must remove keys absent from the committed vnode image"
         );
     }
 

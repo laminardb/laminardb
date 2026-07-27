@@ -2231,7 +2231,16 @@ impl IncrementalAggState {
         &mut self,
         mut staged: StagedAggMutation,
         merged_keys: &[arrow::row::OwnedRow],
+        replaced_vnode: Option<(u32, NonZeroU32)>,
     ) {
+        if let Some((vnode, vnode_count)) = replaced_vnode {
+            let num_group_cols = self.num_group_cols;
+            self.dirty_keys
+                .retain(|key| Self::vnode_for_group_key(num_group_cols, key, vnode_count) != vnode);
+            self.dirty_keys_by_vnode.remove(&vnode);
+            self.last_emitted_dirty_by_vnode.remove(&vnode);
+            self.delta_chain_len.remove(&vnode);
+        }
         for key in staged.affected {
             self.groups.remove(&key);
             if let Some(entry) = staged.groups.remove(&key) {
@@ -2260,6 +2269,7 @@ impl IncrementalAggState {
         &mut self,
         base: Option<&AggStateCheckpoint>,
         deltas: &[AggVnodeDelta],
+        replacement: Option<(u32, u32)>,
     ) -> Result<usize, DbError> {
         // Decode every payload before touching even the live accumulator snapshots. A malformed late
         // delta therefore cannot consume or partially merge the earlier base.
@@ -2271,6 +2281,45 @@ impl IncrementalAggState {
             .map(|delta| self.decode_recovery_delta(delta))
             .collect::<Result<Vec<_>, _>>()?;
 
+        let replacement_scope = replacement
+            .map(|(vnode, vnode_count)| {
+                let vnode_count = self.validate_delta_vnode_count(vnode_count)?;
+                if vnode >= vnode_count.get() {
+                    return Err(DbError::Pipeline(format!(
+                        "vnode {vnode} is outside vnode_count {}",
+                        vnode_count.get()
+                    )));
+                }
+                let belongs_to_replaced_vnode = |key: &arrow::row::OwnedRow| {
+                    Self::vnode_for_group_key(self.num_group_cols, key, vnode_count) == vnode
+                };
+                if decoded_base.as_ref().is_some_and(|mutation| {
+                    mutation
+                        .groups
+                        .iter()
+                        .any(|(key, _, _)| !belongs_to_replaced_vnode(key))
+                        || mutation
+                            .last_emitted
+                            .keys()
+                            .any(|key| !belongs_to_replaced_vnode(key))
+                }) || decoded_deltas.iter().any(|mutation| {
+                    mutation
+                        .groups
+                        .iter()
+                        .any(|(key, _, _)| !belongs_to_replaced_vnode(key))
+                        || mutation
+                            .last_emitted
+                            .keys()
+                            .any(|key| !belongs_to_replaced_vnode(key))
+                }) {
+                    return Err(DbError::Pipeline(format!(
+                        "authoritative vnode {vnode} recovery chain contains a key for another vnode"
+                    )));
+                }
+                Ok((vnode, vnode_count))
+            })
+            .transpose()?;
+
         let mut affected = AHashSet::new();
         if let Some(mutation) = &decoded_base {
             affected.extend(mutation.groups.iter().map(|(key, _, _)| key.clone()));
@@ -2279,6 +2328,24 @@ impl IncrementalAggState {
         for delta in &decoded_deltas {
             affected.extend(delta.groups.iter().map(|(key, _, _)| key.clone()));
             affected.extend(delta.last_emitted.keys().cloned());
+        }
+        if let Some((vnode, vnode_count)) = replacement_scope {
+            let num_group_cols = self.num_group_cols;
+            let belongs_to_replaced_vnode = |key: &arrow::row::OwnedRow| {
+                Self::vnode_for_group_key(num_group_cols, key, vnode_count) == vnode
+            };
+            affected.extend(
+                self.groups
+                    .keys()
+                    .filter(|key| belongs_to_replaced_vnode(key))
+                    .cloned(),
+            );
+            affected.extend(
+                self.last_emitted
+                    .keys()
+                    .filter(|key| belongs_to_replaced_vnode(key))
+                    .cloned(),
+            );
         }
 
         let mut staged = if decoded_base.is_some() {
@@ -2298,36 +2365,49 @@ impl IncrementalAggState {
             self.apply_recovery_delta_to_image(&mut staged, delta)?;
         }
         let merged = merged_keys.len();
-        self.commit_recovery_image(staged, &merged_keys);
+        self.commit_recovery_image(staged, &merged_keys, replacement_scope);
         Ok(merged)
     }
 
     /// Apply a delta atomically: changed groups replace existing state per key.
     #[cfg(feature = "cluster")]
     pub(crate) fn apply_delta(&mut self, delta: &AggVnodeDelta) -> Result<(), DbError> {
-        self.apply_recovery_transaction(None, std::slice::from_ref(delta))
+        self.apply_recovery_transaction(None, std::slice::from_ref(delta), None)
             .map(|_| ())
     }
 
-    /// Replay a recovered chain into an off-side image and publish it once after every delta has
-    /// succeeded. A failed or retried chain cannot double-apply its base to live state.
-    #[cfg(feature = "cluster")]
+    /// Merge a recovered chain transactionally. Test-only: production vnode restore must replace
+    /// keys absent from the authoritative image through [`Self::replace_vnode_chain`].
+    #[cfg(all(feature = "cluster", test))]
     pub(crate) fn apply_vnode_chain(
         &mut self,
         base: &AggStateCheckpoint,
         deltas: &[AggVnodeDelta],
     ) -> Result<usize, DbError> {
-        self.apply_recovery_transaction(Some(base), deltas)
+        self.apply_recovery_transaction(Some(base), deltas, None)
+    }
+
+    /// Replace one vnode from a recovered chain and publish it once after every delta succeeds.
+    /// Keys absent from the authoritative image are removed, so retry cannot retain post-cut state.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn replace_vnode_chain(
+        &mut self,
+        vnode: u32,
+        vnode_count: u32,
+        base: &AggStateCheckpoint,
+        deltas: &[AggVnodeDelta],
+    ) -> Result<usize, DbError> {
+        self.apply_recovery_transaction(Some(base), deltas, Some((vnode, vnode_count)))
     }
 
     /// Apply an authoritative FULL checkpoint transactionally. Disjoint vnode keys are inserted;
     /// overlapping keys are replaced so replay is idempotent.
-    #[cfg(feature = "cluster")]
+    #[cfg(all(feature = "cluster", test))]
     pub(crate) fn merge_groups(
         &mut self,
         checkpoint: &AggStateCheckpoint,
     ) -> Result<usize, DbError> {
-        self.apply_recovery_transaction(Some(checkpoint), &[])
+        self.apply_recovery_transaction(Some(checkpoint), &[], None)
     }
 
     /// Re-base delta tracking for vnodes this node just ACQUIRED (owned-set grew): a just-acquired

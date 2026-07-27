@@ -85,10 +85,10 @@ fn log_adoption(source: &str, adoption: &SnapshotAdoption) {
     info!(
         source,
         version = adoption.version,
-        newly_acquired = adoption.newly_acquired.len(),
+        vnodes_requiring_restore = adoption.newly_acquired.len(),
         rehydrated = adoption.rehydrated,
         rehydration_epoch = ?adoption.rehydration_epoch,
-        "rehydrated newly-acquired vnodes after rebalance",
+        "installed vnode state after rebalance",
     );
 }
 
@@ -1138,6 +1138,16 @@ pub(crate) struct AuditedCommittedDrainTransition(AssignmentDrainTransition);
 impl AuditedCommittedDrainTransition {
     pub(crate) fn into_transition(self) -> AssignmentDrainTransition {
         self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_canonical_for_test(
+        transition: AssignmentDrainTransition,
+    ) -> Result<Self, String> {
+        transition
+            .is_canonical()
+            .then_some(Self(transition))
+            .ok_or_else(|| "test drain transition is not canonical".into())
     }
 }
 

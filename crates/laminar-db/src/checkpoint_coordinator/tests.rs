@@ -4287,11 +4287,14 @@ async fn source_offset_handoff_round_trip() {
         .await
         .unwrap()
         .expect("sealed handoff");
-    assert_eq!(acquired.outcome.epoch, attempt.epoch);
-    assert_eq!(acquired.outcome.checkpoint_id, attempt.checkpoint_id);
+    assert_eq!(acquired.vnode_restore_cut.outcome().epoch, attempt.epoch);
+    assert_eq!(
+        acquired.vnode_restore_cut.outcome().checkpoint_id,
+        attempt.checkpoint_id
+    );
     assert_eq!(acquired.sources.attempt(), attempt);
-    assert_eq!(acquired.vnode_restore_head.attempt(), attempt);
-    let restore_inventory = acquired.vnode_restore_head.inventory();
+    assert_eq!(acquired.vnode_restore_cut.attempt(), attempt);
+    let restore_inventory = acquired.vnode_restore_cut.inventory();
     assert_eq!(restore_inventory.attempt, attempt);
     assert_eq!(
         restore_inventory.assignment_fence.as_ref(),
@@ -4408,8 +4411,11 @@ async fn source_handoff_ignores_a_newer_undecided_seal() {
         .await
         .unwrap()
         .expect("the decided cut should satisfy handoff");
-    assert_eq!(acquired.outcome.epoch, decided.epoch);
-    assert_eq!(acquired.outcome.checkpoint_id, decided.checkpoint_id);
+    assert_eq!(acquired.vnode_restore_cut.outcome().epoch, decided.epoch);
+    assert_eq!(
+        acquired.vnode_restore_cut.outcome().checkpoint_id,
+        decided.checkpoint_id
+    );
     assert_eq!(
         acquired
             .sources
@@ -4548,8 +4554,11 @@ async fn recovery_capsules_preserve_each_decided_source_cut() {
         .await
         .unwrap()
         .expect("highest decided handoff");
-    assert_eq!(latest.outcome.epoch, attempt8.epoch);
-    assert_eq!(latest.outcome.checkpoint_id, attempt8.checkpoint_id);
+    assert_eq!(latest.vnode_restore_cut.outcome().epoch, attempt8.epoch);
+    assert_eq!(
+        latest.vnode_restore_cut.outcome().checkpoint_id,
+        attempt8.checkpoint_id
+    );
     assert_eq!(
         latest
             .sources

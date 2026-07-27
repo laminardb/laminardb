@@ -132,6 +132,8 @@ mod table_provider;
 mod table_store;
 mod temporal_probe;
 mod vnode_partial;
+#[cfg(feature = "cluster")]
+mod vnode_transition_staging;
 
 // End-to-end tests for the crypto-sentiment demo pipeline, backed by wiremock.
 // In-crate (not tests/) so it can drive the OperatorGraph directly.
@@ -171,7 +173,7 @@ pub use recovery_manager::{RecoveredState, RecoveryManager};
 
 /// Rebalance-driven state-rehydration types (cluster mode).
 #[cfg(feature = "cluster")]
-pub use db::{ClusterStartupDisposition, RehydratedVnode, SnapshotAdoption};
+pub use db::{ClusterStartupDisposition, SnapshotAdoption};
 
 /// Re-export the connector registry for custom connector registration.
 pub use laminar_connectors::registry::ConnectorRegistry;

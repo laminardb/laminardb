@@ -101,7 +101,8 @@ pub(crate) trait GraphOperator: Send {
         Ok(None)
     }
 
-    /// Replay one operator's recovery chain for a vnode: a FULL base then ordered deltas.
+    /// Replace one vnode from its authoritative recovery chain: a FULL base then ordered deltas.
+    /// Implementations must remove live keys absent from that recovered image.
     #[cfg(feature = "cluster")]
     fn apply_vnode_chain(
         &mut self,
@@ -144,22 +145,40 @@ enum GraphExecutionMode {
 }
 
 const GRAPH_EXECUTION_POISON_REASON: &str =
-    "operator graph execution was cancelled or panicked after potentially mutating state, or a \
-     vnode lifecycle callback returned an indeterminate outcome; recovery from the last committed \
-     checkpoint is required";
+    "operator graph execution was cancelled or panicked after potentially mutating state, failed \
+     terminally after input admission, or a vnode lifecycle callback returned an indeterminate \
+     outcome; recovery from the last committed checkpoint is required";
 
-/// A graph cycle may hold operator mutation and graph-owned input in different futures. Only an
-/// explicit `Result` proves that the cycle reached its classification/cleanup boundary; unwind or
-/// cancellation permanently fences this graph generation.
+/// In cluster mode, assignment adoption may trust the installed-state binding only while this
+/// graph generation remains usable. Clear that success marker before publishing poison so an
+/// observer that sees the poison can never retain authority derived from indeterminate state.
+#[cfg(feature = "cluster")]
+fn publish_cluster_execution_poison(
+    poisoned: &AtomicBool,
+    installed_vnode_state: Option<&crate::vnode_transition_staging::InstalledVnodeStateHandle>,
+) {
+    if let Some(installed_vnode_state) = installed_vnode_state {
+        installed_vnode_state.lock().take();
+    }
+    poisoned.store(true, Ordering::Release);
+}
+
+/// A graph cycle may hold operator mutation and graph-owned input in different futures. Unwind or
+/// cancellation before the explicit result boundary permanently fences this graph generation;
+/// post-admission terminal results are fenced where they are classified.
 struct GraphExecutionAttemptGuard {
     poisoned: Arc<AtomicBool>,
+    #[cfg(feature = "cluster")]
+    installed_vnode_state: Option<crate::vnode_transition_staging::InstalledVnodeStateHandle>,
     armed: bool,
 }
 
 impl GraphExecutionAttemptGuard {
-    fn new(poisoned: Arc<AtomicBool>) -> Self {
+    fn new(graph: &OperatorGraph) -> Self {
         Self {
-            poisoned,
+            poisoned: Arc::clone(&graph.execution_poisoned),
+            #[cfg(feature = "cluster")]
+            installed_vnode_state: graph.installed_vnode_state.as_ref().map(Arc::clone),
             armed: true,
         }
     }
@@ -172,6 +191,9 @@ impl GraphExecutionAttemptGuard {
 impl Drop for GraphExecutionAttemptGuard {
     fn drop(&mut self) {
         if self.armed {
+            #[cfg(feature = "cluster")]
+            publish_cluster_execution_poison(&self.poisoned, self.installed_vnode_state.as_ref());
+            #[cfg(not(feature = "cluster"))]
             self.poisoned.store(true, Ordering::Release);
         }
     }
@@ -504,15 +526,15 @@ pub(crate) struct OperatorGraph {
     // Set from the shuffle registry in cluster mode.
     #[cfg(feature = "cluster")]
     vnode_count: Option<u32>,
-    // Staged per-vnode rehydration map; drained at the top of each cycle.
+    // Logical pipeline/state ABI bound into every managed vnode transition.
     #[cfg(feature = "cluster")]
-    #[allow(clippy::disallowed_types)] // shares the DB's std-HashMap-typed handle
-    rehydrated_vnode_state:
-        Option<Arc<parking_lot::Mutex<std::collections::HashMap<u32, crate::db::RehydratedVnode>>>>,
-    // One assignment-bound vnode revocation batch, consumed only after complete lifecycle success.
+    pipeline_identity: Option<laminar_core::checkpoint::PipelineIdentity>,
+    // One immutable revoke/restore transition, consumed only after complete lifecycle success.
     #[cfg(feature = "cluster")]
-    staged_vnode_revocation:
-        Option<Arc<parking_lot::Mutex<Option<crate::db::StagedVnodeRevocation>>>>,
+    pending_vnode_transition: Option<crate::vnode_transition_staging::PendingVnodeTransitionHandle>,
+    // Success-only binding for the exact vnode state installed in this graph generation.
+    #[cfg(feature = "cluster")]
+    installed_vnode_state: Option<crate::vnode_transition_staging::InstalledVnodeStateHandle>,
     #[cfg(feature = "cluster")]
     rotation_execution_fence: Option<Arc<tokio::sync::RwLock<()>>>,
 }
@@ -559,9 +581,11 @@ impl OperatorGraph {
             #[cfg(feature = "cluster")]
             vnode_count: None,
             #[cfg(feature = "cluster")]
-            rehydrated_vnode_state: None,
+            pipeline_identity: None,
             #[cfg(feature = "cluster")]
-            staged_vnode_revocation: None,
+            pending_vnode_transition: None,
+            #[cfg(feature = "cluster")]
+            installed_vnode_state: None,
             #[cfg(feature = "cluster")]
             rotation_execution_fence: None,
             ctx,
@@ -723,10 +747,11 @@ impl OperatorGraph {
 
     #[cfg(feature = "cluster")]
     fn checkpoint_transition_is_applied(&self) -> bool {
-        !self.has_staged_vnode_transition()
+        !self.has_pending_vnode_transition()
             && self.cluster_shuffle.as_ref().is_none_or(|shuffle| {
-                self.last_execution_assignment_version
-                    == Some(shuffle.registry.assignment_version())
+                !shuffle.registry.any_restoring()
+                    && self.last_execution_assignment_version
+                        == Some(shuffle.registry.assignment_version())
             })
     }
 
@@ -809,23 +834,31 @@ impl OperatorGraph {
         self.last_execution_assignment_version
     }
 
-    /// Share the staged per-vnode rehydration map; consumed after a complete successful batch.
+    /// Bind the graph to the logical pipeline and recovery-state ABI.
     #[cfg(feature = "cluster")]
-    #[allow(clippy::disallowed_types)] // shares the DB's std-HashMap-typed handle
-    pub fn set_rehydration_handle(
+    pub(crate) fn set_pipeline_identity(
         &mut self,
-        staged: Arc<parking_lot::Mutex<std::collections::HashMap<u32, crate::db::RehydratedVnode>>>,
+        identity: laminar_core::checkpoint::PipelineIdentity,
     ) {
-        self.rehydrated_vnode_state = Some(staged);
+        self.pipeline_identity = Some(identity);
     }
 
-    /// Share the assignment-bound vnode revocation batch.
+    /// Share the single immutable pending vnode transition slot.
     #[cfg(feature = "cluster")]
-    pub fn set_vnode_revocation_handle(
+    pub(crate) fn set_pending_vnode_transition_handle(
         &mut self,
-        staged: Arc<parking_lot::Mutex<Option<crate::db::StagedVnodeRevocation>>>,
+        pending: crate::vnode_transition_staging::PendingVnodeTransitionHandle,
     ) {
-        self.staged_vnode_revocation = Some(staged);
+        self.pending_vnode_transition = Some(pending);
+    }
+
+    /// Share the success-only installed-state binding with assignment adoption.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn set_installed_vnode_state_handle(
+        &mut self,
+        installed: crate::vnode_transition_staging::InstalledVnodeStateHandle,
+    ) {
+        self.installed_vnode_state = Some(installed);
     }
 
     #[cfg(feature = "cluster")]
@@ -2056,6 +2089,7 @@ impl OperatorGraph {
             }
             Err(e) => {
                 if e.requires_pipeline_recovery() || e.requires_pipeline_halt() {
+                    self.poison_after_terminal_error();
                     return Err(e);
                 }
                 // Defer (preserve input, keep the cycle alive) when the upstream
@@ -2201,7 +2235,7 @@ impl OperatorGraph {
     /// adopting a newer assignment without reopening source intake.
     #[cfg(feature = "cluster")]
     pub(crate) async fn complete_pending_vnode_transition(&mut self) -> Result<bool, DbError> {
-        let pending = self.has_staged_vnode_transition()
+        let pending = self.has_pending_vnode_transition()
             || self
                 .cluster_shuffle
                 .as_ref()
@@ -2219,11 +2253,11 @@ impl OperatorGraph {
 
         // Waiting for assignment publication has not touched operator state. Cancellation after
         // this point is indeterminate for the same reason as a normal graph cycle.
-        let mut attempt = GraphExecutionAttemptGuard::new(Arc::clone(&self.execution_poisoned));
+        let mut attempt = GraphExecutionAttemptGuard::new(self);
         self.whole_restore_open = false;
         self.last_execution_assignment_version = None;
         let result = (|| {
-            let final_owner_exit = self.has_staged_final_owner_exit();
+            let final_owner_exit = self.has_pending_final_owner_exit();
             let execution_assignment_version = if final_owner_exit {
                 None
             } else if let Some(config) = &self.cluster_shuffle {
@@ -2241,9 +2275,9 @@ impl OperatorGraph {
                 None
             };
             if final_owner_exit {
-                self.complete_committed_final_owner_exit()?;
+                self.apply_committed_final_owner_exit()?;
             } else {
-                self.complete_staged_vnode_transition()?;
+                self.apply_pending_vnode_transition()?;
             }
             self.last_execution_assignment_version = execution_assignment_version;
             Ok(true)
@@ -2281,7 +2315,7 @@ impl OperatorGraph {
         #[cfg(feature = "cluster")]
         let _rotation_guard = match self.rotation_execution_fence.as_ref() {
             Some(fence) => Some(Arc::clone(fence).read_owned().await),
-            None if self.has_staged_vnode_transition()
+            None if self.has_pending_vnode_transition()
                 || self
                     .cluster_shuffle
                     .as_ref()
@@ -2297,7 +2331,7 @@ impl OperatorGraph {
 
         // Waiting for the cluster rotation fence has not admitted input or touched operator state.
         // Arm only after it is held so cancellation while ownership is rotating is not poisoned.
-        let mut attempt = GraphExecutionAttemptGuard::new(Arc::clone(&self.execution_poisoned));
+        let mut attempt = GraphExecutionAttemptGuard::new(self);
         let result = self
             .execute_cycle_attempt(source_batches, current_watermark, source_watermarks, mode)
             .await;
@@ -2330,7 +2364,7 @@ impl OperatorGraph {
             } else {
                 None
             };
-            self.complete_staged_vnode_transition()?;
+            self.apply_pending_vnode_transition()?;
             self.last_execution_assignment_version = execution_assignment_version;
         }
 
@@ -2381,6 +2415,7 @@ impl OperatorGraph {
                 GateDecision::Skip => continue,
                 GateDecision::Fail => {
                     self.finish_cycle();
+                    self.poison_after_terminal_error();
                     return Err(DbError::BackpressureFail(format!(
                         "input buffer at capacity downstream of '{}'",
                         self.nodes[node_id].name
@@ -2456,6 +2491,22 @@ impl OperatorGraph {
         self.execution_poisoned
             .load(Ordering::Acquire)
             .then_some(GRAPH_EXECUTION_POISON_REASON)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn poison_cluster_execution(&self) {
+        if self.installed_vnode_state.is_none() {
+            return;
+        }
+        publish_cluster_execution_poison(
+            &self.execution_poisoned,
+            self.installed_vnode_state.as_ref(),
+        );
+    }
+
+    fn poison_after_terminal_error(&self) {
+        #[cfg(feature = "cluster")]
+        self.poison_cluster_execution();
     }
 
     fn complete_cycle(
@@ -2592,6 +2643,7 @@ impl OperatorGraph {
             match self.gate_decision(deferred_id) {
                 GateDecision::Skip => continue,
                 GateDecision::Fail => {
+                    self.poison_after_terminal_error();
                     return Err(DbError::BackpressureFail(format!(
                         "input buffer at capacity downstream of '{}'",
                         self.nodes[deferred_id].name

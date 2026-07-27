@@ -144,6 +144,38 @@ async fn full_replay_replaces_preexisting_rows_and_is_idempotent() {
 }
 
 #[tokio::test]
+async fn authoritative_replacement_rejects_a_chain_for_another_vnode_atomically() {
+    let mut donor = fresh_state().await;
+    feed(&mut donor, &[("AAPL", 100), ("GOOG", 200), ("MSFT", 50)]);
+    let (actual_vnode, slice) = donor
+        .checkpoint_groups_by_vnode(VNODES)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("the donor must produce a vnode slice");
+    let claimed_vnode = (actual_vnode + 1) % VNODES;
+
+    let mut target = fresh_state().await;
+    feed(&mut target, &[("LOCAL", 7)]);
+    let before = rkyv::to_bytes::<rkyv::rancor::Error>(&target.checkpoint_groups().unwrap())
+        .unwrap()
+        .to_vec();
+
+    let error = target
+        .replace_vnode_chain(claimed_vnode, VNODES, &slice, &[])
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("key for another vnode"),
+        "{error}"
+    );
+
+    let after = rkyv::to_bytes::<rkyv::rancor::Error>(&target.checkpoint_groups().unwrap())
+        .unwrap()
+        .to_vec();
+    assert_eq!(after, before, "rejected chain changed the live state image");
+}
+
+#[tokio::test]
 async fn aggregate_key_mapping_matches_shuffle_capture_and_drop() {
     let rows = [
         ("AAPL", 1),

@@ -769,13 +769,184 @@ impl ValidatedVnodeRestoreHead {
     }
 }
 
+/// One exact committed cluster recovery cut authorized for vnode-state reads.
+///
+/// This value is constructed only after the durable outcome, content-addressed recovery capsule,
+/// sealed artifact inventory, artifact metadata, and participant-readiness inventory have been
+/// validated as one recovery image. Keeping those bindings together prevents later transition
+/// staging from accidentally combining individually valid records from different cuts.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedClusterVnodeRestoreCut {
+    outcome: laminar_core::checkpoint_decision::CheckpointOutcome,
+    recovery_capsule_ref: RecoveryCapsuleRef,
+    pipeline_identity: PipelineIdentity,
+    seal_inventory_sha256: String,
+    restore_head: ValidatedVnodeRestoreHead,
+}
+
+#[cfg(feature = "cluster")]
+impl ValidatedClusterVnodeRestoreCut {
+    #[cfg(test)]
+    pub(crate) fn synthetic_for_transition_test(
+        attempt: CheckpointAttempt,
+        pipeline_identity: PipelineIdentity,
+        assignment_fence: laminar_core::checkpoint::CheckpointAssignmentFence,
+        owners: &[u64],
+        required_vnodes: &[u32],
+    ) -> Result<Self, DbError> {
+        if !attempt.is_canonical() || !assignment_fence.matches_owner_map(owners) {
+            return Err(DbError::Checkpoint(
+                "synthetic transition restore cut has invalid attempt or assignment".into(),
+            ));
+        }
+        let mut required_vnodes = required_vnodes.to_vec();
+        required_vnodes.sort_unstable();
+        required_vnodes.dedup();
+        let sealed_partials = required_vnodes
+            .iter()
+            .map(|vnode| {
+                let owner = owners.get(*vnode as usize).copied().ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "synthetic transition restore cut vnode {vnode} is out of range"
+                    ))
+                })?;
+                let boot_incarnation =
+                    assignment_fence
+                        .participant_incarnation(owner)
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "synthetic transition restore cut owner {owner} is not certified"
+                            ))
+                        })?;
+                Ok(laminar_core::state::SealedVnodePartial {
+                    vnode: *vnode,
+                    assignment_version: assignment_fence.assignment_version,
+                    writer: Some(laminar_core::state::SealedVnodeWriter {
+                        node_id: owner,
+                        boot_incarnation,
+                        assignment_certificate_digest: assignment_fence.digest(),
+                    }),
+                    payload_len: 1,
+                    payload_sha256: "22".repeat(32),
+                })
+            })
+            .collect::<Result<Vec<_>, DbError>>()?;
+        let inventory = CheckpointSealInventory {
+            attempt,
+            assignment_fence: Some(assignment_fence.clone()),
+            assignment_version: assignment_fence.assignment_version,
+            required_vnodes,
+            sealed_partials,
+            required_descriptors: Vec::new(),
+            sealed_descriptors: Vec::new(),
+        };
+        inventory.validate_vnode_partials().map_err(|error| {
+            DbError::Checkpoint(format!("synthetic transition restore cut: {error}"))
+        })?;
+        let recovery_capsule_ref = RecoveryCapsuleRef {
+            epoch: attempt.epoch,
+            checkpoint_id: attempt.checkpoint_id,
+            sha256: "11".repeat(32),
+            len: 1,
+        };
+        let leader = assignment_fence.participants[0];
+        let outcome = laminar_core::checkpoint_decision::CheckpointOutcome {
+            version: 2,
+            scope: laminar_core::checkpoint_decision::CheckpointScope::Cluster,
+            epoch: attempt.epoch,
+            checkpoint_id: attempt.checkpoint_id,
+            deployment_id: uuid::Uuid::from_u128(1).to_string(),
+            assignment_fence: Some(assignment_fence),
+            leader_proof: Some(laminar_core::checkpoint::LeaderProof {
+                owner: laminar_core::checkpoint::LeaderProofOwner {
+                    node_id: leader.node_id,
+                    boot_id: leader.boot_incarnation,
+                    process_term: 1,
+                },
+                fencing_token: 1,
+            }),
+            recovery_capsule: Some(recovery_capsule_ref.clone()),
+            verdict: laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
+        };
+        let seal_inventory_sha256 = canonical_json_sha256(&inventory).map_err(|error| {
+            DbError::Checkpoint(format!(
+                "synthetic transition restore-cut inventory encode: {error}"
+            ))
+        })?;
+        let cut = Self {
+            outcome,
+            recovery_capsule_ref,
+            pipeline_identity,
+            seal_inventory_sha256,
+            restore_head: ValidatedVnodeRestoreHead::new(inventory),
+        };
+        cut.validate_transition_binding().map_err(|error| {
+            DbError::Checkpoint(format!("synthetic transition restore cut: {error}"))
+        })?;
+        Ok(cut)
+    }
+
+    #[must_use]
+    pub(crate) fn attempt(&self) -> CheckpointAttempt {
+        self.restore_head.attempt()
+    }
+
+    #[must_use]
+    pub(crate) fn outcome(&self) -> &laminar_core::checkpoint_decision::CheckpointOutcome {
+        &self.outcome
+    }
+
+    #[must_use]
+    pub(crate) fn pipeline_identity(&self) -> &PipelineIdentity {
+        &self.pipeline_identity
+    }
+
+    #[must_use]
+    pub(crate) fn restore_head(&self) -> &ValidatedVnodeRestoreHead {
+        &self.restore_head
+    }
+
+    #[must_use]
+    pub(crate) fn inventory(&self) -> Arc<CheckpointSealInventory> {
+        self.restore_head.inventory()
+    }
+
+    pub(crate) fn validate_transition_binding(&self) -> Result<(), String> {
+        let attempt = self.attempt();
+        let outcome_attempt =
+            CheckpointAttempt::new(self.outcome.epoch, self.outcome.checkpoint_id);
+        if !self.outcome.is_commit()
+            || self.outcome.scope != laminar_core::checkpoint_decision::CheckpointScope::Cluster
+            || outcome_attempt != attempt
+            || self.recovery_capsule_ref.epoch != attempt.epoch
+            || self.recovery_capsule_ref.checkpoint_id != attempt.checkpoint_id
+            || self.outcome.recovery_capsule.as_ref() != Some(&self.recovery_capsule_ref)
+            || self.outcome.assignment_fence.is_none()
+            || self.outcome.assignment_fence.as_ref()
+                != self.restore_head.inventory.assignment_fence.as_ref()
+        {
+            return Err("committed restore-cut authority no longer identifies one seal".into());
+        }
+        self.recovery_capsule_ref.validate()?;
+        if self.seal_inventory_sha256.len() != 64
+            || !self
+                .seal_inventory_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("committed restore cut has a non-canonical seal digest".into());
+        }
+        Ok(())
+    }
+}
+
 /// One validated durable source and vnode-state cut selected for assignment acquisition.
 #[cfg(feature = "cluster")]
 #[derive(Debug)]
 pub(crate) struct AcquiredClusterHandoff {
-    pub(crate) outcome: laminar_core::checkpoint_decision::CheckpointOutcome,
     pub(crate) sources: Arc<CommittedSourceHandoff>,
-    pub(crate) vnode_restore_head: ValidatedVnodeRestoreHead,
+    pub(crate) vnode_restore_cut: ValidatedClusterVnodeRestoreCut,
 }
 
 /// Immutable handles needed to read one cluster recovery cut without holding the checkpoint
@@ -827,41 +998,25 @@ impl ClusterHandoffReader {
                     outcome.checkpoint_id, outcome.epoch
                 ))
             })?;
-        let attempt = CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id);
-        let inventory = self
-            .backend
-            .checkpoint_seal_inventory(attempt)
-            .await
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "source-offset handoff seal read failed for checkpoint {} epoch {}: {error}",
-                    attempt.checkpoint_id, attempt.epoch
-                ))
-            })?
-            .ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "[LDB-6041] decided checkpoint {} epoch {} has no exact state seal",
-                    attempt.checkpoint_id, attempt.epoch
-                ))
-            })?;
         let deployment_id = self.deployment_id.as_deref().ok_or_else(|| {
             DbError::Checkpoint(
                 "coordinated commit requires a durable deployment identity before startup".into(),
             )
         })?;
-        CheckpointCoordinator::validate_cluster_recovery_capsule(
+        let vnode_restore_cut = CheckpointCoordinator::validate_cluster_cut_metadata(
+            self.backend.as_ref(),
             &outcome,
-            &inventory,
             &capsule,
             deployment_id,
             &self.pipeline_identity,
-        )?;
+        )
+        .await?;
         let sources = Arc::new(CommittedSourceHandoff::try_from(&capsule).map_err(|error| {
             DbError::Checkpoint(format!(
                 "[LDB-6041] recovery capsule source handoff is invalid: {error}"
             ))
         })?);
-        let vnode_restore_head = ValidatedVnodeRestoreHead::new(inventory);
+        let attempt = vnode_restore_cut.attempt();
         info!(
             epoch = attempt.epoch,
             checkpoint_id = attempt.checkpoint_id,
@@ -869,9 +1024,8 @@ impl ClusterHandoffReader {
             "decision-bound source handoff staged for acquire"
         );
         Ok(Some(AcquiredClusterHandoff {
-            outcome,
             sources,
-            vnode_restore_head,
+            vnode_restore_cut,
         }))
     }
 
@@ -2214,6 +2368,16 @@ impl CheckpointCoordinator {
                     .into(),
             )),
         }
+    }
+
+    /// Return the exact runtime identity already bound before cluster recovery or publication.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn bound_pipeline_identity(&self) -> Result<PipelineIdentity, DbError> {
+        self.pipeline_identity.clone().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6043] checkpoint coordinator has no bound pipeline identity".into(),
+            )
+        })
     }
 
     /// Bind the create-once durable deployment incarnation before any coordinated sink opens.
@@ -7500,7 +7664,7 @@ impl CheckpointCoordinator {
         capsule: &ClusterRecoveryCapsule,
         expected_deployment: &str,
         expected_identity: &PipelineIdentity,
-    ) -> Result<ValidatedVnodeRestoreHead, DbError> {
+    ) -> Result<ValidatedClusterVnodeRestoreCut, DbError> {
         let attempt = CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id);
         let inventory = backend
             .checkpoint_seal_inventory(attempt)
@@ -7510,8 +7674,8 @@ impl CheckpointCoordinator {
             })?
             .ok_or_else(|| {
                 DbError::Checkpoint(format!(
-                    "[LDB-6041] decided epoch {} checkpoint {} has no exact state seal",
-                    outcome.epoch, outcome.checkpoint_id
+                    "[LDB-6041] decided checkpoint {} epoch {} has no exact state seal",
+                    outcome.checkpoint_id, outcome.epoch
                 ))
             })?;
         Self::validate_cluster_recovery_capsule(
@@ -7544,7 +7708,19 @@ impl CheckpointCoordinator {
                 outcome.epoch, outcome.checkpoint_id
             )));
         }
-        Ok(ValidatedVnodeRestoreHead::new(inventory))
+        let recovery_capsule_ref = outcome.recovery_capsule.clone().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "[LDB-6041] cluster Commit for epoch {} checkpoint {} has no recovery capsule",
+                outcome.epoch, outcome.checkpoint_id
+            ))
+        })?;
+        Ok(ValidatedClusterVnodeRestoreCut {
+            outcome: outcome.clone(),
+            recovery_capsule_ref,
+            pipeline_identity: capsule.pipeline_identity.clone(),
+            seal_inventory_sha256: capsule.seal_inventory_sha256.clone(),
+            restore_head: ValidatedVnodeRestoreHead::new(inventory),
+        })
     }
 
     #[cfg(feature = "cluster")]
@@ -7611,7 +7787,7 @@ impl CheckpointCoordinator {
                 outcome.epoch, outcome.checkpoint_id
             ))
         })?;
-        let vnode_restore_head = Self::validate_cluster_cut_metadata(
+        let vnode_restore_cut = Self::validate_cluster_cut_metadata(
             backend.as_ref(),
             outcome,
             capsule,
@@ -7619,7 +7795,7 @@ impl CheckpointCoordinator {
             &self.expected_pipeline_identity(),
         )
         .await?;
-        recovered.set_vnode_restore_head(vnode_restore_head);
+        recovered.set_vnode_restore_cut(vnode_restore_cut);
         Ok(())
     }
 

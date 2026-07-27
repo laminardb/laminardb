@@ -31,7 +31,7 @@ pub struct RecoveredState {
     #[cfg(feature = "cluster")]
     cluster_capsule: Option<ClusterRecoveryCapsule>,
     #[cfg(feature = "cluster")]
-    vnode_restore_head: Option<crate::checkpoint_coordinator::ValidatedVnodeRestoreHead>,
+    vnode_restore_cut: Option<crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut>,
 }
 
 impl RecoveredState {
@@ -57,18 +57,18 @@ impl RecoveredState {
     }
 
     #[cfg(feature = "cluster")]
-    pub(crate) fn set_vnode_restore_head(
+    pub(crate) fn set_vnode_restore_cut(
         &mut self,
-        head: crate::checkpoint_coordinator::ValidatedVnodeRestoreHead,
+        cut: crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut,
     ) {
-        self.vnode_restore_head = Some(head);
+        self.vnode_restore_cut = Some(cut);
     }
 
     #[cfg(feature = "cluster")]
-    pub(crate) fn vnode_restore_head(
+    pub(crate) fn vnode_restore_cut(
         &self,
-    ) -> Option<&crate::checkpoint_coordinator::ValidatedVnodeRestoreHead> {
-        self.vnode_restore_head.as_ref()
+    ) -> Option<&crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut> {
+        self.vnode_restore_cut.as_ref()
     }
 }
 
@@ -1350,7 +1350,7 @@ impl<'a> RecoveryManager<'a> {
             #[cfg(feature = "cluster")]
             cluster_capsule: None,
             #[cfg(feature = "cluster")]
-            vnode_restore_head: None,
+            vnode_restore_cut: None,
         })
     }
 

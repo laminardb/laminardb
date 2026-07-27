@@ -16,10 +16,10 @@ use laminar_core::cluster::control::controller::{
     RecoveryAnnouncement, RecoveryFault, RecoveryRound,
 };
 use laminar_core::cluster::control::{
-    CatalogManifest, CatalogManifestEntry, CatalogManifestStore, CatalogObjectKind,
-    CheckpointParticipant, ClusterController, ClusterKv, InMemoryKv, LeaderLeaseOwner,
-    LeaderLeaseStore, LeaseDeadline, LeaseOutcome, ProcessLeaseAuthority, ProcessLeaseOutcome,
-    RecoverPhase,
+    AssignmentSnapshot, AssignmentSnapshotStore, CatalogManifest, CatalogManifestEntry,
+    CatalogManifestStore, CatalogObjectKind, CheckpointParticipant, ClusterController, ClusterKv,
+    InMemoryKv, LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline, LeaseOutcome,
+    ProcessLeaseAuthority, ProcessLeaseOutcome, RecoverPhase,
 };
 use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
 use laminar_core::state::{
@@ -139,14 +139,15 @@ async fn startup_db() -> (
     let kv = Arc::new(InMemoryKv::new(node_id));
     let controller_kv: Arc<dyn ClusterKv> = kv.clone();
     let (members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let checkpoint_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let assignment_store = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&checkpoint_store)));
     let controller = Arc::new(ClusterController::new(
         node_id,
         controller_kv,
-        None,
+        Some(Arc::clone(&assignment_store)),
         members_rx,
     ));
-    let checkpoint_store: Arc<dyn object_store::ObjectStore> =
-        Arc::new(object_store::memory::InMemory::new());
     let process_authority = Arc::new(
         ProcessLeaseAuthority::new(Arc::clone(&checkpoint_store), Duration::from_secs(60)).unwrap(),
     );
@@ -194,18 +195,20 @@ async fn startup_db() -> (
     controller.set_active(true);
     let manifest_store = Arc::new(CatalogManifestStore::new(authority));
     let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(node_id.0)));
-    let round = RecoveryRound::new(
-        1,
-        lease.proof(),
-        CheckpointAssignmentFence::from_owner_map(
-            1,
-            &[node_id.0],
+    let assignment = AssignmentSnapshot::empty()
+        .next_for_participants(
+            std::collections::BTreeMap::from([(0, StateNodeId(node_id.0))]),
             vec![CheckpointParticipant {
                 node_id: node_id.0,
                 boot_incarnation: controller.recovery_incarnation(),
             }],
         )
-        .unwrap(),
+        .unwrap();
+    assignment_store.save_if_absent(&assignment).await.unwrap();
+    let round = RecoveryRound::new(
+        1,
+        lease.proof(),
+        assignment.assignment_fence().unwrap(),
         Vec::new(),
         1,
         vec![RecoveryFault {
@@ -218,6 +221,7 @@ async fn startup_db() -> (
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(checkpoint_store)
+        .assignment_snapshot_store(assignment_store)
         .catalog_manifest_store(Arc::clone(&manifest_store))
         .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
             interval_ms: Some(3_600_000),

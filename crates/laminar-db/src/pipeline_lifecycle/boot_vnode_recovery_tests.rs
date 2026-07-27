@@ -7,12 +7,17 @@ use laminar_core::checkpoint::{
     CommittedSourceHandoff, ParticipantRecoveryRef, PipelineIdentity,
     CLUSTER_RECOVERY_CAPSULE_VERSION, PIPELINE_IDENTITY_VERSION,
 };
-use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv, LeaseDeadline};
+use laminar_core::cluster::control::{
+    AssignmentSnapshot, AssignmentSnapshotStore, ClusterController, ClusterKv, InMemoryKv,
+    LeaseDeadline,
+};
 use laminar_core::cluster::discovery::{NodeId as ClusterNodeId, NodeInfo};
 use laminar_core::state::{CheckpointAttempt, InProcessBackend, NodeId, VnodeRegistry};
 
+use crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut;
 use crate::db::LaminarDB;
 use crate::recovery_manager::vnode_chains::LoadedVnodeChains;
+use crate::vnode_transition_staging::VnodeTransitionOrigin;
 
 fn digest(byte: u8) -> String {
     format!("{byte:02x}").repeat(32)
@@ -79,6 +84,49 @@ async fn boot_test_db(registry: Arc<VnodeRegistry>) -> Arc<LaminarDB> {
         .unwrap()
 }
 
+fn boot_restore_authority(
+    target: &laminar_core::state::VnodeAssignmentSnapshot,
+    attempt: CheckpointAttempt,
+    required_vnodes: &[u32],
+) -> (
+    CheckpointAssignmentFence,
+    CheckpointParticipant,
+    ValidatedClusterVnodeRestoreCut,
+) {
+    let owner_ids: Vec<u64> = target.owners().iter().map(|owner| owner.0).collect();
+    let mut participant_ids = owner_ids.clone();
+    participant_ids.sort_unstable();
+    participant_ids.dedup();
+    let participants: Vec<CheckpointParticipant> = participant_ids
+        .into_iter()
+        .map(|node_id| CheckpointParticipant {
+            node_id,
+            boot_incarnation: uuid::Uuid::from_u128(u128::from(node_id)),
+        })
+        .collect();
+    let participant = participants
+        .iter()
+        .copied()
+        .find(|participant| participant.node_id == 1)
+        .expect("boot test target must retain the local participant");
+    let fence =
+        CheckpointAssignmentFence::from_owner_map(target.version(), &owner_ids, participants)
+            .unwrap();
+    let identity = PipelineIdentity {
+        canonical_version: PIPELINE_IDENTITY_VERSION,
+        sha256: digest(1),
+    };
+    let cut = ValidatedClusterVnodeRestoreCut::synthetic_for_transition_test(
+        attempt,
+        identity,
+        fence.clone(),
+        &owner_ids,
+        required_vnodes,
+    )
+    .unwrap();
+    (fence, participant, cut)
+}
+
 #[tokio::test]
 async fn boot_report_marks_and_stages_the_exact_owned_roster() {
     let registry = Arc::new(VnodeRegistry::single_owner(2, NodeId(1)));
@@ -92,17 +140,47 @@ async fn boot_report_marks_and_stages_the_exact_owned_roster() {
         ]),
     };
     let target_assignment = registry.versioned_snapshot();
+    let (target_fence, participant, restore_cut) =
+        boot_restore_authority(&target_assignment, attempt, &[0, 1]);
 
-    db.stage_boot_vnode_rehydration(&registry, &target_assignment, &[0, 1], attempt, report)
-        .unwrap();
+    db.publish_boot_vnode_restore_transition(
+        &registry,
+        &target_assignment,
+        target_fence.clone(),
+        participant,
+        restore_cut,
+        report,
+    )
+    .unwrap();
 
     assert_eq!(registry.restoring_vnodes(), vec![0, 1]);
-    let staged = db.rehydrated_vnode_state.lock();
-    assert_eq!(staged.len(), 2);
-    assert_eq!(staged[&0].attempt, attempt);
-    assert_eq!(staged[&0].chain, vec![Bytes::from_static(b"vnode-0")]);
-    assert_eq!(staged[&1].attempt, attempt);
-    assert_eq!(staged[&1].chain, vec![Bytes::from_static(b"vnode-1")]);
+    let transition = db
+        .pending_vnode_transition
+        .lock()
+        .clone()
+        .expect("boot transition must be published");
+    assert_eq!(transition.origin(), &VnodeTransitionOrigin::BootRecovery);
+    assert_eq!(transition.target(), &target_fence);
+    assert_eq!(transition.acquired_vnodes(), [0, 1]);
+    assert!(transition.revoked_vnodes().is_empty());
+    assert_eq!(
+        transition
+            .restore_cut()
+            .expect("boot transition must retain its cut")
+            .attempt(),
+        attempt
+    );
+    assert_eq!(transition.restores().len(), 2);
+    assert_eq!(transition.restores()[0].vnode(), 0);
+    assert_eq!(
+        transition.restores()[0].chain(),
+        [Bytes::from_static(b"vnode-0")]
+    );
+    assert_eq!(transition.restores()[1].vnode(), 1);
+    assert_eq!(
+        transition.restores()[1].chain(),
+        [Bytes::from_static(b"vnode-1")]
+    );
 }
 
 #[tokio::test]
@@ -115,13 +193,22 @@ async fn invalid_boot_report_changes_neither_staging_nor_lifecycle() {
         chains: HashMap::from([(0, vec![Bytes::from_static(b"vnode-0")])]),
     };
     let target_assignment = registry.versioned_snapshot();
+    let (target_fence, participant, restore_cut) =
+        boot_restore_authority(&target_assignment, attempt, &[0, 1]);
 
     let error = db
-        .stage_boot_vnode_rehydration(&registry, &target_assignment, &[0, 1], attempt, report)
+        .publish_boot_vnode_restore_transition(
+            &registry,
+            &target_assignment,
+            target_fence,
+            participant,
+            restore_cut,
+            report,
+        )
         .unwrap_err();
 
-    assert!(error.to_string().contains("does not match owned roster"));
-    assert!(db.rehydrated_vnode_state.lock().is_empty());
+    assert!(error.to_string().contains("does not match acquired roster"));
+    assert!(db.pending_vnode_transition.lock().is_none());
     assert!(!registry.any_restoring());
 }
 
@@ -130,8 +217,10 @@ async fn changed_boot_assignment_rejects_report_without_mutation() {
     let registry = Arc::new(VnodeRegistry::single_owner(2, NodeId(1)));
     let db = boot_test_db(Arc::clone(&registry)).await;
     let target_assignment = registry.versioned_snapshot();
-    registry.set_assignment_and_version(vec![NodeId(2), NodeId(2)].into(), 2);
     let attempt = CheckpointAttempt::canonical(7);
+    let (target_fence, participant, restore_cut) =
+        boot_restore_authority(&target_assignment, attempt, &[0, 1]);
+    registry.set_assignment_and_version(vec![NodeId(2), NodeId(2)].into(), 2);
     let report = LoadedVnodeChains {
         attempt: Some(attempt),
         chains: HashMap::from([
@@ -141,11 +230,18 @@ async fn changed_boot_assignment_rejects_report_without_mutation() {
     };
 
     let error = db
-        .stage_boot_vnode_rehydration(&registry, &target_assignment, &[0, 1], attempt, report)
+        .publish_boot_vnode_restore_transition(
+            &registry,
+            &target_assignment,
+            target_fence,
+            participant,
+            restore_cut,
+            report,
+        )
         .unwrap_err();
 
     assert!(error.to_string().contains("changed"), "{error}");
-    assert!(db.rehydrated_vnode_state.lock().is_empty());
+    assert!(db.pending_vnode_transition.lock().is_none());
     assert!(!registry.any_restoring());
 }
 
@@ -155,6 +251,8 @@ async fn wrong_boot_attempt_rejects_report_without_mutation() {
     let db = boot_test_db(Arc::clone(&registry)).await;
     let target_assignment = registry.versioned_snapshot();
     let attempt = CheckpointAttempt::canonical(7);
+    let (target_fence, participant, restore_cut) =
+        boot_restore_authority(&target_assignment, attempt, &[0, 1]);
     let report = LoadedVnodeChains {
         attempt: Some(CheckpointAttempt::canonical(8)),
         chains: HashMap::from([
@@ -164,59 +262,283 @@ async fn wrong_boot_attempt_rejects_report_without_mutation() {
     };
 
     let error = db
-        .stage_boot_vnode_rehydration(&registry, &target_assignment, &[0, 1], attempt, report)
+        .publish_boot_vnode_restore_transition(
+            &registry,
+            &target_assignment,
+            target_fence,
+            participant,
+            restore_cut,
+            report,
+        )
         .unwrap_err();
 
     assert!(error.to_string().contains("does not match"), "{error}");
-    assert!(db.rehydrated_vnode_state.lock().is_empty());
+    assert!(db.pending_vnode_transition.lock().is_none());
     assert!(!registry.any_restoring());
 }
 
 #[tokio::test]
-async fn startup_reset_clears_stale_staging_and_lifecycle() {
+async fn failed_boot_preparation_retains_prior_exact_transition_and_lifecycle() {
     let registry = Arc::new(VnodeRegistry::single_owner(2, NodeId(1)));
     let db = boot_test_db(Arc::clone(&registry)).await;
-    registry.mark_restoring(&[0, 1]);
-    *db.staged_vnode_revocation.lock() = Some(
-        crate::db::StagedVnodeRevocation::target_scoped_for_test([0].into_iter().collect())
-            .unwrap(),
-    );
-    db.rehydrated_vnode_state.lock().insert(
-        1,
-        crate::db::RehydratedVnode {
-            attempt: CheckpointAttempt::canonical(7),
-            chain: vec![Bytes::from_static(b"stale")],
+    let target = registry.versioned_snapshot();
+    let prior_attempt = CheckpointAttempt::canonical(7);
+    let (prior_fence, participant, prior_cut) =
+        boot_restore_authority(&target, prior_attempt, &[0, 1]);
+    db.publish_boot_vnode_restore_transition(
+        &registry,
+        &target,
+        prior_fence,
+        participant,
+        prior_cut,
+        LoadedVnodeChains {
+            attempt: Some(prior_attempt),
+            chains: HashMap::from([
+                (0, vec![Bytes::from_static(b"prior-0")]),
+                (1, vec![Bytes::from_static(b"prior-1")]),
+            ]),
         },
+    )
+    .unwrap();
+    let prior = db
+        .pending_vnode_transition
+        .lock()
+        .clone()
+        .expect("prior boot transition must be pending");
+
+    let replacement_attempt = CheckpointAttempt::canonical(8);
+    let (_replacement_fence, _participant, replacement_cut) =
+        boot_restore_authority(&target, replacement_attempt, &[0, 1]);
+    let error = db
+        .prepare_boot_vnode_restore_transition(&replacement_cut)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("no durable assignment history"));
+    let retained = db
+        .pending_vnode_transition
+        .lock()
+        .clone()
+        .expect("failed replacement must retain prior transition");
+    assert!(Arc::ptr_eq(&prior, &retained));
+    assert_eq!(registry.restoring_vnodes(), vec![0, 1]);
+    assert_eq!(retained.restore_cut().unwrap().attempt(), prior_attempt);
+    assert_eq!(
+        retained.restores()[0].chain(),
+        [Bytes::from_static(b"prior-0")]
     );
+}
 
-    db.reset_staged_vnode_transition_for_startup();
+#[tokio::test]
+async fn successful_boot_replacement_publishes_exact_arc_and_target_lifecycle() {
+    let registry = Arc::new(VnodeRegistry::new_unassigned(2));
+    registry.set_assignment_and_version(vec![NodeId(1), NodeId(2)].into(), 2);
+    let db = boot_test_db(Arc::clone(&registry)).await;
+    let target = registry.versioned_snapshot();
+    let prior_attempt = CheckpointAttempt::canonical(7);
+    let (prior_fence, participant, prior_cut) =
+        boot_restore_authority(&target, prior_attempt, &[0]);
+    db.publish_boot_vnode_restore_transition(
+        &registry,
+        &target,
+        prior_fence,
+        participant,
+        prior_cut,
+        LoadedVnodeChains {
+            attempt: Some(prior_attempt),
+            chains: HashMap::from([(0, vec![Bytes::from_static(b"prior")])]),
+        },
+    )
+    .unwrap();
+    let prior = db
+        .pending_vnode_transition
+        .lock()
+        .clone()
+        .expect("prior boot transition must be pending");
+    registry.mark_restoring(&[1]);
+    assert_eq!(registry.restoring_vnodes(), vec![0, 1]);
 
-    assert!(db.staged_vnode_revocation.lock().is_none());
-    assert!(db.rehydrated_vnode_state.lock().is_empty());
+    let replacement_attempt = CheckpointAttempt::canonical(8);
+    let (replacement_fence, participant, replacement_cut) =
+        boot_restore_authority(&target, replacement_attempt, &[0]);
+    db.publish_boot_vnode_restore_transition(
+        &registry,
+        &target,
+        replacement_fence.clone(),
+        participant,
+        replacement_cut,
+        LoadedVnodeChains {
+            attempt: Some(replacement_attempt),
+            chains: HashMap::from([(0, vec![Bytes::from_static(b"replacement")])]),
+        },
+    )
+    .unwrap();
+
+    let replacement = db
+        .pending_vnode_transition
+        .lock()
+        .clone()
+        .expect("replacement boot transition must be pending");
+    assert!(!Arc::ptr_eq(&prior, &replacement));
+    assert_eq!(replacement.origin(), &VnodeTransitionOrigin::BootRecovery);
+    assert_eq!(replacement.target(), &replacement_fence);
+    assert_eq!(replacement.acquired_vnodes(), [0]);
+    assert_eq!(
+        replacement.restore_cut().unwrap().attempt(),
+        replacement_attempt
+    );
+    assert_eq!(replacement.restores().len(), 1);
+    assert_eq!(replacement.restores()[0].vnode(), 0);
+    assert_eq!(
+        replacement.restores()[0].chain(),
+        [Bytes::from_static(b"replacement")]
+    );
+    assert_eq!(registry.restoring_vnodes(), vec![0]);
+    assert!(!registry.is_restoring(1));
+}
+
+#[tokio::test]
+async fn zero_owned_boot_target_retires_prior_transition_only_after_authority_audit() {
+    let self_id = NodeId(1);
+    let peer_id = NodeId(2);
+    let registry = Arc::new(VnodeRegistry::new_unassigned(2));
+    registry.set_assignment_and_version(vec![peer_id, peer_id].into(), 1);
+
+    let objects: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let assignments = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&objects)));
+    let target = AssignmentSnapshot::empty()
+        .next_for_participants(
+            BTreeMap::from([(0, peer_id), (1, peer_id)]),
+            vec![CheckpointParticipant {
+                node_id: peer_id.0,
+                boot_incarnation: uuid::Uuid::from_u128(2),
+            }],
+        )
+        .unwrap();
+    assignments.save_if_absent(&target).await.unwrap();
+
+    let node = ClusterNodeId(self_id.0);
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let controller = Arc::new(ClusterController::new(
+        node,
+        kv,
+        Some(Arc::clone(&assignments)),
+        members_rx,
+    ));
+    controller
+        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+            std::time::Duration::from_secs(60),
+        )))
+        .unwrap();
+    let db = LaminarDB::builder()
+        .cluster_controller(controller)
+        .cluster_checkpoint_object_store(Arc::clone(&objects))
+        .state_backend(Arc::new(InProcessBackend::new(2)))
+        .vnode_registry(Arc::clone(&registry))
+        .assignment_snapshot_store(assignments)
+        .build()
+        .await
+        .unwrap();
+
+    let attempt = CheckpointAttempt::canonical(7);
+    let identity = PipelineIdentity {
+        canonical_version: PIPELINE_IDENTITY_VERSION,
+        sha256: digest(1),
+    };
+    let prior_participant = CheckpointParticipant {
+        node_id: self_id.0,
+        boot_incarnation: uuid::Uuid::from_u128(1),
+    };
+    let prior_fence = CheckpointAssignmentFence::from_owner_map(
+        1,
+        &[self_id.0, self_id.0],
+        vec![prior_participant],
+    )
+    .unwrap();
+    let prior_cut = ValidatedClusterVnodeRestoreCut::synthetic_for_transition_test(
+        attempt,
+        identity.clone(),
+        prior_fence.clone(),
+        &[self_id.0, self_id.0],
+        &[0, 1],
+    )
+    .unwrap();
+    let prior = Arc::new(
+        crate::vnode_transition_staging::PendingVnodeTransition::boot_recovery(
+            prior_fence,
+            &[self_id, self_id],
+            prior_participant,
+            identity.clone(),
+            prior_cut,
+            LoadedVnodeChains {
+                attempt: Some(attempt),
+                chains: HashMap::from([
+                    (0, vec![Bytes::from_static(b"prior-0")]),
+                    (1, vec![Bytes::from_static(b"prior-1")]),
+                ]),
+            },
+        )
+        .unwrap(),
+    );
+    *db.pending_vnode_transition.lock() = Some(Arc::clone(&prior));
+    registry.mark_restoring(&[0, 1]);
+
+    let target_fence = target.assignment_fence().unwrap();
+    let target_cut = ValidatedClusterVnodeRestoreCut::synthetic_for_transition_test(
+        attempt,
+        identity,
+        target_fence,
+        &[peer_id.0, peer_id.0],
+        &[],
+    )
+    .unwrap();
+    db.prepare_boot_vnode_restore_transition(&target_cut)
+        .await
+        .unwrap();
+
+    assert!(db.pending_vnode_transition.lock().is_none());
     assert!(!registry.any_restoring());
-    assert!(registry.restoring_vnodes().is_empty());
+    assert!(db.installed_vnode_state.lock().is_none());
 }
 
 #[tokio::test]
 async fn fresh_cluster_start_rejects_staged_vnode_state_without_clearing_it() {
     let registry = Arc::new(VnodeRegistry::single_owner(2, NodeId(1)));
     let db = boot_test_db(Arc::clone(&registry)).await;
-    registry.mark_restoring(&[1]);
-    db.rehydrated_vnode_state.lock().insert(
-        1,
-        crate::db::RehydratedVnode {
-            attempt: CheckpointAttempt::canonical(7),
-            chain: vec![Bytes::from_static(b"must-not-be-discarded")],
-        },
-    );
+    let attempt = CheckpointAttempt::canonical(7);
+    let target = registry.versioned_snapshot();
+    let (fence, participant, cut) = boot_restore_authority(&target, attempt, &[0, 1]);
+    let loaded = LoadedVnodeChains {
+        attempt: Some(attempt),
+        chains: HashMap::from([
+            (0, vec![Bytes::from_static(b"must-not-be-discarded-0")]),
+            (1, vec![Bytes::from_static(b"must-not-be-discarded-1")]),
+        ]),
+    };
+    db.publish_boot_vnode_restore_transition(&registry, &target, fence, participant, cut, loaded)
+        .unwrap();
+    let pending = db
+        .pending_vnode_transition
+        .lock()
+        .clone()
+        .expect("valid boot transition must be pending");
 
     let error = db.validate_fresh_cluster_vnode_start().unwrap_err();
 
     assert!(error.to_string().contains("refusing a fresh graph"));
-    assert!(registry.is_restoring(1));
+    assert_eq!(registry.restoring_vnodes(), vec![0, 1]);
+    let retained = db
+        .pending_vnode_transition
+        .lock()
+        .clone()
+        .expect("fresh-start rejection must retain pending work");
+    assert!(Arc::ptr_eq(&pending, &retained));
+    assert_eq!(retained.restores()[1].vnode(), 1);
     assert_eq!(
-        db.rehydrated_vnode_state.lock()[&1].chain,
-        vec![Bytes::from_static(b"must-not-be-discarded")]
+        retained.restores()[1].chain(),
+        [Bytes::from_static(b"must-not-be-discarded-1")]
     );
 }
 
@@ -233,14 +555,28 @@ async fn assert_boot_recovery_target_mismatch_is_non_mutating(
         2,
         committed_source_handoff(committed_attempt, sealed_assignment_version),
     );
-    registry.mark_restoring(&[0]);
-    db.rehydrated_vnode_state.lock().insert(
-        0,
-        crate::db::RehydratedVnode {
-            attempt: committed_attempt,
-            chain: vec![Bytes::from_static(b"existing-stage")],
+    let target = registry.versioned_snapshot();
+    let (fence, participant, cut) = boot_restore_authority(&target, committed_attempt, &[0, 1]);
+    db.publish_boot_vnode_restore_transition(
+        &registry,
+        &target,
+        fence,
+        participant,
+        cut,
+        LoadedVnodeChains {
+            attempt: Some(committed_attempt),
+            chains: HashMap::from([
+                (0, vec![Bytes::from_static(b"existing-stage-0")]),
+                (1, vec![Bytes::from_static(b"existing-stage-1")]),
+            ]),
         },
-    );
+    )
+    .unwrap();
+    let pending = db
+        .pending_vnode_transition
+        .lock()
+        .clone()
+        .expect("pre-existing boot transition must be pending");
 
     let error = db
         .validate_boot_vnode_recovery_target(recovered_attempt, recovered_assignment_version)
@@ -258,12 +594,18 @@ async fn assert_boot_recovery_target_mismatch_is_non_mutating(
         assignment.source_handoff_assignment_version(),
         Some(sealed_assignment_version)
     );
-    assert_eq!(registry.restoring_vnodes(), vec![0]);
+    assert_eq!(registry.restoring_vnodes(), vec![0, 1]);
+    let retained = db
+        .pending_vnode_transition
+        .lock()
+        .clone()
+        .expect("target mismatch must retain the pending transition");
+    assert!(Arc::ptr_eq(&pending, &retained));
     assert_eq!(
-        db.rehydrated_vnode_state.lock()[&0].chain,
-        vec![Bytes::from_static(b"existing-stage")]
+        retained.restores()[0].chain(),
+        [Bytes::from_static(b"existing-stage-0")]
     );
-    assert!(!registry.is_restoring(1));
+    assert!(registry.is_restoring(1));
 }
 
 #[tokio::test]

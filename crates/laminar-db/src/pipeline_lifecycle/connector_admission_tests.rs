@@ -577,6 +577,36 @@ async fn coordinated_recovery_supervisor_is_owned_and_replaces_a_terminated_task
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn cluster_without_checkpoint_config_still_derives_graph_identity() {
+    let controller = sink_open_authority(1);
+    let db = LaminarDB::builder()
+        .cluster_controller(controller)
+        .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+        .build()
+        .await
+        .unwrap();
+    assert!(db.config.checkpoint.is_none());
+
+    let identity = db
+        .initialize_checkpointing(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            RuntimeMode::Cluster,
+            db.cluster_checkpoint_object_store(),
+            StateBackendDurability::ClusterShared,
+        )
+        .await
+        .unwrap();
+
+    assert!(identity.is_some());
+    assert!(db.coordinator.lock().await.is_none());
+    db.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn coordinated_recovery_supervisor_rejects_local_runtime() {
     let db = LaminarDB::open().unwrap();
 
