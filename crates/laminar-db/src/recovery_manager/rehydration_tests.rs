@@ -745,18 +745,38 @@ async fn validated_reader_enforces_current_six_artifact_boundary() {
             .unwrap();
     assert_eq!(loaded.chains[&0].len(), production_limit);
 
+    let over_limit_attempt = CheckpointAttempt::canonical(107);
+    write_and_seal_partial(
+        &backend,
+        over_limit_attempt,
+        crate::vnode_partial::VnodePartial {
+            operators: Vec::new(),
+            base: Some(head_attempt),
+            deltas: vec![("agg".into(), b"delta-107".to_vec())],
+        },
+    )
+    .await;
+    let over_limit_inventory = backend
+        .checkpoint_seal_inventory(over_limit_attempt)
+        .await
+        .unwrap()
+        .unwrap();
+    let over_limit_head =
+        crate::checkpoint_coordinator::ValidatedVnodeRestoreHead::from_unchecked_inventory_for_test(
+            over_limit_inventory,
+        );
     let error = SealedVnodeChainReader::from_validated_head(
         &backend,
-        &head,
+        &over_limit_head,
         u64::MAX,
-        production_limit - 1,
+        production_limit,
     )
     .unwrap()
-    .load_at(&[0], head_attempt)
+    .load_at(&[0], over_limit_attempt)
     .await
     .expect_err("the artifact immediately beyond the production limit must fail closed");
     assert!(
-        error.to_string().contains("limit of 5 artifacts"),
+        error.to_string().contains("limit of 6 artifacts"),
         "{error}"
     );
 }
