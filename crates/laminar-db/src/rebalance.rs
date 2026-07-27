@@ -2820,6 +2820,26 @@ async fn await_drain_quorum(
     .is_ok()
 }
 
+fn assignment_binds_local_process(
+    snapshot: &AssignmentSnapshot,
+    controller: &ClusterController,
+) -> Result<bool, String> {
+    let fence = snapshot
+        .assignment_fence()
+        .map_err(|error| error.to_string())?;
+    let owners = snapshot
+        .to_vnode_vec(fence.vnode_count)
+        .map_err(|error| error.to_string())?;
+    let local = controller.instance_id().0;
+    let owns = owners.iter().any(|owner| owner.0 == local);
+    let bound = fence.participant_incarnation(local);
+    Ok(if owns {
+        bound == Some(controller.recovery_incarnation())
+    } else {
+        bound.is_none()
+    })
+}
+
 /// Settle a draining generation without changing the target version certified by source receipts.
 /// The terminal verdict first enters the shared leader/checkpoint authority sequence; the snapshot
 /// store then publishes that immutable verdict as the assignment materialization.
@@ -2905,20 +2925,27 @@ async fn finalize_drain_snapshot(
     }
 
     let version = durable.version;
-    let adoption_deadline = tokio::time::Instant::now() + config.checkpoint_timeout;
-    let adoption = db
-        .adopt_assignment_snapshot(durable, adoption_deadline)
-        .await
-        .map_err(|error| error.to_string())?;
-    log_adoption("rebalance-drain-finalize", &adoption);
-    if local_drain_participant(controller, transition).is_some() {
-        db.resolve_local_source_drain(
-            transition.id(),
-            source_outcome,
-            tokio::time::Instant::now() + config.drain_ack_timeout,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+    if assignment_binds_local_process(&durable, controller)? {
+        let adoption_deadline = tokio::time::Instant::now() + config.checkpoint_timeout;
+        let adoption = db
+            .adopt_assignment_snapshot(durable, adoption_deadline)
+            .await
+            .map_err(|error| error.to_string())?;
+        log_adoption("rebalance-drain-finalize", &adoption);
+        if local_drain_participant(controller, transition).is_some() {
+            db.resolve_local_source_drain(
+                transition.id(),
+                source_outcome,
+                tokio::time::Instant::now() + config.drain_ack_timeout,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+    } else {
+        warn!(
+            version,
+            "materialized drain terminal names a predecessor process; local adoption waits for a recovery successor"
+        );
     }
     controller.publish_checkpoint_drain_transition(None);
     let oldest_retained = version.saturating_sub(1);

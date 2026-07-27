@@ -2118,7 +2118,7 @@ async fn restart_after_durable_drain_retains_abort_until_recovery() {
     ));
     controller.publish_recovery_incarnation().await.unwrap();
     let _leader_lease = grant_test_leadership(&controller).await;
-    let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
+    let registry = Arc::new(VnodeRegistry::new_unassigned(1));
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
@@ -2128,9 +2128,7 @@ async fn restart_after_durable_drain_retains_abort_until_recovery() {
         .build()
         .await
         .unwrap();
-    db.validate_source_drain_snapshot(&drain).unwrap();
-
-    let error = try_rebalance(
+    let settled = try_rebalance(
         &db,
         &controller,
         &durable,
@@ -2139,14 +2137,14 @@ async fn restart_after_durable_drain_retains_abort_until_recovery() {
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("a skipped assignment generation must restore before local adoption");
-    assert!(error.contains("cannot acquire 1 vnodes"), "{error}");
+    .expect("the drain abort may settle without installing a predecessor process certificate");
+    assert_eq!(settled, Some(drain.version));
     let aborted = durable.load().await.unwrap().unwrap();
     assert!(!aborted.draining);
     assert_eq!(aborted.version, drain.version);
     assert_eq!(aborted.vnodes, committed_vnodes);
     assert_eq!(aborted.participants, vec![participant]);
-    assert_eq!(registry.assignment_version(), committed.version);
+    assert_eq!(registry.assignment_version(), 0);
     assert!(db.cluster_intake_fenced());
 }
 
@@ -2513,6 +2511,7 @@ async fn draining_head_with_dead_predecessor_owner_uses_retained_roster() {
 async fn replacement_process_aborts_drain_through_the_same_authority_sequence() {
     use laminar_core::cluster::control::{
         ClusterCheckpointAuthorityError, ClusterKv, InMemoryKv, LeaderLeaseOwner, LeaseOutcome,
+        ProcessLeaseAuthority, ProcessLeaseOutcome,
     };
     use laminar_core::cluster::discovery::NodeInfo;
     use uuid::Uuid;
@@ -2520,7 +2519,8 @@ async fn replacement_process_aborts_drain_through_the_same_authority_sequence() 
     let self_id = NodeId(1);
     let old_boot = Uuid::from_u128(11);
     let new_boot = Uuid::from_u128(111);
-    let authority = Arc::new(LeaderLeaseStore::new(Arc::new(InMemory::new()), 10));
+    let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&shared), 10));
     let old_owner = LeaderLeaseOwner {
         node: self_id,
         boot: old_boot,
@@ -2532,7 +2532,7 @@ async fn replacement_process_aborts_drain_through_the_same_authority_sequence() 
     };
     let old_proof = old_lease.proof();
 
-    let durable = Arc::new(store());
+    let durable = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&shared)));
     let committed = AssignmentSnapshot::empty()
         .next_for_participants(
             BTreeMap::from([(0, self_id)]),
@@ -2587,13 +2587,43 @@ async fn replacement_process_aborts_drain_through_the_same_authority_sequence() 
         new_boot,
     ));
     controller.publish_recovery_incarnation().await.unwrap();
+    let process_authority = Arc::new(
+        ProcessLeaseAuthority::new(Arc::clone(&shared), Duration::from_millis(10)).unwrap(),
+    );
+    let process_store = process_authority.store_for(self_id);
+    let ProcessLeaseOutcome::Acquired(old_process_lease) =
+        process_store.try_acquire(old_boot, 0).await.unwrap()
+    else {
+        panic!("empty process authority must grant the predecessor process");
+    };
+    let process_observation = process_store.observe_rival(&old_process_lease).unwrap();
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    let ProcessLeaseOutcome::Acquired(new_process_lease) = process_store
+        .try_takeover(new_boot, &process_observation, 20)
+        .await
+        .unwrap()
+    else {
+        panic!("replacement process must take over the predecessor process lease");
+    };
+    controller
+        .set_process_lease_authority(process_authority)
+        .unwrap();
+    controller
+        .set_process_lease_deadline(Arc::new(
+            laminar_core::cluster::control::LeaseDeadline::live_for(Duration::from_secs(60)),
+        ))
+        .unwrap();
+    controller
+        .publish_leased_recovery_incarnation(&new_process_lease)
+        .await
+        .unwrap();
     let _lease_watch = install_test_leadership(
         &controller,
         Arc::clone(&authority),
         new_owner,
         takeover.clone(),
     );
-    let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
+    let registry = Arc::new(VnodeRegistry::new_unassigned(1));
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
@@ -2604,7 +2634,7 @@ async fn replacement_process_aborts_drain_through_the_same_authority_sequence() 
         .await
         .unwrap();
 
-    let error = try_rebalance(
+    let settled = try_rebalance(
         &db,
         &controller,
         &durable,
@@ -2613,8 +2643,8 @@ async fn replacement_process_aborts_drain_through_the_same_authority_sequence() 
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("replacement must restore before adopting the predecessor rollback");
-    assert!(error.contains("cannot acquire 1 vnodes"), "{error}");
+    .expect("the replacement may settle the drain without inheriting predecessor authority");
+    assert_eq!(settled, Some(draining.version));
     let materialized = durable.load().await.unwrap().unwrap();
     assert!(!materialized.draining);
     assert_eq!(materialized.version, draining.version);
@@ -2626,6 +2656,31 @@ async fn replacement_process_aborts_drain_through_the_same_authority_sequence() 
         .unwrap();
     assert_eq!(winner.verdict, AssignmentDrainVerdict::Abort);
     assert_eq!(winner.leader_proof, takeover.proof());
+    assert_eq!(registry.assignment_version(), 0);
+    assert!(db.cluster_intake_fenced());
+
+    let error = try_rebalance(
+        &db,
+        &controller,
+        &durable,
+        &registry,
+        &[self_id],
+        RebalanceConfig::test_defaults(),
+    )
+    .await
+    .expect_err("the recovery successor must restore before boot adoption");
+    assert!(error.contains("cannot acquire 1 vnodes"), "{error}");
+    let recovered = durable.load().await.unwrap().unwrap();
+    assert_eq!(recovered.version, draining.version + 1);
+    assert_eq!(recovered.vnodes, committed.vnodes);
+    assert_eq!(
+        recovered.participants,
+        vec![CheckpointParticipant {
+            node_id: self_id.0,
+            boot_incarnation: new_boot,
+        }]
+    );
+    assert_eq!(registry.assignment_version(), 0);
 
     let stale = AssignmentDrainDecision::new(
         draining.drain_transition.as_ref().unwrap(),
