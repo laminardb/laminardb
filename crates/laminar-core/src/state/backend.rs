@@ -363,6 +363,35 @@ pub struct CheckpointSealInventory {
 }
 
 impl CheckpointSealInventory {
+    /// Validate the canonical vnode artifact inventory and every writer/content attestation.
+    ///
+    /// This is the recovery-side validation boundary for inventories returned by custom backend
+    /// implementations. It deliberately excludes commit descriptors, whose authority is checked
+    /// independently by [`Self::descriptor_leader_proof`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attempt, assignment certificate, vnode roster, or any per-vnode
+    /// provenance/content attestation is noncanonical.
+    pub fn validate_vnode_partials(&self) -> Result<(), String> {
+        validate_vnode_seal_inventory(
+            self.attempt,
+            self.assignment_fence.as_ref(),
+            self.assignment_version,
+            &self.required_vnodes,
+            &self.sealed_partials,
+        )
+    }
+
+    /// Find the exact attestation for `vnode` in a validated canonical inventory.
+    #[must_use]
+    pub fn sealed_vnode_partial(&self, vnode: u32) -> Option<&SealedVnodePartial> {
+        self.sealed_partials
+            .binary_search_by_key(&vnode, |partial| partial.vnode)
+            .ok()
+            .map(|index| &self.sealed_partials[index])
+    }
+
     /// Attestation for one exact descriptor key.
     #[must_use]
     pub fn sealed_descriptor(&self, key: &str) -> Option<&SealedCommitDescriptor> {
@@ -445,6 +474,64 @@ impl CheckpointSealInventory {
     }
 }
 
+fn validate_vnode_seal_inventory(
+    attempt: CheckpointAttempt,
+    assignment_fence: Option<&CheckpointAssignmentFence>,
+    assignment_version: u64,
+    required_vnodes: &[u32],
+    sealed_partials: &[SealedVnodePartial],
+) -> Result<(), String> {
+    if !attempt.is_canonical() {
+        return Err(
+            "checkpoint seal inventory must use one nonzero canonical checkpoint ID".into(),
+        );
+    }
+    if assignment_fence.is_some_and(|fence| !fence.is_canonical()) {
+        return Err("checkpoint seal inventory has a non-canonical assignment certificate".into());
+    }
+    if assignment_fence.is_some_and(|fence| fence.assignment_version != assignment_version) {
+        return Err(
+            "checkpoint seal inventory assignment version does not match its certificate".into(),
+        );
+    }
+
+    if required_vnodes.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err("checkpoint seal inventory vnode roster is not canonical".into());
+    }
+    if sealed_partials.len() != required_vnodes.len()
+        || sealed_partials
+            .iter()
+            .zip(required_vnodes)
+            .any(|(partial, required)| partial.vnode != *required)
+    {
+        return Err("checkpoint seal partial attestations do not exactly cover its vnodes".into());
+    }
+    for partial in sealed_partials {
+        let valid_digest = partial.payload_sha256.len() == 64
+            && partial
+                .payload_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if partial.assignment_version != assignment_version || !valid_digest {
+            return Err(format!(
+                "checkpoint seal has invalid provenance for vnode {}",
+                partial.vnode
+            ));
+        }
+        match (assignment_fence, &partial.writer) {
+            (Some(fence), Some(writer)) if writer.matches_fence(fence) => {}
+            (None, None) => {}
+            _ => {
+                return Err(format!(
+                    "checkpoint seal has invalid writer certificate for vnode {}",
+                    partial.vnode
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Structured body of an exact-attempt state seal.
 ///
 /// This remains crate-private because callers consume only the canonical
@@ -522,66 +609,13 @@ impl CheckpointSeal {
         if self.instance_id.is_empty() || self.execution_id.is_nil() {
             return Err("checkpoint seal has an empty writer identity".into());
         }
-        if !self.attempt.is_canonical() {
-            return Err("checkpoint seal must use one nonzero canonical checkpoint ID".into());
-        }
-        if self
-            .assignment_fence
-            .as_ref()
-            .is_some_and(|fence| !fence.is_canonical())
-        {
-            return Err("checkpoint seal has a non-canonical assignment certificate".into());
-        }
-        if self
-            .assignment_fence
-            .as_ref()
-            .is_some_and(|fence| fence.assignment_version != self.assignment_version)
-        {
-            return Err("checkpoint seal assignment version does not match its certificate".into());
-        }
-
-        let mut canonical_vnodes = self.required_vnodes.clone();
-        canonical_vnodes.sort_unstable();
-        canonical_vnodes.dedup();
-        if canonical_vnodes != self.required_vnodes {
-            return Err("checkpoint seal vnode inventory is not canonical".into());
-        }
-        let partial_vnodes: Vec<u32> = self
-            .sealed_partials
-            .iter()
-            .map(|partial| partial.vnode)
-            .collect();
-        if partial_vnodes != canonical_vnodes {
-            return Err(
-                "checkpoint seal partial attestations do not exactly cover its vnodes".into(),
-            );
-        }
-        for partial in &self.sealed_partials {
-            let valid_digest = |digest: &str| {
-                digest.len() == 64
-                    && digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            };
-            if partial.assignment_version != self.assignment_version
-                || !valid_digest(&partial.payload_sha256)
-            {
-                return Err(format!(
-                    "checkpoint seal has invalid provenance for vnode {}",
-                    partial.vnode
-                ));
-            }
-            match (&self.assignment_fence, &partial.writer) {
-                (Some(fence), Some(writer)) if writer.matches_fence(fence) => {}
-                (None, None) => {}
-                _ => {
-                    return Err(format!(
-                        "checkpoint seal has invalid writer certificate for vnode {}",
-                        partial.vnode
-                    ));
-                }
-            }
-        }
+        validate_vnode_seal_inventory(
+            self.attempt,
+            self.assignment_fence.as_ref(),
+            self.assignment_version,
+            &self.required_vnodes,
+            &self.sealed_partials,
+        )?;
 
         let mut canonical_descriptors = self.required_descriptors.clone();
         canonical_descriptors.sort_unstable();
@@ -801,6 +835,8 @@ pub trait StateBackend: Send + Sync + 'static {
     /// payload. Durable implementations must reject an impossible or oversized object from
     /// metadata before loading its body. The default fails closed because [`Self::read_partial`]
     /// cannot prove that a self-consistent replacement still belongs to the sealed recovery cut.
+    /// The caller must obtain `sealed` from an inventory already validated against recovery
+    /// authority; this storage operation proves a matching artifact, not the authority itself.
     async fn read_sealed_partial_bounded(
         &self,
         attempt: CheckpointAttempt,
@@ -809,7 +845,7 @@ pub trait StateBackend: Send + Sync + 'static {
     ) -> Result<Option<Bytes>, StateBackendError> {
         Err(StateBackendError::Conflict {
             resource: format!(
-                "state-v2/epoch={}/checkpoint={}/vnode={}/partial.bin",
+                "checkpoint epoch {} attempt {} vnode {} partial",
                 attempt.epoch, attempt.checkpoint_id, sealed.vnode
             ),
             message: format!(

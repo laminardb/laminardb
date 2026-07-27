@@ -2559,7 +2559,7 @@ impl LaminarDB {
                 )));
             }
         }
-        let mut rehydration = if let Some(handoff) = source_handoff
+        let mut loaded_chains = if let Some(handoff) = source_handoff
             .as_ref()
             .filter(|_| !newly_acquired.is_empty())
         {
@@ -2573,15 +2573,15 @@ impl LaminarDB {
                 handoff.outcome.checkpoint_id,
             );
             let max_partial_bytes = self.checkpoint_state_artifact_cap_bytes()?;
-            crate::recovery_manager::VnodeRehydrator::from_validated_head(
+            crate::recovery_manager::vnode_chains::SealedVnodeChainReader::from_validated_head(
                 backend.as_ref(),
                 &handoff.vnode_restore_head,
                 max_partial_bytes,
             )?
-            .rehydrate_at(&newly_acquired, attempt)
+            .load_at(&newly_acquired, attempt)
             .await?
         } else {
-            crate::recovery_manager::VnodeRehydration::default()
+            crate::recovery_manager::vnode_chains::LoadedVnodeChains::default()
         };
 
         let observed_outcome = if let Some(reader) = handoff_reader.as_ref() {
@@ -2713,12 +2713,12 @@ impl LaminarDB {
         } else {
             Some(StagedVnodeRevocation::target_scoped(revoked)?)
         };
-        let rehydration_attempt = rehydration.attempt;
+        let rehydration_attempt = loaded_chains.attempt;
         let adoption = SnapshotAdoption {
             adopted: true,
             version: snapshot.version,
             newly_acquired: newly_acquired.clone(),
-            rehydrated: rehydration.restored.len(),
+            rehydrated: loaded_chains.chain_count(),
             rehydration_epoch: rehydration_attempt.map(|attempt| attempt.epoch),
         };
 
@@ -2747,7 +2747,7 @@ impl LaminarDB {
                     *vnode,
                     RehydratedVnode {
                         attempt,
-                        chain: rehydration.restored.remove(vnode).unwrap_or_default(),
+                        chain: loaded_chains.chains.remove(vnode).unwrap_or_default(),
                     },
                 );
             }

@@ -1217,7 +1217,7 @@ impl LaminarDB {
         target_assignment: &laminar_core::state::VnodeAssignmentSnapshot,
         owned: &[u32],
         attempt: laminar_core::state::CheckpointAttempt,
-        report: crate::recovery_manager::VnodeRehydration,
+        loaded: crate::recovery_manager::vnode_chains::LoadedVnodeChains,
     ) -> Result<(), DbError> {
         // Pin the registry publication through staging. The startup assignment lock prevents a
         // competing adopter from beginning, while this read guard also makes the helper itself
@@ -1233,14 +1233,14 @@ impl LaminarDB {
                 current_assignment.version()
             )));
         }
-        if report.attempt != Some(attempt) {
+        if loaded.attempt != Some(attempt) {
             return Err(DbError::Checkpoint(format!(
                 "[LDB-6031] boot vnode recovery report {:?} does not match recovered attempt \
                  {attempt:?}",
-                report.attempt
+                loaded.attempt
             )));
         }
-        let mut restored_vnodes: Vec<u32> = report.restored.keys().copied().collect();
+        let mut restored_vnodes: Vec<u32> = loaded.chains.keys().copied().collect();
         restored_vnodes.sort_unstable();
         if restored_vnodes != owned {
             return Err(DbError::Checkpoint(format!(
@@ -1251,7 +1251,7 @@ impl LaminarDB {
 
         let mut staged = self.rehydrated_vnode_state.lock();
         registry.mark_restoring(owned);
-        for (vnode, chain) in report.restored {
+        for (vnode, chain) in loaded.chains {
             staged.insert(vnode, crate::db::RehydratedVnode { attempt, chain });
         }
         Ok(())
@@ -1311,14 +1311,15 @@ impl LaminarDB {
             ));
         };
         let max_partial_bytes = self.checkpoint_state_artifact_cap_bytes()?;
-        let report = crate::recovery_manager::VnodeRehydrator::from_validated_head(
-            backend.as_ref(),
-            restore_head,
-            max_partial_bytes,
-        )?
-        .rehydrate_at(&owned, attempt)
-        .await?;
-        self.stage_boot_vnode_rehydration(&registry, &target_assignment, &owned, attempt, report)?;
+        let loaded =
+            crate::recovery_manager::vnode_chains::SealedVnodeChainReader::from_validated_head(
+                backend.as_ref(),
+                restore_head,
+                max_partial_bytes,
+            )?
+            .load_at(&owned, attempt)
+            .await?;
+        self.stage_boot_vnode_rehydration(&registry, &target_assignment, &owned, attempt, loaded)?;
         tracing::info!(
             staged = owned.len(),
             epoch = attempt.epoch,

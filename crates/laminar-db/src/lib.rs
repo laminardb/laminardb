@@ -167,7 +167,7 @@ pub use handle::{
 pub use laminar_connectors::connector::DeliveryGuarantee;
 pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use profile::{Profile, ProfileError};
-pub use recovery_manager::{RecoveredState, RecoveryManager, VnodeRehydration, VnodeRehydrator};
+pub use recovery_manager::{RecoveredState, RecoveryManager};
 
 /// Rebalance-driven state-rehydration types (cluster mode).
 #[cfg(feature = "cluster")]

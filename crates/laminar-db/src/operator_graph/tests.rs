@@ -498,6 +498,23 @@ fn encoded_vnode_partial(partial: &crate::vnode_partial::VnodePartial) -> bytes:
 }
 
 #[cfg(feature = "cluster")]
+fn sealed_test_parent(
+    attempt: laminar_core::state::CheckpointAttempt,
+) -> crate::vnode_partial::SealedVnodeParentLink {
+    crate::vnode_partial::SealedVnodeParentLink::new(
+        attempt,
+        &laminar_core::state::SealedVnodePartial {
+            vnode: 0,
+            assignment_version: 0,
+            writer: None,
+            payload_len: 0,
+            payload_sha256: "00".repeat(32),
+        },
+    )
+    .expect("valid test parent attestation")
+}
+
+#[cfg(feature = "cluster")]
 type TestVnodeRevokeHandle = Arc<parking_lot::Mutex<Option<crate::db::StagedVnodeRevocation>>>;
 
 #[cfg(feature = "cluster")]
@@ -3646,7 +3663,9 @@ async fn execution_assignment_is_not_published_when_transport_scope_is_stale() {
 async fn rehydration_delta_without_full_base_is_rejected_before_callbacks() {
     let partial = crate::vnode_partial::VnodePartial {
         operators: Vec::new(),
-        base: Some(laminar_core::state::CheckpointAttempt::new(1, 1)),
+        base: Some(sealed_test_parent(
+            laminar_core::state::CheckpointAttempt::new(1, 1),
+        )),
         deltas: vec![("agg".to_string(), vec![1])],
     };
     let VnodeTransitionHarness {

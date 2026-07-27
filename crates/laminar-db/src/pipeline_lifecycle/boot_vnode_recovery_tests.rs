@@ -12,7 +12,7 @@ use laminar_core::cluster::discovery::{NodeId as ClusterNodeId, NodeInfo};
 use laminar_core::state::{CheckpointAttempt, InProcessBackend, NodeId, VnodeRegistry};
 
 use crate::db::LaminarDB;
-use crate::recovery_manager::VnodeRehydration;
+use crate::recovery_manager::vnode_chains::LoadedVnodeChains;
 
 fn digest(byte: u8) -> String {
     format!("{byte:02x}").repeat(32)
@@ -84,9 +84,9 @@ async fn boot_report_marks_and_stages_the_exact_owned_roster() {
     let registry = Arc::new(VnodeRegistry::single_owner(2, NodeId(1)));
     let db = boot_test_db(Arc::clone(&registry)).await;
     let attempt = CheckpointAttempt::canonical(7);
-    let report = VnodeRehydration {
+    let report = LoadedVnodeChains {
         attempt: Some(attempt),
-        restored: HashMap::from([
+        chains: HashMap::from([
             (1, vec![Bytes::from_static(b"vnode-1")]),
             (0, vec![Bytes::from_static(b"vnode-0")]),
         ]),
@@ -110,9 +110,9 @@ async fn invalid_boot_report_changes_neither_staging_nor_lifecycle() {
     let registry = Arc::new(VnodeRegistry::single_owner(2, NodeId(1)));
     let db = boot_test_db(Arc::clone(&registry)).await;
     let attempt = CheckpointAttempt::canonical(7);
-    let report = VnodeRehydration {
+    let report = LoadedVnodeChains {
         attempt: Some(attempt),
-        restored: HashMap::from([(0, vec![Bytes::from_static(b"vnode-0")])]),
+        chains: HashMap::from([(0, vec![Bytes::from_static(b"vnode-0")])]),
     };
     let target_assignment = registry.versioned_snapshot();
 
@@ -132,9 +132,9 @@ async fn changed_boot_assignment_rejects_report_without_mutation() {
     let target_assignment = registry.versioned_snapshot();
     registry.set_assignment_and_version(vec![NodeId(2), NodeId(2)].into(), 2);
     let attempt = CheckpointAttempt::canonical(7);
-    let report = VnodeRehydration {
+    let report = LoadedVnodeChains {
         attempt: Some(attempt),
-        restored: HashMap::from([
+        chains: HashMap::from([
             (0, vec![Bytes::from_static(b"vnode-0")]),
             (1, vec![Bytes::from_static(b"vnode-1")]),
         ]),
@@ -155,9 +155,9 @@ async fn wrong_boot_attempt_rejects_report_without_mutation() {
     let db = boot_test_db(Arc::clone(&registry)).await;
     let target_assignment = registry.versioned_snapshot();
     let attempt = CheckpointAttempt::canonical(7);
-    let report = VnodeRehydration {
+    let report = LoadedVnodeChains {
         attempt: Some(CheckpointAttempt::canonical(8)),
-        restored: HashMap::from([
+        chains: HashMap::from([
             (0, vec![Bytes::from_static(b"vnode-0")]),
             (1, vec![Bytes::from_static(b"vnode-1")]),
         ]),

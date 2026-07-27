@@ -625,14 +625,17 @@ impl OperatorGraph {
                     .iter()
                     .map(|(node_idx, name)| {
                         let (base, deltas) =
-                            crate::recovery_manager::resolve_op_chain(&vnode.chain, name)
-                                .ok_or_else(|| {
-                                    DbError::Checkpoint(format!(
-                                        "[LDB-6051] vnode {} rehydration chain has no FULL base \
+                            crate::recovery_manager::vnode_chains::resolve_op_chain(
+                                &vnode.chain,
+                                name,
+                            )
+                            .ok_or_else(|| {
+                                DbError::Checkpoint(format!(
+                                    "[LDB-6051] vnode {} rehydration chain has no FULL base \
                                          for operator '{name}'",
-                                        vnode.vnode
-                                    ))
-                                })?;
+                                    vnode.vnode
+                                ))
+                            })?;
                         Ok(ResolvedOperator {
                             node_idx: *node_idx,
                             name,
