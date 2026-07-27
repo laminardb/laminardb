@@ -1407,3 +1407,34 @@ fn fake_protocol_cancel_frame_interrupts_a_stalled_probe() {
     assert_eq!(connection_counts, [1, 0, 0]);
     drop(stdin);
 }
+
+#[test]
+fn fake_protocol_supervisor_eof_interrupts_a_stalled_probe() {
+    let fixture = Fixture::new();
+    let servers = [
+        OwnedFakeServer::stall(),
+        OwnedFakeServer::success(2),
+        OwnedFakeServer::success(3),
+    ];
+    let addresses = std::array::from_fn(|index| servers[index].address);
+    let BootstrappedFakeProtocol {
+        child,
+        supervisor: stdin,
+        plan_bytes: _,
+        sanitized_plan_sha256: _,
+        invocation_id: _,
+    } = spawn_bootstrapped_fake_protocol(&fixture, "D", addresses);
+    wait_for_connections(&servers[0], 1, CANCELLATION_BOUND);
+    drop(stdin);
+
+    let output = wait_for_child(child, CANCELLATION_BOUND);
+    assert_observer_output_redacted(&output);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("Cancelled"));
+    let connection_counts: [usize; 3] =
+        std::array::from_fn(|index| servers[index].connection_count());
+    assert_eq!(connection_counts, [1, 0, 0]);
+}

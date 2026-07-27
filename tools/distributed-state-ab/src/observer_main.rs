@@ -208,7 +208,6 @@ fn spawn_cancellation_listener(cancellation: ProtocolCancellation) -> Result<(),
             let mut observed = 0_usize;
             while observed < control.len() {
                 match reader.read(&mut control[observed..]) {
-                    Ok(0) if observed == 0 => return,
                     Ok(0) => {
                         cancellation.cancel();
                         return;

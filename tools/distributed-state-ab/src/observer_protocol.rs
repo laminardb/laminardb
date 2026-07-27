@@ -217,8 +217,7 @@ fn validate_sanitized_plan(
     let mut addresses = std::collections::BTreeSet::new();
     for (index, endpoint) in plan.endpoints.iter().enumerate() {
         if endpoint.node_ordinal != plan.observer_schedule.node_ordinals[index]
-            || endpoint.address.port() == 0
-            || !endpoint.address.ip().is_loopback()
+            || !is_canonical_loopback_endpoint(endpoint.address)
             || !addresses.insert(endpoint.address)
         {
             return Err(invalid());
@@ -441,10 +440,18 @@ fn valid_driver_endpoint_input(input: &DriverFakeEndpointInputV1) -> bool {
     let mut addresses = BTreeSet::new();
     input.endpoints.iter().enumerate().all(|(index, endpoint)| {
         endpoint.node_ordinal == index as u8
-            && endpoint.address.port() != 0
-            && endpoint.address.ip().is_loopback()
+            && is_canonical_loopback_endpoint(endpoint.address)
             && addresses.insert(endpoint.address)
     })
+}
+
+fn is_canonical_loopback_endpoint(address: SocketAddr) -> bool {
+    address.port() != 0
+        && address.ip().is_loopback()
+        && match address {
+            SocketAddr::V4(_) => true,
+            SocketAddr::V6(address) => address.flowinfo() == 0 && address.scope_id() == 0,
+        }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3778,11 +3785,30 @@ mod tests {
         candidate.endpoints[0].address = "192.0.2.1:4317".parse().unwrap();
         invalid_plans.push(candidate);
         let mut candidate = plan.plan().clone();
+        candidate.endpoints[0].address = SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::LOCALHOST,
+            4317,
+            0,
+            1,
+        ));
+        invalid_plans.push(candidate);
+        let mut candidate = plan.plan().clone();
         candidate.endpoints[1].address = candidate.endpoints[0].address;
         invalid_plans.push(candidate);
         for candidate in invalid_plans {
             reject(raw_frame(&candidate));
         }
+        let mut noncanonical_flow = plan.plan().clone();
+        noncanonical_flow.endpoints[0].address = SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::LOCALHOST,
+            4317,
+            1,
+            0,
+        ));
+        assert_eq!(
+            validate_sanitized_plan(noncanonical_flow).unwrap_err().kind,
+            ProtocolFailureKind::InvalidPlan
+        );
 
         let duplicate_nodes = [success_server(1), success_server(1), success_server(3)];
         let error = run_with_servers(
@@ -3907,8 +3933,16 @@ mod tests {
         let mut candidate = valid_input.clone();
         candidate.endpoints[1].address = candidate.endpoints[0].address;
         invalid_inputs.push(candidate);
-        let mut candidate = valid_input;
+        let mut candidate = valid_input.clone();
         candidate.endpoints[0].address = "192.0.2.1:31001".parse().unwrap();
+        invalid_inputs.push(candidate);
+        let mut candidate = valid_input.clone();
+        candidate.endpoints[0].address = SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::LOCALHOST,
+            31001,
+            0,
+            1,
+        ));
         invalid_inputs.push(candidate);
         for candidate in invalid_inputs {
             reject(raw_frame(&candidate));
@@ -3932,6 +3966,22 @@ mod tests {
             &secret()
         )
         .is_err());
+        let mut noncanonical_flow = addresses;
+        noncanonical_flow[0] = SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::LOCALHOST,
+            31001,
+            1,
+            0,
+        ));
+        assert!(write_driver_fake_input(Vec::new(), noncanonical_flow, &secret()).is_err());
+        let mut noncanonical_scope = addresses;
+        noncanonical_scope[0] = SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::LOCALHOST,
+            31001,
+            0,
+            1,
+        ));
+        assert!(write_driver_fake_input(Vec::new(), noncanonical_scope, &secret()).is_err());
         assert!(write_driver_fake_input(
             Vec::new(),
             [
