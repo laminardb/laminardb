@@ -83,7 +83,7 @@ driver/observer schedule scaffold. Its Windows matrix proves byte-identical comm
 across C/D and observer success, exit, hang, and malformed output, with bounded capture and process
 cleanup. The driver only materializes a static schedule and D only emits planned probes: no SUT,
 HTTP, workload, fault, latency, A/B, backend, or soak was executed.
-Cycle 63 then audits the current HTTP/reload boundary and selects a server-enforced, disjoint,
+[Cycle 63](../reviews/distributed-keyed-state-cycle-63.md) then audits the current HTTP/reload boundary and selects a server-enforced, disjoint,
 startup-bound, loopback-only diagnostic credential instead of a console-bearer broker. It is a
 design decision only: no credential, router split, observer, HTTP request, or empirical result has
 landed.
