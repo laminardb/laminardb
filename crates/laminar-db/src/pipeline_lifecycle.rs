@@ -48,6 +48,8 @@ const EXACT_SINK_PROTOCOL: &str =
 const CLUSTER_BEST_EFFORT: &str =
     "cluster mode requires at_least_once delivery; best_effort has no defined \
      rebalance/state-loss contract";
+#[cfg(feature = "cluster")]
+const CLUSTER_COMPUTE_THREAD_STACK_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PipelineLifecycleAuthority {
@@ -1148,7 +1150,7 @@ fn publish_runtime_fault_state(state: &std::sync::atomic::AtomicU8) -> bool {
 impl LaminarDB {
     #[cfg(feature = "cluster")]
     fn reset_staged_vnode_transition_for_startup(&self) {
-        self.pending_revoke_vnodes.lock().clear();
+        self.staged_vnode_revocation.lock().take();
         self.rehydrated_vnode_state.lock().clear();
         if let Some(registry) = self.vnode_registry.lock().as_ref() {
             registry.mark_active(&registry.restoring_vnodes());
@@ -3112,7 +3114,7 @@ impl LaminarDB {
                     self_id,
                 });
                 graph.set_rehydration_handle(Arc::clone(&self.rehydrated_vnode_state));
-                graph.set_revoke_handle(Arc::clone(&self.pending_revoke_vnodes));
+                graph.set_vnode_revocation_handle(Arc::clone(&self.staged_vnode_revocation));
                 graph.set_rotation_execution_fence(Arc::clone(&self.rotation_execution_fence));
                 // With a durable backend, per-vnode partials are the authoritative agg checkpoint;
                 // the whole-node manifest copy is one node's slices and traps boot recovery.
@@ -4725,8 +4727,17 @@ impl LaminarDB {
         let compute_fault_pending = Arc::clone(&self.pending_recovery_fault);
         #[cfg(feature = "cluster")]
         let compute_fault_runtime_shutdown = runtime_shutdown.clone();
-        match std::thread::Builder::new()
-            .name("laminar-compute".into())
+        let compute_thread = std::thread::Builder::new().name("laminar-compute".into());
+        #[cfg(feature = "cluster")]
+        let compute_thread = if runtime_mode == RuntimeMode::Cluster {
+            // Windows' default thread stack is too small for the clustered graph/control
+            // lifecycle. Keep this explicit and bounded: there is one compute thread per running
+            // pipeline, and the cluster I/O workers use the same 4 MiB policy.
+            compute_thread.stack_size(CLUSTER_COMPUTE_THREAD_STACK_BYTES)
+        } else {
+            compute_thread
+        };
+        match compute_thread
             .spawn(move || {
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -4827,7 +4838,8 @@ impl LaminarDB {
                     }
                 };
                 done_tx.send(exit);
-            }) {
+            })
+        {
             Ok(_) => {}
             Err(e) => {
                 return Err(DbError::Config(format!(

@@ -15,6 +15,7 @@ use crate::vnode_partial::VnodePartial;
 #[allow(clippy::disallowed_types)] // shares the DB's std-HashMap-typed staging handle
 type StagedVnodeStateHandle =
     Arc<parking_lot::Mutex<std::collections::HashMap<u32, RehydratedVnode>>>;
+type StagedVnodeRevokeHandle = Arc<parking_lot::Mutex<Option<crate::db::StagedVnodeRevocation>>>;
 
 struct VnodeTransitionAuthoritySnapshot {
     registry: Arc<laminar_core::state::VnodeRegistry>,
@@ -112,14 +113,146 @@ impl VnodeTransitionAuthoritySnapshot {
     }
 }
 
+struct FinalOwnerExitAuthoritySnapshot {
+    registry: Arc<laminar_core::state::VnodeRegistry>,
+    self_id: laminar_core::state::NodeId,
+    assignment: laminar_core::state::VnodeAssignmentSnapshot,
+    sender: Arc<laminar_core::shuffle::ShuffleSender>,
+    receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
+}
+
+impl FinalOwnerExitAuthoritySnapshot {
+    fn capture(
+        config: &ClusterShuffleConfig,
+        transition: &laminar_core::checkpoint::AssignmentDrainTransition,
+        revoked: &FxHashSet<u32>,
+    ) -> Result<Self, DbError> {
+        let assignment = config.registry.versioned_snapshot();
+        let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
+        if !transition.is_canonical()
+            || transition.target.assignment_version != assignment.version()
+            || transition.target.vnode_count != config.registry.vnode_count()
+            || !transition.target.matches_owner_map(&owners)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6051] final-owner-exit authority does not match target assignment {}",
+                assignment.version()
+            )));
+        }
+        if transition.target.contains(config.self_id.0) {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6051] final-owner-exit target still certifies local node {}",
+                config.self_id.0
+            )));
+        }
+        let predecessor_incarnation = transition
+            .predecessor
+            .participant_incarnation(config.self_id.0)
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6051] final-owner-exit predecessor does not certify local node {}",
+                    config.self_id.0
+                ))
+            })?;
+        if config.sender.local_id() != config.self_id.0
+            || config.receiver.local_id() != config.self_id.0
+            || config.sender.incarnation() != predecessor_incarnation
+            || config.receiver.incarnation() != predecessor_incarnation
+        {
+            return Err(DbError::Checkpoint(
+                "[LDB-6051] final-owner-exit predecessor process identity does not match the \
+                 local shuffle endpoints"
+                    .into(),
+            ));
+        }
+        if config.sender.assignment_version() != 0
+            || config.receiver.assignment_version() != 0
+            || config.sender.active_assignment_digest().is_some()
+            || config.receiver.active_assignment_digest().is_some()
+        {
+            return Err(DbError::Checkpoint(
+                "[LDB-6051] final-owner-exit cleanup requires inactive shuffle endpoints".into(),
+            ));
+        }
+        if revoked.is_empty()
+            || revoked.iter().any(|vnode| {
+                assignment
+                    .owners()
+                    .get(*vnode as usize)
+                    .is_none_or(|owner| *owner == config.self_id)
+            })
+        {
+            return Err(DbError::Checkpoint(
+                "[LDB-6051] final-owner-exit revoke roster is empty, out of range, or still \
+                 target-owned"
+                    .into(),
+            ));
+        }
+        Ok(Self {
+            registry: Arc::clone(&config.registry),
+            self_id: config.self_id,
+            assignment,
+            sender: Arc::clone(&config.sender),
+            receiver: Arc::clone(&config.receiver),
+        })
+    }
+
+    fn revalidate_after_callbacks(&self) -> Result<(), DbError> {
+        if self.sender.assignment_version() != 0
+            || self.receiver.assignment_version() != 0
+            || self.sender.active_assignment_digest().is_some()
+            || self.receiver.active_assignment_digest().is_some()
+        {
+            return Err(DbError::StatefulOperatorPartialApply(
+                "[LDB-6051] shuffle authority became active during final-owner-exit callbacks; \
+                 recovery is required"
+                    .into(),
+            ));
+        }
+        let current = self.registry.versioned_snapshot();
+        if current.version() != self.assignment.version()
+            || current.owners() != self.assignment.owners()
+        {
+            return Err(DbError::StatefulOperatorPartialApply(format!(
+                "[LDB-6051] vnode assignment changed from {} during final-owner-exit callbacks; \
+                 recovery is required",
+                self.assignment.version()
+            )));
+        }
+        if current.owners().contains(&self.self_id) {
+            return Err(DbError::StatefulOperatorPartialApply(
+                "[LDB-6051] final-owner-exit target acquired local ownership during callbacks; \
+                 recovery is required"
+                    .into(),
+            ));
+        }
+        if self.registry.any_restoring() {
+            return Err(DbError::StatefulOperatorPartialApply(
+                "[LDB-6051] vnode restore lifecycle appeared during final-owner-exit callbacks; \
+                 recovery is required"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 struct StagedVnodeTransition {
     authority: VnodeTransitionAuthoritySnapshot,
-    revoke_handle: Option<Arc<parking_lot::Mutex<FxHashSet<u32>>>>,
+    revoke_handle: Option<StagedVnodeRevokeHandle>,
     rehydration_handle: Option<StagedVnodeStateHandle>,
     revoked: FxHashSet<u32>,
     staged: Vec<(u32, RehydratedVnode)>,
     staged_vnodes: Vec<u32>,
     expected_vnodes: Vec<u32>,
+}
+
+struct StagedFinalOwnerExit {
+    authority: FinalOwnerExitAuthoritySnapshot,
+    revoke_handle: StagedVnodeRevokeHandle,
+    rehydration_handle: StagedVnodeStateHandle,
+    transition: laminar_core::checkpoint::AssignmentDrainTransition,
+    revoked: FxHashSet<u32>,
 }
 
 struct DecodedVnode {
@@ -159,20 +292,29 @@ fn callback_error(poisoned: &AtomicBool, phase: &str, error: DbError) -> DbError
 }
 
 impl OperatorGraph {
+    pub(super) fn has_staged_final_owner_exit(&self) -> bool {
+        self.staged_vnode_revocation.as_ref().is_some_and(|handle| {
+            handle
+                .lock()
+                .as_ref()
+                .is_some_and(|staged| staged.committed_transition().is_some())
+        })
+    }
+
     pub(super) fn has_staged_vnode_transition(&self) -> bool {
         // Assignment adoption holds these in the same order while staging both halves of the
         // transition. Taking both here prevents a checkpoint sample from observing an impossible
         // mixed staging point.
         match (
-            self.pending_revoke_vnodes.as_ref(),
+            self.staged_vnode_revocation.as_ref(),
             self.rehydrated_vnode_state.as_ref(),
         ) {
             (Some(revoked), Some(rehydrated)) => {
                 let revoked = revoked.lock();
                 let rehydrated = rehydrated.lock();
-                !revoked.is_empty() || !rehydrated.is_empty()
+                revoked.is_some() || !rehydrated.is_empty()
             }
-            (Some(revoked), None) => !revoked.lock().is_empty(),
+            (Some(revoked), None) => revoked.lock().is_some(),
             (None, Some(rehydrated)) => !rehydrated.lock().is_empty(),
             (None, None) => false,
         }
@@ -197,6 +339,73 @@ impl OperatorGraph {
         self.finalize_vnode_transition(&transition, &resolved)
     }
 
+    pub(super) fn complete_committed_final_owner_exit(&mut self) -> Result<(), DbError> {
+        let transition = self.collect_final_owner_exit()?;
+        self.run_vnode_transition_callbacks(&transition.revoked, &[])?;
+        self.finalize_final_owner_exit(&transition)
+    }
+
+    fn collect_final_owner_exit(&self) -> Result<StagedFinalOwnerExit, DbError> {
+        let revoke_handle = self
+            .staged_vnode_revocation
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                DbError::Checkpoint(
+                    "[LDB-6051] final-owner-exit cleanup has no staged revoke handle".into(),
+                )
+            })?;
+        let staged_revoke = revoke_handle.lock().clone().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6051] final-owner-exit cleanup has no staged revoke batch".into(),
+            )
+        })?;
+        let transition = staged_revoke
+            .committed_transition()
+            .cloned()
+            .ok_or_else(|| {
+                DbError::Checkpoint(
+                    "[LDB-6051] control-only vnode transition has no committed final-owner-exit \
+                     authority"
+                        .into(),
+                )
+            })?;
+        let revoked = staged_revoke.vnodes().clone();
+        let rehydration_handle = self
+            .rehydrated_vnode_state
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                DbError::Checkpoint(
+                    "[LDB-6051] final-owner-exit cleanup has no staged restore handle".into(),
+                )
+            })?;
+        if !rehydration_handle.lock().is_empty() {
+            return Err(DbError::Checkpoint(
+                "[LDB-6051] final-owner-exit cleanup cannot include staged vnode restore state"
+                    .into(),
+            ));
+        }
+        let config = self.cluster_shuffle.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6051] final-owner-exit cleanup has no cluster ownership scope".into(),
+            )
+        })?;
+        if config.registry.any_restoring() {
+            return Err(DbError::Checkpoint(
+                "[LDB-6051] final-owner-exit cleanup cannot include restoring vnodes".into(),
+            ));
+        }
+        let authority = FinalOwnerExitAuthoritySnapshot::capture(config, &transition, &revoked)?;
+        Ok(StagedFinalOwnerExit {
+            authority,
+            revoke_handle,
+            rehydration_handle,
+            transition,
+            revoked,
+        })
+    }
+
     fn collect_staged_vnode_transition(&self) -> Result<Option<StagedVnodeTransition>, DbError> {
         if !self.has_staged_vnode_transition()
             && self
@@ -207,11 +416,24 @@ impl OperatorGraph {
             return Ok(None);
         }
 
-        let revoke_handle = self.pending_revoke_vnodes.as_ref().map(Arc::clone);
+        let revoke_handle = self.staged_vnode_revocation.as_ref().map(Arc::clone);
         let rehydration_handle = self.rehydrated_vnode_state.as_ref().map(Arc::clone);
-        let revoked = revoke_handle
+        let staged_revoke = revoke_handle
             .as_ref()
-            .map_or_else(FxHashSet::default, |handle| handle.lock().clone());
+            .and_then(|handle| handle.lock().clone());
+        if staged_revoke
+            .as_ref()
+            .is_some_and(|staged| staged.committed_transition().is_some())
+        {
+            return Err(DbError::ShuffleNotReady(
+                "[LDB-6051] committed final-owner-exit cleanup requires the fenced control-only \
+                 execution path"
+                    .into(),
+            ));
+        }
+        let revoked = staged_revoke
+            .as_ref()
+            .map_or_else(FxHashSet::default, |staged| staged.vnodes().clone());
         let authority = self
             .cluster_shuffle
             .as_ref()
@@ -479,6 +701,19 @@ impl OperatorGraph {
             self.execution_poisoned.store(true, Ordering::Release);
             return Err(error);
         }
+        if let Some(handle) = &transition.revoke_handle {
+            let exact = handle.lock().as_ref().is_some_and(|staged| {
+                staged.committed_transition().is_none() && staged.vnodes() == &transition.revoked
+            });
+            if !transition.revoked.is_empty() && !exact {
+                self.execution_poisoned.store(true, Ordering::Release);
+                return Err(DbError::StatefulOperatorPartialApply(
+                    "[LDB-6051] staged target-scoped revoke batch changed after lifecycle \
+                     callbacks; recovery is required"
+                        .into(),
+                ));
+            }
+        }
         // Activation starts only after every callback and revalidation succeeds. Individual
         // lifecycle slots are sequential atomics, not one atomic batch publication.
         transition
@@ -488,9 +723,9 @@ impl OperatorGraph {
 
         let applied: FxHashSet<u32> = transition.staged_vnodes.iter().copied().collect();
         if let Some(handle) = &transition.revoke_handle {
-            handle
-                .lock()
-                .retain(|vnode| !transition.revoked.contains(vnode));
+            if !transition.revoked.is_empty() {
+                *handle.lock() = None;
+            }
         }
         if let Some(handle) = &transition.rehydration_handle {
             handle.lock().retain(|vnode, _| !applied.contains(vnode));
@@ -510,6 +745,42 @@ impl OperatorGraph {
             revoked_vnodes = transition.revoked.len(),
             restored_vnodes = resolved.len(),
             "completed staged vnode transition"
+        );
+        Ok(())
+    }
+
+    fn finalize_final_owner_exit(&self, transition: &StagedFinalOwnerExit) -> Result<(), DbError> {
+        if let Err(error) = transition.authority.revalidate_after_callbacks() {
+            self.execution_poisoned.store(true, Ordering::Release);
+            return Err(error);
+        }
+        let mut staged = transition.revoke_handle.lock();
+        let rehydrated = transition.rehydration_handle.lock();
+        if !rehydrated.is_empty() || transition.authority.registry.any_restoring() {
+            self.execution_poisoned.store(true, Ordering::Release);
+            return Err(DbError::StatefulOperatorPartialApply(
+                "[LDB-6051] vnode restore state appeared during final-owner-exit callbacks; \
+                 recovery is required"
+                    .into(),
+            ));
+        }
+        let exact = staged.as_ref().is_some_and(|current| {
+            current.committed_transition() == Some(&transition.transition)
+                && current.vnodes() == &transition.revoked
+        });
+        if !exact {
+            self.execution_poisoned.store(true, Ordering::Release);
+            return Err(DbError::StatefulOperatorPartialApply(
+                "[LDB-6051] staged final-owner-exit revoke batch changed after callbacks; \
+                 recovery is required"
+                    .into(),
+            ));
+        }
+        *staged = None;
+        tracing::info!(
+            assignment_version = transition.authority.assignment.version(),
+            revoked_vnodes = transition.revoked.len(),
+            "completed committed final-owner-exit vnode cleanup"
         );
         Ok(())
     }

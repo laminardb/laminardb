@@ -1124,9 +1124,30 @@ fn finalized_drain_outcome(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AuditedDrainOutcome {
+pub(crate) struct AuditedDrainOutcome {
     transition: AssignmentDrainTransition,
     outcome: SourceDrainOutcome,
+}
+
+/// A committed drain transition returned only after durable authority audit.
+///
+/// The private field makes this a capability: sibling modules may consume it, but cannot mint one
+/// from an arbitrary canonical transition.
+pub(crate) struct AuditedCommittedDrainTransition(AssignmentDrainTransition);
+
+impl AuditedCommittedDrainTransition {
+    pub(crate) fn into_transition(self) -> AssignmentDrainTransition {
+        self.0
+    }
+}
+
+impl AuditedDrainOutcome {
+    /// The exact transition whose target durably committed, if this was not an abort.
+    #[must_use]
+    pub(crate) fn into_committed_transition(self) -> Option<AuditedCommittedDrainTransition> {
+        (self.outcome == SourceDrainOutcome::Commit)
+            .then_some(AuditedCommittedDrainTransition(self.transition))
+    }
 }
 
 /// Audit a materialized assignment-drain outcome against the shared authority sequence.
@@ -1230,7 +1251,7 @@ pub async fn startup_committed_assignment(
     Ok(prior)
 }
 
-async fn audit_assignment_snapshot_authority_outcome(
+pub(crate) async fn audit_assignment_snapshot_authority_outcome(
     store: &AssignmentSnapshotStore,
     controller: Option<&ClusterController>,
     snapshot: &AssignmentSnapshot,

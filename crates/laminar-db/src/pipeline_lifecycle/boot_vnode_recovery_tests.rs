@@ -177,7 +177,10 @@ async fn startup_reset_clears_stale_staging_and_lifecycle() {
     let registry = Arc::new(VnodeRegistry::single_owner(2, NodeId(1)));
     let db = boot_test_db(Arc::clone(&registry)).await;
     registry.mark_restoring(&[0, 1]);
-    db.pending_revoke_vnodes.lock().insert(0);
+    *db.staged_vnode_revocation.lock() = Some(
+        crate::db::StagedVnodeRevocation::target_scoped_for_test([0].into_iter().collect())
+            .unwrap(),
+    );
     db.rehydrated_vnode_state.lock().insert(
         1,
         crate::db::RehydratedVnode {
@@ -188,7 +191,7 @@ async fn startup_reset_clears_stale_staging_and_lifecycle() {
 
     db.reset_staged_vnode_transition_for_startup();
 
-    assert!(db.pending_revoke_vnodes.lock().is_empty());
+    assert!(db.staged_vnode_revocation.lock().is_none());
     assert!(db.rehydrated_vnode_state.lock().is_empty());
     assert!(!registry.any_restoring());
     assert!(registry.restoring_vnodes().is_empty());

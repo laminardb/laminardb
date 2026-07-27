@@ -1132,6 +1132,7 @@ mod rebalance {
         );
         let leader_idx = harness.leader_idx();
         let held_polls = harness.nodes[leader_idx].source_state.polls();
+        let held_follower_polls = harness.nodes[follower_idx].source_state.polls();
         assert_eq!(harness.nodes[leader_idx].source_state.drain_finishes(), 0);
         let watcher = harness.nodes[leader_idx].rebalance_tasks.remove(0);
         watcher.abort();
@@ -1188,6 +1189,41 @@ mod rebalance {
         );
         wait_for(
             || {
+                let follower = &harness.nodes[follower_idx];
+                follower.vnode_registry.assignment_version() >= expected
+                    && follower.owned_vnodes().is_empty()
+                    && follower.db.pending_revoke_vnode_count() == 0
+            },
+            "zero-vnode follower to consume its pending revoke through control-only completion",
+        )
+        .await;
+        assert_eq!(
+            harness.nodes[follower_idx].source_state.polls(),
+            held_follower_polls,
+            "control-only vnode completion must not poll the fenced follower source",
+        );
+        wait_for(
+            || {
+                let follower = &harness.nodes[follower_idx];
+                let follower_id = follower.instance_id.0;
+                follower.db.cluster_intake_fenced()
+                    && follower.shuffle_sender.assignment_version() == 0
+                    && follower.shuffle_receiver.assignment_version() == 0
+                    && follower.shuffle_sender.active_assignment_digest().is_none()
+                    && follower
+                        .shuffle_receiver
+                        .active_assignment_digest()
+                        .is_none()
+                    && harness.cluster.nodes[follower_idx]
+                        .controller
+                        .checkpoint_assignment_fence(expected)
+                        .is_some_and(|fence| !fence.contains(follower_id))
+            },
+            "zero-vnode follower to remain intake-fenced without shuffle authority",
+        )
+        .await;
+        wait_for(
+            || {
                 harness
                     .cluster
                     .nodes
@@ -1217,6 +1253,21 @@ mod rebalance {
             harness.nodes[harness.leader_idx()].owned_vnodes().len(),
             VNODE_COUNT as usize,
         );
+        let follower = &harness.nodes[follower_idx];
+        assert!(follower.owned_vnodes().is_empty());
+        assert_eq!(follower.db.pending_revoke_vnode_count(), 0);
+        assert!(
+            follower.db.cluster_intake_fenced(),
+            "successor activation must not reopen intake on a zero-vnode follower",
+        );
+        assert_eq!(follower.source_state.polls(), held_follower_polls);
+        assert_eq!(follower.shuffle_sender.assignment_version(), 0);
+        assert_eq!(follower.shuffle_receiver.assignment_version(), 0);
+        assert!(follower.shuffle_sender.active_assignment_digest().is_none());
+        assert!(follower
+            .shuffle_receiver
+            .active_assignment_digest()
+            .is_none());
 
         harness.shutdown().await;
     }

@@ -498,6 +498,23 @@ fn encoded_vnode_partial(partial: &crate::vnode_partial::VnodePartial) -> bytes:
 }
 
 #[cfg(feature = "cluster")]
+type TestVnodeRevokeHandle = Arc<parking_lot::Mutex<Option<crate::db::StagedVnodeRevocation>>>;
+
+#[cfg(feature = "cluster")]
+fn target_scoped_revoke_handle(vnodes: impl IntoIterator<Item = u32>) -> TestVnodeRevokeHandle {
+    let vnodes = vnodes.into_iter().collect::<FxHashSet<_>>();
+    Arc::new(parking_lot::Mutex::new(Some(
+        crate::db::StagedVnodeRevocation::target_scoped_for_test(vnodes)
+            .expect("test revoke roster must be nonempty"),
+    )))
+}
+
+#[cfg(feature = "cluster")]
+fn staged_revoke_vnodes(handle: &TestVnodeRevokeHandle) -> Option<FxHashSet<u32>> {
+    handle.lock().as_ref().map(|staged| staged.vnodes().clone())
+}
+
+#[cfg(feature = "cluster")]
 struct VnodeTransitionHarness {
     graph: OperatorGraph,
     registry: Arc<laminar_core::state::VnodeRegistry>,
@@ -587,10 +604,123 @@ async fn vnode_transition_harness_for_assignment(
             .collect(),
     ));
     graph.set_rehydration_handle(Arc::clone(&staged));
+    graph.set_rotation_execution_fence(Arc::new(tokio::sync::RwLock::new(())));
     VnodeTransitionHarness {
         graph,
         registry,
         staged,
+    }
+}
+
+#[cfg(feature = "cluster")]
+struct FinalOwnerExitHarness {
+    graph: OperatorGraph,
+    registry: Arc<laminar_core::state::VnodeRegistry>,
+    sender: Arc<laminar_core::shuffle::ShuffleSender>,
+    receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
+    revoked: TestVnodeRevokeHandle,
+}
+
+#[cfg(feature = "cluster")]
+async fn final_owner_exit_harness(endpoint_incarnation: uuid::Uuid) -> FinalOwnerExitHarness {
+    use laminar_core::checkpoint::{
+        AssignmentDrainTransition, CheckpointAssignmentFence, CheckpointParticipant, LeaderProof,
+        LeaderProofOwner,
+    };
+    use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+    use laminar_core::state::{NodeId, VnodeRegistry};
+
+    let self_id = NodeId(1);
+    let predecessor_incarnation = uuid::Uuid::from_u128(1);
+    let target_incarnation = uuid::Uuid::from_u128(2);
+    let predecessor_owners = [self_id];
+    let target_owners = [NodeId(2)];
+    let predecessor_participant = CheckpointParticipant {
+        node_id: self_id.0,
+        boot_incarnation: predecessor_incarnation,
+    };
+    let predecessor =
+        CheckpointAssignmentFence::from_owner_map(1, &[self_id.0], vec![predecessor_participant])
+            .unwrap();
+    let target = CheckpointAssignmentFence::from_owner_map(
+        2,
+        &[2],
+        vec![CheckpointParticipant {
+            node_id: 2,
+            boot_incarnation: target_incarnation,
+        }],
+    )
+    .unwrap();
+    let transition = AssignmentDrainTransition::new(
+        predecessor.clone(),
+        target,
+        LeaderProof {
+            owner: LeaderProofOwner {
+                node_id: 2,
+                boot_id: target_incarnation,
+                process_term: 1,
+            },
+            fencing_token: 1,
+        },
+    )
+    .unwrap();
+    let registry = Arc::new(VnodeRegistry::new_unassigned(1));
+    registry.set_assignment_and_version(target_owners.to_vec().into(), 2);
+    let receiver = Arc::new(
+        ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap(), endpoint_incarnation)
+            .await
+            .expect("bind final-owner-exit test receiver"),
+    );
+    let sender = Arc::new(ShuffleSender::new(1, endpoint_incarnation));
+    let process_deadline = Arc::new(laminar_core::cluster::control::LeaseDeadline::live_for(
+        std::time::Duration::from_secs(60),
+    ));
+    receiver
+        .install_process_lease_deadline(Arc::clone(&process_deadline))
+        .unwrap();
+    sender
+        .install_process_lease_deadline(process_deadline)
+        .unwrap();
+    if endpoint_incarnation == predecessor_incarnation {
+        receiver
+            .install_assignment_fence(&predecessor, &[self_id.0])
+            .unwrap();
+        sender
+            .install_assignment_fence(&predecessor, &[self_id.0])
+            .unwrap();
+        receiver.invalidate_assignment_fence();
+        sender.invalidate_assignment_fence();
+    }
+
+    let revoked = Arc::new(parking_lot::Mutex::new(Some(
+        crate::db::StagedVnodeRevocation::committed_final_owner_exit_for_test(
+            transition,
+            1,
+            &predecessor_owners,
+            2,
+            &target_owners,
+            predecessor_participant,
+        )
+        .unwrap(),
+    )));
+    let mut graph = test_graph();
+    graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
+        registry: Arc::clone(&registry),
+        sender: Arc::clone(&sender),
+        receiver: Arc::clone(&receiver),
+        self_id,
+    });
+    graph.set_vnode_revocation_handle(Arc::clone(&revoked));
+    graph.set_rehydration_handle(Arc::new(parking_lot::Mutex::new(
+        std::collections::HashMap::new(),
+    )));
+    graph.set_rotation_execution_fence(Arc::new(tokio::sync::RwLock::new(())));
+    FinalOwnerExitHarness {
+        graph,
+        registry,
+        sender,
+        receiver,
+        revoked,
     }
 }
 
@@ -2646,6 +2776,501 @@ fn terminal_shuffle_graph(query_budget_ns: u64) -> OperatorGraph {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn committed_final_owner_exit_runs_only_on_the_control_path() {
+    struct RevokeOnlyProbe {
+        process_calls: Arc<std::sync::atomic::AtomicUsize>,
+        revoked: Arc<parking_lot::Mutex<Vec<FxHashSet<u32>>>>,
+    }
+
+    #[async_trait]
+    impl GraphOperator for RevokeOnlyProbe {
+        fn cluster_capability(&self) -> OperatorCapability {
+            OperatorCapability::test_probe()
+        }
+
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            self.process_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn drop_owned_vnodes(&mut self, revoked: &FxHashSet<u32>) -> Result<(), DbError> {
+            self.revoked.lock().push(revoked.clone());
+            Ok(())
+        }
+    }
+
+    let FinalOwnerExitHarness {
+        mut graph,
+        sender,
+        receiver,
+        revoked,
+        ..
+    } = final_owner_exit_harness(uuid::Uuid::from_u128(1)).await;
+    let process_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_revokes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    graph.push_test_node(
+        "revoke-only",
+        Box::new(RevokeOnlyProbe {
+            process_calls: Arc::clone(&process_calls),
+            revoked: Arc::clone(&observed_revokes),
+        }),
+    );
+
+    let normal_error = graph
+        .complete_staged_vnode_transition()
+        .expect_err("the normal transition path must reject final-owner-exit authority");
+    assert!(
+        normal_error.to_string().contains("control-only"),
+        "{normal_error}"
+    );
+    assert!(observed_revokes.lock().is_empty());
+    assert!(revoked.lock().is_some());
+
+    let normal_error = graph
+        .execute_cycle(&FxHashMap::default(), i64::MAX, None)
+        .await
+        .expect_err("normal execution must not consume final-owner-exit authority");
+    assert!(normal_error.is_shuffle_not_ready(), "{normal_error}");
+    assert_eq!(process_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(observed_revokes.lock().is_empty());
+    assert!(revoked.lock().is_some());
+
+    assert!(graph
+        .complete_pending_vnode_transition()
+        .await
+        .expect("control-only final-owner-exit cleanup should complete"));
+
+    assert_eq!(process_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(
+        &*observed_revokes.lock(),
+        &[[0u32].into_iter().collect::<FxHashSet<_>>()]
+    );
+    assert!(revoked.lock().is_none());
+    assert_eq!(sender.assignment_version(), 0);
+    assert_eq!(receiver.assignment_version(), 0);
+    assert!(sender.active_assignment_digest().is_none());
+    assert!(receiver.active_assignment_digest().is_none());
+    assert!(graph.execution_poison_reason().is_none());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn final_owner_exit_rejects_process_mismatch_and_active_transport_before_callbacks() {
+    struct RevokeCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl GraphOperator for RevokeCounter {
+        fn cluster_capability(&self) -> OperatorCapability {
+            OperatorCapability::test_probe()
+        }
+
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) -> Result<(), DbError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    let mut mismatched = final_owner_exit_harness(uuid::Uuid::from_u128(9)).await;
+    let mismatch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    mismatched.graph.push_test_node(
+        "revoke-probe",
+        Box::new(RevokeCounter(Arc::clone(&mismatch_calls))),
+    );
+    let error = mismatched
+        .graph
+        .complete_pending_vnode_transition()
+        .await
+        .expect_err("a different process incarnation must not clean predecessor state");
+    assert!(error.to_string().contains("process identity"), "{error}");
+    assert_eq!(mismatch_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(mismatched.revoked.lock().is_some());
+    assert!(mismatched.graph.execution_poison_reason().is_none());
+
+    let mut active = final_owner_exit_harness(uuid::Uuid::from_u128(1)).await;
+    let active_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    active.graph.push_test_node(
+        "revoke-probe",
+        Box::new(RevokeCounter(Arc::clone(&active_calls))),
+    );
+    let active_fence = laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
+        3,
+        &[1],
+        vec![laminar_core::checkpoint::CheckpointParticipant {
+            node_id: 1,
+            boot_incarnation: uuid::Uuid::from_u128(1),
+        }],
+    )
+    .unwrap();
+    active
+        .sender
+        .install_assignment_fence(&active_fence, &[1])
+        .unwrap();
+    active
+        .receiver
+        .install_assignment_fence(&active_fence, &[1])
+        .unwrap();
+    let error = active
+        .graph
+        .complete_pending_vnode_transition()
+        .await
+        .expect_err("active transport must block final-owner-exit cleanup");
+    assert!(error.to_string().contains("inactive shuffle"), "{error}");
+    assert_eq!(active_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(active.revoked.lock().is_some());
+    assert!(active.graph.execution_poison_reason().is_none());
+
+    let mut unfenced = final_owner_exit_harness(uuid::Uuid::from_u128(1)).await;
+    let unfenced_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    unfenced.graph.push_test_node(
+        "revoke-probe",
+        Box::new(RevokeCounter(Arc::clone(&unfenced_calls))),
+    );
+    unfenced.graph.rotation_execution_fence = None;
+    let error = unfenced
+        .graph
+        .complete_pending_vnode_transition()
+        .await
+        .expect_err("final-owner-exit cleanup requires the rotation execution fence");
+    assert!(
+        error.to_string().contains("rotation execution fence"),
+        "{error}"
+    );
+    assert_eq!(unfenced_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(unfenced.revoked.lock().is_some());
+    assert!(unfenced.graph.execution_poison_reason().is_none());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn final_owner_exit_rejects_restore_work_before_revoke_callbacks() {
+    struct RevokeCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl GraphOperator for RevokeCounter {
+        fn cluster_capability(&self) -> OperatorCapability {
+            OperatorCapability::test_probe()
+        }
+
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) -> Result<(), DbError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    let mut staged = final_owner_exit_harness(uuid::Uuid::from_u128(1)).await;
+    let staged_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    staged.graph.push_test_node(
+        "revoke-probe",
+        Box::new(RevokeCounter(Arc::clone(&staged_calls))),
+    );
+    staged
+        .graph
+        .rehydrated_vnode_state
+        .as_ref()
+        .unwrap()
+        .lock()
+        .insert(
+            0,
+            crate::db::RehydratedVnode {
+                epoch: 7,
+                chain: vec![bytes::Bytes::from_static(b"unexpected-restore")],
+            },
+        );
+    let error = staged
+        .graph
+        .complete_pending_vnode_transition()
+        .await
+        .expect_err("final-owner-exit cleanup cannot mix restore state");
+    assert!(
+        error.to_string().contains("staged vnode restore"),
+        "{error}"
+    );
+    assert_eq!(staged_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(staged.revoked.lock().is_some());
+
+    let mut restoring = final_owner_exit_harness(uuid::Uuid::from_u128(1)).await;
+    let restoring_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    restoring.graph.push_test_node(
+        "revoke-probe",
+        Box::new(RevokeCounter(Arc::clone(&restoring_calls))),
+    );
+    restoring.registry.mark_restoring(&[0]);
+    let error = restoring
+        .graph
+        .complete_pending_vnode_transition()
+        .await
+        .expect_err("final-owner-exit cleanup cannot mix lifecycle restore state");
+    assert!(error.to_string().contains("restoring vnodes"), "{error}");
+    assert_eq!(
+        restoring_calls.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert!(restoring.revoked.lock().is_some());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn final_owner_exit_callback_failure_poisons_and_retains_authority() {
+    struct FailingRevoke;
+
+    #[async_trait]
+    impl GraphOperator for FailingRevoke {
+        fn cluster_capability(&self) -> OperatorCapability {
+            OperatorCapability::test_probe()
+        }
+
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) -> Result<(), DbError> {
+            Err(DbError::Pipeline(
+                "injected final-owner-exit failure".into(),
+            ))
+        }
+    }
+
+    let mut harness = final_owner_exit_harness(uuid::Uuid::from_u128(1)).await;
+    harness
+        .graph
+        .push_test_node("failing-revoke", Box::new(FailingRevoke));
+
+    let error = harness
+        .graph
+        .complete_pending_vnode_transition()
+        .await
+        .expect_err("an indeterminate final-owner-exit callback must poison the graph");
+
+    assert!(matches!(error, DbError::StatefulOperatorPartialApply(_)));
+    assert!(error.to_string().contains("injected final-owner-exit"));
+    assert!(harness.revoked.lock().is_some());
+    assert!(harness.graph.execution_poison_reason().is_some());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn final_owner_exit_restore_drift_after_callback_poisons_and_retains_authority() {
+    struct RestoringRevoke {
+        registry: Arc<laminar_core::state::VnodeRegistry>,
+        staged: Arc<parking_lot::Mutex<std::collections::HashMap<u32, crate::db::RehydratedVnode>>>,
+    }
+
+    #[async_trait]
+    impl GraphOperator for RestoringRevoke {
+        fn cluster_capability(&self) -> OperatorCapability {
+            OperatorCapability::test_probe()
+        }
+
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) -> Result<(), DbError> {
+            self.registry.mark_restoring(&[0]);
+            self.staged.lock().insert(
+                0,
+                crate::db::RehydratedVnode {
+                    epoch: 7,
+                    chain: vec![bytes::Bytes::from_static(b"injected-restore")],
+                },
+            );
+            Ok(())
+        }
+    }
+
+    let mut harness = final_owner_exit_harness(uuid::Uuid::from_u128(1)).await;
+    let staged = Arc::clone(
+        harness
+            .graph
+            .rehydrated_vnode_state
+            .as_ref()
+            .expect("final-owner-exit harness must install restore staging"),
+    );
+    harness.graph.push_test_node(
+        "restoring-revoke",
+        Box::new(RestoringRevoke {
+            registry: Arc::clone(&harness.registry),
+            staged: Arc::clone(&staged),
+        }),
+    );
+
+    let error = harness
+        .graph
+        .complete_pending_vnode_transition()
+        .await
+        .expect_err("restore drift after callbacks must poison the graph");
+
+    assert!(matches!(error, DbError::StatefulOperatorPartialApply(_)));
+    assert!(error.to_string().contains("restore lifecycle"), "{error}");
+    assert!(harness.registry.any_restoring());
+    assert!(!staged.lock().is_empty());
+    assert!(harness.revoked.lock().is_some());
+    assert!(harness.graph.execution_poison_reason().is_some());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn final_owner_exit_transport_drift_after_callback_poisons_and_retains_authority() {
+    struct ActivatingRevoke {
+        receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
+        fence: laminar_core::checkpoint::CheckpointAssignmentFence,
+    }
+
+    #[async_trait]
+    impl GraphOperator for ActivatingRevoke {
+        fn cluster_capability(&self) -> OperatorCapability {
+            OperatorCapability::test_probe()
+        }
+
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) -> Result<(), DbError> {
+            self.receiver
+                .install_assignment_fence(&self.fence, &[1])
+                .map_err(|error| DbError::Pipeline(error.to_string()))?;
+            Ok(())
+        }
+    }
+
+    let mut harness = final_owner_exit_harness(uuid::Uuid::from_u128(1)).await;
+    let conflicting = laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
+        3,
+        &[1],
+        vec![laminar_core::checkpoint::CheckpointParticipant {
+            node_id: 1,
+            boot_incarnation: uuid::Uuid::from_u128(1),
+        }],
+    )
+    .unwrap();
+    harness.graph.push_test_node(
+        "activating-revoke",
+        Box::new(ActivatingRevoke {
+            receiver: Arc::clone(&harness.receiver),
+            fence: conflicting,
+        }),
+    );
+
+    let error = harness
+        .graph
+        .complete_pending_vnode_transition()
+        .await
+        .expect_err("transport activation after revoke must poison the graph");
+
+    assert!(matches!(error, DbError::StatefulOperatorPartialApply(_)));
+    assert!(error.to_string().contains("became active"), "{error}");
+    assert!(harness.revoked.lock().is_some());
+    assert!(harness.graph.execution_poison_reason().is_some());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn final_owner_exit_assignment_drift_after_callback_poisons_and_retains_authority() {
+    struct ReassigningRevoke(Arc<laminar_core::state::VnodeRegistry>);
+
+    #[async_trait]
+    impl GraphOperator for ReassigningRevoke {
+        fn cluster_capability(&self) -> OperatorCapability {
+            OperatorCapability::test_probe()
+        }
+
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) -> Result<(), DbError> {
+            self.0
+                .set_assignment_and_version(vec![laminar_core::state::NodeId(2)].into(), 3);
+            Ok(())
+        }
+    }
+
+    let mut harness = final_owner_exit_harness(uuid::Uuid::from_u128(1)).await;
+    harness.graph.push_test_node(
+        "reassigning-revoke",
+        Box::new(ReassigningRevoke(Arc::clone(&harness.registry))),
+    );
+
+    let error = harness
+        .graph
+        .complete_pending_vnode_transition()
+        .await
+        .expect_err("assignment drift after revoke must poison the graph");
+
+    assert!(matches!(error, DbError::StatefulOperatorPartialApply(_)));
+    assert!(error.to_string().contains("assignment changed"), "{error}");
+    assert!(harness.revoked.lock().is_some());
+    assert!(harness.graph.execution_poison_reason().is_some());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn successful_revoke_batch_consumes_handle() {
     let VnodeTransitionHarness { mut graph, .. } = vnode_transition_harness_for_assignment(
         vec![
@@ -2656,13 +3281,11 @@ async fn successful_revoke_batch_consumes_handle() {
         Vec::new(),
     )
     .await;
-    let handle = Arc::new(parking_lot::Mutex::new(
-        [0u32].into_iter().collect::<FxHashSet<u32>>(),
-    ));
-    graph.set_revoke_handle(Arc::clone(&handle));
+    let handle = target_scoped_revoke_handle([0]);
+    graph.set_vnode_revocation_handle(Arc::clone(&handle));
     graph.complete_staged_vnode_transition().unwrap();
     assert!(
-        handle.lock().is_empty(),
+        handle.lock().is_none(),
         "the revoke handle is consumed only after the complete batch succeeds",
     );
 }
@@ -2700,18 +3323,16 @@ async fn out_of_range_revoke_is_rejected_before_callbacks() {
         vnode_transition_harness(1, &[], Vec::new()).await;
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     graph.push_test_node("revoke-probe", Box::new(RevokeCounter(Arc::clone(&calls))));
-    let handle = Arc::new(parking_lot::Mutex::new(
-        [7u32].into_iter().collect::<FxHashSet<u32>>(),
-    ));
-    graph.set_revoke_handle(Arc::clone(&handle));
+    let handle = target_scoped_revoke_handle([7]);
+    graph.set_vnode_revocation_handle(Arc::clone(&handle));
 
     let error = graph.complete_staged_vnode_transition().unwrap_err();
 
     assert!(error.to_string().contains("outside the pinned assignment"));
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert_eq!(
-        *handle.lock(),
-        [7u32].into_iter().collect::<FxHashSet<u32>>()
+        staged_revoke_vnodes(&handle),
+        Some([7u32].into_iter().collect::<FxHashSet<u32>>())
     );
     assert!(graph.execution_poison_reason().is_none());
 }
@@ -2748,18 +3369,16 @@ fn revoke_without_cluster_scope_is_rejected_before_callbacks() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut graph = test_graph();
     graph.push_test_node("revoke-probe", Box::new(RevokeCounter(Arc::clone(&calls))));
-    let handle = Arc::new(parking_lot::Mutex::new(
-        [1u32].into_iter().collect::<FxHashSet<u32>>(),
-    ));
-    graph.set_revoke_handle(Arc::clone(&handle));
+    let handle = target_scoped_revoke_handle([1]);
+    graph.set_vnode_revocation_handle(Arc::clone(&handle));
 
     let error = graph.complete_staged_vnode_transition().unwrap_err();
 
     assert!(error.to_string().contains("no cluster ownership scope"));
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert_eq!(
-        *handle.lock(),
-        [1u32].into_iter().collect::<FxHashSet<u32>>()
+        staged_revoke_vnodes(&handle),
+        Some([1u32].into_iter().collect::<FxHashSet<u32>>())
     );
     assert!(graph.execution_poison_reason().is_none());
 }
@@ -2830,18 +3449,16 @@ async fn vnode_revoke_failure_faults_and_retains_pending_work() {
             failure: None,
         }),
     );
-    let handle = Arc::new(parking_lot::Mutex::new(
-        [0u32].into_iter().collect::<FxHashSet<u32>>(),
-    ));
-    graph.set_revoke_handle(Arc::clone(&handle));
+    let handle = target_scoped_revoke_handle([0]);
+    graph.set_vnode_revocation_handle(Arc::clone(&handle));
 
     let error = graph.complete_staged_vnode_transition().unwrap_err();
     assert!(matches!(error, DbError::StatefulOperatorPartialApply(_)));
     assert!(error.to_string().contains("z-revoke-failure"));
     assert_eq!(&*calls.lock(), &["success", "failure"]);
     assert_eq!(
-        *handle.lock(),
-        [0u32].into_iter().collect::<FxHashSet<u32>>()
+        staged_revoke_vnodes(&handle),
+        Some([0u32].into_iter().collect::<FxHashSet<u32>>())
     );
     assert!(graph.execution_poison_reason().is_some());
 }
@@ -2932,10 +3549,8 @@ async fn checkpoint_quiescence_requires_staged_vnode_transitions_to_apply() {
         Vec::new(),
     )
     .await;
-    let revoked = Arc::new(parking_lot::Mutex::new(
-        [0u32].into_iter().collect::<FxHashSet<u32>>(),
-    ));
-    revoke_graph.set_revoke_handle(Arc::clone(&revoked));
+    let revoked = target_scoped_revoke_handle([0]);
+    revoke_graph.set_vnode_revocation_handle(Arc::clone(&revoked));
     assert!(
         !revoke_graph.checkpoint_is_quiescent(),
         "staged revoke state must enter the checkpoint drain loop"
@@ -2952,7 +3567,7 @@ async fn checkpoint_quiescence_requires_staged_vnode_transitions_to_apply() {
         .execute_checkpoint_drain_cycle(i64::MAX, None)
         .await
         .expect("checkpoint drain should apply staged revoke state");
-    assert!(revoked.lock().is_empty());
+    assert!(revoked.lock().is_none());
     assert!(revoke_graph.checkpoint_is_quiescent());
 
     registry.set_assignment(vec![laminar_core::state::NodeId(1)].into());
@@ -3216,10 +3831,8 @@ async fn later_vnode_structural_failure_runs_no_callbacks_and_retains_batch() {
         "agg",
         Box::new(TransitionCallbackProbe(Arc::clone(&callbacks))),
     );
-    let revoked = Arc::new(parking_lot::Mutex::new(
-        [2u32].into_iter().collect::<FxHashSet<_>>(),
-    ));
-    graph.set_revoke_handle(Arc::clone(&revoked));
+    let revoked = target_scoped_revoke_handle([2]);
+    graph.set_vnode_revocation_handle(Arc::clone(&revoked));
 
     let error = graph
         .execute_cycle(&FxHashMap::default(), i64::MAX, None)
@@ -3232,8 +3845,8 @@ async fn later_vnode_structural_failure_runs_no_callbacks_and_retains_batch() {
     assert_eq!(registry.restoring_vnodes(), vec![0, 1]);
     assert_eq!(staged.lock().len(), 2, "preflight consumed recovery input");
     assert_eq!(
-        *revoked.lock(),
-        [2u32].into_iter().collect::<FxHashSet<_>>()
+        staged_revoke_vnodes(&revoked),
+        Some([2u32].into_iter().collect::<FxHashSet<_>>())
     );
     assert!(graph.execution_poison_reason().is_none());
     assert_eq!(graph.last_execution_assignment_version(), None);
@@ -3350,10 +3963,8 @@ async fn currently_owned_revoke_requires_matching_restore() {
     } = vnode_transition_harness(1, &[], Vec::new()).await;
     let callbacks = Arc::new(parking_lot::Mutex::new(Vec::new()));
     graph.push_test_node("probe", Box::new(RevokeProbe(Arc::clone(&callbacks))));
-    let revoked = Arc::new(parking_lot::Mutex::new(
-        [0u32].into_iter().collect::<FxHashSet<_>>(),
-    ));
-    graph.set_revoke_handle(Arc::clone(&revoked));
+    let revoked = target_scoped_revoke_handle([0]);
+    graph.set_vnode_revocation_handle(Arc::clone(&revoked));
 
     let error = graph
         .execute_cycle(&FxHashMap::default(), i64::MAX, None)
@@ -3365,8 +3976,8 @@ async fn currently_owned_revoke_requires_matching_restore() {
         .contains("currently owned revoked vnodes [0]"));
     assert!(callbacks.lock().is_empty());
     assert_eq!(
-        *revoked.lock(),
-        [0u32].into_iter().collect::<FxHashSet<_>>()
+        staged_revoke_vnodes(&revoked),
+        Some([0u32].into_iter().collect::<FxHashSet<_>>())
     );
     assert!(!registry.any_restoring());
     assert!(graph.execution_poison_reason().is_none());
@@ -3445,10 +4056,8 @@ async fn later_restore_callback_failure_poisons_and_retains_complete_transition(
             failure_on_vnode: Some((1, "injected vnode apply failure")),
         }),
     );
-    let revoked = Arc::new(parking_lot::Mutex::new(
-        [0u32].into_iter().collect::<FxHashSet<_>>(),
-    ));
-    graph.set_revoke_handle(Arc::clone(&revoked));
+    let revoked = target_scoped_revoke_handle([0]);
+    graph.set_vnode_revocation_handle(Arc::clone(&revoked));
 
     let error = graph
         .execute_cycle(&FxHashMap::default(), i64::MAX, None)
@@ -3461,8 +4070,8 @@ async fn later_restore_callback_failure_poisons_and_retains_complete_transition(
     assert_eq!(registry.restoring_vnodes(), vec![0, 1]);
     assert_eq!(staged.lock().len(), 2);
     assert_eq!(
-        *revoked.lock(),
-        [0u32].into_iter().collect::<FxHashSet<_>>()
+        staged_revoke_vnodes(&revoked),
+        Some([0u32].into_iter().collect::<FxHashSet<_>>())
     );
     assert!(graph.execution_poison_reason().is_some());
 
@@ -3539,10 +4148,8 @@ async fn transport_certificate_change_after_callback_poisons_before_activation()
             applied: Arc::clone(&applied),
         }),
     );
-    let revoked = Arc::new(parking_lot::Mutex::new(
-        [0u32].into_iter().collect::<FxHashSet<_>>(),
-    ));
-    graph.set_revoke_handle(Arc::clone(&revoked));
+    let revoked = target_scoped_revoke_handle([0]);
+    graph.set_vnode_revocation_handle(Arc::clone(&revoked));
 
     let error = graph
         .execute_cycle(&FxHashMap::default(), i64::MAX, None)
@@ -3556,8 +4163,8 @@ async fn transport_certificate_change_after_callback_poisons_before_activation()
     assert!(registry.is_restoring(0));
     assert_eq!(staged.lock().len(), 1);
     assert_eq!(
-        *revoked.lock(),
-        [0u32].into_iter().collect::<FxHashSet<_>>()
+        staged_revoke_vnodes(&revoked),
+        Some([0u32].into_iter().collect::<FxHashSet<_>>())
     );
     assert!(graph.execution_poison_reason().is_some());
     assert_eq!(graph.last_execution_assignment_version(), None);
@@ -3622,10 +4229,8 @@ async fn revoke_then_reacquire_overlap_drops_before_restore() {
     } = vnode_transition_harness(1, &[0], vec![(0, vec![encoded_vnode_partial(&partial)])]).await;
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
     graph.push_test_node("agg", Box::new(RevokeRestoreProbe(Arc::clone(&events))));
-    let revoked = Arc::new(parking_lot::Mutex::new(
-        [0u32].into_iter().collect::<FxHashSet<_>>(),
-    ));
-    graph.set_revoke_handle(Arc::clone(&revoked));
+    let revoked = target_scoped_revoke_handle([0]);
+    graph.set_vnode_revocation_handle(Arc::clone(&revoked));
 
     graph
         .execute_cycle(&FxHashMap::default(), i64::MAX, None)
@@ -3635,7 +4240,7 @@ async fn revoke_then_reacquire_overlap_drops_before_restore() {
     assert_eq!(&*events.lock(), &["revoke", "restore"]);
     assert!(!registry.is_restoring(0));
     assert!(staged.lock().is_empty());
-    assert!(revoked.lock().is_empty());
+    assert!(revoked.lock().is_none());
 }
 
 #[cfg(feature = "cluster")]

@@ -509,9 +509,10 @@ pub(crate) struct OperatorGraph {
     #[allow(clippy::disallowed_types)] // shares the DB's std-HashMap-typed handle
     rehydrated_vnode_state:
         Option<Arc<parking_lot::Mutex<std::collections::HashMap<u32, crate::db::RehydratedVnode>>>>,
-    // Staged set of vnodes lost on rebalance; drained at the top of each cycle to drop their state.
+    // One assignment-bound vnode revocation batch, consumed only after complete lifecycle success.
     #[cfg(feature = "cluster")]
-    pending_revoke_vnodes: Option<Arc<parking_lot::Mutex<FxHashSet<u32>>>>,
+    staged_vnode_revocation:
+        Option<Arc<parking_lot::Mutex<Option<crate::db::StagedVnodeRevocation>>>>,
     #[cfg(feature = "cluster")]
     rotation_execution_fence: Option<Arc<tokio::sync::RwLock<()>>>,
 }
@@ -560,7 +561,7 @@ impl OperatorGraph {
             #[cfg(feature = "cluster")]
             rehydrated_vnode_state: None,
             #[cfg(feature = "cluster")]
-            pending_revoke_vnodes: None,
+            staged_vnode_revocation: None,
             #[cfg(feature = "cluster")]
             rotation_execution_fence: None,
             ctx,
@@ -818,10 +819,13 @@ impl OperatorGraph {
         self.rehydrated_vnode_state = Some(staged);
     }
 
-    /// Share the staged revoked-vnode set; consumed after a complete successful batch.
+    /// Share the assignment-bound vnode revocation batch.
     #[cfg(feature = "cluster")]
-    pub fn set_revoke_handle(&mut self, staged: Arc<parking_lot::Mutex<FxHashSet<u32>>>) {
-        self.pending_revoke_vnodes = Some(staged);
+    pub fn set_vnode_revocation_handle(
+        &mut self,
+        staged: Arc<parking_lot::Mutex<Option<crate::db::StagedVnodeRevocation>>>,
+    ) {
+        self.staged_vnode_revocation = Some(staged);
     }
 
     #[cfg(feature = "cluster")]
@@ -2206,10 +2210,12 @@ impl OperatorGraph {
             return Ok(false);
         }
         self.ensure_execution_not_poisoned()?;
-        let _rotation_guard = match self.rotation_execution_fence.as_ref() {
-            Some(fence) => Some(Arc::clone(fence).read_owned().await),
-            None => None,
-        };
+        let rotation_fence = self.rotation_execution_fence.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6051] staged vnode completion requires the rotation execution fence".into(),
+            )
+        })?;
+        let _rotation_guard = Arc::clone(rotation_fence).read_owned().await;
 
         // Waiting for assignment publication has not touched operator state. Cancellation after
         // this point is indeterminate for the same reason as a normal graph cycle.
@@ -2217,7 +2223,10 @@ impl OperatorGraph {
         self.whole_restore_open = false;
         self.last_execution_assignment_version = None;
         let result = (|| {
-            let execution_assignment_version = if let Some(config) = &self.cluster_shuffle {
+            let final_owner_exit = self.has_staged_final_owner_exit();
+            let execution_assignment_version = if final_owner_exit {
+                None
+            } else if let Some(config) = &self.cluster_shuffle {
                 let version = config.registry.versioned_snapshot().version();
                 if config.sender.assignment_version() != version
                     || config.receiver.assignment_version() != version
@@ -2231,7 +2240,11 @@ impl OperatorGraph {
             } else {
                 None
             };
-            self.complete_staged_vnode_transition()?;
+            if final_owner_exit {
+                self.complete_committed_final_owner_exit()?;
+            } else {
+                self.complete_staged_vnode_transition()?;
+            }
             self.last_execution_assignment_version = execution_assignment_version;
             Ok(true)
         })();
@@ -2268,6 +2281,17 @@ impl OperatorGraph {
         #[cfg(feature = "cluster")]
         let _rotation_guard = match self.rotation_execution_fence.as_ref() {
             Some(fence) => Some(Arc::clone(fence).read_owned().await),
+            None if self.has_staged_vnode_transition()
+                || self
+                    .cluster_shuffle
+                    .as_ref()
+                    .is_some_and(|config| config.registry.any_restoring()) =>
+            {
+                return Err(DbError::Checkpoint(
+                    "[LDB-6051] staged vnode execution requires the rotation execution fence"
+                        .into(),
+                ));
+            }
             None => None,
         };
 
