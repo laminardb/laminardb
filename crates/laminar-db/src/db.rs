@@ -2232,7 +2232,49 @@ impl LaminarDB {
         let self_id = laminar_core::state::NodeId(controller.instance_id().0);
         let observed_assignment = registry.versioned_snapshot();
         let observed_version = observed_assignment.version();
-        if snapshot.version != observed_version.saturating_add(1) {
+        if observed_version == 0 {
+            let pristine_boot = observed_assignment
+                .owners()
+                .iter()
+                .all(|owner| *owner == laminar_core::state::NodeId::UNASSIGNED)
+                && !observed_assignment.has_committed_handoff()
+                && self.pending_vnode_transition.lock().is_none()
+                && self.installed_vnode_state.lock().is_none()
+                && !registry.any_restoring();
+            if !pristine_boot {
+                return Err(DbError::Checkpoint(
+                    "[LDB-6053] assignment-zero bootstrap contains retained vnode lifecycle state"
+                        .into(),
+                ));
+            }
+            let durable_head = assignment_snapshot_store
+                .load()
+                .await
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6053] failed to load the durable assignment head: {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "[LDB-6053] assignment-zero bootstrap has no durable assignment head"
+                            .into(),
+                    )
+                })?;
+            let committed = crate::rebalance::startup_committed_assignment(
+                assignment_snapshot_store.as_ref(),
+                Some(controller.as_ref()),
+                durable_head,
+            )
+            .await
+            .map_err(|error| DbError::Checkpoint(format!("[LDB-6053] {error}")))?;
+            if committed != snapshot {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6053] assignment-zero bootstrap target {} is not the current committed assignment {}",
+                    snapshot.version, committed.version
+                )));
+            }
+        } else if snapshot.version != observed_version.saturating_add(1) {
             return Err(DbError::Checkpoint(format!(
                 "[LDB-6053] assignment {} is not the exact successor of local assignment {observed_version}; coordinated recovery must install missing generations",
                 snapshot.version
@@ -2288,6 +2330,11 @@ impl LaminarDB {
             node_id: self_id.0,
             boot_incarnation: current_incarnation,
         };
+        crate::vnode_transition_staging::PendingVnodeTransition::validate_target_process(
+            &target_fence,
+            &new_assignment,
+            local_participant,
+        )?;
         let predecessor_process_is_current =
             predecessor_fence.as_ref().is_some_and(|predecessor| {
                 predecessor.participant_incarnation(self_id.0) == Some(current_incarnation)

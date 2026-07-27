@@ -1,6 +1,9 @@
+#[cfg(feature = "cluster")]
 use std::sync::Arc;
 
-use super::vnode_chains::{resolve_op_chain, LoadedVnodeChains, SealedVnodeChainReader};
+#[cfg(feature = "cluster")]
+use super::vnode_chains::resolve_op_chain;
+use super::vnode_chains::{LoadedVnodeChains, SealedVnodeChainReader};
 use async_trait::async_trait;
 use bytes::Bytes;
 use laminar_core::state::{

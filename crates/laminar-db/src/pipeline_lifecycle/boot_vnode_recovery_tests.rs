@@ -504,6 +504,45 @@ async fn zero_owned_boot_target_retires_prior_transition_only_after_authority_au
 }
 
 #[tokio::test]
+async fn unassigned_replacement_boot_defers_restore_without_publishing_state() {
+    let registry = Arc::new(VnodeRegistry::new_unassigned(2));
+    let db = boot_test_db(Arc::clone(&registry)).await;
+    let donor = VnodeRegistry::single_owner(2, NodeId(1)).versioned_snapshot();
+    let (_, _, restore_cut) =
+        boot_restore_authority(&donor, CheckpointAttempt::canonical(7), &[0, 1]);
+
+    db.prepare_boot_vnode_restore_transition(&restore_cut)
+        .await
+        .expect("an unassigned replacement process must restore through later adoption");
+
+    assert_eq!(registry.assignment_version(), 0);
+    assert!(!registry.any_restoring());
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db.installed_vnode_state.lock().is_none());
+}
+
+#[tokio::test]
+async fn unassigned_replacement_boot_rejects_retained_lifecycle_state() {
+    let registry = Arc::new(VnodeRegistry::new_unassigned(2));
+    registry.mark_restoring(&[0]);
+    let db = boot_test_db(Arc::clone(&registry)).await;
+    let donor = VnodeRegistry::single_owner(2, NodeId(1)).versioned_snapshot();
+    let (_, _, restore_cut) =
+        boot_restore_authority(&donor, CheckpointAttempt::canonical(7), &[0, 1]);
+
+    let error = db
+        .prepare_boot_vnode_restore_transition(&restore_cut)
+        .await
+        .expect_err("assignment zero with retained lifecycle state must fail closed");
+
+    assert!(error.to_string().contains("[LDB-6031]"), "{error}");
+    assert_eq!(registry.assignment_version(), 0);
+    assert!(registry.is_restoring(0));
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db.installed_vnode_state.lock().is_none());
+}
+
+#[tokio::test]
 async fn fresh_cluster_start_rejects_staged_vnode_state_without_clearing_it() {
     let registry = Arc::new(VnodeRegistry::single_owner(2, NodeId(1)));
     let db = boot_test_db(Arc::clone(&registry)).await;

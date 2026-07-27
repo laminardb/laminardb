@@ -1306,6 +1306,35 @@ impl LaminarDB {
             }
         };
         let target_assignment = registry.versioned_snapshot();
+        let owned = laminar_core::state::owned_vnodes(&registry, self_id);
+        if target_assignment.version() == 0 {
+            let has_pending_transition = self.pending_vnode_transition.lock().is_some();
+            let has_installed_state = self.installed_vnode_state.lock().is_some();
+            if !owned.is_empty()
+                || target_assignment
+                    .owners()
+                    .iter()
+                    .any(|owner| *owner != laminar_core::state::NodeId::UNASSIGNED)
+                || has_pending_transition
+                || has_installed_state
+                || registry.any_restoring()
+                || target_assignment.has_committed_handoff()
+            {
+                return Err(DbError::Checkpoint(
+                    "[LDB-6031] unassigned cluster boot has retained vnode lifecycle state".into(),
+                ));
+            }
+            // Existing clusters intentionally construct replacement processes unassigned. Source
+            // intake remains fenced while the audited durable assignment is adopted after the
+            // graph and coordinator start; that adoption loads the exact committed vnode cut.
+            // Do not invent assignment-zero authority or mark any vnode active here.
+            tracing::info!(
+                epoch = restore_cut.attempt().epoch,
+                checkpoint_id = restore_cut.attempt().checkpoint_id,
+                "cluster recovery: deferring vnode restore until durable assignment adoption"
+            );
+            return Ok(());
+        }
         let assignment_store = self
             .assignment_snapshot_store
             .lock()
@@ -1356,7 +1385,6 @@ impl LaminarDB {
         let target_fence = target_snapshot
             .assignment_fence()
             .map_err(|error| DbError::Checkpoint(error.to_string()))?;
-        let owned = laminar_core::state::owned_vnodes(&registry, self_id);
         let attempt = restore_cut.attempt();
         tracing::info!(
             owned = owned.len(),

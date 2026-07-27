@@ -2410,24 +2410,6 @@ fn try_rebalance_owned(
                 local_assignment.version()
             ));
         }
-        if !current.draining && current.version > local_assignment.version() {
-            // A writer can fail after its durable CAS succeeds but before local adoption. Reconcile
-            // that durable fact before comparing it with desired placement; otherwise an
-            // already-correct owner map would be mistaken for a no-op forever.
-            let adoption = db
-                .adopt_assignment_snapshot(current.clone(), head_deadline)
-                .await
-                .map_err(|error| error.to_string())?;
-            log_adoption("rebalance-reconcile", &adoption);
-            let reconciled_version = registry.assignment_version();
-            if reconciled_version < current.version {
-                return Err(format!(
-                    "durable assignment {} was not adopted; local assignment remains {}",
-                    current.version, reconciled_version
-                ));
-            }
-            return Ok(Some(reconciled_version));
-        }
         if current.version == local_assignment.version()
             && current_owners.as_slice() != local_assignment.owners()
         {
@@ -2524,6 +2506,27 @@ fn try_rebalance_owned(
             .collect();
         if successors.is_empty() {
             return Ok(None);
+        }
+        let current_roster_is_live = successor_participants(&current_owners, &successor_processes)
+            .is_ok_and(|participants| participants == current.participants);
+        if current.version > local_assignment.version() && current_roster_is_live {
+            // A writer can fail after its durable CAS succeeds but before local adoption. Adopt
+            // that exact live-process generation before planning another rotation. A replacement
+            // process must not adopt a retained certificate naming its predecessor incarnation;
+            // it proceeds below through the authority-sequenced recovery-successor path.
+            let adoption = db
+                .adopt_assignment_snapshot(current.clone(), head_deadline)
+                .await
+                .map_err(|error| error.to_string())?;
+            log_adoption("rebalance-reconcile", &adoption);
+            let reconciled_version = registry.assignment_version();
+            if reconciled_version < current.version {
+                return Err(format!(
+                    "durable assignment {} was not adopted; local assignment remains {}",
+                    current.version, reconciled_version
+                ));
+            }
+            return Ok(Some(reconciled_version));
         }
         let mut new_assignment =
             rendezvous_assignment(registry.vnode_count(), &successors).to_vec();

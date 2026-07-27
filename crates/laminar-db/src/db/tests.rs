@@ -107,6 +107,79 @@ async fn cluster_controller_identity_is_fixed_for_the_graph_generation() {
 }
 
 #[cfg(feature = "cluster")]
+#[tokio::test]
+async fn assignment_zero_cannot_publish_a_predecessor_process_certificate() {
+    use laminar_core::checkpoint::CheckpointParticipant;
+    use laminar_core::cluster::control::{
+        AssignmentSnapshot, ClusterController, ClusterKv, InMemoryKv,
+    };
+    use laminar_core::cluster::discovery::{NodeId as ClusterNodeId, NodeInfo};
+    use laminar_core::state::{InProcessBackend, NodeId, VnodeRegistry};
+    use uuid::Uuid;
+
+    let self_id = NodeId(1);
+    let current_boot = Uuid::from_u128(22);
+    let predecessor_boot = Uuid::from_u128(11);
+    let (authority_store, assignments) = test_assignment_history();
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(ClusterNodeId(self_id.0)));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        ClusterNodeId(self_id.0),
+        Arc::clone(&kv),
+        kv,
+        Some(Arc::clone(&assignments)),
+        members_rx,
+        current_boot,
+    ));
+    install_test_process_deadline(&controller);
+    let retained = AssignmentSnapshot::empty()
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[self_id]),
+            vec![CheckpointParticipant {
+                node_id: self_id.0,
+                boot_incarnation: predecessor_boot,
+            }],
+        )
+        .unwrap();
+    assignments.save_if_absent(&retained).await.unwrap();
+    let registry = Arc::new(VnodeRegistry::new_unassigned(1));
+    let db = LaminarDB::builder()
+        .cluster_controller(controller)
+        .cluster_checkpoint_object_store(authority_store)
+        .state_backend(Arc::new(InProcessBackend::new(1)))
+        .vnode_registry(Arc::clone(&registry))
+        .assignment_snapshot_store(assignments)
+        .build()
+        .await
+        .unwrap();
+    let intake_was_fenced = db.cluster_intake_fenced();
+
+    let error = db
+        .adopt_assignment_snapshot(
+            retained,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("a replacement process must not inherit its predecessor certificate");
+
+    assert!(
+        error
+            .to_string()
+            .contains("target assignment does not bind the local ownership"),
+        "{error}"
+    );
+    assert_eq!(registry.assignment_version(), 0);
+    assert!(registry
+        .snapshot()
+        .iter()
+        .all(|owner| *owner == NodeId::UNASSIGNED));
+    assert!(!registry.any_restoring());
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db.installed_vnode_state.lock().is_none());
+    assert_eq!(db.cluster_intake_fenced(), intake_was_fenced);
+}
+
+#[cfg(feature = "cluster")]
 #[test]
 fn pending_final_owner_exit_binds_exact_transition_and_process() {
     use laminar_core::checkpoint::{

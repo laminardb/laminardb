@@ -245,7 +245,7 @@ impl OperatorCapability {
         .with_managed_state(ManagedStateContract::TestVnodeStateV1)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cluster"))]
     pub(crate) const fn test_global_state() -> Self {
         Self::internal(
             OperatorImplementation::TestProbe,

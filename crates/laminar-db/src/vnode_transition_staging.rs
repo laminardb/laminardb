@@ -272,7 +272,7 @@ impl PendingVnodeTransition {
         Ok(())
     }
 
-    fn validate_target_process(
+    pub(crate) fn validate_target_process(
         target: &CheckpointAssignmentFence,
         target_owners: &[NodeId],
         participant: CheckpointParticipant,

@@ -1947,7 +1947,7 @@ async fn watcher_resumes_exact_authority_after_transient_audit_gaps() {
 }
 
 #[tokio::test]
-async fn restarted_process_publishes_an_authorized_recovery_generation() {
+async fn unassigned_restarted_process_authorizes_successor_before_boot_adoption() {
     use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
     use laminar_core::cluster::discovery::NodeInfo;
     use uuid::Uuid;
@@ -2033,7 +2033,7 @@ async fn restarted_process_publishes_an_authorized_recovery_generation() {
     let _leader_lease =
         install_test_leadership(&controller, leader_authority, leader_owner, leader_lease);
 
-    let registry = Arc::new(VnodeRegistry::single_owner(2, self_id));
+    let registry = Arc::new(VnodeRegistry::new_unassigned(2));
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
@@ -2066,7 +2066,7 @@ async fn restarted_process_publishes_an_authorized_recovery_generation() {
         }]
     );
     assert!(db.cluster_intake_fenced());
-    assert_eq!(registry.assignment_version(), first.version);
+    assert_eq!(registry.assignment_version(), 0);
 }
 
 #[tokio::test]

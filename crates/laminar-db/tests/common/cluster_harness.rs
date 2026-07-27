@@ -1015,31 +1015,6 @@ impl ClusterEngineHarness {
         }
         // Fast timings so tests don't wait the 5s production debounce.
         let cfg = laminar_db::rebalance::RebalanceConfig::test_defaults();
-        for (node, cluster_node) in self.nodes.iter().zip(&self.cluster.nodes) {
-            if node.vnode_registry.assignment_version() != 0 {
-                continue;
-            }
-            let deadline = tokio::time::Instant::now() + cfg.checkpoint_timeout;
-            let head = node
-                .assignment_snapshot_store
-                .load()
-                .await
-                .expect("load retained startup assignment")
-                .expect("retained startup assignment");
-            let committed = laminar_db::rebalance::startup_committed_assignment(
-                node.assignment_snapshot_store.as_ref(),
-                Some(cluster_node.controller.as_ref()),
-                head,
-            )
-            .await
-            .expect("audit retained startup assignment");
-            let adoption = node
-                .db
-                .adopt_assignment_snapshot(committed, deadline)
-                .await
-                .expect("adopt retained startup assignment");
-            assert!(adoption.adopted, "retained startup assignment was deferred");
-        }
         for (idx, nh) in self.cluster.nodes.iter().enumerate() {
             let node = &mut self.nodes[idx];
             let watcher = laminar_db::rebalance::spawn_snapshot_watcher(
