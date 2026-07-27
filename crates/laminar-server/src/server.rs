@@ -180,6 +180,8 @@ pub async fn run_server(
     // Validate independently of config-file loading: cluster startup acquires durable leases and
     // starts discovery before constructing LaminarDB, and programmatic callers can bypass the
     // TOML validator entirely.
+    crate::config::validate_http_auth(&config)
+        .map_err(|error| ServerError::Build(format!("HTTP authentication: {error}")))?;
     resolved_checkpoint_state_bytes(&config.checkpoint)
         .map_err(|error| ServerError::Build(format!("checkpoint.max_staged_bytes: {error}")))?;
 
@@ -601,6 +603,7 @@ pub(crate) async fn prepare_http_api(
     #[cfg(feature = "cluster")] cluster: Option<ClusterComponents>,
 ) -> Result<PreparedHttpApi, ServerError> {
     let bind = config.server.bind.clone();
+    let auth_policy = http::HttpAuthPolicy::from_server(&config.server);
 
     let server_metrics = ServerMetrics::new(&registry);
 
@@ -611,6 +614,9 @@ pub(crate) async fn prepare_http_api(
         reload_guard: ReloadGuard::new(),
         registry,
         server_metrics,
+        auth_policy,
+        #[cfg(feature = "cluster")]
+        diagnostic_reads: http::DiagnosticReadGate::new(),
         ws_slots: http::ws_connection_slots(),
         serving_gate,
         #[cfg(feature = "cluster")]
@@ -908,6 +914,27 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn server_entry_rejects_programmatic_diagnostic_auth_before_other_startup_work() {
+        let mut config: ServerConfig = toml::from_str("").unwrap();
+        config.server.diagnostic_read_token = Some(Secret::new("invalid"));
+        // This second invalid value makes the test terminate safely even if authentication
+        // validation is accidentally moved later; authentication must still win.
+        config.checkpoint.max_staged_bytes = Some(0);
+
+        let result = run_server(config, PathBuf::from("unused.toml")).await;
+        let Err(error) = result else {
+            panic!("invalid programmatic diagnostic authentication was admitted");
+        };
+        let message = error.to_string();
+        assert!(message.contains("HTTP authentication"), "{message}");
+        assert!(message.contains("diagnostic_read_token"), "{message}");
+        assert!(
+            !message.contains("checkpoint.max_staged_bytes"),
+            "{message}"
+        );
     }
 
     #[tokio::test]

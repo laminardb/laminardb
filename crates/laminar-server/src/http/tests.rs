@@ -1,6 +1,8 @@
 use super::*;
 use axum::body::Body;
 use axum::http::Request;
+#[cfg(feature = "cluster")]
+use base64::Engine as _;
 use tower::ServiceExt;
 
 #[test]
@@ -28,6 +30,295 @@ fn cap_result_trims_and_flags() {
     assert_eq!((rows(&b), t), (5, true));
 }
 
+#[cfg(feature = "cluster")]
+#[test]
+fn diagnostic_read_gate_is_single_flight_and_rate_bounded() {
+    let gate = DiagnosticReadGate::new();
+    let permit = gate.permit.try_acquire().unwrap();
+    assert!(gate.permit.try_acquire().is_err());
+    drop(permit);
+    assert!(gate.permit.try_acquire().is_ok());
+
+    let now = Instant::now();
+    let mut rate = DiagnosticRateWindow::default();
+    for _ in 0..DIAGNOSTIC_READ_MAX_STARTS_PER_WINDOW {
+        assert!(rate.try_start(now));
+    }
+    assert!(!rate.try_start(now));
+    assert!(rate.try_start(now + DIAGNOSTIC_READ_RATE_WINDOW));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn diagnostic_read_deadline_releases_the_single_flight_permit() {
+    let (state, diagnostic) = diagnostic_middleware_state();
+    let app = Router::new()
+        .route(
+            "/api/v1/cluster/local-evidence",
+            get(|| async {
+                tokio::time::sleep(DIAGNOSTIC_READ_DEADLINE + std::time::Duration::from_secs(1))
+                    .await;
+                StatusCode::OK
+            }),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            diagnostic_bounds_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            diagnostic_auth_middleware,
+        ));
+    let request = Request::builder()
+        .uri("/api/v1/cluster/local-evidence")
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {diagnostic}"),
+        )
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(state.diagnostic_reads.permit.available_permits(), 1);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cancelling_a_diagnostic_read_releases_the_single_flight_permit() {
+    let (state, diagnostic) = diagnostic_middleware_state();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let blocked = Arc::new(tokio::sync::Notify::new());
+    let handler_started = started.notified();
+    let app = Router::new()
+        .route(
+            "/api/v1/cluster/local-evidence",
+            get({
+                let started = Arc::clone(&started);
+                let blocked = Arc::clone(&blocked);
+                move || {
+                    let started = Arc::clone(&started);
+                    let blocked = Arc::clone(&blocked);
+                    async move {
+                        started.notify_one();
+                        blocked.notified().await;
+                        StatusCode::OK
+                    }
+                }
+            }),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            diagnostic_bounds_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            diagnostic_auth_middleware,
+        ));
+    let request = Request::builder()
+        .uri("/api/v1/cluster/local-evidence")
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {diagnostic}"),
+        )
+        .body(Body::empty())
+        .unwrap();
+
+    let task = tokio::spawn(app.oneshot(request));
+    handler_started.await;
+    assert_eq!(state.diagnostic_reads.permit.available_permits(), 0);
+    task.abort();
+    let _ = task.await;
+    tokio::task::yield_now().await;
+    assert_eq!(state.diagnostic_reads.permit.available_permits(), 1);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn diagnostic_auth_precedes_accounting_and_both_routes_share_one_permit() {
+    let (state, diagnostic) = diagnostic_middleware_state();
+    let first_started = Arc::new(tokio::sync::Notify::new());
+    let first_blocked = Arc::new(tokio::sync::Notify::new());
+    let second_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/api/v1/cluster/local-evidence",
+            get({
+                let first_started = Arc::clone(&first_started);
+                let first_blocked = Arc::clone(&first_blocked);
+                move || {
+                    let first_started = Arc::clone(&first_started);
+                    let first_blocked = Arc::clone(&first_blocked);
+                    async move {
+                        first_started.notify_one();
+                        first_blocked.notified().await;
+                        StatusCode::OK
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/v1/cluster/local-checkpoint-barrier-timings",
+            get({
+                let second_entries = Arc::clone(&second_entries);
+                move || {
+                    let second_entries = Arc::clone(&second_entries);
+                    async move {
+                        second_entries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }
+            }),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            diagnostic_bounds_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            diagnostic_auth_middleware,
+        ));
+
+    let authorized = |path: &'static str| {
+        Request::builder()
+            .uri(path)
+            .header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {diagnostic}"),
+            )
+            .body(Body::empty())
+            .unwrap()
+    };
+    let first = tokio::spawn(
+        app.clone()
+            .oneshot(authorized("/api/v1/cluster/local-evidence")),
+    );
+    first_started.notified().await;
+    assert_eq!(state.diagnostic_reads.permit.available_permits(), 0);
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cluster/local-checkpoint-barrier-timings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let contended = app
+        .clone()
+        .oneshot(authorized(
+            "/api/v1/cluster/local-checkpoint-barrier-timings",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(contended.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(second_entries.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        state
+            .diagnostic_reads
+            .rate
+            .lock()
+            .starts
+            .iter()
+            .flatten()
+            .count(),
+        1
+    );
+
+    first.abort();
+    let _ = first.await;
+    tokio::task::yield_now().await;
+    assert_eq!(state.diagnostic_reads.permit.available_permits(), 1);
+
+    let success = app
+        .oneshot(authorized(
+            "/api/v1/cluster/local-checkpoint-barrier-timings",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(success.status(), StatusCode::OK);
+    assert_eq!(state.diagnostic_reads.permit.available_permits(), 1);
+    assert_eq!(second_entries.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn diagnostic_rolling_window_admits_eight_starts_then_rejects_without_handler_entry() {
+    let (state, diagnostic) = diagnostic_middleware_state();
+    let entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handler = {
+        let entries = Arc::clone(&entries);
+        move || {
+            let entries = Arc::clone(&entries);
+            async move {
+                entries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                StatusCode::OK
+            }
+        }
+    };
+    let app = Router::new()
+        .route("/api/v1/cluster/local-evidence", get(handler.clone()))
+        .route(
+            "/api/v1/cluster/local-checkpoint-barrier-timings",
+            get(handler),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            diagnostic_bounds_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            diagnostic_auth_middleware,
+        ));
+    let request = |path: &'static str, token: &str| {
+        Request::builder()
+            .uri(path)
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    for index in 0..DIAGNOSTIC_READ_MAX_STARTS_PER_WINDOW {
+        let path = if index % 2 == 0 {
+            "/api/v1/cluster/local-evidence"
+        } else {
+            "/api/v1/cluster/local-checkpoint-barrier-timings"
+        };
+        let response = app
+            .clone()
+            .oneshot(request(path, &diagnostic))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "start {index}");
+    }
+
+    let excess = app
+        .clone()
+        .oneshot(request("/api/v1/cluster/local-evidence", &diagnostic))
+        .await
+        .unwrap();
+    assert_eq!(excess.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        entries.load(std::sync::atomic::Ordering::SeqCst),
+        DIAGNOSTIC_READ_MAX_STARTS_PER_WINDOW
+    );
+    assert_eq!(state.diagnostic_reads.permit.available_permits(), 1);
+
+    let unauthorized = app
+        .oneshot(request("/api/v1/cluster/local-evidence", "wrong-token"))
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        entries.load(std::sync::atomic::Ordering::SeqCst),
+        DIAGNOSTIC_READ_MAX_STARTS_PER_WINDOW
+    );
+}
+
 fn ready_serving_gate() -> Arc<ServingGate> {
     let gate = Arc::new(ServingGate::starting());
     assert!(gate.open());
@@ -45,11 +336,13 @@ fn test_state_with_db_and_gate(
     let engine_metrics = Arc::new(laminar_db::EngineMetrics::new(&registry));
     db.set_engine_metrics(engine_metrics);
     let server_metrics = crate::metrics::ServerMetrics::new(&registry);
+    let server = crate::config::ServerSection::default();
+    let auth_policy = HttpAuthPolicy::from_server(&server);
     Arc::new(AppState {
         db,
         config_path: PathBuf::from("test.toml"),
         current_config: parking_lot::RwLock::new(crate::config::ServerConfig {
-            server: crate::config::ServerSection::default(),
+            server,
             state: laminar_core::state::StateBackendConfig::default(),
             checkpoint: crate::config::CheckpointSection::default(),
             supervision: Default::default(),
@@ -67,6 +360,9 @@ fn test_state_with_db_and_gate(
 
         registry,
         server_metrics,
+        auth_policy,
+        #[cfg(feature = "cluster")]
+        diagnostic_reads: DiagnosticReadGate::new(),
         ws_slots: ws_connection_slots(),
         serving_gate,
         #[cfg(feature = "cluster")]
@@ -86,9 +382,41 @@ fn test_state() -> Arc<AppState> {
     test_state_with_db(LaminarDB::open().unwrap())
 }
 
-/// Like [`test_state`] but with a console bearer token configured, so the
-/// auth middleware is active on protected routes.
-fn test_state_with_token_and_gate(token: &str, serving_gate: Arc<ServingGate>) -> Arc<AppState> {
+fn test_state_with_config_path(
+    config_path: PathBuf,
+    current_config: crate::config::ServerConfig,
+) -> Arc<AppState> {
+    let registry = Arc::new(crate::metrics::build_registry([
+        ("instance".into(), "test".into()),
+        ("pipeline".into(), "test".into()),
+    ]));
+    let db = LaminarDB::open().unwrap();
+    let engine_metrics = Arc::new(laminar_db::EngineMetrics::new(&registry));
+    db.set_engine_metrics(engine_metrics);
+    let server_metrics = crate::metrics::ServerMetrics::new(&registry);
+    let auth_policy = HttpAuthPolicy::from_server(&current_config.server);
+    Arc::new(AppState {
+        db,
+        config_path,
+        current_config: parking_lot::RwLock::new(current_config),
+        reload_guard: ReloadGuard::new(),
+        registry,
+        server_metrics,
+        auth_policy,
+        #[cfg(feature = "cluster")]
+        diagnostic_reads: DiagnosticReadGate::new(),
+        ws_slots: ws_connection_slots(),
+        serving_gate: ready_serving_gate(),
+        #[cfg(feature = "cluster")]
+        cluster: None,
+    })
+}
+
+fn test_state_with_auth_and_gate(
+    console_token: Option<&str>,
+    diagnostic_read_token: Option<&str>,
+    serving_gate: Arc<ServingGate>,
+) -> Arc<AppState> {
     let registry = Arc::new(crate::metrics::build_registry([
         ("instance".into(), "test".into()),
         ("pipeline".into(), "test".into()),
@@ -98,9 +426,11 @@ fn test_state_with_token_and_gate(token: &str, serving_gate: Arc<ServingGate>) -
     db.set_engine_metrics(engine_metrics);
     let server_metrics = crate::metrics::ServerMetrics::new(&registry);
     let server = crate::config::ServerSection {
-        console_token: Some(crate::config::Secret::new(token)),
+        console_token: console_token.map(crate::config::Secret::new),
+        diagnostic_read_token: diagnostic_read_token.map(crate::config::Secret::new),
         ..Default::default()
     };
+    let auth_policy = HttpAuthPolicy::from_server(&server);
     Arc::new(AppState {
         db,
         config_path: PathBuf::from("test.toml"),
@@ -122,6 +452,9 @@ fn test_state_with_token_and_gate(token: &str, serving_gate: Arc<ServingGate>) -
         reload_guard: ReloadGuard::new(),
         registry,
         server_metrics,
+        auth_policy,
+        #[cfg(feature = "cluster")]
+        diagnostic_reads: DiagnosticReadGate::new(),
         ws_slots: ws_connection_slots(),
         serving_gate,
         #[cfg(feature = "cluster")]
@@ -129,8 +462,34 @@ fn test_state_with_token_and_gate(token: &str, serving_gate: Arc<ServingGate>) -
     })
 }
 
+/// Like [`test_state`] but with a console bearer token configured, so the
+/// auth middleware is active on protected routes.
+fn test_state_with_token_and_gate(token: &str, serving_gate: Arc<ServingGate>) -> Arc<AppState> {
+    test_state_with_auth_and_gate(Some(token), None, serving_gate)
+}
+
 fn test_state_with_token(token: &str) -> Arc<AppState> {
     test_state_with_token_and_gate(token, ready_serving_gate())
+}
+
+#[cfg(feature = "cluster")]
+fn canonical_auth_token(byte: u8) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 32])
+}
+
+#[cfg(feature = "cluster")]
+fn diagnostic_middleware_state() -> (Arc<AppState>, String) {
+    let console = canonical_auth_token(249);
+    let diagnostic = canonical_auth_token(250);
+    let mut state =
+        test_state_with_auth_and_gate(Some(&console), Some(&diagnostic), ready_serving_gate());
+    let auth_policy = {
+        let mut current = state.current_config.write();
+        current.server.mode = crate::config::ServerMode::Cluster;
+        HttpAuthPolicy::from_server(&current.server)
+    };
+    Arc::get_mut(&mut state).unwrap().auth_policy = auth_policy;
+    (state, diagnostic)
 }
 
 #[cfg(feature = "cluster")]
@@ -143,8 +502,9 @@ struct LocalEvidenceFixture {
 }
 
 #[cfg(feature = "cluster")]
-async fn local_evidence_fixture(
-    token: Option<&str>,
+async fn local_evidence_fixture_with_auth(
+    console_token: Option<&str>,
+    diagnostic_read_token: Option<&str>,
     serving_gate: Arc<ServingGate>,
     publish_adoption: bool,
 ) -> LocalEvidenceFixture {
@@ -223,12 +583,16 @@ async fn local_evidence_fixture(
         ));
     }
 
-    let mut state = match token {
-        Some(token) => test_state_with_token_and_gate(token, serving_gate),
-        None => test_state_with_gate(serving_gate),
+    let mut state =
+        test_state_with_auth_and_gate(console_token, diagnostic_read_token, serving_gate);
+    let auth_policy = {
+        let mut current = state.current_config.write();
+        current.server.mode = crate::config::ServerMode::Cluster;
+        HttpAuthPolicy::from_server(&current.server)
     };
-    state.current_config.write().server.mode = crate::config::ServerMode::Cluster;
-    Arc::get_mut(&mut state).unwrap().cluster = Some(ClusterComponents {
+    let mutable_state = Arc::get_mut(&mut state).unwrap();
+    mutable_state.auth_policy = auth_policy;
+    mutable_state.cluster = Some(ClusterComponents {
         controller: Arc::clone(&controller),
         snapshot_store,
         membership_rx: members_rx,
@@ -244,15 +608,27 @@ async fn local_evidence_fixture(
 }
 
 #[cfg(feature = "cluster")]
-async fn local_checkpoint_barrier_timings_fixture(
+async fn local_evidence_fixture(
     token: Option<&str>,
+    serving_gate: Arc<ServingGate>,
+    publish_adoption: bool,
+) -> LocalEvidenceFixture {
+    local_evidence_fixture_with_auth(token, None, serving_gate, publish_adoption).await
+}
+
+#[cfg(feature = "cluster")]
+async fn local_checkpoint_barrier_timings_fixture_with_auth(
+    console_token: Option<&str>,
+    diagnostic_read_token: Option<&str>,
     serving_gate: Arc<ServingGate>,
 ) -> LocalEvidenceFixture {
     use laminar_core::cluster::control::{
         prove_shared_object_store_namespaces, ClusterKv, InMemoryKv,
     };
 
-    let mut fixture = local_evidence_fixture(token, serving_gate, false).await;
+    let mut fixture =
+        local_evidence_fixture_with_auth(console_token, diagnostic_read_token, serving_gate, false)
+            .await;
     let participant = fixture.adoption.participant;
     let proof_control: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(
         laminar_core::cluster::discovery::NodeId(participant.node_id),
@@ -293,6 +669,14 @@ async fn local_checkpoint_barrier_timings_fixture(
         .expect("the fixture must retain the only app-state reference")
         .db = db;
     fixture
+}
+
+#[cfg(feature = "cluster")]
+async fn local_checkpoint_barrier_timings_fixture(
+    token: Option<&str>,
+    serving_gate: Arc<ServingGate>,
+) -> LocalEvidenceFixture {
+    local_checkpoint_barrier_timings_fixture_with_auth(token, None, serving_gate).await
 }
 
 #[cfg(feature = "cluster")]
@@ -490,13 +874,14 @@ async fn startup_gate_preserves_probes_and_rejects_every_other_route() {
             StatusCode::SERVICE_UNAVAILABLE,
             "non-probe {path}"
         );
+        let expected_cors = (path == "/api/v1/sources").then_some("https://console.example");
         assert_eq!(
             response
                 .headers()
                 .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
                 .and_then(|value| value.to_str().ok()),
-            Some("https://console.example"),
-            "closed startup response must retain CORS headers for {path}"
+            expected_cors,
+            "only a matched console route may receive CORS headers while startup is closed: {path}"
         );
     }
 }
@@ -978,57 +1363,32 @@ async fn test_reload_concurrent_returns_conflict() {
 }
 
 #[tokio::test]
-async fn test_reload_with_valid_config() {
+async fn explicit_reload_retains_pure_restart_only_configuration_and_auth_policy() {
     use std::io::Write;
 
-    // Create a real temp config file
     let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
-    writeln!(tmpfile, "[server]").unwrap();
-    let path = tmpfile.path().to_path_buf();
+    writeln!(
+        tmpfile,
+        "[server]\nbind = \"127.0.0.1:9191\"\nconsole_token = \"replacement-console-token\""
+    )
+    .unwrap();
 
-    let registry = Arc::new(crate::metrics::build_registry([
-        ("instance".into(), "test".into()),
-        ("pipeline".into(), "test".into()),
-    ]));
-    let db = LaminarDB::open().unwrap();
-    let engine_metrics = Arc::new(laminar_db::EngineMetrics::new(&registry));
-    db.set_engine_metrics(engine_metrics);
-    let server_metrics = crate::metrics::ServerMetrics::new(&registry);
-    let state = Arc::new(AppState {
-        db,
-        config_path: path,
-        current_config: parking_lot::RwLock::new(crate::config::ServerConfig {
-            server: crate::config::ServerSection::default(),
-            state: laminar_core::state::StateBackendConfig::default(),
-            checkpoint: crate::config::CheckpointSection::default(),
-            supervision: Default::default(),
-            sources: vec![],
-            lookups: vec![],
-            pipelines: vec![],
-            sinks: vec![],
-            discovery: None,
-            node_id: None,
-            sql: None,
-            ai: Default::default(),
-            models: Default::default(),
-        }),
-        reload_guard: ReloadGuard::new(),
-
-        registry,
-        server_metrics,
-        ws_slots: ws_connection_slots(),
-        serving_gate: ready_serving_gate(),
-        #[cfg(feature = "cluster")]
-        cluster: None,
-    });
+    let mut current: crate::config::ServerConfig = toml::from_str("[server]\n").unwrap();
+    current.server.console_token = Some(crate::config::Secret::new("original-console-token"));
+    let original_server = current.server.clone();
+    let state = test_state_with_config_path(tmpfile.path().to_path_buf(), current);
 
     let app = build_router(state.clone());
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/reload")
+        .header(
+            axum::http::header::AUTHORIZATION,
+            "Bearer original-console-token",
+        )
         .body(Body::empty())
         .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -1036,6 +1396,151 @@ async fn test_reload_with_valid_config() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["success"], true);
+    assert!(json["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning.as_str().unwrap().contains("[server]")));
+    assert_eq!(state.current_config.read().server, original_server);
+
+    let replacement = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/sources")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    "Bearer replacement-console-token",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replacement.status(), StatusCode::UNAUTHORIZED);
+    let original = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/sources")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    "Bearer original-console-token",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(original.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn explicit_reload_commits_live_sections_but_retains_mixed_restart_only_changes() {
+    use std::io::Write;
+
+    let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
+    writeln!(
+        tmpfile,
+        "[server]\nbind = \"127.0.0.1:9292\"\nconsole_token = \"replacement-console-token\""
+    )
+    .unwrap();
+
+    let mut current: crate::config::ServerConfig = toml::from_str("[server]\n").unwrap();
+    current.server.console_token = Some(crate::config::Secret::new("original-console-token"));
+    current.sources.push(crate::config::SourceConfig {
+        name: "removed_source".to_string(),
+        connector: "kafka".to_string(),
+        format: "json".to_string(),
+        properties: toml::Table::new(),
+        schema: vec![],
+        watermark: None,
+    });
+    let original_server = current.server.clone();
+    let state = test_state_with_config_path(tmpfile.path().to_path_buf(), current);
+    let response = build_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/reload")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    "Bearer original-console-token",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let current = state.current_config.read();
+    assert!(current.sources.is_empty());
+    assert_eq!(current.server, original_server);
+}
+
+#[tokio::test]
+async fn explicit_reload_failure_commits_neither_live_nor_restart_only_configuration() {
+    use std::io::Write;
+
+    let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
+    writeln!(
+        tmpfile,
+        "[server]\nbind = \"127.0.0.1:9393\"\nconsole_token = \"replacement-console-token\"\n\n[[pipeline]]\nname = \"bad_reload\"\nsql = \"NOT VALID SQL AT ALL\""
+    )
+    .unwrap();
+
+    let mut current: crate::config::ServerConfig = toml::from_str("[server]\n").unwrap();
+    current.server.console_token = Some(crate::config::Secret::new("original-console-token"));
+    let original = current.clone();
+    let state = test_state_with_config_path(tmpfile.path().to_path_buf(), current);
+    let response = build_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/reload")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    "Bearer original-console-token",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::MULTI_STATUS);
+    assert_eq!(*state.current_config.read(), original);
+}
+
+#[tokio::test]
+async fn explicit_reload_parse_error_body_does_not_disclose_substituted_secret() {
+    use std::io::Write;
+
+    const SENTINEL: &str = "LDB_RELOAD_SECRET_SENTINEL_0d927841";
+    let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
+    writeln!(
+        tmpfile,
+        "[server]\nconsole_token = ${{LDB_RELOAD_REDACTION_TOKEN:-{SENTINEL}}}"
+    )
+    .unwrap();
+    let current: crate::config::ServerConfig = toml::from_str("[server]\n").unwrap();
+    let state = test_state_with_config_path(tmpfile.path().to_path_buf(), current);
+    let response = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/reload")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains(SENTINEL));
 }
 
 /// POST a SQL statement to `/api/v1/sql`, asserting it succeeds.
@@ -1624,18 +2129,23 @@ async fn test_get_graph_empty() {
 
 #[tokio::test]
 async fn test_cluster_local_evidence_404_when_not_cluster() {
-    let app = build_router(test_state());
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/cluster/local-evidence")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    for state in [test_state(), test_state_with_token("supersecret-token")] {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/cluster/local-evidence")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        "Bearer supersecret-token",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 #[cfg(feature = "cluster")]
@@ -1692,6 +2202,429 @@ async fn cluster_local_evidence_requires_the_current_bearer() {
         .await
         .unwrap();
     assert_eq!(query_token.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn diagnostic_and_console_bearers_can_read_local_evidence() {
+    let console = canonical_auth_token(1);
+    let diagnostic = canonical_auth_token(2);
+    let fixture = local_evidence_fixture_with_auth(
+        Some(&console),
+        Some(&diagnostic),
+        ready_serving_gate(),
+        true,
+    )
+    .await;
+    let app = build_router(fixture.state);
+
+    for token in [&console, &diagnostic] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/cluster/local-evidence")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(axum::http::header::ORIGIN, "https://observer.invalid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn diagnostic_auth_policy_is_immutable_after_startup() {
+    let console = canonical_auth_token(11);
+    let diagnostic = canonical_auth_token(12);
+    let replacement_console = canonical_auth_token(13);
+    let replacement_diagnostic = canonical_auth_token(14);
+    let fixture = local_evidence_fixture_with_auth(
+        Some(&console),
+        Some(&diagnostic),
+        ready_serving_gate(),
+        true,
+    )
+    .await;
+    {
+        let mut current = fixture.state.current_config.write();
+        current.server.console_token = Some(crate::config::Secret::new(&replacement_console));
+        current.server.diagnostic_read_token =
+            Some(crate::config::Secret::new(&replacement_diagnostic));
+        current.server.mode = crate::config::ServerMode::Single;
+    }
+    let app = build_router(fixture.state);
+
+    let replacement = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cluster/local-evidence")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {replacement_diagnostic}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replacement.status(), StatusCode::UNAUTHORIZED);
+
+    let original = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cluster/local-evidence")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {diagnostic}"),
+                )
+                .header(axum::http::header::ORIGIN, "https://observer.invalid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(original.status(), StatusCode::OK);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn diagnostic_bearer_is_rejected_before_every_console_handler() {
+    let console = canonical_auth_token(3);
+    let diagnostic = canonical_auth_token(4);
+    let fixture = local_evidence_fixture_with_auth(
+        Some(&console),
+        Some(&diagnostic),
+        ready_serving_gate(),
+        true,
+    )
+    .await;
+    let state = Arc::clone(&fixture.state);
+    let before_pipeline = state.db.pipeline_state();
+    let before_reloads = state.server_metrics.reload_total.get();
+    let app = build_router(fixture.state);
+
+    for (method, path) in [
+        ("GET", "/api/v1/sources"),
+        ("GET", "/api/v1/sinks"),
+        ("GET", "/api/v1/streams"),
+        ("GET", "/api/v1/streams/example"),
+        ("GET", "/api/v1/mvs"),
+        ("GET", "/api/v1/connectors"),
+        ("GET", "/api/v1/graph"),
+        ("GET", "/api/v1/cluster"),
+        ("GET", "/api/v1/cluster/nodes"),
+        ("GET", "/api/v1/cluster/vnodes"),
+        ("GET", "/api/v1/cluster/leader"),
+        ("GET", "/api/v1/cluster/checkpoints"),
+        ("GET", "/api/v1/pipeline/status"),
+        ("GET", "/ws/events"),
+        ("POST", "/api/v1/checkpoint"),
+        ("POST", "/api/v1/sql"),
+        ("POST", "/api/v1/reload"),
+        ("POST", "/api/v1/pipeline/stop"),
+        ("POST", "/api/v1/pipeline/start"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {diagnostic}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}"
+        );
+    }
+
+    let websocket_query = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/ws/events?token={diagnostic}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(websocket_query.status(), StatusCode::UNAUTHORIZED);
+
+    for path in ["/health", "/ready", "/metrics"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{path}?token={diagnostic}"))
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {diagnostic}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains(&diagnostic), "{path}");
+        assert!(!body.contains("adopted_assignment"), "{path}");
+    }
+
+    assert_eq!(state.db.pipeline_state(), before_pipeline);
+    assert_eq!(state.server_metrics.reload_total.get(), before_reloads);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn diagnostic_routes_reject_method_substitution_and_cors() {
+    let console = canonical_auth_token(5);
+    let diagnostic = canonical_auth_token(6);
+    let fixture = local_evidence_fixture_with_auth(
+        Some(&console),
+        Some(&diagnostic),
+        ready_serving_gate(),
+        true,
+    )
+    .await;
+    let app = build_router(fixture.state);
+
+    for path in [
+        "/api/v1/cluster/local-evidence",
+        "/api/v1/cluster/local-checkpoint-barrier-timings",
+    ] {
+        for method in [
+            "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(
+                            axum::http::header::AUTHORIZATION,
+                            format!("Bearer {diagnostic}"),
+                        )
+                        .header(axum::http::header::ORIGIN, "https://observer.invalid")
+                        .header(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {path}"
+            );
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .is_none(),
+                "diagnostic route unexpectedly received CORS for {method} {path}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn diagnostic_routes_reject_credential_and_request_target_aliases() {
+    let console = canonical_auth_token(7);
+    let diagnostic = canonical_auth_token(8);
+    let fixture = local_evidence_fixture_with_auth(
+        Some(&console),
+        Some(&diagnostic),
+        ready_serving_gate(),
+        true,
+    )
+    .await;
+    let app = build_router(fixture.state);
+    let path = "/api/v1/cluster/local-evidence";
+
+    for request in [
+        Request::builder().uri(path).body(Body::empty()).unwrap(),
+        Request::builder()
+            .uri(format!("{path}?token={diagnostic}"))
+            .body(Body::empty())
+            .unwrap(),
+        Request::builder()
+            .uri(path)
+            .header(axum::http::header::COOKIE, format!("token={diagnostic}"))
+            .body(Body::empty())
+            .unwrap(),
+        Request::builder()
+            .uri(path)
+            .header(axum::http::header::AUTHORIZATION, "Bearer short")
+            .body(Body::empty())
+            .unwrap(),
+        Request::builder()
+            .uri(path)
+            .header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {diagnostic},Bearer {diagnostic}"),
+            )
+            .body(Body::empty())
+            .unwrap(),
+    ] {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let oversized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {}", "A".repeat(4_096)),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::UNAUTHORIZED);
+
+    let mut duplicate = Request::builder()
+        .uri(path)
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {diagnostic}"),
+        )
+        .body(Body::empty())
+        .unwrap();
+    duplicate.headers_mut().append(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {diagnostic}").parse().unwrap(),
+    );
+    let response = app.clone().oneshot(duplicate).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let query = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("{path}?unexpected=true"))
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {diagnostic}"),
+                )
+                .header(axum::http::header::ORIGIN, "https://observer.invalid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(query.status(), StatusCode::BAD_REQUEST);
+
+    let absolute = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("http://observer.invalid/api/v1/cluster/local-evidence")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {diagnostic}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(absolute.status(), StatusCode::BAD_REQUEST);
+
+    for alias in [
+        "/api/v1/cluster/local-evidence/",
+        "/api/v1/cluster//local-evidence",
+        "/api/v1/cluster/LOCAL-EVIDENCE",
+        "/api/v1/cluster/local%2Fevidence",
+        "/api/v1/cluster/local%5Cevidence",
+        "/api/v1/cluster/%2e/local-evidence",
+        "/api/v1/cluster/not-local-evidence",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(alias)
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {diagnostic}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{alias}");
+    }
+
+    let timings_path = "/api/v1/cluster/local-checkpoint-barrier-timings";
+    let absolute_timings = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("http://observer.invalid{timings_path}"))
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {diagnostic}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(absolute_timings.status(), StatusCode::BAD_REQUEST);
+
+    for alias in [
+        "/api/v1/cluster/local-checkpoint-barrier-timings/",
+        "/api/v1/cluster//local-checkpoint-barrier-timings",
+        "/api/v1/cluster/LOCAL-CHECKPOINT-BARRIER-TIMINGS",
+        "/api/v1/cluster/local-checkpoint%2Fbarrier-timings",
+        "/api/v1/cluster/local-checkpoint%5Cbarrier-timings",
+        "/api/v1/cluster/%2e/local-checkpoint-barrier-timings",
+        "/api/v1/cluster/not-local-checkpoint-barrier-timings",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(alias)
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {diagnostic}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{alias}");
+    }
 }
 
 #[cfg(feature = "cluster")]
@@ -1901,17 +2834,23 @@ async fn cluster_local_evidence_preserves_startup_recovery_and_terminal_gates() 
 
 #[tokio::test]
 async fn test_cluster_local_checkpoint_barrier_timings_404_when_not_cluster() {
-    let response = build_router(test_state())
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/cluster/local-checkpoint-barrier-timings")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    for state in [test_state(), test_state_with_token("supersecret-token")] {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/cluster/local-checkpoint-barrier-timings")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        "Bearer supersecret-token",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 #[cfg(feature = "cluster")]
@@ -1956,6 +2895,38 @@ async fn cluster_local_checkpoint_barrier_timings_requires_a_configured_bearer()
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn diagnostic_bearer_can_read_local_checkpoint_barrier_timings() {
+    let console = canonical_auth_token(9);
+    let diagnostic = canonical_auth_token(10);
+    let fixture = local_checkpoint_barrier_timings_fixture_with_auth(
+        Some(&console),
+        Some(&diagnostic),
+        ready_serving_gate(),
+    )
+    .await;
+    let response = build_router(fixture.state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cluster/local-checkpoint-barrier-timings?after_sequence=0")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {diagnostic}"),
+                )
+                .header(axum::http::header::ORIGIN, "https://observer.invalid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response
+        .headers()
+        .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .is_none());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn cluster_local_checkpoint_barrier_timings_rejects_closed_or_noncanonical_queries() {
     let fixture =
         local_checkpoint_barrier_timings_fixture(Some("supersecret-token"), ready_serving_gate())
@@ -1968,6 +2939,8 @@ async fn cluster_local_checkpoint_barrier_timings_rejects_closed_or_noncanonical
         "/api/v1/cluster/local-checkpoint-barrier-timings?after_sequence=0&expected_node_id=61"
             .to_string(),
         format!("{valid}&unexpected=true"),
+        format!("{valid}&after_sequence=0"),
+        format!("{valid}&expected_node_id=61"),
         valid.replace("expected_node_id=61", "expected_node_id=0"),
         valid.replace(&uuid::Uuid::from_u128(610).to_string(), "not-a-uuid"),
     ] {

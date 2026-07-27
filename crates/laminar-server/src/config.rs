@@ -7,6 +7,8 @@ use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use laminar_core::state::{
     KeyGroupCount, StateBackendConfig, StateBackendDurability, DEFAULT_CLUSTER_KEY_GROUP_COUNT,
     LOCAL_KEY_GROUP_COUNT,
@@ -26,6 +28,12 @@ const MIN_PGWIRE_PASSWORD_LEN: usize = 12;
 /// Minimum length for the console bearer token (HTTP control-plane auth).
 const MIN_CONSOLE_TOKEN_LEN: usize = 8;
 
+/// Both HTTP bearer credentials use a full 256 bits when observer access is enabled.
+const HTTP_AUTH_TOKEN_BYTES: usize = 32;
+
+/// Unpadded base64url length of a 32-byte credential.
+const HTTP_AUTH_TOKEN_ENCODED_LEN: usize = 43;
+
 /// Load, parse, and validate a LaminarDB configuration file.
 pub fn load_config(path: &Path) -> Result<ServerConfig, ConfigError> {
     let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::FileRead {
@@ -34,11 +42,15 @@ pub fn load_config(path: &Path) -> Result<ServerConfig, ConfigError> {
     })?;
 
     let substituted = substitute_env_vars(&raw)?;
-    let config: ServerConfig =
-        toml::from_str(&substituted).map_err(|e| ConfigError::ParseError {
+    let config: ServerConfig = toml::from_str(&substituted).map_err(|mut source| {
+        // `toml::de::Error` retains and renders its input. The substituted document can
+        // contain credentials, so detach it before the error crosses this boundary.
+        source.set_input(None);
+        ConfigError::ParseError {
             path: path.to_path_buf(),
-            source: e,
-        })?;
+            source,
+        }
+    })?;
 
     validate_config(&config)?;
     Ok(config)
@@ -70,6 +82,99 @@ fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
     }
 
     Ok(result.replace(ESCAPED_OPEN, "${"))
+}
+
+/// Validate the startup-bound HTTP authentication boundary.
+///
+/// This is separate from full file validation so programmatic startup paths can enforce the
+/// same credential and bind invariants before creating any externally visible resources.
+pub(crate) fn validate_http_auth(config: &ServerConfig) -> Result<(), ConfigError> {
+    let mut errors = Vec::new();
+    collect_http_auth_errors(config, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ConfigError::ValidationErrors { errors })
+    }
+}
+
+fn collect_http_auth_errors(config: &ServerConfig, errors: &mut Vec<String>) {
+    let bind = match config.server.bind.parse::<std::net::SocketAddr>() {
+        Ok(bind) => Some(bind),
+        Err(_) => {
+            errors.push(format!(
+                "invalid server bind address: '{}'",
+                config.server.bind
+            ));
+            None
+        }
+    };
+
+    let Some(diagnostic_token) = &config.server.diagnostic_read_token else {
+        if let Some(console_token) = &config.server.console_token {
+            if console_token.len() < MIN_CONSOLE_TOKEN_LEN {
+                errors.push(format!(
+                    "server.console_token must be at least {MIN_CONSOLE_TOKEN_LEN} characters"
+                ));
+            }
+        }
+        return;
+    };
+
+    if config.server.mode != ServerMode::Cluster {
+        errors.push("server.diagnostic_read_token requires server.mode = \"cluster\"".to_string());
+    }
+
+    match bind {
+        Some(bind) if !bind.ip().is_loopback() => errors.push(
+            "server.diagnostic_read_token requires server.bind to be a loopback socket address"
+                .to_string(),
+        ),
+        Some(_) | None => {}
+    }
+
+    if !is_canonical_http_auth_token(diagnostic_token) {
+        errors.push(format!(
+            "server.diagnostic_read_token must be the canonical unpadded base64url encoding of \
+             exactly {HTTP_AUTH_TOKEN_BYTES} bytes ({HTTP_AUTH_TOKEN_ENCODED_LEN} characters)"
+        ));
+    }
+
+    match &config.server.console_token {
+        None => errors.push(
+            "server.diagnostic_read_token requires server.console_token to be configured"
+                .to_string(),
+        ),
+        Some(console_token) => {
+            if !is_canonical_http_auth_token(console_token) {
+                errors.push(format!(
+                    "server.console_token must be the canonical unpadded base64url encoding of \
+                     exactly {HTTP_AUTH_TOKEN_BYTES} bytes ({HTTP_AUTH_TOKEN_ENCODED_LEN} \
+                     characters) when server.diagnostic_read_token is configured"
+                ));
+            }
+            if console_token == diagnostic_token {
+                errors.push(
+                    "server.diagnostic_read_token must differ from server.console_token"
+                        .to_string(),
+                );
+            }
+        }
+    }
+}
+
+fn is_canonical_http_auth_token(token: &Secret) -> bool {
+    let encoded = token.expose();
+    if encoded.len() != HTTP_AUTH_TOKEN_ENCODED_LEN {
+        return false;
+    }
+
+    match URL_SAFE_NO_PAD.decode(encoded) {
+        Ok(decoded) if decoded.len() == HTTP_AUTH_TOKEN_BYTES => {
+            URL_SAFE_NO_PAD.encode(decoded) == encoded
+        }
+        Ok(_) | Err(_) => false,
+    }
 }
 
 fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
@@ -114,12 +219,8 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
     }
 
-    if config.server.bind.parse::<std::net::SocketAddr>().is_err() {
-        errors.push(format!(
-            "invalid server bind address: '{}'",
-            config.server.bind
-        ));
-    }
+    collect_http_auth_errors(config, &mut errors);
+
     if let Some(addr) = &config.server.pgwire_bind {
         match addr.parse::<std::net::SocketAddr>() {
             Ok(addr) if !addr.ip().is_loopback() && config.server.pgwire_tls_cert.is_none() => {
@@ -192,14 +293,6 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
         if !ca.exists() {
             errors.push(format!("pgwire_tls_client_ca not found: {}", ca.display()));
-        }
-    }
-
-    if let Some(token) = &config.server.console_token {
-        if token.len() < MIN_CONSOLE_TOKEN_LEN {
-            errors.push(format!(
-                "server.console_token must be at least {MIN_CONSOLE_TOKEN_LEN} characters"
-            ));
         }
     }
 
@@ -419,6 +512,9 @@ pub struct ServerSection {
     /// Bearer token gating the HTTP console API; `None` leaves it unauthenticated (loopback/dev only).
     #[serde(default)]
     pub console_token: Option<Secret>,
+    /// Read-only bearer token for cluster diagnostics; enables the split diagnostic boundary.
+    #[serde(default)]
+    pub diagnostic_read_token: Option<Secret>,
     /// CORS allow-list of console origins; `None` falls back to a permissive policy (dev only).
     #[serde(default)]
     pub console_cors_allowed_origins: Option<Vec<String>>,
@@ -454,6 +550,7 @@ impl Default for ServerSection {
             pgwire_max_auth_failures_per_min: default_pgwire_max_auth_failures_per_min(),
             pgwire_tls_min_version: default_pgwire_tls_min_version(),
             console_token: None,
+            diagnostic_read_token: None,
             console_cors_allowed_origins: None,
         }
     }
@@ -999,6 +1096,29 @@ classify = "finbert"
 complete = "haiku"
 "#;
 
+    fn canonical_http_auth_secret(byte: u8) -> Secret {
+        Secret::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 32]))
+    }
+
+    fn diagnostic_auth_config(
+        diagnostic_read_token: Secret,
+        console_token: Option<Secret>,
+    ) -> ServerConfig {
+        let mut config: ServerConfig = toml::from_str("[server]\n").unwrap();
+        config.server.mode = ServerMode::Cluster;
+        config.server.bind = "127.0.0.1:8080".to_string();
+        config.server.console_token = console_token;
+        config.server.diagnostic_read_token = Some(diagnostic_read_token);
+        config
+    }
+
+    fn http_auth_errors(config: &ServerConfig) -> Vec<String> {
+        match validate_http_auth(config).unwrap_err() {
+            ConfigError::ValidationErrors { errors } => errors,
+            error => panic!("expected validation errors, got {error:?}"),
+        }
+    }
+
     #[test]
     fn parses_ai_section_and_models() {
         let config: ServerConfig = toml::from_str(AI_TOML).unwrap();
@@ -1097,6 +1217,32 @@ task = "classify"
         assert!(config.sources.is_empty());
         assert!(config.pipelines.is_empty());
         assert!(config.sinks.is_empty());
+    }
+
+    #[test]
+    fn parse_error_does_not_retain_substituted_input() {
+        const SENTINEL: &str = "LDB_PARSE_SECRET_SENTINEL_4f8757d46e";
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("invalid-secret.toml");
+        let input =
+            format!("[server]\nconsole_token = ${{LDB_PARSE_REDACTION_TEST_TOKEN:-{SENTINEL}}}\n");
+        std::fs::write(&path, input).unwrap();
+
+        let error = load_config(&path).expect_err("the unquoted substituted token is invalid TOML");
+        assert!(matches!(&error, ConfigError::ParseError { .. }));
+        assert!(!error.to_string().contains(SENTINEL));
+        assert!(!format!("{error:?}").contains(SENTINEL));
+
+        let mut source = std::error::Error::source(&error);
+        assert!(
+            source.is_some(),
+            "parse errors must retain their typed source"
+        );
+        while let Some(cause) = source {
+            assert!(!cause.to_string().contains(SENTINEL));
+            assert!(!format!("{cause:?}").contains(SENTINEL));
+            source = cause.source();
+        }
     }
 
     #[test]
@@ -1883,6 +2029,199 @@ console_cors_allowed_origins = ["https://console.example.com", "http://localhost
     }
 
     #[test]
+    fn legacy_console_only_token_remains_compatible() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+[server]
+console_token = "supersecret-token"
+"#,
+        )
+        .unwrap();
+
+        validate_http_auth(&config).expect("legacy console-only credentials remain valid");
+    }
+
+    #[test]
+    fn diagnostic_token_requires_console_token() {
+        let config = diagnostic_auth_config(canonical_http_auth_secret(1), None);
+        let errors = http_auth_errors(&config);
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("requires server.console_token")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_token_rejects_weak_diagnostic_credential() {
+        let config =
+            diagnostic_auth_config(Secret::new("weak"), Some(canonical_http_auth_secret(2)));
+        let errors = http_auth_errors(&config);
+
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("server.diagnostic_read_token") && error.contains("exactly 32 bytes")
+            }),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_token_rejects_noncanonical_base64url() {
+        let mut noncanonical = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([3_u8; 32]);
+        noncanonical.replace_range(HTTP_AUTH_TOKEN_ENCODED_LEN - 1.., "B");
+        assert_eq!(noncanonical.len(), HTTP_AUTH_TOKEN_ENCODED_LEN);
+
+        let config = diagnostic_auth_config(
+            Secret::new(noncanonical),
+            Some(canonical_http_auth_secret(4)),
+        );
+        let errors = http_auth_errors(&config);
+
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("server.diagnostic_read_token") && error.contains("canonical")
+            }),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_token_requires_strong_console_credential() {
+        let config =
+            diagnostic_auth_config(canonical_http_auth_secret(5), Some(Secret::new("weak")));
+        let errors = http_auth_errors(&config);
+
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("server.console_token") && error.contains("exactly 32 bytes")
+            }),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_and_console_tokens_must_be_distinct() {
+        let token = canonical_http_auth_secret(6);
+        let config = diagnostic_auth_config(token.clone(), Some(token));
+        let errors = http_auth_errors(&config);
+
+        assert!(
+            errors.iter().any(|error| error.contains("must differ")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_token_requires_cluster_mode() {
+        let mut config = diagnostic_auth_config(
+            canonical_http_auth_secret(7),
+            Some(canonical_http_auth_secret(8)),
+        );
+        config.server.mode = ServerMode::Single;
+        let errors = http_auth_errors(&config);
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("requires server.mode = \"cluster\"")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_token_requires_loopback_http_bind() {
+        let mut config = diagnostic_auth_config(
+            canonical_http_auth_secret(9),
+            Some(canonical_http_auth_secret(10)),
+        );
+        config.server.bind = "0.0.0.0:8080".to_string();
+        let errors = http_auth_errors(&config);
+
+        assert!(
+            errors.iter().any(|error| error.contains("loopback")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_token_accepts_valid_split_credentials() {
+        let diagnostic = canonical_http_auth_secret(11);
+        let console = canonical_http_auth_secret(12);
+        let diagnostic_value = diagnostic.expose().to_string();
+        let console_value = console.expose().to_string();
+        let config = diagnostic_auth_config(diagnostic, Some(console));
+
+        validate_http_auth(&config).expect("valid split diagnostic credentials must pass");
+        let debug = format!("{:?}", config.server);
+        assert!(
+            !debug.contains(&diagnostic_value),
+            "diagnostic token leaked"
+        );
+        assert!(!debug.contains(&console_value), "console token leaked");
+    }
+
+    #[test]
+    fn file_loader_uses_the_shared_diagnostic_auth_validator() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("diagnostic-auth.toml");
+        let diagnostic = canonical_http_auth_secret(13);
+        let console = canonical_http_auth_secret(14);
+        let invalid = format!(
+            "[server]\nconsole_token = \"{}\"\ndiagnostic_read_token = \"{}\"\n",
+            console.expose(),
+            diagnostic.expose()
+        );
+        std::fs::write(&path, invalid).unwrap();
+        let error = load_config(&path).expect_err("single-node diagnostic auth must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("diagnostic_read_token requires server.mode"),
+            "{error}"
+        );
+
+        let valid = format!(
+            r#"node_id = "node-1"
+
+[server]
+mode = "cluster"
+bind = "127.0.0.1:8080"
+console_token = "{}"
+diagnostic_read_token = "{}"
+
+[state]
+backend = "object_store"
+url = "az://laminardb-test/state"
+
+[checkpoint]
+url = "az://laminardb-test/checkpoints"
+
+[discovery]
+strategy = "static"
+seeds = []
+gossip_port = 7946
+"#,
+            console.expose(),
+            diagnostic.expose()
+        );
+        std::fs::write(&path, valid).unwrap();
+        let loaded = load_config(&path).expect("valid file-based split credentials must pass");
+        assert_eq!(loaded.server.mode, ServerMode::Cluster);
+        assert_eq!(
+            loaded
+                .server
+                .diagnostic_read_token
+                .as_ref()
+                .unwrap()
+                .expose(),
+            diagnostic.expose()
+        );
+    }
+
+    #[test]
     fn test_console_token_redacted_in_debug() {
         let toml = r#"
 [server]
@@ -1927,6 +2266,7 @@ console_token = "supersecret-token"
     fn test_console_auth_defaults_to_none() {
         let config = ServerSection::default();
         assert!(config.console_token.is_none());
+        assert!(config.diagnostic_read_token.is_none());
         assert!(config.console_cors_allowed_origins.is_none());
     }
 

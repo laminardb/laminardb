@@ -158,6 +158,14 @@ pub fn diff_configs(old: &ServerConfig, new: &ServerConfig) -> ConfigDiff {
     diff
 }
 
+/// Commit only the configuration sections supported by live reload.
+pub(crate) fn commit_reloadable_config(current: &mut ServerConfig, new: ServerConfig) {
+    current.sources = new.sources;
+    current.lookups = new.lookups;
+    current.pipelines = new.pipelines;
+    current.sinks = new.sinks;
+}
+
 fn diff_named_section<T: Clone + PartialEq>(
     old: &[T],
     new: &[T],
@@ -471,6 +479,99 @@ mod tests {
             primary_key: vec![],
             schema: vec![],
         }
+    }
+
+    #[test]
+    fn commit_reloadable_config_replaces_only_live_sections() {
+        let mut current = empty_config();
+        current.sources.push(make_source("old_source"));
+        current.lookups.push(make_lookup("old_lookup"));
+        current
+            .pipelines
+            .push(make_pipeline("old_pipeline", "SELECT 1"));
+        current.sinks.push(make_sink("old_sink", "old_pipeline"));
+        current.server.bind = "127.0.0.1:8100".to_owned();
+        current.server.console_token = Some(Secret::new("old-console-token"));
+        current.state = laminar_core::state::StateBackendConfig::local("./old-state");
+        current.checkpoint.url = "file:///old-checkpoints".to_owned();
+        current.supervision.max_restarts = Some(3);
+        current.sql = Some("CREATE SOURCE retained (id BIGINT)".to_owned());
+        current.discovery = Some(DiscoverySection {
+            strategy: "static".to_owned(),
+            seeds: vec!["127.0.0.1:9000".to_owned()],
+            gossip_port: 9_001,
+            advertise_host: Some("127.0.0.1".to_owned()),
+            failure_domain: Some("rack=old".to_owned()),
+            placement_isolation_tier: 0,
+            cluster_tls_cert: None,
+            cluster_tls_key: None,
+            cluster_tls_client_ca: None,
+            cluster_tls_server_name: None,
+        });
+        current.node_id = Some("old-node".to_owned());
+        current
+            .ai
+            .defaults
+            .insert("classify".to_owned(), "old-model".to_owned());
+        current.models.insert(
+            "old-model".to_owned(),
+            ModelConfig {
+                kind: "local".to_owned(),
+                task: TaskSpec::One("classify".to_owned()),
+                provider: None,
+                model: None,
+                source: Some("file:///old-model".to_owned()),
+            },
+        );
+
+        let retained_server = current.server.clone();
+        let retained_state = current.state.clone();
+        let retained_checkpoint = current.checkpoint.clone();
+        let retained_supervision = current.supervision.clone();
+        let retained_sql = current.sql.clone();
+        let retained_discovery = current.discovery.clone();
+        let retained_node_id = current.node_id.clone();
+        let retained_ai = current.ai.clone();
+        let retained_models = current.models.clone();
+
+        let mut new = current.clone();
+        new.sources = vec![make_source("new_source")];
+        new.lookups = vec![make_lookup("new_lookup")];
+        new.pipelines = vec![make_pipeline("new_pipeline", "SELECT 2")];
+        new.sinks = vec![make_sink("new_sink", "new_pipeline")];
+        new.server.bind = "127.0.0.1:8200".to_owned();
+        new.server.console_token = Some(Secret::new("new-console-token"));
+        new.state = laminar_core::state::StateBackendConfig::local("./new-state");
+        new.checkpoint.url = "file:///new-checkpoints".to_owned();
+        new.supervision.max_restarts = Some(9);
+        new.sql = Some("CREATE SOURCE replaced (id BIGINT)".to_owned());
+        new.discovery.as_mut().unwrap().strategy = "gossip".to_owned();
+        new.node_id = Some("new-node".to_owned());
+        new.ai.defaults.clear();
+        new.models.clear();
+
+        commit_reloadable_config(&mut current, new);
+
+        assert_eq!(current.sources, vec![make_source("new_source")]);
+        assert_eq!(current.lookups, vec![make_lookup("new_lookup")]);
+        assert_eq!(
+            current.pipelines,
+            vec![make_pipeline("new_pipeline", "SELECT 2")]
+        );
+        assert_eq!(current.sinks, vec![make_sink("new_sink", "new_pipeline")]);
+        assert_eq!(current.server, retained_server);
+        assert_eq!(
+            current.server.console_token.as_ref().unwrap().expose(),
+            "old-console-token"
+        );
+        assert_eq!(current.state, retained_state);
+        assert_eq!(current.checkpoint, retained_checkpoint);
+        assert_eq!(current.supervision, retained_supervision);
+        assert_eq!(current.sql, retained_sql);
+        assert_eq!(current.discovery, retained_discovery);
+        assert_eq!(current.node_id, retained_node_id);
+        assert_eq!(current.ai, retained_ai);
+        assert_eq!(current.models, retained_models);
     }
 
     // -- diff_configs tests --

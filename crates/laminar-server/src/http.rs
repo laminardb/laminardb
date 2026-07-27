@@ -10,8 +10,12 @@ use std::{future::Future as _, future::IntoFuture as _, task::Poll};
 use prometheus::Registry;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+#[cfg(feature = "cluster")]
+use axum::extract::{Extension, RawQuery};
+use axum::extract::{MatchedPath, Path, Query, State};
+use axum::http::StatusCode;
+#[cfg(feature = "cluster")]
+use axum::http::{HeaderMap, Method};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -21,7 +25,7 @@ use tracing::{info, warn};
 
 use laminar_db::{ConnectorInfo, LaminarDB, PipelineNodeType};
 
-use crate::config::{ServerConfig, ServerMode};
+use crate::config::{Secret, ServerConfig, ServerMode, ServerSection};
 use crate::metrics::ServerMetrics;
 use crate::reload::{self, ReloadGuard};
 use crate::server::ServerError;
@@ -47,12 +51,136 @@ pub struct AppState {
     pub reload_guard: ReloadGuard,
     pub registry: Arc<Registry>,
     pub server_metrics: ServerMetrics,
+    pub(crate) auth_policy: HttpAuthPolicy,
+    #[cfg(feature = "cluster")]
+    pub(crate) diagnostic_reads: DiagnosticReadGate,
     pub(crate) ws_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) serving_gate: Arc<ServingGate>,
     /// Cluster control-plane handles (cluster mode only). `None` in
     /// single-node mode; the cluster endpoints 404 when absent.
     #[cfg(feature = "cluster")]
     pub cluster: Option<ClusterComponents>,
+}
+
+#[derive(Clone)]
+pub(crate) struct HttpAuthPolicy {
+    console_token: Option<Secret>,
+    #[cfg(feature = "cluster")]
+    diagnostic_read_token: Option<Secret>,
+    #[cfg(feature = "cluster")]
+    cluster_mode: bool,
+}
+
+impl HttpAuthPolicy {
+    pub(crate) fn from_server(server: &ServerSection) -> Self {
+        Self {
+            console_token: server.console_token.clone(),
+            #[cfg(feature = "cluster")]
+            diagnostic_read_token: server.diagnostic_read_token.clone(),
+            #[cfg(feature = "cluster")]
+            cluster_mode: server.mode == ServerMode::Cluster,
+        }
+    }
+
+    fn console_token(&self) -> Option<&Secret> {
+        self.console_token.as_ref()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn diagnostic_principal(&self, headers: &HeaderMap) -> DiagnosticAuth {
+        let Some(token) = single_bearer_token(headers) else {
+            return if self.console_token.is_none() && self.diagnostic_read_token.is_none() {
+                DiagnosticAuth::Unconfigured
+            } else {
+                DiagnosticAuth::Unauthorized
+            };
+        };
+        if self
+            .console_token
+            .as_ref()
+            .is_some_and(|expected| secret_matches(token, expected))
+        {
+            return DiagnosticAuth::Authorized(DiagnosticPrincipal::Console);
+        }
+        if self
+            .diagnostic_read_token
+            .as_ref()
+            .is_some_and(|expected| secret_matches(token, expected))
+        {
+            return DiagnosticAuth::Authorized(DiagnosticPrincipal::DiagnosticRead);
+        }
+        DiagnosticAuth::Unauthorized
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "cluster")]
+enum DiagnosticPrincipal {
+    Console,
+    DiagnosticRead,
+}
+
+#[cfg(feature = "cluster")]
+enum DiagnosticAuth {
+    Unconfigured,
+    Unauthorized,
+    Authorized(DiagnosticPrincipal),
+}
+
+#[cfg(feature = "cluster")]
+const DIAGNOSTIC_READ_MAX_STARTS_PER_WINDOW: usize = 8;
+#[cfg(feature = "cluster")]
+const DIAGNOSTIC_READ_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(feature = "cluster")]
+const DIAGNOSTIC_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(feature = "cluster")]
+struct DiagnosticRateWindow {
+    starts: [Option<Instant>; DIAGNOSTIC_READ_MAX_STARTS_PER_WINDOW],
+}
+
+#[cfg(feature = "cluster")]
+impl Default for DiagnosticRateWindow {
+    fn default() -> Self {
+        Self {
+            starts: [None; DIAGNOSTIC_READ_MAX_STARTS_PER_WINDOW],
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl DiagnosticRateWindow {
+    fn try_start(&mut self, now: Instant) -> bool {
+        for start in &mut self.starts {
+            if start.is_some_and(|started| {
+                now.checked_duration_since(started)
+                    .is_some_and(|elapsed| elapsed >= DIAGNOSTIC_READ_RATE_WINDOW)
+            }) {
+                *start = None;
+            }
+        }
+        let Some(slot) = self.starts.iter_mut().find(|start| start.is_none()) else {
+            return false;
+        };
+        *slot = Some(now);
+        true
+    }
+}
+
+#[cfg(feature = "cluster")]
+pub(crate) struct DiagnosticReadGate {
+    permit: Arc<tokio::sync::Semaphore>,
+    rate: parking_lot::Mutex<DiagnosticRateWindow>,
+}
+
+#[cfg(feature = "cluster")]
+impl DiagnosticReadGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            rate: parking_lot::Mutex::new(DiagnosticRateWindow::default()),
+        }
+    }
 }
 
 const SERVING_STARTING: u8 = 0;
@@ -215,7 +343,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     // Control-plane (`/api/v1/*`) and realtime (`/ws/{name}`) routes, gated by
     // the console bearer token when one is configured.
-    let protected = Router::new()
+    let console = Router::new()
         .route("/api/v1/sources", get(list_sources))
         .route("/api/v1/sinks", get(list_sinks))
         .route("/api/v1/streams", get(list_streams))
@@ -229,14 +357,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/cluster", get(cluster_status))
         .route("/api/v1/cluster/nodes", get(cluster_nodes))
         .route("/api/v1/cluster/vnodes", get(cluster_vnodes))
-        .route(
-            "/api/v1/cluster/local-evidence",
-            get(cluster_local_evidence),
-        )
-        .route(
-            "/api/v1/cluster/local-checkpoint-barrier-timings",
-            get(cluster_local_checkpoint_barrier_timings),
-        )
         .route("/api/v1/cluster/leader", get(cluster_leader))
         .route("/api/v1/cluster/checkpoints", get(cluster_checkpoints))
         .route("/api/v1/pipeline/stop", post(stop_pipeline))
@@ -248,13 +368,41 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             auth_middleware,
         ));
 
-    public
-        .merge(protected)
+    // The local evidence routes accept the console administrator or the strictly narrower
+    // diagnostic-read bearer. They intentionally sit outside console CORS and override Axum's
+    // implicit GET-to-HEAD behavior.
+    let diagnostics = Router::new()
+        .route(
+            "/api/v1/cluster/local-evidence",
+            get(cluster_local_evidence).head(diagnostic_method_not_allowed),
+        )
+        .route(
+            "/api/v1/cluster/local-checkpoint-barrier-timings",
+            get(cluster_local_checkpoint_barrier_timings).head(diagnostic_method_not_allowed),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            diagnostic_bounds_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            diagnostic_auth_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            startup_gate_middleware,
+        ));
+
+    let public_console = public
+        .merge(console)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             startup_gate_middleware,
         ))
         .layer(cors)
+        .merge(diagnostics);
+
+    public_console
         .layer(axum::middleware::from_fn(request_logging))
         .with_state(state)
 }
@@ -309,19 +457,16 @@ async fn auth_middleware(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    // Clone the token out and drop the guard before any `.await`; the
-    // parking_lot guard is `!Send` and must not cross `next.run`.
-    let expected = state.current_config.read().server.console_token.clone();
-
-    if let Some(expected) = expected {
-        let expected = expected.expose();
+    if let Some(expected) = state.auth_policy.console_token() {
         // The `?token=` query parameter exists for browser WebSocket clients,
         // which can't set the `Authorization` header on the upgrade request.
         // Restrict it to WS routes (`/ws/…`) so it can't leak into access
         // logs, referrers, or proxy caches on regular control-plane requests.
         let is_ws = req.uri().path().starts_with("/ws/");
-        let authorized = bearer_token(req.headers()).is_some_and(|t| ct_eq(t, expected))
-            || (is_ws && query_token(req.uri()).is_some_and(|t| ct_eq(&t, expected)));
+        let authorized = single_bearer_token(req.headers())
+            .is_some_and(|token| secret_matches(token, expected))
+            || (is_ws
+                && query_token(req.uri()).is_some_and(|token| secret_matches(&token, expected)));
         if !authorized {
             return error_response(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
@@ -330,13 +475,113 @@ async fn auth_middleware(
     next.run(req).await
 }
 
-/// Extract the bearer token from an `Authorization: Bearer <token>` header.
-fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
+#[cfg(feature = "cluster")]
+async fn diagnostic_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    mut req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !state.auth_policy.cluster_mode {
+        return next.run(req).await;
+    }
+    if req.uri().scheme().is_some() || req.uri().authority().is_some() {
+        return error_response(StatusCode::BAD_REQUEST, "invalid diagnostic request target")
+            .into_response();
+    }
+    match state.auth_policy.diagnostic_principal(req.headers()) {
+        DiagnosticAuth::Unconfigured => next.run(req).await,
+        DiagnosticAuth::Unauthorized => {
+            error_response(StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+        }
+        DiagnosticAuth::Authorized(principal) => {
+            req.extensions_mut().insert(principal);
+            next.run(req).await
+        }
+    }
+}
+
+#[cfg(not(feature = "cluster"))]
+async fn diagnostic_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let _ = state;
+    next.run(req).await
+}
+
+#[cfg(feature = "cluster")]
+async fn diagnostic_bounds_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let bounded_get = req.method() == Method::GET
+        && matches!(
+            req.uri().path(),
+            "/api/v1/cluster/local-evidence" | "/api/v1/cluster/local-checkpoint-barrier-timings"
+        )
+        && req.extensions().get::<DiagnosticPrincipal>().is_some();
+    if !bounded_get {
+        return next.run(req).await;
+    }
+
+    let Ok(_permit) = Arc::clone(&state.diagnostic_reads.permit).try_acquire_owned() else {
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "local diagnostic request already in progress",
+        )
+        .into_response();
+    };
+    if !state.diagnostic_reads.rate.lock().try_start(Instant::now()) {
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "local diagnostic request rate exceeded",
+        )
+        .into_response();
+    }
+
+    match tokio::time::timeout(DIAGNOSTIC_READ_DEADLINE, next.run(req)).await {
+        Ok(response) => response,
+        Err(_) => error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "local diagnostic request timed out",
+        )
+        .into_response(),
+    }
+}
+
+#[cfg(not(feature = "cluster"))]
+async fn diagnostic_bounds_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let _ = state;
+    next.run(req).await
+}
+
+async fn diagnostic_method_not_allowed() -> impl IntoResponse {
+    error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "diagnostic route requires GET",
+    )
+}
+
+/// Extract exactly one bearer value. Duplicate fields and comma-joined values fail closed.
+fn single_bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(axum::http::header::AUTHORIZATION).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let token = value.to_str().ok()?.strip_prefix("Bearer ")?;
+    (!token.contains(',')).then_some(token)
+}
+
+fn secret_matches(presented: &str, expected: &Secret) -> bool {
+    let expected = expected.expose();
+    presented.len() == expected.len() && ct_eq(presented, expected)
 }
 
 /// Extract and percent-decode the `token` query parameter, if present. Browser
@@ -494,9 +739,14 @@ async fn request_logging(
     next: axum::middleware::Next,
 ) -> impl IntoResponse {
     let method = req.method().clone();
-    // Log only the path — the query string can carry the `?token=` secret used
-    // by browser WebSocket clients, which must not land in access logs.
-    let path = req.uri().path().to_owned();
+    // Log only the matched route template. Raw targets can carry a WebSocket query token or an
+    // attacker-controlled credential-shaped path segment and must not land in access logs.
+    let path = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or("<unmatched>")
+        .to_owned();
     let start = Instant::now();
 
     let response = next.run(req).await;
@@ -822,7 +1072,7 @@ async fn handle_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     // Update current config on success
     if result.success {
         let mut current = state.current_config.write();
-        *current = new_config;
+        reload::commit_reloadable_config(&mut current, new_config);
         info!(
             "Configuration reloaded successfully ({} ops)",
             result.applied.len()
@@ -900,7 +1150,7 @@ async fn fan_out_pipeline_control(state: &AppState, local: bool, path: &str) {
             .filter(|m| self_id != m.id)
             .map(|m| m.rpc_address.clone())
             .collect();
-        let token = state.current_config.read().server.console_token.clone();
+        let token = state.auth_policy.console_token.clone();
         let client = reqwest::Client::new();
         // Fan out concurrently with `join_all`; these are I/O-bound futures with
         // no CPU work, so there's nothing to gain from spawning a task each.
@@ -1041,7 +1291,9 @@ const LOCAL_EVIDENCE_SCHEMA_VERSION: &str = "laminardb-local-authority-evidence/
 const MAX_LOCAL_EVIDENCE_RESPONSE_BYTES: usize = 4_096;
 #[cfg(feature = "cluster")]
 const LOCAL_EVIDENCE_TOKEN_REQUIRED_MSG: &str =
-    "local process authority evidence requires server.console_token";
+    "local process authority evidence requires configured HTTP authentication";
+#[cfg(feature = "cluster")]
+const LOCAL_EVIDENCE_QUERY_MSG: &str = "local process authority evidence does not accept a query";
 #[cfg(feature = "cluster")]
 const LOCAL_EVIDENCE_UNAVAILABLE_MSG: &str = "local process authority evidence is unavailable";
 #[cfg(feature = "cluster")]
@@ -1053,7 +1305,7 @@ const LOCAL_CHECKPOINT_BARRIER_TIMINGS_SCHEMA_VERSION: &str =
 const MAX_LOCAL_CHECKPOINT_BARRIER_TIMINGS_RESPONSE_BYTES: usize = 64 * 1_024;
 #[cfg(feature = "cluster")]
 const LOCAL_CHECKPOINT_BARRIER_TIMINGS_TOKEN_REQUIRED_MSG: &str =
-    "local checkpoint barrier timings require server.console_token";
+    "local checkpoint barrier timings require configured HTTP authentication";
 #[cfg(feature = "cluster")]
 const LOCAL_CHECKPOINT_BARRIER_TIMINGS_UNAVAILABLE_MSG: &str =
     "local checkpoint barrier timings are unavailable";
@@ -1232,138 +1484,116 @@ async fn cluster_vnodes(State(state): State<Arc<AppState>>) -> impl IntoResponse
 ///
 /// This route intentionally remains behind the normal startup/recovery serving gate. It never
 /// rereads the durable assignment snapshot or treats shared publication as local convergence.
+#[cfg(feature = "cluster")]
 async fn cluster_local_evidence(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    principal: Option<Extension<DiagnosticPrincipal>>,
+    RawQuery(raw_query): RawQuery,
 ) -> impl IntoResponse {
-    #[cfg(feature = "cluster")]
-    {
-        let Some(cluster) = state.cluster.as_ref() else {
-            return error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response();
-        };
+    let Some(cluster) = state.cluster.as_ref() else {
+        return error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response();
+    };
+    let Some(Extension(_principal)) = principal else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            LOCAL_EVIDENCE_TOKEN_REQUIRED_MSG,
+        )
+        .into_response();
+    };
+    if raw_query.is_some() {
+        return error_response(StatusCode::BAD_REQUEST, LOCAL_EVIDENCE_QUERY_MSG).into_response();
+    }
 
-        // The protected router authenticates this request first. Require a configured token for
-        // this sensitive route and accept only the bearer form before capturing evidence. The
-        // same checks are repeated immediately before 200 to close a configuration-reload race.
-        let expected = state.current_config.read().server.console_token.clone();
-        let Some(expected) = expected else {
+    let evidence = match cluster
+        .controller
+        .read_local_process_authority_evidence()
+        .await
+    {
+        Ok(evidence) => evidence,
+        Err(laminar_core::cluster::control::LocalProcessAuthorityEvidenceError::Unavailable(
+            error,
+        )) => {
+            warn!(%error, "local process authority evidence is unavailable");
             return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                LOCAL_EVIDENCE_TOKEN_REQUIRED_MSG,
+                LOCAL_EVIDENCE_UNAVAILABLE_MSG,
             )
             .into_response();
-        };
-        if !bearer_token(&headers).is_some_and(|token| ct_eq(token, expected.expose())) {
-            return error_response(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
-
-        let evidence = match cluster
-            .controller
-            .read_local_process_authority_evidence()
-            .await
-        {
-            Ok(evidence) => evidence,
-            Err(
-                laminar_core::cluster::control::LocalProcessAuthorityEvidenceError::Unavailable(
-                    error,
-                ),
-            ) => {
-                warn!(%error, "local process authority evidence is unavailable");
-                return error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    LOCAL_EVIDENCE_UNAVAILABLE_MSG,
-                )
-                .into_response();
-            }
-            Err(laminar_core::cluster::control::LocalProcessAuthorityEvidenceError::Invalid(
-                error,
-            )) => {
-                warn!(%error, "local process authority evidence is invalid");
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    LOCAL_EVIDENCE_INVALID_MSG,
-                )
-                .into_response();
-            }
-        };
-
-        let adoption = &evidence.adopted_assignment;
-        if evidence.participant.node_id == 0
-            || evidence.participant.boot_incarnation.is_nil()
-            || evidence.process_term == 0
-            || !adoption.is_canonical()
-            || adoption.participant != evidence.participant
-        {
-            warn!("local process authority evidence violated its canonical response contract");
+        Err(laminar_core::cluster::control::LocalProcessAuthorityEvidenceError::Invalid(error)) => {
+            warn!(%error, "local process authority evidence is invalid");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 LOCAL_EVIDENCE_INVALID_MSG,
             )
             .into_response();
         }
+    };
 
-        let envelope = LocalEvidenceResponse {
-            schema_version: LOCAL_EVIDENCE_SCHEMA_VERSION,
-            evidence,
-        };
-        let encoded = match serde_json::to_vec(&envelope) {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                warn!(%error, "failed to serialize local process authority evidence");
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    LOCAL_EVIDENCE_INVALID_MSG,
-                )
-                .into_response();
-            }
-        };
-        if encoded.len() > MAX_LOCAL_EVIDENCE_RESPONSE_BYTES {
-            warn!(
-                encoded_bytes = encoded.len(),
-                maximum_bytes = MAX_LOCAL_EVIDENCE_RESPONSE_BYTES,
-                "local process authority evidence exceeded its response bound"
-            );
+    let adoption = &evidence.adopted_assignment;
+    if evidence.participant.node_id == 0
+        || evidence.participant.boot_incarnation.is_nil()
+        || evidence.process_term == 0
+        || !adoption.is_canonical()
+        || adoption.participant != evidence.participant
+    {
+        warn!("local process authority evidence violated its canonical response contract");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            LOCAL_EVIDENCE_INVALID_MSG,
+        )
+        .into_response();
+    }
+
+    let envelope = LocalEvidenceResponse {
+        schema_version: LOCAL_EVIDENCE_SCHEMA_VERSION,
+        evidence,
+    };
+    let encoded = match serde_json::to_vec(&envelope) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            warn!(%error, "failed to serialize local process authority evidence");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 LOCAL_EVIDENCE_INVALID_MSG,
             )
             .into_response();
         }
-
-        // Close a capture/response race with terminal fencing or a newly started recovery. The
-        // middleware performs the same check before capture; neither check grants data authority.
-        if let Some(reason) = state.serving_rejection() {
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
-        }
-
-        let expected = state.current_config.read().server.console_token.clone();
-        let Some(expected) = expected else {
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                LOCAL_EVIDENCE_TOKEN_REQUIRED_MSG,
-            )
-            .into_response();
-        };
-        if !bearer_token(&headers).is_some_and(|token| ct_eq(token, expected.expose())) {
-            return error_response(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-        }
-
-        let mut response = (StatusCode::OK, encoded).into_response();
-        response.headers_mut().insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/json"),
+    };
+    if encoded.len() > MAX_LOCAL_EVIDENCE_RESPONSE_BYTES {
+        warn!(
+            encoded_bytes = encoded.len(),
+            maximum_bytes = MAX_LOCAL_EVIDENCE_RESPONSE_BYTES,
+            "local process authority evidence exceeded its response bound"
         );
-        response.headers_mut().insert(
-            axum::http::header::CACHE_CONTROL,
-            axum::http::HeaderValue::from_static("no-store"),
-        );
-        response
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            LOCAL_EVIDENCE_INVALID_MSG,
+        )
+        .into_response();
     }
-    #[cfg(not(feature = "cluster"))]
-    {
-        let _ = (state, headers);
-        error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response()
+
+    // Close a capture/response race with terminal fencing or a newly started recovery.
+    if let Some(reason) = state.serving_rejection() {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
     }
+
+    let mut response = (StatusCode::OK, encoded).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+#[cfg(not(feature = "cluster"))]
+async fn cluster_local_evidence(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let _ = state;
+    error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response()
 }
 
 /// `GET /api/v1/cluster/local-checkpoint-barrier-timings` — bounded local pause evidence.
@@ -1375,7 +1605,7 @@ async fn cluster_local_evidence(
 #[cfg(feature = "cluster")]
 async fn cluster_local_checkpoint_barrier_timings(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    principal: Option<Extension<DiagnosticPrincipal>>,
     query: Result<
         Query<LocalCheckpointBarrierTimingsQuery>,
         axum::extract::rejection::QueryRejection,
@@ -1388,21 +1618,13 @@ async fn cluster_local_checkpoint_barrier_timings(
         let Some(_cluster) = state.cluster.as_ref() else {
             return error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response();
         };
-
-        // The router has already authenticated configured tokens. This evidence route is stricter:
-        // it is disabled without a token and accepts only the bearer header. Repeat this check
-        // immediately before 200 to close a concurrent configuration-reload race.
-        let expected_token = state.current_config.read().server.console_token.clone();
-        let Some(expected_token) = expected_token else {
+        let Some(Extension(_principal)) = principal else {
             return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 LOCAL_CHECKPOINT_BARRIER_TIMINGS_TOKEN_REQUIRED_MSG,
             )
             .into_response();
         };
-        if !bearer_token(&headers).is_some_and(|token| ct_eq(token, expected_token.expose())) {
-            return error_response(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-        }
 
         let Query(query) = match query {
             Ok(query) => query,
@@ -1511,17 +1733,6 @@ async fn cluster_local_checkpoint_barrier_timings(
 
         if let Some(reason) = state.serving_rejection() {
             return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
-        }
-        let expected_token = state.current_config.read().server.console_token.clone();
-        let Some(expected_token) = expected_token else {
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                LOCAL_CHECKPOINT_BARRIER_TIMINGS_TOKEN_REQUIRED_MSG,
-            )
-            .into_response();
-        };
-        if !bearer_token(&headers).is_some_and(|token| ct_eq(token, expected_token.expose())) {
-            return error_response(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
 
         let mut response = (StatusCode::OK, encoded).into_response();
