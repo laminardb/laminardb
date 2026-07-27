@@ -552,6 +552,15 @@ impl ObjectStoreBackend {
         expected_attempt: CheckpointAttempt,
         expected_vnode: u32,
     ) -> Result<Bytes, StateBackendError> {
+        Self::decode_partial_with_attestation(bytes, expected_attempt, expected_vnode)
+            .map(|(_, payload)| payload)
+    }
+
+    fn decode_partial_with_attestation(
+        bytes: &Bytes,
+        expected_attempt: CheckpointAttempt,
+        expected_vnode: u32,
+    ) -> Result<(SealedVnodePartial, Bytes), StateBackendError> {
         const ARCHIVE_ALIGNMENT: usize = rkyv::util::AlignedVec::<16>::ALIGNMENT;
 
         let metadata = Self::parse_partial_header(bytes, expected_attempt, expected_vnode)?;
@@ -571,16 +580,19 @@ impl ObjectStoreBackend {
                 "vnode partial payload checksum mismatch".into(),
             ));
         }
-        if payload.is_empty() || payload.as_ptr().align_offset(ARCHIVE_ALIGNMENT) == 0 {
-            return Ok(payload);
-        }
-
-        // Object-store clients may expose a view into an arbitrarily aligned network buffer.
-        // Normalize it once here so recovery-chain consumers can validate and decode the rkyv
-        // payload repeatedly without making a fresh aligned copy on every pass.
-        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(payload.len());
-        aligned.extend_from_slice(&payload);
-        Ok(Bytes::from_owner(aligned))
+        let payload = if payload.is_empty() || payload.as_ptr().align_offset(ARCHIVE_ALIGNMENT) == 0
+        {
+            payload
+        } else {
+            // Object-store clients may expose a view into an arbitrarily aligned network
+            // buffer. Normalize it once here so recovery-chain consumers can validate and
+            // decode the rkyv payload repeatedly without making a fresh aligned copy on every
+            // pass.
+            let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(payload.len());
+            aligned.extend_from_slice(&payload);
+            Bytes::from_owner(aligned)
+        };
+        Ok((metadata, payload))
     }
 
     async fn read_partial_attestation(
@@ -1191,6 +1203,69 @@ impl StateBackend for ObjectStoreBackend {
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(StateBackendError::Io(e.to_string())),
+        }
+    }
+
+    async fn read_sealed_partial_bounded(
+        &self,
+        attempt: CheckpointAttempt,
+        sealed: &SealedVnodePartial,
+        max_bytes: u64,
+    ) -> Result<Option<Bytes>, StateBackendError> {
+        Self::ensure_canonical_attempt(attempt)?;
+        self.check_vnode(sealed.vnode)?;
+        let path = Self::partial_path(attempt, sealed.vnode);
+        if sealed.payload_len > max_bytes {
+            return Err(StateBackendError::Conflict {
+                resource: path.to_string(),
+                message: format!(
+                    "sealed vnode partial declares {} bytes; read bound is {max_bytes}",
+                    sealed.payload_len
+                ),
+            });
+        }
+        if self.attempt_is_pruned(attempt).await? {
+            return Ok(None);
+        }
+        match self.store.get(&path).await {
+            Ok(result) => {
+                let expected_object_bytes = (VNODE_PARTIAL_HEADER_LEN as u64)
+                    .checked_add(sealed.payload_len)
+                    .ok_or_else(|| StateBackendError::Conflict {
+                        resource: path.to_string(),
+                        message: "sealed vnode partial length overflows object size".into(),
+                    })?;
+                if result.meta.size != expected_object_bytes {
+                    return Err(StateBackendError::Conflict {
+                        resource: path.to_string(),
+                        message: format!(
+                            "stored vnode partial is {} bytes; checkpoint seal requires \
+                             {expected_object_bytes} bytes including its header",
+                            result.meta.size
+                        ),
+                    });
+                }
+                let bytes = result
+                    .bytes()
+                    .await
+                    .map_err(|error| StateBackendError::Io(error.to_string()))?;
+                if self.attempt_is_pruned(attempt).await? {
+                    return Ok(None);
+                }
+                let (current, payload) =
+                    Self::decode_partial_with_attestation(&bytes, attempt, sealed.vnode)?;
+                if &current != sealed {
+                    return Err(StateBackendError::Conflict {
+                        resource: path.to_string(),
+                        message:
+                            "stored vnode partial attestation does not match the checkpoint seal"
+                                .into(),
+                    });
+                }
+                Ok(Some(payload))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(StateBackendError::Io(error.to_string())),
         }
     }
 

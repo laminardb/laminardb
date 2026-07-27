@@ -210,6 +210,97 @@ impl ObjectStore for SealPublishGateStore {
     }
 }
 
+/// Reports invalid metadata for one full GET and records whether its body is polled.
+struct FullGetMetadataProbeStore {
+    inner: Arc<dyn ObjectStore>,
+    target: OsPath,
+    body_polls: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for FullGetMetadataProbeStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FullGetMetadataProbeStore")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for FullGetMetadataProbeStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FullGetMetadataProbeStore")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for FullGetMetadataProbeStore {
+    async fn put_opts(
+        &self,
+        location: &OsPath,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &OsPath,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &OsPath,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        let probe_body = location == &self.target && !options.head && options.range.is_none();
+        let mut result = self.inner.get_opts(location, options).await?;
+        if probe_body {
+            result.meta.size = result.meta.size.saturating_add(1);
+            let body_polls = Arc::clone(&self.body_polls);
+            result.payload = object_store::GetResultPayload::Stream(
+                futures::stream::once(async move {
+                    body_polls.fetch_add(1, Ordering::AcqRel);
+                    Ok(Bytes::new())
+                })
+                .boxed(),
+            );
+        }
+        Ok(result)
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<OsPath>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<OsPath>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&OsPath>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&OsPath>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &OsPath,
+        to: &OsPath,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
 fn attempt(checkpoint_id: u64) -> CheckpointAttempt {
     CheckpointAttempt::canonical(checkpoint_id)
 }
@@ -394,6 +485,106 @@ async fn write_read_roundtrip() {
         .unwrap();
     let got = backend.read_partial(attempt(1), 0).await.unwrap().unwrap();
     assert_eq!(&got[..], b"hello");
+}
+
+#[tokio::test]
+async fn sealed_partial_read_rejects_a_valid_replacement_envelope() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let backend = ObjectStoreBackend::new(Arc::clone(&store), "node-1", 1);
+    let checkpoint = attempt(1);
+    let fence = assignment_fence(7, 1);
+    backend.set_authoritative_version(7);
+    backend
+        .write_certified_partial(checkpoint, 0, &fence, 1, Bytes::from_static(b"state"))
+        .await
+        .unwrap();
+    assert!(backend
+        .seal_checkpoint(checkpoint, Some(&fence), &[0], &[])
+        .await
+        .unwrap());
+    let inventory = backend
+        .checkpoint_seal_inventory(checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    let sealed = &inventory.sealed_partials[0];
+
+    assert_eq!(
+        backend
+            .read_sealed_partial_bounded(checkpoint, sealed, 5)
+            .await
+            .unwrap(),
+        Some(Bytes::from_static(b"state"))
+    );
+    let error = backend
+        .read_sealed_partial_bounded(checkpoint, sealed, 4)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StateBackendError::Conflict { .. }));
+    assert!(error.to_string().contains("read bound is 4"));
+
+    let replacement = ObjectStoreBackend::encode_partial(
+        checkpoint,
+        0,
+        fence.assignment_version,
+        None,
+        &Bytes::from_static(b"state"),
+    );
+    store
+        .put(
+            &ObjectStoreBackend::partial_path(checkpoint, 0),
+            PutPayload::from(replacement),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.read_partial(checkpoint, 0).await.unwrap(),
+        Some(Bytes::from_static(b"state")),
+        "the replacement must be a self-consistent partial envelope"
+    );
+
+    let error = backend
+        .read_sealed_partial_bounded(checkpoint, sealed, 5)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StateBackendError::Conflict { .. }));
+    assert!(error
+        .to_string()
+        .contains("does not match the checkpoint seal"));
+}
+
+#[tokio::test]
+async fn sealed_partial_read_rejects_bad_metadata_before_polling_body() {
+    let checkpoint = attempt(1);
+    let target = ObjectStoreBackend::partial_path(checkpoint, 0);
+    let body_polls = Arc::new(AtomicU64::new(0));
+    let store: Arc<dyn ObjectStore> = Arc::new(FullGetMetadataProbeStore {
+        inner: Arc::new(object_store::memory::InMemory::new()),
+        target,
+        body_polls: Arc::clone(&body_polls),
+    });
+    let backend = ObjectStoreBackend::new(store, "node-0", 1);
+    backend
+        .write_partial(checkpoint, 0, 0, Bytes::from_static(b"state"))
+        .await
+        .unwrap();
+    assert!(backend
+        .seal_checkpoint(checkpoint, None, &[0], &[])
+        .await
+        .unwrap());
+    let inventory = backend
+        .checkpoint_seal_inventory(checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let error = backend
+        .read_sealed_partial_bounded(checkpoint, &inventory.sealed_partials[0], 5)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StateBackendError::Conflict { .. }));
+    assert!(error.to_string().contains("including its header"));
+    assert_eq!(body_polls.load(Ordering::Acquire), 0);
 }
 
 #[tokio::test]

@@ -794,6 +794,30 @@ pub trait StateBackend: Send + Sync + 'static {
         vnode: u32,
     ) -> Result<Option<Bytes>, StateBackendError>;
 
+    /// Read a vnode partial admitted by an exact checkpoint seal under an allocation bound.
+    ///
+    /// Implementations must compare the currently stored vnode, assignment generation, writer
+    /// certificate, payload length, and payload digest with `sealed` before returning the
+    /// payload. Durable implementations must reject an impossible or oversized object from
+    /// metadata before loading its body. The default fails closed because [`Self::read_partial`]
+    /// cannot prove that a self-consistent replacement still belongs to the sealed recovery cut.
+    async fn read_sealed_partial_bounded(
+        &self,
+        attempt: CheckpointAttempt,
+        sealed: &SealedVnodePartial,
+        max_bytes: u64,
+    ) -> Result<Option<Bytes>, StateBackendError> {
+        Err(StateBackendError::Conflict {
+            resource: format!(
+                "state-v2/epoch={}/checkpoint={}/vnode={}/partial.bin",
+                attempt.epoch, attempt.checkpoint_id, sealed.vnode
+            ),
+            message: format!(
+                "backend cannot read checkpoint-sealed vnode partials under a {max_bytes}-byte allocation bound"
+            ),
+        })
+    }
+
     /// Persist a local-runtime coordinated-commit descriptor for `attempt` under `key`.
     ///
     /// `key` is opaque and unique within the attempt. Backends with an installed assignment

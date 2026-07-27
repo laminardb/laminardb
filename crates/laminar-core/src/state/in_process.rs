@@ -248,6 +248,48 @@ impl StateBackend for InProcessBackend {
             .map(|partial| partial.bytes.clone()))
     }
 
+    async fn read_sealed_partial_bounded(
+        &self,
+        attempt: CheckpointAttempt,
+        sealed: &SealedVnodePartial,
+        max_bytes: u64,
+    ) -> Result<Option<Bytes>, StateBackendError> {
+        Self::ensure_canonical_attempt(attempt)?;
+        self.check_vnode(sealed.vnode)?;
+        let resource = format!(
+            "state-v2/epoch={}/checkpoint={}/vnode={}/partial.bin",
+            attempt.epoch, attempt.checkpoint_id, sealed.vnode
+        );
+        if sealed.payload_len > max_bytes {
+            return Err(StateBackendError::Conflict {
+                resource,
+                message: format!(
+                    "sealed vnode partial declares {} bytes; read bound is {max_bytes}",
+                    sealed.payload_len
+                ),
+            });
+        }
+        let partials = self.partials.read();
+        let Some(stored) = partials.get(&(attempt, sealed.vnode)) else {
+            return Ok(None);
+        };
+        if &stored.attestation != sealed {
+            return Err(StateBackendError::Conflict {
+                resource,
+                message: "stored vnode partial attestation does not match the checkpoint seal"
+                    .into(),
+            });
+        }
+        if stored.bytes.len() as u64 != sealed.payload_len
+            || digest_hex(&sha256(&stored.bytes)) != sealed.payload_sha256
+        {
+            return Err(StateBackendError::Serialization(
+                "stored vnode partial payload does not match its sealed length and digest".into(),
+            ));
+        }
+        Ok(Some(stored.bytes.clone()))
+    }
+
     async fn write_commit_descriptor(
         &self,
         attempt: CheckpointAttempt,
@@ -600,6 +642,52 @@ mod tests {
         let got = b.read_partial(checkpoint, 2).await.unwrap().unwrap();
         assert_eq!(got, payload);
         assert!(b.read_partial(attempt(8), 2).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sealed_partial_read_is_exact_and_bounded() {
+        let backend = InProcessBackend::new(1);
+        let checkpoint = attempt(7);
+        backend
+            .write_partial(checkpoint, 0, 0, Bytes::from_static(b"state"))
+            .await
+            .unwrap();
+        assert!(backend
+            .seal_checkpoint(checkpoint, None, &[0], &[])
+            .await
+            .unwrap());
+        let inventory = backend
+            .checkpoint_seal_inventory(checkpoint)
+            .await
+            .unwrap()
+            .unwrap();
+        let sealed = &inventory.sealed_partials[0];
+
+        assert_eq!(
+            backend
+                .read_sealed_partial_bounded(checkpoint, sealed, 5)
+                .await
+                .unwrap(),
+            Some(Bytes::from_static(b"state"))
+        );
+
+        let mut wrong_provenance = sealed.clone();
+        wrong_provenance.assignment_version = 1;
+        let error = backend
+            .read_sealed_partial_bounded(checkpoint, &wrong_provenance, 5)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StateBackendError::Conflict { .. }));
+        assert!(error
+            .to_string()
+            .contains("does not match the checkpoint seal"));
+
+        let error = backend
+            .read_sealed_partial_bounded(checkpoint, sealed, 4)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StateBackendError::Conflict { .. }));
+        assert!(error.to_string().contains("read bound is 4"));
     }
 
     #[tokio::test]
