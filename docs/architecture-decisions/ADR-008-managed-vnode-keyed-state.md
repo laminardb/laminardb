@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 66
+- **Last reconciled:** 2026-07-27 during Cycle 67
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -1389,6 +1389,37 @@ hostile outcomes. This does not authorize a live request or change this ADR's ru
 Pacing/rate-limit compatibility, durable tail authority, multi-host security, A/B evidence,
 backend qualification, delivery, admission, and independent soak remain open; `[LDB-4007]`,
 `[LDB-0013]`, and production **NO-GO** are unchanged.
+
+Cycle 67 makes the next decision without adding code or issuing a request. A distinct paced v1
+contract will use one bounded driver-to-observer monotonic start handshake, absolute five-second
+targets, three concurrent persistent node lanes, absolute 4.5-second node cuts, no overlap or burst
+catch-up, and a cross-slot per-node client shaper below the server's eight-start rolling-second
+limit. Its result must contain the complete 174-node-slot vector and a content-addressed attempt/
+response transcript; accelerated result v3 cannot be relabelled. Only external Cycle 60 metrics and
+correctness outcomes feed `D - C`; exact records remain arm-specific diagnostics, and v1 remains
+effect-estimation rather than powered equivalence.
+
+The process-local timing ledger is accepted only as an observed prefix. A record, loss update, or
+in-flight guard can become invisible after the last old-process page and before abrupt death, and
+`durable_tail_handoff` is state-handoff metadata rather than ledger durability. Cycle 67 therefore
+chooses the minimal no-hot-path interpretation: report each open/unsealed generation and its
+monotonic observation-gap bound when an independent seal/reap/window cut exists, otherwise report
+the bound as unknown; the number of hidden records always remains unknown. Exact crash-
+spanning timing would require a separately approved durable intent/terminal/generation-seal journal
+and checkpoint-control-path latency gates; periodic, graceful-only, or worker-local persistence is
+not sufficient.
+
+Co-located engineering may later use the current loopback listener only with launcher-prebound
+inherited sockets, trusted child/process descriptors, and nonce-bound v2 responses in one exact
+network namespace. Multi-host A/B and
+production soak instead require a separate two-route diagnostics listener with direct TLS 1.3 mTLS,
+per-generation node identities, hash-chained signed roster updates, and attempt-bound observer
+credentials. Existing shared-name
+cluster mTLS does not protect Axum diagnostics, and the transport remains provider-neutral rather
+than coupled to S3, TidesDB object storage, or any cloud-specific identity API. Implementation,
+fake-paced tests, a release-binary preflight, live A/B, multi-host security, and the independent soak
+remain ordered later gates. `[LDB-4007]`, `[LDB-0013]`, backend status, and production **NO-GO** are
+unchanged.
 
 Selected attempts may then be joined at low cadence only through a new read-only, same-snapshot
 core audit of the exact outcome, both retention floors, and validated live capsule reference;

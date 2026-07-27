@@ -864,6 +864,263 @@ The component is approved only for accelerated owned-fake-server supervision. It
 does not close process-local timing-tail loss, and makes no LaminarDB, A/B, latency, backend,
 delivery, exactly-once, admission, multi-host-security, or independent-soak claim.
 
+### Cycle 67 paced-observer and evidence decision
+
+Cycle 67 freezes a design and authorizes no request. The accelerated sanitized-plan v2, bootstrap
+v4, and result v3 remain fake-only. A live implementation must use distinct
+`paced-observer-plan/v1`, `paced-observer-ready/v1`, `paced-observer-start/v1`, and
+`paced-observer-result/v1` contracts; none may accept the accelerated schema as evidence. The
+result separates **protocol completion**, **timing-evidence coverage**, and **A/B attempt
+classification** so a completed network schedule cannot be mistaken for a complete timing history
+or a passing experiment.
+
+The common driver provisions and verifies the observer before `t0`. A dedicated bounded readiness
+channel may be inspected during preflight, before workload or measurement starts. At `t0`, a
+dedicated scheduler sends one fixed-size invocation-bound start frame without waiting for any
+observer outcome and continues the immutable workload, checkpoint, fault, and end schedules. The
+driver's monotonic instant immediately before that send is `t0` and anchors every common schedule;
+there is no separately selected timestamp whose send lateness could be hidden. The
+observer captures its own monotonic anchor only after that complete frame arrives and immediately
+returns one fixed-size acknowledgement on a separate bounded channel. The driver may drain and
+timestamp that acknowledgement but must not interpret it until after the common end seal. Its
+monotonic round-trip is a conservative upper bound on observer-anchor displacement from driver
+`t0`; more than 50 ms makes the attempt `INVALID`. Wall time is metadata only and must not schedule
+or order work.
+
+Paced execution is absolute, not completion-relative:
+
+- the 58 targets remain `observer_t0 + ordinal * 5 seconds` for ordinals 0 through 57. A release
+  begins at or after its target and no more than 50 ms late. A later release is recorded as missed
+  and opens no socket; it is never executed immediately or used to shift a later target;
+- three persistent, independent node lanes start concurrently at each eligible target. Each lane
+  is bound to its verified server-process descriptor and owns that node's cursor, process history,
+  and cross-slot connection-start history. Three-way fan-out is eligible only after launcher
+  evidence proves three distinct process/AppState gate instances; distinct node ordinals or socket
+  addresses alone are insufficient. A restart installs a freshly verified descriptor while
+  retaining the lane's conservative client-start history. After all lanes quiesce, one deterministic
+  node-ordinal reducer checks cross-node assignment and identity invariants. The present serial
+  three-node loop cannot be reused because three 4.5-second node budgets do not fit one five-second
+  slot;
+- every node deadline is the absolute target plus 4.5 seconds, not 4.5 seconds after a late wake.
+  At that cut the coordinator cancels outstanding lane work. All persistent lanes must acknowledge
+  per-slot quiescence by target plus 4.75 seconds; their worker threads are joined only during final
+  shutdown, and failure to quiesce instead terminates the observer. This leaves 250 ms with no
+  observer-side lane work before the next target. Lane reuse requires a complete response proving
+  the preceding server interaction reached a terminal response. A full/partial write followed by
+  timeout, EOF, cancellation, or malformed transport is ambiguous: quarantine that process lane for
+  the rest of the run, issue no retry or later socket from it, and mark protocol collection
+  incomplete. Thus a later slot never knowingly overlaps an earlier interaction; client cancellation
+  alone does not claim the Axum handler or permit already ended;
+- a complete lane still permits at most eight TCP starts across both routes, two attempts per
+  logical request, six timing pages, and the existing byte/record bounds. Before every start a
+  per-node rolling deque, retained across slots and process restarts, permits a proposed start only
+  when inserting it leaves at most seven client starts in `(now - 1 second, now]`. An ineligible
+  start waits only within the absolute node budget; it is otherwise an explicit rate deferral.
+  Server-terminal requests remain sequential within a
+  process lane, so this conservative client bound prevents the exclusive observer alone from
+  exceeding the server's shared eight authenticated handler starts in `(now - 1 second, now]`; it
+  does not reserve capacity for another caller. The 100-ms retry delay remains a minimum, not
+  permission to bypass this shaper. Scheduled lane release and first socket start have separate
+  offsets; shaping which exhausts the absolute budget is a rate deferral, not a missed release or
+  catch-up; and
+- C runs the same clock, lanes, slot vector, cancellation, and finalization code while suppressing
+  all 348 logical probes. D alone opens connections. Neither arm may inspect a response or observer
+  status to alter checkpoint dispatch, fault actuation, workload progress, recovery waits, or the
+  290-second end. The final D lane must stop by observer `t0 + 289.75 seconds`; paced result
+  finalization is bounded at observer `t0 + 290 seconds`. Because the accepted start round-trip
+  bounds anchor displacement to 50 ms, the supervisor waits a fixed 250 ms after the common driver
+  end for the already drained result before applying the existing bounded cancel/grace/kill/reap
+  discipline.
+
+No other console or diagnostic client may address these routes during an attempt. The server gate
+is per process, shared by both routes and both accepted principals, single-flight, and charged only
+after successful auth and permit acquisition. A paced client must retain every 429/503/504 and
+rate deferral rather than hiding it with catch-up. A forbidden external caller can make an attempt
+`INVALID` only with independent evidence; otherwise SUT unavailability, deadline exhaustion,
+limiting, or response loss is a product `FAIL`.
+
+The frozen request accounting is:
+
+| Node-slot path | Local starts | Timing starts | Total starts |
+|---|---:|---:|---:|
+| Healthy empty or single page | 1 | 1 | 2 |
+| Six timing pages without retry | 1 | 6 | 7 |
+| Six timing pages with one retry | 1 | 7 | 8 |
+| Minimum successful 409 recovery | 2 | 2 | 4 |
+| 409 recovery plus maximum accepted pages | 2 | 6 (one 409, five pages) | 8 |
+| Six pages plus 409 recovery | impossible | impossible | Ninth start is prohibited; budget exhausts before the sixth accepted page |
+
+Across 174 node-slots this permits at most 1,392 physical starts, 696 retries, 1,044 timing pages,
+and 66,816 timing records. One node lane permits at most 464 physical starts and 232 retries.
+Local starts can reach four in one conflict/retry path and timing starts seven, but their combined
+node-slot cap remains eight.
+
+Response classification is also fixed. A validated `200` continues. One timing `409` may perform
+one local-evidence rebind only when it proves a genuinely newer process; `410`, malformed data,
+unknown status, or invalid cursor is fatal. The current server does not distinguish busy from rate
+`429` in a stable machine schema, so paced v1 records only `429_unclassified` and never retries it.
+A complete `503` or `504` response, or a connect failure known to precede connection, permits at
+most one retry after both the 100-ms minimum and the rolling shaper, within the absolute deadline.
+Failure after possible request delivery quarantines the lane as above. Missed release, rate
+deferral, deadline, unresolved final page, cancellation, quarantine, or limiter response prevents
+protocol `complete`. Node-start-budget exhaustion leaves the unread tail for a later scheduled slot
+and makes that node-slot incomplete; the distinct six-page deferral may still complete only if later
+slots drain the exact tail before the final cut.
+
+`paced-observer-result/v1` must carry a complete fixed 58-by-3 node-slot vector, not the accelerated
+result's 32-detail prefix. Each entry binds target and actual monotonic offsets, release outcome,
+first-socket, every-attempt start/end, finish/cancel/lane-quiescence offsets, request-delivery stage
+(`not_connected`, `connected_not_written`, `write_complete`, `response_complete`, or `ambiguous`),
+all route attempts and statuses, rate waits/deferrals, bytes/pages/records, lane quarantine, and
+process transitions. The result also binds the server diagnostic-contract hash and exact constants
+(concurrency one, eight starts, one-second window, two-second handler deadline), verified
+process-lane descriptors, driver start-send offset, acknowledgement round-trip/anchor uncertainty,
+maximum observed client starts per rolling window, pacing wait count/total/max, explicit exclusivity
+evidence, and separate unclassified-429 totals. Checked totals are derived from the vector. A
+bounded append-only transcript separately binds every request identity (without the bearer), fresh 128-bit nonce,
+response status/body hash, parsed process tuple, and exact timing records before aggregates are
+accepted. The supervisor creates the transcript sink exclusively before spawn; the child receives
+only a typed handle, never an arbitrary evidence path. The transcript is sealed, synced, reread,
+and content-addressed, and its digest is bound into the result. Aggregate-only or truncated evidence
+is ineligible. Canonical result JSON is capped at 1,048,576 bytes. The transcript is capped at
+134,217,728 bytes, 1,392 attempt rows (174 node-slots times eight starts), and 66,816 timing records
+(174 times 384); response parsing retains the existing per-response and per-node-slot limits. Hitting
+any byte or record cap is explicit incomplete evidence, never silent truncation.
+
+The current checkpoint-timing ledger remains a strong sampled process-local prefix, not a durable
+generation history. After a page which appears drained, the old process can append a record,
+increment recording-loss metadata, or complete or retain an in-flight timing guard and then be
+fenced, replaced, or die. The successor starts a fresh sequence domain and exposes no predecessor
+final high-water or seal.
+`durable_tail_handoff` says state capture reached the checkpoint's durable tail; it does not make the
+timing record durable. Therefore each observed process generation reports:
+
+- exact process identity; first/last requested cursor; last observed `next_sequence`, overwrite and
+  recording-loss counts, exhaustion flag, captured-record count, and assignment-anchor status.
+  `anchored` means every assignment version/digest used by an accepted timing record or
+  assignment-specific conclusion resolves to the exact audited canonical
+  `CheckpointAssignmentFence`; a digest or current owner map alone is not an anchor;
+- `cut_finality = sampled_open_prefix` for a live sampled cut or
+  `unsealed_transition` after replacement. `authoritatively_sealed` is reserved but cannot be
+  emitted by today's server. A successor descriptor, fence, or response does not prove the old
+  process died or stopped an already-created guard;
+- the predecessor's last request-start, successor's first confirmed-evidence completion, and
+  `gap_end_authority = generation_seal | predecessor_reaped | measurement_window_cut | none`.
+  `unobserved_tail_interval_upper_bound_ns` is numeric only through a timestamped authoritative seal,
+  independently attested termination/reap, or the fixed window cut for claims limited to that
+  measurement window. With `none` it is `unknown`; successor evidence alone is never its endpoint;
+  and
+- `unobserved_completed_record_count_upper_bound = unknown`. The HTTP rate limit and 1,024-record
+  ring do not bound records or loss metadata that disappeared with a process.
+
+Run-level timing coverage is separately `observed_prefixes`,
+`observed_prefixes_with_bounded_gaps`, `observed_prefixes_with_unbounded_gaps`, or `invalid`.
+Overwrite, observed recording loss, exhausted metadata, a required but unanchored assignment, a
+missing generation, or overflowed monotonic evidence makes timing coverage invalid. A repeated
+empty page does not seal a live generation. An expected hard restart can complete the paced
+protocol while producing bounded-gap coverage only when the launcher independently observes and
+reaps the predecessor; remote successor authority alone produces an unbounded gap. The
+maximum claim is exactly: **no SLO violation was found in captured, completed barrier observations
+through the reported process-local cursors**. It cannot mean every attempt was observed, no slow
+attempt occurred, the killed generation's tail was empty, or the whole 290-second window is exact.
+
+This observed-prefix interpretation is selected now because it adds no synchronous persistence to a
+checkpoint path. If restart-spanning exact timing becomes a release criterion, a separate ADR must
+design a fenced durable diagnostic journal with a durable intent before an observation can become
+invisible, an immutable terminal record, and a predecessor/successor generation seal. Periodic or
+shutdown-only flush and local Fjall/TidesDB storage leave crash or node-loss gaps. Synchronous intent
+durability would add checkpoint-control-path I/O and must pass its own outage policy, p50/p95/p99/
+p99.9 A/B, crash-boundary, stale-writer, retention, and independent-soak gates. Nondeterministic
+timings do not belong in checkpoint outcome or recovery-capsule authority.
+
+Two transport profiles remain deliberately separate:
+
+1. **Co-located engineering A/B.** The current listener is eligible only on literal loopback with
+   the observer in the same OS network stack and exact network namespace. Before spawning each
+   pinned server, the launcher exclusively pre-binds the literal loopback listener and passes that
+   exact inherited socket handle to the child; configured caller-owned ports are ineligible. The
+   current server binds its own socket and does not implement this required inherited-listener seam,
+   so it cannot yet satisfy the profile. The child then returns one post-serving descriptor over a
+   separate inherited channel, binding its
+   adoption of that handle to deployment/run, node ordinal and stable ID, boot UUID, process term,
+   endpoint, server digest, and configuration digest. This is a trusted launcher/child/host
+   association, not cryptographic process attestation; a compromised launcher, malicious pinned
+   child, same-user process, administrator/root, or kernel invalidates the attempt. PID, configured
+   port, gossip address, port scan, DNS, proxy, redirect, ingress, and port-forward are not identity.
+   The expected tuples are sealed before polling. A restart follows predecessor termination/reap
+   and a fresh pre-bind/descriptor with new boot UUID and higher durable term. Linux host-network
+   mode may qualify only when namespace identity proves it is literally shared; Docker-published/
+   bridged ports and Windows/WSL forwarded or mirrored localhost never qualify as same-namespace loopback.
+   Literal `127.0.0.1` or `::1` reachability is necessary but never sufficient; a host-network
+   configuration label alone is not evidence. Otherwise the multi-host profile applies.
+2. **Multi-host A/B and production soak.** Add a separate diagnostics-only listener containing only
+   the two GETs, with separate startup configuration and auth state—no console credential, public
+   probe, WebSocket, or mutation route. Require direct end-to-end TLS 1.3 mutual authentication,
+   HTTP/1.1 ALPN, no 0-RTT, no session resumption/tickets in v1, bounded handshakes/connections, and
+   the attempt-scoped diagnostic bearer as defense in depth. A server leaf requires `serverAuth`, an
+   exact DNS or IP SAN for its dial target, and exactly one URI workload SAN binding deployment, run,
+   node, boot UUID, and process term.
+   The observer leaf requires `clientAuth` and one URI SAN binding deployment, run, and observer
+   role. Chain, validity, EKU, dial-target SAN, exact URI SAN, and peer certificate/SPKI digest are
+   all verified and recorded; CA membership, wildcard/shared node identity, or a fingerprint alone
+   is insufficient. Existing optional cluster mTLS uses a shared control-plane name and does not
+   terminate or identify the Axum diagnostic listener, so it is not this proof.
+
+The current v1 response envelopes cannot echo experiment identity or freshness. Both profiles
+therefore require a distinct, capped `diagnostic-request-response/v2`: fixed versioned request
+headers carry exact invocation/run/slot/route and a fresh 128-bit nonce outside the URL and bearer,
+and capped response envelopes echo those fields with deployment and process identity. Unknown,
+duplicate, oversized, or missing fields fail closed. The paced plan binds that schema/hash; current
+v1 request/response payloads are ineligible. For remote use, the sealed plan pins the external
+experiment controller's attempt-scoped roster-verification public key and digest before `t0`.
+Roster v1 binds deployment/run, all node-specific addresses and exact certificate/process
+identities, protocol/hash, and artifact/configuration digests. Each detached signed update must be
+exactly prior version plus one, include the prior canonical roster digest, and replace only the
+declared process generation with a higher durable term. The observer persists its highest version/
+digest and rejects rollback, skipped or duplicate version, fork, wrong signer/run/deployment, or
+address reuse without a successor identity. The signing private key remains only in the independent
+controller; DNS is a recorded locator, never roster authority.
+
+The trust policy, trust bundle, observer client identity, bearer, and roster-verification key are
+fixed for one bounded attempt. They are replaced only at a quiesced attempt boundary with zero
+overlap and proved old-credential rejection. Every restarted server generation instead obtains a
+fresh key/leaf only after its durable term is acquired; the signed successor roster update activates
+it, predecessor connections close, and the predecessor key/leaf and roster version are rejected and
+destroyed or revoked. A successor cannot receive observer traffic until its roster update is
+accepted. This mandatory successor issuance is not optional live rotation. Rotating an observer
+capability or a still-live server generation mid-attempt remains a separate blocked design. The
+provider-neutral identity interface
+accepts a certificate chain, private-key capability, trust bundle, and verified workload identity
+in memory. A file-backed PEM certificate/PKCS#8 key/PEM CA-bundle provider is the baseline. An
+optional SPIFFE Workload API adapter supplies its X.509-SVID, signer, and bundle through that same
+interface without materializing credential files. Cloud, Kubernetes, and service-mesh adapters are
+optional. No AWS, Azure, GCP, Kubernetes, service mesh, load balancer, S3, TidesDB object-store
+feature, or Laminar `object_store` provider is required by the protocol. TLS termination by an
+ingress or sidecar is ineligible absent a separately reviewed end-process identity profile. Private
+keys and bearers remain outside plans, arguments, general environment, URLs, logs, results, and evidence;
+checkpoint storage continues through LaminarDB's provider-neutral `object_store` path and is never
+identity authority. The separate remote configuration must not relax, overload, or reuse the
+current loopback-only `server.diagnostic_read_token` policy or merge the remote router into the
+public/console listener.
+
+Only the Cycle 60 external metrics and correctness outcomes may feed `D - C`; exact records and the
+coverage vector are arm-specific diagnostics. The eight-block v1 remains effect-estimation-only.
+No equivalence conclusion is allowed until owners freeze margins, multiplicity, and prospective
+power/sample size in v2. Warm-ups, Williams order, fixed fault/window anchors, reserve blocks,
+invalid-run rules, raw evidence, and independent classification remain as frozen in Cycle 60.
+
+Before a first live request, an implementation cycle must prove the paced clock and three-lane
+state machine against owned fake servers with deterministic-clock boundary tests plus one real-time
+290-second C/D child test; cross-slot rate shaping against the actual server limiter; complete
+transcript/result validation; ambiguous-I/O quarantine; hidden-tail/restart coverage classification;
+launcher-prebound socket adoption plus trusted child descriptor binding; and the start/shutdown
+bounds. The 250-ms post-end wait and all clock tolerances remain provisional until that real-time
+Windows test passes. A later non-measurement release-binary loopback preflight is still not A/B
+evidence. Multi-host use additionally requires the separate mTLS listener and hostile identity/
+roster/rotation tests. No live request, A/B, latency result, backend qualification,
+distributed-state admission, delivery/exactly-once change, or independent soak occurred in Cycle
+67; `certification_eligible` remains `false`.
+
 ## Frozen numerical contract
 
 An eligible machine-readable charter contains no `TBD`, zero, or results-derived threshold. It

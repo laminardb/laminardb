@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 66
+- **Last reconciled:** 2026-07-27 during Cycle 67
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -282,6 +282,25 @@ manifest-pinned child, binds each canonical result to a fresh invocation, and co
 the identical common trace has been file-synced and end-sealed. Bounded hostile child/input/output
 tests pass without persisting raw streams. The accelerated 58-slot path remains ineligible for live
 or A/B use; a separately versioned paced contract and an honest timing-tail decision are next.
+
+Cycle 67 freezes those two decisions and still performs no live work. Paced v1 uses an acknowledged
+monotonic start bound, absolute five-second targets, three parallel persistent node lanes, no late
+catch-up or overlapping slot, a cross-slot client rolling limiter below the server's allowance, and
+a complete slot/transcript result distinct from fake result v3. It adopts observed process-local
+timing prefixes with explicit unsealed restart gaps; it does not add checkpoint-path persistence or
+claim an unknown old-process tail is complete. A future exact option requires a fenced durable
+intent/terminal/generation-seal journal and its own checkpoint-latency/outage decision.
+
+The next bounded implementation gate is owned-fake only: build paced schemas, clock abstraction,
+three lanes, rate shaping, full transcript validation, hidden-tail classification, and deterministic
+boundary tests plus one real-time 290-second C/D pair. Ambiguous post-delivery I/O quarantines its
+process lane; actual-limiter tests must prove no overlap or paced 429 retry. Then prove launcher-
+prebound socket adoption, trusted release-process descriptors, and nonce-bound v2 responses in a
+non-measurement loopback preflight before any A/B. Multi-host work remains a
+separate diagnostics-only TLS 1.3 mTLS listener with signed node-specific roster/identity and
+attempt-bound credentials; it cannot reuse current cluster mTLS as HTTP evidence. Live A/B,
+powered equivalence, TidesDB qualification, runtime admission, delivery/exactly-once work, and the
+independent release-binary soak remain separate later gates.
 
 ## Scope and non-goals
 

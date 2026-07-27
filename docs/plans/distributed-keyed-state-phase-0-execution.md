@@ -5,7 +5,7 @@
   pending a new official package; no runtime
   dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 66
+- **Last reconciled:** 2026-07-27 during Cycle 67
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -512,6 +512,25 @@ C/D common plan and trace bytes remain identical and raw child streams are not p
 closes the fake-only consuming-supervisor gate, not the live observer: `at_ns`, the server start-rate
 limit, durable timing-tail authority, multi-host transport, effect estimation, powered A/B,
 backend qualification, delivery, admission, and independent soak remain blocked.
+
+Cycle 67 is the code-free paced/evidence gate. Its
+[normative contract](../testing/distributed-state-production-soak-charter.md#cycle-67-paced-observer-and-evidence-decision)
+requires distinct live schemas; pre-`t0` readiness and a bounded monotonic start acknowledgement;
+three concurrent node lanes at absolute 0..285-second targets; absolute slot deadlines, no overlap
+or catch-up; cross-slot rate shaping; ambiguous-delivery lane quarantine; and a complete slot vector
+plus sealed transcript. It chooses
+an explicitly open/unsealed process-local prefix claim, because abrupt restart can erase records,
+loss metadata, or in-flight guards after the last poll. Exact continuity is deferred to a separate
+durable-journal decision that must account for checkpoint-control-path latency.
+
+Work proceeds in this order: (1) paced owned-fake implementation and deterministic plus one real-
+time schedule test; (2) launcher-prebound loopback socket, trusted release-process descriptor, and
+nonce-bound v2 response preflight, still not
+an A/B sample; (3) engineering effect-estimation under Cycle 60 only after review; (4) a separate
+provider-neutral diagnostics-only TLS 1.3 mTLS listener and hostile identity tests for multi-host;
+and (5) powered equivalence and the independently operated production soak only after their own
+frozen inputs. None authorizes a TidesDB package attempt, runtime backend dependency, keyed-state
+admission, or delivery-guarantee change.
 
 The existing output path satisfies none of the new provenance/fence fields: it passes only a batch
 and deadline and uses an idempotent, non-transactional Kafka producer. The supported evidence APIs
