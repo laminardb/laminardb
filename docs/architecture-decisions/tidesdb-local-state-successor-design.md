@@ -2,7 +2,7 @@
 
 - **Status:** Accepted integration direction; exact Cargo package `tidesdb v0.11.1` stopped at T0
 - **Date:** 2026-07-25
-- **Last reconciled:** 2026-07-25 during Cycle 41
+- **Last reconciled:** 2026-07-27 during Core Cycle 1
 - **Selected integration line:** the official `tidesdb/tidesdb-rs` binding, published on crates.io
   as package and library `tidesdb`; the unrelated `tidesdb-rs` crate is excluded
 - **Stopped exact prescreen subject:** Cargo package `tidesdb v0.11.1`, tag commit
@@ -26,13 +26,21 @@ transaction, iterator, callback, and raw-pointer types do not become Laminar API
 The crates.io package literally named `tidesdb-rs` is a separate third-party wrapper from
 `0x6flab`. It is not selected, copied into Laminar, or combined with the official binding.
 
-This decision explicitly rejects:
+This decision explicitly rejects for LaminarDB's dependency graph:
 
 - a project-private TidesDB FFI wrapper;
 - a TidesDB or `tidesdb-rs` fork or vendored patch series;
 - replacing the package's native payload with a newer system or locally built TidesDB library;
 - using native TidesDB object storage, checkpoint, or reopen as recovery authority; and
 - adding the package to a runtime crate before the bounded package prescreen passes.
+
+A short-lived contributor fork is permitted only to propose a focused upstream PR to the official
+`tidesdb/tidesdb-rs` repository. LaminarDB never depends on that fork, vendors it, or treats its CI
+as qualification. PR preparation is capped at one engineer-day and one local machine-hour and may
+cover only the native-version update, exact transaction outcome, and minimum fatal/stall/close
+signals. Only a merged, officially published successor package can re-enter T0. A successor release
+is the planned path, but neither the contributor branch nor that expectation has qualification or
+runtime authority.
 
 The current release was a **prescreen subject, not an admitted backend**, and failed T0 in Cycle 41.
 Its native 9.3.6 payload predates published memtable-corruption, stats/read concurrency, recovery,
@@ -208,7 +216,7 @@ is not weakened to make the chosen dependency pass.
 
 ### T0 — exact-source and safe-subset closure
 
-- **Cap:** one working day, at most eight engineer-hours, zero candidate machine-hours.
+- **Cap:** one working day, at most four engineer-hours, zero candidate machine-hours.
 - Freeze the release tag, commit, crate checksum, lock resolution, features, native source archive,
   native tag/commit, toolchain, license/SBOM, and supported target matrix.
 - Reconcile every native correctness/recovery fix after 9.3.6 against the one-DB/one-CF,
@@ -232,7 +240,7 @@ evidence and re-entry contract are in the
 
 ### T1 — isolated official-binding feasibility (not authorized for v0.11.1)
 
-- **Cap:** two working days and four machine-hours.
+- **Cap:** one engineer-day and one candidate machine-hour.
 - **Location:** a disposable isolated workspace, not a Laminar runtime crate.
 - Build and verify one exact release-configuration package/features subject in an isolated Linux
   feasibility environment. WSL2 or a Linux container is acceptable for T1, but cannot satisfy the

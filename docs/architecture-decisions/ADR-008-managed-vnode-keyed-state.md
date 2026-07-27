@@ -1,8 +1,9 @@
 # ADR-008: Managed vnode-keyed working state for distributed operators
 
-- **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
+- **Status:** Proposed; core reference implementation resumed, production qualification paused,
+  and cluster admission unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 68
+- **Last reconciled:** 2026-07-27 during Core Cycle 1
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -29,6 +30,29 @@ Cluster-shared checkpoint storage and the existing `StateBackend` remain recover
 local store is disposable capacity/latency infrastructure: it cannot assign a vnode, authorize an
 epoch, replace restore-before-activate/revoke fencing, or create source/sink exactly-once semantics.
 No runtime backend dependency or adapter is authorized by this ADR state.
+
+### 2026-07-27 workstream reset
+
+Cycle 69 and all further soak, A/B, observer, transcript, and certification-tooling work are paused.
+Cycle 68 remains a completed historical boundary. Core implementation resumes with one deliberately
+small reference vertical: concrete vnode-local append-only `COUNT(*)` + nullable direct
+`SUM(Int64)` state, hard semantic-payload byte accounting, whole-batch validation before mutation,
+portable FULL/EMPTY capture, off-side restore/revoke/retained-fence preparation, and
+caller-supplied transition-batch preflight followed by infallible publication. The future graph
+owner must still prove authoritative roster completeness. This is not a generic working-state
+trait, a runtime-selectable backend, a production memory profile, or an admission consumer.
+
+This exception permits backend-neutral reference code while the Phase 0 product gate remains open.
+It does not authorize TidesDB candidate qualification, runtime construction or execution, an
+adapter, or any other disk backend. As of this reconciliation the official Cargo package remains
+`tidesdb v0.11.1`; re-entry waits for a newer official package. Repeated T0 is capped at four
+engineer-hours in one working day and zero candidate machine-hours, stopping at the first source
+veto. Only a complete T0 pass may authorize a separately reviewed T1 capped at one engineer-day and
+one candidate machine-hour. A timeboxed contributor fork may be used solely to propose fixes
+upstream to the official repository; PR-local build/tests are permitted only inside its separate
+one-local-machine-hour cap and are not candidate qualification. LaminarDB does not depend on that
+fork. The canonical contribution and re-entry rules live in the
+[TidesDB design](tidesdb-local-state-successor-design.md).
 
 The provider-neutral Rust `object_store` path retains local file, S3, GCS, and Azure builders.
 Cluster authority comes only from the exact checkpoint/state handles admitted by verified namespace
@@ -527,9 +551,10 @@ nonzero accumulator. When the cached contract declares a non-nullable SUM input,
 must equal COUNT. Zero non-null count has canonical zero accumulator bytes and evaluates to SQL
 `NULL`; otherwise the exact signed `i64` accumulator is the nullable `Int64` result. Cycle 5
 publishes one normative binary layout with every magic, field offset, width, byte order, and digest
-range plus frozen goldens, a private borrowed reader, and a test-only full-buffer fixture encoder.
-The fixture encoder is not release code or the production streaming writer; this ADR does not treat an archived
-Rust type or prose alone as the wire specification.
+range plus frozen goldens, a private borrowed reader, and a full-buffer reference encoder. Core
+Cycle 1 promotes that inner encoder into private release code solely for the bounded in-memory
+managed shard; it is not the production streaming writer. This ADR does not treat an archived Rust
+type or prose alone as the wire specification.
 Current `last_updated_ms` is not part of v1 because no aggregate execution path consumes it.
 Changed-group append output derives its stable
 operation identity from the canonical key and checked count version, so v1 also carries no
@@ -563,8 +588,9 @@ per-entry BODY digests against its expected source context. It does not authenti
 object or establish aggregate-state semantics. Production composition must first match the complete
 payload to the trusted seal/inventory digest and manifest selector, then invoke the expected inner
 reader for every BODY with exact identity, kind, parent, codec, routing-schema, and state-contract
-context. The fixture encoders compile only in tests, allocate complete vectors, and are not
-production streaming writers.
+context. The outer-directory fixture encoder compiles only in tests. The inner aggregate reference
+encoder now compiles privately for Core Cycle 1, allocates a complete vector, and is not a production
+streaming writer.
 
 The trusted checkpoint pointer first identifies the inventory object and its expected digest. A
 metadata/HEAD request must expose its encoded length; restore rejects a value above
@@ -1360,7 +1386,8 @@ parse errors no longer retain substituted input, and successful POST/watcher rel
 the four live DDL sections while retaining restart-only authority. Complete server unit matrices
 passed with and without `cluster` (316 and 238 tests), as did warnings-denied Clippy. These are
 in-process boundary tests, not a live observer, A/B sample, backend result, multi-host transport, or
-production soak. The loopback fake-server observer protocol is the next gate; `[LDB-4007]`,
+production soak. The loopback fake-server observer protocol was then the next gate before the
+certification workstream was suspended; `[LDB-4007]`,
 `[LDB-0013]`, and production **NO-GO** remain unchanged.
 
 Cycle 65 implements only the standalone, root-workspace-excluded loopback protocol component in
@@ -1370,7 +1397,8 @@ explicit complete/incomplete results, a two-second bootstrap deadline, and super
 are covered by owned fake servers and real child processes. D completed 348 parsed fake requests
 (116 per endpoint); C opened none. No LaminarDB process was contacted, and loopback addressing does
 not itself attest that a configured process is fake. The sealed common driver does not yet launch or
-consume this network-mode observer, so fake-protocol non-feedback is the next gate. No runtime,
+consume this network-mode observer, so fake-protocol non-feedback was then the next gate before the
+certification workstream was suspended. No runtime,
 backend, admission, delivery, multi-host, A/B, latency, or soak conclusion changes; `[LDB-4007]`,
 `[LDB-0013]`, and production **NO-GO** remain unchanged. This fake path accelerates all 58 slots
 instead of honoring `at_ns`; a separately versioned paced integration path is required before any
@@ -1434,7 +1462,7 @@ server response identity.
 The accelerated protocol remains unchanged, and the new module has no CLI wiring, network call,
 result/transcript, lanes, timing-coverage reducer, or real-time run. Its 20 focused tests and the
 unchanged standalone suite pass on Windows, with three independent reviews approving only this
-partial boundary. Cycle 69 may add bounded owned-fake evidence/result framing; HTTP delivery-stage
+partial boundary. The former Cycle 69 framing plan is paused; HTTP delivery-stage
 classification, lane execution, supervisor spooling, the manual 290-second pair, release-process
 preflight, live A/B, backend qualification, delivery, admission, and independent soak remain later
 gates. `[LDB-4007]`, `[LDB-0013]`, and production **NO-GO** are unchanged.

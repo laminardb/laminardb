@@ -5,9 +5,10 @@
 - **Byte order:** Big-endian for every integer
 
 This is the normative byte layout for the first managed grouped-aggregate artifact and its
-`VnodePartialV2` directory. Cycle 5 lands private borrowed aggregate and outer-directory readers,
-plus test-only full-buffer fixture encoders. Those encoders are not release code or production
-streaming writers. The current
+`VnodePartialV2` directory. Cycle 5 lands private borrowed aggregate and outer-directory readers plus
+full-buffer fixture encoders. Core Cycle 1 promotes only the inner aggregate encoder into private
+release code for its bounded in-memory reference shard; the outer-directory encoder remains
+test-only. Neither is a production streaming writer. The current
 checkpoint manifest has no selector for these bytes, so a production reader or writer must not
 sniff this magic or fall back from this format to legacy rkyv. A manifest-version/format-selector
 change, rolling reader capability proof, trusted sealed-object composition, bounded object fetch,
@@ -223,7 +224,7 @@ A persisted row requires `1 <= COUNT <= i64::MAX`, non-null count no greater tha
 SUM when non-null count is zero. When the cached contract declares a non-nullable SUM input, the
 non-null count must equal COUNT. A zero non-null count evaluates to SQL NULL; otherwise SUM is its
 exact signed `i64` value. `state_bytes == row_count * 24`, and scanned row, key, and state totals must
-equal the header. The test-only fixture encoder consumes already sorted rows and builds the complete
+equal the header. The private reference encoder consumes already sorted rows and builds the complete
 byte vector in memory; it is not the production checkpoint writer. A future
 writer sorts on a bounded blocking checkpoint worker or consumes an ordered LSM scan, never on the
 event-loop hot path, and streams under the artifact budget.
@@ -338,8 +339,8 @@ certificate forces FULL/EMPTY rather than a DELTA. During whole-chain validation
 value/replacement record: for a key found in its parent, COUNT must strictly increase and SUM
 non-null count cannot decrease. These cross-chain checks do not belong to the isolated row decoder.
 
-The borrowed readers validate bytes already admitted under those reservations. Test-only fixture
-encoders allocate complete output vectors for frozen conformance vectors. None of
+The borrowed readers validate bytes already admitted under those reservations. The inner reference
+encoder and test-only outer fixture encoder allocate complete output vectors. None of
 this makes the current whole-object `read_partial` bounded, verifies a trusted top-level seal,
 resolves chains, invokes operators, installs state, alters manifest dispatch, or relaxes
 `[LDB-4007]`. Whole-transition preflight must validate every roster entry, aggregate the per-object
@@ -347,8 +348,9 @@ counters, and finish every chain before any operator callback.
 
 ## Rolling compatibility
 
-Release N may ship these private admission-neutral readers and frozen goldens without a production
-writer; the fixture encoders compile only in tests. A future N+1 streaming writer is enabled only after every checkpoint
+Release N may ship these private admission-neutral readers, the inner reference encoder, and frozen
+goldens without a production writer; the outer-directory fixture encoder compiles only in tests. A
+future N+1 streaming writer is enabled only after every checkpoint
 participant advertises the manifest-selected reader capability and trusted sealed composition is
 wired. Legacy rkyv remains reachable only through explicit legacy inventory proof for the admitted
 global vnode-0 path. There is no magic-sniff fallback in either direction.

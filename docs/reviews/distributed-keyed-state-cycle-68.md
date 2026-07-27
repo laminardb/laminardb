@@ -83,7 +83,11 @@ deferred executable/evidence work.
   ignored. Formatting, warnings-denied Clippy, diff checks, local Markdown links, and the research/
   memory audit pass. These tests are not a real-time, Linux, network, or product soak claim.
 
-## Cycle 69 review plan
+## Superseded Cycle 69 review plan
+
+Owner direction on 2026-07-27 pauses this plan and all later soak, A/B, observer, transcript, and
+certification-tooling work. The completed Cycle 68 code and commits remain preserved; none of the
+items below is active work.
 
 1. Add only domain-separated owned-fake evidence/result schemas; do not use the reserved live
    `paced-observer-result/v1` or `diagnostic-request-response/v2` names yet.

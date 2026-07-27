@@ -6,6 +6,12 @@
 
 **Scope:** admission and lifecycle validation only; no cluster capability is enabled by this work.
 
+**2026-07-27 core update:** The
+[ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset)
+pauses later certification tooling. Core Cycle 1 adds only a private reference managed vnode shard
+and caller-supplied lifecycle-batch publication; it does not add TidesDB, wire a graph operator, or
+relax `[LDB-4007]`.
+
 **Current authority:** the [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
 selects the official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb`, as the intended
 integration line. [Cycle 41 T0](tidesdb-rs-t0-source-closure-2026-07-25.md) stops exact v0.11.1/

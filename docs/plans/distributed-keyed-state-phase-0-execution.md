@@ -1,11 +1,12 @@
 # Phase 0 execution plan: distributed keyed state
 
-- **Status:** In progress but backend-gated; official `tidesdb/tidesdb-rs`, published as Cargo
-  package `tidesdb`, remains the worker-local integration line, while exact v0.11.1 is stopped at T0
-  pending a new official package; no runtime
-  dependency, backend qualification evidence, independent production-soak result, or admission change
+- **Status:** Certification/qualification work paused; backend-neutral core reference work resumed;
+  official `tidesdb/tidesdb-rs`, published as Cargo package `tidesdb`, remains the worker-local
+  integration line, while exact v0.11.1 is stopped at T0 pending a new official package; no runtime
+  dependency, backend qualification evidence, independent production-soak result, or admission
+  change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 68
+- **Last reconciled:** 2026-07-27 during Core Cycle 1
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -22,6 +23,10 @@ Cycle 20 does not split the existing Phase 0 review gate;
 Phase 1 remains blocked until that gate completes or an accepted ADR/plan amendment defines a
 smaller owner-approved entry gate. This phase does not add a state backend to the runtime, relax
 `[LDB-4007]`, enable a materialized view, or change the cluster delivery guarantee.
+
+The [2026-07-27 ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset)
+pauses Cycle 69 and later certification work and authorizes only the private reference core slice.
+It is not Phase 0 completion, backend qualification, or permission to execute a candidate.
 
 The phase is complete only when maintainers can answer, with versioned evidence:
 
@@ -195,7 +200,9 @@ introspection, canonicalization, dependency selection, SHA-256, rkyv/format pars
 post-freeze encoding never run per row or per processing batch.
 
 Cycle 5 freezes the normative layout and goldens with private, admission-neutral borrowed aggregate
-and outer-structural `VnodePartialV2` readers plus test-only full-buffer fixture encoders. The 160-byte V2 header hashes the
+and outer-structural `VnodePartialV2` readers plus full-buffer fixture encoders. Core Cycle 1 promotes
+only the inner aggregate encoder into private release code for the reference vnode shard; the outer
+encoder remains test-only. The 160-byte V2 header hashes the
 directory; each BODY entry hashes its exact slice, so there is no redundant whole-body hash. The
 outer reader does not authenticate the object or validate aggregate semantics. Production restore
 must first match the complete payload to the trusted seal/inventory digest, select the format from
@@ -523,7 +530,8 @@ an explicitly open/unsealed process-local prefix claim, because abrupt restart c
 loss metadata, or in-flight guards after the last poll. Exact continuity is deferred to a separate
 durable-journal decision that must account for checkpoint-control-path latency.
 
-Work proceeds in this order: (1) paced owned-fake implementation and deterministic plus one real-
+This certification sequence is suspended. If explicitly resumed, work would proceed in this order:
+(1) paced owned-fake implementation and deterministic plus one real-
 time schedule test; (2) launcher-prebound loopback socket, trusted release-process descriptor, and
 nonce-bound v2 response preflight, still not
 an A/B sample; (3) engineering effect-estimation under Cycle 60 only after review; (4) a separate
@@ -540,7 +548,8 @@ and one intentionally ignored subprocess fixture on Windows. No executable mode,
 result, transcript, lane, HTTP interaction, or real-time 290-second test exists, so step (1) remains
 open.
 
-Cycle 69 is limited to library-level owned-fake evidence contracts: bounded sequenced framing,
+The former Cycle 69 scope is paused. A separately reauthorized cycle could add library-level
+owned-fake evidence contracts: bounded sequenced framing,
 supervisor-spool-compatible transcript validation, a complete ordered 174-node-slot result, checked
 totals, and honest open/unsealed generation coverage. It must remain incapable of contacting
 LaminarDB. Transport delivery-stage extraction, persistent lanes, child/supervisor integration, the
@@ -875,12 +884,12 @@ Remaining work is kept reviewable in this dependency order:
    poison, resource/health admission, and fresh-native-root fencing must land only with a real
    runtime consumer rather than a disconnected future trait;
 4. wait for a new official Cargo package `tidesdb`, freeze its exact native pair, and repeat the
-   complete one-day/zero-machine-hour T0. The repeated T0 must reconcile every later native fix and
-   prove exact transaction success or explicitly accept the full-key verified-commit/fail-stop
-   protocol. Only after a pass and separately reviewed execution scope may T1 spend at most two
-   working days/four machine-hours in an isolated workspace; compilation, linkage, diagnostics, and
-   smoke execution are facade-feasibility evidence only. Freeze successor identities after a pass
-   and add an adapter only under its own later authority;
+   complete four-engineer-hour/one-working-day/zero-machine-hour T0. The repeated T0 must reconcile
+   every later native fix and prove exact transaction success or explicitly accept the full-key
+   verified-commit/fail-stop protocol. Only after a pass and separately reviewed execution scope may
+   T1 spend at most one engineer-day/one machine-hour in an isolated workspace; compilation,
+   linkage, diagnostics, and smoke execution are facade-feasibility evidence only. Freeze successor
+   identities after a pass and add an adapter only under its own later authority;
 5. after a future package passes T0/T1, implement only genuinely reusable parsers/evaluators,
    formulas, bounded readers, synthetic execution-ineligible fixtures, and negative-capability tests
    directly required by the
@@ -901,12 +910,14 @@ sequence. If a future bounded charter yields a favorable administrative recommen
 explicit scope decision and additive profile/schema revision are still required before any redb
 adapter commit.
 
-Phase 1 tracks the temporary reader-first dead-code allowances as **DKS-P1-001**. Owner:
-distributed-state lifecycle implementation. Deadline: 2026-08-31 or the first trusted,
-manifest-selected restore-composition commit, whichever comes first. That commit removes both
-module-level allowances, installs the sole sealed outer-plus-inner consumer, and must land before a
-reader capability is advertised or any admission guard is relaxed. Test-only fixture encoders do
-not compile into release builds.
+Phase 1 tracks three temporary release dead-code allowances as **DKS-P1-001**. Owner:
+distributed-state lifecycle implementation. Deadline: 2026-08-31 or the first applicable runtime
+consumer, whichever comes first. The trusted manifest-selected outer-plus-inner consumer removes
+the allowances in `aggregate_state/artifact_v1.rs` and `vnode_partial/v2.rs`; a real
+cluster graph/lifecycle consumer removes the allowance in `aggregate_state/managed_v1.rs`, or that
+reference module is removed. All three exits must land before any admission guard is relaxed. The
+outer-directory fixture encoder remains test-only; the promoted inner reference encoder is not a
+manifest-selected or production streaming writer.
 
 Each commit runs its affected feature matrix. Backend candidates do not touch runtime crates, and
 the first graph-lifecycle implementation remains a Phase 1 change. The first guard-removal commit

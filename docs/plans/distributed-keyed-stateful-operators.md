@@ -1,9 +1,9 @@
 # Phased plan: distributed keyed and stateful operators
 
-- **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
-  operator is admitted by this document
+- **Status:** Core reference implementation resumed; production qualification/certification paused;
+  exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster operator is admitted
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 68
+- **Last reconciled:** 2026-07-27 during Core Cycle 1
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -35,6 +35,23 @@ The critical path is:
 
 Performance, fault injection, compatibility, operational telemetry, and end-of-cycle review run
 through every phase; they are not a final cleanup sprint.
+
+### Core workstream reset
+
+The owner reset is recorded normatively in
+[ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset).
+Cycle 69 and later certification work are paused; Core Cycle 1 is limited to a private,
+reference-only managed vnode shard plus caller-supplied lifecycle-batch publication and does not
+change runtime admission.
+
+The next core lifecycle slice integrates complete-batch multi-vnode restore preparation and
+activation into the graph. The private reference validates every supplied participant before an
+allocation-free publication loop, but it has no authoritative roster and the current graph still
+drains and applies staged vnodes sequentially. Until the graph owner validates roster completeness
+and uses this lifecycle shape, a post-mutation apply failure remains recovery-required. Backend
+work does not block this slice. TidesDB re-entry and the upstream-contribution boundary are owned by
+the
+[TidesDB design](../architecture-decisions/tidesdb-local-state-successor-design.md).
 
 The Cycle 20 [working-state placement analysis](../reports/state-working-state-options-2026-07-24.md)
 separates the capability from a named engine but does not change sequencing authority. Phase 1
@@ -259,15 +276,17 @@ route logging contain the surface. Parse-error input is detached, and both reloa
 restart-only active configuration while committing only successful source/lookup/pipeline/sink
 changes. The no-cluster and cluster server matrices pass (238/238 and 316/316), including the
 credential/alias/method matrix and reload success/failure paths. No observer or real-process HTTP
-run exists yet. The next bounded gate is a loopback fake-server observer protocol; multi-host
-transport, effect-estimation, powered equivalence, and the independent release soak remain later.
+run exists yet. A loopback fake-server observer protocol was then the next bounded gate before the
+certification workstream was suspended; multi-host transport, effect-estimation, powered
+equivalence, and the independent release soak remain open.
 
 Cycle 65 completes only that root-workspace-excluded loopback fake-protocol component. Typed stdin
 bootstrap, exact bounded HTTP parsing, restart/cursor/assignment validation, explicit
 incompleteness, cancellation, zero C sockets, and 348 successful D fake responses pass in unit and
 real-child tests. No LaminarDB process or workload was used, and configured loopback alone is not
 fake-process attestation. The sealed common driver has not yet been upgraded to launch and consume
-the network-mode observer; that fake-only non-feedback proof is the next gate. Runtime admission,
+the network-mode observer; that fake-only non-feedback proof was then the next gate before this
+workstream was suspended. Runtime admission,
 TidesDB qualification, source/state/sink delivery, multi-host security, latency A/B, and the
 independent release soak remain open.
 
@@ -297,7 +316,8 @@ anchor-after-decode ordering, absolute timing classifiers, and atomic cross-slot
 `paced-owned-fake-*` names cannot be relabelled as live readiness, and it has no executable, network,
 lane, result, transcript, or timing-coverage path.
 
-The next bounded implementation gate remains owned-fake only: add a separately versioned bounded
+The following certification sequence is suspended. If explicitly resumed, its next owned-fake gate
+would add a separately versioned bounded
 frame stream, complete 174-node-slot result validation, append-only transcript validation, and
 open/unsealed timing-generation classification without a CLI or socket. Then extract delivery-stage
 HTTP behavior with accelerated-v3 regression coverage; implement three persistent lanes and
@@ -452,8 +472,8 @@ Work:
     prior native state, native checkpoint, remote mode, strict replay, and per-batch `FULL` are
     outside the initial profile. T1, a runtime dependency, an adapter, and successor profile
     identities are cancelled for v0.11.1. A future official native/package release repeats the
-    complete one-working-day/zero-machine-hour T0; only a pass may fund T1's at-most-two-working-day/
-    four-machine-hour isolated package feasibility. Cgroup
+    complete four-engineer-hour/one-working-day/zero-machine-hour T0; only a pass may fund T1's
+    at-most-one-engineer-day/one-machine-hour isolated package feasibility. Cgroup
     resources, maintenance health, immutable cuts, concurrency, tails, faults, portable restore,
     delivery, and independent soak remain hard gates. TidesDB native remote storage stays disabled.
     Cycle 19's reviewed
@@ -870,19 +890,23 @@ admission/phase merge. It must name evidence and owners rather than checking box
 Required passes:
 
 1. **AI-slop:** verify every symbol/path/config/source claim against the tree; remove speculative
-   APIs, fake precision, duplicated prose, cargo-cult architecture, stale TODOs, and generated filler.
+   APIs, fake precision, duplicated prose, cargo-cult architecture, stale TODOs, generated filler,
+   and names that promise more than the implementation guarantees.
 2. **Over-engineering:** challenge every abstraction, dependency, feature flag, migration mode, and
    public option; record what is deliberately deferred and why the smallest vertical is insufficient
    without any retained mechanism.
 3. **Unused/dead code:** run compiler/clippy feature matrices plus reachability/search review; remove
    superseded maps, hooks, adapters, metrics, configs, test helpers, and ignored return values, or
-   assign a dated removal issue.
+   assign a dated removal issue. No unowned `allow(dead_code)` may reach an admission change: staged
+   code must gain its real consumer, move to test/conformance scope, or be removed.
 4. **Production readiness:** review failure containment, resource bounds, security, upgrades,
    rollback, observability, on-call actions, data compatibility, and evidence against numerical
    SLO/RTO gates. For a production claim, verify the independent soak's release identity, external
    oracle, raw artifacts, reviewer independence, and complete valid pass without unexplained gaps.
 5. **Documentation:** keep ADR as decision authority and this file as sequencing authority; update
    public capability docs, remove superseded diaries/research, test every link, and cut repetition.
+   Split oversized source/test files only at coherent ownership boundaries; do not preserve vague
+   helper names or create line-count-only modules.
 6. **Tests:** list exact commands/results, skipped suites and prerequisites, nondeterminism/retry
    counts, fault coverage, differential oracle, performance environment, and coverage gaps. A test
    that matches zero cases or needs unrecorded temporary instrumentation is a failure.
@@ -890,6 +914,10 @@ Required passes:
 The reviewer must conclude `APPROVE`, `APPROVE WITH OWNED FOLLOW-UPS`, or `BLOCK`. A block leaves the
 admission flag closed. Reviews are cumulative; use the highest numbered completed
 `docs/reviews/distributed-keyed-state-cycle-*.md` review as the current cycle boundary.
+
+Before any production-ready claim, run one repository-wide maintainability audit over runtime and
+soak/tooling callers, names, dead-code allowances, module ownership, and superseded documentation.
+That audit removes unused code rather than converting it into permanent compatibility surface.
 
 ## Commit and change discipline
 
