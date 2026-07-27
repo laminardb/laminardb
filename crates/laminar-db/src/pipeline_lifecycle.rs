@@ -3610,23 +3610,13 @@ impl LaminarDB {
         sources: &[TrackedSourceRegistration],
         sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
         stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+        stream_output_schemas: &HashMap<String, arrow_schema::SchemaRef>,
         runtime_mode: RuntimeMode,
         checkpointing_enabled: bool,
         pipeline_checkpoint_timeout: std::time::Duration,
         prom_registry: Option<&Arc<prometheus::Registry>>,
     ) -> Result<PipelineSinkSetup, DbError> {
         use crate::connector_manager::build_sink_config;
-        let stream_output_schemas = resolve_stream_output_schemas(&self.ctx, stream_regs).await?;
-        {
-            let mut schemas = self.stream_schemas.write();
-            schemas.clear();
-            schemas.extend(
-                stream_output_schemas
-                    .iter()
-                    .map(|(k, v)| (k.clone(), Arc::clone(v))),
-            );
-        }
-
         let (sink_event_tx, sink_event_rx) =
             laminar_core::streaming::channel::channel::<crate::sink_task::SinkEvent>(
                 crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY,
@@ -5192,12 +5182,27 @@ impl LaminarDB {
                 std::time::Duration::from_millis,
             );
 
+        let stream_output_schemas = resolve_stream_output_schemas(&self.ctx, &stream_regs).await?;
+        {
+            let mut schemas = self.stream_schemas.write();
+            schemas.clear();
+            schemas.extend(
+                stream_output_schemas
+                    .iter()
+                    .map(|(name, schema)| (name.clone(), Arc::clone(schema))),
+            );
+        }
+
         let mut graph = self.build_connector_operator_graph(
             &source_regs,
             &stream_regs,
             &table_regs,
             pipeline_identity.as_ref(),
         )?;
+        for (name, schema) in &stream_output_schemas {
+            graph.register_intermediate_schema(name, schema);
+        }
+        let mut graph = graph.initialize_managed_state().await?;
 
         let prom_registry = self.prometheus_registry.lock().clone();
         let mut sources = self.build_pipeline_sources(
@@ -5213,6 +5218,7 @@ impl LaminarDB {
                 &sources,
                 &sink_regs,
                 &stream_regs,
+                &stream_output_schemas,
                 runtime_mode,
                 checkpointing_enabled,
                 pipeline_checkpoint_timeout,

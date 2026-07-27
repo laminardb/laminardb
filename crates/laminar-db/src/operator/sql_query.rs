@@ -1048,6 +1048,20 @@ impl GraphOperator for SqlQueryOperator {
         self.capability
     }
 
+    async fn initialize_managed_state(&mut self) -> Result<(), DbError> {
+        if matches!(self.state, QueryState::Uninit) {
+            self.lazy_init().await?;
+        }
+        if matches!(self.state, QueryState::Agg(_)) {
+            return Ok(());
+        }
+        // The immutable AST classifier deliberately over-approximates direct aggregates. Local
+        // execution may legitimately resolve a derived aggregate to DataFusion instead of the
+        // incremental state table. Cluster execution rejects that fallback inside `lazy_init`.
+        self.capability.managed_state = None;
+        Ok(())
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
@@ -1501,7 +1515,9 @@ mod checkpoint_tests {
 
     #[test]
     fn sql_capability_classification_is_shape_aware_and_fail_closed() {
-        use crate::operator::capability::{ClusterExecutionStatus, OperatorStateClass};
+        use crate::operator::capability::{
+            ClusterExecutionStatus, ManagedStateContract, OperatorStateClass,
+        };
 
         let context = laminar_sql::create_session_context();
         let classify = |sql| classify_sql_capability(sql, &context);
@@ -1517,6 +1533,10 @@ mod checkpoint_tests {
         let global = classify("SELECT COUNT(*) AS n FROM events");
         assert_eq!(global.state_class, OperatorStateClass::GlobalSingleton);
         assert_eq!(global.cluster_status, ClusterExecutionStatus::DdlGuarded);
+        assert_eq!(
+            global.managed_state,
+            Some(ManagedStateContract::SqlAggregateV1)
+        );
 
         let keyed = classify("SELECT key, SUM(value) AS total FROM events GROUP BY key");
         assert_eq!(keyed.state_class, OperatorStateClass::VnodeKeyed);
@@ -1524,6 +1544,10 @@ mod checkpoint_tests {
             keyed.cluster_status,
             ClusterExecutionStatus::Rejected { .. }
         ));
+        assert_eq!(
+            keyed.managed_state,
+            Some(ManagedStateContract::SqlAggregateV1)
+        );
 
         let window_keyed = classify(
             "SELECT TUMBLE(ts, INTERVAL '1' MINUTE), SUM(value) FROM events \
@@ -1535,6 +1559,7 @@ mod checkpoint_tests {
         };
         assert!(reason.contains("timer"), "{reason}");
         assert!(reason.contains("watermark"), "{reason}");
+        assert_eq!(window_keyed.managed_state, None);
 
         let analytic = classify("SELECT SUM(value) OVER (PARTITION BY key) AS running FROM events");
         assert_eq!(analytic.state_class, OperatorStateClass::LocalOnly);
@@ -1577,6 +1602,23 @@ mod checkpoint_tests {
             malformed.cluster_status,
             ClusterExecutionStatus::Rejected { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn managed_aggregate_initializes_before_receiving_input() {
+        let (context, _) = context_and_batch();
+        let mut operator = SqlQueryOperator::new(
+            "sum",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            false,
+        );
+
+        operator.initialize_managed_state().await.unwrap();
+
+        assert!(matches!(operator.state, QueryState::Agg(_)));
+        assert!(operator.checkpoint().unwrap().is_some());
     }
 
     pub(super) fn context_and_batch() -> (SessionContext, RecordBatch) {
@@ -1679,8 +1721,9 @@ mod checkpoint_tests {
             false,
         );
 
-        operator.lazy_init().await.unwrap();
+        operator.initialize_managed_state().await.unwrap();
         assert!(matches!(operator.state, QueryState::CachedPlan(_)));
+        assert_eq!(operator.capability.managed_state, None);
     }
 
     #[test]

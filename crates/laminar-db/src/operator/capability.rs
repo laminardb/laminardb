@@ -19,6 +19,20 @@ pub(crate) enum OperatorStateClass {
     LocalOnly,
 }
 
+/// Durable working-state contract implemented by an operator.
+///
+/// This is independent of runtime mode. Embedded and single-node execution use the same state
+/// implementation and codec; cluster execution additionally projects this contract onto vnode
+/// ownership and rebalance. A state class without a managed contract remains descriptive only and
+/// must not participate in the managed lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagedStateContract {
+    /// The existing incremental SQL aggregate checkpoint codec.
+    SqlAggregateV1,
+    #[cfg(test)]
+    TestVnodeStateV1,
+}
+
 /// Current relationship between this inventory entry and cluster DDL admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClusterExecutionStatus {
@@ -67,6 +81,7 @@ pub(crate) struct OperatorCapability {
     pub(crate) implementation: OperatorImplementation,
     pub(crate) state_class: OperatorStateClass,
     pub(crate) cluster_status: ClusterExecutionStatus,
+    pub(crate) managed_state: Option<ManagedStateContract>,
 }
 
 impl OperatorCapability {
@@ -78,6 +93,7 @@ impl OperatorCapability {
             implementation,
             state_class,
             cluster_status: ClusterExecutionStatus::DdlGuarded,
+            managed_state: None,
         }
     }
 
@@ -90,6 +106,7 @@ impl OperatorCapability {
             implementation,
             state_class,
             cluster_status: ClusterExecutionStatus::Rejected { reason },
+            managed_state: None,
         }
     }
 
@@ -101,7 +118,13 @@ impl OperatorCapability {
             implementation,
             state_class,
             cluster_status: ClusterExecutionStatus::InternalOnly,
+            managed_state: None,
         }
+    }
+
+    const fn with_managed_state(mut self, contract: ManagedStateContract) -> Self {
+        self.managed_state = Some(contract);
+        self
     }
 
     /// Fixed classification for every non-polymorphic production implementation.
@@ -181,6 +204,7 @@ impl OperatorCapability {
             OperatorImplementation::SqlQuery,
             OperatorStateClass::GlobalSingleton,
         )
+        .with_managed_state(ManagedStateContract::SqlAggregateV1)
     }
 
     /// Descriptor for the current grouped-aggregate path.
@@ -190,6 +214,7 @@ impl OperatorCapability {
             OperatorStateClass::VnodeKeyed,
             "keyed working state remains an unbounded operator-owned map outside a qualified managed-state lifecycle",
         )
+        .with_managed_state(ManagedStateContract::SqlAggregateV1)
     }
 
     /// Descriptor for a keyed SQL aggregate with event-time window state.
@@ -209,6 +234,15 @@ impl OperatorCapability {
     #[cfg(test)]
     pub(crate) const fn test_probe() -> Self {
         Self::fixed(OperatorImplementation::TestProbe)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn test_vnode_state() -> Self {
+        Self::internal(
+            OperatorImplementation::TestProbe,
+            OperatorStateClass::VnodeKeyed,
+        )
+        .with_managed_state(ManagedStateContract::TestVnodeStateV1)
     }
 }
 
@@ -318,6 +352,7 @@ mod tests {
                     implementation,
                     state_class,
                     cluster_status,
+                    managed_state: None,
                 }
             );
         }

@@ -40,6 +40,18 @@ pub(crate) trait GraphOperator: Send {
     /// it compiles. Cluster DDL admission does not consume this descriptor yet.
     fn cluster_capability(&self) -> OperatorCapability;
 
+    /// Build and install the operator's declared managed working state before recovery.
+    ///
+    /// The graph calls this only for operators whose capability declares a managed-state
+    /// contract. The rejecting default makes a newly declared participant fail during startup
+    /// instead of silently staging unvalidated checkpoint bytes.
+    async fn initialize_managed_state(&mut self) -> Result<(), DbError> {
+        Err(DbError::Checkpoint(
+            "operator declares managed state but does not implement managed-state initialization"
+                .into(),
+        ))
+    }
+
     /// `watermarks[i]` is the upstream output watermark for `inputs[i]`.
     async fn process(
         &mut self,
@@ -116,10 +128,12 @@ pub(crate) trait GraphOperator: Send {
     }
 
     /// Drop in-memory state for vnodes this node lost on a rebalance, before a later authoritative
-    /// vnode image is installed. Vnode-sharded stateful operators override the default no-op.
+    /// vnode image is installed. Managed vnode-state operators must implement this callback.
     #[cfg(feature = "cluster")]
     fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) -> Result<(), DbError> {
-        Ok(())
+        Err(DbError::Checkpoint(
+            "operator declares vnode state but does not implement vnode revocation".into(),
+        ))
     }
 
     /// Force the next delta capture to re-base FULL after a failed epoch (destructive capture
@@ -206,7 +220,7 @@ const STATS_SAMPLE_INTERVAL: u64 = 32;
 pub(crate) type OperatorStateMap = std::collections::HashMap<String, Vec<u8>>;
 
 /// Persisted operator-graph state ABI.
-pub(crate) const GRAPH_CHECKPOINT_VERSION: u32 = 4;
+pub(crate) const GRAPH_CHECKPOINT_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct GraphCheckpoint {
@@ -217,6 +231,7 @@ pub(crate) struct GraphCheckpoint {
 struct GraphNode {
     name: Arc<str>,
     operator: Box<dyn GraphOperator>,
+    capability: OperatorCapability,
     input_port_count: usize,
     output_routes: Vec<(usize, u8)>,
     removed: bool,
@@ -235,6 +250,7 @@ impl GraphNode {
         Self {
             name,
             operator,
+            capability,
             input_port_count,
             output_routes: Vec::new(),
             removed: false,
@@ -251,6 +267,7 @@ impl GraphNode {
             "replaced physical operator capability inventory"
         );
         self.operator = operator;
+        self.capability = capability;
     }
 }
 
@@ -998,6 +1015,47 @@ impl OperatorGraph {
     pub fn register_source_schema(&mut self, name: String, schema: SchemaRef) {
         self.ensure_live_provider(&name, &schema);
         self.source_schemas.insert(name, schema);
+    }
+
+    /// Register a schema-only live provider for an intermediate stream before managed operators
+    /// are prepared. The normal graph cycle fills the same provider when the upstream emits.
+    pub(crate) fn register_intermediate_schema(&mut self, name: &str, schema: &SchemaRef) {
+        self.ensure_live_provider(name, schema);
+    }
+
+    /// Initialize every declared managed-state participant before checkpoint recovery begins.
+    ///
+    /// This runs in embedded, single-node, and cluster pipelines. Cluster then layers vnode
+    /// ownership and transition fencing over the same initialized operator state.
+    pub(crate) async fn initialize_managed_state(mut self) -> Result<Self, DbError> {
+        if !self.whole_restore_open {
+            return Err(DbError::Checkpoint(
+                "managed state must be initialized before graph recovery or execution".into(),
+            ));
+        }
+        for node in &mut self.nodes {
+            if node.removed || node.capability.managed_state.is_none() {
+                continue;
+            }
+            node.operator
+                .initialize_managed_state()
+                .await
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "managed-state initialization for operator '{}' failed: {error}",
+                        node.name
+                    ))
+                })?;
+            let resolved = node.operator.cluster_capability();
+            if resolved.implementation != node.capability.implementation {
+                return Err(DbError::Checkpoint(format!(
+                    "managed-state initialization changed operator '{}' implementation from {:?} to {:?}",
+                    node.name, node.capability.implementation, resolved.implementation
+                )));
+            }
+            node.capability = resolved;
+        }
+        Ok(self)
     }
 
     fn ensure_live_provider(&mut self, name: &str, schema: &SchemaRef) {
