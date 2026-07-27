@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use distributed_state_ab::observer_protocol::{
-    run_observer_protocol, ProtocolCancellation, ProtocolDispositionV1, ProvisionedObserverInput,
+    run_observer_protocol, ProtocolCancellation, ProtocolDispositionV2, ProvisionedObserverInput,
     SupervisorBootstrapSource, SUPERVISOR_CANCEL_BYTES,
 };
 use distributed_state_ab::{
@@ -36,14 +36,30 @@ fn run() -> Result<(), String> {
     let mut arguments = std::env::args_os();
     let _program = arguments.next();
     let command = arguments.next().ok_or_else(usage)?;
-    if std::env::vars_os().next().is_some() {
-        return Err("observer environment must be empty".to_owned());
-    }
+    validate_observer_environment()?;
     match command.to_str() {
         Some("dry-run") => run_dry_run(arguments),
         Some("fake-protocol") => run_fake_protocol(arguments),
         _ => Err(usage()),
     }
+}
+
+fn validate_observer_environment() -> Result<(), String> {
+    for (name, value) in std::env::vars_os() {
+        #[cfg(windows)]
+        if name
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case("SystemRoot"))
+            && !value.is_empty()
+            && std::path::Path::new(&value).is_absolute()
+        {
+            continue;
+        }
+        #[cfg(not(windows))]
+        let _ = (&name, &value);
+        return Err("observer environment contains an unsupported entry".to_owned());
+    }
+    Ok(())
 }
 
 fn run_dry_run(mut arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<(), String> {
@@ -119,7 +135,7 @@ fn run_fake_protocol(
     std::io::stdout()
         .flush()
         .map_err(|error| format!("flush observer protocol result: {error}"))?;
-    if result.disposition == ProtocolDispositionV1::Incomplete {
+    if result.disposition == ProtocolDispositionV2::Incomplete {
         return Err("observer protocol collection was incomplete".to_owned());
     }
     Ok(())

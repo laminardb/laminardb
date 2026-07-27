@@ -24,8 +24,8 @@ use crate::{
 };
 
 pub const SANITIZED_PLAN_SCHEMA: &str = "laminardb-observer-sanitized-plan/v2";
-pub const PROTOCOL_RESULT_SCHEMA: &str = "laminardb-observer-loopback-fake-protocol/v1";
-pub const SUPERVISOR_BOOTSTRAP_PREFIX: &[u8] = b"LAMINARDB_AB_OBSERVER_BOOTSTRAP_V2\n";
+pub const PROTOCOL_RESULT_SCHEMA: &str = "laminardb-observer-loopback-fake-protocol/v2";
+pub const SUPERVISOR_BOOTSTRAP_PREFIX: &[u8] = b"LAMINARDB_AB_OBSERVER_BOOTSTRAP_V3\n";
 pub const SUPERVISOR_CANCEL_BYTES: &[u8] = b"LAMINARDB_AB_OBSERVER_CANCEL_V1\n";
 
 const MAX_SANITIZED_PLAN_BYTES: usize = 64 * 1_024;
@@ -38,7 +38,7 @@ const TIMING_SCHEMA: &str = "laminardb-local-checkpoint-barrier-timings/v1";
 const PARTITIONING_ABI_VERSION: u16 = 1;
 const TIMING_LEDGER_CAPACITY: usize = 1_024;
 const MAX_TIMING_PAGE_RECORDS: usize = 64;
-const MAX_ASSIGNMENT_DIGESTS_PER_NODE_RUN: usize = 1_024;
+const MAX_ASSIGNMENT_IDENTITIES_PER_NODE_RUN: usize = 1_024;
 const MAX_PROCESS_GENERATIONS_PER_NODE_RUN: usize = EXPECTED_OBSERVER_SLOTS * 2;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -456,7 +456,7 @@ pub struct ObserverProtocolEventV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ObserverProtocolResultV1 {
+pub struct ObserverProtocolResultV2 {
     pub schema_version: String,
     pub notice: String,
     pub execution_eligible: bool,
@@ -475,13 +475,13 @@ pub struct ObserverProtocolResultV1 {
     pub page_budget_deferrals: u32,
     pub unresolved_timing_nodes: u8,
     pub retained_events_dropped: u32,
-    pub disposition: ProtocolDispositionV1,
+    pub disposition: ProtocolDispositionV2,
     pub retained_events: Vec<ObserverProtocolEventV1>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ProtocolDispositionV1 {
+pub enum ProtocolDispositionV2 {
     Complete,
     Incomplete,
 }
@@ -713,6 +713,17 @@ impl TimingState {
     fn reset(&mut self) {
         *self = Self::default();
     }
+
+    fn has_unread_records(&self) -> bool {
+        self.metadata
+            .is_some_and(|metadata| self.cursor < metadata.next_sequence - 1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AssignmentIdentity {
+    vnode_count: Option<u32>,
+    digest: [u8; 32],
 }
 
 #[derive(Default)]
@@ -720,7 +731,7 @@ struct NodeProtocolState {
     stable_node_id: Option<u64>,
     authority: Option<AuthorityState>,
     seen_boot_incarnations: BTreeSet<Uuid>,
-    assignment_digests: BTreeMap<u64, [u8; 32]>,
+    assignment_identities: BTreeMap<u64, AssignmentIdentity>,
     timing: TimingState,
 }
 
@@ -790,6 +801,9 @@ impl NodeProtocolState {
                 if next.assignment_version < previous.assignment_version {
                     return Err(ProtocolFailureKind::InvalidLocalEvidence);
                 }
+                if self.timing.has_unread_records() {
+                    return Err(ProtocolFailureKind::EvidenceLoss);
+                }
                 AuthorityTransition::Restarted
             }
         };
@@ -800,16 +814,21 @@ impl NodeProtocolState {
             return Err(ProtocolFailureKind::EvidenceLoss);
         }
         if self
-            .assignment_digests
+            .assignment_identities
             .get(&next.assignment_version)
-            .is_some_and(|digest| digest != &next.assignment_digest)
+            .is_some_and(|identity| {
+                identity.digest != next.assignment_digest
+                    || identity
+                        .vnode_count
+                        .is_some_and(|vnode_count| vnode_count != next.vnode_count)
+            })
         {
             return Err(ProtocolFailureKind::InvalidLocalEvidence);
         }
         if !self
-            .assignment_digests
+            .assignment_identities
             .contains_key(&next.assignment_version)
-            && self.assignment_digests.len() == MAX_ASSIGNMENT_DIGESTS_PER_NODE_RUN
+            && self.assignment_identities.len() == MAX_ASSIGNMENT_IDENTITIES_PER_NODE_RUN
         {
             return Err(ProtocolFailureKind::EvidenceLoss);
         }
@@ -817,9 +836,13 @@ impl NodeProtocolState {
             self.timing.reset();
         }
         self.seen_boot_incarnations.insert(process.boot_incarnation);
-        self.assignment_digests
+        self.assignment_identities
             .entry(next.assignment_version)
-            .or_insert(next.assignment_digest);
+            .and_modify(|identity| identity.vnode_count = Some(next.vnode_count))
+            .or_insert(AssignmentIdentity {
+                vnode_count: Some(next.vnode_count),
+                digest: next.assignment_digest,
+            });
         self.stable_node_id.get_or_insert(process.node_id);
         self.authority = Some(next);
         Ok(transition)
@@ -924,16 +947,16 @@ impl NodeProtocolState {
             let _role = record.role;
             let _deadline_exhausted = record.deadline_exhausted;
             if self
-                .assignment_digests
+                .assignment_identities
                 .get(&record.assignment_version)
-                .is_some_and(|digest| digest != &record.assignment_digest)
+                .is_some_and(|identity| identity.digest != record.assignment_digest)
             {
                 return Err(ProtocolFailureKind::InvalidTimingPage);
             }
             if !self
-                .assignment_digests
+                .assignment_identities
                 .contains_key(&record.assignment_version)
-                && self.assignment_digests.len() == MAX_ASSIGNMENT_DIGESTS_PER_NODE_RUN
+                && self.assignment_identities.len() == MAX_ASSIGNMENT_IDENTITIES_PER_NODE_RUN
             {
                 return Err(ProtocolFailureKind::EvidenceLoss);
             }
@@ -942,9 +965,12 @@ impl NodeProtocolState {
             {
                 return Err(ProtocolFailureKind::InvalidTimingPage);
             }
-            self.assignment_digests
+            self.assignment_identities
                 .entry(record.assignment_version)
-                .or_insert(record.assignment_digest);
+                .or_insert(AssignmentIdentity {
+                    vnode_count: None,
+                    digest: record.assignment_digest,
+                });
             self.timing.last_assignment_version = Some(record.assignment_version);
             self.timing.last_checkpoint_id = Some(record.attempt.checkpoint_id);
             self.timing.cursor = record.sequence;
@@ -1004,7 +1030,7 @@ pub fn run_observer_protocol(
     input: ProvisionedObserverInput,
     arm: Arm,
     cancellation: &ProtocolCancellation,
-) -> Result<ObserverProtocolResultV1, ObserverProtocolError> {
+) -> Result<ObserverProtocolResultV2, ObserverProtocolError> {
     run_observer_protocol_inner(input, arm, cancellation, usize::MAX)
 }
 
@@ -1013,7 +1039,7 @@ fn run_observer_protocol_inner(
     arm: Arm,
     cancellation: &ProtocolCancellation,
     slot_limit: usize,
-) -> Result<ObserverProtocolResultV1, ObserverProtocolError> {
+) -> Result<ObserverProtocolResultV2, ObserverProtocolError> {
     let ProvisionedObserverInput { plan, secret } = input;
     let sanitized_plan_sha256 = plan.canonical_sha256().to_owned();
     let plan = plan.plan();
@@ -1023,7 +1049,7 @@ fn run_observer_protocol_inner(
         .checked_mul(3)
         .and_then(|count| count.checked_mul(2))
         .ok_or_else(|| ObserverProtocolError::new(ProtocolFailureKind::InvalidPlan))?;
-    let mut result = ObserverProtocolResultV1 {
+    let mut result = ObserverProtocolResultV2 {
         schema_version: PROTOCOL_RESULT_SCHEMA.to_owned(),
         notice: NOTICE.to_owned(),
         execution_eligible: false,
@@ -1042,7 +1068,7 @@ fn run_observer_protocol_inner(
         page_budget_deferrals: 0,
         unresolved_timing_nodes: 0,
         retained_events_dropped: 0,
-        disposition: ProtocolDispositionV1::Complete,
+        disposition: ProtocolDispositionV2::Complete,
         retained_events: Vec::new(),
     };
     if arm.observer_mode() == crate::ObserverMode::Suppress {
@@ -1069,17 +1095,12 @@ fn run_observer_protocol_inner(
     result.unresolved_timing_nodes = u8::try_from(
         states
             .iter()
-            .filter(|state| {
-                state
-                    .timing
-                    .metadata
-                    .is_some_and(|metadata| state.timing.cursor < metadata.next_sequence - 1)
-            })
+            .filter(|state| state.timing.has_unread_records())
             .count(),
     )
     .map_err(|_| ObserverProtocolError::new(ProtocolFailureKind::EvidenceLoss))?;
     if result.transient_failures != 0 || result.unresolved_timing_nodes != 0 {
-        result.disposition = ProtocolDispositionV1::Incomplete;
+        result.disposition = ProtocolDispositionV2::Incomplete;
     }
     Ok(result)
 }
@@ -1114,7 +1135,7 @@ fn observe_node_slot(
     secret: &DiagnosticReadSecret,
     cancellation: &ProtocolCancellation,
     run_deadline: Instant,
-    result: &mut ObserverProtocolResultV1,
+    result: &mut ObserverProtocolResultV2,
 ) -> Result<(), ObserverProtocolError> {
     let mut budget = NodeSlotBudget::new(run_deadline);
     let Some(transition) = read_local_evidence(
@@ -1326,7 +1347,7 @@ fn read_local_evidence(
     secret: &DiagnosticReadSecret,
     cancellation: &ProtocolCancellation,
     budget: &mut NodeSlotBudget,
-    result: &mut ObserverProtocolResultV1,
+    result: &mut ObserverProtocolResultV2,
 ) -> Result<Option<AuthorityTransition>, ObserverProtocolError> {
     let response = probe_with_retry(
         slot,
@@ -1407,7 +1428,7 @@ fn record_authority_transition(
     slot: &ObserverSlotV1,
     endpoint: &ObserverEndpointV2,
     transition: AuthorityTransition,
-    result: &mut ObserverProtocolResultV1,
+    result: &mut ObserverProtocolResultV2,
 ) {
     if transition == AuthorityTransition::Restarted {
         result.process_transitions += 1;
@@ -1422,7 +1443,7 @@ fn record_authority_transition(
 }
 
 fn retain_event(
-    result: &mut ObserverProtocolResultV1,
+    result: &mut ObserverProtocolResultV2,
     slot: &ObserverSlotV1,
     node_ordinal: u8,
     route: DiagnosticRouteV1,
@@ -1441,7 +1462,7 @@ fn retain_event(
 }
 
 fn record_transient(
-    result: &mut ObserverProtocolResultV1,
+    result: &mut ObserverProtocolResultV2,
     slot: &ObserverSlotV1,
     node_ordinal: u8,
     route: DiagnosticRouteV1,
@@ -1461,7 +1482,7 @@ fn probe_with_retry(
     secret: &DiagnosticReadSecret,
     cancellation: &ProtocolCancellation,
     budget: &mut NodeSlotBudget,
-    result: &mut ObserverProtocolResultV1,
+    result: &mut ObserverProtocolResultV2,
 ) -> Result<ProbeOutcome, ObserverProtocolError> {
     let logical_deadline =
         minimum_deadline(Instant::now() + REQUEST_TOTAL_TIMEOUT, budget.deadline);
@@ -2191,7 +2212,7 @@ mod tests {
         servers: &[FakeServer; 3],
         arm: Arm,
         cancellation: &ProtocolCancellation,
-    ) -> Result<ObserverProtocolResultV1, ObserverProtocolError> {
+    ) -> Result<ObserverProtocolResultV2, ObserverProtocolError> {
         run_observer_protocol_inner(
             input([servers[0].address, servers[1].address, servers[2].address]),
             arm,
@@ -2204,12 +2225,59 @@ mod tests {
         servers: &[FakeServer; 3],
         arm: Arm,
         cancellation: &ProtocolCancellation,
-    ) -> Result<ObserverProtocolResultV1, ObserverProtocolError> {
+    ) -> Result<ObserverProtocolResultV2, ObserverProtocolError> {
         run_observer_protocol(
             input([servers[0].address, servers[1].address, servers[2].address]),
             arm,
             cancellation,
         )
+    }
+
+    #[test]
+    fn serialized_policy_matches_every_runtime_bound() {
+        let policy = ObserverProtocolPolicyV2::FROZEN;
+        assert_eq!(
+            CONNECT_TIMEOUT,
+            Duration::from_millis(policy.connect_timeout_ms)
+        );
+        assert_eq!(
+            WRITE_TIMEOUT,
+            Duration::from_millis(policy.write_timeout_ms)
+        );
+        assert_eq!(
+            READ_IDLE_TIMEOUT,
+            Duration::from_millis(policy.read_idle_timeout_ms)
+        );
+        assert_eq!(
+            REQUEST_TOTAL_TIMEOUT,
+            Duration::from_millis(policy.request_total_timeout_ms)
+        );
+        assert_eq!(
+            NODE_SLOT_TOTAL_TIMEOUT,
+            Duration::from_millis(policy.node_slot_total_timeout_ms)
+        );
+        assert_eq!(RETRY_DELAY, Duration::from_millis(policy.retry_delay_ms));
+        assert_eq!(
+            READ_POLL_INTERVAL,
+            Duration::from_millis(policy.cancellation_poll_ms)
+        );
+        assert_eq!(
+            FAKE_RUN_TOTAL_TIMEOUT,
+            Duration::from_millis(policy.fake_run_total_timeout_ms)
+        );
+        assert_eq!(MAX_REQUEST_ATTEMPTS, policy.max_request_attempts);
+        assert_eq!(MAX_NODE_SLOT_ATTEMPTS, policy.max_node_slot_attempts);
+        assert_eq!(MAX_TIMING_PAGES_PER_SLOT, policy.max_timing_pages_per_slot);
+        assert_eq!(
+            MAX_TIMING_BYTES_PER_SLOT,
+            policy.max_timing_bytes_per_slot as usize
+        );
+        assert_eq!(
+            MAX_TIMING_RECORDS_PER_SLOT,
+            policy.max_timing_records_per_slot as usize
+        );
+        assert_eq!(HTTP_HEADER_MAX_BYTES, policy.http_header_max_bytes as usize);
+        assert_eq!(MAX_RETAINED_EVENTS, policy.max_retained_events as usize);
     }
 
     #[test]
@@ -2239,7 +2307,7 @@ mod tests {
         assert_eq!(result.suppressed_probes, 348);
         assert_eq!(result.connection_attempts, 0);
         assert_eq!(result.parsed_responses, 0);
-        assert_eq!(result.disposition, ProtocolDispositionV1::Complete);
+        assert_eq!(result.disposition, ProtocolDispositionV2::Complete);
         assert_eq!(result.sanitized_plan_sha256, plan.canonical_sha256());
         std::thread::sleep(Duration::from_millis(20));
         assert!(servers.iter().all(|server| server.connection_count() == 0));
@@ -2293,7 +2361,7 @@ mod tests {
         );
         assert_eq!(result.retries, 0);
         assert_eq!(result.timing_records, 0);
-        assert_eq!(result.disposition, ProtocolDispositionV1::Complete);
+        assert_eq!(result.disposition, ProtocolDispositionV2::Complete);
         assert_eq!(result.unresolved_timing_nodes, 0);
         for (index, server) in servers.iter().enumerate() {
             assert_eq!(server.connection_count(), 116);
@@ -2361,7 +2429,7 @@ mod tests {
             boot(1, 1)
         )));
         assert!(result.retained_events.is_empty());
-        assert_eq!(result.disposition, ProtocolDispositionV1::Complete);
+        assert_eq!(result.disposition, ProtocolDispositionV2::Complete);
     }
 
     #[test]
@@ -2586,7 +2654,7 @@ mod tests {
         assert_eq!(result.transient_failures, 1);
         assert_eq!(servers[0].connection_count(), 2);
         assert_eq!(result.retained_events.len(), 1);
-        assert_eq!(result.disposition, ProtocolDispositionV1::Incomplete);
+        assert_eq!(result.disposition, ProtocolDispositionV2::Incomplete);
         assert_eq!(result.unresolved_timing_nodes, 0);
         drop(servers);
 
@@ -2616,7 +2684,7 @@ mod tests {
         assert_eq!(servers[0].connection_count(), 7);
         assert_eq!(result.page_budget_deferrals, 1);
         assert_eq!(result.unresolved_timing_nodes, 1);
-        assert_eq!(result.disposition, ProtocolDispositionV1::Incomplete);
+        assert_eq!(result.disposition, ProtocolDispositionV2::Incomplete);
         assert!(result
             .retained_events
             .iter()
@@ -2740,6 +2808,38 @@ mod tests {
                 .unwrap_err(),
             ProtocolFailureKind::InvalidLocalEvidence
         );
+
+        let mut state = NodeProtocolState::default();
+        state
+            .apply_local_evidence(parse_local(local_evidence(1, 1)))
+            .unwrap();
+        let mut changed_width: Value = serde_json::from_slice(&local_evidence(1, 2)).unwrap();
+        changed_width["evidence"]["adopted_assignment"]["assignment_version"] = json!(1);
+        changed_width["evidence"]["adopted_assignment"]["assignment_digest"] = json!(vec![1; 32]);
+        changed_width["evidence"]["adopted_assignment"]["vnode_count"] = json!(512);
+        assert_eq!(
+            state
+                .apply_local_evidence(serde_json::from_value(changed_width).unwrap())
+                .unwrap_err(),
+            ProtocolFailureKind::InvalidLocalEvidence
+        );
+
+        let mut state = NodeProtocolState::default();
+        state
+            .apply_local_evidence(parse_local(local_evidence(1, 1)))
+            .unwrap();
+        let records = (1..=64)
+            .map(|sequence| timing_record(1, 1, sequence))
+            .collect();
+        let unread: TimingEnvelopeWire =
+            serde_json::from_slice(&timing_page(1, 1, 0, records, 66, true)).unwrap();
+        assert_eq!(state.apply_timing_page(unread).unwrap(), (true, 64));
+        assert_eq!(
+            state
+                .apply_local_evidence(parse_local(local_evidence(1, 2)))
+                .unwrap_err(),
+            ProtocolFailureKind::EvidenceLoss
+        );
     }
 
     #[test]
@@ -2763,7 +2863,7 @@ mod tests {
         }
         assert_eq!(result.retained_events.len(), MAX_RETAINED_EVENTS);
         assert_eq!(result.retained_events_dropped, 3);
-        assert_eq!(result.disposition, ProtocolDispositionV1::Complete);
+        assert_eq!(result.disposition, ProtocolDispositionV2::Complete);
         assert!(servers.iter().all(|server| server.connection_count() == 0));
     }
 
