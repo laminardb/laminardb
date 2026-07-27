@@ -244,6 +244,15 @@ impl OperatorCapability {
         )
         .with_managed_state(ManagedStateContract::TestVnodeStateV1)
     }
+
+    #[cfg(test)]
+    pub(crate) const fn test_global_state() -> Self {
+        Self::internal(
+            OperatorImplementation::TestProbe,
+            OperatorStateClass::GlobalSingleton,
+        )
+        .with_managed_state(ManagedStateContract::TestVnodeStateV1)
+    }
 }
 
 #[cfg(test)]

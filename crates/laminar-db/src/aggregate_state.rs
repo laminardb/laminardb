@@ -1659,6 +1659,18 @@ impl IncrementalAggState {
         query_fingerprint(&self.query_sql, &self.output_schema)
     }
 
+    /// Canonical semantic EMPTY image for this exact aggregate plan.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn empty_checkpoint(&self) -> AggStateCheckpoint {
+        AggStateCheckpoint {
+            fingerprint: self.query_fingerprint(),
+            keys_ipc: Vec::new(),
+            acc_state_ipc: Vec::new(),
+            last_updated_ms: Vec::new(),
+            last_emitted: Vec::new(),
+        }
+    }
+
     pub(crate) fn checkpoint_groups(&mut self) -> Result<AggStateCheckpoint, DbError> {
         let fingerprint = self.query_fingerprint();
         let retractable = self.weight_col_idx.is_some();

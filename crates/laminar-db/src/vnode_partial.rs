@@ -1,6 +1,7 @@
 //! Per-vnode durable partial state in an immutable checkpoint-attempt namespace.
 //!
-//! An empty `operators` map is valid: it seals the epoch carrying no state.
+//! An empty `operators` map is valid only when the bound graph has no managed participant for the
+//! vnode. A stateful semantic empty is a named operator payload, not an omitted participant.
 
 use crate::error::DbError;
 
@@ -11,7 +12,8 @@ pub(crate) mod v2;
 
 /// Operator-state slices for one vnode at one epoch, in one of three shapes:
 ///
-/// - FULL/EMPTY: `base = None`, `deltas` empty, and `operators` may be empty.
+/// - FULL/EMPTY: `base = None`, `deltas` empty, and `operators` names every managed participant;
+///   it may be empty only for a graph-authoritative empty roster.
 /// - REFERENCE: `operators`/`deltas` empty, `base = Some(attempt)` — byte-identical to the base.
 /// - DELTA: `deltas` non-empty, `base = Some(parent)` — per-operator changes since `parent`.
 ///

@@ -3142,7 +3142,6 @@ impl LaminarDB {
 
     fn build_connector_operator_graph(
         &self,
-        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
         stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
         table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
         pipeline_identity: Option<&laminar_core::checkpoint::PipelineIdentity>,
@@ -3270,9 +3269,12 @@ impl LaminarDB {
             }
         }
 
-        for name in source_regs.keys() {
-            if let Some(entry) = self.catalog.get_source(name) {
-                graph.register_source_schema(name.clone(), entry.schema.clone());
+        // The connector manager contains only externally configured sources. Plain SQL-created
+        // sources are bridged directly from the catalog, but managed operators must still plan
+        // against their schemas before source connectors and checkpoint recovery are built.
+        for name in self.catalog.list_sources() {
+            if let Some(entry) = self.catalog.get_source(&name) {
+                graph.register_source_schema(name, entry.schema.clone());
             }
         }
 
@@ -3412,7 +3414,6 @@ impl LaminarDB {
 
     fn build_pipeline_sources(
         &self,
-        graph: &mut crate::operator_graph::OperatorGraph,
         source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
         checkpointing_enabled: bool,
         runtime_mode: RuntimeMode,
@@ -3561,7 +3562,6 @@ impl LaminarDB {
                 continue;
             }
             if let Some(entry) = self.catalog.get_source(&name) {
-                graph.register_source_schema(name.clone(), entry.schema.clone());
                 let subscription = entry.sink.subscribe();
                 let connector = crate::catalog_connector::CatalogSourceConnector::new(
                     subscription,
@@ -5194,7 +5194,6 @@ impl LaminarDB {
         }
 
         let mut graph = self.build_connector_operator_graph(
-            &source_regs,
             &stream_regs,
             &table_regs,
             pipeline_identity.as_ref(),
@@ -5202,11 +5201,10 @@ impl LaminarDB {
         for (name, schema) in &stream_output_schemas {
             graph.register_intermediate_schema(name, schema);
         }
-        let mut graph = graph.initialize_managed_state().await?;
+        let graph = graph.initialize_managed_state().await?;
 
         let prom_registry = self.prometheus_registry.lock().clone();
         let mut sources = self.build_pipeline_sources(
-            &mut graph,
             &source_regs,
             checkpointing_enabled,
             runtime_mode,

@@ -418,7 +418,7 @@ struct RecordingVnodeRestoreOperator {
 #[async_trait]
 impl GraphOperator for RecordingVnodeRestoreOperator {
     fn cluster_capability(&self) -> OperatorCapability {
-        OperatorCapability::test_probe()
+        OperatorCapability::test_vnode_state()
     }
 
     async fn process(
@@ -434,6 +434,33 @@ impl GraphOperator for RecordingVnodeRestoreOperator {
     }
 
     fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    fn checkpoint_by_vnode(
+        &mut self,
+        required_vnodes: &[u32],
+        _vnode_count: u32,
+    ) -> Result<
+        Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
+        DbError,
+    > {
+        Ok(Some(
+            required_vnodes
+                .iter()
+                .map(|vnode| {
+                    (
+                        *vnode,
+                        crate::checkpoint_coordinator::StagedSlice::Bytes(
+                            bytes::Bytes::from_static(b"recording-vnode-state"),
+                        ),
+                    )
+                })
+                .collect(),
+        ))
+    }
+
+    fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) -> Result<(), DbError> {
         Ok(())
     }
 
@@ -464,7 +491,7 @@ struct RestoringRosterProbe {
 #[async_trait]
 impl GraphOperator for RestoringRosterProbe {
     fn cluster_capability(&self) -> OperatorCapability {
-        OperatorCapability::test_probe()
+        OperatorCapability::test_vnode_state()
     }
 
     async fn process(
@@ -2974,7 +3001,7 @@ async fn committed_final_owner_exit_runs_only_on_the_control_path() {
     #[async_trait]
     impl GraphOperator for RevokeOnlyProbe {
         fn cluster_capability(&self) -> OperatorCapability {
-            OperatorCapability::test_probe()
+            OperatorCapability::test_vnode_state()
         }
 
         async fn process(
@@ -3060,7 +3087,7 @@ async fn final_owner_exit_rejects_process_mismatch_and_active_transport_before_c
     #[async_trait]
     impl GraphOperator for RevokeCounter {
         fn cluster_capability(&self) -> OperatorCapability {
-            OperatorCapability::test_probe()
+            OperatorCapability::test_vnode_state()
         }
 
         async fn process(
@@ -3159,7 +3186,7 @@ async fn final_owner_exit_rejects_restoring_lifecycle_before_revoke_callbacks() 
     #[async_trait]
     impl GraphOperator for RevokeCounter {
         fn cluster_capability(&self) -> OperatorCapability {
-            OperatorCapability::test_probe()
+            OperatorCapability::test_vnode_state()
         }
 
         async fn process(
@@ -3208,7 +3235,7 @@ async fn final_owner_exit_callback_failure_poisons_and_retains_authority() {
     #[async_trait]
     impl GraphOperator for FailingRevoke {
         fn cluster_capability(&self) -> OperatorCapability {
-            OperatorCapability::test_probe()
+            OperatorCapability::test_vnode_state()
         }
 
         async fn process(
@@ -3257,7 +3284,7 @@ async fn final_owner_exit_restore_drift_after_callback_poisons_and_retains_autho
     #[async_trait]
     impl GraphOperator for RestoringRevoke {
         fn cluster_capability(&self) -> OperatorCapability {
-            OperatorCapability::test_probe()
+            OperatorCapability::test_vnode_state()
         }
 
         async fn process(
@@ -3310,7 +3337,7 @@ async fn final_owner_exit_transport_drift_after_callback_poisons_and_retains_aut
     #[async_trait]
     impl GraphOperator for ActivatingRevoke {
         fn cluster_capability(&self) -> OperatorCapability {
-            OperatorCapability::test_probe()
+            OperatorCapability::test_vnode_state()
         }
 
         async fn process(
@@ -3371,7 +3398,7 @@ async fn final_owner_exit_assignment_drift_after_callback_poisons_and_retains_au
     #[async_trait]
     impl GraphOperator for ReassigningRevoke {
         fn cluster_capability(&self) -> OperatorCapability {
-            OperatorCapability::test_probe()
+            OperatorCapability::test_vnode_state()
         }
 
         async fn process(
@@ -3456,7 +3483,7 @@ fn revoke_without_cluster_scope_is_rejected_before_callbacks() {
     #[async_trait]
     impl GraphOperator for RevokeCounter {
         fn cluster_capability(&self) -> OperatorCapability {
-            OperatorCapability::test_probe()
+            OperatorCapability::test_vnode_state()
         }
 
         async fn process(
@@ -3519,7 +3546,7 @@ async fn vnode_revoke_failure_faults_and_retains_pending_work() {
     #[async_trait]
     impl GraphOperator for RevokeProbe {
         fn cluster_capability(&self) -> OperatorCapability {
-            OperatorCapability::test_probe()
+            OperatorCapability::test_vnode_state()
         }
 
         async fn process(
@@ -3618,6 +3645,293 @@ async fn checkpoint_capture_guard_excludes_assignment_publication() {
 }
 
 #[cfg(feature = "cluster")]
+#[test]
+fn managed_vnode_capture_requires_the_exact_owned_roster() {
+    struct InexactCapture(Vec<u32>);
+
+    #[async_trait]
+    impl GraphOperator for InexactCapture {
+        fn cluster_capability(&self) -> OperatorCapability {
+            OperatorCapability::test_vnode_state()
+        }
+
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn checkpoint_by_vnode(
+            &mut self,
+            _required_vnodes: &[u32],
+            _vnode_count: u32,
+        ) -> Result<
+            Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
+            DbError,
+        > {
+            Ok(Some(
+                self.0
+                    .iter()
+                    .map(|vnode| {
+                        (
+                            *vnode,
+                            crate::checkpoint_coordinator::StagedSlice::Bytes(
+                                bytes::Bytes::from_static(b"state"),
+                            ),
+                        )
+                    })
+                    .collect(),
+            ))
+        }
+    }
+
+    for (captured, expected_message) in [
+        (vec![0], "captured vnode roster [0]; expected [0, 1]"),
+        (
+            vec![0, 1, 2],
+            "captured vnode roster [0, 1, 2]; expected [0, 1]",
+        ),
+    ] {
+        let mut graph = test_graph();
+        graph.set_test_vnode_count(2);
+        graph.push_test_node("managed", Box::new(InexactCapture(captured)));
+
+        let error = graph
+            .snapshot_state_by_vnode()
+            .expect_err("an inexact managed capture roster must fail closed");
+
+        assert!(error.to_string().contains(expected_message), "{error}");
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn managed_state_placement_scopes_capture_and_restore_rosters() {
+    struct CaptureProbe {
+        capability: OperatorCapability,
+        observed: Arc<parking_lot::Mutex<Vec<Vec<u32>>>>,
+    }
+
+    #[async_trait]
+    impl GraphOperator for CaptureProbe {
+        fn cluster_capability(&self) -> OperatorCapability {
+            self.capability
+        }
+
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn checkpoint_by_vnode(
+            &mut self,
+            required_vnodes: &[u32],
+            _vnode_count: u32,
+        ) -> Result<
+            Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
+            DbError,
+        > {
+            self.observed.lock().push(required_vnodes.to_vec());
+            Ok(Some(
+                required_vnodes
+                    .iter()
+                    .map(|vnode| {
+                        (
+                            *vnode,
+                            crate::checkpoint_coordinator::StagedSlice::Bytes(
+                                bytes::Bytes::from_static(b"state"),
+                            ),
+                        )
+                    })
+                    .collect(),
+            ))
+        }
+    }
+
+    for owned in [vec![1, 2], vec![0, 2]] {
+        let global_observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let keyed_observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut graph = test_graph();
+        graph.set_test_owned_vnodes(3, owned.clone());
+        graph.push_test_node(
+            "global",
+            Box::new(CaptureProbe {
+                capability: OperatorCapability::test_global_state(),
+                observed: Arc::clone(&global_observed),
+            }),
+        );
+        graph.push_test_node(
+            "keyed",
+            Box::new(CaptureProbe {
+                capability: OperatorCapability::test_vnode_state(),
+                observed: Arc::clone(&keyed_observed),
+            }),
+        );
+
+        let captured = graph.snapshot_state_by_vnode().unwrap();
+        let expected_global = owned.contains(&0).then_some(vec![0]).unwrap_or_default();
+        assert_eq!(global_observed.lock().as_slice(), &[expected_global]);
+        assert_eq!(keyed_observed.lock().as_slice(), &[owned.clone()]);
+
+        let mut captured_vnodes: Vec<u32> = captured.keys().copied().collect();
+        captured_vnodes.sort_unstable();
+        assert_eq!(captured_vnodes, owned);
+        for (vnode, operators) in &captured {
+            let mut names: Vec<&str> = operators.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                if *vnode == 0 {
+                    vec!["global", "keyed"]
+                } else {
+                    vec!["keyed"]
+                }
+            );
+        }
+
+        let vnode_zero: Vec<&str> = graph
+            .managed_vnode_participants(0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        let vnode_one: Vec<&str> = graph
+            .managed_vnode_participants(1)
+            .unwrap()
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        assert_eq!(vnode_zero, vec!["global", "keyed"]);
+        assert_eq!(vnode_one, vec!["keyed"]);
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn managed_state_placement_scopes_vnode_revocation() {
+    struct RevokeProbe {
+        capability: OperatorCapability,
+        observed: Arc<parking_lot::Mutex<Vec<Vec<u32>>>>,
+    }
+
+    #[async_trait]
+    impl GraphOperator for RevokeProbe {
+        fn cluster_capability(&self) -> OperatorCapability {
+            self.capability
+        }
+
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn drop_owned_vnodes(&mut self, revoked: &FxHashSet<u32>) -> Result<(), DbError> {
+            let mut revoked: Vec<u32> = revoked.iter().copied().collect();
+            revoked.sort_unstable();
+            self.observed.lock().push(revoked);
+            Ok(())
+        }
+    }
+
+    async fn observe_revocation(
+        owners: Vec<laminar_core::state::NodeId>,
+    ) -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
+        let VnodeTransitionHarness { mut graph, .. } =
+            vnode_transition_harness_for_assignment(owners, &[], Vec::new()).await;
+        let global = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let keyed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        graph.push_test_node(
+            "global",
+            Box::new(RevokeProbe {
+                capability: OperatorCapability::test_global_state(),
+                observed: Arc::clone(&global),
+            }),
+        );
+        graph.push_test_node(
+            "keyed",
+            Box::new(RevokeProbe {
+                capability: OperatorCapability::test_vnode_state(),
+                observed: Arc::clone(&keyed),
+            }),
+        );
+
+        graph.apply_pending_vnode_transition().unwrap();
+        let global = global.lock().clone();
+        let keyed = keyed.lock().clone();
+        (global, keyed)
+    }
+
+    use laminar_core::state::NodeId;
+    let (global, keyed) = observe_revocation(vec![NodeId(1), NodeId(2)]).await;
+    assert!(global.is_empty(), "global state ignores nonzero vnode loss");
+    assert_eq!(keyed, vec![vec![1]]);
+
+    let (global, keyed) = observe_revocation(vec![NodeId(2), NodeId(1)]).await;
+    assert_eq!(global, vec![vec![0]]);
+    assert_eq!(keyed, vec![vec![0]]);
+}
+
+#[tokio::test]
+async fn declared_managed_state_requires_an_initializer() {
+    struct MissingInitializer;
+
+    #[async_trait]
+    impl GraphOperator for MissingInitializer {
+        fn cluster_capability(&self) -> OperatorCapability {
+            OperatorCapability::test_vnode_state()
+        }
+
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+    }
+
+    let mut graph = test_graph();
+    graph.push_test_node("missing-initializer", Box::new(MissingInitializer));
+
+    let error = graph
+        .initialize_managed_state()
+        .await
+        .err()
+        .expect("declared managed state without an initializer must fail startup");
+
+    assert!(
+        error
+            .to_string()
+            .contains("managed-state initialization for operator 'missing-initializer' failed"),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn checkpoint_quiescence_requires_pending_vnode_transitions_to_apply() {
     let partial = crate::vnode_partial::VnodePartial {
@@ -3658,7 +3972,10 @@ async fn checkpoint_quiescence_requires_pending_vnode_transitions_to_apply() {
     assert_eq!(&*applied.lock(), &[0]);
     assert!(graph.checkpoint_is_quiescent());
     assert!(graph.snapshot_state().unwrap().is_none());
-    assert!(graph.snapshot_state_by_vnode().unwrap().is_empty());
+    let vnode_state = graph.snapshot_state_by_vnode().unwrap();
+    assert!(vnode_state
+        .get(&0)
+        .is_some_and(|operators| operators.contains_key("global")));
 
     let VnodeTransitionHarness {
         graph: mut revoke_graph,
@@ -3889,12 +4206,11 @@ async fn operator_without_vnode_restore_contract_cannot_silently_accept_state() 
         .await
         .expect_err("the trait default must reject unowned vnode state");
 
-    assert!(error
-        .to_string()
-        .contains("operator does not accept vnode checkpoint state for vnode 0"));
+    assert!(error.to_string().contains("managed-state roster mismatch"));
+    assert!(error.to_string().contains("unexpected=[\"stateless\"]"));
     assert!(registry.is_restoring(0));
     assert!(pending_is_exact(&pending, &published));
-    assert!(graph.execution_poison_reason().is_some());
+    assert!(graph.execution_poison_reason().is_none());
 }
 
 #[cfg(feature = "cluster")]
@@ -3928,7 +4244,11 @@ async fn missing_rehydration_operator_is_rejected_before_callbacks() {
         .await
         .expect_err("topology drift must fault the cycle");
     let message = error.to_string();
-    assert!(message.contains("missing operator"), "{message}");
+    assert!(
+        message.contains("managed-state roster mismatch"),
+        "{message}"
+    );
+    assert!(message.contains("unexpected"), "{message}");
     assert!(message.contains("ghost"), "{message}");
     assert!(
         present_applied.lock().is_empty(),
@@ -3946,7 +4266,7 @@ async fn later_vnode_structural_failure_runs_no_callbacks_and_retains_batch() {
     #[async_trait]
     impl GraphOperator for TransitionCallbackProbe {
         fn cluster_capability(&self) -> OperatorCapability {
-            OperatorCapability::test_probe()
+            OperatorCapability::test_vnode_state()
         }
 
         async fn process(
@@ -4158,7 +4478,7 @@ fn zero_link_rehydration_cannot_be_published() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn encoded_empty_full_rehydration_activates_vnode() {
+async fn encoded_empty_full_rehydration_activates_stateless_vnode() {
     let empty_full = crate::vnode_partial::VnodePartial {
         operators: Vec::new(),
         base: None,
@@ -4179,6 +4499,42 @@ async fn encoded_empty_full_rehydration_activates_vnode() {
 
     assert!(!registry.is_restoring(0));
     assert!(pending.lock().is_none());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn encoded_empty_full_cannot_omit_a_managed_participant() {
+    let empty_full = crate::vnode_partial::VnodePartial {
+        operators: Vec::new(),
+        base: None,
+        deltas: Vec::new(),
+    };
+    let VnodeTransitionHarness {
+        mut graph,
+        registry,
+        pending,
+        published,
+    } = vnode_transition_harness(1, &[0], vec![(0, vec![encoded_vnode_partial(&empty_full)])])
+        .await;
+    let applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    graph.push_test_node(
+        "agg",
+        Box::new(RecordingVnodeRestoreOperator {
+            applied: Arc::clone(&applied),
+            failure_on_vnode: None,
+        }),
+    );
+
+    let error = graph
+        .execute_cycle(&FxHashMap::default(), i64::MAX, None)
+        .await
+        .expect_err("an operator-less FULL cannot stand in for managed semantic empty state");
+
+    assert!(error.to_string().contains("missing=[\"agg\"]"), "{error}");
+    assert!(applied.lock().is_empty());
+    assert!(registry.is_restoring(0));
+    assert!(pending_is_exact(&pending, &published));
+    assert!(graph.execution_poison_reason().is_none());
 }
 
 #[cfg(feature = "cluster")]
@@ -4260,7 +4616,7 @@ async fn transport_certificate_change_after_callback_poisons_before_activation()
     #[async_trait]
     impl GraphOperator for TransportInvalidatingOperator {
         fn cluster_capability(&self) -> OperatorCapability {
-            OperatorCapability::test_probe()
+            OperatorCapability::test_vnode_state()
         }
 
         async fn process(
@@ -4345,7 +4701,7 @@ async fn unowned_restoring_lifecycle_appearing_during_callback_poisons_and_retai
     #[async_trait]
     impl GraphOperator for RestoringLifecycleInjector {
         fn cluster_capability(&self) -> OperatorCapability {
-            OperatorCapability::test_probe()
+            OperatorCapability::test_vnode_state()
         }
 
         async fn process(
@@ -4358,6 +4714,10 @@ async fn unowned_restoring_lifecycle_appearing_during_callback_poisons_and_retai
 
         fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
             Ok(None)
+        }
+
+        fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) -> Result<(), DbError> {
+            Ok(())
         }
 
         fn apply_vnode_chain(
@@ -4421,7 +4781,7 @@ async fn transition_authority_rejects_shuffle_endpoints_for_another_node_before_
     #[async_trait]
     impl GraphOperator for RestoreCounter {
         fn cluster_capability(&self) -> OperatorCapability {
-            OperatorCapability::test_probe()
+            OperatorCapability::test_vnode_state()
         }
 
         async fn process(
@@ -4553,7 +4913,7 @@ async fn transition_pipeline_identity_mismatch_runs_no_callbacks_and_retains_aut
     #[async_trait]
     impl GraphOperator for RestoreCounter {
         fn cluster_capability(&self) -> OperatorCapability {
-            OperatorCapability::test_probe()
+            OperatorCapability::test_vnode_state()
         }
 
         async fn process(
@@ -4626,7 +4986,7 @@ async fn callback_replacement_of_pending_transition_is_retained_and_poisons_grap
     #[async_trait]
     impl GraphOperator for ReplacingRestoreOperator {
         fn cluster_capability(&self) -> OperatorCapability {
-            OperatorCapability::test_probe()
+            OperatorCapability::test_vnode_state()
         }
 
         async fn process(
@@ -4713,7 +5073,7 @@ async fn mixed_revoke_and_acquire_drops_before_restore() {
     #[async_trait]
     impl GraphOperator for RevokeRestoreProbe {
         fn cluster_capability(&self) -> OperatorCapability {
-            OperatorCapability::test_probe()
+            OperatorCapability::test_vnode_state()
         }
 
         async fn process(

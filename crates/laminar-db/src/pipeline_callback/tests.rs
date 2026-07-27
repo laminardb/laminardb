@@ -10,7 +10,7 @@ struct DrainingCaptureFailureOperator {
 #[async_trait::async_trait]
 impl crate::operator_graph::GraphOperator for DrainingCaptureFailureOperator {
     fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
-        crate::operator::capability::OperatorCapability::test_probe()
+        crate::operator::capability::OperatorCapability::test_vnode_state()
     }
 
     async fn process(
@@ -38,6 +38,7 @@ impl crate::operator_graph::GraphOperator for DrainingCaptureFailureOperator {
     #[cfg(feature = "cluster")]
     fn checkpoint_by_vnode(
         &mut self,
+        required_vnodes: &[u32],
         _vnode_count: u32,
     ) -> Result<
         Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
@@ -53,7 +54,19 @@ impl crate::operator_graph::GraphOperator for DrainingCaptureFailureOperator {
                 "injected failure after draining vnode state".into(),
             ));
         }
-        Ok(None)
+        Ok(Some(
+            required_vnodes
+                .iter()
+                .map(|vnode| {
+                    (
+                        *vnode,
+                        crate::checkpoint_coordinator::StagedSlice::Bytes(
+                            bytes::Bytes::from_static(b"test-vnode-state"),
+                        ),
+                    )
+                })
+                .collect(),
+        ))
     }
 }
 
@@ -145,7 +158,7 @@ struct CheckpointRotationFenceAuditOperator {
 #[async_trait::async_trait]
 impl crate::operator_graph::GraphOperator for CheckpointRotationFenceAuditOperator {
     fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
-        crate::operator::capability::OperatorCapability::test_probe()
+        crate::operator::capability::OperatorCapability::test_vnode_state()
     }
 
     async fn process(
@@ -169,6 +182,7 @@ impl crate::operator_graph::GraphOperator for CheckpointRotationFenceAuditOperat
 
     fn checkpoint_by_vnode(
         &mut self,
+        required_vnodes: &[u32],
         _vnode_count: u32,
     ) -> Result<
         Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
@@ -181,7 +195,19 @@ impl crate::operator_graph::GraphOperator for CheckpointRotationFenceAuditOperat
         }
         self.vnode_capture_observed
             .store(true, std::sync::atomic::Ordering::Release);
-        Ok(None)
+        Ok(Some(
+            required_vnodes
+                .iter()
+                .map(|vnode| {
+                    (
+                        *vnode,
+                        crate::checkpoint_coordinator::StagedSlice::Bytes(
+                            bytes::Bytes::from_static(b"fence-audit-state"),
+                        ),
+                    )
+                })
+                .collect(),
+        ))
     }
 }
 

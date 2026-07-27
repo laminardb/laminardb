@@ -611,7 +611,7 @@ impl OperatorGraph {
                     })
                 })
                 .collect::<Result<_, _>>()?;
-            let mut names = BTreeSet::new();
+            let mut artifact_names = BTreeSet::new();
             for (link, partial) in chain.iter().enumerate() {
                 let mut link_names = BTreeSet::new();
                 for name in partial
@@ -632,24 +632,31 @@ impl OperatorGraph {
                              operator '{name}'"
                         )));
                     }
-                    names.insert(name.clone());
+                    artifact_names.insert(name.clone());
                 }
             }
 
-            let mut operators = Vec::with_capacity(names.len());
-            for name in names {
-                let node_idx = self
-                    .nodes
-                    .iter()
-                    .position(|node| !node.removed && &*node.name == name.as_str())
-                    .ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "[LDB-6051] vnode {vnode} rehydration requires missing operator \
-                             '{name}' (topology drift)"
-                        ))
-                    })?;
-                operators.push((node_idx, name));
+            let expected = self.managed_vnode_participants(vnode)?;
+            let expected_names: BTreeSet<&str> = expected.iter().map(|(_, name)| *name).collect();
+            let missing: Vec<&str> = expected_names
+                .iter()
+                .copied()
+                .filter(|name| !artifact_names.contains(*name))
+                .collect();
+            let unexpected: Vec<&str> = artifact_names
+                .iter()
+                .map(String::as_str)
+                .filter(|name| !expected_names.contains(name))
+                .collect();
+            if !missing.is_empty() || !unexpected.is_empty() {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6051] vnode {vnode} managed-state roster mismatch: missing={missing:?}, unexpected={unexpected:?}"
+                )));
             }
+            let operators = expected
+                .into_iter()
+                .map(|(node_idx, name)| (node_idx, name.to_string()))
+                .collect();
             decoded.push(DecodedVnode {
                 vnode,
                 attempt,
@@ -708,21 +715,40 @@ impl OperatorGraph {
         resolved: &[ResolvedVnode<'_>],
     ) -> Result<(), DbError> {
         if !revoked.is_empty() {
-            let mut node_indices: Vec<usize> = self
+            let mut revoke_callbacks: Vec<(usize, FxHashSet<u32>)> = self
                 .nodes
                 .iter()
                 .enumerate()
-                .filter_map(|(index, node)| (!node.removed).then_some(index))
-                .collect();
-            node_indices.sort_unstable_by(|left, right| {
+                .filter(|(_, node)| !node.removed && node.capability.managed_state.is_some())
+                .map(|(index, node)| {
+                    let relevant = match node.capability.state_class {
+                        crate::operator::capability::OperatorStateClass::GlobalSingleton => revoked
+                            .contains(&0)
+                            .then(|| [0].into_iter().collect())
+                            .unwrap_or_default(),
+                        crate::operator::capability::OperatorStateClass::VnodeKeyed => {
+                            revoked.clone()
+                        }
+                        state_class => {
+                            return Err(DbError::Checkpoint(format!(
+                                "[LDB-6051] managed operator '{}' has unsupported revoke placement {state_class:?}",
+                                node.name
+                            )));
+                        }
+                    };
+                    Ok((index, relevant))
+                })
+                .collect::<Result<_, DbError>>()?;
+            revoke_callbacks.retain(|(_, relevant)| !relevant.is_empty());
+            revoke_callbacks.sort_unstable_by(|(left, _), (right, _)| {
                 self.nodes[*left]
                     .name
                     .cmp(&self.nodes[*right].name)
                     .then_with(|| left.cmp(right))
             });
-            for node_idx in node_indices {
+            for (node_idx, relevant) in revoke_callbacks {
                 let node = &mut self.nodes[node_idx];
-                if let Err(error) = node.operator.drop_owned_vnodes(revoked) {
+                if let Err(error) = node.operator.drop_owned_vnodes(&relevant) {
                     let phase = format!("revoke callback for operator '{}'", node.name);
                     return Err(callback_error(
                         &self.execution_poisoned,

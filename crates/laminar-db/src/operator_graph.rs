@@ -16,6 +16,8 @@ use crate::config::BackpressurePolicy;
 use crate::db::exact_table_reference;
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
+#[cfg(feature = "cluster")]
+use crate::operator::capability::OperatorStateClass;
 use crate::operator::capability::{OperatorCapability, OperatorImplementation};
 #[cfg(feature = "cluster")]
 use crate::operator::RetainedBatch;
@@ -105,6 +107,7 @@ pub(crate) trait GraphOperator: Send {
     #[cfg(feature = "cluster")]
     fn checkpoint_by_vnode(
         &mut self,
+        _required_vnodes: &[u32],
         _vnode_count: u32,
     ) -> Result<
         Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
@@ -554,6 +557,8 @@ pub(crate) struct OperatorGraph {
     installed_vnode_state: Option<crate::vnode_transition_staging::InstalledVnodeStateHandle>,
     #[cfg(feature = "cluster")]
     rotation_execution_fence: Option<Arc<tokio::sync::RwLock<()>>>,
+    #[cfg(all(test, feature = "cluster"))]
+    test_owned_vnodes: Option<Vec<u32>>,
 }
 
 impl OperatorGraph {
@@ -605,6 +610,8 @@ impl OperatorGraph {
             installed_vnode_state: None,
             #[cfg(feature = "cluster")]
             rotation_execution_fence: None,
+            #[cfg(all(test, feature = "cluster"))]
+            test_owned_vnodes: None,
             ctx,
             prom: None,
             lookup_registry: None,
@@ -843,6 +850,103 @@ impl OperatorGraph {
         &self,
     ) -> Option<&crate::operator::sql_query::ClusterShuffleConfig> {
         self.cluster_shuffle.as_ref()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn required_vnodes_for_capability(
+        capability: OperatorCapability,
+        owned_vnodes: &[u32],
+    ) -> Result<Vec<u32>, DbError> {
+        if capability.managed_state.is_none() {
+            return Ok(Vec::new());
+        }
+        match capability.state_class {
+            OperatorStateClass::GlobalSingleton => Ok(owned_vnodes
+                .binary_search(&0)
+                .ok()
+                .map_or_else(Vec::new, |_| vec![0])),
+            OperatorStateClass::VnodeKeyed => Ok(owned_vnodes.to_vec()),
+            state_class => Err(DbError::Checkpoint(format!(
+                "managed-state contract {:?} has unsupported placement {state_class:?}",
+                capability.managed_state
+            ))),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn owned_vnodes_for_managed_state(&self) -> Result<Vec<u32>, DbError> {
+        let has_participants = self
+            .nodes
+            .iter()
+            .any(|node| !node.removed && node.capability.managed_state.is_some());
+        if !has_participants {
+            return Ok(Vec::new());
+        }
+        if let Some(config) = &self.cluster_shuffle {
+            let assignment = config.registry.versioned_snapshot();
+            if u32::try_from(assignment.owners().len()).ok() != self.vnode_count {
+                return Err(DbError::Checkpoint(
+                    "managed-state capture vnode count does not match the active assignment".into(),
+                ));
+            }
+            return Ok(assignment
+                .owners()
+                .iter()
+                .enumerate()
+                .filter_map(|(vnode, owner)| {
+                    (*owner == config.self_id)
+                        .then(|| u32::try_from(vnode).expect("vnode count is represented by u32"))
+                })
+                .collect());
+        }
+        #[cfg(test)]
+        if let Some(vnodes) = &self.test_owned_vnodes {
+            return Ok(vnodes.clone());
+        }
+        Err(DbError::Checkpoint(
+            "managed-state capture has no cluster ownership authority".into(),
+        ))
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(super) fn managed_vnode_participants(
+        &self,
+        vnode: u32,
+    ) -> Result<Vec<(usize, &str)>, DbError> {
+        if self.vnode_count.is_none_or(|count| vnode >= count) {
+            return Err(DbError::Checkpoint(format!(
+                "managed-state roster requested out-of-range vnode {vnode}"
+            )));
+        }
+        let mut participants = Vec::new();
+        let mut names = std::collections::BTreeSet::new();
+        for (node_idx, node) in self.nodes.iter().enumerate() {
+            if node.removed || node.capability.managed_state.is_none() {
+                continue;
+            }
+            let participates = match node.capability.state_class {
+                OperatorStateClass::GlobalSingleton => vnode == 0,
+                OperatorStateClass::VnodeKeyed => true,
+                state_class => {
+                    return Err(DbError::Checkpoint(format!(
+                        "managed operator '{}' has unsupported placement {state_class:?}",
+                        node.name
+                    )));
+                }
+            };
+            if participates {
+                if !names.insert(node.name.as_ref()) {
+                    return Err(DbError::Checkpoint(format!(
+                        "managed vnode roster repeats operator name '{}'",
+                        node.name
+                    )));
+                }
+                participants.push((node_idx, node.name.as_ref()));
+            }
+        }
+        participants
+            .sort_unstable_by(|left, right| left.1.cmp(right.1).then_with(|| left.0.cmp(&right.0)));
+        Ok(participants)
     }
 
     #[cfg(feature = "cluster")]
@@ -3465,7 +3569,18 @@ impl OperatorGraph {
 
     #[cfg(all(test, feature = "cluster"))]
     pub(crate) fn set_test_vnode_count(&mut self, vnode_count: u32) {
+        self.set_test_owned_vnodes(vnode_count, (0..vnode_count).collect());
+    }
+
+    #[cfg(all(test, feature = "cluster"))]
+    pub(crate) fn set_test_owned_vnodes(&mut self, vnode_count: u32, owned_vnodes: Vec<u32>) {
+        assert!(
+            !owned_vnodes.iter().any(|vnode| *vnode >= vnode_count)
+                && !owned_vnodes.windows(2).any(|pair| pair[0] >= pair[1]),
+            "test owned-vnode roster must be canonical and in range"
+        );
         self.vnode_count = Some(vnode_count);
+        self.test_owned_vnodes = Some(owned_vnodes);
     }
 
     pub fn snapshot_state(&mut self) -> Result<Option<GraphCheckpoint>, DbError> {
@@ -3501,17 +3616,49 @@ impl OperatorGraph {
         let Some(vnode_count) = self.vnode_count else {
             return Ok(std::collections::HashMap::new());
         };
-        let mut out: crate::checkpoint_coordinator::StagedVnodeStates =
-            std::collections::HashMap::new();
-        for node in &mut self.nodes {
-            if node.removed {
+        let owned_vnodes = self.owned_vnodes_for_managed_state()?;
+        let mut participant_names = std::collections::BTreeSet::new();
+        let mut participants = Vec::new();
+        for (node_idx, node) in self.nodes.iter().enumerate() {
+            if node.removed || node.capability.managed_state.is_none() {
                 continue;
             }
-            if let Some(per_vnode) = node.operator.checkpoint_by_vnode(vnode_count)? {
-                for (vnode, bytes) in per_vnode {
-                    out.entry(vnode)
-                        .or_default()
-                        .insert(node.name.to_string(), bytes);
+            if !participant_names.insert(node.name.to_string()) {
+                return Err(DbError::Checkpoint(format!(
+                    "managed-state capture repeats operator name '{}'",
+                    node.name
+                )));
+            }
+            participants.push((
+                node_idx,
+                node.name.to_string(),
+                Self::required_vnodes_for_capability(node.capability, &owned_vnodes)?,
+            ));
+        }
+        let mut out: crate::checkpoint_coordinator::StagedVnodeStates =
+            std::collections::HashMap::new();
+        for (node_idx, name, required_vnodes) in participants {
+            let captured = self.nodes[node_idx]
+                .operator
+                .checkpoint_by_vnode(&required_vnodes, vnode_count)?
+                .unwrap_or_default();
+            let mut captured_vnodes: Vec<u32> = captured.keys().copied().collect();
+            captured_vnodes.sort_unstable();
+            if captured_vnodes != required_vnodes {
+                return Err(DbError::Checkpoint(format!(
+                    "managed operator '{name}' captured vnode roster {captured_vnodes:?}; expected {required_vnodes:?}"
+                )));
+            }
+            for (vnode, bytes) in captured {
+                if out
+                    .entry(vnode)
+                    .or_default()
+                    .insert(name.clone(), bytes)
+                    .is_some()
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "managed-state capture repeated operator '{name}' for vnode {vnode}"
+                    )));
                 }
             }
         }

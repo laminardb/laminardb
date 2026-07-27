@@ -358,13 +358,8 @@ impl SqlQueryOperator {
     /// Vnodes owned now but not at the last capture; advances `prev_owned`. The agg re-bases their
     /// delta chains FULL (a just-acquired vnode has no parent epoch on this node).
     #[cfg(feature = "cluster")]
-    fn take_newly_acquired(&mut self) -> rustc_hash::FxHashSet<u32> {
-        let owned: rustc_hash::FxHashSet<u32> = match self.cluster_shuffle.as_ref() {
-            Some(cfg) => laminar_core::state::owned_vnodes(&cfg.registry, cfg.self_id)
-                .into_iter()
-                .collect(),
-            None => return rustc_hash::FxHashSet::default(),
-        };
+    fn take_newly_acquired(&mut self, required_vnodes: &[u32]) -> rustc_hash::FxHashSet<u32> {
+        let owned: rustc_hash::FxHashSet<u32> = required_vnodes.iter().copied().collect();
         let newly: rustc_hash::FxHashSet<u32> =
             owned.difference(&self.prev_owned).copied().collect();
         self.prev_owned = owned;
@@ -1351,28 +1346,34 @@ impl GraphOperator for SqlQueryOperator {
     #[cfg(feature = "cluster")]
     fn checkpoint_by_vnode(
         &mut self,
+        required_vnodes: &[u32],
         vnode_count: u32,
     ) -> Result<
         Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
         DbError,
     > {
         use crate::checkpoint_coordinator::StagedSlice;
+        if required_vnodes.windows(2).any(|pair| pair[0] >= pair[1])
+            || required_vnodes.iter().any(|vnode| *vnode >= vnode_count)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "aggregate '{}' received a non-canonical required vnode roster {required_vnodes:?} for vnode_count {vnode_count}",
+                self.op_name
+            )));
+        }
         // Re-base the delta chain of any vnode acquired since the last capture (its parent epoch is
         // gone), before deciding FULL-vs-DELTA below. Must run before the `agg_state` borrow.
-        let newly_acquired = self.take_newly_acquired();
+        let newly_acquired = self.take_newly_acquired(required_vnodes);
         let QueryState::Agg(ref mut agg_state) = self.state else {
             return Ok(None);
         };
         agg_state.reset_acquired_vnodes(&newly_acquired);
 
         // Incremental delta capture: each touched vnode emits a FULL re-base or a DELTA.
-        if let Some(chain_bound) = self.delta_chain_bound {
+        let mut out = if let Some(chain_bound) = self.delta_chain_bound {
             if agg_state.delta_enabled() {
                 use crate::aggregate_state::VnodeCapture;
                 let captures = agg_state.checkpoint_delta_by_vnode(vnode_count, chain_bound)?;
-                if captures.is_empty() {
-                    return Ok(None);
-                }
                 let mut out = std::collections::HashMap::with_capacity(captures.len());
                 for (vnode, cap) in captures {
                     let slice = match cap {
@@ -1385,22 +1386,54 @@ impl GraphOperator for SqlQueryOperator {
                     };
                     out.insert(vnode, slice);
                 }
-                return Ok(Some(out));
+                out
+            } else {
+                return Err(DbError::Checkpoint(format!(
+                    "aggregate '{}' has a delta chain bound without delta tracking enabled",
+                    self.op_name
+                )));
+            }
+        } else {
+            let per_vnode = agg_state.checkpoint_groups_by_vnode(vnode_count)?;
+            let mut out = std::collections::HashMap::with_capacity(per_vnode.len());
+            for (vnode, cp) in per_vnode {
+                out.insert(
+                    vnode,
+                    StagedSlice::Bytes(bytes::Bytes::from(serialize_agg_cp(&cp, &self.op_name)?)),
+                );
+            }
+            out
+        };
+
+        let required: rustc_hash::FxHashSet<u32> = required_vnodes.iter().copied().collect();
+        let mut unexpected: Vec<u32> = out
+            .keys()
+            .copied()
+            .filter(|vnode| !required.contains(vnode))
+            .collect();
+        unexpected.sort_unstable();
+        if !unexpected.is_empty() {
+            return Err(DbError::Checkpoint(format!(
+                "aggregate '{}' captured state for vnodes {unexpected:?} outside its required roster {required_vnodes:?}",
+                self.op_name
+            )));
+        }
+
+        if out.len() != required_vnodes.len() {
+            let empty = StagedSlice::Bytes(bytes::Bytes::from(serialize_agg_cp(
+                &agg_state.empty_checkpoint(),
+                &self.op_name,
+            )?));
+            for vnode in required_vnodes {
+                out.entry(*vnode).or_insert_with(|| empty.clone());
             }
         }
 
-        let per_vnode = agg_state.checkpoint_groups_by_vnode(vnode_count)?;
-        if per_vnode.is_empty() {
-            return Ok(None);
+        if out.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(out))
         }
-        let mut out = std::collections::HashMap::with_capacity(per_vnode.len());
-        for (vnode, cp) in per_vnode {
-            out.insert(
-                vnode,
-                StagedSlice::Bytes(bytes::Bytes::from(serialize_agg_cp(&cp, &self.op_name)?)),
-            );
-        }
-        Ok(Some(out))
     }
 
     #[cfg(feature = "cluster")]
@@ -1927,6 +1960,83 @@ mod delta_primary_tests {
         assert!(matches!(operator.state, QueryState::Uninit));
     }
 
+    #[tokio::test]
+    async fn empty_aggregate_capture_names_every_required_vnode() {
+        for (sql, required) in [
+            (
+                "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+                (0..8).collect::<Vec<_>>(),
+            ),
+            ("SELECT COUNT(*) AS total FROM events", vec![0]),
+        ] {
+            let (context, _) = super::checkpoint_tests::context_and_batch();
+            let mut operator = SqlQueryOperator::new("totals", sql, context, None, false);
+            let (shuffle, _) = single_owner_shuffle().await;
+            operator.attach_cluster_shuffle(shuffle);
+            operator.initialize_managed_state().await.unwrap();
+
+            let captured = operator
+                .checkpoint_by_vnode(&required, 8)
+                .unwrap()
+                .expect("a required semantic EMPTY must be explicit");
+
+            let mut actual: Vec<u32> = captured.keys().copied().collect();
+            actual.sort_unstable();
+            assert_eq!(actual, required);
+            for slice in captured.values() {
+                let crate::checkpoint_coordinator::StagedSlice::Bytes(bytes) = slice else {
+                    panic!("fresh empty aggregate must establish a FULL base")
+                };
+                let checkpoint =
+                    rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(bytes).unwrap();
+                assert!(checkpoint.keys_ipc.is_empty());
+                assert!(checkpoint.acc_state_ipc.is_empty());
+                assert!(checkpoint.last_updated_ms.is_empty());
+                assert!(checkpoint.last_emitted.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn global_semantic_empty_replaces_groups_and_emission_history() {
+        let (context, batch) = super::checkpoint_tests::context_and_batch();
+        let mut operator = SqlQueryOperator::new(
+            "total",
+            "SELECT SUM(value) AS total FROM events",
+            context,
+            None,
+            true,
+        );
+        let (shuffle, _) = single_owner_shuffle().await;
+        operator.attach_cluster_shuffle(shuffle);
+
+        let initial_rows: usize = operator
+            .process(&[vec![batch.clone()]], &[i64::MIN])
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(initial_rows, 1);
+
+        let empty = match &operator.state {
+            QueryState::Agg(aggregate) => aggregate.empty_checkpoint(),
+            _ => panic!("expected initialized aggregate state"),
+        };
+        let empty = serialize_agg_cp(&empty, &operator.op_name).unwrap();
+        operator.apply_vnode_chain(0, &empty, &[]).unwrap();
+
+        let emitted = operator.process(&[vec![batch]], &[i64::MIN]).await.unwrap();
+        assert_eq!(emitted.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let weights = emitted[0]
+            .column_by_name(laminar_core::changelog::WEIGHT_COLUMN)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(weights.values(), &[1]);
+    }
+
     async fn aggregate_state_checkpoint() -> (SessionContext, AggStateCheckpoint) {
         let (context, batch) = super::checkpoint_tests::context_and_batch();
         let mut operator = SqlQueryOperator::new(
@@ -2420,13 +2530,17 @@ mod delta_primary_tests {
             .await
             .unwrap();
         let slices = donor
-            .checkpoint_by_vnode(8)
+            .checkpoint_by_vnode(&(0..8).collect::<Vec<_>>(), 8)
             .unwrap()
             .expect("per-vnode slices");
         let (v, slice_bytes) = slices
             .iter()
             .find_map(|(v, s)| match s {
-                crate::checkpoint_coordinator::StagedSlice::Bytes(b) => Some((*v, b.clone())),
+                crate::checkpoint_coordinator::StagedSlice::Bytes(b) => {
+                    let checkpoint =
+                        rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(b).unwrap();
+                    (!checkpoint.last_updated_ms.is_empty()).then(|| (*v, b.clone()))
+                }
                 _ => None,
             })
             .expect("at least one full vnode slice");
@@ -2449,7 +2563,8 @@ mod delta_primary_tests {
             .unwrap();
         let revoked: rustc_hash::FxHashSet<u32> = [v].into_iter().collect();
         fixed.drop_owned_vnodes(&revoked).unwrap();
-        assert!(total_sum(&mut fixed) < 3);
+        let remaining_after_revoke = total_sum(&mut fixed);
+        assert!(remaining_after_revoke < 3);
         fixed.apply_vnode_state(v, &slice_bytes).unwrap();
         assert_eq!(
             total_sum(&mut fixed),
@@ -2481,6 +2596,18 @@ mod delta_primary_tests {
             total_sum(&mut replaced),
             3,
             "authoritative restore must remove keys absent from the committed vnode image"
+        );
+
+        let empty = match &replaced.state {
+            QueryState::Agg(aggregate) => aggregate.empty_checkpoint(),
+            _ => panic!("expected initialized aggregate state"),
+        };
+        let empty = serialize_agg_cp(&empty, &replaced.op_name).unwrap();
+        replaced.apply_vnode_chain(v, &empty, &[]).unwrap();
+        assert_eq!(
+            total_sum(&mut replaced),
+            remaining_after_revoke,
+            "semantic EMPTY must remove every group in its authoritative vnode"
         );
     }
 
@@ -2571,12 +2698,16 @@ mod delta_primary_tests {
         let mut donor = populated_op().await;
         donor.process(&[vec![batch]], &[i64::MIN]).await.unwrap();
         let (v, slice_bytes) = donor
-            .checkpoint_by_vnode(8)
+            .checkpoint_by_vnode(&(0..8).collect::<Vec<_>>(), 8)
             .unwrap()
             .expect("per-vnode slices")
             .iter()
             .find_map(|(v, s)| match s {
-                crate::checkpoint_coordinator::StagedSlice::Bytes(b) => Some((*v, b.clone())),
+                crate::checkpoint_coordinator::StagedSlice::Bytes(b) => {
+                    let checkpoint =
+                        rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(b).unwrap();
+                    (!checkpoint.last_updated_ms.is_empty()).then(|| (*v, b.clone()))
+                }
                 _ => None,
             })
             .expect("a full vnode slice");
@@ -2679,7 +2810,7 @@ mod delta_primary_tests {
             .sum();
         assert_eq!(emitted, 2);
         let slices = donor
-            .checkpoint_by_vnode(8)
+            .checkpoint_by_vnode(&(0..8).collect::<Vec<_>>(), 8)
             .unwrap()
             .expect("per-vnode slices");
 
@@ -2796,7 +2927,7 @@ mod delta_primary_tests {
             .sum();
         assert_eq!(emitted, GROUPS);
         let slices = donor
-            .checkpoint_by_vnode(8)
+            .checkpoint_by_vnode(&(0..8).collect::<Vec<_>>(), 8)
             .unwrap()
             .expect("per-vnode slices");
 

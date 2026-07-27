@@ -4880,6 +4880,26 @@ async fn paused_stream_planning_serializes_pipeline_stop() {
 }
 
 #[tokio::test]
+async fn managed_aggregate_plans_against_a_catalog_bridged_source_before_recovery() {
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE events (key VARCHAR, value BIGINT)")
+        .await
+        .unwrap();
+    db.execute(
+        "CREATE STREAM totals AS \
+         SELECT key, SUM(value) AS total FROM events GROUP BY key",
+    )
+    .await
+    .unwrap();
+
+    db.start()
+        .await
+        .expect("managed aggregate startup must see catalog-only source schemas");
+    assert_eq!(DbState::load(&db.state), DbState::Running);
+    db.stop_pipeline().await.unwrap();
+}
+
+#[tokio::test]
 async fn test_create_materialized_view() {
     let db = LaminarDB::open().unwrap();
     db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
