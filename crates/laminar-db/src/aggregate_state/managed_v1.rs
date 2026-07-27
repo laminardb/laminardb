@@ -29,9 +29,9 @@ use super::artifact_v1::{
 /// reserve allocator/container and backend-owned memory before this model can support admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ManagedVnodeLimits {
-    pub(super) max_rows: u64,
-    pub(super) max_encoded_key_bytes: u64,
-    pub(super) max_logical_payload_bytes: u64,
+    pub(super) entry_count_limit: u64,
+    pub(super) encoded_key_size_limit: u64,
+    pub(super) logical_payload_budget: u64,
 }
 
 /// Immutable plan and partition identity for one concrete managed state table/vnode.
@@ -118,7 +118,7 @@ struct ManagedVnodePrecondition {
 
 #[derive(Debug)]
 enum PreparedManagedVnodeActionV1 {
-    Replace(ManagedCountSumVnodeV1),
+    Replace(Box<ManagedCountSumVnodeV1>),
     AdvanceRetainedFence {
         target_assignment: ManagedAssignmentFence,
         next_lifecycle_revision: u64,
@@ -211,7 +211,7 @@ impl ManagedCountSumVnodeV1 {
             }
             let key_len =
                 u64::try_from(append.key.len()).map_err(|_| ArtifactError::ArithmeticOverflow)?;
-            if key_len > self.limits.max_encoded_key_bytes {
+            if key_len > self.limits.encoded_key_size_limit {
                 return Err(ArtifactError::Limit("managed encoded key byte limit"));
             }
             if PartitionKeyCodecV1::vnode_for_encoded(append.key, self.identity.vnode_count)
@@ -234,7 +234,7 @@ impl ManagedCountSumVnodeV1 {
                     .map_err(|_| ArtifactError::ArithmeticOverflow)?
                     .checked_add(candidate_new_rows)
                     .ok_or(ArtifactError::ArithmeticOverflow)?
-                    > self.limits.max_rows
+                    > self.limits.entry_count_limit
                 {
                     return Err(ArtifactError::Limit("managed row limit"));
                 }
@@ -246,7 +246,7 @@ impl ManagedCountSumVnodeV1 {
                     .logical_payload_bytes
                     .checked_add(candidate_new_payload_bytes)
                     .ok_or(ArtifactError::ArithmeticOverflow)?
-                    > self.limits.max_logical_payload_bytes
+                    > self.limits.logical_payload_budget
                 {
                     return Err(ArtifactError::Limit("managed logical payload byte limit"));
                 }
@@ -267,7 +267,7 @@ impl ManagedCountSumVnodeV1 {
         if current_rows
             .checked_add(new_rows)
             .ok_or(ArtifactError::ArithmeticOverflow)?
-            > self.limits.max_rows
+            > self.limits.entry_count_limit
         {
             return Err(ArtifactError::Limit("managed row limit"));
         }
@@ -275,7 +275,7 @@ impl ManagedCountSumVnodeV1 {
             .logical_payload_bytes
             .checked_add(new_payload_bytes)
             .ok_or(ArtifactError::ArithmeticOverflow)?;
-        if next_payload_bytes > self.limits.max_logical_payload_bytes {
+        if next_payload_bytes > self.limits.logical_payload_budget {
             return Err(ArtifactError::Limit("managed logical payload byte limit"));
         }
         let next_lifecycle_revision = self
@@ -367,10 +367,10 @@ impl ManagedCountSumVnodeV1 {
             .key_bytes()
             .checked_add(decoded.state_bytes())
             .ok_or(ArtifactError::ArithmeticOverflow)?;
-        if decoded.row_count() > self.limits.max_rows {
+        if decoded.row_count() > self.limits.entry_count_limit {
             return Err(ArtifactError::Limit("managed row limit"));
         }
-        if logical_payload_bytes > self.limits.max_logical_payload_bytes {
+        if logical_payload_bytes > self.limits.logical_payload_budget {
             return Err(ArtifactError::Limit("managed logical payload byte limit"));
         }
 
@@ -379,7 +379,7 @@ impl ManagedCountSumVnodeV1 {
             let row = row?;
             let key_len =
                 u64::try_from(row.key.len()).map_err(|_| ArtifactError::ArithmeticOverflow)?;
-            if key_len > self.limits.max_encoded_key_bytes {
+            if key_len > self.limits.encoded_key_size_limit {
                 return Err(ArtifactError::Limit("managed encoded key byte limit"));
             }
             entries.insert(row.key.to_vec(), row.state);
@@ -387,7 +387,7 @@ impl ManagedCountSumVnodeV1 {
 
         Ok(PreparedManagedVnodeChangeV1 {
             predecessor: self.precondition(),
-            action: PreparedManagedVnodeActionV1::Replace(Self {
+            action: PreparedManagedVnodeActionV1::Replace(Box::new(Self {
                 instance_id: self.instance_id,
                 identity: self.identity.clone(),
                 assignment: target_assignment,
@@ -396,7 +396,7 @@ impl ManagedCountSumVnodeV1 {
                 limits: self.limits,
                 entries,
                 logical_payload_bytes,
-            }),
+            })),
         })
     }
 
@@ -417,7 +417,7 @@ impl ManagedCountSumVnodeV1 {
             .ok_or(ArtifactError::ArithmeticOverflow)?;
         Ok(PreparedManagedVnodeChangeV1 {
             predecessor: self.precondition(),
-            action: PreparedManagedVnodeActionV1::Replace(Self {
+            action: PreparedManagedVnodeActionV1::Replace(Box::new(Self {
                 instance_id: self.instance_id,
                 identity: self.identity.clone(),
                 assignment: target_assignment,
@@ -426,7 +426,7 @@ impl ManagedCountSumVnodeV1 {
                 limits: self.limits,
                 entries: BTreeMap::new(),
                 logical_payload_bytes: 0,
-            }),
+            })),
         })
     }
 
@@ -486,7 +486,7 @@ impl ManagedCountSumVnodeV1 {
     ) -> Option<Self> {
         match prepared.action {
             PreparedManagedVnodeActionV1::Replace(replacement) => {
-                Some(std::mem::replace(self, replacement))
+                Some(std::mem::replace(self, *replacement))
             }
             PreparedManagedVnodeActionV1::AdvanceRetainedFence {
                 target_assignment,

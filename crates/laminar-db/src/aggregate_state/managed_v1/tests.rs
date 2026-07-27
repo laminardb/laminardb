@@ -38,9 +38,9 @@ fn schema() -> PartitionKeySchemaV1 {
 
 fn limits(payload: u64) -> ManagedVnodeLimits {
     ManagedVnodeLimits {
-        max_rows: 64,
-        max_encoded_key_bytes: 256,
-        max_logical_payload_bytes: payload,
+        entry_count_limit: 64,
+        encoded_key_size_limit: 256,
+        logical_payload_budget: payload,
     }
 }
 
