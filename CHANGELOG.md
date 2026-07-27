@@ -14,6 +14,11 @@
   from a backend-selected seal without the committed recovery-capsule authority used by cluster
   recovery. Vnode restore is now an internal, authority-pinned lifecycle operation; there is no
   public replacement in 0.28.
+- Removed the public `RehydratedVnode` type and `LaminarDB::rehydrated_vnode_state()` inspection
+  method. They exposed partial staged chain bytes without the assignment, process, pipeline, and
+  committed-cut authority now required for safe publication. The replacement transition remains an
+  internal cluster lifecycle detail; there is no public replacement in 0.28. This is an explicit
+  source-breaking change for applications upgrading from v0.27.x to v0.28.0.
 - Removed the experimental tiered-state feature and configuration. Its demotion path could clear
   vnode dirtiness before a checkpoint was durable, then replace newer live groups with bytes from
   the prior durable checkpoint after an attempt failed. It is not a safe keyed-state foundation.

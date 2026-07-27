@@ -1,9 +1,9 @@
 # ADR-008: Managed vnode-keyed working state for distributed operators
 
-- **Status:** Proposed; core reference implementation resumed, production qualification paused,
-  and cluster admission unchanged
+- **Status:** Accepted for phased implementation; core reference work resumed, production
+  qualification paused, and cluster admission unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Core Cycle 5
+- **Last reconciled:** 2026-07-27 during Core Cycle 6
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -14,7 +14,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest core review](../reviews/distributed-keyed-state-core-cycle-04.md)
+  [latest core review](../reviews/distributed-keyed-state-core-cycle-06.md)
 
 ## Decision
 
@@ -131,12 +131,21 @@ writer only after every exact participant can read it, activation forces a FULL 
 cross-format parents, and rollback is limited to a dual-reader release. Gossip version strings are
 not writer authority. This migration is a future compatibility requirement, not Cycle 5 runtime.
 
-This is still not the Phase 1 lifecycle. General acquire and partial-revoke staging lack one
-transition envelope binding predecessor/target assignment, pipeline identity, and an authoritative
-operator/state-table roster; the sealed head and full attempt do not supply that semantic roster;
-callbacks are not prepare/publish/abort; the SQL operator's `QueryState::Uninit` path has no semantic
-install boundary; and aggregate restore accounting, decode scratch, total process memory,
-and publication work have no production memory/pause bound. These gaps,
+Core Cycle 6 replaces the split mutable staging maps with one immutable
+`PendingVnodeTransition`. It binds the exact predecessor and target assignment fences, local process
+incarnation, pipeline identity, capsule-validated committed restore cut, and canonical acquired and
+revoked vnode rosters. Live adoption requires the exact predecessor cut; boot recovery may use an
+older coordinated cut. A process that cannot prove ownership of the predecessor's installed memory
+restores every target-owned vnode. Exact-`Arc` publication and removal prevent an identical-looking
+replacement from being erased, while `InstalledVnodeStateBinding` is reusable only by a Running
+graph with the exact assignment and pipeline identity. Poison, callback ambiguity, lifecycle fault,
+shutdown, and graph replacement clear that success marker before publishing failure.
+
+This is transition-identity and failure containment, not the complete Phase 1 lifecycle. The
+artifact still lacks an authoritative operator/state-table roster and explicit empty state;
+callbacks mutate directly instead of using abortable prepare/publish shadows; the SQL operator's
+`QueryState::Uninit` path has no plan/codec install boundary; and transition-wide encoded bytes,
+object count, decode scratch, decoded RSS, and publication pause remain unbounded. These gaps,
 source/state/sink delivery composition, tail-latency and memory evidence, backend qualification, and
 independent soak keep `[LDB-4007]`, `[LDB-0013]`, and production **NO-GO** unchanged.
 
@@ -166,7 +175,7 @@ The current source detail and rationale live in the
 [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
 [candidate mapping designs](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md),
 [RocksDB closure](../reports/rocksdb-mechanism-source-closure-2026-07-24.md),
-[redb prescreen](../testing/state-backend-redb-prescreen-v1.md), and
+[redb prescreen](../testing/state-backend-redb-prescreen-v1.md),
 [TidesDB prescreen](../reports/tidesdb-static-prescreen-2026-07-25.md),
 [TidesDB package design](tidesdb-local-state-successor-design.md), and
 [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md). These are evidence
@@ -756,6 +765,13 @@ Restore follows this protocol:
    and
 6. leave the short publication section, destroy retired shard handles asynchronously, and open
    source/shuffle/output intake only after complete publication.
+
+Cycle 6 implements the immutable authority envelope, complete structural preflight, post-callback
+authority revalidation, delayed all-vnode activation, exact transition retention, and poison
+containment subset. It does not yet implement abortable semantic shadows or infallible shard swaps:
+callbacks still mutate sequentially, so a later failure can follow earlier mutation. That failure
+clears installed authority, retains the exact transition, keeps acquired vnodes non-active, poisons
+the graph generation, and requires restore into a fresh graph.
 
 Sequential in-memory swaps are logically atomic because exclusive graph/callback serialization and
 closed intake prevent a source row, shuffle row, checkpoint, or output from observing the graph

@@ -3,7 +3,7 @@
 - **Status:** Core reference implementation resumed; production qualification/certification paused;
   exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster operator is admitted
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Core Cycle 5
+- **Last reconciled:** 2026-07-27 during Core Cycle 6
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -40,8 +40,8 @@ through every phase; they are not a final cleanup sprint.
 
 The owner reset is recorded normatively in
 [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset).
-Cycle 69 and later certification work are paused. Core Cycles 1–5 add a private reference shard and
-a fail-closed graph containment path: exact local lifecycle-roster and chain preflight,
+Cycle 69 and later certification work are paused. Core Cycles 1–6 add a private reference shard and
+a fail-closed graph containment path: exact owned/restoring vnode-roster and chain preflight,
 deterministic callbacks, delayed activation, sticky poison after indeterminate mutation, boot-cut
 validation, predecessor-authority repair, control-only completion while source intake is closed,
 an audited committed final-owner exit that does not invent a target participant. Cycle 4 also
@@ -65,11 +65,14 @@ The later resource slice must attest per-vnode transitive sizes, validate the cl
 after exact seal/readiness validation but before capsule persistence and Commit, and reserve the
 target subset before GET. Encoded fetch, retained/spooled bytes, decode scratch, decoded state/RSS,
 and publication pause remain separate limits. A future payload-wire change, if needed for those
-attestations, requires a reader-first, capability-fenced rollout; Cycle 5 does not start one. The
-following lifecycle slice replaces the split mutable staging maps with one immutable record binding
-predecessor/target assignment, pipeline identity, exact committed restore cut, and acquired/revoked
-vnode rosters. The authoritative operator/state-table roster, prepare/publish/abort shadows, and a
-real semantic install boundary for `QueryState::Uninit` remain subsequent gates.
+attestations, requires a reader-first, capability-fenced rollout; Cycle 5 does not start one. Cycle
+6, recorded in the [cycle review](../reviews/distributed-keyed-state-core-cycle-06.md), replaces the
+split mutable staging maps with one immutable record binding predecessor/target assignment, process
+incarnation, pipeline identity, exact committed restore cut, and acquired/revoked vnode rosters. It
+also fences reuse of installed heap state to the exact Running graph and clears that authority on
+poison or lifecycle failure. The authoritative operator/state-table roster,
+prepare/publish/abort shadows, and a real semantic plan/codec install boundary for
+`QueryState::Uninit` are the next lifecycle slice.
 Backend work does not block these slices. TidesDB re-entry and the upstream-contribution boundary
 are owned by the
 [TidesDB design](../architecture-decisions/tidesdb-local-state-successor-design.md).
@@ -680,11 +683,17 @@ Work packages:
 
 ### 1E. Ownership lifecycle
 
+Cycle 6 lands the transition-identity, structural-preflight, authority-revalidation, and
+failure-containment subset below. Phase 1E remains open until the semantic roster, shadow
+preparation/publication, SQL installation, resource bounds, and full lifecycle tests are complete.
+
 - Implement `Unowned -> Acquiring -> Restoring -> Validated -> Active` and
   `Active -> Frozen/Draining -> Revoked` in the graph/runtime.
-- Replace the split acquired/revoked staging maps with one exact transition identity containing
-  the committed cut, checkpoint fence, target assignment/vnode count/owner digest, acquired
-  chains, revoked set, and authoritative lifecycle roster. Never convert a missing chain to empty.
+- **Landed in Cycle 6:** replace the split acquired/revoked staging maps with one exact transition
+  identity containing the committed cut, predecessor/target assignment fences, process and
+  pipeline identity, acquired chains, and revoked roster. Never convert a missing chain to empty.
+- **Remaining:** bind that transition to the authoritative operator/state-table lifecycle roster
+  and explicit empty state described below.
 - Add a mandatory state-lifecycle interface separate from ordinary `GraphOperator` methods.
   Stateful capability without that interface is a preflight error; stateless operators remain
   legitimate nonparticipants, and no successful default can discard named state.

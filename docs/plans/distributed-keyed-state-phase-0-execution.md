@@ -6,7 +6,7 @@
   dependency, backend qualification evidence, independent production-soak result, or admission
   change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Core Cycle 5
+- **Last reconciled:** 2026-07-27 during Core Cycle 6
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -28,7 +28,7 @@ The [2026-07-27 ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed
 pauses Cycle 69 and later certification work and authorizes only the private reference core slice.
 It is not Phase 0 completion, backend qualification, or permission to execute a candidate.
 
-Core Cycles 2–5 add a fail-closed runtime containment path for staged local vnode transitions and a
+Core Cycles 2–6 add a fail-closed runtime containment path for staged local vnode transitions and a
 narrow audited, committed final-owner revoke path. The latter binds predecessor/target versions and
 owner-map digests, local process incarnation, target absence, and the exact lost-vnode roster; it
 cannot be minted from recovery authority, no-store adoption, or an unaudited transition.
@@ -39,10 +39,15 @@ vnode-0 aggregate. Cycle 5 requires the namespace-scoped attempt-to-seal mapping
 until irreversible retirement and independently limits a vnode restore to the current writer
 maximum of six artifacts. The built-ins enforce the contract while artifacts remain under Laminar
 control; external live-seal deletion and mixed-version policy remain qualification/fencing gaps. It
-adds no wire version or configuration. These cycles do not impose an aggregate
-encoded-byte/RSS/decode/publication bound, consume the managed reference, provide prepare/publish/abort
-shadow publication, bind the remaining transition authority to a complete operator/table roster,
-or authorize a stateful query.
+adds no wire version or configuration. Cycle 6 replaces the split mutable restore/revoke staging
+with one immutable transition that retains the exact validated cut and binds predecessor/target
+assignment, process incarnation, pipeline identity, and acquired/revoked vnode rosters. A Running
+graph may reuse predecessor memory only while an exact installed-state binding remains valid;
+transition, fault, poison, and shutdown paths retire that authority. Structural preflight,
+post-callback authority revalidation, delayed activation, and exact-transition retention now contain
+indeterminate callbacks. These cycles do not impose an aggregate encoded-byte/RSS/decode/publication
+bound, consume the managed reference, provide prepare/publish/abort shadow publication, bind a
+  complete authoritative operator/state-table roster, or authorize a stateful query.
 
 The phase is complete only when maintainers can answer, with versioned evidence:
 
@@ -860,45 +865,12 @@ Remaining work is kept reviewable in this dependency order:
    complete-success/failed-before-apply/unknown-poison outcome and publication-exclusion contract,
    checkpoint/rebalance exclusion, fresh-root/fenced-attempt contract, resource-admission formula,
    truthful capability flags, and fake-backend fault tests. Defer TidesDB's owner lane and
-   verified-readback machinery; do not add or execute the package in this slice. Cycle 42 completes
-   the first runtime-consumed part: normal aggregate failures after mutation may begin now map to
-   coordinated recovery, and tests prove the recovery result reaches neither output publication nor
-   a due checkpoint. Cycle 43 completes a second narrow part without recovery: analytic window-frame
-   history is committed only after residual projection succeeds, so a failed/cancelled projection
-   leaves the prior history replay-safe. Cycle 44 precisely separates ASOF pre-ingest failures from
-   returned failures after right state changes and recovery-classifies fallible eviction after
-   pruning. Cycle 45 preserves the learned ASOF right schema across complete eviction by adding a
-   bounded v2 schema appendix around the unchanged v1 buffer body, conditionally migrates v1, and
-   validates restored index/schema coherence before atomic installation. Cycle 46 then proves and
-   closes the retained in-memory graph-generation cancellation boundary: after potentially mutating
-   execution begins, only an explicit returned result disarms the attempt; drop/unwind permanently
-   blocks graph execution and checkpoint capture until a fresh graph restores the last committed
-   cut. The current compute-root panic path already destroys its owned graph, so this is a borrowed-
-   API/future-refactor fence, not backend qualification. Cancellation during a future checkpoint-
-   delivery await after graph completion remains separate. Cycle 47 reproduces that private-
-   callback ambiguity during a real bounded sink enqueue, but confirms no production owner cancels
-   and retains the drain future. The contract now requires an explicit result or destruction of the
-   whole owner generation; a future cancellable caller first needs a coordinator-owned transaction
-   covering input-cut publication, source barriers, and exact-attempt cleanup. A drain-only guard is
-   deliberately not added because normal publication has the same hypothetical boundary. Cycle 48
-   then closes the independent live checkpoint/rotation race: staged acquire/revoke and an
-   unexecuted current assignment enter graph drain; whole and vnode capture reject a pending
-   transition; and every leader/follower capture retains the existing assignment read fence from
-   pre-shuffle alignment through both mutable images. The assignment certificate is revalidated
-   under that token, which is dropped before encoding, durable tail I/O, or awaited cleanup. A
-   callback audit proves the real leader/source-less capture span. Cycle 49 proves the same span on
-   immediate and deferred follower routes, including release before their durable tails and pending-
-   attempt cleanup. Its held-permit probe finds and closes a latency inversion: overlapping mutable
-   capture now rejects with `[LDB-6017]` before state mutation instead of awaiting a retained non-
-   abortable encoder under the assignment token. The encoder keeps its original permit/fault
-   lifecycle, while a queued assignment writer proceeds as soon as rejected capture unwinds. The
-   removed async timeout wrappers could not preempt the synchronous snapshots; their duration and
-   full checkpoint-versus-rotation distributions remain independent-soak gates. Cycle 57 later adds
-   only authenticated, bounded local-process adoption evidence plus the existing three-node
-   engineering consumer; it adds no recovery-Release record, row/checkpoint hot-path work, backend,
-   admission, delivery guarantee, or independent-soak result. A backend-owned sticky root/process
-   poison, resource/health admission, and fresh-native-root fencing must land only with a real
-   runtime consumer rather than a disconnected future trait;
+   verified-readback machinery; do not add or execute the package in this slice. The completed
+   containment increments and their tests are summarized in the
+   [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md). Core Cycle 6 adds
+   the first graph-lifecycle containment slice under the reset exception; its exact boundary and
+   remaining semantic-lifecycle gaps are recorded in the
+   [Cycle 6 review](../reviews/distributed-keyed-state-core-cycle-06.md);
 4. wait for a new official Cargo package `tidesdb`, freeze its exact native pair, and repeat the
    complete four-engineer-hour/one-working-day/zero-machine-hour T0. The repeated T0 must reconcile
    every later native fix and prove exact transaction success or explicitly accept the full-key
@@ -935,9 +907,11 @@ reference module is removed. All three exits must land before any admission guar
 outer-directory fixture encoder remains test-only; the promoted inner reference encoder is not a
 manifest-selected or production streaming writer.
 
-Each commit runs its affected feature matrix. Backend candidates do not touch runtime crates, and
-the first graph-lifecycle implementation remains a Phase 1 change. The first guard-removal commit
-is reserved for the later grouped-aggregate vertical after Phase 1 passes.
+Each commit runs its affected feature matrix. Backend candidates do not touch runtime crates. The
+[Cycle 6 review](../reviews/distributed-keyed-state-core-cycle-06.md) records the first permitted
+Phase 1 containment exception; it neither completes Phase 1 nor bypasses the Phase 0 gates. The
+first guard-removal commit is reserved for the later grouped-aggregate vertical after Phase 1
+passes.
 
 ## Phase 0 exit review
 

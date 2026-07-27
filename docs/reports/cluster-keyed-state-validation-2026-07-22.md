@@ -6,7 +6,7 @@
 
 **Scope:** admission and lifecycle validation only; no cluster capability is enabled by this work.
 
-**2026-07-27 core update (through Core Cycle 5):** The
+**2026-07-27 core update (through Core Cycle 6):** The
 [ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset)
 pauses later certification tooling. Core Cycle 1 adds a private reference managed vnode shard and
 caller-supplied lifecycle publication. Core Cycles 2–4 contain the existing runtime staging path
@@ -22,9 +22,13 @@ rkyv FULL/reference/DELTA wire. Cycle 5 contains transitive parent substitution 
 remain under the built-ins' or a conforming backend's immutable namespace/retirement contract, and
 bounds each vnode chain to the current writer maximum of six artifacts. External deletion of a live
 seal and mixed/future writer-policy compatibility remain production gates. Aggregate encoded bytes,
-RSS/decode limits, and publication pause remain open. These cycles do not consume the managed
-reference, add TidesDB,
-make SQL restore atomically publishable, or relax `[LDB-4007]`.
+RSS/decode limits, and publication pause remain open. Cycle 6 replaces split mutable restore/revoke
+staging with one immutable transition binding the exact predecessor/target assignments, current
+process incarnation, pipeline identity, committed restore cut, and acquired/revoked vnode rosters.
+It structurally preflights the complete raw-chain batch, revalidates authority after callbacks,
+delays activation until every callback succeeds, and invalidates installed-state reuse before graph
+poison is visible. These cycles do not consume the managed reference, add TidesDB, make SQL restore
+atomically publishable, or relax `[LDB-4007]`.
 
 **Current authority:** the [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
 selects the official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb`, as the intended
@@ -217,22 +221,27 @@ A caught downstream panic reproduced the same retained-owner result.
 
 One graph-generation `Arc<AtomicBool>` and an armed cycle guard now close that boundary. The guard is
 created after the cluster rotation read fence is acquired and before restore closure, vnode apply,
-source priming, or operator execution. Any explicit `Ok` or `Err` disarms it, preserving existing
-recovery/halt dispositions; cancellation or unwind sets it permanently. Normal execution,
+source priming, or operator execution. Any explicit result disarms it, while cancellation or unwind
+sets it permanently. In cluster mode, a terminal recovery/halt result after operator input admission,
+an indeterminate vnode callback, or post-callback authority drift uses the same poison path. Cycle 6
+clears the exact installed-state success binding before publishing poison with Release ordering, so
+assignment adoption cannot trust state from an unusable graph generation. Errors while only waiting
+for the rotation fence or performing non-mutating preflight remain unpoisoned. Normal execution,
 checkpoint drain, whole-graph capture, and per-vnode capture check the fence and return
-`StatefulOperatorPartialApply`, which the existing callback maps to recovery. The callback's
-existing `take_pipeline_fault` consumer also observes the sticky graph condition. The fixed test
-proves that the old graph cannot execute or checkpoint and that a fresh graph restored from the
-preceding cut emits the newer ASOF match on one explicit replay invocation. It does not exercise a
-source cursor, callback output publication, sink epoch, or end-to-end exactly-once. Cancellation
-while merely waiting for vnode rotation remains usable because no input/state was admitted.
+`StatefulOperatorPartialApply`, which the existing callback maps to recovery. The callback's existing
+`take_pipeline_fault` consumer also observes the sticky graph condition. The fixed test proves that
+the old graph cannot execute or checkpoint and that a fresh graph restored from the preceding cut
+emits the newer ASOF match on one explicit replay invocation. It does not exercise a source cursor,
+callback output publication, sink epoch, or end-to-end exactly-once.
 
-This adds one atomic load and one `Arc` clone/drop per graph cycle, never per row/operator; there is
-no timeout, task spawn, lock, or I/O in the execution guard. It does not add bounded working state,
-make a checkpoint-delivery await cancellable, or fence a future TidesDB operation that can complete
-after its Rust request/graph is gone. Those require the callback/native owner to poison the complete
-publication/root generation. Cluster delivery also remains at-least-once only: best-effort and
-exactly-once cluster configurations are still rejected independently.
+The normal cluster graph cycle adds one installed-state-handle `Arc` clone/drop to the existing
+guard work, never per row/operator. The installed-state mutex is acquired only when lifecycle or
+fault handling retires authority; there is no normal-row timeout, task spawn, lock, or I/O from this
+change. It does not add bounded working state, make a checkpoint-delivery await cancellable, or fence
+a future TidesDB operation that can complete after its Rust request/graph is gone. Those require the
+callback/native owner to poison the complete publication/root generation. Cluster delivery also
+remains at-least-once only: best-effort and exactly-once cluster configurations are still rejected
+independently.
 
 ### Callback drain publication is owner-non-cancellable today
 
@@ -274,10 +283,10 @@ acquire/revoke work, report quiescence before a graph pass applied it, and captu
 vnode state. A transient red probe removed the fix and reproduced the defect: the staged-acquire
 assertion failed in 0.02 seconds because the checkpoint drain loop did not run.
 
-Staged revoke/rehydration maps and the registry's current assignment version are now checkpoint
-work. A stable transition must complete one graph drain pass before either whole-state or per-vnode
-snapshot APIs will capture. The standalone pending check holds both staging mutexes at once in the
-same revoke-then-rehydrate order as assignment adoption, preventing a mixed sample.
+The immutable pending-transition slot, restoring lifecycle, and registry's current assignment
+version are now checkpoint work. A stable transition must complete one graph drain pass before
+either whole-state or per-vnode snapshot APIs will capture. Cycle 6 replaces the former two-map
+sample with one slot read, so checkpoint inspection cannot observe split revoke/restore staging.
 
 The final quiescence sample alone was insufficient because assignment adoption could still win
 between it and mutable capture. Leader, source-less leader, immediate follower, and deferred
@@ -296,9 +305,10 @@ operator proves that assignment write publication is excluded inside both `check
 leader uses the same method. The two follower routes have separate cleanup contracts but now pass
 already-captured vnode images into the tail; explicit awaited cleanup first drops the token.
 
-This changes only checkpoint/rotation work. The normal graph/row path gains no branch, lock,
-allocation, task, or I/O. Checkpoint sampling adds two short staging-map reads, an assignment-version
-comparison, and one deadline-bounded read acquisition on an existing lock. Cycle 49 found that the
+The Cycle 48 capture change affects only checkpoint/rotation work; it added no normal graph/row
+branch, lock, allocation, task, or I/O. Checkpoint sampling reads the pending-transition slot and
+restoring lifecycle, compares the assignment version, and takes one deadline-bounded read
+acquisition on an existing lock. Cycle 49 found that the
 serialization permit was then awaited under that read token for up to the checkpoint/serialization
 deadline (120 seconds by default), while the default rebalance writer deadline is 15 seconds. A
 timed-out blocking encoder is intentionally non-abortable and can retain the sole permit, so this
@@ -320,10 +330,11 @@ The admitted multi-operator reachability question is also now explicit. More tha
 may each contain its one permitted global aggregate, so one graph can contain multiple vnode-0
 aggregate operators. A later operator can fail after an earlier transition apply, but the returned
 checkpoint-class error maps to coordinated recovery, publishes no output or cut, and destroys the
-callback/graph generation before the coordinator returns. The replacement graph restores the last
-committed cut. No second explicit-error poison was added. Future keyed/window/join/MV admission
-still requires authoritative operator rosters, off-side preparation, and infallible whole-graph
-publication; the current sequential apply loop is not that lifecycle.
+callback/graph generation before the coordinator returns. Cycle 6 also invalidates the installed
+state binding and poisons a cluster graph when a terminal recovery/halt error follows input
+admission. The replacement graph restores the last committed cut. Future keyed/window/join/MV
+admission still requires authoritative operator rosters, off-side preparation, and infallible
+whole-graph publication; the current sequential callback loop is containment, not that lifecycle.
 
 ### Aggregate support is partial substrate, not an admitted feature
 
@@ -340,21 +351,22 @@ The same type nevertheless implements:
 - state removal for revoked vnodes; and
 - assignment-aware shuffle/barrier integration through `SqlQueryOperator`.
 
-That partial restore path has an additional integrity gap which does not affect an admitted keyed
-cluster workload today because admission remains closed. Restore validates the internal shape and
-query fingerprint of an aggregate slice, but it does not prove that every decoded key hashes to
-the vnode named by the checkpoint artifact. The uninitialized staging path also retains base and
-delta payloads without their vnode identity, so it cannot perform that proof after the SQL key
-schema is available. An initialized apply path can therefore merge a well-formed slice under the
-wrong vnode label. Phase 0 must centralize the existing Arrow-row/xxh3 partition codec, preserve
-the vnode tag for every staged base and delta, and preflight the complete chain against the planned
-key schema and vnode count before mutating live state.
+The uninitialized partial-restore path has an additional integrity gap which does not affect an
+admitted keyed cluster workload today because admission remains closed. Cycle 6 makes initialized
+replacement validate every decoded key against the declared vnode and current registry vnode count
+before mutation. `QueryState::Uninit`, however, validates slice shape and query fingerprint and then
+stages serialized bytes before the exact SQL plan/codec contract exists; it cannot yet prove that
+every decoded key hashes to the vnode named by the checkpoint artifact. The pending transition
+retains the vnode tag, full raw chain, exact committed cut, and target assignment, but Phase 1 must
+install the planned key contract and perform the same membership proof before publishing Active.
 
 The feature branch began that work in `562cc590`: capture, delta tracking, `last_emitted`
 bucketing, recovery bookkeeping, and revoke now call one allocation-free mapping over the existing
 encoded `OwnedRow`, and an active delta generation rejects a changed or zero vnode count before
 capture/revoke mutation. This is partition-path hardening only. It does not add a persisted vnode
-count, a count-rotation lifecycle, payload membership validation, or tagged restore chains.
+count, a count-rotation lifecycle, or the missing uninitialized semantic validation. The Cycle 6
+transition tag is authority metadata around the established raw payload, not a persisted semantic
+envelope.
 
 The branch later experimented with a generic Arrow schema descriptor (`b0ac1a7a`) and strict
 single-record-batch IPC helper (`12a34c38`). Cycle 3 review (`1e8b1a59`, `f4ded97b`) narrowed the
@@ -396,44 +408,51 @@ must not be patched as an isolated assertion:
 - Arrow 57.2's row parser assumes converter-produced well-formed bytes and may panic on malformed
   input. Restored partition-key bytes must remain opaque for hash/LSM identity, or pass a separate
   strict decoder before any materialization; artifact bytes cannot be fed directly to `RowParser`;
-- a FULL apply replaces only keys present in its payload; a stale live key in the same vnode but
-  absent from the authoritative image can survive unless the complete vnode namespace is replaced;
+- the former initialized FULL apply merged only keys present in its payload, allowing a stale live
+  key in the same vnode to survive. Cycle 6 replaces the complete initialized vnode namespace and
+  rejects decoded keys for another vnode atomically. The uninitialized path still stages bytes
+  without that declared-vnode membership check or semantic install boundary;
 - at the validated baseline, delta bucketing remembered one vnode count while capture accepted
   another. `562cc590` now rejects that local drift, but artifacts still do not bind their vnode
   count or define an explicit generation-rotation lifecycle;
-- an initialized chain is transactionally decoded off-side, but staged bases and deltas lose chain
-  identity and graph-level application can mutate an earlier operator before a later preflight
-  fails; and
+- Cycle 6 retains exact raw-chain/cut identity and completes structural graph preflight before the
+  first callback, but direct callback application can still mutate an earlier operator before a
+  later callback fails; and
 - ordinary grouped batch processing mutates groups and accumulators sequentially, so a late error
   can leave an in-memory partial batch. Cluster execution must recover from the sealed cut rather
   than retry that batch locally until the managed state write is one atomic transaction.
 
-The graph-level audit makes the restore gap more precise. `apply_rehydrated_vnodes` removes all
-currently owned chains from the shared staging map before it decodes them, applies one vnode and
-one operator at a time, and marks each vnode active immediately after that vnode's operators
-return. A failure therefore discards the exact staged retry material, can leave an earlier
-operator mutated, and can leave an earlier vnode active when a later vnode fails. The existing
-`rehydration_apply_failure_faults_without_activating_vnode` test records this behavior explicitly:
-the first test operator is applied before the second operator's injected failure, even though the
-vnode remains `Restoring`. Revocation has the same sequential partial-graph boundary.
+Cycle 6 closes staged-material loss and activation before completion of the raw callbacks. It does
+not close semantic early activation for `QueryState::Uninit`. The graph
+snapshots one exact pending-transition `Arc`, decodes and resolves the complete raw-chain batch
+before the first callback, retains that exact transition through failure, and activates the
+complete acquired roster only after every callback plus assignment, transport, lifecycle, and
+exact-slot revalidation succeeds. An indeterminate callback or post-callback drift clears installed
+state authority, poisons the graph, retains the exact transition, and leaves acquired vnodes
+non-active so a fresh graph must restore the committed cut.
+
+This is failure containment, not atomic semantic installation. Revoke and restore callbacks still
+mutate live operators sequentially; a later callback failure can follow an earlier mutation. The
+poisoned generation cannot be retried or checkpointed, but there is no abortable shadow that can
+leave the old live graph unchanged.
 
 The current partial also has no authoritative operator inventory. It derives the operator names
 from entries that happen to be present, so omission cannot distinguish an intentionally empty
 state from a missing/corrupt lifecycle participant. `GraphOperator` supplies successful no-op
 defaults for vnode apply/drop, allowing a stateful implementation without hooks to discard named
-state silently if admission ever becomes permissive. `RehydratedVnode` retains only an epoch and
-raw chain bytes; adoption drops the exact checkpoint attempt, checkpoint/target assignment
-identity, vnode count, and owner-map identity, and uses `unwrap_or_default()` for a missing acquired
-chain. Finally, an uninitialized SQL operator can queue bytes and be followed by the graph's
-`Restoring -> Active` transition before asynchronous plan construction proves the exact aggregate
-implementation and state schema. These are independent reasons that the existing apply path
-cannot be reused for keyed admission.
+state silently if admission ever becomes permissive. The pending transition now rejects a missing
+or empty acquired chain and retains the full validated cut and assignment/pipeline identity, but it
+does not supply the missing semantic roster. Finally, an uninitialized SQL operator can queue bytes
+and be followed by the graph's `Restoring -> Active` transition before asynchronous plan
+construction proves the exact aggregate implementation and state schema. These are independent
+reasons that the existing callback path cannot be reused for keyed admission.
 
 The required replacement is the assignment-scoped prepare/publish protocol in
 [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#whole-graph-publication-boundary):
 authoritative roster and explicit empty state, whole-batch preflight, off-side shadows, exclusive
 graph publication, and no activation after partial success. A validator patched onto the current
-raw keyed payload would not satisfy that boundary.
+raw keyed payload would not satisfy that boundary. Cycle 6 implements its authority and structural
+containment precursor; the semantic roster and shadow publication remain required.
 
 This code is useful implementation substrate, but it does not make the operator production safe.
 The current one-million-group guard counts entries, not bytes. The live `groups`, changelog
@@ -694,6 +713,13 @@ The current branch's admission-neutral hardening was then checked separately:
 | Core Cycle 5 sealed lineage reader | PASS, 17/17 | Includes retained-child restore after a conflicting parent reseal, exact FULL/reference/delta recovery, missing/pruned-parent failure, max-four/max-three artifact enforcement, and the current six/seven production boundary |
 | Core Cycle 5 feature/lint checks | PASS | Cluster test targets compile; warnings-denied cluster Clippy, focused policy tests, formatting, and diff checks pass |
 | Core Cycle 5 aggregate restore bytes/RSS/latency/soak | **OPEN / NO PASS CLAIM** | No public cap was added because current seal metadata cannot prove transitive bytes; no full suite, latency, RSS, backend qualification, or independent soak ran |
+| Core Cycle 6 immutable transition model | PASS, 9/9 | Exact boot/live origin, cut/pipeline/assignment/roster binding, incarnation replacement, missing-chain rejection, and committed final-owner authority |
+| Core Cycle 6 graph transition module | PASS, 119/119 | Complete structural preflight, exact-Arc retention, delayed activation, authority/lifecycle drift, callback failure, cancellation/panic, terminal backpressure, and installed-state poison invalidation |
+| Core Cycle 6 boot transition module | PASS, 10/10 | Prepare-before-replace, exact target/cut publication, and audited zero-owned target retirement |
+| Core Cycle 6 initialized aggregate authoritative replacement | PASS, 2/2 focused | Full restore removes post-cut keys absent from the committed vnode image; a chain labeled for another vnode is rejected without mutation |
+| Core Cycle 6 full cluster-feature library suite | PASS, 1,787 passed / 0 failed / 1 profiling test ignored | Includes durable-authority fixtures for final-owner rejection and boot recovery assignment history |
+| Core Cycle 6 cluster test-target compilation | PASS | `cargo check -p laminar-db --tests --no-default-features --features cluster` passed after the integrated transition and poison changes |
+| Core Cycle 6 rebalance module and final lint matrix | PASS | Rebalance passed 31/31; warnings-denied cluster/no-cluster Clippy, formatting, and diff checks passed after final fixes |
 | Core Cycle 3 `operator_graph::tests` with cluster | PASS, 111/111 | Full graph unit module after opaque final-exit authority, rotation-fence, endpoint, restore-drift, assignment-drift, callback-failure, and sticky-poison checks |
 | Core Cycle 3 `final_owner_exit` focused filter | PASS, 8/8 | Audited committed last-vnode cleanup succeeds only for the exact predecessor/target identity and retains staging on every indeterminate result |
 | `snapshot_watcher_handles_draining_phase` multi-node integration | PASS, 1/1 | A zero-vnode follower completes committed revoke without polling its source, remains intake-fenced and non-authoritative, and exposes inactive transport endpoints; not an independent soak |
@@ -706,8 +732,8 @@ The current branch's admission-neutral hardening was then checked separately:
 | `aggregate_state::tests::global_changelog_delta_checkpoint_roundtrips` | PASS, 1/1 | The admitted global aggregate remains pinned to vnode 0 |
 | `db::tests::cluster_query_shape_admission_is_pre_mutation_and_mode_derived` | PASS, 1/1 | The `[LDB-4007]` feature matrix remains closed while stateless/global shapes remain admitted; two independent global aggregate streams prove admission is per query |
 | `aggregate_state::tests::embedded_float_grouping_remains_supported_without_partition_codec_gate` (`--no-default-features`) | PASS, 1/1 | Embedded planning and execution still accept a float key excluded from cluster partition ABI v1 |
-| `operator_graph::tests::rehydration_apply_failure_faults_without_activating_vnode` | PASS, 1/1 | Empirically confirms the current unsafe boundary: the first operator is mutated before a later failure, although the vnode stays `Restoring`; this is blocker evidence, not a desired regression contract |
-| `operator_graph::tests::checkpoint_quiescence_requires_staged_vnode_transitions_to_apply` | PASS, 1/1 | Acquire, revoke, and assignment-version changes block both snapshot APIs until graph drain applies the transition |
+| `operator_graph::tests::later_restore_callback_failure_poisons_and_retains_complete_transition` | PASS, 1/1 | Confirms current containment: an earlier callback can mutate, but the exact transition remains, no acquired vnode activates, installed authority is cleared, and the generation is poisoned |
+| `operator_graph::tests::checkpoint_quiescence_requires_pending_vnode_transitions_to_apply` | PASS, 1/1 | Acquire, revoke, and assignment-version changes block both snapshot APIs until graph drain applies the transition |
 | `pipeline_callback::tests::source_less_leader_holds_rotation_fence_through_whole_and_vnode_capture` | PASS, 1/1 | Production leader/source-less callback holds the existing rotation read token across both mutable capture callbacks and releases it before the tail |
 | `pipeline_callback::tests::source_less_immediate_follower_holds_rotation_fence_through_capture` | PASS, 1/1 | The real source-less `CaptureNow` follower route holds the token through both images and releases it before its blocked durable tail |
 | `pipeline_callback::tests::retained_follower_capture_keeps_ownership_after_promotion` | PASS, 1/1 | The deferred source-barrier follower route preserves attempt cleanup while releasing the token before its blocked durable tail |
@@ -873,6 +899,12 @@ a managed keyed working-state capability connected to the distributed execution 
 9. **Proof:** differential semantics, deterministic fault injection at every cut, skew and quota
    tests, process-death/rebalance output oracles, recovery compatibility, and published latency and
    resource profiles.
+
+Core Cycle 6 implements the transition-identity and failure-containment subset of item 5. It does
+not complete item 5: the current raw callback path still lacks an authoritative operator/state-table
+roster, explicit semantic empty state, abortable off-side preparation, and infallible bounded shard
+publication. `QueryState::Uninit` also has no plan/codec installation boundary, and transition-wide
+encoded bytes, object count, decode scratch, decoded RSS, and apply pause remain unreserved.
 
 The existing `StateBackend` must not be mistaken for item 2. Its contract explicitly persists
 immutable per-checkpoint-attempt vnode artifacts and an exact-attempt durability seal. It has no
