@@ -38,7 +38,7 @@ const TIMING_SCHEMA: &str = "laminardb-local-checkpoint-barrier-timings/v1";
 const PARTITIONING_ABI_VERSION: u16 = 1;
 const TIMING_LEDGER_CAPACITY: usize = 1_024;
 const MAX_TIMING_PAGE_RECORDS: usize = 64;
-const MAX_ASSIGNMENT_IDENTITIES_PER_NODE_RUN: usize = 1_024;
+const MAX_ASSIGNMENT_IDENTITIES_PER_RUN: usize = 1_024;
 const MAX_PROCESS_GENERATIONS_PER_NODE_RUN: usize = EXPECTED_OBSERVER_SLOTS * 2;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -705,7 +705,6 @@ struct TimingMetadata {
 struct TimingState {
     cursor: u64,
     metadata: Option<TimingMetadata>,
-    last_checkpoint_id: Option<u64>,
     last_assignment_version: Option<u64>,
 }
 
@@ -721,9 +720,61 @@ impl TimingState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AssignmentIdentity {
-    vnode_count: Option<u32>,
+struct OwnerMapIdentity {
+    vnode_count: u32,
     digest: [u8; 32],
+}
+
+#[derive(Default)]
+struct RunAssignmentHistory {
+    owner_map_identities: BTreeMap<u64, OwnerMapIdentity>,
+    timing_certificate_digests: BTreeMap<u64, [u8; 32]>,
+}
+
+impl RunAssignmentHistory {
+    fn observe_owner_map(
+        &mut self,
+        version: u64,
+        identity: OwnerMapIdentity,
+    ) -> Result<(), ProtocolFailureKind> {
+        if self
+            .owner_map_identities
+            .get(&version)
+            .is_some_and(|observed| observed != &identity)
+        {
+            return Err(ProtocolFailureKind::InvalidLocalEvidence);
+        }
+        if !self.owner_map_identities.contains_key(&version)
+            && self.owner_map_identities.len() == MAX_ASSIGNMENT_IDENTITIES_PER_RUN
+        {
+            return Err(ProtocolFailureKind::EvidenceLoss);
+        }
+        self.owner_map_identities.entry(version).or_insert(identity);
+        Ok(())
+    }
+
+    fn observe_timing_certificate(
+        &mut self,
+        version: u64,
+        digest: [u8; 32],
+    ) -> Result<(), ProtocolFailureKind> {
+        if self
+            .timing_certificate_digests
+            .get(&version)
+            .is_some_and(|observed| observed != &digest)
+        {
+            return Err(ProtocolFailureKind::InvalidTimingPage);
+        }
+        if !self.timing_certificate_digests.contains_key(&version)
+            && self.timing_certificate_digests.len() == MAX_ASSIGNMENT_IDENTITIES_PER_RUN
+        {
+            return Err(ProtocolFailureKind::EvidenceLoss);
+        }
+        self.timing_certificate_digests
+            .entry(version)
+            .or_insert(digest);
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -731,7 +782,8 @@ struct NodeProtocolState {
     stable_node_id: Option<u64>,
     authority: Option<AuthorityState>,
     seen_boot_incarnations: BTreeSet<Uuid>,
-    assignment_identities: BTreeMap<u64, AssignmentIdentity>,
+    greatest_observed_assignment_version: Option<u64>,
+    greatest_observed_checkpoint_id: Option<u64>,
     timing: TimingState,
 }
 
@@ -746,6 +798,7 @@ impl NodeProtocolState {
     fn apply_local_evidence(
         &mut self,
         envelope: LocalEvidenceEnvelope,
+        assignment_history: &mut RunAssignmentHistory,
     ) -> Result<AuthorityTransition, ProtocolFailureKind> {
         if envelope.schema_version != LOCAL_EVIDENCE_SCHEMA {
             return Err(ProtocolFailureKind::InvalidLocalEvidence);
@@ -778,6 +831,12 @@ impl NodeProtocolState {
             vnode_count: adoption.vnode_count,
             assignment_digest: adoption.assignment_digest,
         };
+        if self
+            .greatest_observed_assignment_version
+            .is_some_and(|version| next.assignment_version < version)
+        {
+            return Err(ProtocolFailureKind::InvalidLocalEvidence);
+        }
         let transition = match self.authority.as_ref() {
             None => AuthorityTransition::Initial,
             Some(previous) if previous.process == process => {
@@ -798,7 +857,7 @@ impl NodeProtocolState {
                 {
                     return Err(ProtocolFailureKind::ProcessIdentityConflict);
                 }
-                if next.assignment_version < previous.assignment_version {
+                if next.assignment_version <= previous.assignment_version {
                     return Err(ProtocolFailureKind::InvalidLocalEvidence);
                 }
                 if self.timing.has_unread_records() {
@@ -813,36 +872,23 @@ impl NodeProtocolState {
         if new_boot && self.seen_boot_incarnations.len() == MAX_PROCESS_GENERATIONS_PER_NODE_RUN {
             return Err(ProtocolFailureKind::EvidenceLoss);
         }
-        if self
-            .assignment_identities
-            .get(&next.assignment_version)
-            .is_some_and(|identity| {
-                identity.digest != next.assignment_digest
-                    || identity
-                        .vnode_count
-                        .is_some_and(|vnode_count| vnode_count != next.vnode_count)
-            })
-        {
-            return Err(ProtocolFailureKind::InvalidLocalEvidence);
-        }
-        if !self
-            .assignment_identities
-            .contains_key(&next.assignment_version)
-            && self.assignment_identities.len() == MAX_ASSIGNMENT_IDENTITIES_PER_NODE_RUN
-        {
-            return Err(ProtocolFailureKind::EvidenceLoss);
-        }
+        assignment_history.observe_owner_map(
+            next.assignment_version,
+            OwnerMapIdentity {
+                vnode_count: next.vnode_count,
+                digest: next.assignment_digest,
+            },
+        )?;
         if transition == AuthorityTransition::Restarted {
             self.timing.reset();
         }
         self.seen_boot_incarnations.insert(process.boot_incarnation);
-        self.assignment_identities
-            .entry(next.assignment_version)
-            .and_modify(|identity| identity.vnode_count = Some(next.vnode_count))
-            .or_insert(AssignmentIdentity {
-                vnode_count: Some(next.vnode_count),
-                digest: next.assignment_digest,
-            });
+        self.greatest_observed_assignment_version = Some(
+            self.greatest_observed_assignment_version
+                .map_or(next.assignment_version, |version| {
+                    version.max(next.assignment_version)
+                }),
+        );
         self.stable_node_id.get_or_insert(process.node_id);
         self.authority = Some(next);
         Ok(transition)
@@ -851,6 +897,7 @@ impl NodeProtocolState {
     fn apply_timing_page(
         &mut self,
         envelope: TimingEnvelopeWire,
+        assignment_history: &mut RunAssignmentHistory,
     ) -> Result<(bool, usize), ProtocolFailureKind> {
         if envelope.schema_version != TIMING_SCHEMA {
             return Err(ProtocolFailureKind::InvalidTimingPage);
@@ -923,8 +970,7 @@ impl NodeProtocolState {
                 || record.attempt.epoch == 0
                 || record.attempt.epoch != record.attempt.checkpoint_id
                 || self
-                    .timing
-                    .last_checkpoint_id
+                    .greatest_observed_checkpoint_id
                     .is_some_and(|previous| record.attempt.checkpoint_id <= previous)
                 || record.assignment_version == 0
                 || record.assignment_digest == [0; 32]
@@ -946,33 +992,16 @@ impl NodeProtocolState {
             }
             let _role = record.role;
             let _deadline_exhausted = record.deadline_exhausted;
-            if self
-                .assignment_identities
-                .get(&record.assignment_version)
-                .is_some_and(|identity| identity.digest != record.assignment_digest)
-            {
-                return Err(ProtocolFailureKind::InvalidTimingPage);
-            }
-            if !self
-                .assignment_identities
-                .contains_key(&record.assignment_version)
-                && self.assignment_identities.len() == MAX_ASSIGNMENT_IDENTITIES_PER_NODE_RUN
-            {
-                return Err(ProtocolFailureKind::EvidenceLoss);
-            }
-            if record.assignment_version == authority.assignment_version
-                && record.assignment_digest != authority.assignment_digest
-            {
-                return Err(ProtocolFailureKind::InvalidTimingPage);
-            }
-            self.assignment_identities
-                .entry(record.assignment_version)
-                .or_insert(AssignmentIdentity {
-                    vnode_count: None,
-                    digest: record.assignment_digest,
-                });
+            assignment_history
+                .observe_timing_certificate(record.assignment_version, record.assignment_digest)?;
+            self.greatest_observed_assignment_version = Some(
+                self.greatest_observed_assignment_version
+                    .map_or(record.assignment_version, |version| {
+                        version.max(record.assignment_version)
+                    }),
+            );
             self.timing.last_assignment_version = Some(record.assignment_version);
-            self.timing.last_checkpoint_id = Some(record.attempt.checkpoint_id);
+            self.greatest_observed_checkpoint_id = Some(record.attempt.checkpoint_id);
             self.timing.cursor = record.sequence;
         }
         if page.has_more
@@ -990,6 +1019,12 @@ impl NodeProtocolState {
 
 struct NodeSlotBudget {
     attempts_remaining: u8,
+    deadline: Instant,
+}
+
+struct ObserverRunContext<'a> {
+    secret: &'a DiagnosticReadSecret,
+    cancellation: &'a ProtocolCancellation,
     deadline: Instant,
 }
 
@@ -1076,7 +1111,13 @@ fn run_observer_protocol_inner(
         return Ok(result);
     }
     let run_deadline = Instant::now() + FAKE_RUN_TOTAL_TIMEOUT;
+    let run_context = ObserverRunContext {
+        secret: &secret,
+        cancellation,
+        deadline: run_deadline,
+    };
     let mut states: [NodeProtocolState; 3] = std::array::from_fn(|_| NodeProtocolState::default());
+    let mut assignment_history = RunAssignmentHistory::default();
     for slot in plan.observer_schedule.slots.iter().take(slot_limit) {
         check_active(cancellation, run_deadline)?;
         for (index, endpoint) in plan.endpoints.iter().enumerate() {
@@ -1084,9 +1125,8 @@ fn run_observer_protocol_inner(
                 slot,
                 endpoint,
                 &mut states[index],
-                &secret,
-                cancellation,
-                run_deadline,
+                &mut assignment_history,
+                &run_context,
                 &mut result,
             )?;
             validate_distinct_node_ids(slot, endpoint.node_ordinal, &states)?;
@@ -1132,18 +1172,17 @@ fn observe_node_slot(
     slot: &ObserverSlotV1,
     endpoint: &ObserverEndpointV2,
     state: &mut NodeProtocolState,
-    secret: &DiagnosticReadSecret,
-    cancellation: &ProtocolCancellation,
-    run_deadline: Instant,
+    assignment_history: &mut RunAssignmentHistory,
+    run_context: &ObserverRunContext<'_>,
     result: &mut ObserverProtocolResultV2,
 ) -> Result<(), ObserverProtocolError> {
-    let mut budget = NodeSlotBudget::new(run_deadline);
+    let mut budget = NodeSlotBudget::new(run_context.deadline);
     let Some(transition) = read_local_evidence(
         slot,
         endpoint,
         state,
-        secret,
-        cancellation,
+        assignment_history,
+        run_context,
         &mut budget,
         result,
     )?
@@ -1187,8 +1226,8 @@ fn observe_node_slot(
             DiagnosticRouteV1::ExactTiming,
             &path,
             64 * 1_024,
-            secret,
-            cancellation,
+            run_context.secret,
+            run_context.cancellation,
             &mut budget,
             result,
         )?;
@@ -1224,14 +1263,16 @@ fn observe_node_slot(
                             DiagnosticRouteV1::ExactTiming,
                         )
                     })?;
-                let (has_more, records) = state.apply_timing_page(envelope).map_err(|kind| {
-                    ObserverProtocolError::at(
-                        kind,
-                        slot,
-                        endpoint.node_ordinal,
-                        DiagnosticRouteV1::ExactTiming,
-                    )
-                })?;
+                let (has_more, records) = state
+                    .apply_timing_page(envelope, assignment_history)
+                    .map_err(|kind| {
+                        ObserverProtocolError::at(
+                            kind,
+                            slot,
+                            endpoint.node_ordinal,
+                            DiagnosticRouteV1::ExactTiming,
+                        )
+                    })?;
                 timing_records = timing_records.checked_add(records).ok_or_else(|| {
                     ObserverProtocolError::at(
                         ProtocolFailureKind::EvidenceLoss,
@@ -1265,8 +1306,8 @@ fn observe_node_slot(
                     slot,
                     endpoint,
                     state,
-                    secret,
-                    cancellation,
+                    assignment_history,
+                    run_context,
                     &mut budget,
                     result,
                 )?
@@ -1344,8 +1385,8 @@ fn read_local_evidence(
     slot: &ObserverSlotV1,
     endpoint: &ObserverEndpointV2,
     state: &mut NodeProtocolState,
-    secret: &DiagnosticReadSecret,
-    cancellation: &ProtocolCancellation,
+    assignment_history: &mut RunAssignmentHistory,
+    run_context: &ObserverRunContext<'_>,
     budget: &mut NodeSlotBudget,
     result: &mut ObserverProtocolResultV2,
 ) -> Result<Option<AuthorityTransition>, ObserverProtocolError> {
@@ -1355,8 +1396,8 @@ fn read_local_evidence(
         DiagnosticRouteV1::LocalEvidence,
         LOCAL_EVIDENCE_PATH,
         4 * 1_024,
-        secret,
-        cancellation,
+        run_context.secret,
+        run_context.cancellation,
         budget,
         result,
     )?;
@@ -1375,7 +1416,7 @@ fn read_local_evidence(
                     )
                 })?;
             state
-                .apply_local_evidence(envelope)
+                .apply_local_evidence(envelope, assignment_history)
                 .map(Some)
                 .map_err(|kind| {
                     ObserverProtocolError::at(
@@ -2127,6 +2168,7 @@ mod tests {
     }
 
     fn timing_record(node: u64, generation: u64, sequence: u64) -> Value {
+        let certificate_digest_byte = (generation as u8) ^ 0x80;
         json!({
             "sequence": sequence,
             "process": {
@@ -2139,7 +2181,7 @@ mod tests {
             "attempt": {"epoch": sequence, "checkpoint_id": sequence},
             "role": if sequence.is_multiple_of(2) {"leader"} else {"follower"},
             "assignment_version": generation,
-            "assignment_digest": vec![generation as u8; 32],
+            "assignment_digest": vec![certificate_digest_byte; 32],
             "pipeline_stall_ns": 30,
             "local_barrier_ns": 10,
             "aligned_resume_ns": 5,
@@ -2750,39 +2792,127 @@ mod tests {
     }
 
     #[test]
-    fn authority_history_rejects_digest_conflicts_regressions_and_reused_boots() {
-        let parse_local = |bytes: Vec<u8>| serde_json::from_slice(&bytes).unwrap();
+    fn assignment_digest_domains_are_separate_and_self_consistent() {
+        let mut history = RunAssignmentHistory::default();
         let mut state = NodeProtocolState::default();
+        let local: LocalEvidenceEnvelope = serde_json::from_slice(&local_evidence(1, 1)).unwrap();
+        state.apply_local_evidence(local, &mut history).unwrap();
+
+        let timing: TimingEnvelopeWire = serde_json::from_slice(&timing_page(
+            1,
+            1,
+            0,
+            vec![timing_record(1, 1, 1)],
+            2,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            state.apply_timing_page(timing, &mut history).unwrap(),
+            (false, 1)
+        );
+        assert_ne!(
+            history.owner_map_identities.get(&1).unwrap().digest,
+            *history.timing_certificate_digests.get(&1).unwrap()
+        );
+
+        let mut conflicting_local: Value = serde_json::from_slice(&local_evidence(1, 1)).unwrap();
+        conflicting_local["evidence"]["adopted_assignment"]["assignment_digest"] =
+            json!(vec![9; 32]);
+        let conflicting_local = serde_json::from_value(conflicting_local).unwrap();
         assert_eq!(
             state
-                .apply_local_evidence(parse_local(local_evidence(1, 1)))
-                .unwrap(),
-            AuthorityTransition::Initial
+                .apply_local_evidence(conflicting_local, &mut history)
+                .unwrap_err(),
+            ProtocolFailureKind::InvalidLocalEvidence
         );
 
-        let mut adoption_v2: Value = serde_json::from_slice(&local_evidence(1, 1)).unwrap();
-        adoption_v2["evidence"]["adopted_assignment"]["assignment_version"] = json!(2);
-        adoption_v2["evidence"]["adopted_assignment"]["assignment_digest"] = json!(vec![2; 32]);
-        state
-            .apply_local_evidence(serde_json::from_value(adoption_v2).unwrap())
-            .unwrap();
-        let mut conflicting_record = timing_record(1, 1, 1);
+        let mut conflicting_record = timing_record(1, 1, 2);
         conflicting_record["assignment_digest"] = json!(vec![9; 32]);
-        let conflict: TimingEnvelopeWire =
-            serde_json::from_slice(&timing_page(1, 1, 0, vec![conflicting_record], 2, false))
+        let conflicting_timing: TimingEnvelopeWire =
+            serde_json::from_slice(&timing_page(1, 1, 1, vec![conflicting_record], 3, false))
                 .unwrap();
         assert_eq!(
-            state.apply_timing_page(conflict).unwrap_err(),
+            state
+                .apply_timing_page(conflicting_timing, &mut history)
+                .unwrap_err(),
             ProtocolFailureKind::InvalidTimingPage
         );
+    }
 
+    #[test]
+    fn assignment_versions_reject_regression_but_allow_historical_timing() {
+        let mut history = RunAssignmentHistory::default();
         let mut state = NodeProtocolState::default();
+        let local: LocalEvidenceEnvelope = serde_json::from_slice(&local_evidence(1, 1)).unwrap();
+        state.apply_local_evidence(local, &mut history).unwrap();
+        let mut record_v2 = timing_record(1, 1, 1);
+        record_v2["assignment_version"] = json!(2);
+        record_v2["assignment_digest"] = json!(vec![0x82; 32]);
+        let timing_v2: TimingEnvelopeWire =
+            serde_json::from_slice(&timing_page(1, 1, 0, vec![record_v2], 2, false)).unwrap();
+        state.apply_timing_page(timing_v2, &mut history).unwrap();
+        let regressed: LocalEvidenceEnvelope =
+            serde_json::from_slice(&local_evidence(1, 1)).unwrap();
+        assert_eq!(
+            state
+                .apply_local_evidence(regressed, &mut history)
+                .unwrap_err(),
+            ProtocolFailureKind::InvalidLocalEvidence
+        );
+
+        let mut history = RunAssignmentHistory::default();
+        let mut state = NodeProtocolState::default();
+        let local: LocalEvidenceEnvelope = serde_json::from_slice(&local_evidence(1, 1)).unwrap();
+        state.apply_local_evidence(local, &mut history).unwrap();
+        let mut record_v3 = timing_record(1, 1, 1);
+        record_v3["assignment_version"] = json!(3);
+        record_v3["assignment_digest"] = json!(vec![0x83; 32]);
+        let timing_v3: TimingEnvelopeWire =
+            serde_json::from_slice(&timing_page(1, 1, 0, vec![record_v3], 2, false)).unwrap();
+        state.apply_timing_page(timing_v3, &mut history).unwrap();
+        let restarted_v2: LocalEvidenceEnvelope =
+            serde_json::from_slice(&local_evidence(1, 2)).unwrap();
+        assert_eq!(
+            state
+                .apply_local_evidence(restarted_v2, &mut history)
+                .unwrap_err(),
+            ProtocolFailureKind::InvalidLocalEvidence
+        );
+
+        let mut history = RunAssignmentHistory::default();
+        let mut state = NodeProtocolState::default();
+        let mut current_v2: Value = serde_json::from_slice(&local_evidence(1, 1)).unwrap();
+        current_v2["evidence"]["adopted_assignment"]["assignment_version"] = json!(2);
+        current_v2["evidence"]["adopted_assignment"]["assignment_digest"] = json!(vec![2; 32]);
         state
-            .apply_local_evidence(parse_local(local_evidence(1, 1)))
+            .apply_local_evidence(serde_json::from_value(current_v2).unwrap(), &mut history)
             .unwrap();
-        state
-            .apply_local_evidence(parse_local(local_evidence(1, 2)))
-            .unwrap();
+        let historical_v1: TimingEnvelopeWire = serde_json::from_slice(&timing_page(
+            1,
+            1,
+            0,
+            vec![timing_record(1, 1, 1)],
+            2,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            state
+                .apply_timing_page(historical_v1, &mut history)
+                .unwrap(),
+            (false, 1)
+        );
+    }
+
+    #[test]
+    fn process_history_rejects_reused_boots_invalid_restarts_and_unread_rollover() {
+        let mut history = RunAssignmentHistory::default();
+        let mut state = NodeProtocolState::default();
+        let first: LocalEvidenceEnvelope = serde_json::from_slice(&local_evidence(1, 1)).unwrap();
+        state.apply_local_evidence(first, &mut history).unwrap();
+        let second: LocalEvidenceEnvelope = serde_json::from_slice(&local_evidence(1, 2)).unwrap();
+        state.apply_local_evidence(second, &mut history).unwrap();
         let reused_boot = boot(1, 1);
         let mut third: Value = serde_json::from_slice(&local_evidence(1, 3)).unwrap();
         third["evidence"]["participant"]["boot_incarnation"] = json!(reused_boot);
@@ -2790,55 +2920,132 @@ mod tests {
             json!(reused_boot);
         assert_eq!(
             state
-                .apply_local_evidence(serde_json::from_value(third).unwrap())
+                .apply_local_evidence(serde_json::from_value(third).unwrap(), &mut history)
                 .unwrap_err(),
             ProtocolFailureKind::ProcessIdentityConflict
         );
 
+        let mut history = RunAssignmentHistory::default();
         let mut state = NodeProtocolState::default();
-        let mut first: Value = serde_json::from_slice(&local_evidence(1, 1)).unwrap();
-        first["evidence"]["adopted_assignment"]["assignment_version"] = json!(3);
-        first["evidence"]["adopted_assignment"]["assignment_digest"] = json!(vec![3; 32]);
-        state
-            .apply_local_evidence(serde_json::from_value(first).unwrap())
-            .unwrap();
+        let first: LocalEvidenceEnvelope = serde_json::from_slice(&local_evidence(1, 1)).unwrap();
+        state.apply_local_evidence(first, &mut history).unwrap();
+        let mut same_version: Value = serde_json::from_slice(&local_evidence(1, 2)).unwrap();
+        same_version["evidence"]["adopted_assignment"]["assignment_version"] = json!(1);
+        same_version["evidence"]["adopted_assignment"]["assignment_digest"] = json!(vec![1; 32]);
         assert_eq!(
             state
-                .apply_local_evidence(parse_local(local_evidence(1, 2)))
+                .apply_local_evidence(serde_json::from_value(same_version).unwrap(), &mut history)
                 .unwrap_err(),
             ProtocolFailureKind::InvalidLocalEvidence
         );
 
+        let mut history = RunAssignmentHistory::default();
         let mut state = NodeProtocolState::default();
-        state
-            .apply_local_evidence(parse_local(local_evidence(1, 1)))
-            .unwrap();
-        let mut changed_width: Value = serde_json::from_slice(&local_evidence(1, 2)).unwrap();
-        changed_width["evidence"]["adopted_assignment"]["assignment_version"] = json!(1);
-        changed_width["evidence"]["adopted_assignment"]["assignment_digest"] = json!(vec![1; 32]);
+        let first: LocalEvidenceEnvelope = serde_json::from_slice(&local_evidence(1, 1)).unwrap();
+        state.apply_local_evidence(first, &mut history).unwrap();
+        let first_timing: TimingEnvelopeWire = serde_json::from_slice(&timing_page(
+            1,
+            1,
+            0,
+            vec![timing_record(1, 1, 1)],
+            2,
+            false,
+        ))
+        .unwrap();
+        state.apply_timing_page(first_timing, &mut history).unwrap();
+        let restarted: LocalEvidenceEnvelope =
+            serde_json::from_slice(&local_evidence(1, 2)).unwrap();
+        state.apply_local_evidence(restarted, &mut history).unwrap();
+        let reused_checkpoint: TimingEnvelopeWire = serde_json::from_slice(&timing_page(
+            1,
+            2,
+            0,
+            vec![timing_record(1, 2, 1)],
+            2,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            state
+                .apply_timing_page(reused_checkpoint, &mut history)
+                .unwrap_err(),
+            ProtocolFailureKind::InvalidTimingPage
+        );
+
+        let mut history = RunAssignmentHistory::default();
+        let mut state = NodeProtocolState::default();
+        let first: LocalEvidenceEnvelope = serde_json::from_slice(&local_evidence(1, 1)).unwrap();
+        state.apply_local_evidence(first, &mut history).unwrap();
+        let mut changed_width: Value = serde_json::from_slice(&local_evidence(1, 1)).unwrap();
         changed_width["evidence"]["adopted_assignment"]["vnode_count"] = json!(512);
         assert_eq!(
             state
-                .apply_local_evidence(serde_json::from_value(changed_width).unwrap())
+                .apply_local_evidence(serde_json::from_value(changed_width).unwrap(), &mut history)
                 .unwrap_err(),
             ProtocolFailureKind::InvalidLocalEvidence
         );
 
+        let mut history = RunAssignmentHistory::default();
         let mut state = NodeProtocolState::default();
-        state
-            .apply_local_evidence(parse_local(local_evidence(1, 1)))
-            .unwrap();
+        let first: LocalEvidenceEnvelope = serde_json::from_slice(&local_evidence(1, 1)).unwrap();
+        state.apply_local_evidence(first, &mut history).unwrap();
         let records = (1..=64)
             .map(|sequence| timing_record(1, 1, sequence))
             .collect();
         let unread: TimingEnvelopeWire =
             serde_json::from_slice(&timing_page(1, 1, 0, records, 66, true)).unwrap();
-        assert_eq!(state.apply_timing_page(unread).unwrap(), (true, 64));
+        state.apply_timing_page(unread, &mut history).unwrap();
+        let restarted: LocalEvidenceEnvelope =
+            serde_json::from_slice(&local_evidence(1, 2)).unwrap();
         assert_eq!(
             state
-                .apply_local_evidence(parse_local(local_evidence(1, 2)))
+                .apply_local_evidence(restarted, &mut history)
                 .unwrap_err(),
             ProtocolFailureKind::EvidenceLoss
+        );
+    }
+
+    #[test]
+    fn run_history_rejects_cross_node_conflicts_within_each_digest_domain() {
+        let mut history = RunAssignmentHistory::default();
+        let mut first = NodeProtocolState::default();
+        let local: LocalEvidenceEnvelope = serde_json::from_slice(&local_evidence(1, 1)).unwrap();
+        first.apply_local_evidence(local, &mut history).unwrap();
+        let timing: TimingEnvelopeWire = serde_json::from_slice(&timing_page(
+            1,
+            1,
+            0,
+            vec![timing_record(1, 1, 1)],
+            2,
+            false,
+        ))
+        .unwrap();
+        first.apply_timing_page(timing, &mut history).unwrap();
+
+        let mut conflicting_owner: Value = serde_json::from_slice(&local_evidence(2, 1)).unwrap();
+        conflicting_owner["evidence"]["adopted_assignment"]["assignment_digest"] =
+            json!(vec![9; 32]);
+        let mut second = NodeProtocolState::default();
+        assert_eq!(
+            second
+                .apply_local_evidence(
+                    serde_json::from_value(conflicting_owner).unwrap(),
+                    &mut history,
+                )
+                .unwrap_err(),
+            ProtocolFailureKind::InvalidLocalEvidence
+        );
+
+        let local: LocalEvidenceEnvelope = serde_json::from_slice(&local_evidence(2, 1)).unwrap();
+        second.apply_local_evidence(local, &mut history).unwrap();
+        let mut conflicting_record = timing_record(2, 1, 1);
+        conflicting_record["assignment_digest"] = json!(vec![9; 32]);
+        let timing: TimingEnvelopeWire =
+            serde_json::from_slice(&timing_page(2, 1, 0, vec![conflicting_record], 2, false))
+                .unwrap();
+        assert_eq!(
+            second.apply_timing_page(timing, &mut history).unwrap_err(),
+            ProtocolFailureKind::InvalidTimingPage
         );
     }
 
