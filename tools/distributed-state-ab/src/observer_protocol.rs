@@ -857,7 +857,10 @@ impl NodeProtocolState {
                 {
                     return Err(ProtocolFailureKind::ProcessIdentityConflict);
                 }
-                if next.assignment_version <= previous.assignment_version {
+                if self
+                    .greatest_observed_assignment_version
+                    .is_some_and(|version| next.assignment_version <= version)
+                {
                     return Err(ProtocolFailureKind::InvalidLocalEvidence);
                 }
                 if self.timing.has_unread_records() {
@@ -2857,6 +2860,23 @@ mod tests {
         assert_eq!(
             state
                 .apply_local_evidence(regressed, &mut history)
+                .unwrap_err(),
+            ProtocolFailureKind::InvalidLocalEvidence
+        );
+        let mut caught_up: Value = serde_json::from_slice(&local_evidence(1, 1)).unwrap();
+        caught_up["evidence"]["adopted_assignment"]["assignment_version"] = json!(2);
+        caught_up["evidence"]["adopted_assignment"]["assignment_digest"] = json!(vec![2; 32]);
+        assert_eq!(
+            state
+                .apply_local_evidence(serde_json::from_value(caught_up).unwrap(), &mut history)
+                .unwrap(),
+            AuthorityTransition::Stable
+        );
+        let equal_restart: LocalEvidenceEnvelope =
+            serde_json::from_slice(&local_evidence(1, 2)).unwrap();
+        assert_eq!(
+            state
+                .apply_local_evidence(equal_restart, &mut history)
                 .unwrap_err(),
             ProtocolFailureKind::InvalidLocalEvidence
         );
