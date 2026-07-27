@@ -722,10 +722,13 @@ impl OperatorGraph {
                 .filter(|(_, node)| !node.removed && node.capability.managed_state.is_some())
                 .map(|(index, node)| {
                     let relevant = match node.capability.state_class {
-                        crate::operator::capability::OperatorStateClass::GlobalSingleton => revoked
-                            .contains(&0)
-                            .then(|| [0].into_iter().collect())
-                            .unwrap_or_default(),
+                        crate::operator::capability::OperatorStateClass::GlobalSingleton => {
+                            if revoked.contains(&0) {
+                                [0].into_iter().collect()
+                            } else {
+                                FxHashSet::default()
+                            }
+                        }
                         crate::operator::capability::OperatorStateClass::VnodeKeyed => {
                             revoked.clone()
                         }

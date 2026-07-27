@@ -893,10 +893,8 @@ impl OperatorGraph {
                 .owners()
                 .iter()
                 .enumerate()
-                .filter_map(|(vnode, owner)| {
-                    (*owner == config.self_id)
-                        .then(|| u32::try_from(vnode).expect("vnode count is represented by u32"))
-                })
+                .filter(|(_, owner)| **owner == config.self_id)
+                .map(|(vnode, _)| u32::try_from(vnode).expect("vnode count is represented by u32"))
                 .collect());
         }
         #[cfg(test)]
