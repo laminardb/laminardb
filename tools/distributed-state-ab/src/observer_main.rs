@@ -8,8 +8,9 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use distributed_state_ab::observer_protocol::{
-    run_observer_protocol, ProtocolCancellation, ProtocolDispositionV2, ProvisionedObserverInput,
-    SupervisorBootstrapSource, SUPERVISOR_CANCEL_BYTES,
+    run_observer_protocol, validate_sanitized_plan_binding, ProtocolCancellation,
+    ProtocolDispositionV2, ProvisionedObserverInput, SupervisorBootstrapSource,
+    SUPERVISOR_CANCEL_BYTES,
 };
 use distributed_state_ab::{
     build_observer_result, seal_base_plan, validate_manifest_path, verify_current_executable, Arm,
@@ -115,7 +116,9 @@ fn run_dry_run(mut arguments: impl Iterator<Item = std::ffi::OsString>) -> Resul
 fn run_fake_protocol(
     mut arguments: impl Iterator<Item = std::ffi::OsString>,
 ) -> Result<(), String> {
+    let manifest_argument = arguments.next().ok_or_else(usage)?;
     let arm_argument = arguments.next().ok_or_else(usage)?;
+    let behavior_argument = arguments.next().ok_or_else(usage)?;
     if arguments.next().is_some() {
         return Err(usage());
     }
@@ -125,7 +128,41 @@ fn run_fake_protocol(
             .ok_or_else(|| "arm is not valid Unicode".to_owned())?,
     )
     .map_err(|error| error.to_string())?;
+    let behavior = ObserverBehavior::from_str(
+        behavior_argument
+            .to_str()
+            .ok_or_else(|| "behavior is not valid Unicode".to_owned())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let manifest_path = PathBuf::from(manifest_argument)
+        .canonicalize()
+        .map_err(|error| format!("canonicalize manifest: {error}"))?;
+    let manifest = validate_manifest_path(&manifest_path).map_err(|error| error.to_string())?;
+    verify_current_executable(&manifest.artifacts().observer).map_err(|error| error.to_string())?;
+    let base_plan = seal_base_plan(&manifest).map_err(|error| error.to_string())?;
     let input = receive_supervisor_bootstrap()?;
+    validate_sanitized_plan_binding(&input.plan, &base_plan).map_err(|error| error.to_string())?;
+    match behavior {
+        ObserverBehavior::Exit => {
+            drop(input);
+            return Err("injected observer exit".to_owned());
+        }
+        ObserverBehavior::Hang => {
+            drop(input);
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        }
+        ObserverBehavior::Malformed => {
+            drop(input);
+            print!("malformed-observer-output");
+            std::io::stdout()
+                .flush()
+                .map_err(|error| format!("flush malformed output: {error}"))?;
+            return Ok(());
+        }
+        ObserverBehavior::Success => {}
+    }
     let cancellation = ProtocolCancellation::default();
     spawn_cancellation_listener(cancellation.clone())?;
     let result =
@@ -207,6 +244,6 @@ fn wait_for_start_signal() -> Result<(), String> {
 fn usage() -> String {
     "usage: distributed-state-ab-observer \
      dry-run <manifest.json> <C|D> <success|exit|hang|malformed> | \
-     fake-protocol <C|D>"
+     fake-protocol <manifest.json> <C|D> <success|exit|hang|malformed>"
         .to_owned()
 }

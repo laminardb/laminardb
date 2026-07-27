@@ -16,7 +16,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use zeroize::Zeroize as _;
+use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::{
     domain_hash, is_lower_sha256, Arm, DiagnosticRouteV1, LifecycleBoundaryV1, ObserverScheduleV1,
@@ -24,11 +24,15 @@ use crate::{
 };
 
 pub const SANITIZED_PLAN_SCHEMA: &str = "laminardb-observer-sanitized-plan/v2";
-pub const PROTOCOL_RESULT_SCHEMA: &str = "laminardb-observer-loopback-fake-protocol/v2";
-pub const SUPERVISOR_BOOTSTRAP_PREFIX: &[u8] = b"LAMINARDB_AB_OBSERVER_BOOTSTRAP_V3\n";
+pub const PROTOCOL_RESULT_SCHEMA: &str = "laminardb-observer-loopback-fake-protocol/v3";
+pub const SUPERVISOR_BOOTSTRAP_PREFIX: &[u8] = b"LAMINARDB_AB_OBSERVER_BOOTSTRAP_V4\n";
 pub const SUPERVISOR_CANCEL_BYTES: &[u8] = b"LAMINARDB_AB_OBSERVER_CANCEL_V1\n";
+pub const DRIVER_FAKE_INPUT_SCHEMA: &str = "laminardb-observer-driver-fake-input/v1";
+pub const DRIVER_FAKE_INPUT_PREFIX: &[u8] = b"LAMINARDB_AB_DRIVER_FAKE_INPUT_V1\n";
+pub const PROTOCOL_RESULT_MAX_BYTES: usize = 64 * 1_024;
 
 const MAX_SANITIZED_PLAN_BYTES: usize = 64 * 1_024;
+const MAX_DRIVER_ENDPOINT_BYTES: usize = 512;
 const DIAGNOSTIC_SECRET_ENCODED_BYTES: usize = 43;
 const DIAGNOSTIC_SECRET_DECODED_BYTES: usize = 32;
 const LOCAL_EVIDENCE_PATH: &str = "/api/v1/cluster/local-evidence";
@@ -67,6 +71,15 @@ const POST_RECOVERY_BASE_NS: u64 = 255_000_000_000;
 pub struct ObserverEndpointV2 {
     pub node_ordinal: u8,
     pub address: SocketAddr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DriverFakeEndpointInputV1 {
+    schema_version: String,
+    notice: String,
+    execution_eligible: bool,
+    endpoints: [ObserverEndpointV2; 3],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,6 +312,141 @@ impl Drop for DiagnosticReadSecret {
     }
 }
 
+pub struct ProvisionedDriverFakeInput {
+    pub addresses: [SocketAddr; 3],
+    pub secret: DiagnosticReadSecret,
+}
+
+pub struct DriverFakeInputSource<R> {
+    reader: Option<R>,
+}
+
+impl<R> DriverFakeInputSource<R> {
+    pub const fn new(reader: R) -> Self {
+        Self {
+            reader: Some(reader),
+        }
+    }
+}
+
+impl<R: Read> DriverFakeInputSource<R> {
+    pub fn take(&mut self) -> Result<ProvisionedDriverFakeInput, ObserverProtocolError> {
+        let mut reader = self.reader.take().ok_or_else(|| {
+            ObserverProtocolError::new(ProtocolFailureKind::SecretAlreadyConsumed)
+        })?;
+        let invalid = || ObserverProtocolError::new(ProtocolFailureKind::InvalidBootstrap);
+        let mut prefix = vec![0_u8; DRIVER_FAKE_INPUT_PREFIX.len()];
+        if reader.read_exact(&mut prefix).is_err() || prefix != DRIVER_FAKE_INPUT_PREFIX {
+            prefix.zeroize();
+            return Err(invalid());
+        }
+        prefix.zeroize();
+
+        let mut length_bytes = [0_u8; 4];
+        if reader.read_exact(&mut length_bytes).is_err() {
+            return Err(invalid());
+        }
+        let endpoint_len =
+            usize::try_from(u32::from_be_bytes(length_bytes)).map_err(|_| invalid())?;
+        if endpoint_len == 0 || endpoint_len > MAX_DRIVER_ENDPOINT_BYTES {
+            return Err(invalid());
+        }
+        let mut endpoint_bytes = vec![0_u8; endpoint_len];
+        if reader.read_exact(&mut endpoint_bytes).is_err() {
+            endpoint_bytes.zeroize();
+            return Err(invalid());
+        }
+        let mut endpoints: DriverFakeEndpointInputV1 = match serde_json::from_slice(&endpoint_bytes)
+        {
+            Ok(endpoints) => endpoints,
+            Err(_) => {
+                endpoint_bytes.zeroize();
+                return Err(invalid());
+            }
+        };
+        let mut canonical = match serde_json::to_vec(&endpoints) {
+            Ok(canonical) => canonical,
+            Err(_) => {
+                endpoint_bytes.zeroize();
+                return Err(invalid());
+            }
+        };
+        let canonical_input = canonical == endpoint_bytes;
+        canonical.zeroize();
+        endpoint_bytes.zeroize();
+        let valid_endpoints = valid_driver_endpoint_input(&endpoints);
+        let addresses = endpoints.endpoints.map(|endpoint| endpoint.address);
+        endpoints.schema_version.zeroize();
+        endpoints.notice.zeroize();
+        if !canonical_input || !valid_endpoints {
+            return Err(invalid());
+        }
+
+        let mut secret_bytes = [0_u8; DIAGNOSTIC_SECRET_ENCODED_BYTES];
+        if reader.read_exact(&mut secret_bytes).is_err() {
+            secret_bytes.zeroize();
+            return Err(invalid());
+        }
+        let secret = DiagnosticReadSecret::from_provisioned_bytes(&secret_bytes)
+            .map_err(|_| ObserverProtocolError::new(ProtocolFailureKind::InvalidSecret));
+        secret_bytes.zeroize();
+        let secret = secret?;
+        let mut terminator = [0_u8; 1];
+        if reader.read_exact(&mut terminator).is_err() || terminator != [b'\n'] {
+            return Err(invalid());
+        }
+        Ok(ProvisionedDriverFakeInput { addresses, secret })
+    }
+}
+
+pub fn write_driver_fake_input<W: Write>(
+    mut writer: W,
+    addresses: [SocketAddr; 3],
+    secret: &DiagnosticReadSecret,
+) -> Result<(), ObserverProtocolError> {
+    let endpoints = std::array::from_fn(|index| ObserverEndpointV2 {
+        node_ordinal: index as u8,
+        address: addresses[index],
+    });
+    let input = DriverFakeEndpointInputV1 {
+        schema_version: DRIVER_FAKE_INPUT_SCHEMA.to_owned(),
+        notice: NOTICE.to_owned(),
+        execution_eligible: false,
+        endpoints,
+    };
+    if !valid_driver_endpoint_input(&input) {
+        return Err(ObserverProtocolError::new(ProtocolFailureKind::InvalidPlan));
+    }
+    let bytes = serde_json::to_vec(&input)
+        .map_err(|_| ObserverProtocolError::new(ProtocolFailureKind::InvalidPlan))?;
+    let length = u32::try_from(bytes.len())
+        .map_err(|_| ObserverProtocolError::new(ProtocolFailureKind::InvalidPlan))?;
+    writer
+        .write_all(DRIVER_FAKE_INPUT_PREFIX)
+        .and_then(|()| writer.write_all(&length.to_be_bytes()))
+        .and_then(|()| writer.write_all(&bytes))
+        .and_then(|()| writer.write_all(secret.encoded()))
+        .and_then(|()| writer.write_all(b"\n"))
+        .and_then(|()| writer.flush())
+        .map_err(|_| ObserverProtocolError::new(ProtocolFailureKind::SecretUnavailable))
+}
+
+fn valid_driver_endpoint_input(input: &DriverFakeEndpointInputV1) -> bool {
+    if input.schema_version != DRIVER_FAKE_INPUT_SCHEMA
+        || input.notice != NOTICE
+        || input.execution_eligible
+    {
+        return false;
+    }
+    let mut addresses = BTreeSet::new();
+    input.endpoints.iter().enumerate().all(|(index, endpoint)| {
+        endpoint.node_ordinal == index as u8
+            && endpoint.address.port() != 0
+            && endpoint.address.ip().is_loopback()
+            && addresses.insert(endpoint.address)
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretSourceError {
     Unavailable,
@@ -332,6 +480,7 @@ impl<R> SupervisorBootstrapSource<R> {
 
 pub struct ProvisionedObserverInput {
     pub plan: ValidatedSanitizedObserverPlanV2,
+    pub invocation_id: Uuid,
     pub secret: DiagnosticReadSecret,
 }
 
@@ -365,6 +514,17 @@ impl<R: Read> SupervisorBootstrapSource<R> {
         plan_bytes.zeroize();
         let plan = plan_result?;
 
+        let mut invocation_bytes = [0_u8; 16];
+        if reader.read_exact(&mut invocation_bytes).is_err() {
+            invocation_bytes.zeroize();
+            return Err(invalid());
+        }
+        let invocation_id = Uuid::from_bytes(invocation_bytes);
+        invocation_bytes.zeroize();
+        if !is_random_invocation_id(invocation_id) {
+            return Err(invalid());
+        }
+
         let mut secret_bytes = [0_u8; DIAGNOSTIC_SECRET_ENCODED_BYTES];
         if reader.read_exact(&mut secret_bytes).is_err() {
             secret_bytes.zeroize();
@@ -387,16 +547,26 @@ impl<R: Read> SupervisorBootstrapSource<R> {
         if reader.read_exact(&mut terminator).is_err() || terminator != [b'\n'] {
             return Err(invalid());
         }
-        Ok(ProvisionedObserverInput { plan, secret })
+        Ok(ProvisionedObserverInput {
+            plan,
+            invocation_id,
+            secret,
+        })
     }
 }
 
 pub fn write_supervisor_bootstrap<W: Write>(
     mut writer: W,
     plan: &SanitizedObserverPlanV2,
+    invocation_id: Uuid,
     secret: &DiagnosticReadSecret,
 ) -> Result<(), ObserverProtocolError> {
     let plan = validate_sanitized_plan(plan.clone())?;
+    if !is_random_invocation_id(invocation_id) {
+        return Err(ObserverProtocolError::new(
+            ProtocolFailureKind::InvalidBootstrap,
+        ));
+    }
     let bytes = serde_json::to_vec(&plan)
         .map_err(|_| ObserverProtocolError::new(ProtocolFailureKind::InvalidPlan))?;
     let length = u32::try_from(bytes.len())
@@ -405,10 +575,15 @@ pub fn write_supervisor_bootstrap<W: Write>(
         .write_all(SUPERVISOR_BOOTSTRAP_PREFIX)
         .and_then(|()| writer.write_all(&length.to_be_bytes()))
         .and_then(|()| writer.write_all(&bytes))
+        .and_then(|()| writer.write_all(invocation_id.as_bytes()))
         .and_then(|()| writer.write_all(secret.encoded()))
         .and_then(|()| writer.write_all(b"\n"))
         .and_then(|()| writer.flush())
         .map_err(|_| ObserverProtocolError::new(ProtocolFailureKind::SecretUnavailable))
+}
+
+fn is_random_invocation_id(invocation_id: Uuid) -> bool {
+    invocation_id.get_version_num() == 4 && invocation_id.get_variant() == uuid::Variant::RFC4122
 }
 
 #[derive(Clone, Default)]
@@ -456,11 +631,12 @@ pub struct ObserverProtocolEventV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ObserverProtocolResultV2 {
+pub struct ObserverProtocolResultV3 {
     pub schema_version: String,
     pub notice: String,
     pub execution_eligible: bool,
     pub arm: Arm,
+    pub invocation_id: Uuid,
     pub sanitized_plan_sha256: String,
     pub base_plan_sha256: String,
     pub observer_schedule_sha256: String,
@@ -486,6 +662,353 @@ pub enum ProtocolDispositionV2 {
     Incomplete,
 }
 
+#[derive(Debug, Clone)]
+pub struct ObserverProtocolResultExpectationV3 {
+    plan: ValidatedSanitizedObserverPlanV2,
+    arm: Arm,
+    invocation_id: Uuid,
+}
+
+impl ObserverProtocolResultExpectationV3 {
+    pub fn sanitized_plan_sha256(&self) -> &str {
+        self.plan.canonical_sha256()
+    }
+
+    pub fn invocation_id(&self) -> Uuid {
+        self.invocation_id
+    }
+}
+
+pub fn bind_observer_protocol_plan(
+    plan: &SanitizedObserverPlanV2,
+    base_plan: &SealedPlanV1,
+    arm: Arm,
+    invocation_id: Uuid,
+) -> Result<ObserverProtocolResultExpectationV3, ObserverProtocolError> {
+    if !is_random_invocation_id(invocation_id) {
+        return Err(ObserverProtocolError::new(ProtocolFailureKind::InvalidPlan));
+    }
+    let bytes = serde_json::to_vec(plan)
+        .map_err(|_| ObserverProtocolError::new(ProtocolFailureKind::InvalidPlan))?;
+    let plan = validate_sanitized_plan_bytes(&bytes)?;
+    validate_sanitized_plan_binding(&plan, base_plan)?;
+    Ok(ObserverProtocolResultExpectationV3 {
+        plan,
+        arm,
+        invocation_id,
+    })
+}
+
+pub fn validate_sanitized_plan_binding(
+    plan: &ValidatedSanitizedObserverPlanV2,
+    base_plan: &SealedPlanV1,
+) -> Result<(), ObserverProtocolError> {
+    let addresses = plan.plan().endpoints.map(|endpoint| endpoint.address);
+    let expected = build_sanitized_observer_plan(base_plan, addresses)?;
+    if plan.plan() != &expected {
+        return Err(ObserverProtocolError::new(ProtocolFailureKind::InvalidPlan));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObserverProtocolResultWire<'a> {
+    #[serde(borrow)]
+    schema_version: &'a str,
+    #[serde(borrow)]
+    notice: &'a str,
+    execution_eligible: bool,
+    arm: Arm,
+    invocation_id: Uuid,
+    #[serde(borrow)]
+    sanitized_plan_sha256: &'a str,
+    #[serde(borrow)]
+    base_plan_sha256: &'a str,
+    #[serde(borrow)]
+    observer_schedule_sha256: &'a str,
+    scheduled_slots: u32,
+    suppressed_probes: u32,
+    connection_attempts: u32,
+    parsed_responses: u32,
+    retries: u32,
+    transient_failures: u32,
+    process_transitions: u32,
+    timing_records: u64,
+    page_budget_deferrals: u32,
+    unresolved_timing_nodes: u8,
+    retained_events_dropped: u32,
+    disposition: ProtocolDispositionV2,
+    retained_events: Vec<ObserverProtocolEventV1>,
+}
+
+pub fn validate_observer_protocol_result(
+    bytes: &[u8],
+    expectation: &ObserverProtocolResultExpectationV3,
+) -> Result<ObserverProtocolResultV3, ObserverProtocolError> {
+    let invalid = || ObserverProtocolError::new(ProtocolFailureKind::InvalidResult);
+    if bytes.is_empty() || bytes.len() > PROTOCOL_RESULT_MAX_BYTES {
+        return Err(invalid());
+    }
+    let observed: ObserverProtocolResultWire<'_> =
+        serde_json::from_slice(bytes).map_err(|_| invalid())?;
+    let plan = expectation.plan.plan();
+    let scheduled_slots =
+        u32::try_from(plan.observer_schedule.slots.len()).map_err(|_| invalid())?;
+    let node_slots = scheduled_slots.checked_mul(3).ok_or_else(invalid)?;
+    let max_connection_attempts = node_slots
+        .checked_mul(u32::from(MAX_NODE_SLOT_ATTEMPTS))
+        .ok_or_else(invalid)?;
+    let max_process_transitions = scheduled_slots
+        .checked_mul(2)
+        .and_then(|per_node| per_node.checked_sub(1))
+        .and_then(|per_node| per_node.checked_mul(3))
+        .ok_or_else(invalid)?;
+    let max_timing_records = u64::from(node_slots)
+        .checked_mul(MAX_TIMING_RECORDS_PER_SLOT as u64)
+        .ok_or_else(invalid)?;
+    let retained_total = u32::try_from(observed.retained_events.len())
+        .map_err(|_| invalid())?
+        .checked_add(observed.retained_events_dropped)
+        .ok_or_else(invalid)?;
+    let event_total = observed
+        .transient_failures
+        .checked_add(observed.process_transitions)
+        .and_then(|count| count.checked_add(observed.page_budget_deferrals))
+        .ok_or_else(invalid)?;
+    let terminal_node_slot_events = observed
+        .transient_failures
+        .checked_add(observed.page_budget_deferrals)
+        .ok_or_else(invalid)?;
+    let disposition_consistent = match observed.disposition {
+        ProtocolDispositionV2::Complete => {
+            observed.transient_failures == 0 && observed.unresolved_timing_nodes == 0
+        }
+        ProtocolDispositionV2::Incomplete => {
+            observed.transient_failures != 0 || observed.unresolved_timing_nodes != 0
+        }
+    };
+    let retries_consistent = observed
+        .retries
+        .checked_mul(2)
+        .is_some_and(|attempts| attempts <= observed.connection_attempts);
+    let timing_records_consistent = u64::from(observed.parsed_responses)
+        .checked_mul(MAX_TIMING_PAGE_RECORDS as u64)
+        .is_some_and(|records| observed.timing_records <= records);
+    let page_deferrals_consistent = observed
+        .page_budget_deferrals
+        .checked_mul(u32::from(MAX_TIMING_PAGES_PER_SLOT))
+        .is_some_and(|pages| pages <= observed.parsed_responses)
+        && u64::from(observed.page_budget_deferrals)
+            .checked_mul(MAX_TIMING_RECORDS_PER_SLOT as u64)
+            .is_some_and(|records| records <= observed.timing_records);
+    let logical_probes = observed
+        .connection_attempts
+        .checked_sub(observed.retries)
+        .ok_or_else(invalid)?;
+    let logical_probes_have_outcomes = observed
+        .parsed_responses
+        .checked_add(observed.transient_failures)
+        .is_some_and(|outcomes| logical_probes <= outcomes);
+    let minimum_logical_probes = node_slots
+        .checked_mul(2)
+        .and_then(|baseline| baseline.checked_sub(observed.transient_failures))
+        .and_then(|baseline| {
+            observed
+                .page_budget_deferrals
+                .checked_mul(u32::from(MAX_TIMING_PAGES_PER_SLOT - 1))
+                .and_then(|extra| baseline.checked_add(extra))
+        })
+        .ok_or_else(invalid)?;
+    let minimum_parsed_responses = node_slots
+        .checked_mul(2)
+        .and_then(|baseline| {
+            observed
+                .transient_failures
+                .checked_mul(2)
+                .and_then(|missing| baseline.checked_sub(missing))
+        })
+        .and_then(|baseline| {
+            observed
+                .page_budget_deferrals
+                .checked_mul(u32::from(MAX_TIMING_PAGES_PER_SLOT - 1))
+                .and_then(|extra| baseline.checked_add(extra))
+        })
+        .ok_or_else(invalid)?;
+    let minimum_parsed_for_timing = observed
+        .timing_records
+        .div_ceil(MAX_TIMING_PAGE_RECORDS as u64)
+        .checked_add(
+            observed
+                .timing_records
+                .div_ceil(MAX_TIMING_RECORDS_PER_SLOT as u64),
+        )
+        .ok_or_else(invalid)?;
+    let minimum_logical_for_timing = u64::from(node_slots)
+        .checked_add(
+            observed
+                .timing_records
+                .div_ceil(MAX_TIMING_PAGE_RECORDS as u64),
+        )
+        .ok_or_else(invalid)?;
+    let maximum_timing_after_transients = u64::from(node_slots)
+        .checked_mul(MAX_TIMING_RECORDS_PER_SLOT as u64)
+        .and_then(|maximum| {
+            u64::from(observed.transient_failures)
+                .checked_mul(MAX_TIMING_PAGE_RECORDS as u64)
+                .and_then(|unavailable| maximum.checked_sub(unavailable))
+        })
+        .ok_or_else(invalid)?;
+    let control_consistent = if expectation.arm == Arm::PollingControl {
+        observed.suppressed_probes == scheduled_slots * 6
+            && observed.connection_attempts == 0
+            && observed.parsed_responses == 0
+            && observed.retries == 0
+            && observed.transient_failures == 0
+            && observed.process_transitions == 0
+            && observed.timing_records == 0
+            && observed.page_budget_deferrals == 0
+            && observed.unresolved_timing_nodes == 0
+            && observed.retained_events_dropped == 0
+            && observed.retained_events.is_empty()
+            && observed.disposition == ProtocolDispositionV2::Complete
+    } else {
+        observed.suppressed_probes == 0
+            && logical_probes >= minimum_logical_probes
+            && logical_probes_have_outcomes
+            && observed.parsed_responses >= minimum_parsed_responses
+            && u64::from(observed.parsed_responses) >= minimum_parsed_for_timing
+            && u64::from(logical_probes) >= minimum_logical_for_timing
+            && observed.timing_records <= maximum_timing_after_transients
+    };
+    let retained_transient_events = observed
+        .retained_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                ProtocolEventKindV1::TransportUnavailable
+                    | ProtocolEventKindV1::ServerBusy
+                    | ProtocolEventKindV1::NodeSlotBudgetExhausted
+            )
+        })
+        .count();
+    let retained_process_events = observed
+        .retained_events
+        .iter()
+        .filter(|event| event.kind == ProtocolEventKindV1::ProcessChanged)
+        .count();
+    let retained_page_events = observed
+        .retained_events
+        .iter()
+        .filter(|event| event.kind == ProtocolEventKindV1::TimingPageBudgetExhausted)
+        .count();
+    let mut retained_node_slots = BTreeMap::<(u32, u8), (u8, bool)>::new();
+    let mut retained_node_slot_shapes_valid = true;
+    for event in &observed.retained_events {
+        let state = retained_node_slots
+            .entry((event.slot_ordinal, event.node_ordinal))
+            .or_default();
+        if event.kind == ProtocolEventKindV1::ProcessChanged {
+            if state.1 || state.0 == 2 {
+                retained_node_slot_shapes_valid = false;
+            }
+            state.0 = state.0.saturating_add(1);
+        } else {
+            if state.1
+                || (event.kind == ProtocolEventKindV1::TimingPageBudgetExhausted && state.0 > 1)
+            {
+                retained_node_slot_shapes_valid = false;
+            }
+            state.1 = true;
+        }
+    }
+    let events_valid = observed.retained_events.len() <= MAX_RETAINED_EVENTS
+        && (observed.retained_events_dropped == 0
+            || observed.retained_events.len() == MAX_RETAINED_EVENTS)
+        && retained_transient_events <= observed.transient_failures as usize
+        && retained_process_events <= observed.process_transitions as usize
+        && retained_page_events <= observed.page_budget_deferrals as usize
+        && retained_node_slot_shapes_valid
+        && observed.retained_events.iter().all(|event| {
+            (event.slot_ordinal as usize) < plan.observer_schedule.slots.len()
+                && plan
+                    .observer_schedule
+                    .node_ordinals
+                    .contains(&event.node_ordinal)
+                && (!matches!(event.kind, ProtocolEventKindV1::ProcessChanged)
+                    || event.route == DiagnosticRouteV1::LocalEvidence)
+                && (!matches!(event.kind, ProtocolEventKindV1::TimingPageBudgetExhausted)
+                    || event.route == DiagnosticRouteV1::ExactTiming)
+        })
+        && observed.retained_events.windows(2).all(|events| {
+            (events[0].slot_ordinal, events[0].node_ordinal)
+                <= (events[1].slot_ordinal, events[1].node_ordinal)
+        });
+    if observed.schema_version != PROTOCOL_RESULT_SCHEMA
+        || observed.notice != NOTICE
+        || observed.execution_eligible
+        || observed.arm != expectation.arm
+        || observed.invocation_id != expectation.invocation_id
+        || observed.sanitized_plan_sha256 != expectation.plan.canonical_sha256()
+        || observed.base_plan_sha256 != plan.base_plan_sha256
+        || observed.observer_schedule_sha256 != plan.observer_schedule_sha256
+        || observed.scheduled_slots != scheduled_slots
+        || observed.connection_attempts > max_connection_attempts
+        || observed.parsed_responses > observed.connection_attempts
+        || !retries_consistent
+        || observed.transient_failures > node_slots
+        || observed.transient_failures > observed.connection_attempts
+        || terminal_node_slot_events > node_slots
+        || observed.process_transitions > max_process_transitions
+        || observed
+            .process_transitions
+            .checked_add(observed.page_budget_deferrals)
+            .is_none_or(|events| events > max_process_transitions)
+        || observed.process_transitions > observed.parsed_responses
+        || observed.timing_records > max_timing_records
+        || !timing_records_consistent
+        || observed.page_budget_deferrals > node_slots
+        || !page_deferrals_consistent
+        || observed.unresolved_timing_nodes > 3
+        || u32::from(observed.unresolved_timing_nodes) > terminal_node_slot_events
+        || retained_total != event_total
+        || !disposition_consistent
+        || !control_consistent
+        || !events_valid
+    {
+        return Err(invalid());
+    }
+    let result = ObserverProtocolResultV3 {
+        schema_version: PROTOCOL_RESULT_SCHEMA.to_owned(),
+        notice: NOTICE.to_owned(),
+        execution_eligible: false,
+        arm: observed.arm,
+        invocation_id: observed.invocation_id,
+        sanitized_plan_sha256: expectation.plan.canonical_sha256().to_owned(),
+        base_plan_sha256: plan.base_plan_sha256.clone(),
+        observer_schedule_sha256: plan.observer_schedule_sha256.clone(),
+        scheduled_slots: observed.scheduled_slots,
+        suppressed_probes: observed.suppressed_probes,
+        connection_attempts: observed.connection_attempts,
+        parsed_responses: observed.parsed_responses,
+        retries: observed.retries,
+        transient_failures: observed.transient_failures,
+        process_transitions: observed.process_transitions,
+        timing_records: observed.timing_records,
+        page_budget_deferrals: observed.page_budget_deferrals,
+        unresolved_timing_nodes: observed.unresolved_timing_nodes,
+        retained_events_dropped: observed.retained_events_dropped,
+        disposition: observed.disposition,
+        retained_events: observed.retained_events,
+    };
+    let canonical = serde_json::to_vec(&result).map_err(|_| invalid())?;
+    if canonical != bytes {
+        return Err(invalid());
+    }
+    Ok(result)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolFailureKind {
     InvalidPlan,
@@ -506,6 +1029,7 @@ pub enum ProtocolFailureKind {
     CursorConflict,
     EvidenceEvicted,
     EvidenceLoss,
+    InvalidResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1069,6 +1593,12 @@ struct BoundedHttpResponse {
     body: Vec<u8>,
 }
 
+impl Drop for BoundedHttpResponse {
+    fn drop(&mut self) {
+        self.body.zeroize();
+    }
+}
+
 enum HttpAttemptError {
     Retryable,
     Fatal(ProtocolFailureKind),
@@ -1078,7 +1608,7 @@ pub fn run_observer_protocol(
     input: ProvisionedObserverInput,
     arm: Arm,
     cancellation: &ProtocolCancellation,
-) -> Result<ObserverProtocolResultV2, ObserverProtocolError> {
+) -> Result<ObserverProtocolResultV3, ObserverProtocolError> {
     run_observer_protocol_inner(input, arm, cancellation, usize::MAX)
 }
 
@@ -1087,8 +1617,12 @@ fn run_observer_protocol_inner(
     arm: Arm,
     cancellation: &ProtocolCancellation,
     slot_limit: usize,
-) -> Result<ObserverProtocolResultV2, ObserverProtocolError> {
-    let ProvisionedObserverInput { plan, secret } = input;
+) -> Result<ObserverProtocolResultV3, ObserverProtocolError> {
+    let ProvisionedObserverInput {
+        plan,
+        invocation_id,
+        secret,
+    } = input;
     let sanitized_plan_sha256 = plan.canonical_sha256().to_owned();
     let plan = plan.plan();
     let scheduled_slots = u32::try_from(plan.observer_schedule.slots.len())
@@ -1097,11 +1631,12 @@ fn run_observer_protocol_inner(
         .checked_mul(3)
         .and_then(|count| count.checked_mul(2))
         .ok_or_else(|| ObserverProtocolError::new(ProtocolFailureKind::InvalidPlan))?;
-    let mut result = ObserverProtocolResultV2 {
+    let mut result = ObserverProtocolResultV3 {
         schema_version: PROTOCOL_RESULT_SCHEMA.to_owned(),
         notice: NOTICE.to_owned(),
         execution_eligible: false,
         arm,
+        invocation_id,
         sanitized_plan_sha256,
         base_plan_sha256: plan.base_plan_sha256.clone(),
         observer_schedule_sha256: plan.observer_schedule_sha256.clone(),
@@ -1187,7 +1722,7 @@ fn observe_node_slot(
     state: &mut NodeProtocolState,
     assignment_history: &mut RunAssignmentHistory,
     run_context: &ObserverRunContext<'_>,
-    result: &mut ObserverProtocolResultV2,
+    result: &mut ObserverProtocolResultV3,
 ) -> Result<(), ObserverProtocolError> {
     let mut budget = NodeSlotBudget::new(run_context.deadline);
     let Some(transition) = read_local_evidence(
@@ -1401,7 +1936,7 @@ fn read_local_evidence(
     assignment_history: &mut RunAssignmentHistory,
     run_context: &ObserverRunContext<'_>,
     budget: &mut NodeSlotBudget,
-    result: &mut ObserverProtocolResultV2,
+    result: &mut ObserverProtocolResultV3,
 ) -> Result<Option<AuthorityTransition>, ObserverProtocolError> {
     let response = probe_with_retry(
         slot,
@@ -1482,7 +2017,7 @@ fn record_authority_transition(
     slot: &ObserverSlotV1,
     endpoint: &ObserverEndpointV2,
     transition: AuthorityTransition,
-    result: &mut ObserverProtocolResultV2,
+    result: &mut ObserverProtocolResultV3,
 ) {
     if transition == AuthorityTransition::Restarted {
         result.process_transitions += 1;
@@ -1497,7 +2032,7 @@ fn record_authority_transition(
 }
 
 fn retain_event(
-    result: &mut ObserverProtocolResultV2,
+    result: &mut ObserverProtocolResultV3,
     slot: &ObserverSlotV1,
     node_ordinal: u8,
     route: DiagnosticRouteV1,
@@ -1516,7 +2051,7 @@ fn retain_event(
 }
 
 fn record_transient(
-    result: &mut ObserverProtocolResultV2,
+    result: &mut ObserverProtocolResultV3,
     slot: &ObserverSlotV1,
     node_ordinal: u8,
     route: DiagnosticRouteV1,
@@ -1536,7 +2071,7 @@ fn probe_with_retry(
     secret: &DiagnosticReadSecret,
     cancellation: &ProtocolCancellation,
     budget: &mut NodeSlotBudget,
-    result: &mut ObserverProtocolResultV2,
+    result: &mut ObserverProtocolResultV3,
 ) -> Result<ProbeOutcome, ObserverProtocolError> {
     let logical_deadline =
         minimum_deadline(Instant::now() + REQUEST_TOTAL_TIMEOUT, budget.deadline);
@@ -1671,7 +2206,7 @@ fn read_http_response(
         .ok_or(HttpAttemptError::Fatal(
             ProtocolFailureKind::ResponseTooLarge,
         ))?;
-    let mut response = Vec::with_capacity(response_cap.min(64 * 1_024));
+    let mut response = Zeroizing::new(Vec::with_capacity(response_cap.min(64 * 1_024)));
     let mut header_end = None;
     let mut last_progress = Instant::now();
     while header_end.is_none() {
@@ -2145,9 +2680,28 @@ mod tests {
         DiagnosticReadSecret::from_provisioned_bytes(TEST_SECRET.as_bytes()).unwrap()
     }
 
+    fn invocation_id() -> Uuid {
+        Uuid::parse_str("a6ee93c9-e014-41f8-b2c6-8966ea90a274").unwrap()
+    }
+
+    fn retained_prefix(
+        route: DiagnosticRouteV1,
+        kind: ProtocolEventKindV1,
+    ) -> Vec<ObserverProtocolEventV1> {
+        (0..MAX_RETAINED_EVENTS)
+            .map(|index| ObserverProtocolEventV1 {
+                slot_ordinal: (index / 3) as u32,
+                node_ordinal: (index % 3) as u8,
+                route,
+                kind,
+            })
+            .collect()
+    }
+
     fn input(addresses: [SocketAddr; 3]) -> ProvisionedObserverInput {
         ProvisionedObserverInput {
             plan: validated_plan(addresses),
+            invocation_id: invocation_id(),
             secret: secret(),
         }
     }
@@ -2267,7 +2821,7 @@ mod tests {
         servers: &[FakeServer; 3],
         arm: Arm,
         cancellation: &ProtocolCancellation,
-    ) -> Result<ObserverProtocolResultV2, ObserverProtocolError> {
+    ) -> Result<ObserverProtocolResultV3, ObserverProtocolError> {
         run_observer_protocol_inner(
             input([servers[0].address, servers[1].address, servers[2].address]),
             arm,
@@ -2280,7 +2834,7 @@ mod tests {
         servers: &[FakeServer; 3],
         arm: Arm,
         cancellation: &ProtocolCancellation,
-    ) -> Result<ObserverProtocolResultV2, ObserverProtocolError> {
+    ) -> Result<ObserverProtocolResultV3, ObserverProtocolError> {
         run_observer_protocol(
             input([servers[0].address, servers[1].address, servers[2].address]),
             arm,
@@ -2340,7 +2894,7 @@ mod tests {
         let servers = [success_server(1), success_server(2), success_server(3)];
         let plan = validated_plan([servers[0].address, servers[1].address, servers[2].address]);
         let mut frame = Vec::new();
-        write_supervisor_bootstrap(&mut frame, plan.plan(), &secret()).unwrap();
+        write_supervisor_bootstrap(&mut frame, plan.plan(), invocation_id(), &secret()).unwrap();
         frame.extend_from_slice(SUPERVISOR_CANCEL_BYTES);
         let mut source = SupervisorBootstrapSource::new(frame.as_slice());
         let provisioned = source.take().unwrap();
@@ -2711,6 +3265,30 @@ mod tests {
         assert_eq!(result.retained_events.len(), 1);
         assert_eq!(result.disposition, ProtocolDispositionV2::Incomplete);
         assert_eq!(result.unresolved_timing_nodes, 0);
+        drop(servers);
+
+        let short_page = FakeServer::spawn(move |_ordinal, request| {
+            if std::str::from_utf8(request)
+                .unwrap()
+                .starts_with(&format!("GET {LOCAL_EVIDENCE_PATH} HTTP/1.1\r\n"))
+            {
+                FakeAction::Json(200, local_evidence(1, 1), Vec::new())
+            } else {
+                FakeAction::Json(
+                    200,
+                    timing_page(1, 1, 0, vec![timing_record(1, 1, 1)], 3, true),
+                    Vec::new(),
+                )
+            }
+        });
+        let servers = [short_page, success_server(2), success_server(3)];
+        let error = run_with_servers(
+            &servers,
+            Arm::PollingTreatment,
+            &ProtocolCancellation::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, ProtocolFailureKind::EvidenceLoss);
         drop(servers);
 
         let paging = FakeServer::spawn(move |_ordinal, request| {
@@ -3126,27 +3704,85 @@ mod tests {
         let servers = [success_server(1), success_server(2), success_server(3)];
         let plan = validated_plan([servers[0].address, servers[1].address, servers[2].address]);
         let mut frame = Vec::new();
-        write_supervisor_bootstrap(&mut frame, plan.plan(), &secret()).unwrap();
-        *frame.last_mut().unwrap() = b'x';
-        let error = match SupervisorBootstrapSource::new(frame.as_slice()).take() {
-            Ok(_) => panic!("bootstrap with an invalid terminator was accepted"),
-            Err(error) => error,
+        write_supervisor_bootstrap(&mut frame, plan.plan(), invocation_id(), &secret()).unwrap();
+        let reject = |candidate: Vec<u8>| {
+            let error = match SupervisorBootstrapSource::new(candidate.as_slice()).take() {
+                Ok(_) => panic!("invalid bootstrap was accepted"),
+                Err(error) => error,
+            };
+            assert!(!format!("{error:?}").contains(TEST_SECRET));
         };
-        assert_eq!(error.kind, ProtocolFailureKind::InvalidBootstrap);
-        assert!(!format!("{error:?}").contains(TEST_SECRET));
+        let plan_start = SUPERVISOR_BOOTSTRAP_PREFIX.len() + 4;
+        let plan_len = u32::from_be_bytes(
+            frame[SUPERVISOR_BOOTSTRAP_PREFIX.len()..plan_start]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let invocation_start = plan_start + plan_len;
+        let secret_start = invocation_start + 16;
+        let mut invalid = frame.clone();
+        invalid[0] ^= 1;
+        reject(invalid);
+        reject(SUPERVISOR_BOOTSTRAP_PREFIX[..3].to_vec());
+        let mut invalid = SUPERVISOR_BOOTSTRAP_PREFIX.to_vec();
+        invalid.extend_from_slice(&[0, 0]);
+        reject(invalid);
+        let mut invalid = frame.clone();
+        invalid[SUPERVISOR_BOOTSTRAP_PREFIX.len()..plan_start]
+            .copy_from_slice(&0_u32.to_be_bytes());
+        reject(invalid);
+        let mut invalid = frame.clone();
+        invalid[SUPERVISOR_BOOTSTRAP_PREFIX.len()..plan_start]
+            .copy_from_slice(&((MAX_SANITIZED_PLAN_BYTES + 1) as u32).to_be_bytes());
+        reject(invalid);
+        reject(frame[..plan_start + plan_len - 1].to_vec());
+        let mut invalid = frame.clone();
+        invalid[invocation_start..secret_start].fill(0);
+        reject(invalid);
+        let mut invalid = frame.clone();
+        invalid[secret_start] = b'!';
+        reject(invalid);
+        reject(frame[..secret_start + 11].to_vec());
+        let mut invalid = frame.clone();
+        *invalid.last_mut().unwrap() = b'x';
+        reject(invalid);
+        reject(frame[..frame.len() - 1].to_vec());
 
-        let mut non_loopback = plan.plan().clone();
-        non_loopback.endpoints[0].address = "192.0.2.1:4317".parse().unwrap();
-        assert_eq!(
-            validate_sanitized_plan(non_loopback).unwrap_err().kind,
-            ProtocolFailureKind::InvalidPlan
-        );
-        let mut aliased = plan.plan().clone();
-        aliased.endpoints[1].address = aliased.endpoints[0].address;
-        assert_eq!(
-            validate_sanitized_plan(aliased).unwrap_err().kind,
-            ProtocolFailureKind::InvalidPlan
-        );
+        let raw_frame = |candidate: &SanitizedObserverPlanV2| {
+            let bytes = serde_json::to_vec(candidate).unwrap();
+            let mut raw = SUPERVISOR_BOOTSTRAP_PREFIX.to_vec();
+            raw.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            raw.extend_from_slice(&bytes);
+            raw.extend_from_slice(invocation_id().as_bytes());
+            raw.extend_from_slice(TEST_SECRET.as_bytes());
+            raw.push(b'\n');
+            raw
+        };
+        let mut invalid_plans = Vec::new();
+        let mut candidate = plan.plan().clone();
+        candidate.schema_version = "wrong".to_owned();
+        invalid_plans.push(candidate);
+        let mut candidate = plan.plan().clone();
+        candidate.notice = "wrong".to_owned();
+        invalid_plans.push(candidate);
+        let mut candidate = plan.plan().clone();
+        candidate.execution_eligible = true;
+        invalid_plans.push(candidate);
+        let mut candidate = plan.plan().clone();
+        candidate.endpoints[0].node_ordinal = 2;
+        invalid_plans.push(candidate);
+        let mut candidate = plan.plan().clone();
+        candidate.endpoints[0].address.set_port(0);
+        invalid_plans.push(candidate);
+        let mut candidate = plan.plan().clone();
+        candidate.endpoints[0].address = "192.0.2.1:4317".parse().unwrap();
+        invalid_plans.push(candidate);
+        let mut candidate = plan.plan().clone();
+        candidate.endpoints[1].address = candidate.endpoints[0].address;
+        invalid_plans.push(candidate);
+        for candidate in invalid_plans {
+            reject(raw_frame(&candidate));
+        }
 
         let duplicate_nodes = [success_server(1), success_server(1), success_server(3)];
         let error = run_with_servers(
@@ -3172,5 +3808,452 @@ mod tests {
                 .map(FakeServer::connection_count)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn driver_fake_input_is_canonical_endpoint_only_and_single_use() {
+        let addresses = [
+            "127.0.0.1:31001".parse().unwrap(),
+            "127.0.0.1:31002".parse().unwrap(),
+            "[::1]:31003".parse().unwrap(),
+        ];
+        let mut bytes = Vec::new();
+        write_driver_fake_input(&mut bytes, addresses, &secret()).unwrap();
+        let payload_start = DRIVER_FAKE_INPUT_PREFIX.len() + 4;
+        let payload_len = u32::from_be_bytes(
+            bytes[DRIVER_FAKE_INPUT_PREFIX.len()..payload_start]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert!(!bytes[payload_start..payload_start + payload_len]
+            .windows(TEST_SECRET.len())
+            .any(|window| window == TEST_SECRET.as_bytes()));
+        let mut source = DriverFakeInputSource::new(std::io::Cursor::new(bytes.clone()));
+        let input = source.take().unwrap();
+        assert_eq!(input.addresses, addresses);
+        let error = match source.take() {
+            Ok(_) => panic!("driver fake input was consumed twice"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, ProtocolFailureKind::SecretAlreadyConsumed);
+
+        let reject = |candidate: Vec<u8>| {
+            let error = match DriverFakeInputSource::new(std::io::Cursor::new(candidate)).take() {
+                Ok(_) => panic!("invalid driver fake input was accepted"),
+                Err(error) => error,
+            };
+            assert!(!format!("{error:?}").contains(TEST_SECRET));
+        };
+        let secret_start = payload_start + payload_len;
+        let mut invalid = bytes.clone();
+        invalid[0] ^= 1;
+        reject(invalid);
+        reject(DRIVER_FAKE_INPUT_PREFIX[..3].to_vec());
+        let mut invalid = DRIVER_FAKE_INPUT_PREFIX.to_vec();
+        invalid.extend_from_slice(&[0, 0]);
+        reject(invalid);
+        let mut invalid = bytes.clone();
+        invalid[DRIVER_FAKE_INPUT_PREFIX.len()..payload_start]
+            .copy_from_slice(&0_u32.to_be_bytes());
+        reject(invalid);
+        let mut invalid = bytes.clone();
+        invalid[DRIVER_FAKE_INPUT_PREFIX.len()..payload_start]
+            .copy_from_slice(&((MAX_DRIVER_ENDPOINT_BYTES + 1) as u32).to_be_bytes());
+        reject(invalid);
+        reject(bytes[..payload_start + payload_len - 1].to_vec());
+        let mut invalid = bytes.clone();
+        invalid[secret_start] = b'!';
+        reject(invalid);
+        reject(bytes[..secret_start + 11].to_vec());
+        let mut invalid = bytes.clone();
+        *invalid.last_mut().unwrap() = b'x';
+        reject(invalid);
+        reject(bytes[..bytes.len() - 1].to_vec());
+
+        let raw_frame = |candidate: &DriverFakeEndpointInputV1| {
+            let payload = serde_json::to_vec(candidate).unwrap();
+            let mut raw = DRIVER_FAKE_INPUT_PREFIX.to_vec();
+            raw.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            raw.extend_from_slice(&payload);
+            raw.extend_from_slice(TEST_SECRET.as_bytes());
+            raw.push(b'\n');
+            raw
+        };
+        let valid_input = DriverFakeEndpointInputV1 {
+            schema_version: DRIVER_FAKE_INPUT_SCHEMA.to_owned(),
+            notice: NOTICE.to_owned(),
+            execution_eligible: false,
+            endpoints: std::array::from_fn(|index| ObserverEndpointV2 {
+                node_ordinal: index as u8,
+                address: addresses[index],
+            }),
+        };
+        let mut invalid_inputs = Vec::new();
+        let mut candidate = valid_input.clone();
+        candidate.schema_version = "wrong".to_owned();
+        invalid_inputs.push(candidate);
+        let mut candidate = valid_input.clone();
+        candidate.notice = "wrong".to_owned();
+        invalid_inputs.push(candidate);
+        let mut candidate = valid_input.clone();
+        candidate.execution_eligible = true;
+        invalid_inputs.push(candidate);
+        let mut candidate = valid_input.clone();
+        candidate.endpoints[0].node_ordinal = 2;
+        invalid_inputs.push(candidate);
+        let mut candidate = valid_input.clone();
+        candidate.endpoints[0].address.set_port(0);
+        invalid_inputs.push(candidate);
+        let mut candidate = valid_input.clone();
+        candidate.endpoints[1].address = candidate.endpoints[0].address;
+        invalid_inputs.push(candidate);
+        let mut candidate = valid_input;
+        candidate.endpoints[0].address = "192.0.2.1:31001".parse().unwrap();
+        invalid_inputs.push(candidate);
+        for candidate in invalid_inputs {
+            reject(raw_frame(&candidate));
+        }
+
+        let mut noncanonical_payload = bytes[payload_start..payload_start + payload_len].to_vec();
+        noncanonical_payload.push(b' ');
+        let mut noncanonical = DRIVER_FAKE_INPUT_PREFIX.to_vec();
+        noncanonical.extend_from_slice(&(noncanonical_payload.len() as u32).to_be_bytes());
+        noncanonical.extend_from_slice(&noncanonical_payload);
+        noncanonical.extend_from_slice(TEST_SECRET.as_bytes());
+        noncanonical.push(b'\n');
+        let error = match DriverFakeInputSource::new(std::io::Cursor::new(noncanonical)).take() {
+            Ok(_) => panic!("noncanonical driver fake input was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, ProtocolFailureKind::InvalidBootstrap);
+        assert!(write_driver_fake_input(
+            Vec::new(),
+            [addresses[0], addresses[0], addresses[2]],
+            &secret()
+        )
+        .is_err());
+        assert!(write_driver_fake_input(
+            Vec::new(),
+            [
+                addresses[0],
+                "192.0.2.1:31002".parse().unwrap(),
+                addresses[2]
+            ],
+            &secret()
+        )
+        .is_err());
+        bytes.zeroize();
+        noncanonical_payload.zeroize();
+    }
+
+    #[test]
+    fn result_validation_is_canonical_plan_bound_and_counter_consistent() {
+        let addresses = [
+            "127.0.0.1:32001".parse().unwrap(),
+            "127.0.0.1:32002".parse().unwrap(),
+            "127.0.0.1:32003".parse().unwrap(),
+        ];
+        let plan = validated_plan(addresses);
+        let expectation = ObserverProtocolResultExpectationV3 {
+            plan: plan.clone(),
+            arm: Arm::PollingControl,
+            invocation_id: invocation_id(),
+        };
+        let result = run_observer_protocol(
+            ProvisionedObserverInput {
+                plan,
+                invocation_id: invocation_id(),
+                secret: secret(),
+            },
+            Arm::PollingControl,
+            &ProtocolCancellation::default(),
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(&result).unwrap();
+        assert_eq!(
+            validate_observer_protocol_result(&bytes, &expectation).unwrap(),
+            result
+        );
+        let stale_expectation = ObserverProtocolResultExpectationV3 {
+            plan: expectation.plan.clone(),
+            arm: expectation.arm,
+            invocation_id: Uuid::parse_str("9cb0c82b-ced1-465d-bfe6-a9d904328644").unwrap(),
+        };
+        assert_eq!(
+            validate_observer_protocol_result(&bytes, &stale_expectation)
+                .unwrap_err()
+                .kind,
+            ProtocolFailureKind::InvalidResult
+        );
+
+        let mut noncanonical = bytes.clone();
+        noncanonical.push(b'\n');
+        assert_eq!(
+            validate_observer_protocol_result(&noncanonical, &expectation)
+                .unwrap_err()
+                .kind,
+            ProtocolFailureKind::InvalidResult
+        );
+        let mut wrong_hash = result.clone();
+        wrong_hash.sanitized_plan_sha256 = "f".repeat(64);
+        assert!(validate_observer_protocol_result(
+            &serde_json::to_vec(&wrong_hash).unwrap(),
+            &expectation
+        )
+        .is_err());
+        let treatment_expectation = ObserverProtocolResultExpectationV3 {
+            plan: expectation.plan.clone(),
+            arm: Arm::PollingTreatment,
+            invocation_id: invocation_id(),
+        };
+        let mut treatment = result.clone();
+        treatment.arm = Arm::PollingTreatment;
+        treatment.suppressed_probes = 0;
+        treatment.connection_attempts = 348;
+        treatment.parsed_responses = 348;
+        assert!(validate_observer_protocol_result(
+            &serde_json::to_vec(&treatment).unwrap(),
+            &treatment_expectation
+        )
+        .is_ok());
+        let mut zero_traffic = treatment.clone();
+        zero_traffic.connection_attempts = 0;
+        zero_traffic.parsed_responses = 0;
+        assert!(validate_observer_protocol_result(
+            &serde_json::to_vec(&zero_traffic).unwrap(),
+            &treatment_expectation
+        )
+        .is_err());
+        let mut wrong_event_semantics = treatment.clone();
+        wrong_event_semantics.process_transitions = 1;
+        wrong_event_semantics
+            .retained_events
+            .push(ObserverProtocolEventV1 {
+                slot_ordinal: 0,
+                node_ordinal: 0,
+                route: DiagnosticRouteV1::ExactTiming,
+                kind: ProtocolEventKindV1::ProcessChanged,
+            });
+        assert!(validate_observer_protocol_result(
+            &serde_json::to_vec(&wrong_event_semantics).unwrap(),
+            &treatment_expectation
+        )
+        .is_err());
+        let mut impossible_retries = treatment.clone();
+        impossible_retries.connection_attempts = 697;
+        impossible_retries.retries = 349;
+        assert!(validate_observer_protocol_result(
+            &serde_json::to_vec(&impossible_retries).unwrap(),
+            &treatment_expectation
+        )
+        .is_err());
+        let mut short_incomplete = treatment.clone();
+        short_incomplete.connection_attempts = 346;
+        short_incomplete.parsed_responses = 346;
+        short_incomplete.transient_failures = 1;
+        short_incomplete.disposition = ProtocolDispositionV2::Incomplete;
+        short_incomplete
+            .retained_events
+            .push(ObserverProtocolEventV1 {
+                slot_ordinal: 0,
+                node_ordinal: 0,
+                route: DiagnosticRouteV1::LocalEvidence,
+                kind: ProtocolEventKindV1::ServerBusy,
+            });
+        assert!(validate_observer_protocol_result(
+            &serde_json::to_vec(&short_incomplete).unwrap(),
+            &treatment_expectation
+        )
+        .is_err());
+        let mut short_deferral = treatment.clone();
+        short_deferral.connection_attempts = 353;
+        short_deferral.parsed_responses = 353;
+        short_deferral.timing_records = 383;
+        short_deferral.page_budget_deferrals = 1;
+        short_deferral.unresolved_timing_nodes = 1;
+        short_deferral.disposition = ProtocolDispositionV2::Incomplete;
+        short_deferral
+            .retained_events
+            .push(ObserverProtocolEventV1 {
+                slot_ordinal: 0,
+                node_ordinal: 0,
+                route: DiagnosticRouteV1::ExactTiming,
+                kind: ProtocolEventKindV1::TimingPageBudgetExhausted,
+            });
+        assert!(validate_observer_protocol_result(
+            &serde_json::to_vec(&short_deferral).unwrap(),
+            &treatment_expectation
+        )
+        .is_err());
+        let mut terminal_before_process = treatment.clone();
+        terminal_before_process.connection_attempts = 347;
+        terminal_before_process.parsed_responses = 346;
+        terminal_before_process.transient_failures = 1;
+        terminal_before_process.process_transitions = 1;
+        terminal_before_process.disposition = ProtocolDispositionV2::Incomplete;
+        terminal_before_process.retained_events = vec![
+            ObserverProtocolEventV1 {
+                slot_ordinal: 0,
+                node_ordinal: 0,
+                route: DiagnosticRouteV1::ExactTiming,
+                kind: ProtocolEventKindV1::ServerBusy,
+            },
+            ObserverProtocolEventV1 {
+                slot_ordinal: 0,
+                node_ordinal: 0,
+                route: DiagnosticRouteV1::LocalEvidence,
+                kind: ProtocolEventKindV1::ProcessChanged,
+            },
+        ];
+        assert!(validate_observer_protocol_result(
+            &serde_json::to_vec(&terminal_before_process).unwrap(),
+            &treatment_expectation
+        )
+        .is_err());
+        let mut mixed_terminals = treatment.clone();
+        mixed_terminals.connection_attempts = 352;
+        mixed_terminals.parsed_responses = 351;
+        mixed_terminals.transient_failures = 1;
+        mixed_terminals.timing_records = 384;
+        mixed_terminals.page_budget_deferrals = 1;
+        mixed_terminals.unresolved_timing_nodes = 1;
+        mixed_terminals.disposition = ProtocolDispositionV2::Incomplete;
+        mixed_terminals.retained_events = vec![
+            ObserverProtocolEventV1 {
+                slot_ordinal: 0,
+                node_ordinal: 0,
+                route: DiagnosticRouteV1::LocalEvidence,
+                kind: ProtocolEventKindV1::ServerBusy,
+            },
+            ObserverProtocolEventV1 {
+                slot_ordinal: 0,
+                node_ordinal: 0,
+                route: DiagnosticRouteV1::ExactTiming,
+                kind: ProtocolEventKindV1::TimingPageBudgetExhausted,
+            },
+        ];
+        assert!(validate_observer_protocol_result(
+            &serde_json::to_vec(&mixed_terminals).unwrap(),
+            &treatment_expectation
+        )
+        .is_err());
+        let mut excessive_unresolved = short_incomplete.clone();
+        excessive_unresolved.connection_attempts = 347;
+        excessive_unresolved.unresolved_timing_nodes = 2;
+        assert!(validate_observer_protocol_result(
+            &serde_json::to_vec(&excessive_unresolved).unwrap(),
+            &treatment_expectation
+        )
+        .is_err());
+        let mut deferral_after_two_restarts = treatment.clone();
+        deferral_after_two_restarts.connection_attempts = 353;
+        deferral_after_two_restarts.parsed_responses = 353;
+        deferral_after_two_restarts.process_transitions = 2;
+        deferral_after_two_restarts.timing_records = 384;
+        deferral_after_two_restarts.page_budget_deferrals = 1;
+        deferral_after_two_restarts.unresolved_timing_nodes = 1;
+        deferral_after_two_restarts.disposition = ProtocolDispositionV2::Incomplete;
+        deferral_after_two_restarts.retained_events = vec![
+            ObserverProtocolEventV1 {
+                slot_ordinal: 0,
+                node_ordinal: 0,
+                route: DiagnosticRouteV1::LocalEvidence,
+                kind: ProtocolEventKindV1::ProcessChanged,
+            },
+            ObserverProtocolEventV1 {
+                slot_ordinal: 0,
+                node_ordinal: 0,
+                route: DiagnosticRouteV1::LocalEvidence,
+                kind: ProtocolEventKindV1::ProcessChanged,
+            },
+            ObserverProtocolEventV1 {
+                slot_ordinal: 0,
+                node_ordinal: 0,
+                route: DiagnosticRouteV1::ExactTiming,
+                kind: ProtocolEventKindV1::TimingPageBudgetExhausted,
+            },
+        ];
+        assert!(validate_observer_protocol_result(
+            &serde_json::to_vec(&deferral_after_two_restarts).unwrap(),
+            &treatment_expectation
+        )
+        .is_err());
+        let mut excessive_terminals = treatment.clone();
+        excessive_terminals.connection_attempts = 1_392;
+        excessive_terminals.parsed_responses = 1_392;
+        excessive_terminals.transient_failures = 174;
+        excessive_terminals.timing_records = 384;
+        excessive_terminals.page_budget_deferrals = 1;
+        excessive_terminals.unresolved_timing_nodes = 1;
+        excessive_terminals.disposition = ProtocolDispositionV2::Incomplete;
+        excessive_terminals.retained_events = retained_prefix(
+            DiagnosticRouteV1::LocalEvidence,
+            ProtocolEventKindV1::ServerBusy,
+        );
+        excessive_terminals.retained_events_dropped = 143;
+        assert!(validate_observer_protocol_result(
+            &serde_json::to_vec(&excessive_terminals).unwrap(),
+            &treatment_expectation
+        )
+        .is_err());
+        let mut excessive_transitions = treatment.clone();
+        excessive_transitions.connection_attempts = 1_392;
+        excessive_transitions.parsed_responses = 1_392;
+        excessive_transitions.process_transitions = 345;
+        excessive_transitions.timing_records = 384;
+        excessive_transitions.page_budget_deferrals = 1;
+        excessive_transitions.retained_events = retained_prefix(
+            DiagnosticRouteV1::LocalEvidence,
+            ProtocolEventKindV1::ProcessChanged,
+        );
+        excessive_transitions.retained_events_dropped = 314;
+        assert!(validate_observer_protocol_result(
+            &serde_json::to_vec(&excessive_transitions).unwrap(),
+            &treatment_expectation
+        )
+        .is_err());
+        let mut timing_probe_shortfall = treatment.clone();
+        timing_probe_shortfall.connection_attempts = 183;
+        timing_probe_shortfall.parsed_responses = 11;
+        timing_probe_shortfall.transient_failures = 174;
+        timing_probe_shortfall.timing_records = 640;
+        timing_probe_shortfall.disposition = ProtocolDispositionV2::Incomplete;
+        timing_probe_shortfall.retained_events = retained_prefix(
+            DiagnosticRouteV1::LocalEvidence,
+            ProtocolEventKindV1::TransportUnavailable,
+        );
+        timing_probe_shortfall.retained_events_dropped = 142;
+        assert!(validate_observer_protocol_result(
+            &serde_json::to_vec(&timing_probe_shortfall).unwrap(),
+            &treatment_expectation
+        )
+        .is_err());
+        let mut unknown_field: Value = serde_json::to_value(&treatment).unwrap();
+        unknown_field["unknown"] = Value::Bool(true);
+        assert!(validate_observer_protocol_result(
+            &serde_json::to_vec(&unknown_field).unwrap(),
+            &treatment_expectation
+        )
+        .is_err());
+        assert!(validate_observer_protocol_result(
+            &vec![b' '; PROTOCOL_RESULT_MAX_BYTES + 1],
+            &treatment_expectation
+        )
+        .is_err());
+        let mut premature_drop = treatment;
+        premature_drop.process_transitions = 1;
+        premature_drop.retained_events_dropped = 1;
+        assert!(validate_observer_protocol_result(
+            &serde_json::to_vec(&premature_drop).unwrap(),
+            &treatment_expectation
+        )
+        .is_err());
+        let mut impossible_control = result;
+        impossible_control.connection_attempts = 1;
+        assert!(validate_observer_protocol_result(
+            &serde_json::to_vec(&impossible_control).unwrap(),
+            &expectation
+        )
+        .is_err());
     }
 }

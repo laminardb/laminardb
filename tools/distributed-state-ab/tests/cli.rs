@@ -8,20 +8,27 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use distributed_state_ab::observer_protocol::{
-    build_sanitized_observer_plan, validate_sanitized_plan_bytes, write_supervisor_bootstrap,
-    DiagnosticReadSecret, ObserverProtocolResultV2, ProtocolDispositionV2, SUPERVISOR_CANCEL_BYTES,
+    build_sanitized_observer_plan, validate_sanitized_plan_bytes, write_driver_fake_input,
+    write_supervisor_bootstrap, DiagnosticReadSecret, ObserverProtocolResultV3,
+    ProtocolDispositionV2, SUPERVISOR_CANCEL_BYTES,
 };
 use distributed_state_ab::{
     seal_base_plan, sha256_bytes, validate_manifest_path, ArtifactIdentityV1, ArtifactSetV1,
-    AuthenticationV1, BasePlanV1, DiagnosticRouteV1, DryRunRecordV1, LifecycleBoundaryV1, LimitsV1,
+    AuthenticationV1, BasePlanV1, DiagnosticRouteV1, DryRunRecordV1,
+    FakeProtocolObserverDispositionV1, FakeProtocolRunRecordV1, LifecycleBoundaryV1, LimitsV1,
     ManifestV1, ObserverDispositionV1, ObserverMode, ObserverPolicyV1, ObserverResultV1, PairV1,
     WorkloadV1, MANIFEST_SCHEMA, NOTICE,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
+use uuid::Uuid;
+use zeroize::Zeroize as _;
 
 const SECRET_SENTINEL: &str = "cycle62-secret-7f52d1d9b9874a73a869";
 const DIAGNOSTIC_TEST_SECRET: &str = "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk";
+const WRONG_DIAGNOSTIC_TEST_SECRET: &str = "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg";
+const DIAGNOSTIC_AUTH_HEADER: &[u8] =
+    b"Authorization: Bearer CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk\r\n";
 const LOCAL_EVIDENCE_PATH: &str = "/api/v1/cluster/local-evidence";
 const TIMING_PATH: &str = "/api/v1/cluster/local-checkpoint-barrier-timings";
 const CHILD_COMPLETION_BOUND: Duration = Duration::from_secs(30);
@@ -46,11 +53,21 @@ struct Run {
     artifact_bytes: Vec<u8>,
 }
 
+struct FakeDriverRun {
+    output: Output,
+    record: FakeProtocolRunRecordV1,
+    plan: Vec<u8>,
+    trace: Vec<u8>,
+    artifact_bytes: Vec<u8>,
+    artifact_names: Vec<String>,
+}
+
 struct BootstrappedFakeProtocol {
     child: Child,
     supervisor: ChildStdin,
     plan_bytes: Vec<u8>,
     sanitized_plan_sha256: String,
+    invocation_id: Uuid,
 }
 
 #[derive(Clone, Copy)]
@@ -58,6 +75,14 @@ enum FakeServerBehavior {
     Success { node_id: u64 },
     BusyThenSuccess { node_id: u64, busy_requests: usize },
     Stall,
+}
+
+#[derive(Clone, Copy)]
+enum DriverFakeInput {
+    Valid(&'static str),
+    Invalid,
+    HeldOpen,
+    PartialHeldOpen,
 }
 
 struct OwnedFakeServer {
@@ -151,6 +176,9 @@ impl Drop for OwnedFakeServer {
         if let Some(thread) = self.thread.take() {
             thread.join().unwrap();
         }
+        for mut request in self.requests.try_iter() {
+            request.zeroize();
+        }
     }
 }
 
@@ -169,6 +197,13 @@ fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
 }
 
 fn write_success_response(stream: &mut TcpStream, node_id: u64, request: &[u8]) {
+    if !request
+        .windows(DIAGNOSTIC_AUTH_HEADER.len())
+        .any(|window| window == DIAGNOSTIC_AUTH_HEADER)
+    {
+        write_json_response(stream, 403, b"{}");
+        return;
+    }
     let body = if request.starts_with(format!("GET {LOCAL_EVIDENCE_PATH} HTTP/1.1\r\n").as_bytes())
     {
         local_evidence_body(node_id)
@@ -180,10 +215,10 @@ fn write_success_response(stream: &mut TcpStream, node_id: u64, request: &[u8]) 
 }
 
 fn write_json_response(stream: &mut TcpStream, status: u16, body: &[u8]) {
-    let reason = if status == 200 {
-        "OK"
-    } else {
-        "Service Unavailable"
+    let reason = match status {
+        200 => "OK",
+        403 => "Forbidden",
+        _ => "Service Unavailable",
     };
     let mut response = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -290,6 +325,25 @@ fn wait_for_connections(server: &OwnedFakeServer, expected: usize, bound: Durati
     assert_eq!(server.connection_count(), expected);
 }
 
+fn passive_loopback_endpoints() -> ([TcpListener; 3], [SocketAddr; 3]) {
+    let listeners = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
+    let addresses = std::array::from_fn(|index| listeners[index].local_addr().unwrap());
+    (listeners, addresses)
+}
+
+fn assert_fake_outcome_is_post_end(record: &FakeProtocolRunRecordV1) {
+    let end = record
+        .supervisor_events
+        .iter()
+        .position(|event| event == "end_seal_consumed")
+        .unwrap();
+    for (index, event) in record.supervisor_events.iter().enumerate() {
+        if event.contains("post_end") {
+            assert!(index > end, "{event:?} occurred before end seal");
+        }
+    }
+}
+
 fn assert_observer_output_redacted(output: &Output) {
     for secret in [
         SECRET_SENTINEL.as_bytes(),
@@ -310,7 +364,9 @@ fn fake_protocol_command(fixture: &Fixture, arm: &str) -> Command {
     let mut command = Command::new(&fixture.manifest.artifacts.observer.path);
     command
         .arg("fake-protocol")
+        .arg(&fixture.manifest_path)
         .arg(arm)
+        .arg("success")
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -342,15 +398,17 @@ fn spawn_bootstrapped_fake_protocol(
         .to_owned();
     let secret =
         DiagnosticReadSecret::from_provisioned_bytes(DIAGNOSTIC_TEST_SECRET.as_bytes()).unwrap();
+    let invocation_id = Uuid::new_v4();
     let mut child = spawn_fake_protocol_child(fixture, arm);
     let mut supervisor = child.stdin.take().unwrap();
-    write_supervisor_bootstrap(&mut supervisor, &plan, &secret).unwrap();
+    write_supervisor_bootstrap(&mut supervisor, &plan, invocation_id, &secret).unwrap();
     supervisor.flush().unwrap();
     BootstrappedFakeProtocol {
         child,
         supervisor,
         plan_bytes,
         sanitized_plan_sha256,
+        invocation_id,
     }
 }
 
@@ -468,6 +526,106 @@ impl Fixture {
             observer_stdout,
             observer_stderr,
             artifact_bytes,
+        }
+    }
+
+    fn run_fake_driver(
+        &self,
+        arm: &str,
+        behavior: &str,
+        name: &str,
+        addresses: [SocketAddr; 3],
+        input: DriverFakeInput,
+    ) -> FakeDriverRun {
+        let artifact_directory = self.root.join(name);
+        let mut child = Command::new(&self.driver)
+            .arg("fake-protocol")
+            .arg(&self.manifest_path)
+            .arg(&artifact_directory)
+            .arg(arm)
+            .arg(behavior)
+            .env("LAMINAR_AB_SECRET_SENTINEL", SECRET_SENTINEL)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = Some(child.stdin.take().unwrap());
+        match input {
+            DriverFakeInput::Valid(secret) => {
+                let secret =
+                    DiagnosticReadSecret::from_provisioned_bytes(secret.as_bytes()).unwrap();
+                write_driver_fake_input(stdin.as_mut().unwrap(), addresses, &secret).unwrap();
+            }
+            DriverFakeInput::Invalid => {
+                let mut pipe = stdin.take().unwrap();
+                pipe.write_all(b"invalid-driver-frame").unwrap();
+                drop(pipe);
+            }
+            DriverFakeInput::HeldOpen => {}
+            DriverFakeInput::PartialHeldOpen => {
+                let secret =
+                    DiagnosticReadSecret::from_provisioned_bytes(DIAGNOSTIC_TEST_SECRET.as_bytes())
+                        .unwrap();
+                let mut frame = Vec::new();
+                write_driver_fake_input(&mut frame, addresses, &secret).unwrap();
+                let secret_start = frame.len() - DIAGNOSTIC_TEST_SECRET.len() - 1;
+                stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(&frame[..secret_start + 11])
+                    .unwrap();
+                frame.zeroize();
+            }
+        }
+        let output = wait_for_child(child, CHILD_COMPLETION_BOUND);
+        drop(stdin);
+        for secret in [
+            SECRET_SENTINEL.as_bytes(),
+            DIAGNOSTIC_TEST_SECRET.as_bytes(),
+            WRONG_DIAGNOSTIC_TEST_SECRET.as_bytes(),
+        ] {
+            assert!(!output
+                .stdout
+                .windows(secret.len())
+                .any(|window| window == secret));
+            assert!(!output
+                .stderr
+                .windows(secret.len())
+                .any(|window| window == secret));
+        }
+        let record: FakeProtocolRunRecordV1 = serde_json::from_slice(
+            &std::fs::read(artifact_directory.join("fake-protocol-run-record.json")).unwrap(),
+        )
+        .unwrap();
+        let plan = std::fs::read(artifact_directory.join("base-plan.json")).unwrap();
+        let trace = std::fs::read(artifact_directory.join("driver-trace.json")).unwrap();
+        let mut artifact_bytes = Vec::new();
+        let mut artifact_names = Vec::new();
+        for entry in std::fs::read_dir(&artifact_directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                artifact_names.push(path.file_name().unwrap().to_string_lossy().into_owned());
+                artifact_bytes.extend(std::fs::read(path).unwrap());
+            }
+        }
+        artifact_names.sort();
+        for secret in [
+            SECRET_SENTINEL.as_bytes(),
+            DIAGNOSTIC_TEST_SECRET.as_bytes(),
+            WRONG_DIAGNOSTIC_TEST_SECRET.as_bytes(),
+        ] {
+            assert!(!artifact_bytes
+                .windows(secret.len())
+                .any(|window| window == secret));
+        }
+        FakeDriverRun {
+            output,
+            record,
+            plan,
+            trace,
+            artifact_bytes,
+            artifact_names,
         }
     }
 }
@@ -794,6 +952,230 @@ fn observer_spawn_failure_is_classified_only_after_the_same_trace_completes() {
 }
 
 #[test]
+fn fake_driver_consumes_complete_results_only_after_the_same_end_seal() {
+    let fixture = Fixture::new();
+    let (_listeners, control_addresses) = passive_loopback_endpoints();
+    let control = fixture.run_fake_driver(
+        "C",
+        "success",
+        "fake-driver-control-complete",
+        control_addresses,
+        DriverFakeInput::Valid(DIAGNOSTIC_TEST_SECRET),
+    );
+    let servers = [
+        OwnedFakeServer::success(1),
+        OwnedFakeServer::success(2),
+        OwnedFakeServer::success(3),
+    ];
+    let treatment_addresses = std::array::from_fn(|index| servers[index].address);
+    let treatment = fixture.run_fake_driver(
+        "D",
+        "success",
+        "fake-driver-treatment-complete",
+        treatment_addresses,
+        DriverFakeInput::Valid(DIAGNOSTIC_TEST_SECRET),
+    );
+
+    for run in [&control, &treatment] {
+        assert!(run.output.status.success());
+        assert_eq!(
+            run.record.observer_disposition,
+            FakeProtocolObserverDispositionV1::Complete
+        );
+        assert!(run.record.observer_protocol_result.is_some());
+        assert!(run.record.sanitized_observer_plan_sha256.is_some());
+        assert_eq!(
+            run.record.observer_invocation_id,
+            Some(
+                run.record
+                    .observer_protocol_result
+                    .as_ref()
+                    .unwrap()
+                    .invocation_id
+            )
+        );
+        assert!(run.record.observer_outcome_consumed_only_after_end);
+        assert!(!run.record.raw_observer_output_persisted);
+        assert_eq!(run.record.action_count, 104);
+        assert_eq!(run.record.scheduled_end_ns, 290_000_000_000);
+        assert_eq!(
+            run.artifact_names,
+            [
+                "base-plan.json",
+                "driver-trace.json",
+                "fake-protocol-run-record.json"
+            ]
+        );
+        assert!(!run.artifact_bytes.is_empty());
+        assert_fake_outcome_is_post_end(&run.record);
+    }
+    assert_eq!(control.plan, treatment.plan);
+    assert_eq!(control.trace, treatment.trace);
+    assert_ne!(
+        control.record.observer_invocation_id,
+        treatment.record.observer_invocation_id
+    );
+    let control_result = control.record.observer_protocol_result.as_ref().unwrap();
+    assert_eq!(control_result.suppressed_probes, 348);
+    assert_eq!(control_result.connection_attempts, 0);
+    let treatment_result = treatment.record.observer_protocol_result.as_ref().unwrap();
+    assert_eq!(treatment_result.connection_attempts, 348);
+    assert_eq!(treatment_result.parsed_responses, 348);
+    for server in &servers {
+        assert_eq!(server.connection_count(), 116);
+    }
+}
+
+#[test]
+fn fake_driver_failures_cannot_change_plan_trace_or_persist_raw_output() {
+    let fixture = Fixture::new();
+    let (_listeners, addresses) = passive_loopback_endpoints();
+    let baseline = fixture.run_fake_driver(
+        "C",
+        "success",
+        "fake-driver-failure-baseline",
+        addresses,
+        DriverFakeInput::Valid(DIAGNOSTIC_TEST_SECRET),
+    );
+    let mut runs = vec![
+        (
+            fixture.run_fake_driver(
+                "C",
+                "exit",
+                "fake-driver-early-exit",
+                addresses,
+                DriverFakeInput::Valid(DIAGNOSTIC_TEST_SECRET),
+            ),
+            FakeProtocolObserverDispositionV1::ExitNonzero,
+        ),
+        (
+            fixture.run_fake_driver(
+                "C",
+                "hang",
+                "fake-driver-hang",
+                addresses,
+                DriverFakeInput::Valid(DIAGNOSTIC_TEST_SECRET),
+            ),
+            FakeProtocolObserverDispositionV1::CompletionDeadlineExceeded,
+        ),
+        (
+            fixture.run_fake_driver(
+                "C",
+                "malformed",
+                "fake-driver-malformed",
+                addresses,
+                DriverFakeInput::Valid(DIAGNOSTIC_TEST_SECRET),
+            ),
+            FakeProtocolObserverDispositionV1::InvalidResult,
+        ),
+        (
+            fixture.run_fake_driver(
+                "C",
+                "success",
+                "fake-driver-invalid-input",
+                addresses,
+                DriverFakeInput::Invalid,
+            ),
+            FakeProtocolObserverDispositionV1::ProvisioningRejected,
+        ),
+        (
+            fixture.run_fake_driver(
+                "C",
+                "success",
+                "fake-driver-partial-held-input",
+                addresses,
+                DriverFakeInput::PartialHeldOpen,
+            ),
+            FakeProtocolObserverDispositionV1::ProvisioningRejected,
+        ),
+        (
+            fixture.run_fake_driver(
+                "C",
+                "success",
+                "fake-driver-held-input",
+                addresses,
+                DriverFakeInput::HeldOpen,
+            ),
+            FakeProtocolObserverDispositionV1::ProvisioningRejected,
+        ),
+    ];
+    let incomplete_servers = [
+        OwnedFakeServer::busy_then_success(1, 2),
+        OwnedFakeServer::success(2),
+        OwnedFakeServer::success(3),
+    ];
+    runs.push((
+        fixture.run_fake_driver(
+            "D",
+            "success",
+            "fake-driver-incomplete",
+            std::array::from_fn(|index| incomplete_servers[index].address),
+            DriverFakeInput::Valid(DIAGNOSTIC_TEST_SECRET),
+        ),
+        FakeProtocolObserverDispositionV1::Incomplete,
+    ));
+    let stalled_servers = [
+        OwnedFakeServer::stall(),
+        OwnedFakeServer::success(2),
+        OwnedFakeServer::success(3),
+    ];
+    runs.push((
+        fixture.run_fake_driver(
+            "D",
+            "success",
+            "fake-driver-cancelled",
+            std::array::from_fn(|index| stalled_servers[index].address),
+            DriverFakeInput::Valid(DIAGNOSTIC_TEST_SECRET),
+        ),
+        FakeProtocolObserverDispositionV1::CompletionDeadlineExceeded,
+    ));
+    let auth_servers = [
+        OwnedFakeServer::success(1),
+        OwnedFakeServer::success(2),
+        OwnedFakeServer::success(3),
+    ];
+    runs.push((
+        fixture.run_fake_driver(
+            "D",
+            "success",
+            "fake-driver-wrong-authority",
+            std::array::from_fn(|index| auth_servers[index].address),
+            DriverFakeInput::Valid(WRONG_DIAGNOSTIC_TEST_SECRET),
+        ),
+        FakeProtocolObserverDispositionV1::ExitNonzero,
+    ));
+
+    for (run, expected) in runs {
+        assert_eq!(run.output.status.code(), Some(2));
+        assert_eq!(run.record.observer_disposition, expected);
+        assert_eq!(run.plan, baseline.plan);
+        assert_eq!(run.trace, baseline.trace);
+        assert!(!run.record.raw_observer_output_persisted);
+        assert_eq!(
+            run.artifact_names,
+            [
+                "base-plan.json",
+                "driver-trace.json",
+                "fake-protocol-run-record.json"
+            ]
+        );
+        assert_fake_outcome_is_post_end(&run.record);
+        if expected == FakeProtocolObserverDispositionV1::Incomplete {
+            assert_eq!(
+                run.record
+                    .observer_protocol_result
+                    .as_ref()
+                    .unwrap()
+                    .disposition,
+                ProtocolDispositionV2::Incomplete
+            );
+        } else {
+            assert!(run.record.observer_protocol_result.is_none());
+        }
+    }
+}
+
+#[test]
 fn fake_protocol_control_receives_only_the_typed_supervisor_bootstrap() {
     let fixture = Fixture::new();
     let listeners: [TcpListener; 3] = std::array::from_fn(|_| {
@@ -807,6 +1189,7 @@ fn fake_protocol_control_receives_only_the_typed_supervisor_bootstrap() {
         supervisor,
         plan_bytes,
         sanitized_plan_sha256,
+        invocation_id,
     } = spawn_bootstrapped_fake_protocol(&fixture, "C", addresses);
     assert!(!plan_bytes
         .windows(DIAGNOSTIC_TEST_SECRET.len())
@@ -815,7 +1198,8 @@ fn fake_protocol_control_receives_only_the_typed_supervisor_bootstrap() {
     let output = wait_for_child(child, BOOTSTRAP_FAILURE_BOUND);
     assert_observer_output_redacted(&output);
     assert!(output.status.success(), "observer status={}", output.status);
-    let result: ObserverProtocolResultV2 = serde_json::from_slice(&output.stdout).unwrap();
+    let result: ObserverProtocolResultV3 = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result.invocation_id, invocation_id);
     assert_eq!(result.sanitized_plan_sha256, sanitized_plan_sha256);
     assert_eq!(result.suppressed_probes, 348);
     assert_eq!(result.connection_attempts, 0);
@@ -843,11 +1227,12 @@ fn fake_protocol_treatment_completes_with_open_supervisor_pipe_and_exact_connect
         supervisor,
         plan_bytes: _,
         sanitized_plan_sha256,
+        invocation_id,
     } = spawn_bootstrapped_fake_protocol(&fixture, "D", addresses);
 
     let output = wait_for_child(child, CHILD_COMPLETION_BOUND);
     assert_observer_output_redacted(&output);
-    let result: ObserverProtocolResultV2 = serde_json::from_slice(&output.stdout).unwrap();
+    let result: ObserverProtocolResultV3 = serde_json::from_slice(&output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr.clone()).unwrap();
     assert!(
         output.status.success(),
@@ -855,6 +1240,7 @@ fn fake_protocol_treatment_completes_with_open_supervisor_pipe_and_exact_connect
         output.status
     );
     assert_eq!(result.sanitized_plan_sha256, sanitized_plan_sha256);
+    assert_eq!(result.invocation_id, invocation_id);
     assert_eq!(result.disposition, ProtocolDispositionV2::Complete);
     assert_eq!(result.scheduled_slots, 58);
     assert_eq!(result.suppressed_probes, 0);
@@ -871,7 +1257,7 @@ fn fake_protocol_treatment_completes_with_open_supervisor_pipe_and_exact_connect
 
     for (index, server) in servers.iter().enumerate() {
         assert_eq!(server.connection_count(), 116);
-        let requests = server.drain_requests();
+        let mut requests = server.drain_requests();
         assert_eq!(requests.len(), 116);
         let node_id = index as u64 + 1;
         let local = format!(
@@ -888,6 +1274,7 @@ fn fake_protocol_treatment_completes_with_open_supervisor_pipe_and_exact_connect
             assert!(pair[1] == timing.as_bytes());
         }
         assert!(pairs.remainder().is_empty());
+        requests.zeroize();
     }
     drop(supervisor);
 }
@@ -906,13 +1293,15 @@ fn fake_protocol_incomplete_collection_serializes_then_exits_nonzero() {
         supervisor,
         plan_bytes: _,
         sanitized_plan_sha256,
+        invocation_id,
     } = spawn_bootstrapped_fake_protocol(&fixture, "D", addresses);
 
     let output = wait_for_child(child, CHILD_COMPLETION_BOUND);
     assert_observer_output_redacted(&output);
-    assert!(!output.status.success());
-    let result: ObserverProtocolResultV2 = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let result: ObserverProtocolResultV3 = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result.sanitized_plan_sha256, sanitized_plan_sha256);
+    assert_eq!(result.invocation_id, invocation_id);
     assert_eq!(result.disposition, ProtocolDispositionV2::Incomplete);
     assert_eq!(result.connection_attempts, 348);
     assert_eq!(result.parsed_responses, 348);
@@ -934,6 +1323,34 @@ fn fake_protocol_bootstrap_deadline_does_not_wait_for_supervisor_eof() {
     let stdin = child.stdin.take().unwrap();
 
     let output = wait_for_child(child, BOOTSTRAP_FAILURE_BOUND);
+    assert_observer_output_redacted(&output);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("INVALID_OBSERVER_FAKE_PROTOCOL"));
+    assert!(stderr.contains("bootstrap"));
+    drop(stdin);
+}
+
+#[test]
+fn fake_protocol_partial_secret_deadline_exits_the_dedicated_process() {
+    let fixture = Fixture::new();
+    let (_listeners, addresses) = passive_loopback_endpoints();
+    let manifest = validate_manifest_path(&fixture.manifest_path).unwrap();
+    let base_plan = seal_base_plan(&manifest).unwrap();
+    let plan = build_sanitized_observer_plan(&base_plan, addresses).unwrap();
+    let secret =
+        DiagnosticReadSecret::from_provisioned_bytes(DIAGNOSTIC_TEST_SECRET.as_bytes()).unwrap();
+    let mut frame = Vec::new();
+    write_supervisor_bootstrap(&mut frame, &plan, Uuid::new_v4(), &secret).unwrap();
+    let secret_start = frame.len() - DIAGNOSTIC_TEST_SECRET.len() - 1;
+    let mut child = spawn_fake_protocol_child(&fixture, "C");
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(&frame[..secret_start + 11]).unwrap();
+    stdin.flush().unwrap();
+
+    let output = wait_for_child(child, BOOTSTRAP_FAILURE_BOUND);
+    frame.zeroize();
     assert_observer_output_redacted(&output);
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
@@ -972,6 +1389,7 @@ fn fake_protocol_cancel_frame_interrupts_a_stalled_probe() {
         supervisor: mut stdin,
         plan_bytes: _,
         sanitized_plan_sha256: _,
+        invocation_id: _,
     } = spawn_bootstrapped_fake_protocol(&fixture, "D", addresses);
     wait_for_connections(&servers[0], 1, CANCELLATION_BOUND);
     stdin.write_all(SUPERVISOR_CANCEL_BYTES).unwrap();

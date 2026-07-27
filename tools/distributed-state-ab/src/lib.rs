@@ -17,6 +17,8 @@ pub const BASE_PLAN_SCHEMA: &str = "laminardb-instrumentation-ab-base-plan/v1";
 pub const DRIVER_TRACE_SCHEMA: &str = "laminardb-instrumentation-ab-driver-trace/v1";
 pub const OBSERVER_RESULT_SCHEMA: &str = "laminardb-instrumentation-ab-observer-dry-run/v1";
 pub const DRY_RUN_RECORD_SCHEMA: &str = "laminardb-instrumentation-ab-nonfeedback-result/v1";
+pub const FAKE_PROTOCOL_RUN_RECORD_SCHEMA: &str =
+    "laminardb-instrumentation-ab-fake-protocol-run/v1";
 pub const START_SIGNAL_BYTES: &[u8] = b"LAMINARDB_AB_DRY_RUN_START_V1\n";
 
 const PURPOSE: &str = "engineering_instrumentation_ab_nonfeedback_dry_run";
@@ -619,6 +621,58 @@ pub struct DryRunRecordV1 {
     pub supervisor_events: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FakeProtocolObserverDispositionV1 {
+    Complete,
+    Incomplete,
+    ProvisioningRejected,
+    SpawnFailed,
+    BootstrapDeliveryFailed,
+    ExitNonzero,
+    InvalidResult,
+    CompletionDeadlineExceeded,
+    StatusInspectionFailed,
+    OutputOversized,
+    CaptureIncomplete,
+    TerminationFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FakeProtocolRunRecordV1 {
+    pub schema_version: String,
+    pub notice: String,
+    pub execution_eligible: bool,
+    pub attempt_id: String,
+    pub arm: Arm,
+    pub injected_observer_behavior: String,
+    pub raw_manifest_sha256: String,
+    pub canonical_manifest_sha256: String,
+    pub base_plan_sha256: String,
+    pub driver_schedule_sha256: String,
+    pub observer_schedule_sha256: String,
+    pub sanitized_observer_plan_sha256: Option<String>,
+    pub observer_invocation_id: Option<uuid::Uuid>,
+    pub driver_trace_sha256: String,
+    pub driver_sha256: String,
+    pub observer_sha256: String,
+    pub artifact_digests: ArtifactDigestsV1,
+    pub observer_pid: Option<u32>,
+    pub action_count: u32,
+    pub scheduled_end_ns: u64,
+    pub trace_matches_plan: bool,
+    pub observer_outcome_consumed_only_after_end: bool,
+    pub observer_disposition: FakeProtocolObserverDispositionV1,
+    pub observer_protocol_result: Option<observer_protocol::ObserverProtocolResultV3>,
+    pub observer_stdout_retained_bytes: u32,
+    pub observer_stdout_retained_sha256: String,
+    pub observer_stderr_retained_bytes: u32,
+    pub observer_stderr_retained_sha256: String,
+    pub raw_observer_output_persisted: bool,
+    pub supervisor_events: Vec<String>,
+}
+
 pub fn validate_manifest_path(path: &Path) -> Result<ValidatedManifestV1, ContractError> {
     let file = std::fs::File::open(path).map_err(|error| {
         ContractError::new(format!("open manifest {}: {error}", path.display()))
@@ -684,6 +738,24 @@ pub fn verify_current_executable(expected: &ResolvedArtifactV1) -> Result<PathBu
         )));
     }
     Ok(current)
+}
+
+pub fn verify_resolved_artifact(
+    name: &str,
+    expected: &ResolvedArtifactV1,
+) -> Result<PathBuf, ContractError> {
+    let declared = ArtifactIdentityV1 {
+        path: expected.path.clone(),
+        byte_length: expected.byte_length,
+        sha256: expected.sha256.clone(),
+    };
+    let observed = verify_artifact(name, &declared)?;
+    if &observed != expected {
+        return Err(ContractError::new(format!(
+            "{name} resolved identity changed before use"
+        )));
+    }
+    Ok(observed.path)
 }
 
 pub fn seal_base_plan(manifest: &ValidatedManifestV1) -> Result<SealedPlanV1, ContractError> {
