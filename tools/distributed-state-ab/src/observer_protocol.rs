@@ -254,12 +254,15 @@ impl DiagnosticReadSecret {
             return Err(SecretSourceError::Invalid);
         }
         let mut decoded = [0_u8; DIAGNOSTIC_SECRET_DECODED_BYTES];
-        let decoded_len = URL_SAFE_NO_PAD
-            .decode_slice(bytes, &mut decoded)
-            .map_err(|_| SecretSourceError::Invalid)?;
-        let mut canonical = URL_SAFE_NO_PAD.encode(decoded);
+        let decoded_len = URL_SAFE_NO_PAD.decode_slice(bytes, &mut decoded);
+        let mut canonical = if decoded_len.is_ok() {
+            URL_SAFE_NO_PAD.encode(decoded)
+        } else {
+            String::new()
+        };
+        let valid =
+            decoded_len == Ok(DIAGNOSTIC_SECRET_DECODED_BYTES) && canonical.as_bytes() == bytes;
         decoded.zeroize();
-        let valid = decoded_len == DIAGNOSTIC_SECRET_DECODED_BYTES && canonical.as_bytes() == bytes;
         canonical.zeroize();
         if !valid {
             return Err(SecretSourceError::Invalid);

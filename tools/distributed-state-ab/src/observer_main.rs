@@ -18,7 +18,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{NOTICE}: INVALID_OBSERVER {error}");
+            eprintln!("{NOTICE}: INVALID_OBSERVER_DRY_RUN {error}");
             ExitCode::from(2)
         }
     }
