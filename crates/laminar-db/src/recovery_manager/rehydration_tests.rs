@@ -200,7 +200,8 @@ async fn validated_head_is_reused_and_rejects_attempt_substitution() {
             inventory,
         );
     let expected_inventory = head.inventory();
-    let reader = SealedVnodeChainReader::from_validated_head(&backend, &head, u64::MAX).unwrap();
+    let reader =
+        SealedVnodeChainReader::from_validated_head(&backend, &head, u64::MAX, usize::MAX).unwrap();
 
     let cached_inventory = reader.sealed_inventory(committed).await.unwrap();
     assert!(
@@ -234,17 +235,24 @@ async fn validated_reader_enforces_the_per_artifact_limit() {
             inventory,
         );
 
-    let error = SealedVnodeChainReader::from_validated_head(&backend, &head, partial_len - 1)
-        .unwrap()
-        .load_at(&[0], attempt)
-        .await
-        .expect_err("one artifact larger than the configured read limit must be rejected");
+    let error =
+        SealedVnodeChainReader::from_validated_head(&backend, &head, partial_len - 1, usize::MAX)
+            .unwrap()
+            .load_at(&[0], attempt)
+            .await
+            .expect_err("one artifact larger than the configured read limit must be rejected");
     assert!(error.to_string().contains("read bound"), "{error}");
 
-    let zero_limit = SealedVnodeChainReader::from_validated_head(&backend, &head, 0)
+    let zero_limit = SealedVnodeChainReader::from_validated_head(&backend, &head, 0, usize::MAX)
         .err()
         .expect("a zero artifact limit must be rejected");
     assert!(zero_limit.to_string().contains("must be nonzero"));
+
+    let zero_chain_limit =
+        SealedVnodeChainReader::from_validated_head(&backend, &head, u64::MAX, 0)
+            .err()
+            .expect("a zero chain artifact limit must be rejected");
+    assert!(zero_chain_limit.to_string().contains("must be nonzero"));
 }
 
 #[tokio::test]
@@ -640,7 +648,17 @@ async fn retention_keeps_reference_then_delta_ancestry() {
     // consecutive deltas. The earliest retained E104 fallback therefore needs additive
     // state slack (R-1)+C=4, preserving E100.
     backend.prune_before(100).await.unwrap();
-    let report = SealedVnodeChainReader::new(&backend)
+    let inventory = backend
+        .checkpoint_seal_inventory(delta_two)
+        .await
+        .unwrap()
+        .unwrap();
+    let head =
+        crate::checkpoint_coordinator::ValidatedVnodeRestoreHead::from_unchecked_inventory_for_test(
+            inventory,
+        );
+    let report = SealedVnodeChainReader::from_validated_head(&backend, &head, u64::MAX, 4)
+        .unwrap()
         .load_at(&[0], delta_two)
         .await
         .expect("reference followed by deltas must retain its FULL root");
@@ -654,6 +672,16 @@ async fn retention_keeps_reference_then_delta_ancestry() {
     assert_eq!(
         deltas,
         vec![b"delta-103".as_slice(), b"delta-104".as_slice()]
+    );
+
+    let error = SealedVnodeChainReader::from_validated_head(&backend, &head, u64::MAX, 3)
+        .unwrap()
+        .load_at(&[0], delta_two)
+        .await
+        .expect_err("reader must independently reject lineage beyond the writer-derived bound");
+    assert!(
+        error.to_string().contains("limit of 3 artifacts"),
+        "{error}"
     );
 }
 

@@ -37,6 +37,7 @@ pub(crate) struct SealedVnodeChainReader<'a> {
     seal_cache: tokio::sync::Mutex<HashMap<CheckpointAttempt, Arc<CheckpointSealInventory>>>,
     validated_head_attempt: Option<CheckpointAttempt>,
     max_partial_bytes: u64,
+    max_chain_artifacts: usize,
 }
 
 impl<'a> SealedVnodeChainReader<'a> {
@@ -49,6 +50,7 @@ impl<'a> SealedVnodeChainReader<'a> {
             seal_cache: tokio::sync::Mutex::new(HashMap::new()),
             validated_head_attempt: None,
             max_partial_bytes: u64::MAX,
+            max_chain_artifacts: usize::MAX,
         }
     }
 
@@ -58,10 +60,16 @@ impl<'a> SealedVnodeChainReader<'a> {
         backend: &'a dyn StateBackend,
         head: &crate::checkpoint_coordinator::ValidatedVnodeRestoreHead,
         max_partial_bytes: u64,
+        max_chain_artifacts: usize,
     ) -> Result<Self, DbError> {
         if max_partial_bytes == 0 {
             return Err(DbError::Checkpoint(
                 "[LDB-6050] vnode partial artifact limit must be nonzero".into(),
+            ));
+        }
+        if max_chain_artifacts == 0 {
+            return Err(DbError::Checkpoint(
+                "[LDB-6050] vnode chain artifact limit must be nonzero".into(),
             ));
         }
         let attempt = head.attempt();
@@ -79,6 +87,7 @@ impl<'a> SealedVnodeChainReader<'a> {
             seal_cache: tokio::sync::Mutex::new(seal_cache),
             validated_head_attempt: Some(attempt),
             max_partial_bytes,
+            max_chain_artifacts,
         })
     }
 
@@ -177,6 +186,27 @@ impl<'a> SealedVnodeChainReader<'a> {
         Ok(bytes)
     }
 
+    async fn read_chain_artifact(
+        &self,
+        attempt: CheckpointAttempt,
+        vnode: u32,
+        artifact_count: &mut usize,
+    ) -> Result<Bytes, DbError> {
+        let next = artifact_count.checked_add(1).ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "[LDB-6051] vnode {vnode} chain artifact count overflow"
+            ))
+        })?;
+        if next > self.max_chain_artifacts {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6051] vnode {vnode} recovery chain exceeds the writer-derived limit of {} artifacts",
+                self.max_chain_artifacts
+            )));
+        }
+        *artifact_count = next;
+        self.read_verified_partial(attempt, vnode).await
+    }
+
     /// Load each vnode's partial chain pinned at `attempt`, a committed cut chosen by the caller.
     ///
     /// # Errors
@@ -253,7 +283,10 @@ impl<'a> SealedVnodeChainReader<'a> {
     ) -> Result<Vec<Bytes>, DbError> {
         use crate::vnode_partial::VnodePartial;
 
-        let (bytes, mut current, head) = self.resolve_reference_head(vnode, attempt).await?;
+        let mut artifact_count = 0;
+        let (bytes, mut current, head) = self
+            .resolve_reference_head(vnode, attempt, &mut artifact_count)
+            .await?;
         let mut need: std::collections::HashSet<String> = head
             .deltas
             .iter()
@@ -278,7 +311,7 @@ impl<'a> SealedVnodeChainReader<'a> {
                 )));
             }
             let parent_bytes = self
-                .read_verified_partial(parent_attempt, vnode)
+                .read_chain_artifact(parent_attempt, vnode, &mut artifact_count)
                 .await
                 .map_err(|error| {
                     DbError::Checkpoint(format!(
@@ -307,10 +340,13 @@ impl<'a> SealedVnodeChainReader<'a> {
         &self,
         vnode: u32,
         attempt: CheckpointAttempt,
+        artifact_count: &mut usize,
     ) -> Result<(Bytes, CheckpointAttempt, crate::vnode_partial::VnodePartial), DbError> {
         use crate::vnode_partial::VnodePartial;
 
-        let mut bytes = self.read_verified_partial(attempt, vnode).await?;
+        let mut bytes = self
+            .read_chain_artifact(attempt, vnode, artifact_count)
+            .await?;
         let mut current = attempt;
         loop {
             let partial = VnodePartial::decode(&bytes).map_err(|error| {
@@ -336,7 +372,7 @@ impl<'a> SealedVnodeChainReader<'a> {
                 )));
             }
             bytes = self
-                .read_verified_partial(base_attempt, vnode)
+                .read_chain_artifact(base_attempt, vnode, artifact_count)
                 .await
                 .map_err(|error| {
                     DbError::Checkpoint(format!(

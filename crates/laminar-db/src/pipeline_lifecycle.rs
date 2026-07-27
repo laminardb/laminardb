@@ -35,6 +35,26 @@ const fn cluster_delta_chain_bound(max_retained: usize) -> Option<u32> {
     }
 }
 
+/// Maximum number of physical partial artifacts a writer-conformant vnode restore may fetch.
+/// One FULL is always required; retention of two or more cuts permits one direct REFERENCE edge,
+/// and the remaining edges are the independently bounded consecutive DELTAs.
+#[cfg(feature = "cluster")]
+pub(crate) const fn cluster_vnode_chain_artifact_limit(max_retained: usize) -> usize {
+    let reference_edge = if max_retained >= 2 { 1 } else { 0 };
+    let delta_edges = match cluster_delta_chain_bound(max_retained) {
+        Some(bound) => bound as usize,
+        None => 0,
+    };
+    1 + reference_edge + delta_edges
+}
+
+/// Absolute reader limit across every currently accepted retention setting. The local
+/// `max_retained` value is not yet part of cluster identity, so using its narrower limit could
+/// strand a valid checkpoint produced by a differently configured participant.
+#[cfg(feature = "cluster")]
+pub(crate) const MAX_CLUSTER_VNODE_CHAIN_ARTIFACTS: usize =
+    cluster_vnode_chain_artifact_limit(usize::MAX);
+
 const fn required_recovery_scope(runtime: RuntimeMode) -> StateBackendDurability {
     match runtime {
         RuntimeMode::Local => StateBackendDurability::NodeDurable,
@@ -1316,6 +1336,7 @@ impl LaminarDB {
                 backend.as_ref(),
                 restore_head,
                 max_partial_bytes,
+                MAX_CLUSTER_VNODE_CHAIN_ARTIFACTS,
             )?
             .load_at(&owned, attempt)
             .await?;

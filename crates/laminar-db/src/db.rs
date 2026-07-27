@@ -2577,6 +2577,7 @@ impl LaminarDB {
                 backend.as_ref(),
                 &handoff.vnode_restore_head,
                 max_partial_bytes,
+                crate::pipeline_lifecycle::MAX_CLUSTER_VNODE_CHAIN_ARTIFACTS,
             )?
             .load_at(&newly_acquired, attempt)
             .await?

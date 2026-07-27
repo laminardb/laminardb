@@ -1,11 +1,14 @@
-#[cfg(feature = "cluster")]
-use super::cluster_delta_chain_bound;
 use super::LaminarDB;
 use super::{
     admit_sink, admit_sink_contract, admit_source_contract, close_opened_sinks,
     open_prepared_sinks, resolve_stream_output_schemas, validate_source_recovery_assignment,
     ConnectorTaskFenceRegistration, DbError, PreparedSink, RuntimeMode, SinkAdmissionContext,
     TrackedSourceRegistration, CLUSTER_BEST_EFFORT, EXACT_SINK_PROTOCOL,
+};
+#[cfg(feature = "cluster")]
+use super::{
+    cluster_delta_chain_bound, cluster_vnode_chain_artifact_limit,
+    MAX_CLUSTER_VNODE_CHAIN_ARTIFACTS,
 };
 use crate::db::DbState;
 use crate::pipeline::PipelineConfig;
@@ -38,6 +41,15 @@ fn cluster_delta_chain_bound_is_derived_from_retention() {
     assert_eq!(cluster_delta_chain_bound(4), Some(3));
     assert_eq!(cluster_delta_chain_bound(5), Some(4));
     assert_eq!(cluster_delta_chain_bound(usize::MAX), Some(4));
+
+    assert_eq!(cluster_vnode_chain_artifact_limit(0), 1);
+    assert_eq!(cluster_vnode_chain_artifact_limit(1), 1);
+    assert_eq!(cluster_vnode_chain_artifact_limit(2), 3);
+    assert_eq!(cluster_vnode_chain_artifact_limit(3), 4);
+    assert_eq!(cluster_vnode_chain_artifact_limit(4), 5);
+    assert_eq!(cluster_vnode_chain_artifact_limit(5), 6);
+    assert_eq!(cluster_vnode_chain_artifact_limit(usize::MAX), 6);
+    assert_eq!(MAX_CLUSTER_VNODE_CHAIN_ARTIFACTS, 6);
 }
 
 struct RetiringQuiesceSink {
