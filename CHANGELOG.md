@@ -7,6 +7,9 @@
 - Key-group topology is mode-scoped: embedded and single-node use one group, while cluster uses
   optional `server.key_groups` (default 256). Checkpoints and assignment certificates now bind the
   partitioning ABI so incompatible recovery or shuffle peers fail closed.
+- `SnapshotAdoption` now reports `vnodes_requiring_restore`, `restored_vnode_count`, and
+  `restore_epoch`. The former acquisition/rehydration names were inaccurate when a retained vnode
+  required restore because the process could not prove an exact installed-state binding.
 
 ### Removed
 

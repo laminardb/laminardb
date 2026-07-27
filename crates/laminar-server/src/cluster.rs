@@ -2032,8 +2032,8 @@ pub async fn start_cluster(
                 info!(
                     version = adoption.version,
                     adopted = adoption.adopted,
-                    newly_acquired = adoption.newly_acquired.len(),
-                    rehydrated = adoption.rehydrated,
+                    vnodes_requiring_restore = adoption.vnodes_requiring_restore.len(),
+                    restored_vnode_count = adoption.restored_vnode_count,
                     "startup assignment adoption"
                 );
                 if adoption.adopted {

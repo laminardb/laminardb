@@ -79,15 +79,15 @@ impl RebalanceConfig {
 
 /// Log what moved so there's an audit trail of every rebalance-driven state transfer.
 fn log_adoption(source: &str, adoption: &SnapshotAdoption) {
-    if adoption.newly_acquired.is_empty() {
+    if adoption.vnodes_requiring_restore.is_empty() {
         return;
     }
     info!(
         source,
         version = adoption.version,
-        vnodes_requiring_restore = adoption.newly_acquired.len(),
-        rehydrated = adoption.rehydrated,
-        rehydration_epoch = ?adoption.rehydration_epoch,
+        vnodes_requiring_restore = adoption.vnodes_requiring_restore.len(),
+        restored_vnode_count = adoption.restored_vnode_count,
+        restore_epoch = ?adoption.restore_epoch,
         "installed vnode state after rebalance",
     );
 }

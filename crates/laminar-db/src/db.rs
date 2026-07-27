@@ -832,14 +832,13 @@ pub struct SnapshotAdoption {
     pub version: u64,
     /// Vnodes whose committed state had to be installed for this rotation.
     ///
-    /// The historical field name is retained for API compatibility. The list can include vnodes
-    /// whose ownership stayed local when this process cannot prove that its current graph has the
-    /// exact predecessor assignment and pipeline state installed.
-    pub newly_acquired: Vec<u32>,
-    /// How many entries in `newly_acquired` had committed state read back.
-    pub rehydrated: usize,
-    /// Committed epoch the rehydration read from, if any.
-    pub rehydration_epoch: Option<u64>,
+    /// This can include retained ownership when the current process cannot prove that its graph
+    /// has the exact predecessor assignment and pipeline state installed.
+    pub vnodes_requiring_restore: Vec<u32>,
+    /// Number of required vnodes whose committed state was read back.
+    pub restored_vnode_count: usize,
+    /// Committed epoch used for vnode restore, if any.
+    pub restore_epoch: Option<u64>,
 }
 
 /// Result of certifying a clustered process at startup.
@@ -2570,14 +2569,14 @@ impl LaminarDB {
         }
         let new_set: rustc_hash::FxHashSet<u32> = new_owned.iter().copied().collect();
         let revoked: rustc_hash::FxHashSet<u32> = old_set.difference(&new_set).copied().collect();
-        let rehydration_attempt = loaded_chains.attempt;
-        let rehydrated = loaded_chains.chain_count();
+        let restore_attempt = loaded_chains.attempt;
+        let restored_vnode_count = loaded_chains.chain_count();
         let adoption = SnapshotAdoption {
             adopted: true,
             version: snapshot.version,
-            newly_acquired: vnodes_requiring_restore.clone(),
-            rehydrated,
-            rehydration_epoch: rehydration_attempt.map(|attempt| attempt.epoch),
+            vnodes_requiring_restore: vnodes_requiring_restore.clone(),
+            restored_vnode_count,
+            restore_epoch: restore_attempt.map(|attempt| attempt.epoch),
         };
         let initializes_genesis =
             predecessor_snapshot.is_none() && source_handoff.is_none() && revoked.is_empty();
@@ -2728,9 +2727,9 @@ impl LaminarDB {
 
         tracing::info!(
             version = snapshot.version,
-            vnodes_requiring_restore = adoption.newly_acquired.len(),
-            rehydrated = adoption.rehydrated,
-            rehydration_epoch = ?adoption.rehydration_epoch,
+            vnodes_requiring_restore = adoption.vnodes_requiring_restore.len(),
+            restored_vnode_count = adoption.restored_vnode_count,
+            restore_epoch = ?adoption.restore_epoch,
             "adopted assignment snapshot",
         );
         Ok(adoption)
