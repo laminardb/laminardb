@@ -5,7 +5,7 @@
   pending a new official package; no runtime
   dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 63
+- **Last reconciled:** 2026-07-27 during Cycle 64
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -476,6 +476,16 @@ router split, and exhaustive route/config/reload tests only; the observer client
 remain blocked. Since the main HTTP address is also advertised for checkpoint RPC, this loopback
 slice cannot support a multi-host A/B or production soak; that later gate needs a separate local
 diagnostic listener or native TLS/mTLS design.
+
+Cycle 64 implements and verifies that slice in `3a0d3b5c` and `cf0f5aa4`. The shared validator enforces canonical
+split credentials, cluster mode, and a loopback bind before startup side effects; an immutable
+policy and typed principal isolate both diagnostic routes from every console mutation/read and
+WebSocket route. One post-auth permit, fixed rolling window, and two-second deadline are local to
+the diagnostic control plane. Substituted TOML input is stripped from parse errors, and the POST
+and watcher paths now retain every restart-only value across pure and mixed successful/failed
+reloads. Full no-cluster and cluster server tests pass (238 and 316), with warnings-denied Clippy in
+both configurations. This authorizes only the next fake-server observer-protocol cycle: no live
+request, A/B, backend package, admission, delivery, multi-host transport, or soak gate changed.
 
 The existing output path satisfies none of the new provenance/fence fields: it passes only a batch
 and deadline and uses an idempotent, non-transactional Kafka producer. The supported evidence APIs

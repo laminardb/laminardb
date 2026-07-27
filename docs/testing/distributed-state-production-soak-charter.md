@@ -715,6 +715,54 @@ deadlines, retry/page/cursor state, response bounds, cancellation, and zero C co
 effect-estimation, a powered equivalence experiment, and the independent immutable release-binary
 soak remain later and separate.
 
+### Cycle 64 diagnostic-read boundary implementation
+
+Cycle 64 implements the preceding contract in `3a0d3b5c` and `cf0f5aa4` and still authorizes no live observer or
+networked experiment. `server.diagnostic_read_token` and the console administrator credential are
+copied into one immutable startup policy. A shared validator runs during `load_config` and at the
+start of programmatic `run_server`; when diagnostic authority is enabled it requires cluster mode,
+a loopback bind, distinct canonical unpadded base64url encodings of exactly 32 bytes, and both
+credentials. Legacy console-only minimum-length behavior remains unchanged.
+
+The two diagnostic routes are a separate router outside console CORS. After the outer serving gate,
+authentication accepts exactly one bearer header as either the console administrator or the typed
+diagnostic-read principal. Duplicate, comma-joined, missing, wrong-size, query, cookie, and
+WebSocket credentials fail; absolute-form targets fail before a handler; explicit `HEAD` and all
+other methods return `405`; aliases do not match. The diagnostic principal is rejected from every
+registered console route before its handler. Access logging records the matched route template (or
+`<unmatched>`), method, status, and latency, never the raw target, query, or headers. Malformed
+timing-query rejection also emits only a fixed event; a captured-log sentinel test covers both
+logging paths.
+
+One shared non-queuing semaphore covers both handlers. A fixed eight-slot rolling-second array
+accounts starts only after successful authentication, and every admitted handler is wrapped in a
+two-second timeout. Integrated tests prove authentication precedes accounting, cross-route
+contention returns `429` without handler entry, the ninth start returns `429`, and success, timeout,
+and task cancellation release the permit. These objects are referenced only by the HTTP diagnostic
+control plane; no row, source, sink, operator-state, or checkpoint-capture path changed.
+
+`toml::de::Error::set_input(None)` now detaches substituted source before a parse error can cross
+the configuration boundary. Tests prove the sentinel is absent from `Display`, `Debug`, the source
+chain, and the reload response; the watcher test consumes the same redacted error used by its log
+statement. Both reload entry points call one publication helper which replaces only `source`,
+`lookup`, `pipeline`, and `sink`. Tests cover pure restart-only changes and mixed successful/failed
+DDL for POST and watcher paths; server/auth and all other restart-only values remain the active
+snapshot, preserving agreement with the checkpoint forwarder's startup console credential.
+
+The complete Laminar server unit matrices pass with no default features (238/238) and with
+`cluster` (316/316). Warnings-denied Clippy passes in both configurations, as do formatting and diff
+checks. This is in-process configuration/router/race evidence, not a socket-level observer, A/B
+measurement, backend qualification, multi-host transport result, or independent soak. The main
+HTTP/checkpoint-RPC listener is still loopback-only when diagnostic authority is enabled, so only a
+co-located engineering topology is possible. `certification_eligible` remains `false`.
+
+Cycle 65 is limited to the observer's loopback fake-server protocol and secret-delivery boundary:
+a sanitized plan, a typed secret source with no console fallback, exact origin-form request
+construction, disabled proxy/redirect behavior, bounded connect/read/total deadlines and retries,
+strict response sizes/schemas, timing-page cursor/process transitions, cancellation, and proof that
+arm C opens zero connections. It must not contact LaminarDB or run an A/B. Native TLS/mTLS or a
+separate diagnostic listener remains a later prerequisite for multi-host and production-soak use.
+
 ## Frozen numerical contract
 
 An eligible machine-readable charter contains no `TBD`, zero, or results-derived threshold. It

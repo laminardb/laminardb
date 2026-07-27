@@ -87,6 +87,10 @@ HTTP, workload, fault, latency, A/B, backend, or soak was executed.
 startup-bound, loopback-only diagnostic credential instead of a console-bearer broker. It is a
 design decision only: no credential, router split, observer, HTTP request, or empirical result has
 landed.
+[Cycle 64](../reviews/distributed-keyed-state-cycle-64.md) implements that bounded control-plane
+slice: shared startup validation, immutable split authority, exact diagnostic routing and
+availability bounds, parse-error redaction, and reloadable-section-only publication. In-process
+route/config/reload matrices pass, but no live observer, networked A/B, backend trial, or soak ran.
 
 ## Verdict
 
@@ -668,6 +672,7 @@ The current branch's admission-neutral hardening was then checked separately:
 | Cycle 61 executable provenance seam | PASS, focused/full/lint gates; no real-process run | Canonical regular-file path plus exact SHA-256 fail closed on partial configuration, relative/missing/unreadable/non-regular paths, malformed or mismatched digest, and post-resolution mutation; executable permission/format/architecture remain OS spawn checks |
 | Cycle 62 schedule scaffold | PASS for logical schedule isolation; 10 tests passed, one ignored subprocess fixture; no real-process run | Separate driver/observer bytes, raw-manifest-bound common plan, exact file-synced end seal, capped pipe retention, bounded kill/reap, and identical C/D traces across four observer outcomes; static planned probes only, with no HTTP, SUT, workload execution, timing, or A/B evidence |
 | Cycle 63 diagnostic-read authority | DESIGN ONLY; no runtime or empirical sample | Selects a disjoint startup-bound credential on exactly two loopback diagnostic GETs; rejects the unrestricted-bearer broker and identifies parse-error disclosure plus restart-only reload publication as prerequisites |
+| Cycle 64 diagnostic-read boundary | PASS for in-process configuration, route, race, and reload tests; no real-process sample | Implements the disjoint immutable credential, exact two-route allowlist, post-auth permit/rate/deadline bounds, route-template logs, parse-input redaction, and restart-only reload retention; 238 no-cluster and 316 cluster tests pass |
 
 Both cluster and no-feature `cargo check` and `cargo clippy -D warnings` configurations passed, as
 did formatting and diff checks. These focused results do not exercise keyed cluster restore.
@@ -719,6 +724,16 @@ retains the startup console token; and TOML parse errors can preserve substitute
 requires parse-error redaction, reloadable-section-only commits, and a disjoint immutable
 diagnostic policy before a live observer can be written. No route or guarantee changed, and the
 independent immutable release-binary soak has still not run.
+
+Cycle 64 adds executable boundary evidence but no empirical product sample. Full in-process server
+matrices pass without and with the cluster feature (238/238 and 316/316), including both principals,
+all registered console routes, hostile credential/target aliases, method/CORS isolation,
+single-flight/rate/timeout/cancellation behavior, shared file/programmatic validation, and pure or
+mixed successful/failed POST and watcher reload. Matched route templates replace raw request-target
+logging, and stripped TOML input keeps substituted sentinels out of all downstream error formatting.
+No socket-level observer, real cluster, workload, fault, latency A/B, backend, or independent soak
+was exercised. Loopback still limits this slice to co-located engineering use, and
+`certification_eligible` remains `false`.
 
 These are admission and focused operator tests, not a production certification. No existing test
 demonstrates a distributed keyed operator processing remote rows through crash, restore, and

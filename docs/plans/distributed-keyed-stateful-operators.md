@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 63
+- **Last reconciled:** 2026-07-27 during Cycle 64
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -251,6 +251,16 @@ observer protocol, live effect-estimation, powered equivalence, and independent 
 remain ordered gates after that control-plane work. The main HTTP port is also the advertised
 checkpoint-RPC port, so the loopback slice is single-host engineering support only; multi-host and
 production-soak use need a later separate local listener or native TLS/mTLS design.
+
+Cycle 64 completes only that prerequisite boundary. `server.diagnostic_read_token` is validated at
+file load and programmatic startup, snapshotted with console authority, and accepted only on the two
+diagnostic GETs outside console CORS. Fixed post-auth concurrency/rate/deadline bounds and matched-
+route logging contain the surface. Parse-error input is detached, and both reload paths retain all
+restart-only active configuration while committing only successful source/lookup/pipeline/sink
+changes. The no-cluster and cluster server matrices pass (238/238 and 316/316), including the
+credential/alias/method matrix and reload success/failure paths. No observer or real-process HTTP
+run exists yet. The next bounded gate is a loopback fake-server observer protocol; multi-host
+transport, effect-estimation, powered equivalence, and the independent release soak remain later.
 
 ## Scope and non-goals
 

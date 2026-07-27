@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Cycle 63
+- **Last reconciled:** 2026-07-27 during Cycle 64
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-63.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-64.md)
 
 ## Decision
 
@@ -1351,6 +1351,17 @@ checkpoint forwarder retains its startup token, and substituted TOML input must 
 parse errors before those errors are logged or returned. The next cycle may implement only that
 control-plane boundary and its tests; no observer, A/B, backend, delivery, admission, or production
 claim is authorized by this decision.
+
+Cycle 64 implements that control-plane boundary in `3a0d3b5c` and `cf0f5aa4`. File and programmatic startup share
+one fail-closed validator; the immutable startup policy separates the console administrator from a
+diagnostic-read principal on exactly the two routes; route-template logging, a shared non-queuing
+permit, an eight-start rolling-second window, and a two-second deadline bound the surface. TOML
+parse errors no longer retain substituted input, and successful POST/watcher reloads publish only
+the four live DDL sections while retaining restart-only authority. Complete server unit matrices
+passed with and without `cluster` (316 and 238 tests), as did warnings-denied Clippy. These are
+in-process boundary tests, not a live observer, A/B sample, backend result, multi-host transport, or
+production soak. The loopback fake-server observer protocol is the next gate; `[LDB-4007]`,
+`[LDB-0013]`, and production **NO-GO** remain unchanged.
 
 Selected attempts may then be joined at low cadence only through a new read-only, same-snapshot
 core audit of the exact outcome, both retention floors, and validated live capsule reference;
