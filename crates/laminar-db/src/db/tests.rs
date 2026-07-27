@@ -1907,6 +1907,114 @@ async fn recovering_flag_does_not_authorize_unapplied_vnode_state_discard() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn assignment_publication_clears_restoring_state_for_a_vnode_lost_after_preflight() {
+    use std::collections::BTreeMap;
+
+    use laminar_core::checkpoint::CheckpointParticipant;
+    use laminar_core::cluster::control::{
+        AssignmentSnapshot, ClusterController, ClusterKv, InMemoryKv,
+    };
+    use laminar_core::cluster::discovery::{NodeId as ClusterNodeId, NodeInfo};
+    use laminar_core::state::{InProcessBackend, NodeId, VnodeRegistry};
+    use uuid::Uuid;
+
+    let self_id = NodeId(1);
+    let successor_id = NodeId(2);
+    let cluster_self_id = ClusterNodeId(self_id.0);
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(cluster_self_id));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let controller = Arc::new(ClusterController::new(
+        cluster_self_id,
+        kv,
+        None,
+        members_rx,
+    ));
+    install_test_process_deadline(&controller);
+
+    let current = AssignmentSnapshot::empty()
+        .next_for_participants(
+            BTreeMap::from([(0, self_id)]),
+            vec![CheckpointParticipant {
+                node_id: self_id.0,
+                boot_incarnation: controller.recovery_incarnation(),
+            }],
+        )
+        .unwrap();
+    let successor = current
+        .next_for_participants(
+            BTreeMap::from([(0, successor_id)]),
+            vec![CheckpointParticipant {
+                node_id: successor_id.0,
+                boot_incarnation: Uuid::from_u128(22),
+            }],
+        )
+        .unwrap();
+    let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
+        .state_backend(Arc::new(InProcessBackend::new(1)))
+        .vnode_registry(Arc::clone(&registry))
+        .build()
+        .await
+        .unwrap();
+    *db.local_state_incarnation.lock() = Some(controller.recovery_incarnation());
+
+    // Let adoption pass its initial no-pending-work check, then hold it immediately before the
+    // publication boundary where ownership, staging, and lifecycle state change together.
+    let execution = Arc::clone(&db.rotation_execution_fence).read_owned().await;
+    let revision_before = db
+        .assignment_authority_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+    let adopting_db = Arc::clone(&db);
+    let adoption = tokio::spawn(async move {
+        adopting_db
+            .adopt_assignment_snapshot(
+                successor,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while db
+            .assignment_authority_revision
+            .load(std::sync::atomic::Ordering::Acquire)
+            == revision_before
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("assignment adoption did not reach the rotation write fence");
+
+    registry.mark_restoring(&[0]);
+    db.rehydrated_vnode_state.lock().insert(
+        0,
+        RehydratedVnode {
+            epoch: 7,
+            chain: vec![bytes::Bytes::from_static(b"acquired-before-loss")],
+        },
+    );
+    drop(execution);
+
+    let adopted = adoption
+        .await
+        .expect("assignment adoption task panicked")
+        .expect("successor assignment should publish");
+    assert!(adopted.adopted);
+    assert_eq!(registry.assignment_version(), current.version + 1);
+    assert_eq!(registry.owner(0), successor_id);
+    assert!(db.rehydrated_vnode_state.lock().is_empty());
+    assert!(!registry.is_restoring(0));
+    assert!(!registry.any_restoring());
+    assert_eq!(
+        *db.pending_revoke_vnodes.lock(),
+        [0_u32].into_iter().collect::<rustc_hash::FxHashSet<_>>()
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn assignment_adoption_rejects_smaller_and_larger_vnode_maps() {
     use laminar_core::checkpoint::{CheckpointParticipant, LeaderProof, LeaderProofOwner};
     use laminar_core::cluster::control::{
