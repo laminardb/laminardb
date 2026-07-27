@@ -1,16 +1,23 @@
+use std::io::Write as _;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
+use distributed_state_ab::observer_protocol::{
+    build_sanitized_observer_plan, write_supervisor_bootstrap, DiagnosticReadSecret,
+    ObserverProtocolResultV1,
+};
 use distributed_state_ab::{
-    sha256_bytes, ArtifactIdentityV1, ArtifactSetV1, AuthenticationV1, BasePlanV1,
-    DiagnosticRouteV1, DryRunRecordV1, LifecycleBoundaryV1, LimitsV1, ManifestV1,
-    ObserverDispositionV1, ObserverMode, ObserverPolicyV1, ObserverResultV1, PairV1, WorkloadV1,
-    MANIFEST_SCHEMA, NOTICE,
+    seal_base_plan, sha256_bytes, validate_manifest_path, ArtifactIdentityV1, ArtifactSetV1,
+    AuthenticationV1, BasePlanV1, DiagnosticRouteV1, DryRunRecordV1, LifecycleBoundaryV1, LimitsV1,
+    ManifestV1, ObserverDispositionV1, ObserverMode, ObserverPolicyV1, ObserverResultV1, PairV1,
+    WorkloadV1, MANIFEST_SCHEMA, NOTICE,
 };
 use serde_json::Value;
 use tempfile::TempDir;
 
 const SECRET_SENTINEL: &str = "cycle62-secret-7f52d1d9b9874a73a869";
+const DIAGNOSTIC_TEST_SECRET: &str = "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk";
 
 struct Fixture {
     _directory: TempDir,
@@ -467,4 +474,63 @@ fn observer_spawn_failure_is_classified_only_after_the_same_trace_completes() {
         std::fs::read(artifact_directory.join("driver-trace.json")).unwrap(),
         baseline.trace
     );
+}
+
+#[test]
+fn fake_protocol_control_receives_only_the_typed_supervisor_bootstrap() {
+    let fixture = Fixture::new();
+    let manifest = validate_manifest_path(&fixture.manifest_path).unwrap();
+    let base_plan = seal_base_plan(&manifest).unwrap();
+    let listeners: [TcpListener; 3] = std::array::from_fn(|_| {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        listener
+    });
+    let addresses = std::array::from_fn(|index| listeners[index].local_addr().unwrap());
+    let plan = build_sanitized_observer_plan(&base_plan, addresses).unwrap();
+    let secret =
+        DiagnosticReadSecret::from_provisioned_bytes(DIAGNOSTIC_TEST_SECRET.as_bytes()).unwrap();
+    let plan_bytes = serde_json::to_vec(&plan).unwrap();
+    assert!(!plan_bytes
+        .windows(DIAGNOSTIC_TEST_SECRET.len())
+        .any(|window| window == DIAGNOSTIC_TEST_SECRET.as_bytes()));
+
+    let mut child = Command::new(&fixture.manifest.artifacts.observer.path)
+        .arg("fake-protocol")
+        .arg("C")
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    write_supervisor_bootstrap(&mut stdin, &plan, &secret).unwrap();
+    stdin.flush().unwrap();
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: ObserverProtocolResultV1 = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result.suppressed_probes, 348);
+    assert_eq!(result.connection_attempts, 0);
+    assert_eq!(result.parsed_responses, 0);
+    assert!(!output
+        .stdout
+        .windows(DIAGNOSTIC_TEST_SECRET.len())
+        .any(|window| window == DIAGNOSTIC_TEST_SECRET.as_bytes()));
+    assert!(!output
+        .stderr
+        .windows(DIAGNOSTIC_TEST_SECRET.len())
+        .any(|window| window == DIAGNOSTIC_TEST_SECRET.as_bytes()));
+    for listener in listeners {
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
 }
