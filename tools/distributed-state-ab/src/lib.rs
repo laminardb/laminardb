@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 pub mod observer_protocol;
+pub mod paced_observer;
 
 pub const NOTICE: &str = "NOT A/B OR CERTIFICATION EVIDENCE";
 pub const MANIFEST_SCHEMA: &str = "laminardb-instrumentation-ab-nonfeedback-manifest/v1";
