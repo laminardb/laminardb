@@ -1535,6 +1535,241 @@ mod rebalance {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replacement_boot_restores_global_aggregate_across_aborted_drain_generation() {
+        let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+        harness
+            .bootstrap_catalog(&[
+                super::cluster_harness::TEST_SOURCE_DDL,
+                "CREATE STREAM totals AS SELECT SUM(value) AS total FROM src EMIT CHANGES",
+                super::cluster_harness::TEST_AGGREGATE_SINK_DDL,
+            ])
+            .await
+            .expect("bootstrap stateful cluster catalog");
+        harness.start_all().await;
+
+        let store = Arc::clone(&harness.nodes[0].assignment_snapshot_store);
+        let predecessor = store
+            .load()
+            .await
+            .expect("load committed predecessor assignment")
+            .expect("committed predecessor assignment");
+        let aggregate_owner = predecessor.vnodes[&0];
+
+        harness.source_log.append(&[(1, 10), (2, 20)]);
+        wait_for(
+            || {
+                harness
+                    .sink_state
+                    .observations()
+                    .contains(&AggregateObservation {
+                        node_id: aggregate_owner,
+                        total: 30,
+                        weight: 1,
+                    })
+            },
+            "predecessor aggregate output",
+        )
+        .await;
+        let committed = harness.nodes[harness.leader_idx()]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint the predecessor aggregate cut");
+        assert!(
+            committed.success,
+            "predecessor aggregate checkpoint failed: {:?}",
+            committed.error
+        );
+        let committed_attempt = CheckpointAttempt::new(committed.epoch, committed.checkpoint_id);
+        let committed_outcome = harness.cluster.nodes[harness.leader_idx()]
+            .controller
+            .checkpoint_authority()
+            .expect("cluster checkpoint authority")
+            .cluster_outcome(committed.epoch)
+            .await
+            .expect("read predecessor checkpoint outcome")
+            .expect("predecessor checkpoint outcome");
+        assert!(committed_outcome.is_commit());
+        assert_eq!(
+            committed_outcome.assignment_fence,
+            Some(predecessor.assignment_fence().unwrap())
+        );
+
+        let transfer_target = harness
+            .nodes
+            .iter()
+            .map(|node| node.instance_id)
+            .find(|node| *node != aggregate_owner)
+            .expect("two-node harness has a distinct drain target");
+        let mut drain_target = predecessor.vnodes.clone();
+        drain_target.insert(0, transfer_target);
+        let (draining, stale_leader_proof) =
+            begin_planned_rotation(&mut harness, drain_target).await;
+        assert_eq!(draining.version, predecessor.version + 1);
+        assert_eq!(store.load().await.unwrap(), Some(draining.clone()));
+
+        let (shared_dir, checkpoint_dirs, control_store) = harness.shutdown_keep_dirs().await;
+        let mut restarted = ClusterEngineHarness::spawn_with_dirs(
+            N_NODES,
+            VNODE_COUNT,
+            shared_dir,
+            checkpoint_dirs,
+            control_store,
+        )
+        .await;
+        // The scripted connector models a durable replayable log. Repopulate its immutable
+        // prefix before recovery so cursor restoration, rather than an empty test fixture, decides
+        // whether the committed rows are replayed.
+        restarted.source_log.append(&[(1, 10), (2, 20)]);
+        assert_eq!(
+            restarted.nodes[0]
+                .assignment_snapshot_store
+                .load()
+                .await
+                .expect("load stale draining head before replacement startup"),
+            Some(draining.clone())
+        );
+        restarted.start_all().await;
+
+        let store = Arc::clone(&restarted.nodes[0].assignment_snapshot_store);
+        let successor = store
+            .load()
+            .await
+            .expect("load replacement assignment")
+            .expect("replacement assignment");
+        assert!(!successor.draining);
+        assert_eq!(successor.version, draining.version + 1);
+        assert_eq!(successor.vnodes, predecessor.vnodes);
+        assert_eq!(successor.participants.len(), predecessor.participants.len());
+        assert!(
+            successor
+                .participants
+                .iter()
+                .zip(&predecessor.participants)
+                .all(|(replacement, stale)| {
+                    replacement.node_id == stale.node_id
+                        && replacement.boot_incarnation != stale.boot_incarnation
+                }),
+            "replacement assignment must retain stable owners under fresh process incarnations"
+        );
+
+        let aborted = store
+            .load_version(draining.version)
+            .await
+            .expect("load materialized drain generation")
+            .expect("materialized drain generation");
+        assert!(!aborted.draining);
+        assert_eq!(aborted.version, draining.version);
+        assert_eq!(aborted.vnodes, predecessor.vnodes);
+        assert_eq!(aborted.participants, predecessor.participants);
+        assert_eq!(
+            store
+                .load_drain_transition(draining.version)
+                .await
+                .expect("load retained stale drain transition"),
+            draining.drain_transition
+        );
+
+        let leader_idx = restarted.leader_idx();
+        let authority = restarted.cluster.nodes[leader_idx]
+            .controller
+            .checkpoint_authority()
+            .expect("cluster checkpoint authority");
+        let drain_decision = authority
+            .assignment_drain_decision(draining.version)
+            .await
+            .expect("read stale drain decision")
+            .expect("stale drain decision");
+        assert_eq!(drain_decision.verdict, AssignmentDrainVerdict::Abort);
+        assert_ne!(drain_decision.leader_proof, stale_leader_proof);
+
+        let successor_fence = successor.assignment_fence().unwrap();
+        let recovery_decision = authority
+            .assignment_recovery_decision(successor.version)
+            .await
+            .expect("read replacement recovery decision")
+            .expect("replacement recovery decision");
+        assert_eq!(
+            recovery_decision.predecessor,
+            aborted.assignment_fence().unwrap()
+        );
+        assert_eq!(recovery_decision.target, successor_fence.clone());
+
+        let replacement_owner = successor.vnodes[&0];
+        let replacement_index = restarted
+            .nodes
+            .iter()
+            .position(|node| node.instance_id == replacement_owner)
+            .expect("replacement aggregate owner belongs to the restarted harness");
+        let replacement = &restarted.nodes[replacement_index];
+        assert_eq!(
+            replacement
+                .vnode_registry
+                .versioned_snapshot()
+                .source_handoff_attempt(),
+            Some(committed_attempt),
+            "replacement ownership must restore from the older committed cut"
+        );
+        wait_for(
+            || replacement.source_state.resume_starts() > 0 && replacement.source_state.polls() > 0,
+            "replacement source to resume and poll after the committed prefix",
+        )
+        .await;
+        assert_eq!(replacement.source_state.last_resume_cursor(), 2);
+        assert!(
+            restarted.sink_state.observations().is_empty(),
+            "replacement startup must not replay the committed aggregate prefix"
+        );
+
+        restarted.source_log.append(&[(3, 7)]);
+        wait_for(
+            || {
+                restarted.sink_state.observations()
+                    == vec![
+                        AggregateObservation {
+                            node_id: replacement_owner,
+                            total: 30,
+                            weight: -1,
+                        },
+                        AggregateObservation {
+                            node_id: replacement_owner,
+                            total: 37,
+                            weight: 1,
+                        },
+                    ]
+            },
+            "replacement aggregate to continue from restored total 30",
+        )
+        .await;
+
+        let post_recovery = restarted.nodes[leader_idx]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint after replacement recovery");
+        assert!(
+            post_recovery.success,
+            "replacement checkpoint failed: {:?}",
+            post_recovery.error
+        );
+        assert!(post_recovery.epoch > committed.epoch);
+        let post_recovery_outcome = authority
+            .cluster_outcome(post_recovery.epoch)
+            .await
+            .expect("read replacement checkpoint outcome")
+            .expect("replacement checkpoint outcome");
+        assert!(post_recovery_outcome.is_commit());
+        assert_eq!(
+            post_recovery_outcome.assignment_fence,
+            Some(successor_fence),
+            "subsequent checkpoint must certify the replacement generation"
+        );
+        assert_eq!(replacement.source_state.last_checkpoint_cursor(), 3);
+
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn source_assignment_cut_survives_cluster_restart() {
         let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
         harness
