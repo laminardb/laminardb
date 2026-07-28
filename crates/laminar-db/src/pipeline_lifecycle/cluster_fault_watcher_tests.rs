@@ -10,7 +10,6 @@ use laminar_connectors::connector::{
     SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceStart, SourceTopology,
 };
 use laminar_connectors::error::ConnectorError;
-use laminar_core::checkpoint::CheckpointAssignmentFence;
 use laminar_core::checkpoint_decision::{CheckpointVerdict, RecordOutcomeResult};
 use laminar_core::cluster::control::controller::{
     RecoveryAnnouncement, RecoveryFault, RecoveryRound,
@@ -35,15 +34,23 @@ use std::time::Duration;
 #[derive(Default)]
 struct IdleClusterTestSource {
     assignment_version: Option<std::num::NonZeroU64>,
+    fail_start: bool,
 }
 
 static REJECTING_SPLITTABLE_STARTED: AtomicBool = AtomicBool::new(false);
+static FAILING_CLUSTER_SOURCE_STARTED: AtomicBool = AtomicBool::new(false);
 
 struct RejectingSplittableSource;
 
 #[async_trait]
 impl SourceConnector for IdleClusterTestSource {
     async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
+        if self.fail_start {
+            FAILING_CLUSTER_SOURCE_STARTED.store(true, Ordering::Release);
+            return Err(ConnectorError::ReadError(
+                "injected cluster source startup failure".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -253,6 +260,23 @@ async fn startup_db() -> (
                     config_keys: vec![],
                 },
                 Arc::new(|_| Ok(Box::new(RejectingSplittableSource))),
+            )?;
+            registry.register_source(
+                "failing-start-cluster-test",
+                ConnectorInfo {
+                    name: "failing-start-cluster-test".into(),
+                    display_name: "Failing cluster start test source".into(),
+                    version: "1".into(),
+                    is_source: true,
+                    is_sink: false,
+                    config_keys: vec![],
+                },
+                Arc::new(|_| {
+                    Ok(Box::new(IdleClusterTestSource {
+                        fail_start: true,
+                        ..IdleClusterTestSource::default()
+                    }))
+                }),
             )
         })
         .build()
@@ -316,21 +340,31 @@ async fn zero_vnode_worker_finishes_startup_idle_and_data_plane_fenced() {
         last_heartbeat_ms: 0,
     };
     let (_members_tx, members_rx) = tokio::sync::watch::channel(vec![owner_member]);
-    let controller = Arc::new(ClusterController::new(local, kv, None, members_rx));
+    let objects: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let assignment_store = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&objects)));
+    let controller = Arc::new(ClusterController::new(
+        local,
+        kv,
+        Some(Arc::clone(&assignment_store)),
+        members_rx,
+    ));
     controller
         .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
         .unwrap();
     controller.publish_recovery_incarnation().await.unwrap();
     controller.set_active(true);
-    let fence = CheckpointAssignmentFence::from_owner_map(
-        1,
-        &[owner.0],
-        vec![CheckpointParticipant {
-            node_id: owner.0,
-            boot_incarnation: owner_boot,
-        }],
-    )
-    .unwrap();
+    let assignment = AssignmentSnapshot::empty()
+        .next_for_participants(
+            std::collections::BTreeMap::from([(0, owner)]),
+            vec![CheckpointParticipant {
+                node_id: owner.0,
+                boot_incarnation: owner_boot,
+            }],
+        )
+        .unwrap();
+    assignment_store.save_if_absent(&assignment).await.unwrap();
+    let fence = assignment.assignment_fence().unwrap();
     controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
     let sender = Arc::new(laminar_core::shuffle::ShuffleSender::new(
         local.0,
@@ -347,7 +381,8 @@ async fn zero_vnode_worker_finishes_startup_idle_and_data_plane_fenced() {
     );
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
-        .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+        .cluster_checkpoint_object_store(Arc::clone(&objects))
+        .assignment_snapshot_store(assignment_store)
         .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, owner)))
         .shuffle_sender(Arc::clone(&sender))
@@ -355,6 +390,28 @@ async fn zero_vnode_worker_finishes_startup_idle_and_data_plane_fenced() {
         .build()
         .await
         .unwrap();
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
+        crate::checkpoint_coordinator::CheckpointConfig::default(),
+        Box::new(
+            laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
+                checkpoint_dir.path(),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    coordinator
+        .bind_pipeline_identity(laminar_core::checkpoint::PipelineIdentity::empty())
+        .unwrap();
+    *db.coordinator.lock().await = Some(coordinator);
+    assert!(db
+        .prepare_graph_ready_vnode_state_binding(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .is_none());
     db.fence_cluster_startup();
 
     assert_eq!(
@@ -420,6 +477,53 @@ async fn splittable_source_without_assignment_hook_fails_before_start() {
     assert!(
         !REJECTING_SPLITTABLE_STARTED.load(Ordering::Acquire),
         "source I/O must not start before assignment admission succeeds"
+    );
+}
+
+#[tokio::test]
+async fn cluster_source_start_failure_does_not_leave_graph_ready_vnode_state() {
+    FAILING_CLUSTER_SOURCE_STARTED.store(false, Ordering::Release);
+    let (db, _controller, _kv, _members, _round, manifest_store, proof) = startup_db().await;
+    let state_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    *db.state_backend.lock() = Some(Arc::new(ObjectStoreBackend::cluster_shared(
+        state_store,
+        "node-7",
+        1,
+    )));
+    manifest_store
+        .seal(
+            &CatalogManifest::new(vec![
+                CatalogManifestEntry {
+                    canonical_name: "failing_input".into(),
+                    kind: CatalogObjectKind::Source,
+                    ddl: "CREATE SOURCE failing_input (id BIGINT) WITH ('connector' = \
+                          'failing-start-cluster-test')"
+                        .into(),
+                },
+                CatalogManifestEntry {
+                    canonical_name: "failing_output".into(),
+                    kind: CatalogObjectKind::Stream,
+                    ddl: "CREATE STREAM failing_output AS SELECT id FROM failing_input".into(),
+                },
+            ])
+            .unwrap(),
+            &proof,
+        )
+        .await
+        .unwrap();
+
+    let error = db.start().await.unwrap_err().to_string();
+    assert!(
+        error.contains("injected cluster source startup failure"),
+        "{error}"
+    );
+    assert!(FAILING_CLUSTER_SOURCE_STARTED.load(Ordering::Acquire));
+    assert!(db.installed_vnode_state.lock().is_none());
+    tokio::task::yield_now().await;
+    assert!(
+        db.installed_vnode_state.lock().is_none(),
+        "failed startup must not asynchronously resurrect graph-ready vnode state"
     );
 }
 
@@ -544,6 +648,11 @@ async fn cluster_startup_defers_source_actor_until_prepared_outcome_is_terminal(
         .unwrap();
 
     db.start().await.unwrap();
+    let registry = db.vnode_registry.lock().clone().unwrap();
+    assert!(db
+        .local_vnode_state_is_ready(&registry, &round.assignment_fence)
+        .await
+        .unwrap());
     assert_eq!(
         db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(2))
             .await

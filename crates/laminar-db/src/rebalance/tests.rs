@@ -790,6 +790,59 @@ async fn recovering_watcher_repairs_uncached_predecessor_without_opening_intake(
 }
 
 #[tokio::test]
+async fn watcher_republishes_ready_after_a_direct_readiness_withdrawal() {
+    let mut fixture = pending_predecessor_authority_fixture(false).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    fixture
+        .watcher
+        .ensure_current_assignment_authority_cached(&fixture.audited_successor, deadline)
+        .await
+        .unwrap();
+    fixture.db.pending_vnode_transition.lock().take();
+    fixture.registry.mark_active(&[0]);
+    let _checkpoint_dir = install_running_test_vnode_state(&fixture.db, &fixture.current).await;
+    let authority_revision = fixture
+        .db
+        .assignment_authority_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+
+    fixture
+        .watcher
+        .publish_authority(authority_revision, deadline)
+        .await;
+    assert!(
+        fixture.controller.read_adopted_assignments().await.unwrap()[0]
+            .1
+            .vnode_state_ready
+    );
+
+    fixture
+        .db
+        .publish_local_vnode_state_report(
+            &fixture.controller,
+            &fixture.registry.versioned_snapshot(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !fixture.controller.read_adopted_assignments().await.unwrap()[0]
+            .1
+            .vnode_state_ready
+    );
+
+    fixture
+        .watcher
+        .publish_authority(authority_revision, deadline)
+        .await;
+    assert!(
+        fixture.controller.read_adopted_assignments().await.unwrap()[0]
+            .1
+            .vnode_state_ready
+    );
+}
+
+#[tokio::test]
 async fn failure_recovery_retains_a_healthy_predecessor_with_no_rendezvous_share() {
     let healthy = CheckpointParticipant {
         node_id: 3,
@@ -1010,7 +1063,7 @@ async fn at_least_once_live_rotation_uses_the_global_drain_protocol() {
     .await
     .expect_err("a wrong same-version owner-complete fence must block rotation");
     assert!(
-        error.contains("exact owner-complete certificate"),
+        error.contains("exact assignment-adoption certificate"),
         "{error}"
     );
     assert_eq!(durable.load().await.unwrap(), Some(current.clone()));
@@ -1040,6 +1093,9 @@ async fn at_least_once_live_rotation_uses_the_global_drain_protocol() {
         .unwrap()
         .is_none());
     registry.mark_active(&[0]);
+    db.publish_local_vnode_state_report(&controller, &registry.versioned_snapshot(), true)
+        .await
+        .unwrap();
 
     let error = try_rebalance(
         &db,
@@ -1278,6 +1334,7 @@ fn checkpoint_fence_requires_exact_reports_and_complete_live_owners() {
         participant: CheckpointParticipant,
         version: u64,
         owners: &[u64],
+        vnode_state_ready: bool,
     ) -> CheckpointAssignmentAdoption {
         let vnode_count = u32::try_from(owners.len()).unwrap();
         CheckpointAssignmentAdoption {
@@ -1286,6 +1343,7 @@ fn checkpoint_fence_requires_exact_reports_and_complete_live_owners() {
             vnode_count,
             partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
             assignment_digest: CheckpointAssignmentFence::owner_map_digest(vnode_count, owners),
+            vnode_state_ready,
         }
     }
 
@@ -1293,8 +1351,8 @@ fn checkpoint_fence_requires_exact_reports_and_complete_live_owners() {
     let p2 = participant(2, 22);
     let owners = [1, 2, 1];
     let reported = rustc_hash::FxHashMap::from_iter([
-        (1, adoption(p1, 7, &owners)),
-        (2, adoption(p2, 7, &owners)),
+        (1, adoption(p1, 7, &owners, true)),
+        (2, adoption(p2, 7, &owners, true)),
     ]);
     let fence = checkpoint_assignment_fence(
         7,
@@ -1306,6 +1364,21 @@ fn checkpoint_fence_requires_exact_reports_and_complete_live_owners() {
     assert_eq!(fence.assignment_version, 7);
     assert_eq!(fence.participant_ids(), [1, 2]);
     assert!(fence.matches_owner_map(&owners));
+    assert!(assignment_vnode_state_is_ready(&fence, &reported));
+
+    let mut remote_state_pending = reported.clone();
+    remote_state_pending.insert(2, adoption(p2, 7, &owners, false));
+    assert!(checkpoint_assignment_fence(
+        7,
+        &[NodeId(1), NodeId(2), NodeId(1)],
+        vec![p1, p2],
+        &remote_state_pending,
+    )
+    .is_some());
+    assert!(
+        !assignment_vnode_state_is_ready(&fence, &remote_state_pending),
+        "transport adoption must not be mistaken for remote semantic-state readiness"
+    );
 
     assert!(
         checkpoint_assignment_fence(7, &[NodeId(1), NodeId(9)], vec![p1, p2], &reported,).is_none(),
@@ -1317,14 +1390,14 @@ fn checkpoint_fence_requires_exact_reports_and_complete_live_owners() {
         "unassigned vnodes are never restorable"
     );
 
-    let missing_report = rustc_hash::FxHashMap::from_iter([(1, adoption(p1, 7, &[1, 2]))]);
+    let missing_report = rustc_hash::FxHashMap::from_iter([(1, adoption(p1, 7, &[1, 2], true))]);
     assert!(
         checkpoint_assignment_fence(7, &[NodeId(1), NodeId(2)], vec![p1, p2], &missing_report,)
             .is_none()
     );
     let stale_report = rustc_hash::FxHashMap::from_iter([
-        (1, adoption(p1, 7, &[1, 2])),
-        (2, adoption(p2, 6, &[1, 2])),
+        (1, adoption(p1, 7, &[1, 2], true)),
+        (2, adoption(p2, 6, &[1, 2], true)),
     ]);
     assert!(
         checkpoint_assignment_fence(7, &[NodeId(1), NodeId(2)], vec![p1, p2], &stale_report,)
@@ -1332,8 +1405,8 @@ fn checkpoint_fence_requires_exact_reports_and_complete_live_owners() {
     );
 
     let divergent_same_version = rustc_hash::FxHashMap::from_iter([
-        (1, adoption(p1, 7, &[1, 2])),
-        (2, adoption(p2, 7, &[2, 1])),
+        (1, adoption(p1, 7, &[1, 2], true)),
+        (2, adoption(p2, 7, &[2, 1], true)),
     ]);
     assert!(checkpoint_assignment_fence(
         7,
@@ -1349,8 +1422,8 @@ fn checkpoint_fence_requires_exact_reports_and_complete_live_owners() {
         &[NodeId(1), NodeId(2)],
         vec![p1, restarted_p2],
         &rustc_hash::FxHashMap::from_iter([
-            (1, adoption(p1, 7, &[1, 2])),
-            (2, adoption(p2, 7, &[1, 2])),
+            (1, adoption(p1, 7, &[1, 2], true)),
+            (2, adoption(p2, 7, &[1, 2], true)),
         ]),
     )
     .is_none());
@@ -2165,32 +2238,22 @@ async fn watcher_resumes_exact_authority_after_transient_audit_gaps() {
         serde_json::to_string(&incomplete_adoption).unwrap(),
     );
     tokio::time::timeout(Duration::from_secs(1), async {
-        while !db.cluster_intake_fenced()
-            || sender.assignment_version() != 0
-            || receiver.assignment_version() != 0
-        {
+        loop {
+            let repaired = controller
+                .read_adopted_assignments()
+                .await
+                .unwrap()
+                .into_iter()
+                .find_map(|(node, adoption)| (node == self_id).then_some(adoption));
+            if repaired.as_ref() == Some(&exact_adoption) {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("an incomplete adoption cut must suspend assignment authority");
-    assert_eq!(
-        controller.checkpoint_assignment_fence(committed.version),
-        None
-    );
-
-    kv.seed(
-        self_id,
-        "control:adopted-assignment",
-        serde_json::to_string(&exact_adoption).unwrap(),
-    );
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while db.cluster_intake_fenced() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the exact adoption cut should resume its retained certificate");
+    .expect("the live watcher must repair an out-of-band stale adoption report");
+    assert!(!db.cluster_intake_fenced());
     assert_eq!(registry.assignment_version(), committed.version);
     assert_eq!(sender.assignment_version(), committed.version);
     assert_eq!(receiver.assignment_version(), committed.version);

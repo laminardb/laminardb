@@ -604,6 +604,7 @@ async fn local_evidence_fixture_with_auth(
         partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
         vnode_count: u32::try_from(owners.len()).unwrap(),
         assignment_digest: CheckpointAssignmentFence::owner_map_digest(3, &owners),
+        vnode_state_ready: true,
     };
     if publish_adoption {
         controller

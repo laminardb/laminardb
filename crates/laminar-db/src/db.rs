@@ -900,6 +900,14 @@ fn local_state_requires_full_restore(
             })
 }
 
+#[cfg(feature = "cluster")]
+const fn predecessor_readiness_withdrawal_required(
+    has_pending_transition: bool,
+    observed_assignment_version: u64,
+) -> bool {
+    has_pending_transition && observed_assignment_version != 0
+}
+
 impl LaminarDB {
     pub(crate) const fn runtime_mode(&self) -> RuntimeMode {
         self.runtime_mode
@@ -940,6 +948,97 @@ impl LaminarDB {
         registry: &laminar_core::state::VnodeRegistry,
     ) -> bool {
         self.pending_vnode_transition.lock().is_some() || registry.any_restoring()
+    }
+
+    /// Whether the current graph has completely installed this assignment's managed vnode state.
+    /// A process without a checkpoint coordinator has no managed pipeline identity to bind. Once
+    /// an identity exists, readiness requires the exact assignment-and-identity success marker.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn local_vnode_state_is_ready(
+        &self,
+        registry: &laminar_core::state::VnodeRegistry,
+        assignment: &laminar_core::checkpoint::CheckpointAssignmentFence,
+    ) -> Result<bool, DbError> {
+        let local_assignment = registry.versioned_snapshot();
+        let owner_ids: Vec<u64> = local_assignment
+            .owners()
+            .iter()
+            .map(|owner| owner.0)
+            .collect();
+        if !assignment.is_canonical()
+            || assignment.assignment_version != local_assignment.version()
+            || !assignment.matches_owner_map(&owner_ids)
+        {
+            return Ok(false);
+        }
+        if self.has_unapplied_vnode_transition(registry) {
+            return Ok(false);
+        }
+        let pipeline_identity = self
+            .coordinator
+            .lock()
+            .await
+            .as_ref()
+            .map(crate::checkpoint_coordinator::CheckpointCoordinator::bound_pipeline_identity)
+            .transpose()?;
+        Ok(pipeline_identity.as_ref().is_none_or(|pipeline_identity| {
+            self.installed_vnode_state
+                .lock()
+                .as_ref()
+                .is_some_and(|installed| installed.matches(assignment, pipeline_identity))
+        }))
+    }
+
+    /// Build this process's exact assignment identity and semantic vnode-state readiness report.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn local_vnode_state_report(
+        &self,
+        controller: &laminar_core::cluster::control::ClusterController,
+        assignment: &laminar_core::state::VnodeAssignmentSnapshot,
+        vnode_state_ready: bool,
+    ) -> Result<laminar_core::checkpoint::CheckpointAssignmentAdoption, DbError> {
+        let owner_ids: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
+        let vnode_count = u32::try_from(owner_ids.len()).map_err(|_| {
+            DbError::Checkpoint("local vnode-state report owner count exceeds u32::MAX".into())
+        })?;
+        let report = laminar_core::checkpoint::CheckpointAssignmentAdoption {
+            participant: laminar_core::checkpoint::CheckpointParticipant {
+                node_id: controller.instance_id().0,
+                boot_incarnation: controller.recovery_incarnation(),
+            },
+            assignment_version: assignment.version(),
+            partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
+            vnode_count,
+            assignment_digest:
+                laminar_core::checkpoint::CheckpointAssignmentFence::owner_map_digest(
+                    vnode_count,
+                    &owner_ids,
+                ),
+            vnode_state_ready,
+        };
+        Ok(report)
+    }
+
+    /// Durably publish a local vnode-state report. A `false` report is the withdrawal that must
+    /// precede exposing new pending/restoring work for an already-reported assignment.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn publish_local_vnode_state_report(
+        &self,
+        controller: &laminar_core::cluster::control::ClusterController,
+        assignment: &laminar_core::state::VnodeAssignmentSnapshot,
+        vnode_state_ready: bool,
+    ) -> Result<laminar_core::checkpoint::CheckpointAssignmentAdoption, DbError> {
+        let report = self.local_vnode_state_report(controller, assignment, vnode_state_ready)?;
+        controller
+            .announce_adopted_assignment(&report)
+            .await
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "could not publish local vnode-state readiness for assignment {}: {error}",
+                    assignment.version()
+                ))
+            })?;
+        Ok(report)
     }
 
     /// Create an embedded in-memory database with default settings.
@@ -2707,6 +2806,26 @@ impl LaminarDB {
         } else {
             None
         };
+
+        // Assignment zero is intentionally noncanonical and can never have published a readiness
+        // report. Replacement processes therefore stage their first target restore without an
+        // impossible predecessor withdrawal; the watcher publishes target=false after adoption.
+        if predecessor_readiness_withdrawal_required(
+            pending_transition.is_some(),
+            observed_assignment.version(),
+        ) {
+            tokio::time::timeout_at(
+                deadline,
+                self.publish_local_vnode_state_report(&controller, &observed_assignment, false),
+            )
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "assignment {} timed out withdrawing predecessor vnode-state readiness",
+                    snapshot.version
+                ))
+            })??;
+        }
 
         // Publish one complete immutable transition while the compute-cycle write fence is held,
         // then publish ownership before releasing its slot. The next cycle therefore observes

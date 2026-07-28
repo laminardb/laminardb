@@ -6316,6 +6316,7 @@ fn local_assignment_cut_fixture() -> (
                         partitioning_abi_version: fence.partitioning_abi_version,
                         vnode_count: fence.vnode_count,
                         assignment_digest: fence.assignment_digest,
+                        vnode_state_ready: true,
                     },
                 },
             )

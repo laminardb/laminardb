@@ -240,7 +240,6 @@ struct SnapshotWatcher {
     config: RebalanceConfig,
     controller: Option<Arc<ClusterController>>,
     ticker: tokio::time::Interval,
-    published_adoption: Option<CheckpointAssignmentAdoption>,
     metrics_version: u64,
     last_drained: u64,
     durable_snapshot: Option<AssignmentSnapshot>,
@@ -271,7 +270,6 @@ impl SnapshotWatcher {
             config,
             controller,
             ticker,
-            published_adoption: None,
             metrics_version: 0,
             last_drained: 0,
             durable_snapshot: None,
@@ -364,6 +362,18 @@ impl SnapshotWatcher {
             self.assignment_authority_dirty = true;
         }
 
+        // Serialize the report with assignment adoption and boot staging. A transition publishes
+        // its false report under this same lock before exposing pending/restoring state, so a
+        // delayed watcher can never overwrite that withdrawal with stale readiness.
+        let Ok(adoption_guard) =
+            tokio::time::timeout_at(head_deadline, self.db.assignment_adoption_lock.lock()).await
+        else {
+            self.assignment_authority_dirty = true;
+            warn!(
+                "vnode-state readiness publication timed out waiting for assignment serialization"
+            );
+            return;
+        };
         let assignment = self.registry.versioned_snapshot();
         let version = assignment.version();
         if let Some(ref c) = self.controller {
@@ -371,50 +381,72 @@ impl SnapshotWatcher {
                 node_id: c.instance_id().0,
                 boot_incarnation: c.recovery_incarnation(),
             };
-            let local_is_participant = self.durable_snapshot.as_ref().is_some_and(|snapshot| {
-                snapshot.version == version
-                    && snapshot
-                        .participants
-                        .binary_search_by_key(&participant.node_id, |entry| entry.node_id)
-                        .ok()
-                        .and_then(|index| snapshot.participants.get(index))
-                        == Some(&participant)
+            let exact_assignment_fence = self
+                .durable_snapshot
+                .as_ref()
+                .filter(|snapshot| {
+                    !snapshot.draining
+                        && snapshot.version == version
+                        && snapshot.has_canonical_participants()
+                        && snapshot
+                            .to_vnode_vec(self.registry.vnode_count())
+                            .is_ok_and(|owners| owners.as_slice() == assignment.owners())
+                })
+                .and_then(|snapshot| snapshot.assignment_fence().ok());
+            let local_is_participant = exact_assignment_fence.as_ref().is_some_and(|fence| {
+                fence.participant_incarnation(participant.node_id)
+                    == Some(participant.boot_incarnation)
             });
-            if local_is_participant {
-                let owner_ids: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
-                let adoption = CheckpointAssignmentAdoption {
-                    participant,
-                    assignment_version: version,
-                    vnode_count: self.registry.vnode_count(),
-                    partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
-                    assignment_digest: CheckpointAssignmentFence::owner_map_digest(
-                        self.registry.vnode_count(),
-                        &owner_ids,
-                    ),
+            if let Some(exact_assignment_fence) =
+                exact_assignment_fence.filter(|_| local_is_participant)
+            {
+                let vnode_state_ready = match tokio::time::timeout_at(
+                    head_deadline,
+                    self.db
+                        .local_vnode_state_is_ready(&self.registry, &exact_assignment_fence),
+                )
+                .await
+                {
+                    Ok(Ok(ready)) => ready,
+                    Ok(Err(error)) => {
+                        warn!(%error, version, "could not determine local vnode-state readiness");
+                        drop(adoption_guard);
+                        return;
+                    }
+                    Err(_) => {
+                        warn!(
+                            version,
+                            "local vnode-state readiness exceeded the head deadline"
+                        );
+                        drop(adoption_guard);
+                        return;
+                    }
                 };
-                if self.published_adoption.as_ref() != Some(&adoption) {
-                    match tokio::time::timeout_at(
-                        head_deadline,
-                        c.announce_adopted_assignment(&adoption),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => self.published_adoption = Some(adoption),
-                        Ok(Err(error)) => {
-                            warn!(%error, version, "adopted assignment publication failed; retrying");
-                        }
-                        Err(_) => {
-                            warn!(
-                                version,
-                                "adopted assignment publication exceeded the head deadline"
-                            );
-                        }
+                // Do not suppress same-value writes here. Startup, assignment adoption, and
+                // recovery staging also publish this durable slot directly; a watcher-local cache
+                // cannot observe those writes and could otherwise strand a newer false report.
+                let publication =
+                    self.db
+                        .publish_local_vnode_state_report(c, &assignment, vnode_state_ready);
+                match tokio::time::timeout_at(head_deadline, publication).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        warn!(%error, version, "assignment vnode-state report publication failed; retrying");
+                        drop(adoption_guard);
+                        return;
+                    }
+                    Err(_) => {
+                        warn!(
+                            version,
+                            "assignment vnode-state report publication exceeded the head deadline"
+                        );
+                        drop(adoption_guard);
+                        return;
                     }
                 }
-            } else {
-                self.published_adoption = None;
             }
         }
+        drop(adoption_guard);
         if version != self.metrics_version {
             self.metrics_version = version;
             if let (Some(c), Some(metrics)) = (self.controller.as_ref(), self.db.engine_metrics()) {
@@ -1085,6 +1117,9 @@ fn checkpoint_assignment_fence(
         })
         || participants.iter().any(|participant| {
             reported.get(&participant.node_id).is_none_or(|adoption| {
+                // Transport activation requires exact assignment adoption, including while vnode
+                // state is still installing. Graceful rotation applies the stronger semantic
+                // readiness gate separately immediately before its durable CAS.
                 adoption.participant != *participant
                     || adoption.assignment_version != assignment_version
                     || adoption.vnode_count != vnode_count
@@ -1096,6 +1131,38 @@ fn checkpoint_assignment_fence(
     }
 
     CheckpointAssignmentFence::from_owner_map(assignment_version, &owner_ids, participants).ok()
+}
+
+fn assignment_vnode_state_is_ready(
+    fence: &CheckpointAssignmentFence,
+    reported: &rustc_hash::FxHashMap<u64, CheckpointAssignmentAdoption>,
+) -> bool {
+    fence.participants.iter().all(|participant| {
+        reported.get(&participant.node_id).is_some_and(|adoption| {
+            adoption.vnode_state_ready
+                && adoption.participant == *participant
+                && adoption.matches_fence(fence)
+        })
+    })
+}
+
+async fn read_assignment_vnode_state_readiness(
+    controller: &ClusterController,
+    fence: &CheckpointAssignmentFence,
+    deadline: tokio::time::Instant,
+) -> Result<bool, String> {
+    let reported = tokio::time::timeout_at(deadline, controller.read_adopted_assignments())
+        .await
+        .map_err(|_| {
+            format!(
+                "vnode-state readiness read for assignment {} timed out",
+                fence.assignment_version
+            )
+        })??
+        .into_iter()
+        .map(|(node, adoption)| (node.0, adoption))
+        .collect();
+    Ok(assignment_vnode_state_is_ready(fence, &reported))
 }
 
 fn local_drain_participant(
@@ -2345,12 +2412,23 @@ fn execute_graceful_rotation_owned(
         let current_owners = current
             .to_vnode_vec(registry.vnode_count())
             .map_err(|error| error.to_string())?;
+        let publication_deadline = tokio::time::Instant::now() + config.checkpoint_timeout;
         let rotate_outcome = {
             // Assignment adoption and startup recovery create pending/restoring vnode work under
             // this lock. Keep it through the durable CAS so neither can appear after preflight but
             // before V+1 is published. The scope must end before conflict adoption or drain
             // finalization, both of which acquire the same lock.
-            let _adoption = db.assignment_adoption_lock.lock().await;
+            let _adoption = tokio::time::timeout_at(
+                publication_deadline,
+                db.assignment_adoption_lock.lock(),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "graceful rotation from assignment {} timed out waiting for assignment serialization",
+                    current.version
+                )
+            })?;
             let local = registry.versioned_snapshot();
             if local.version() != current.version || local.owners() != current_owners.as_slice() {
                 return Err(format!(
@@ -2359,10 +2437,22 @@ fn execute_graceful_rotation_owned(
                     local.version()
                 ));
             }
-            if db.has_unapplied_vnode_transition(&registry) {
+            let local_vnode_state_ready = tokio::time::timeout_at(
+                publication_deadline,
+                db.local_vnode_state_is_ready(&registry, &transition.predecessor),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "graceful rotation from assignment {} timed out checking local vnode-state readiness",
+                    current.version
+                )
+            })?
+            .map_err(|error| error.to_string())?;
+            if !local_vnode_state_ready {
                 debug!(
                     version = current.version,
-                    "graceful rotation deferred while vnode transition work remains unapplied"
+                    "graceful rotation deferred until local vnode state matches the predecessor"
                 );
                 return Ok(None);
             }
@@ -2370,20 +2460,52 @@ fn execute_graceful_rotation_owned(
             else {
                 debug!(
                     version = current.version,
-                    "graceful rotation deferred until the predecessor is owner-complete"
+                    "graceful rotation deferred until the predecessor assignment is adopted"
                 );
                 return Ok(None);
             };
             if published_fence != transition.predecessor {
                 return Err(format!(
-                    "graceful rotation predecessor assignment {} does not match the exact owner-complete certificate",
+                    "graceful rotation predecessor assignment {} does not match the exact assignment-adoption certificate",
                     current.version
                 ));
             }
-            store
-                .save_if_version(&drain, current.version)
-                .await
-                .map_err(|error| error.to_string())?
+            // This mutable report scan is a best-current preflight, not a cross-node lease. It
+            // prevents assignment chaining before every participant's initial install; a later
+            // withdrawal is contained by source drain and forced-checkpoint abort/recovery.
+            if !read_assignment_vnode_state_readiness(
+                &controller,
+                &transition.predecessor,
+                publication_deadline,
+            )
+            .await?
+            {
+                debug!(
+                    version = current.version,
+                    "graceful rotation deferred until every participant installs vnode state"
+                );
+                return Ok(None);
+            }
+            match tokio::time::timeout_at(
+                publication_deadline,
+                store.save_if_version(&drain, current.version),
+            )
+            .await
+            {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(error)) => {
+                    return Err(format!(
+                        "assignment drain {} publication failed with an ambiguous durable outcome: {error}; the durable head must be reconciled on retry",
+                        drain.version
+                    ));
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "assignment drain {} publication timed out with an ambiguous durable outcome; the durable head must be reconciled on retry",
+                        drain.version
+                    ));
+                }
+            }
         };
         match rotate_outcome {
             RotateOutcome::Rotated => {

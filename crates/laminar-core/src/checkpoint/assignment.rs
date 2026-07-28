@@ -21,7 +21,8 @@ pub struct CheckpointParticipant {
     pub boot_incarnation: Uuid,
 }
 
-/// One process's exact adopted assignment identity, published into its control-plane slot.
+/// One process's exact adopted assignment identity and local vnode-state readiness, published into
+/// its control-plane slot.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "UncheckedCheckpointAssignmentAdoption")]
 pub struct CheckpointAssignmentAdoption {
@@ -35,6 +36,9 @@ pub struct CheckpointAssignmentAdoption {
     pub vnode_count: u32,
     /// Digest of the adopted partitioning ABI and ordered vnode-owner map.
     pub assignment_digest: [u8; 32],
+    /// Whether every vnode transition for this assignment has completed semantic graph install.
+    /// Transport activation intentionally does not require this bit; assignment rotation does.
+    pub vnode_state_ready: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -44,6 +48,7 @@ struct UncheckedCheckpointAssignmentAdoption {
     partitioning_abi_version: u16,
     vnode_count: u32,
     assignment_digest: [u8; 32],
+    vnode_state_ready: bool,
 }
 
 impl TryFrom<UncheckedCheckpointAssignmentAdoption> for CheckpointAssignmentAdoption {
@@ -56,6 +61,7 @@ impl TryFrom<UncheckedCheckpointAssignmentAdoption> for CheckpointAssignmentAdop
             partitioning_abi_version: unchecked.partitioning_abi_version,
             vnode_count: unchecked.vnode_count,
             assignment_digest: unchecked.assignment_digest,
+            vnode_state_ready: unchecked.vnode_state_ready,
         };
         adoption
             .is_canonical()
@@ -517,6 +523,7 @@ mod tests {
             partitioning_abi_version: PARTITIONING_ABI_VERSION,
             vnode_count: fence.vnode_count,
             assignment_digest: fence.assignment_digest,
+            vnode_state_ready: true,
         };
         assert!(adoption.is_canonical());
         assert!(adoption.matches_fence(&fence));
@@ -527,6 +534,13 @@ mod tests {
             .unwrap()
             .remove("partitioning_abi_version");
         assert!(serde_json::from_value::<CheckpointAssignmentAdoption>(missing_adoption).is_err());
+
+        let mut missing_readiness = serde_json::to_value(&adoption).unwrap();
+        missing_readiness
+            .as_object_mut()
+            .unwrap()
+            .remove("vnode_state_ready");
+        assert!(serde_json::from_value::<CheckpointAssignmentAdoption>(missing_readiness).is_err());
 
         let mut wrong_adoption = adoption;
         wrong_adoption.partitioning_abi_version = PARTITIONING_ABI_VERSION + 1;

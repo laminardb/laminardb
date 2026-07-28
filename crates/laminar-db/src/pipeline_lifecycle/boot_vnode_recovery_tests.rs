@@ -73,6 +73,7 @@ async fn boot_test_db(registry: Arc<VnodeRegistry>) -> Arc<LaminarDB> {
             std::time::Duration::from_secs(60),
         )))
         .unwrap();
+    controller.publish_recovery_incarnation().await.unwrap();
 
     LaminarDB::builder()
         .cluster_controller(controller)
@@ -142,6 +143,10 @@ async fn boot_report_marks_and_stages_the_exact_owned_roster() {
     let target_assignment = registry.versioned_snapshot();
     let (target_fence, participant, restore_cut) =
         boot_restore_authority(&target_assignment, attempt, &[0, 1]);
+    let controller = db.cluster_controller.lock().clone().unwrap();
+    db.publish_local_vnode_state_report(&controller, &target_assignment, true)
+        .await
+        .unwrap();
 
     db.publish_boot_vnode_restore_transition(
         &registry,
@@ -151,8 +156,16 @@ async fn boot_report_marks_and_stages_the_exact_owned_roster() {
         restore_cut,
         report,
     )
+    .await
     .unwrap();
 
+    let readiness = controller.read_adopted_assignments().await.unwrap();
+    let local_report = readiness
+        .iter()
+        .find_map(|(node, report)| (*node == ClusterNodeId(1)).then_some(report))
+        .expect("boot staging must retain the local readiness slot");
+    assert_eq!(local_report.assignment_version, target_assignment.version());
+    assert!(!local_report.vnode_state_ready);
     assert_eq!(registry.restoring_vnodes(), vec![0, 1]);
     let transition = db
         .pending_vnode_transition
@@ -205,6 +218,7 @@ async fn invalid_boot_report_changes_neither_staging_nor_lifecycle() {
             restore_cut,
             report,
         )
+        .await
         .unwrap_err();
 
     assert!(error.to_string().contains("does not match acquired roster"));
@@ -238,6 +252,7 @@ async fn changed_boot_assignment_rejects_report_without_mutation() {
             restore_cut,
             report,
         )
+        .await
         .unwrap_err();
 
     assert!(error.to_string().contains("changed"), "{error}");
@@ -270,6 +285,7 @@ async fn wrong_boot_attempt_rejects_report_without_mutation() {
             restore_cut,
             report,
         )
+        .await
         .unwrap_err();
 
     assert!(error.to_string().contains("does not match"), "{error}");
@@ -299,6 +315,7 @@ async fn failed_boot_preparation_retains_prior_exact_transition_and_lifecycle() 
             ]),
         },
     )
+    .await
     .unwrap();
     let prior = db
         .pending_vnode_transition
@@ -349,6 +366,7 @@ async fn successful_boot_replacement_publishes_exact_arc_and_target_lifecycle() 
             chains: HashMap::from([(0, vec![Bytes::from_static(b"prior")])]),
         },
     )
+    .await
     .unwrap();
     let prior = db
         .pending_vnode_transition
@@ -372,6 +390,7 @@ async fn successful_boot_replacement_publishes_exact_arc_and_target_lifecycle() 
             chains: HashMap::from([(0, vec![Bytes::from_static(b"replacement")])]),
         },
     )
+    .await
     .unwrap();
 
     let replacement = db
@@ -557,6 +576,7 @@ async fn fresh_cluster_start_rejects_staged_vnode_state_without_clearing_it() {
         ]),
     };
     db.publish_boot_vnode_restore_transition(&registry, &target, fence, participant, cut, loaded)
+        .await
         .unwrap();
     let pending = db
         .pending_vnode_transition
@@ -610,6 +630,7 @@ async fn assert_boot_recovery_target_mismatch_is_non_mutating(
             ]),
         },
     )
+    .await
     .unwrap();
     let pending = db
         .pending_vnode_transition

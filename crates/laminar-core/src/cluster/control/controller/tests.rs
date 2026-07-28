@@ -369,6 +369,7 @@ fn assignment_adoption(
         partitioning_abi_version: crate::state::PARTITIONING_ABI_VERSION,
         vnode_count: u32::try_from(owners.len()).unwrap(),
         assignment_digest: CheckpointAssignmentFence::owner_map_digest(3, &owners),
+        vnode_state_ready: true,
     }
 }
 
@@ -2105,6 +2106,7 @@ async fn adopted_assignment_report_binds_the_current_process_and_exact_map() {
         partitioning_abi_version: crate::state::PARTITIONING_ABI_VERSION,
         vnode_count: u32::try_from(owners.len()).unwrap(),
         assignment_digest: CheckpointAssignmentFence::owner_map_digest(3, &owners),
+        vnode_state_ready: true,
     };
     c.announce_adopted_assignment(&report).await.unwrap();
     assert_eq!(
@@ -2112,7 +2114,15 @@ async fn adopted_assignment_report_binds_the_current_process_and_exact_map() {
         vec![(NodeId(1), report.clone())]
     );
 
-    let mut restarted = report;
+    let mut withdrawn = report;
+    withdrawn.vnode_state_ready = false;
+    c.announce_adopted_assignment(&withdrawn).await.unwrap();
+    assert_eq!(
+        c.read_adopted_assignments().await.unwrap(),
+        vec![(NodeId(1), withdrawn.clone())]
+    );
+
+    let mut restarted = withdrawn;
     restarted.participant.boot_incarnation = Uuid::new_v4();
     assert!(c.announce_adopted_assignment(&restarted).await.is_err());
 }

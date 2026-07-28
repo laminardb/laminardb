@@ -1231,8 +1231,126 @@ impl LaminarDB {
         Ok(())
     }
 
+    /// Prepare the success marker for a graph generation with no vnode transition callbacks.
+    /// Startup holds `assignment_adoption_lock`, so the registry cannot be overtaken while durable
+    /// history is revalidated. The marker is installed at the compute-generation ready boundary.
     #[cfg(feature = "cluster")]
-    fn publish_boot_vnode_restore_transition(
+    async fn prepare_graph_ready_vnode_state_binding(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<crate::vnode_transition_staging::InstalledVnodeStateBinding>, DbError> {
+        let registry = self.vnode_registry.lock().clone().ok_or_else(|| {
+            DbError::Checkpoint(
+                "cluster graph readiness has no vnode registry for installed-state binding".into(),
+            )
+        })?;
+        let assignment = registry.versioned_snapshot();
+        if assignment.version() == 0 || self.has_unapplied_vnode_transition(&registry) {
+            return Ok(None);
+        }
+
+        let pipeline_identity = self
+            .coordinator
+            .lock()
+            .await
+            .as_ref()
+            .map(crate::checkpoint_coordinator::CheckpointCoordinator::bound_pipeline_identity)
+            .transpose()?;
+        let Some(pipeline_identity) = pipeline_identity else {
+            return Ok(None);
+        };
+        let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
+            DbError::Checkpoint(
+                "cluster graph readiness has no controller for assignment validation".into(),
+            )
+        })?;
+        let store = self
+            .assignment_snapshot_store
+            .lock()
+            .clone()
+            .ok_or_else(|| {
+                DbError::Checkpoint(
+                    "cluster graph readiness has no durable assignment history".into(),
+                )
+            })?;
+        let durable = tokio::time::timeout_at(deadline, store.load_version(assignment.version()))
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "assignment {} history read timed out at graph readiness",
+                    assignment.version()
+                ))
+            })?
+            .map_err(|error| DbError::Checkpoint(error.to_string()))?
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "assignment {} is absent from durable history at graph readiness",
+                    assignment.version()
+                ))
+            })?;
+        tokio::time::timeout_at(
+            deadline,
+            crate::rebalance::audit_assignment_snapshot_authority(
+                &store,
+                Some(controller.as_ref()),
+                &durable,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            DbError::Checkpoint(format!(
+                "assignment {} authority audit timed out at graph readiness",
+                assignment.version()
+            ))
+        })?
+        .map_err(DbError::Checkpoint)?;
+        let durable_owners = durable
+            .to_vnode_vec(registry.vnode_count())
+            .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+        if durable.draining
+            || durable.version != assignment.version()
+            || durable_owners.as_slice() != assignment.owners()
+        {
+            return Err(DbError::Checkpoint(format!(
+                "assignment {} durable history does not match the graph-ready registry",
+                assignment.version()
+            )));
+        }
+        let fence = durable
+            .assignment_fence()
+            .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+        match fence.participant_incarnation(controller.instance_id().0) {
+            Some(boot_incarnation) if boot_incarnation == controller.recovery_incarnation() => {}
+            Some(_) => {
+                return Err(DbError::Checkpoint(format!(
+                    "assignment {} names a different local process incarnation at graph readiness",
+                    assignment.version()
+                )));
+            }
+            None => return Ok(None),
+        }
+
+        // Revalidate after external I/O even though startup still owns assignment adoption.
+        let current = registry.versioned_snapshot();
+        if current.version() != assignment.version()
+            || current.owners() != assignment.owners()
+            || self.has_unapplied_vnode_transition(&registry)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "assignment {} changed or gained vnode work before graph-ready publication",
+                assignment.version()
+            )));
+        }
+        Ok(Some(
+            crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
+                fence,
+                pipeline_identity,
+            )?,
+        ))
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn publish_boot_vnode_restore_transition(
         &self,
         registry: &laminar_core::state::VnodeRegistry,
         target_assignment: &laminar_core::state::VnodeAssignmentSnapshot,
@@ -1275,12 +1393,18 @@ impl LaminarDB {
                     != Some(laminar_core::state::NodeId(local_node_id))
             })
             .collect();
+        drop(current_assignment);
 
         // The caller owns the startup assignment and generation fences. Publish lifecycle and
         // the complete immutable replacement while the exact target assignment remains pinned.
         // Reserve the new owned roster before exposing its transition so hot-path readiness can
         // observe a conservative false positive, never a false Active state. Only lifecycle
         // entries proven unowned by this exact target may be released from stale boot work.
+        let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
+            DbError::Checkpoint("[LDB-6031] boot vnode staging has no cluster controller".into())
+        })?;
+        self.publish_local_vnode_state_report(&controller, target_assignment, false)
+            .await?;
         let mut pending = self.pending_vnode_transition.lock();
         registry.mark_restoring(&target_owned);
         *pending = Some(transition);
@@ -1458,7 +1582,8 @@ impl LaminarDB {
             },
             restore_cut.clone(),
             loaded,
-        )?;
+        )
+        .await?;
         tracing::info!(
             staged = owned.len(),
             epoch = attempt.epoch,
@@ -3955,12 +4080,44 @@ impl LaminarDB {
         mut graph: crate::operator_graph::OperatorGraph,
         sources: &mut [TrackedSourceRegistration],
         runtime_mode: RuntimeMode,
+        vnode_state_report_timeout: std::time::Duration,
     ) -> Result<PipelineRecoveryState, DbError> {
+        #[cfg(not(feature = "cluster"))]
+        let _ = vnode_state_report_timeout;
         #[cfg(feature = "cluster")]
         if runtime_mode == RuntimeMode::Cluster {
             // A new graph generation has no installed vnode state until fresh initialization or
             // exact-cut callbacks complete. A stopped/faulted graph must never lend its marker to
-            // the replacement generation.
+            // the replacement generation. Startup holds assignment_adoption_lock, so publish the
+            // durable withdrawal before clearing the marker; otherwise a remote rotation could
+            // consume a stale true report during recovery preparation.
+            let registry = self.vnode_registry.lock().clone().ok_or_else(|| {
+                DbError::Checkpoint(
+                    "cluster pipeline recovery has no vnode registry for readiness withdrawal"
+                        .into(),
+                )
+            })?;
+            let assignment = registry.versioned_snapshot();
+            if assignment.version() != 0 {
+                let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "cluster pipeline recovery has no controller for readiness withdrawal"
+                            .into(),
+                    )
+                })?;
+                let deadline = tokio::time::Instant::now() + vnode_state_report_timeout;
+                tokio::time::timeout_at(
+                    deadline,
+                    self.publish_local_vnode_state_report(&controller, &assignment, false),
+                )
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "assignment {} vnode-state readiness withdrawal timed out before pipeline recovery",
+                        assignment.version()
+                    ))
+                })??;
+            }
             self.installed_vnode_state.lock().take();
         }
         // Must run BEFORE begin_initial_epoch so the epoch reflects the recovered state.
@@ -5035,9 +5192,9 @@ impl LaminarDB {
             }
         }
 
-        // Readiness transfers the recovered MV image and fully wired graph to the live loop.
-        // Release only now: a subsequent assignment may safely stage into the graph's shared
-        // handles, and a first cycle already waiting on the read fence can then proceed.
+        // Readiness transfers the recovered MV image and fully wired graph to the live loop. The
+        // caller installed any pre-audited no-work success marker before launch, so an immediate
+        // runtime fault can only clear it, never race a post-ready write that resurrects it.
         #[cfg(feature = "cluster")]
         drop(startup_generation_fence);
 
@@ -5274,7 +5431,12 @@ impl LaminarDB {
                 reconciled_source_handoff_version: startup_reconciled_source_handoff_version,
             restored_reference_tables,
         } = self
-            .recover_pipeline_state(graph, &mut sources, runtime_mode)
+            .recover_pipeline_state(
+                graph,
+                &mut sources,
+                runtime_mode,
+                pipeline_checkpoint_timeout,
+            )
             .await?;
         let previous_mv_store = {
             let mut live = self.mv_store.write();
@@ -5364,14 +5526,38 @@ impl LaminarDB {
             )
             .await?;
 
-        self.launch_pipeline_runtime(
-            runtime,
-            Arc::clone(&self.shutdown_signal),
-            runtime_shutdown,
+        #[cfg(feature = "cluster")]
+        let graph_ready_vnode_state = if runtime_mode == RuntimeMode::Cluster {
+            self.prepare_graph_ready_vnode_state_binding(
+                tokio::time::Instant::now() + pipeline_checkpoint_timeout,
+            )
+            .await?
+        } else {
+            None
+        };
+        #[cfg(feature = "cluster")]
+        if let Some(installed) = graph_ready_vnode_state.as_ref() {
+            *self.installed_vnode_state.lock() = Some(installed.clone());
+        }
+        let launch = self
+            .launch_pipeline_runtime(
+                runtime,
+                Arc::clone(&self.shutdown_signal),
+                runtime_shutdown,
+                #[cfg(feature = "cluster")]
+                startup_generation_fence,
+            )
+            .await;
+        if let Err(error) = launch {
             #[cfg(feature = "cluster")]
-            startup_generation_fence,
-        )
-        .await?;
+            if let Some(expected) = graph_ready_vnode_state.as_ref() {
+                let mut installed = self.installed_vnode_state.lock();
+                if installed.as_ref() == Some(expected) {
+                    installed.take();
+                }
+            }
+            return Err(error);
+        }
 
         // Readiness has transferred the exact captured assignment and its staged state to the
         // live graph. A watcher may now prepare a successor generation.

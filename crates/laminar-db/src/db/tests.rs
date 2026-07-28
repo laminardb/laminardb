@@ -75,6 +75,134 @@ fn nonzero_assignment_requires_an_exact_installed_state_binding() {
 }
 
 #[cfg(feature = "cluster")]
+#[test]
+fn assignment_zero_pending_target_has_no_predecessor_readiness_to_withdraw() {
+    use laminar_core::checkpoint::CheckpointParticipant;
+    use laminar_core::cluster::control::AssignmentSnapshot;
+    use laminar_core::state::{CheckpointAttempt, NodeId};
+
+    let participant = CheckpointParticipant {
+        node_id: 1,
+        boot_incarnation: uuid::Uuid::from_u128(1),
+    };
+    let target = AssignmentSnapshot::empty()
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[NodeId(1)]),
+            vec![participant],
+        )
+        .unwrap();
+    let pending = synthetic_boot_transition(
+        &target,
+        &[NodeId(1)],
+        participant,
+        CheckpointAttempt::canonical(7),
+    );
+
+    assert_eq!(pending.target().assignment_version, target.version);
+    assert!(!predecessor_readiness_withdrawal_required(true, 0));
+    assert!(predecessor_readiness_withdrawal_required(
+        true,
+        target.version
+    ));
+    assert!(!predecessor_readiness_withdrawal_required(
+        false,
+        target.version
+    ));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn vnode_state_readiness_requires_the_bound_pipeline_and_exact_assignment() {
+    use laminar_core::checkpoint::{
+        CheckpointAssignmentFence, CheckpointParticipant, PipelineIdentity,
+    };
+    use laminar_core::state::{NodeId, VnodeRegistry};
+
+    let db = LaminarDB::open().unwrap();
+    let registry = VnodeRegistry::single_owner(1, NodeId(1));
+    let participant = CheckpointParticipant {
+        node_id: 1,
+        boot_incarnation: uuid::Uuid::from_u128(1),
+    };
+    let assignment = CheckpointAssignmentFence::from_owner_map(
+        registry.assignment_version(),
+        &[1],
+        vec![participant],
+    )
+    .unwrap();
+
+    assert!(db
+        .local_vnode_state_is_ready(&registry, &assignment)
+        .await
+        .unwrap());
+
+    let wrong_owner = CheckpointParticipant {
+        node_id: 2,
+        boot_incarnation: uuid::Uuid::from_u128(2),
+    };
+    let wrong_owner_assignment = CheckpointAssignmentFence::from_owner_map(
+        registry.assignment_version(),
+        &[2],
+        vec![wrong_owner],
+    )
+    .unwrap();
+    assert!(!db
+        .local_vnode_state_is_ready(&registry, &wrong_owner_assignment)
+        .await
+        .unwrap());
+
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
+        crate::checkpoint_coordinator::CheckpointConfig::default(),
+        Box::new(
+            laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
+                checkpoint_dir.path(),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    let pipeline_identity = PipelineIdentity::empty();
+    coordinator
+        .bind_pipeline_identity(pipeline_identity.clone())
+        .unwrap();
+    *db.coordinator.lock().await = Some(coordinator);
+
+    assert!(!db
+        .local_vnode_state_is_ready(&registry, &assignment)
+        .await
+        .unwrap());
+    *db.installed_vnode_state.lock() = Some(
+        crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
+            assignment.clone(),
+            pipeline_identity,
+        )
+        .unwrap(),
+    );
+    assert!(db
+        .local_vnode_state_is_ready(&registry, &assignment)
+        .await
+        .unwrap());
+
+    let successor = CheckpointAssignmentFence::from_owner_map(
+        assignment.assignment_version + 1,
+        &[1],
+        vec![participant],
+    )
+    .unwrap();
+    assert!(!db
+        .local_vnode_state_is_ready(&registry, &successor)
+        .await
+        .unwrap());
+
+    registry.mark_restoring(&[0]);
+    assert!(!db
+        .local_vnode_state_is_ready(&registry, &assignment)
+        .await
+        .unwrap());
+}
+
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn cluster_controller_identity_is_fixed_for_the_graph_generation() {
     use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
