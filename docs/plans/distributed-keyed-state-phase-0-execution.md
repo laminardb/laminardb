@@ -1,22 +1,20 @@
 # Phase 0 execution plan: distributed keyed state
 
 - **Status:** Certification/qualification work paused; backend-neutral core reference work resumed;
-  stock official Fjall 3.1.8 is the preferred worker-local qualification-entry subject; no runtime
-  dependency, backend selection, qualification evidence, independent production-soak result, or
-  admission change
+  stock Fjall 3.1.8 failed adapter entry; no runtime dependency, backend selection, qualification
+  evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-28 during Core Cycle 10
+- **Last reconciled:** 2026-07-28 after the Fjall 3.1.8 source closure
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
 
 ## Outcome
 
-Phase 0 proves the contracts needed before any stock-Fjall working-state implementation can be
-considered for production admission. Exact-source review finds the required atomic-batch, snapshot
-and ordered-range primitive shapes but leaves concurrent/crash semantics, pressure bounds,
-synchronous-call deadlines, maintenance/error health, prefix cleanup, tail latency and fault
-behavior to prove. Backend-neutral
+Phase 0 proves the contracts needed before any disk-backed working-state implementation can be
+considered for production admission. The bounded stock-Fjall 3.1.8 source closure found the required
+primitive shapes but stopped adapter entry on unbounded teardown after fatal worker exit and the
+frozen contract's incomplete background-failure surface. Backend-neutral
 Laminar lifecycle/checkpoint, publication-boundary, resource-admission and truthful health-
 composition work may continue without adding a backend dependency.
 Cycle 20 does not split the existing Phase 0 review gate;
@@ -28,10 +26,11 @@ The [2026-07-27 ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed
 pauses Cycle 69 and later certification work and authorizes only the private reference core slice.
 It is not Phase 0 completion, backend qualification, or permission to execute a candidate.
 
-The [2026-07-28 Fjall amendment](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-28-fjall-318-priority-amendment)
-supersedes the former TidesDB work order. TidesDB-specific T0/T1 and campaign text retained below is
-historical Cycle 40/41 evidence unless the current numbered implementation order explicitly says
-otherwise. It does not schedule a package wait, fork, adapter, or run.
+The [2026-07-28 Fjall source closure](../reports/fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md)
+supersedes the earlier Fjall priority amendment. TidesDB-specific T0/T1 and campaign text retained
+below is historical Cycle 40/41 evidence unless the current numbered implementation order explicitly
+says otherwise. A new bounded re-entry must identify and audit the current official Rust/native
+subject; it does not inherit adapter or execution authority from that history.
 
 Core Cycles 2–10 add a fail-closed runtime containment path for staged local vnode transitions and a
 narrow audited, committed final-owner revoke path. Cycles 4–6 pin restore to the capsule-validated
@@ -873,12 +872,12 @@ lineage reader/staging receipt. The managed artifact-v1 and `VnodePartialV2` rea
 
 Remaining work is kept reviewable in this dependency order:
 
-1. retain the Cycle 40 TidesDB selection and Cycle 41 T0 stop as historical evidence; no package
-   wait, fork, PR, adapter, or qualification work remains scheduled for that line;
-2. `docs: prioritize stock official Fjall 3.1.8 for bounded qualification-entry review` — the
-   2026-07-28 amendment changes candidate priority without adding or executing the crate. Source
-   review finds required KV primitive shapes and disproves a hard global write-buffer cap and hard
-   journal cap; the one-engineer-day, zero-candidate-machine-hour source/contract closure remains;
+1. retain the Cycle 40 TidesDB selection and Cycle 41 T0 stop as historical evidence; the stale
+   package/native pair grants no dependency, adapter, or execution authority;
+2. `docs: close stock Fjall 3.1.8 at adapter entry` — the one-engineer-day,
+   zero-candidate-machine-hour closure is complete. Fatal worker exit can leave database destruction
+   waiting indefinitely on a private active-thread count, and the frozen v2 background-failure
+   mapping is incomplete. No crate, adapter, build, or candidate execution landed;
 3. complete the remaining backend-neutral Laminar gaps required regardless of the engine.
    Core Cycle 10 now metadata-traverses every required parent seal, verifies exact child-parent
    lineage before the pre-Commit cluster-global payload/artifact sum, persists participant-agreed
@@ -889,29 +888,30 @@ Remaining work is kept reviewable in this dependency order:
    health signals, and a second state-family consumer. The outcome, publication,
    checkpoint/rebalance fencing, fresh-root, capability, and current raw-lineage authority already
    landed in Core Cycles 6–10 and must remain regression coverage rather than be reimplemented.
-   Do not add or execute Fjall in this slice. The completed containment increments and their tests are summarized in the
+   Do not add or execute a backend in this slice. The completed containment increments and their tests are summarized in the
    [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md). Core Cycles 6–10
    complete the immutable transition, aggregate prepare/publication, and current raw-lineage
    authority subsets. The next backend-neutral slice is the held acquired-subset raw transition
    reservation; wrapper/seal/request/spool/decode/RSS/pause limits, vnode sharding, and a second
    state family remain open. The latest exact boundary is recorded in the
    [Cycle 10 review](../reviews/distributed-keyed-state-core-cycle-10.md);
-4. use the one-engineer-day, zero-candidate-machine-hour read-only closure to prove truthful stable
-   sources for every required Fjall pressure, progress, error, resource and fail-stop fact. Freeze
-   the smallest testable entry contract only on a pass; the first unavailable internal fact or
-   required fork stops the candidate;
-5. only after that pass and under a separately reviewed implementation scope, build the smallest adapter/conformance
-   vertical required to prove that contract in embedded, single-node, and cluster-with-admission-
-   closed modes. Remove it if entry correctness/resource containment fails; do not build a generic
-   runtime-selectable backend framework or speculative alternate adapters;
+4. under the owner's stated pivot, separately scope a current official TidesDB Rust/native re-entry;
+   verify package and native source identity afresh, then apply a short source-first atomicity,
+   failure-lifecycle, resource and public-health gate. Stop on the first decisive veto; do not add a
+   dependency, adapter, fork, object-store coupling, or candidate run in that source slice;
+5. only after a source pass and under a separately reviewed implementation scope, build the smallest
+   adapter/conformance vertical required to prove the contract in embedded, single-node, and
+   cluster-with-admission-closed modes. Remove it if entry correctness/resource containment fails;
+   do not build a generic runtime-selectable backend framework or speculative alternate adapters;
 6. `docs: authorize an exact keyed-state qualification run`
    - the project owner may revise the candidate before explicitly authorizing exact thresholds, case
      matrix, Zipf sampler, runner source/build identity, target/isolation/limits/cost, and evidence
      rules. The current validator continues to accept only null approvals and
      `qualification_eligible=false` until that separate execution design lands;
-7. `test: exercise Fjall uniform/Zipf aggregate, timer/window and join-family C2/C3 plus checkpoint,
-   cleanup, rebalance, crash, resource and endurance gates` using only the authorized artifacts;
-8. `docs: record the Fjall qualification verdict`; a hard failure or required fork disqualifies the
+7. `test: exercise the admitted candidate with uniform/Zipf aggregate, timer/window and join-family
+   C2/C3 plus checkpoint, cleanup, rebalance, crash, resource and endurance gates` using only the
+   authorized artifacts;
+8. `docs: record the candidate qualification verdict`; a hard failure or required fork disqualifies the
    target and returns alternatives to an explicit owner decision rather than silently activating
    one;
 9. run the existing cluster failover, ALO and EO-eligible regression matrices, then complete the

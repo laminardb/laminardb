@@ -4,13 +4,13 @@
 
 ### Changed
 
-- Stock official Fjall 3.1.8 is now the sole preferred worker-local managed-state
-  qualification-entry subject, replacing the stopped TidesDB work order. Exact-source review finds
-  the required atomic-batch, snapshot, and ordered-range primitive shapes but leaves concurrent and
-  crash behavior, hard pressure bounds, maintenance/error health, prefix cleanup, p99.9/max
-  latency, and fault/resource qualification open. No backend dependency, adapter, candidate
-  execution, admission, delivery, or production-readiness change follows; no Fjall fork is
-  permitted and `[LDB-4007]`/`[LDB-0013]` remain closed.
+- The bounded stock-Fjall 3.1.8 adapter-entry source closure stops the candidate before dependency,
+  adapter, or execution. A background worker that returns an error poisons and exits without
+  decrementing Fjall's private active-thread count, while database destruction waits without a
+  deadline for that count to reach zero. Laminar cannot repair this all-mode lifecycle defect
+  through the stock public API, and the no-fork boundary remains. No backend is selected or
+  production-qualified; `[LDB-4007]`/`[LDB-0013]` remain closed and TidesDB requires a separate
+  bounded re-entry decision.
 - Managed aggregate candidates are now planned and initialized before checkpoint recovery in
   embedded, single-node, and cluster pipelines. Catalog-bridged and intermediate source schemas are
   registered before that planning boundary.

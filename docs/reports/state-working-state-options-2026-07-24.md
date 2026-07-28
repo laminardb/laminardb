@@ -8,22 +8,21 @@
   cluster-shared checkpoints
 - **Bounded-memory outcome:** reference/conformance-only under the current ADR and plan; no cluster
   product profile or production-soak matrix
-- **Preferred worker-local qualification-entry subject:** stock official Fjall 3.1.8; no backend is
+- **Current worker-local result:** stock official Fjall 3.1.8 failed adapter entry; no backend is
   selected or production-qualified, and admission remains closed
 - **Evidence:** code inspection and current primary-source review; no candidate or product run
 - **Admission:** unchanged and fail-closed under `[LDB-4007]` and `[LDB-0013]`
 
 **2026-07-28 current direction:** the engine-neutral placement conclusion remains authoritative.
-The project owner prioritizes stock official Fjall 3.1.8 as the sole preferred qualification-entry
-subject. Exact source contains atomic-batch, consistent-snapshot and ordered-range primitive shapes,
-but the global write-buffer setting is unenforced and the journal limit is soft; concurrent/crash
-semantics, synchronous stalls, maintenance/error health, prefix cleanup, serialized-write tails and
-fault behavior remain open. A bounded recheck must determine whether Laminar's direct observations
-and stock public facts together satisfy the minimum contract without a Fjall fork. The Cycle 40/41 TidesDB
-design and T0 stop are retained only as historical evidence. Selection is not qualification,
-runtime admission, or a production claim. Every later `current`, `continue`, `keep`, or `should`
-imperative in the dated Cycle 20 engine screen is historical and superseded by the current
-implementation order below.
+The bounded stock-Fjall 3.1.8
+[source closure](fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md) stops before dependency,
+adapter, or execution. Fatal worker exit can leave database destruction waiting indefinitely on
+private worker accounting; the frozen v2 background-failure mapping also cannot be completed from
+stock public facts. The Cycle 40/41 TidesDB design and T0 stop remain historical evidence, not a
+current package selection. The owner's stated next direction is a separately bounded current
+official Rust/native TidesDB source re-entry. This is not qualification, runtime admission, or a production
+claim. Every later `current`, `continue`, `keep`, or `should` imperative in the dated Cycle 20 engine
+screen is historical and superseded by the current implementation order below.
 
 ## Decision
 
@@ -148,23 +147,24 @@ validation-only implementation.
 ## Current implementation and qualification order
 
 1. Retain the Cycle 40 TidesDB design and Cycle 41 `STOP_WAIT_FOR_UPSTREAM` only as historical
-   evidence; no package wait, fork, PR, adapter, or qualification step remains scheduled.
-2. Prioritize stock official Fjall 3.1.8 for one engineer-day and zero candidate machine-hours of
-   read-only source/contract closure. Do not fork, add the dependency, construct an adapter, execute
-   the candidate, or rely on its unenforced global write-buffer option or soft journal limit.
+   evidence; the stale subject grants no dependency, adapter, or qualification authority.
+2. Record stock official Fjall 3.1.8 as `OBSERVED_DESIGN_UNSUPPORTED_IN_STOCK_SOURCE`. Its bounded
+   one-engineer-day, zero-candidate-machine-hour closure stopped on worker-exit/drop lifecycle and
+   maintenance-health contract defects; do not fork, add, adapt, or execute it.
 3. Continue the backend-neutral complete/failed-before-apply/unknown-poison publication,
    fresh-root/fencing, resource-admission, and health-capability contracts plus fake-backend fault
    tests. Cycle 42 completes the current aggregate classification/publication slice: an error after
    aggregate state application may begin requires coordinated recovery, and the recovery path
    excludes output and a due checkpoint. The backend-owned sticky native-root poison and remaining
    admission contracts stay open. Do not add Fjall in those core slices.
-4. Freeze the smallest testable adapter-entry contract only if the read-only closure proves truthful
-   sources for every required pressure, progress, error and fail-stop fact. The first required
-   internal fact unavailable without a fork stops Fjall.
-5. Only after that pass, seek separate implementation authority for the smallest all-mode adapter/
+4. Under the owner-stated pivot, separately scope a short, source-first re-entry for the current
+   official TidesDB Rust/native package. Verify exact identity and stop on the first atomicity,
+   failure-lifecycle, resource, or public-health veto; do not couple local state to its S3 path or add
+   an adapter in the source slice.
+5. Only after a source pass, seek separate implementation authority for the smallest all-mode adapter/
    conformance vertical. Remove it on a correctness or resource-containment failure; do not add
    alternative adapters or a generic runtime backend framework.
-6. Qualify the exact Fjall subject using the actual uniform/Zipf aggregate, window/timer and join
+6. Qualify the exact admitted subject using the actual uniform/Zipf aggregate, window/timer and join
    operations plus checkpoint, cleanup, rebalance, crash, corruption, disk-pressure, N/N-1 and
    p99/p99.9/max gates. A hard failure or required fork disqualifies it and returns alternatives to
    an explicit owner decision.

@@ -1,10 +1,10 @@
 # Phased plan: distributed keyed and stateful operators
 
-- **Status:** Core reference implementation resumed; stock Fjall 3.1.8 is the preferred local-spill
-  qualification-entry subject, but no backend is selected; production qualification/certification
-  is paused and no new cluster operator is admitted
+- **Status:** Core reference implementation resumed; stock Fjall 3.1.8 failed local-spill adapter
+  entry and no backend is selected; production qualification/certification is paused and no new
+  cluster operator is admitted
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-28 during Core Cycle 10
+- **Last reconciled:** 2026-07-28 after the Fjall 3.1.8 source closure
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -127,9 +127,8 @@ apply an absolute restore/acquisition deadline with cancellation, and prove rele
 abort, poison, and graph replacement. Encoded wrapper/seal metadata, decoder scratch and expansion,
 decoded/live/prepared/retired RSS, and apply/retirement pause remain separate limits.
 Bounded working-state storage remains later.
-Backend work does not block these slices. The bounded stock-Fjall entry and no-fork boundary are
-owned by the
-[ADR amendment](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-28-fjall-318-priority-amendment).
+Backend work does not block these slices. The stock-Fjall stop and no-fork boundary are recorded in
+the [source closure](../reports/fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md).
 
 **DKS-CLEANUP-001 — final maintainability gate.** The distributed keyed-state feature maintainer
 owns this gate. Low-risk cleanup lands as each core slice stabilizes; the final sweep runs after the
@@ -197,16 +196,15 @@ current decisions and evidence. This gate does not resume paused certification o
 The Cycle 20 [working-state placement analysis](../reports/state-working-state-options-2026-07-24.md)
 separates the capability from a named engine but does not change sequencing authority. Phase 1
 remains blocked by the existing Phase 0 review gate. Any later gate split requires an accepted ADR/
-plan amendment with named scope and owners. The intended broad/variable-state production profile
-  still waits for stock official Fjall 3.1.8 to pass bounded integration and absolute qualification.
-  Source review finds the required KV primitive shapes, while concurrent/crash semantics,
-  unenforced global write-buffer configuration, soft journal limits, synchronous stalls, incomplete
-  maintenance visibility, prefix cleanup and tail/fault evidence remain open. Backend-neutral
-  Laminar lifecycle, publication-boundary,
-checkpoint, resource-admission and health-composition work may continue. Candidate priority is not
-runtime authorization or production admission. The
-  project decision keeps bounded memory as a reference/conformance implementation
-  only; it has no cluster product schedule or production-soak matrix under this plan.
+plan amendment with named scope and owners. Stock Fjall 3.1.8 failed bounded adapter entry: a fatal
+worker exit can leave database destruction waiting indefinitely on private worker accounting. The
+frozen maintenance-health contract also cannot obtain complete background-failure coverage from
+stock public facts. The intended broad/variable-state profile therefore has no selected backend.
+Backend-neutral Laminar lifecycle, publication-boundary, checkpoint, resource-admission and health-
+composition work may continue. The owner-stated TidesDB pivot still requires a separately bounded
+current-package re-entry; it is not runtime authorization or production admission. Bounded memory remains a reference/
+conformance implementation only; it has no cluster product schedule or production-soak matrix under
+this plan.
 
 Cycle 42 completes one backend-neutral, runtime-consumed correction: a normal incremental
 aggregate error after state application may have begun is recovery-required, and the coordinator
@@ -242,7 +240,7 @@ a direct-API/future-refactor invariant rather than evidence of a formerly reacha
 fault. It adds one atomic check and one `Arc` clone/drop per graph cycle, not per row/operator. A
 future cancellable checkpoint-delivery path and any native operation that can outlive the graph still
 need their own owner-level poison/publication fence. Distribution, rebalance, source/sink delivery,
-Fjall integration/qualification, cluster admission, and the independent soak remain open.
+backend selection/qualification, cluster admission, and the independent soak remain open.
 
 Cycle 47 closes the audit—not the implementation—of post-graph drain publication cancellation. A
 one-slot real sink-actor probe reproduced an unclassified retained-callback drop after graph input
@@ -432,7 +430,7 @@ real-child tests. No LaminarDB process or workload was used, and configured loop
 fake-process attestation. The sealed common driver has not yet been upgraded to launch and consume
 the network-mode observer; that fake-only non-feedback proof was then the next gate before this
 workstream was suspended. Runtime admission,
-Fjall integration/qualification, source/state/sink delivery, multi-host security, latency A/B, and the
+backend selection/qualification, source/state/sink delivery, multi-host security, latency A/B, and the
 independent release soak remain open.
 
 The fake path accelerates all 58 logical slots and does not validate the 0..285-second cadence or
@@ -472,7 +470,7 @@ trusted release-process descriptors, and nonce-bound v2 responses in a non-measu
 preflight before any A/B. Multi-host work remains a
 separate diagnostics-only TLS 1.3 mTLS listener with signed node-specific roster/identity and
 attempt-bound credentials; it cannot reuse current cluster mTLS as HTTP evidence. Live A/B,
-powered equivalence, Fjall integration/qualification, runtime admission, delivery/exactly-once work, and the
+powered equivalence, backend selection/qualification, runtime admission, delivery/exactly-once work, and the
 independent release-binary soak remain separate later gates.
 
 ## Scope and non-goals
@@ -602,22 +600,21 @@ Work:
    [decision matrix](../reports/state-backend-contract-decision-matrix-2026-07-24.md) recommends an
    additive maintenance-health successor. Cycle 21 records the direction approval, and Cycle 38
    accepts the consolidated contract for validation-only implementation without a GitHub approval
-   workflow. The 2026-07-28 owner amendment makes stock official Fjall 3.1.8 the sole preferred
-   qualification-entry subject; Cycle 40/41 TidesDB selection and stop remain historical. Exact-
-   source review finds Fjall's atomic-batch, consistent-snapshot and ordered-range primitive shapes
-   but disproves a hard global memtable cap and hard journal cap and retains synchronous-stall,
-   maintenance-health and prefix-cleanup risks. The bounded recheck must prove that stable stock and
-   directly observed Laminar facts truthfully cover every required mechanism. It may not substitute
-   a watchdog for invisible engine debt, progress, stalls, or background errors. No missing signal
-   is zero and no Fjall fork or git dependency is allowed. Cycle 19's reviewed
+   workflow. The 2026-07-28
+   [Fjall source closure](../reports/fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md)
+   completes the bounded recheck with `OBSERVED_DESIGN_UNSUPPORTED_IN_STOCK_SOURCE`. The required KV
+   primitive shapes exist, but fatal worker exit can leave database destruction waiting forever on
+   private worker accounting; stock public facts also cannot close the frozen background-failure
+   contract. No missing signal is zero and no Fjall fork or git dependency is allowed. Cycle 19's reviewed
    [candidate mappings](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
    define the historical RocksDB source/binding closure and Fjall scheduler/lifecycle closure used
    by the immutable v4 reference lineage. Redb 4.1.0 is parked after its Cycle 34 design timebox; it has no scheduled
    protocol or adapter work and may reopen only under the bounded micro-prescreen charter recorded
    in its canonical protocol. SurrealKV 0.21.2 remains rejected. These engine gates apply to the
    general local-spill profile. They are not an architectural need of the in-memory reference, but
-   the current Phase 0 gate still blocks Phase 1. Run an authorized exact Fjall subject through an
-   execution profile that binds stock 3.1.8, `lsm-tree`, adapter, configuration, target and limits:
+   the current Phase 0 gate still blocks Phase 1. Under the owner-stated pivot, a separately scoped
+   current-package TidesDB source re-entry must pass before any execution profile binds its exact Rust/native source, adapter,
+   configuration, target and limits. A later admitted candidate must exercise:
    Arrow-batch-sized atomic requests, realistic
    hot/cold multi-key reads, timer scans, snapshot/export overlap, sorted restore, vnode drop/GC,
    maintenance pressure/write stalls, hard memory/disk/FD limits, `kill -9`, torn/corrupt data,
@@ -654,10 +651,10 @@ Exit gate:
 - benchmark and numerical SLO/RTO profile is reproducible on a clean runner;
 - golden ABI/schema vectors and compatibility policy pass;
 - the placement-neutral service/lifecycle and in-memory conformance subject are reviewable without
-  implying admission; before broad-profile admission, the exact stock-Fjall target passes
-  reproducible conformance, latency, resource, fault and operability gates, or it is disqualified
-  and the profile stays closed; the in-memory subject remains reference/conformance-only and
-  supplies no admission evidence;
+  implying admission; stock Fjall 3.1.8 is disqualified, so the broad profile stays closed until a
+  separately selected exact target passes reproducible conformance, latency, resource, fault and
+  operability gates; the in-memory subject remains reference/conformance-only and supplies no
+  admission evidence;
 - at least one source/operator/append-sink scenario has a complete ALO oracle and every unsupported
   output/delivery combination has a fail-closed assertion;
 - the independent production-soak charter is approved before implementation results can influence
@@ -690,12 +687,11 @@ Work packages:
 - Provide the in-memory semantic/lifecycle implementation first and the Phase-0-selected local-
   spill backend behind the same contract and conformance suite. Neither implementation changes
   admission by existing; do not retain losing disk qualification adapters.
-- If Fjall passes the ADR-008 entry closure, use only the reviewed exact official crates.io release
-  behind the managed-state facade. Every Fjall API call uses a bounded foreground blocking lane;
-  Fjall's internal maintenance remains engine-owned and un-cancellable. Freeze the exact database/
-  keyspace layout and limits in the entry contract. Do not allocate a database or keyspace per
-  vnode, expose Fjall types outside the facade, depend on a fork, or credit its deprecated global
-  write-buffer option as a resource bound.
+- Do not add Fjall 3.1.8 or preserve a losing adapter. If a separately authorized backend passes its
+  source gate, use only the reviewed exact official package behind the managed-state facade, route
+  blocking work through the bounded foreground lane, and freeze its database/keyspace layout and
+  limits. Do not allocate an engine instance per vnode, expose backend types outside the facade, or
+  depend on a private fork.
 - Encode hot values with a compact schema-versioned binary format. Do not use per-group Arrow IPC,
   live DataFusion/rkyv checkpoint types, read-before-write accounting, or the removed cold-tier
   wrapper.

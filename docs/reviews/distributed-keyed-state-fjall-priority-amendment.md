@@ -1,5 +1,10 @@
 # Distributed keyed state — Fjall 3.1.8 priority amendment review
 
+> **Superseded on 2026-07-28:** the bounded
+> [Fjall source closure](../reports/fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md) stopped
+> stock 3.1.8 before dependency, adapter, or execution. This file remains historical decision
+> provenance, not current candidate authority.
+
 - **Date:** 2026-07-28
 - **Decision commit:** `b914cc35`
 - **Reviewed decision head:** `b914cc35`

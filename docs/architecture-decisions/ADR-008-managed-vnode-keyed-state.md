@@ -3,16 +3,16 @@
 - **Status:** Accepted for phased implementation; core reference work resumed, production
   qualification paused, and cluster admission unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-28 after Core Cycle 10 and the Fjall priority amendment
+- **Last reconciled:** 2026-07-28 after Core Cycle 10 and the Fjall source closure
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
-- **Production/backend verdict:** stock official Fjall 3.1.8 is the sole preferred subject for the
-  next bounded qualification-entry assessment; no backend is selected or production-qualified and
-  admission is **NO-GO**
+- **Production/backend verdict:** stock official Fjall 3.1.8 failed bounded adapter entry; no
+  backend is selected or production-qualified and admission is **NO-GO**
 - **Related:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md),
   [implementation plan](../plans/distributed-keyed-stateful-operators.md),
   [historical Cycle 21 owner decisions](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md),
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [exact backend source audit](../reports/state-backend-static-audit-2026-07-23.md),
+  [Fjall 3.1.8 source closure](../reports/fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md),
   [historical TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
   [latest core review](../reviews/distributed-keyed-state-core-cycle-10.md)
 
@@ -21,24 +21,51 @@
 LaminarDB will add one common, byte-governed, batch-oriented working-state service scoped by stable
 pipeline, operator, table, vnode, and ownership identities. State access stays local; cold or
 blocking work is coalesced per Arrow batch and kept off compute/event-loop threads. The in-memory
-implementation is the semantic/lifecycle conformance subject only. Stock Fjall 3.1.8 is the sole
-current broad-state candidate to recheck before any integration decision. The architecture does not
-intrinsically require an LSM or make the product choice production evidence.
+implementation is the semantic/lifecycle conformance subject only. Stock Fjall 3.1.8 failed the
+bounded source gate before integration. The architecture does not intrinsically require an LSM or
+make any future product choice production evidence.
 
 Cluster-shared checkpoint storage and the existing `StateBackend` remain recovery authority. A
 local store is disposable capacity/latency infrastructure: it cannot assign a vnode, authorize an
 epoch, replace restore-before-activate/revoke fencing, or create source/sink exactly-once semantics.
 No runtime backend dependency or adapter is authorized by this ADR state.
 
+### 2026-07-28 Fjall 3.1.8 source closure
+
+The bounded, read-only
+[adapter-entry closure](../reports/fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md) disqualifies
+stock Fjall 3.1.8 before dependency, adapter, or candidate execution. The decisive all-mode defect
+is lifecycle correctness: Fjall pre-counts its worker pool, decrements only when a worker tick
+reports orderly termination, and exits a worker that returns an error without decrementing.
+`DatabaseInner::drop` then waits without a deadline for the private count to reach zero. A
+wrapper-owned fatal latch, queue timeout,
+quota, or public `persist` probe cannot reconcile that count or cancel the destructor. A sidecar is
+a different architecture, and a private fix conflicts with the no-fork boundary.
+
+The frozen v2 maintenance-health contract independently fails because automatic rotation can warn
+and discard a fallible version-history maintenance result without poison or a complete stable public
+failure signal. This is retained as a contract-specific veto; the report does not overstate it as a
+universal Fjall data-correctness failure. Native resource limits, lossy private scheduling,
+synchronous write halts, and incomplete diagnostics remain supporting qualification risks rather
+than the primary stop.
+
+The result is `OBSERVED_DESIGN_UNSUPPORTED_IN_STOCK_SOURCE`. No workload result exists because a
+structural source veto made candidate-machine execution unnecessary for this gate. No backend is selected, and no
+TidesDB dependency, adapter, or automatic fallback is authorized. The owner's stated TidesDB pivot
+is the next backend-choice direction, but its current official Rust/native subject still needs a
+separately scoped bounded re-entry; backend-neutral core work may continue.
+Fjall may re-enter only through a newer official release with source-proven balanced worker lifetime
+and bounded shutdown, followed by the complete empirical gate.
+
 ### 2026-07-28 Fjall 3.1.8 priority amendment
 
-The project-owner direction reopens the exact official
+This historical project-owner direction reopened the exact official
 [`fjall` 3.1.8](https://github.com/fjall-rs/fjall/releases/tag/3.1.8) release as the sole preferred
 qualification-entry subject. Version 3.1.8 is the current official release, not a successor to the
 already audited subject. Its tag resolves to
 `6debe706dbc53d6d0eb666aae5057671d5c1370f`; any later build must pin the top-level crate and exact
 `lsm-tree` resolution. LaminarDB will not carry a Fjall fork, private patch series, or git
-dependency. TidesDB v0.11.1 remains stopped-source evidence with no scheduled product work.
+dependency. The source closure above now supersedes this candidate-entry authority.
 
 The source/API prescreen found the needed primitive shapes—atomic batches, logically consistent
 snapshots, point access, ordered prefix/range iteration, explicit journal persistence, and a
@@ -58,15 +85,10 @@ fatal. Laminar-owned reservations, foreground-call timing, fatal latches, cgroup
 quotas may report only facts they actually observe; they cannot stand in for invisible Fjall
 compaction/flush debt or an unreported background error.
 
-The next backend step is capped at one engineer-day and zero candidate machine-hours. It is a
-read-only source/contract closure, not adapter construction or another backend survey. It must
-determine whether stock official 3.1.8 can meet the minimum pressure, maintenance-progress/error,
-bounded-memory/disk and cancellation/fail-stop contract using truthful stable sources, and freeze
-the smallest testable adapter-entry contract only on a pass. The first internal fact that remains
-unobservable without a fork stops the candidate. Only a passing entry closure may fund a separately
-reviewed adapter slice and later uniform/Zipf aggregate, window/timer and join qualification on
-target Linux/NVMe. If the latency/resource/fault gates then fail, backend choice returns to an
-explicit decision.
+The authorized backend step was capped at one engineer-day and zero candidate machine-hours. It was
+a read-only source/contract closure, not adapter construction or another backend survey. The
+closure is now complete and stopped on stock-source lifecycle and health-contract defects before an
+adapter or target Linux/NVMe run.
 
 No Fjall dependency, adapter, candidate execution, backend admission, delivery change, or
 production claim lands in this documentation amendment. `[LDB-4007]` and `[LDB-0013]` remain
@@ -96,8 +118,9 @@ profile, or admission consumer.
 
 This exception permits backend-neutral reference code while the Phase 0 product gate remains open.
 It does not itself authorize candidate construction, execution, an adapter, or a disk dependency.
-The Fjall amendment above supersedes the former TidesDB re-entry order; the complete TidesDB design
-and T0 closure remain historical decision evidence rather than current work.
+At the time of this reset, the Fjall amendment superseded the former TidesDB re-entry order and the
+complete TidesDB design/T0 closure became historical evidence. The later Fjall source stop and
+owner-stated pivot do not reactivate that stale package subject; a new bounded scope is required.
 
 Core Cycles 2–4 add runtime containment, not operator admission. Assignment adoption and startup
 stage vnode work under the assignment/rotation fences; the graph preflights the complete locally
@@ -268,12 +291,12 @@ seal, coordinator decision, or restore-before-activate authority.
 | Track | Current disposition | Required next authority/evidence |
 |---|---|---|
 | In-memory | Reference/conformance-only; no product profile, admission schedule, fallback, or soak matrix | A separate future ADR/charter amendment before any bounded-memory product claim |
-| Local-spill product profile | Sole current broad-state product target; stock official Fjall 3.1.8 is the preferred qualification-entry subject, but no backend is selected, qualified, or admitted | Run the capped read-only Fjall source/contract closure. Only a pass may fund an adapter and later workload/fault qualification, integration, existing failover/delivery regressions, and independent product soak |
-| Qualification contract | Cycle 38 maintenance-health v2 and exact v4 remain immutable validation/reference lineage; no GitHub approval workflow exists or is required for that scope; v1 remains immutable regression lineage | Do not relabel frozen evidence. A later Fjall run needs exact source/build/profile/plan/target/limits authority and may use only truthful candidate or Laminar-owned bounded signals; unsupported is never zero |
+| Local-spill product profile | Sole current broad-state product target; no backend is selected, qualified, or admitted after Fjall 3.1.8 failed adapter entry | Under the owner-stated pivot, separately scope a current-package TidesDB re-entry before any dependency or adapter. A source pass could fund workload/fault qualification, integration, existing failover/delivery regressions, and independent product soak |
+| Qualification contract | Cycle 38 maintenance-health v2 and exact v4 remain immutable validation/reference lineage; no GitHub approval workflow exists or is required for that scope; v1 remains immutable regression lineage | Do not relabel frozen evidence. Any later candidate run needs exact source/build/profile/plan/target/limits authority and may use only truthful candidate or Laminar-owned bounded signals; unsupported is never zero |
 | RocksDB 10.4.2 via `rocksdb` 0.24.0 | Mature operational LSM reference and immutable v1-v4 regression/comparison subject; not the product backend | No new adapter, source-closure, or qualification work is scheduled absent a new project-owner direction |
-| Fjall 3.1.8, official tag `6debe706` | **Preferred qualification-entry subject.** Required KV primitive shapes exist; concurrent/crash semantics remain unqualified, the global write-buffer setting is unenforced, the journal limit is soft, synchronous stalls and incomplete maintenance visibility remain, and no latency/fault result exists | No fork. First run the one-engineer-day, zero-candidate-machine-hour source/contract closure. Any required internal fact unavailable from a truthful stable source stops the candidate; only a pass may authorize adapter work and later empirical gates |
+| Fjall 3.1.8, official tag `6debe706` | **DISQUALIFIED AT ADAPTER ENTRY.** Fatal worker exit can leave the active-thread count nonzero while database drop waits indefinitely; frozen v2 failure coverage also cannot be completed from stock public facts | No dependency, adapter, or run. Re-enter only for a newer official release with balanced worker lifetime and bounded teardown; no fork |
 | redb 4.1.0 | **PARKED after Cycle 34**; administrative status, not a formal `DEFER` result; design timebox exhausted; no candidate profile, adapter, mechanism result, or execution authority | No scheduled work. Reopen only through an explicit two-day/four-machine-hour micro-prescreen charter; otherwise retain as history. A favorable observation could only fund a later mapping/profile proposal |
-| Official `tidesdb/tidesdb-rs` binding: Cargo package `tidesdb v0.11.1`, native 9.3.6 | Historical **STOP_WAIT_FOR_UPSTREAM at T0** evidence: the payload misses relevant later native correctness/memory-safety fixes, one-CF transactions can acknowledge a short partial batch, and resource/health facts remain unclosed | No scheduled TidesDB package, adapter, fork, or upstream-wait work. Re-entry requires a later explicit owner decision after the Fjall line stops or is disqualified |
+| Official `tidesdb/tidesdb-rs` binding: historical Cargo package `tidesdb v0.11.1`, native 9.3.6 | Historical **STOP_WAIT_FOR_UPSTREAM at T0** evidence: the payload misses relevant later native correctness/memory-safety fixes, one-CF transactions can acknowledge a short partial batch, and resource/health facts remain unclosed | Next candidate-choice step is a separately bounded current official Rust/native package re-entry. This is not selection, dependency, adapter, or permission to reuse the stale subject |
 | SurrealKV 0.21.2 | Rejected unmodified; no active candidate track | Correctness/liveness fork and new bounded prescreen authority before reconsideration |
 
 The current source detail and rationale live in the
@@ -287,8 +310,8 @@ The current source detail and rationale live in the
 [TidesDB prescreen](../reports/tidesdb-static-prescreen-2026-07-25.md),
 [historical TidesDB package design](tidesdb-local-state-successor-design.md), and
 [historical TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md). These
-are evidence and gate records. The Fjall amendment above is current candidate authority; no runtime
-dependency, qualification result, or production admission follows.
+are evidence and gate records. The Fjall source closure above is current backend authority; no
+runtime dependency, qualification result, or production admission follows.
 
 The existing fixed vnode ABI, bounded shuffle, assignment/process fencing, aligned barriers,
 per-vnode checkpoint artifacts, and exact-attempt seal are retained. Cluster admission will move
@@ -578,10 +601,10 @@ with a semaphore try-acquire and changes no normal row path. Synchronous capture
 checkpoint-versus-rotation wait distributions remain independent-soak gates. Delivery remains
 cluster at-least-once, and no source, sink, exactly-once, or `[LDB-4007]` capability changes.
 
-#### Current Fjall evidence and historical RocksDB/TidesDB lines
+#### Fjall stop evidence and historical RocksDB/TidesDB lines
 
-The Fjall material below is both exact warning evidence and the source basis for the current
-preferred qualification-entry subject; it is not qualification. The RocksDB material remains
+The Fjall material below is exact warning evidence for the now-completed adapter-entry closure; it
+is not qualification. The RocksDB material remains
 reference/regression rationale. Cycle 40's official `tidesdb/tidesdb-rs` decision and Cycle 41's stop of exact
 v0.11.1/native 9.3.6 at T0 are historical. Native 9.3.14 remains
 comparison/source evidence, retains the decisive silent-short defect, and cannot be substituted
@@ -624,14 +647,11 @@ compaction can dominate the tail. The new harness must use the actual always-cur
 workload—batched group updates, timer-range scans, snapshots, and checkpoint export—on target Linux
 NVMe and report p99.9 as well as p99.
 
-The current stock Fjall subject passes only if it meets the precommitted performance
-profile, exposes stable cache/memtable/journal/disk/compaction telemetry, obeys hard memory/disk/
-queue bounds, survives the crash/corruption matrix, and supports the required portable restore/
-upgrade policy. Every admitted candidate runs the same logical batches, timer scans, snapshot/export
-overlap, restore, cleanup, and fault schedule rather than comparing unrelated vendor microbenchmarks.
-An approved Fjall-specific mapping must cover every enabled maintenance mechanism with truthful
-stable sources; Laminar-owned facts cover only what Laminar directly observes, and an unsupported
-internal Fjall fact stops the candidate. RocksDB's
+The source closure stopped stock Fjall 3.1.8 before a performance profile or candidate run. Every
+later admitted candidate still runs the same logical batches, timer scans, snapshot/export overlap,
+restore, cleanup, and fault schedule rather than comparing unrelated vendor microbenchmarks. Its
+mapping must cover every enabled maintenance mechanism with truthful stable sources; Laminar-owned
+facts cover only what Laminar directly observes. RocksDB's
 multi-get, range delete, rate limiting, mature operational telemetry, and physical
 [checkpoint](https://github.com/facebook/rocksdb/wiki/Checkpoints)/SST-ingest primitives are
 advantages; its C++ build, native-memory accounting, platform burden, and compaction tuning are
@@ -1789,9 +1809,9 @@ Targets are chosen before optimization results are known; “fast on a laptop”
 
 The checked-in [`linux-nvme-v4` input](../../tools/state-backend-qual/profiles/linux-nvme-v4.freeze-candidate.json)
 is accepted only for validation and immutable Fjall/RocksDB regression. Its exact roster and
-RocksDB-specific controls cannot be relabelled as a Fjall product run. The current Fjall line needs
-an exact execution profile and candidate mapping that bind stock 3.1.8, the Laminar adapter,
-configuration, target, limits, operation schedule and truthful health sources before execution. The
+RocksDB-specific controls cannot be relabelled as a product run. Fjall 3.1.8 stopped before execution.
+Any future candidate needs an exact execution profile and mapping that bind its source, Laminar
+adapter, configuration, target, limits, operation schedule, and truthful health sources. The
 standalone validator must continue to accept only explicitly ineligible forms, reject
 measured/result fields, and have no runtime or backend dependency. Exact run authorization, evidence
 for the exact subject, the product connector/object-store profile, and the independent release
@@ -1904,11 +1924,10 @@ correctness and risks falsely advertising end-to-end exactly-once.
 The removed tier cached checkpoint slices and used point operations; it did not own always-current
 state, and its dirty-state coupling was unsafe. Restoring it would preserve the missing lifecycle.
 Conversely, API checklists and old single-insert or vendor benchmarks are insufficient to qualify
-Fjall, RocksDB, or TidesDB for production. The owner now prioritizes stock official Fjall 3.1.8 as
-the sole qualification-entry subject; that choice does not waive source, latency, resource or fault
-closure and does not constitute production admission. Its absolute campaign is required because the backend directly affects the
-tail, resource governor, restore, cleanup, and operational surface; a permanent two-backend product
-is not planned.
+Fjall, RocksDB, or TidesDB for production. The bounded source closure disqualified stock Fjall 3.1.8
+without restoring the old tier. A future selected candidate still requires an absolute campaign
+because the backend directly affects the tail, resource governor, restore, cleanup, and operational
+surface; a permanent two-backend product is not planned.
 
 ## Consequences and risks
 

@@ -121,12 +121,12 @@ recovery, and startup-checkpoint budgets also lack large-state validation. None 
 hot-path change or production-readiness evidence.
 
 **Current authority:** the
-[2026-07-28 ADR amendment](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-28-fjall-318-priority-amendment)
-makes stock official Fjall 3.1.8 the sole preferred qualification-entry subject.
-No Cargo dependency, bounded working-state integration, or runtime backend selector has landed.
-Exact source contains the required local KV primitive shapes but leaves concurrent/crash behavior,
-synchronous stalls, maintenance/error health, prefix cleanup, latency and faults unproved. The
-Cycle 40/41 TidesDB selection and v0.11.1/native 9.3.6 T0 stop remain historical evidence.
+[2026-07-28 Fjall source closure](fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md)
+disqualifies stock official Fjall 3.1.8 at adapter entry. Fatal worker exit can leave database drop
+waiting indefinitely on a private active-thread count, and the frozen v2 background-failure mapping
+cannot be completed from stock public facts. No Cargo dependency, bounded working-state integration,
+or runtime backend selector has landed. The Cycle 40/41 TidesDB v0.11.1/native 9.3.6 T0 stop remains
+historical evidence; any TidesDB re-entry must identify and audit the current official subject.
 [Cycle 42](../reviews/distributed-keyed-state-cycle-42.md)
 corrects current aggregate failure classification and proves synchronous output/checkpoint
 exclusion after an indeterminate apply. [Cycle 43](../reviews/distributed-keyed-state-cycle-43.md)
@@ -787,9 +787,11 @@ current three-node engineering harness consume exact local adoption evidence. Du
 authority and admission-neutral transactional runtime integration remain open. The independent
 soak remains later and separately operated.
 
-### Fjall is the qualification-entry subject; its former cold tier is historical
+### Fjall failed adapter entry; its former cold tier remains historical
 
-The current baseline contains no Fjall dependency or state-tier module. Fjall 3.1 was previously
+The current baseline contains no Fjall dependency or state-tier module. Stock Fjall 3.1.8 failed
+the bounded source gate before integration; the decisive lifecycle trace is in the
+[source closure](fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md). Fjall 3.1 was previously
 used by the v0.26-era optional `state-tier` feature as a rebuildable cold cache for demoted
 checkpoint slices/groups. The current [`CHANGELOG.md`](../../CHANGELOG.md) records why commit
 `1e2f8429` removed it: a correctness defect allowed demotion to clear vnode dirtiness before
@@ -801,12 +803,10 @@ point inserts and uniform cold reads; the wrapper also read before write/remove 
 copied returned values. Formal target-Linux/NVMe testing never ran. Current Fjall 3.1.8 has useful
 atomic batches, snapshots, range scans, and sorted ingestion, but lacks native multi-get/range
 delete and a mature supported memory/compaction observability surface. The ADR therefore requires
-the same real state workload and fault gates before selecting a backend rather than assuming the
-historical dependency is fit. The 2026-07-28 owner amendment prioritizes the exact stock 3.1.8
-release as the sole qualification-entry subject, not the removed tier. Its unenforced global write-
-buffer option, soft journal limit, synchronous stalls, incomplete stable maintenance/error surface,
-missing multi-get/range delete, serialized journal writer, cleanup cost and p99.9/max behavior are
-still gates. There is no `fjall` or `tidesdb` dependency or selectable bounded working-state
+the same real state workload and fault gates before selecting any backend rather than assuming a
+historical dependency is fit. The source closure stopped exact stock 3.1.8 before those empirical
+gates because its fatal worker-exit/drop lifecycle cannot be repaired by the public adapter. There
+is no `fjall` or `tidesdb` dependency or selectable bounded working-state
 implementation in the current manifests or runtime. The existing injectable `StateBackend` is
 instead checkpoint-artifact storage, as distinguished below.
 
