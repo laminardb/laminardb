@@ -149,11 +149,15 @@ LaminarDB supports multi-node cluster deployments. In this mode, streaming pipel
 > Embedded/single-node exactly-once requires node-durable state and the built-in local checkpoint/decision store, held under an OS-released exclusive deployment lock. For the standalone server, a `file://` checkpoint URL selects that store. Shared object-store URLs and library-injected object or decision stores fail closed with `[LDB-0014]` because their writer-fencing provenance cannot yet be proved.
 > Cluster SQL is deliberately narrower than embedded SQL. `CREATE STREAM` admits stateless
 > projection/filter pipelines and one direct ungrouped aggregate stage using supported
-> non-`DISTINCT` built-ins. Every `GROUP BY`, windowed aggregate, and stateful join fails closed with
-> `[LDB-4007]`. Cluster materialized views also fail closed regardless of query shape because their
+> non-`DISTINCT` built-ins. Every `GROUP BY`, windowed aggregate, and implemented local stateful-join
+> shape that reaches cluster admission fails closed with `[LDB-4007]`. Physical-route rejection is
+> family-specific: bounded interval joins other than `INNER` fail earlier with `InvalidQuery`, while
+> temporal/lookup translation can coerce unsupported join types which then reach `[LDB-4007]`.
+> Cluster materialized views also fail closed regardless of query shape because their
 > retained output lacks a planner-certified distribution and assignment-fenced checkpoint/read
 > lifecycle. Embedded and single-node operators are unaffected. See the
-> [validation report](docs/reports/cluster-keyed-state-validation-2026-07-22.md) for the exact matrix.
+> [validation report](docs/reports/cluster-keyed-state-validation-2026-07-22.md) for the canonical
+> named-route matrix and its explicit DDL-coverage limits.
 
 ### Cluster Configuration Example
 
@@ -231,15 +235,26 @@ EMIT ON WINDOW CLOSE;
 
 ### Join Types
 
-| Join | Description | Status |
-|------|-------------|--------|
-| Inner / Left / Right / Full | Standard SQL joins | ✅ |
-| Left Semi / Anti | Existence checks | ✅ |
-| Interval (stream-stream) | Time-bounded join, `ts BETWEEN other.ts - INTERVAL … AND other.ts + INTERVAL …` | ✅ |
-| ASOF | Point-in-time lookup — backward (`>=`), forward, or `NEAREST` | ✅ |
-| Temporal Probe | Fan each left row out across fixed time offsets (e.g. markout curves) | ✅ |
-| Temporal | Versioned join with time-validity (`FOR SYSTEM_TIME AS OF`) | ✅ |
-| Lookup | Enrichment against reference tables (Postgres, Parquet) | ✅ |
+Stateful streaming joins currently run only in embedded/single-node mode for the implemented
+physical shapes. They comprise dual-live bounded interval `INNER`, incremental/changelog
+`INNER`/`LEFT`, ASOF and temporal-probe paths, plus one-live-input temporal, snapshot, on-demand,
+and static-dimension lookup paths. The partial/on-demand path currently owns fetched/cache rows and
+pending requests; a checkpoint-bound version or durable-response design is future work, not a
+current capability.
+
+Cluster rejects every such candidate that reaches its admission gate with `[LDB-4007]`. Bounded
+interval non-`INNER` forms currently fail during physical planning; temporal/lookup translation can
+coerce unsupported join types and those candidates may instead reach `[LDB-4007]`. DDL coverage is
+partial, so this paragraph is not an exhaustive syntax-to-error matrix. The
+[validation report](docs/reports/cluster-keyed-state-validation-2026-07-22.md) is the canonical
+current/future join inventory and admission evidence.
+
+The target includes finite bounded outer and existence joins, with unmatched output authorized by
+the opposite frontier and stable output identity before cleanup. `RIGHT` may lower through a valid
+side swap; `FULL`, semi, and anti need explicit matched/unmatched and retraction semantics. Arbitrary
+dual-unbounded joins and correlated `APPLY` remain fail-closed. Known local blockers also include
+forward/nearest ASOF finality, loss at the temporal-probe pending cap, extra interval/temporal equi
+keys, unchecked incremental multiplicity, join-type coercion, and reference recovery identity.
 
 ```sql
 -- ASOF join: latest trade price for each order

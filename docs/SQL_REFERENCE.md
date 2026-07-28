@@ -142,6 +142,19 @@ GROUP BY account_id, SESSION(ts, INTERVAL '2' SECOND)
 
 ## Joins
 
+These stateful examples are embedded/single-node code paths, not production-certification claims.
+Cluster rejects each physical stateful-join candidate that reaches admission with `[LDB-4007]`.
+The route boundary is not uniform: bounded interval joins other than `INNER` currently fail during
+physical planning, while temporal/lookup translation can coerce unsupported join types which may
+then reach `[LDB-4007]`. DDL coverage is partial. The
+[cluster validation report](reports/cluster-keyed-state-validation-2026-07-22.md) is the canonical
+current/future family inventory and syntax-to-rejection evidence.
+
+Partial/on-demand lookup currently owns fetched/cache rows and pending requests. Checkpoint-bound
+reference versions or durable resolved responses are possible target contracts, not current
+behavior. Before distributed admission, local paths must also close finality, lossless pending-work,
+composite-key, checked-multiplicity, join-type coercion, and reference-recovery gaps.
+
 ### INNER JOIN (Time-bounded)
 
 Join two sources within a time window. Both sources must have compatible timestamps.
@@ -163,10 +176,16 @@ AND o.ts BETWEEN t.ts - INTERVAL '10' SECOND AND t.ts + INTERVAL '10' SECOND
 ```
 
 **Key points:**
+
 - `INTERVAL` arithmetic on `TIMESTAMP` columns is handled natively by
   DataFusion. No need for the old `ts - 10000` millisecond tricks.
 - Both sources need watermarks advanced for the join to emit
 - Column aliases (`AS trade_price`) are required when both sources have columns with the same name
+- Only `INNER` has a current bounded-interval physical route. The finite `LEFT` target must retain
+  row/output identity and emit unmatched left rows only after the right frontier makes them final;
+  cleanup must be checkpoint/output ordered and late corrections require explicit retractions.
+  `RIGHT` is valid only through a semantics-preserving side swap. `FULL`, semi, and anti require
+  deliberate symmetric unmatched/existence state and output contracts; none is implemented here.
 
 ### ASOF JOIN
 
@@ -202,6 +221,9 @@ ON t.symbol = r.symbol AND MATCH_CONDITION(NEAREST(t.ts, r.ts))
 **Key points:**
 - Matches by minimum absolute time difference, not just preceding events
 - Useful when reference data may arrive slightly before or after the trade
+- The current streaming path does not retain left rows until a right-side frontier makes
+  forward/nearest matches final. Treat this form as experimental and not recovery/distribution
+  ready; cluster mode rejects it.
 
 ---
 
@@ -299,13 +321,15 @@ while let Some(rows) = sub.poll() {
 Cluster `CREATE STREAM` currently admits projection/filter pipelines and one direct ungrouped
 aggregate stage composed of supported non-`DISTINCT` `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX` calls.
 The aggregate must use the exact incremental path; derived/multi-stage aggregates may still be
-rejected. Every `GROUP BY`, windowed aggregate, and stateful join fails closed with `[LDB-4007]`.
+rejected. Every `GROUP BY`, windowed aggregate, and implemented local stateful-join shape that
+reaches cluster admission fails closed with `[LDB-4007]`. Join types without a physical route can
+fail earlier, but temporal/lookup coercion means that is not a universal boundary.
 
 Cluster materialized-view creation is rejected with `[LDB-4007]` regardless of query shape because
 retained output and reads do not yet have a planner-certified distributed lifecycle. Consequently,
 the materialized-view form of `SUBSCRIBE` below applies to embedded and single-node runtimes. See
-the [cluster validation report](reports/cluster-keyed-state-validation-2026-07-22.md) for the exact
-admission matrix and limitations.
+the [cluster validation report](reports/cluster-keyed-state-validation-2026-07-22.md) for the
+canonical, explicitly partial DDL admission evidence and limitations.
 
 ### SUBSCRIBE over the Postgres wire protocol
 

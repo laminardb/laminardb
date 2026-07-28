@@ -68,17 +68,51 @@ operator, update mode, connector, or delivery guarantee. Bounded memory has no p
 under this charter. Adding any future profile requires an owner-approved charter/ADR amendment
 before a run, and prior local-spill evidence cannot be reused to certify it.
 
+This table names certification classes rather than repeating the SQL/physical-route inventory. The
+[validation report](../reports/cluster-keyed-state-validation-2026-07-22.md) is canonical for
+current versus target join families and the explicitly partial DDL rejection evidence. Every named
+family inside a collapsed row still requires its own approved scenario/profile pair.
+
 | Scenario | Initial intended path | Current status |
 |---|---|---|
 | Harness control | Kafka source -> stateless projection -> Kafka append sink | Engineering-only; proves oracle/deployment, never keyed-state production support |
 | Grouped aggregate ALO | Kafka source -> grouped `COUNT(*)`/`SUM(Int64)` changed-group append snapshots -> certified, externally fenced Kafka append sink | Blocked by `[LDB-4007]` and Phase 0/1 evidence |
 | Fixed event-time window ALO | Certified source -> tumbling window/final append output -> compatible sink | Blocked by `[LDB-4007]` and timer/frontier lifecycle |
-| Bounded interval join ALO | Two certified inputs -> inner equi-interval join -> compatible append sink | Blocked by `[LDB-4007]` and co-partitioned join lifecycle |
+| Dual-live current physical joins | Each of bounded interval `INNER`, incremental/changelog `INNER`/`LEFT`, ASOF, and temporal probe gets an independent two-cursor/state/frontier/output oracle and compatible sink | Blocked by `[LDB-4007]` plus the per-family lifecycle/correctness gaps in the validation report |
+| One-live-input/reference current physical joins | Each temporal, full-snapshot, on-demand, or static-dimension family gets an independent live-cursor/reference/output oracle. Partial lookup must account for its current fetched/cache rows and pending requests | Blocked by `[LDB-4007]`; exact snapshot/version or checkpointed pending-work authority is absent |
+| Finite outer/existence targets | Bounded interval `LEFT` authorizes unmatched output by the opposite frontier and retains stable identity through cleanup/retraction; valid side-swap `RIGHT`, symmetric `FULL`, and semi/anti get independent oracles | Not implemented. Interval non-`INNER` currently fails during planning; temporal/lookup coercion can instead carry unsupported join types to `[LDB-4007]` |
+| Later finite join targets | Frozen-schema natural lowering, bounded cross product, or named pairwise multiway stages -> query-cut oracle -> compatible sink | Blocked before cluster admission pending deliberate physical and lifecycle contracts |
+| Arbitrary dual-unbounded or correlated `APPLY` | No production soak scenario | Intentionally fail-closed |
 | Retraction/FullChangelog | Stateful operator -> FullChangelog-capable cluster sink | Blocked; no built-in qualifying sink |
 | Exactly-once | Exact-certified source/state/sink combination | Blocked independently by `[LDB-0013]` |
 
 Only scenarios explicitly proposed for a release are run, but every scenario proposed for that
 release must pass.
+
+### Core Cycle 7 readiness evidence disposition
+
+Assignment adoption now reports `vnode_state_ready` separately from process/fence adoption.
+Startup and recovery withdraw readiness before state staging, and assignment publication requires a
+current `true` report from every exact participant after registry and installed-state checks. The
+watcher republishes the bounded report every two seconds; adoption lock, local readiness, remote
+scan, and compare-and-swap share one absolute checkpoint deadline.
+
+This remains a current-state scan rather than a lease across the final compare-and-swap. A
+withdrawal after the scan must make drain/checkpoint abort and preserve the predecessor, and that
+exact fault point still needs deterministic coverage. Two-second control-KV write/readback cost,
+readiness/refusal health signals, outcome-unknown CAS reconciliation signals, and large-state
+deadline behavior are not yet qualified. The retained pre-fix three-node ALO engineering attempt
+failed under subject SHA-256
+`bef33cb62c397dc6486d062d09d4c0f5df808eb8124a11e986614d8629a41904`; logs are at
+`target/tmp/soak-942164-1785198920573674300`. The final post-`142dadf7` engineering rerun passed
+against server SHA-256
+`089197fa82d20cc9c83118036d8820d3168f6c3752125f05c6677ac6418f81d5`; logs are at
+`target/tmp/soak-996548-1785223178826043700`. It exercised three leader/follower hard-kill and
+rejoin rounds at 400 records/s, observed all 132,899 expected IDs under the allowed ALO oracle,
+kept all 514 measured stalls at or below 1,024 ms, and reported no deadline or SLO violations.
+This is engineering evidence only. No independent immutable release-candidate soak has run, the
+deterministic Release-E/newer-Commit-E+1 passive-connector case remains open, and
+`certification_eligible` remains `false`.
 
 The initial grouped-aggregate scenario is narrower than the general row: each logical group is
 routed to one fixed Kafka input partition, `COUNT(*)` is mandatory as its logical state version,

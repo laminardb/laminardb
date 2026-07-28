@@ -3,7 +3,7 @@
 - **Status:** Accepted for phased implementation; core reference work resumed, production
   qualification paused, and cluster admission unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Core Cycle 6
+- **Last reconciled:** 2026-07-28 during Core Cycle 7
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -14,7 +14,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest core review](../reviews/distributed-keyed-state-core-cycle-06.md)
+  [latest core review](../reviews/distributed-keyed-state-core-cycle-07.md)
 
 ## Decision
 
@@ -33,9 +33,11 @@ No runtime backend dependency or adapter is authorized by this ADR state.
 
 ### 2026-07-27 workstream reset
 
-Cycle 69 and all further soak, A/B, observer, transcript, and certification-tooling work are paused.
-Cycle 68 remains a completed historical boundary. Core implementation resumes with one deliberately
-small reference vertical: concrete vnode-local append-only `COUNT(*)` + nullable direct
+Cycle 69 and the A/B, observer, transcript, and certification-tooling sequence remain paused. Cycle
+68 remains a completed historical boundary. One narrowly scoped Core Cycle 7 engineering rerun
+later validated its recovery fix; it did not resume certification or authorize further soak work.
+Core implementation resumes with one deliberately small reference vertical: concrete vnode-local
+append-only `COUNT(*)` + nullable direct
 `SUM(Int64)` state, hard semantic-payload byte accounting, whole-batch validation before mutation,
 portable FULL/EMPTY capture, off-side restore/revoke/retained-fence preparation, and
 caller-supplied transition-batch preflight followed by infallible publication. The future graph
@@ -141,13 +143,55 @@ replacement from being erased, while `InstalledVnodeStateBinding` is reusable on
 graph with the exact assignment and pipeline identity. Poison, callback ambiguity, lifecycle fault,
 shutdown, and graph replacement clear that success marker before publishing failure.
 
-This is transition-identity and failure containment, not the complete Phase 1 lifecycle. The
-artifact still lacks an authoritative operator/state-table roster and explicit empty state;
-callbacks mutate directly instead of using abortable prepare/publish shadows; the SQL operator's
-`QueryState::Uninit` path has no plan/codec install boundary; and transition-wide encoded bytes,
-object count, decode scratch, decoded RSS, and publication pause remain unbounded. These gaps,
-source/state/sink delivery composition, tail-latency and memory evidence, backend qualification, and
-independent soak keep `[LDB-4007]`, `[LDB-0013]`, and production **NO-GO** unchanged.
+Core Cycle 7 makes the graph, rather than checkpoint bytes, authoritative for managed participants.
+Mode-neutral managed operators are initialized before recovery in embedded, single-node, and
+cluster pipelines. Capture derives the exact state-vnode roster from one ownership snapshot;
+global state participates only on vnode zero, keyed state participates on every owned vnode, and
+each required empty vnode carries a named FULL payload whose decoded state is empty. Restore rejects
+missing, unexpected, duplicate names within one artifact link, or out-of-scope participants before
+callbacks, and revoke callbacks receive only their placement-relevant vnodes. Repetition across a
+valid FULL/delta lineage is expected. The raw `VnodePartial` rkyv layout is unchanged, but the graph
+checkpoint/state ABI advances from 4 to 5; an older graph checkpoint is deliberately rejected and
+requires an explicit state reset or separately designed upgrade bridge.
+
+Cycle 7 also extends each process's exact `CheckpointAssignmentAdoption` report with mandatory
+`vnode_state_ready`. Under the assignment-adoption lock, a process publishes `false` before startup,
+recovery, or assignment adoption exposes pending/restoring vnode state or stages lifecycle work.
+For a bound managed pipeline it may publish `true` only when the registry still matches the exact
+durable assignment fence and the current graph holds the exact `InstalledVnodeStateBinding` for
+that assignment and pipeline. A process with no checkpoint coordinator has no managed pipeline
+identity or state to bind and can report ready only after the same exact registry-fence and
+no-pending-transition checks. Pristine assignment-zero bootstrap has no predecessor report to
+withdraw.
+Transport activation still requires exact adoption but does not treat `false` as installed state;
+chaining assignment `V+1` additionally requires an exact `true` report from every participant in
+`V` immediately before the durable assignment CAS. The field has no compatibility default: an old
+or missing-field report is invalid, so mixed-version rolling deployment of this control wire is
+fail-closed and requires a coordinated rollout or a separately designed compatibility bridge.
+
+The adoption lock, local binding check, remote report read, and durable CAS consume one shared
+absolute checkpoint deadline rather than restarting independent timeouts. A CAS timeout or error
+has an outcome-unknown durable result: intake remains guarded and the next pass reloads and audits
+the durable head, adopting or reconciling it—including aborting a materialized drain when required—
+instead of blindly publishing another successor. The remote report scan is nevertheless only a
+best-current preflight, not an atomic cross-node lease with the CAS. A process can withdraw
+readiness after the scan; source drain and the forced checkpoint must then abort and retain the
+predecessor rather than certify unsafe state. Production admission therefore requires a
+deterministic withdrawal-between-scan-and-CAS test. The two-second watcher currently republishes
+its control-KV slot unconditionally so an out-of-band `false` cannot be masked by a stale cache;
+qualification must measure that write/readback load and may coalesce it only with a protocol that
+cannot hide withdrawal. Required bounded health signals and the still-open transition-wide
+encoded/object/scratch/RSS/publication budget are specified in the implementation plan.
+
+This remains transition identity and structural lifecycle validation, not complete Phase 1.
+Operator payload decoding and mutation still happen in sequential callbacks instead of graph-wide
+abortable prepare followed by infallible shadow publication. Transition-wide encoded bytes, object
+count, decode scratch, decoded RSS, publication pause, bounded hot working state, source/state/sink
+delivery composition, tail-latency evidence, backend qualification, and independent soak remain
+open. Every implemented local keyed/windowed/join candidate that reaches cluster admission stays
+behind `[LDB-4007]`. Some unsupported temporal/lookup forms are currently coerced to `INNER` and
+may also reach that guard; other unsupported forms fail earlier in planning. Cluster exactly-once
+stays behind `[LDB-0013]`, and production remains **NO-GO**.
 
 The provider-neutral Rust `object_store` path retains local file, S3, GCS, and Azure builders.
 Cluster authority comes only from the exact checkpoint/state handles admitted by verified namespace
@@ -189,8 +233,18 @@ descriptor. Each stateful operator must declare its partition key, stable state 
 retention, output mode, checkpoint schema, and acquire/revoke behavior.
 
 The implementation order is grouped aggregates, fixed event-time windows, then bounded interval
-joins. Stateful streams may be enabled before cluster materialized views. `[LDB-4007]` remains
-closed for keyed/windowed/join state and `[LDB-0013]` remains closed for cluster exactly-once. The
+`INNER` followed by finite bounded interval `LEFT`, followed independently by the existing
+incremental/changelog, ASOF, temporal, temporal-probe, replicated/full-snapshot lookup,
+partial/on-demand lookup, and changelog-input plus static-dimension physical families. A finite
+`RIGHT` may normalize to the certified `LEFT` implementation only when a side swap preserves
+original output order/nullability and correctly inverts interval predicates, temporal bounds, and
+frontier ownership; finite `FULL`/semi/anti,
+schema-frozen natural, bounded cross, and explicit/implicit pairwise multiway forms require
+deliberate physical implementations after that migration; they do not inherit state support from
+syntax or translator configuration.
+Stateful streams may be enabled before cluster materialized views. `[LDB-4007]` remains closed for
+implemented local keyed/windowed/join state that reaches cluster admission, and `[LDB-0013]`
+remains closed for cluster exactly-once. The
 first keyed-state release remains at-least-once and requires a separately certified source/operator/
 output/sink combination. Production additionally requires the independently operated,
 immutable-release soak; backend qualification or a redb prescreen cannot substitute for it.
@@ -198,9 +252,14 @@ immutable-release soak; backend qualification or a redb prescreen cannot substit
 ## Context
 
 Cluster SQL admission is correctly fail-closed today. Stateless streams and one direct ungrouped
-aggregate stage are admitted; keyed aggregates, all windowed aggregates, all joins, and all
-materialized views are rejected with nested `[LDB-4007]`. Embedded mode has local implementations
-for these operators.
+aggregate stage are admitted; keyed aggregates, all windowed aggregates, every implemented local
+stateful-join shape that reaches the cluster gate, and all materialized views are rejected with
+nested `[LDB-4007]`. Unsupported temporal/lookup join types can currently be coerced to `INNER` and
+therefore may also reach `[LDB-4007]`; Phase 4A replaces that coercion with explicit rejection.
+Other shapes without a supported Laminar streaming plan can fail earlier with an uncoded
+`InvalidQuery`, including current finite outer/existence, arbitrary unbounded, natural/cross,
+explicit/implicit multiway, and correlated apply shapes. Embedded and single-node modes have the
+local stateful implementations inventoried below.
 
 The error description is not a complete diagnosis for aggregates. `SqlQueryOperator` already
 shuffles aggregate keys and captures, restores, rebases, and revokes aggregate state by vnode. The
@@ -624,10 +683,10 @@ and SUM at **every input prefix**, not just the coalesced batch result. It prefl
 the Arrow batch before publishing one atomic state/output mutation; overflow in a late row or group
 faults with no group or output from that batch applied. Thus `[MAX, +1, -1]` cannot pass merely
 because it was coalesced into one batch. The same Laminar checked implementation becomes the
-embedded/reference executor for this exact shape before cluster admission, with a compatibility
-note for the former DataFusion 52.3 wrapping/profile-dependent behavior. Decimal, unsigned,
-floating, `AVG`, `MIN`/`MAX`, retractions, and UDAFs remain codec-unavailable until separately
-specified and tested.
+embedded/single-node reference executor for this exact shape before cluster admission, with a
+compatibility note for the former DataFusion 52.3 wrapping/profile-dependent behavior. Decimal,
+unsigned, floating, `AVG`, `MIN`/`MAX`, retractions, and UDAFs remain codec-unavailable until
+separately specified and tested.
 
 Each non-empty payload row is `u32_be key_length | key_bytes | fixed_state_bytes`. A zero key length
 is valid: ABI v1 admits a nonempty `Null` grouping schema, for which Arrow 57.2 encodes the row as
@@ -848,6 +907,15 @@ correctness path.
 
 ## Operator state models and rollout order
 
+The target semantic state implementation, codecs, resource limits, and checkpoint contract are
+mode-neutral. Today there is no runtime backend selector or TidesDB dependency: embedded and
+single-node execute with a local one-key-group topology, while cluster uses configured vnode
+ownership and keeps keyed/windowed/join admission closed. The completed implementation must use the
+same managed representation in every mode; cluster alone adds exchange, distributed ownership,
+assignment fencing, and vnode transfer. A future qualified local-spill backend may change capacity
+and maintenance behavior, but never SQL semantics or artifact authority. No operator may keep a
+second mode-specific authoritative map beside managed state.
+
 ### Grouped aggregate
 
 Managed tables hold the encoded group key and versioned accumulator state. Any timestamp, timer,
@@ -887,19 +955,63 @@ so it follows fixed windows rather than sharing their initial admission flag.
 
 ### Stateful join
 
-The first distributed join is an append-only bounded inner equi-interval join. Both inputs exchange
+The first distributed join is an append-only bounded inner equi-interval join, followed by a
+separately admitted finite bounded interval `LEFT` join. Both inputs exchange
 on the same canonical encoded join key. Each vnode owns two ordered multiset tables indexed by join
 key, event time, and stable row identity, plus side watermarks and eviction timers. A match probes a
 bounded time range and commits buffered rows and required output bookkeeping atomically.
 
 Watermarks and interval bounds determine when each side can no longer match and may be deleted.
+For `LEFT`, only the opposite-side frontier may authorize an unmatched null-padded emission and
+cleanup; matched/unmatched output identity, matched counts, and deterministic retractions are
+checkpointed with both sides so replay or a late match cannot duplicate or strand output.
 Unbounded stream joins remain rejected unless the user selects a documented finite retention
 contract whose semantic effect is visible; an internal cache TTL is not correctness.
 
-Outer/semi/anti joins follow only after unmatched-row timers and emitted/retraction identity are
-checkpointed. Changelog joins additionally require signed multiplicities and deterministic
-retraction. ASOF, temporal, and session-like joins need ordered-history/version rules and arrive
-later. Lookup enrichment stays a distinct versioned replicated/read-through design.
+Before any migration, the existing local paths must be made explicit and correct: unsupported
+temporal/lookup join types are rejected instead of coerced; interval and temporal execution either
+preserve every analyzed equi key or reject composite keys; signed multiplicity arithmetic is
+checked; temporal-probe overflow backpressures, spills, or fails without dropping rows; forward and
+nearest ASOF retain left rows until frontier finality; and changing lookup sources expose a stable
+snapshot/version or durable resolved response. These are Phase 0 correctness gates, not defects a
+state backend can hide.
+
+Dual-live-input joins bind both source cursors and assignment generations with both sides' state,
+frontiers/timers, output identity, and the sink transaction or ALO publication boundary. Interval,
+incremental/changelog, ASOF, and temporal probe use this topology; ASOF and temporal probe each have
+two live input cursors despite their asymmetric history/probe logic. Both sources independently need
+replay, splitting, and fenced handoff capability.
+
+Stream-reference joins instead bind one live source cursor and assignment to an exact reference
+snapshot/version, or to durable resolved responses and pending work, in the same state/output/sink
+cut. They do not invent a second replayable source cursor. The shared state/lifecycle service must
+cover every persistent streaming-state physical family, while each family retains a separate
+planner descriptor, admission bit, and certification matrix:
+
+| Join family | Input topology and required managed state |
+|---|---|
+| Bounded interval `INNER` and finite `LEFT` | Two live inputs; ordered left/right multisets, stable row identity, both frontiers, bounds and eviction timers; `LEFT` also persists matched identity/counts, frontier-authorized unmatched output and deterministic retractions |
+| Incremental/changelog `INNER` and `LEFT` | Two live changelog inputs; signed multisets, stable row identity, match multiplicity, deterministic retractions, and `FullChangelog`-compatible output |
+| ASOF | Two live inputs; ordered right history, direction/tie/finality rules, pending left rows for forward/nearest matches, and emitted-result identity |
+| Temporal probe | Two live inputs; versioned right history, durable multi-offset probes, timers, exact progress, and bounded pending work |
+| `FOR SYSTEM_TIME AS OF` temporal lookup | One live input plus an atomically published reference snapshot/version, replicated when bounded or vnode-partitioned when large |
+| Replicated/full-snapshot lookup | One live input plus the exact lookup snapshot/version bound into the checkpoint cut |
+| Partial/on-demand lookup enrich | One live input plus vnode-owned pending requests, assignment-generation fencing, watermark holds, and a versioned refetch or durable resolved response; the current dedicated path is single-key |
+| Changelog-input plus static-dimension enrich | One live changelog input plus reference snapshot identity and output multiset at the same cut |
+| Target `RIGHT`/`FULL`, left/right semi, and left/right anti variants | Two finite live inputs; matched counts/bits, opposite-side frontier timers, null-padding or existence-output identity, and deterministic retractions |
+| Target natural, cross, and multiway variants | Frozen-schema natural-key lowering, a bounded cross-product contract, and named pairwise stages under one validated query cut |
+
+Current `RIGHT`/`FULL`/semi/anti, natural/cross, arbitrary unbounded, and explicit/implicit multiway
+forms can fail in planning before the cluster `[LDB-4007]` gate; unsupported temporal/lookup forms
+may instead be coerced to `INNER` and reach that guard until Phase 4A removes the coercion. Syntax or
+translator configuration is not a supported streaming operator. The target includes finite,
+well-defined variants: normalize `RIGHT` from the certified `LEFT` path only when a side swap
+preserves original output order/nullability and correctly inverts interval predicates, temporal
+bounds, and frontier ownership; implement finite `FULL` and left/right semi/anti explicitly, lower
+`NATURAL` only after freezing its equi keys, permit `CROSS` only with a
+bounded side or explicit finite window/retention contract, and lower multiway queries to named
+pairwise stages with stable
+identities. Arbitrary dual-unbounded joins and correlated `APPLY` remain fail-closed.
 
 ### Materialized output
 
@@ -1625,7 +1737,7 @@ and vnode unavailability during rebalance. Results include steady state, checkpo
 backpressure, spill, hot skew, node loss, object-store delay, disk pressure, and `1 -> 3 -> 2`
 ownership changes.
 
-Correctness uses differential output/state comparison with embedded/reference execution plus
+Correctness uses differential output/state comparison with embedded/single-node reference execution plus
 deterministic crash points before and after state batch, timer fire, freeze, upload, seal,
 assignment publish, revoke, install, and activation. A PGVal-style matrix varies data rate,
 partitions, topology, parallelism, skew, and fault timing; one happy-path recovery test is not a
@@ -1743,7 +1855,7 @@ Costs and risks:
 - asynchronous full/delta materialization needs strict generation retention and pressure control;
 - hot keys can still serialize one vnode/operator even when storage is bounded;
 - rebalance RTO grows with restored bytes until standby or incremental migration is justified; and
-- embedded execution must not regress while maps are replaced incrementally.
+- embedded and single-node execution must not regress while maps are replaced incrementally.
 
 Mitigations are the backend qualification spike, whole-process resource governor, version/golden
 tests, bounded frozen generations, per-vnode skew metrics, checkpoint-cut rollout, delivery-matrix

@@ -6,7 +6,7 @@
 
 **Scope:** admission and lifecycle validation only; no cluster capability is enabled by this work.
 
-**2026-07-27 core update (through Core Cycle 6):** The
+**2026-07-28 core update (through Core Cycle 7):** The
 [ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset)
 pauses later certification tooling. Core Cycle 1 adds a private reference managed vnode shard and
 caller-supplied lifecycle publication. Core Cycles 2–4 contain the existing runtime staging path
@@ -27,12 +27,78 @@ staging with one immutable transition binding the exact predecessor/target assig
 process incarnation, pipeline identity, committed restore cut, and acquired/revoked vnode rosters.
 It structurally preflights the complete raw-chain batch, revalidates authority after callbacks,
 delays activation until every callback succeeds, and invalidates installed-state reuse before graph
-poison is visible. These cycles do not consume the managed reference, add TidesDB, make SQL restore
-atomically publishable, or relax `[LDB-4007]`.
+poison is visible. Cycle 7 initializes declared aggregate state before recovery in embedded,
+single-node, and cluster pipelines and makes cached graph capabilities authoritative for the exact
+managed participant roster. Capture uses one ownership snapshot, global state is scoped to vnode
+zero, keyed state is scoped to every owned vnode, and each required empty participant emits a named
+FULL payload whose decoded aggregate image is empty. Restore rejects omitted, unexpected,
+placement-invalid, or duplicate-within-link participants before callbacks; revoke receives only
+placement-relevant vnodes. The raw vnode artifact layout remains unchanged, while graph
+checkpoint/state ABI 5 deliberately rejects older ambiguous graph state. These cycles do not add a
+bounded working-state backend or runtime selector, make SQL restore atomically publishable, admit a
+keyed/windowed/join operator, or relax `[LDB-4007]`.
+
+Cycle 7 also separates durable assignment adoption from installed vnode-state readiness.
+`CheckpointAssignmentAdoption.vnode_state_ready` is published `false` before startup/recovery clears
+or stages state. It becomes `true` only for the exact registry fence and, when a coordinator and
+pipeline identity exist, the exact installed vnode-state binding. A no-work graph installs that
+audited binding before runtime launch; a failed launch removes only its exact marker. Transport
+fencing can recognize an adopted participant in either readiness state, but successor assignment
+publication requires `true` from every exact target participant. Pristine assignment zero has no
+predecessor readiness to withdraw.
+
+The snapshot watcher republishes its bounded adoption report every two seconds so a direct
+`false` withdrawal is not hidden behind a local cache. Adoption-lock acquisition, local readiness,
+the remote participant scan, and object-store compare-and-swap all consume one absolute checkpoint
+timeout. A timed-out or failed compare-and-swap is treated as outcome-unknown: the next pass reloads
+the durable head and aborts an already-materialized drain when reconciliation requires it.
+
+The next real three-node ALO engineering run retained one more failure. Subject SHA-256
+`91fe9d2c2ef734e1fad4f148da9e69a2eebed92057a74b70702b9b77fb490b10`, logs
+`target/tmp/soak-989812-1785220503643922100`, reached checkpoint 5 on the surviving owners after
+the leader was killed, but the restarted ownerless process did not converge before the harness
+timeout. It repeatedly consumed a Release for epoch E after the owner quorum had already produced
+the newer durable Commit E+1, armed E as an exact recovery target, and correctly hit the strict
+`[LDB-6041]` no-rewind rejection. The rejection is a required safety check; relaxing it would make
+the older cut eligible despite the newer authoritative Commit.
+
+Commit `142dadf7` fixes the caller instead. Only a process outside the frozen participant roster
+recovers the latest durable head while its assignment and intake remain closed, and its previous
+recovery target is explicitly cleared. Owners named by the round still restore the exact Release
+cut. Focused recovery gates passed 38/38, the strict newer-Commit sentinel passed, cluster
+warnings-denied Clippy passed, and the serialized cluster integration target passed 23/23 after
+the change. A deterministic connector-bearing regression that freezes Release E, advances the
+owner quorum to Commit E+1, and then exercises a passive nonparticipant is still open.
+
+The post-`142dadf7` real-process rerun passed its engineering gate. Server SHA-256
+`089197fa82d20cc9c83118036d8820d3168f6c3752125f05c6677ac6418f81d5`, harness SHA-256
+`b88df679bc4acc93739a4d4462bf208ac9c3b684bc58afc3f09a62a5d096b7b6`, and logs
+`target/tmp/soak-996548-1785223178826043700` bind the executed subject. Runtime was 339.97 seconds;
+the three kill/rejoin convergence pairs were 43.721/36.441, 37.089/30.020, and 34.586/31.053
+seconds. End-of-steady-soak progress was checkpoint 170/epoch 170, and the frozen durable input cut
+was checkpoint 187/epoch 187. At a 400 rps target, all 132,899 expected IDs were observed, with 7,898
+at-least-once duplicates counted. All 514 observed stalls were at or below 1,024 ms, and there
+were zero deadline or SLO violations. This is engineering-only evidence, not an exactly-once,
+production-latency, or production-readiness result. The independent immutable release-candidate
+soak remains **NOT RUN**.
+
+A separate attempted launch used an executable whose SHA-256 began `5ee...`, but the configured
+digest did not match the file at preflight. The harness stopped before spawning LaminarDB. This is
+evidence that immutable-subject protection worked, not runtime failure or soak evidence.
+
+This is a best-current preflight, not an atomic distributed lease across scan and compare-and-swap.
+A process can stop, fault, or poison its graph after the scan; drain and forced checkpoint must then
+abort and retain the predecessor. The deterministic withdrawal-between-scan-and-CAS fault remains
+to be added. The unconditional two-second control-KV write/readback cost is unmeasured and may need
+safe coalescing. There is not yet a production health contract for false-readiness duration,
+refusal reason, last successful report, or outcome-unknown reconciliation. Fixed assignment,
+recovery, and startup-checkpoint budgets also lack large-state validation. None of this is a row
+hot-path change or production-readiness evidence.
 
 **Current authority:** the [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
 selects the official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb`, as the intended
-integration line. [Cycle 41 T0](tidesdb-rs-t0-source-closure-2026-07-25.md) stops exact v0.11.1/
+qualification line. No Cargo dependency, bounded working-state integration, or runtime backend
+selector has landed. [Cycle 41 T0](tidesdb-rs-t0-source-closure-2026-07-25.md) stops exact v0.11.1/
 native 9.3.6 pending a new official package. [Cycle 42](../reviews/distributed-keyed-state-cycle-42.md)
 corrects current aggregate failure classification and proves synchronous output/checkpoint
 exclusion after an indeterminate apply. [Cycle 43](../reviews/distributed-keyed-state-cycle-43.md)
@@ -152,7 +218,9 @@ The reported fail-closed boundary is genuine, with three qualifications:
    is currently at-least-once only, source/sink topology is checked independently, and there is no
    built-in cluster-admissible FullChangelog sink for retraction output.
 
-The current cluster admission matrix is therefore:
+The current cluster admission matrix below is canonical for the named physical routes, but DDL
+coverage is partial. It must not be read as proof that every syntactic join spelling reaches the
+same error boundary:
 
 | SQL shape | Cluster `CREATE STREAM` | Embedded/single-node | Exact cluster reason |
 |---|---:|---:|---|
@@ -162,8 +230,38 @@ The current cluster admission matrix is therefore:
 | Running tumbling/hopping aggregate | `[LDB-4007]` | Supported | Window columns become grouping keys and hit the same grouped-state rejection |
 | `EMIT ON WINDOW CLOSE` / `EMIT FINAL` | `[LDB-4007]` | Supported | Whole-operator window state has no vnode lifecycle |
 | Analytic/window-frame operator | `[LDB-4007]` | Supported | No vnode-keyed state lifecycle |
-| Stream, ASOF, temporal, temporal-probe, lookup, or changelog join | `[LDB-4007]` | Supported when the local operator's own boundedness contract is met | No co-partitioned operator/output-state lifecycle |
+| Bounded stream interval `INNER` join | `[LDB-4007]` | Physical implementation exists for an append-only, positive finite, single-key shape | Both time indexes, frontiers, and output are not vnode-managed together; additional equi keys are not yet rejected before the single-key runtime config |
+| Bounded stream interval non-`INNER` join | Planner `InvalidQuery` before cluster admission | No current physical interval route | The interval planner accepts only `INNER`; this is an earlier physical-route rejection, not `[LDB-4007]` evidence |
+| Incremental/changelog `INNER` or `LEFT` join | `[LDB-4007]` | Physical composite-key signed-multiset implementation exists | Retraction output has no vnode/delivery lifecycle or hard state bound, and output-weight multiplication is not checked |
+| ASOF join | `[LDB-4007]` | Backward matching over two live inputs is locally tested; SQL is left-preserving | Forward/nearest are not streaming-final because left rows are not retained for later right arrivals; both live cursors, ordered history, and output identity are not bound in one vnode cut |
+| Temporal-probe join | `[LDB-4007]` | Physical backward-probe implementation over two live inputs exists, but is not production-correct at its current pending limit | Above 100,000 pending probes it drains oldest rows and logs data loss; both live cursors, history, probes, and timers are not bound in one vnode cut |
+| System-time temporal lookup | `[LDB-4007]` when a physical candidate reaches cluster admission, including some coerced unsupported join types | Intended local single-key `INNER`/`LEFT` implementation has one live input plus versioned reference state | Translation does not consistently reject unsupported join types; the live cursor and exact reference version are not bound together, and reference changes do not retract prior output |
+| Replicated/full-snapshot lookup | `[LDB-4007]` when its physical candidate reaches cluster admission, including some coerced unsupported join types | Local `INNER`/`LEFT` implementation has one live input plus a registry snapshot | Translation does not consistently reject unsupported join types; exact reference snapshot identity is not bound to the live cursor, assignment, output state, and sink cut |
+| Partial/on-demand lookup | `[LDB-4007]` when its physical candidate reaches cluster admission, including some coerced unsupported join types | Dedicated local single-key `INNER`/`LEFT` implementation has one live input plus fetched/cache rows and pending-request state | Current cached rows and in-flight request state are not assignment-fenced in one checkpoint; versioned refetch or durable resolved responses are possible future contracts, not current behavior |
+| Changelog-input plus static-dimension enrich | `[LDB-4007]` | Local composite pure-equi `INNER`/`LEFT` implementation has one live changelog input plus a static reference | Reference snapshot identity and output multiset are not bound to the live cursor and assignment cut |
+| Other current `RIGHT`/`FULL` or semi/anti streaming forms | Route-dependent: commonly planner `InvalidQuery`; temporal/lookup coercion may instead reach `[LDB-4007]` | Syntax/translator cases exist, but no deliberate general streaming implementation | Syntax/configuration is not an execution or state-lifecycle capability; named-route DDL coverage is partial |
+| Current natural/cross, arbitrary unbounded, or explicit/implicit multiway streaming join | Planner-rejected or unsupported in inspected paths | Rejected or unsupported | No current finite distribution/retention/output contract; correlated apply is also rejected; this is not an exhaustive DDL matrix |
 | Any materialized view | `[LDB-4007]` | Supported | Distributed materialized output and read ownership are not certified |
+
+The finite bounded-interval target has deliberately stronger semantics than a side tag on the
+current `INNER` operator:
+
+- `LEFT` retains each left row, its stable input identity, match count, emitted pair identities, and
+  unmatched-output identity until the right frontier plus the declared lateness policy proves that
+  no valid match can still arrive. Unmatched output is frontier-authorized, not timeout-by-wall-
+  clock. State cleanup occurs only after that output decision and its sink admission are covered by
+  a checkpoint. A correction/retraction-capable input must retract a prior pair or unmatched result
+  deterministically rather than silently changing history.
+- `RIGHT` may lower to `LEFT` only through a validated side swap which preserves interval direction,
+  predicates, canonical keys, input/frontier roles, output projection order, and nullability.
+- `FULL` carries the symmetric identities and frontier obligations for both sides. Semi joins retain
+  existence counts and emit once on the first valid match; changelog updates retract on the last
+  match. Anti joins use the same frontier-final unmatched rule as outer joins for append-only output,
+  or explicit insert/retract transitions under a compatible changelog sink.
+
+No such outer/existence interval implementation is present today. Natural, bounded cross, and
+pairwise multiway targets likewise require their own reviewed physical contracts; arbitrary
+dual-unbounded joins and correlated `APPLY` remain intentionally fail-closed.
 
 “One global aggregate” means one logical aggregate node per stream query, not one aggregate
 expression or one such stream in the cluster. That node may contain multiple direct aggregate
@@ -188,10 +286,10 @@ Evidence:
   query is registered.
 - [`validate_cluster_query_shape_before_plan`](../../crates/laminar-db/src/ddl.rs) rejects
   `DISTINCT`, window-close/final emission, analytic frames, AI in-flight state, temporal filters,
-  and specialized join routes.
+  and named specialized join routes. It is not exhaustive across all join DDL/translation paths.
 - [`validate_cluster_query_shape`](../../crates/laminar-db/src/ddl.rs) rejects every join plan and
-  DataFusion join fallback, multi-stage aggregates, incomplete shuffle/ownership configuration,
-  and aggregates outside the exact incremental execution path.
+  DataFusion join fallback that reaches that cluster gate, plus multi-stage aggregates, incomplete
+  shuffle/ownership configuration, and aggregates outside the exact incremental execution path.
 - [`CLUSTER_STATE_LIFECYCLE_UNSUPPORTED`](../../crates/laminar-core/src/error_codes.rs) is
   `[LDB-4007]`.
 - `handle_create_materialized_view` has an independent blanket cluster rejection because an MV's
@@ -333,8 +431,8 @@ checkpoint-class error maps to coordinated recovery, publishes no output or cut,
 callback/graph generation before the coordinator returns. Cycle 6 also invalidates the installed
 state binding and poisons a cluster graph when a terminal recovery/halt error follows input
 admission. The replacement graph restores the last committed cut. Future keyed/window/join/MV
-admission still requires authoritative operator rosters, off-side preparation, and infallible
-whole-graph publication; the current sequential callback loop is containment, not that lifecycle.
+admission still requires off-side preparation, infallible whole-graph publication, and bounded
+working state; the current sequential callback loop is containment, not that lifecycle.
 
 ### Aggregate support is partial substrate, not an admitted feature
 
@@ -351,22 +449,20 @@ The same type nevertheless implements:
 - state removal for revoked vnodes; and
 - assignment-aware shuffle/barrier integration through `SqlQueryOperator`.
 
-The uninitialized partial-restore path has an additional integrity gap which does not affect an
-admitted keyed cluster workload today because admission remains closed. Cycle 6 makes initialized
-replacement validate every decoded key against the declared vnode and current registry vnode count
-before mutation. `QueryState::Uninit`, however, validates slice shape and query fingerprint and then
-stages serialized bytes before the exact SQL plan/codec contract exists; it cannot yet prove that
-every decoded key hashes to the vnode named by the checkpoint artifact. The pending transition
-retains the vnode tag, full raw chain, exact committed cut, and target assignment, but Phase 1 must
-install the planned key contract and perform the same membership proof before publishing Active.
+Cycle 7 removes the earlier uninitialized-restore gap for the current aggregate path. Every
+connector-pipeline runtime mode initializes declared aggregate state before recovery; cached graph
+capabilities then define the exact managed participant roster. Aggregate apply validates each
+decoded key against the declared vnode and current registry vnode count before mutation. This
+closes early activation and omitted empty-participant ambiguity for the current aggregate
+implementation, but does not make grouped aggregate state bounded or cluster-admissible.
 
 The feature branch began that work in `562cc590`: capture, delta tracking, `last_emitted`
 bucketing, recovery bookkeeping, and revoke now call one allocation-free mapping over the existing
 encoded `OwnedRow`, and an active delta generation rejects a changed or zero vnode count before
 capture/revoke mutation. This is partition-path hardening only. It does not add a persisted vnode
-count, a count-rotation lifecycle, or the missing uninitialized semantic validation. The Cycle 6
-transition tag is authority metadata around the established raw payload, not a persisted semantic
-envelope.
+count, a count-rotation lifecycle, or a bounded versioned semantic payload. The Cycle 6 transition
+tag and Cycle 7 graph ABI are authority metadata around the established raw payload, not that
+payload envelope.
 
 The branch later experimented with a generic Arrow schema descriptor (`b0ac1a7a`) and strict
 single-record-batch IPC helper (`12a34c38`). Cycle 3 review (`1e8b1a59`, `f4ded97b`) narrowed the
@@ -410,8 +506,8 @@ must not be patched as an isolated assertion:
   strict decoder before any materialization; artifact bytes cannot be fed directly to `RowParser`;
 - the former initialized FULL apply merged only keys present in its payload, allowing a stale live
   key in the same vnode to survive. Cycle 6 replaces the complete initialized vnode namespace and
-  rejects decoded keys for another vnode atomically. The uninitialized path still stages bytes
-  without that declared-vnode membership check or semantic install boundary;
+  rejects decoded keys for another vnode atomically. Cycle 7 initializes the aggregate before
+  recovery, so the runtime restore path no longer relies on uninitialized raw-byte staging;
 - at the validated baseline, delta bucketing remembered one vnode count while capture accepted
   another. `562cc590` now rejects that local drift, but artifacts still do not bind their vnode
   count or define an explicit generation-rotation lifecycle;
@@ -422,37 +518,25 @@ must not be patched as an isolated assertion:
   can leave an in-memory partial batch. Cluster execution must recover from the sealed cut rather
   than retry that batch locally until the managed state write is one atomic transaction.
 
-Cycle 6 closes staged-material loss and activation before completion of the raw callbacks. It does
-not close semantic early activation for `QueryState::Uninit`. The graph
-snapshots one exact pending-transition `Arc`, decodes and resolves the complete raw-chain batch
-before the first callback, retains that exact transition through failure, and activates the
-complete acquired roster only after every callback plus assignment, transport, lifecycle, and
-exact-slot revalidation succeeds. An indeterminate callback or post-callback drift clears installed
-state authority, poisons the graph, retains the exact transition, and leaves acquired vnodes
-non-active so a fresh graph must restore the committed cut.
+Cycles 6–7 close staged-material loss, activation before callback completion, and semantic early
+activation for the declared aggregate. The graph snapshots one exact pending-transition `Arc`,
+structurally resolves the complete raw-chain inventory against its cached participant roster before
+the first callback, retains that transition through failure, and activates the complete acquired
+roster only after every callback plus assignment, transport, lifecycle, and exact-slot revalidation
+succeeds. An indeterminate callback or post-callback drift clears installed-state authority,
+poisons the graph, retains the exact transition, and leaves acquired vnodes non-active so a fresh
+graph must restore the committed cut.
 
-This is failure containment, not atomic semantic installation. Revoke and restore callbacks still
-mutate live operators sequentially; a later callback failure can follow an earlier mutation. The
-poisoned generation cannot be retried or checkpointed, but there is no abortable shadow that can
-leave the old live graph unchanged.
-
-The current partial also has no authoritative operator inventory. It derives the operator names
-from entries that happen to be present, so omission cannot distinguish an intentionally empty
-state from a missing/corrupt lifecycle participant. `GraphOperator` supplies successful no-op
-defaults for vnode apply/drop, allowing a stateful implementation without hooks to discard named
-state silently if admission ever becomes permissive. The pending transition now rejects a missing
-or empty acquired chain and retains the full validated cut and assignment/pipeline identity, but it
-does not supply the missing semantic roster. Finally, an uninitialized SQL operator can queue bytes
-and be followed by the graph's `Restoring -> Active` transition before asynchronous plan
-construction proves the exact aggregate implementation and state schema. These are independent
-reasons that the existing callback path cannot be reused for keyed admission.
-
-The required replacement is the assignment-scoped prepare/publish protocol in
-[ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#whole-graph-publication-boundary):
-authoritative roster and explicit empty state, whole-batch preflight, off-side shadows, exclusive
-graph publication, and no activation after partial success. A validator patched onto the current
-raw keyed payload would not satisfy that boundary. Cycle 6 implements its authority and structural
-containment precursor; the semantic roster and shadow publication remain required.
+This is failure containment, not atomic semantic installation. Cycle 7's exact named roster,
+named FULL payloads for decoded-empty aggregate images, placement checks, and rejecting default
+vnode hooks prevent silent participant omission. Revoke and restore callbacks still mutate live
+operators sequentially, however, so a later callback failure can follow an earlier mutation. The
+poisoned generation cannot be retried or checkpointed, but there is no abortable shadow that leaves
+the old live graph unchanged. The remaining replacement is the assignment-scoped off-side
+prepare/infallible-publish boundary in
+[ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#whole-graph-publication-boundary),
+plus graph-wide resource reservations; another validator around the raw keyed payload is not that
+boundary.
 
 This code is useful implementation substrate, but it does not make the operator production safe.
 The current one-million-group guard counts entries, not bytes. The live `groups`, changelog
@@ -470,17 +554,41 @@ direct tail-latency blocker, not merely an implementation detail.
 graph's per-vnode capture/apply/drop hooks. Distributed windows also need vnode-owned event-time
 timers, watermark/frontier state, late-data policy, firing/output bookkeeping, and atomic cleanup.
 
-Join implementations checkpoint local state but likewise do not implement the graph's vnode hooks.
-A production distributed join additionally needs both inputs shuffled with one canonical join-key
-encoding, side-specific vnode tables and time indexes, watermarks/retention for bounded cleanup,
-multiset or changelog weights, unmatched-row timers for outer joins, and assignment-fenced output
-ownership. Merely serializing the current hash tables per vnode would leave routing, bounds, tail
-latency, and recovery correctness unresolved.
+The persistent streaming-state physical join families are interval stream-stream, two-sided
+incremental/changelog, ASOF, temporal probe, system-time temporal lookup, replicated/full-snapshot
+lookup, partial/on-demand lookup, and changelog-input plus static-dimension enrichment. Finite ad hoc
+ASOF and generic DataFusion batch/fallback plans are not separate managed operator families. None of
+the streaming families declares managed vnode state. The current interval physical route accepts
+only `INNER`, so its non-`INNER` shapes fail during planning. General `RIGHT`, `FULL`, semi, and anti
+cases have no deliberate supported streaming implementation, but their observed error boundary is
+route-dependent: temporal/lookup translation can coerce an unsupported join type and let the
+resulting candidate reach cluster `[LDB-4007]`. Natural/cross, arbitrary unbounded,
+explicit/implicit multiway, and correlated apply shapes remain planner-rejected or unsupported in
+the inspected paths; DDL coverage is partial.
 
-The default no-op vnode methods on `GraphOperator` are safe only because DDL admission is explicit
-and fail-closed. They are not a scalable proof mechanism: a new stateful operator can compile
-without declaring a distribution contract. The ADR replaces that implicit convention with a
-planner-visible capability descriptor and runtime assertions.
+Local execution also has correctness gates before distributed migration: forward/nearest ASOF is
+not streaming-final; temporal probe drops oldest pending work above its fixed cap; temporal/lookup
+translation can coerce unsupported join types; interval/temporal planning can discard extra equi
+keys; and incremental output multiplicity can overflow unchecked. These must fail closed or gain
+correct bounded semantics rather than being inherited by cluster state.
+
+A production dual-live-input join additionally needs both inputs shuffled with one canonical
+join-key encoding and one fenced checkpoint cut covering both source positions and assignments,
+side-specific vnode tables/time indexes, watermarks/retention, multiset weights, matched or emitted
+output identity, and assignment-fenced output ownership. Interval, incremental/changelog, ASOF, and
+temporal probe use two live cursors; ASOF/probe asymmetry does not turn the right input into a
+checkpoint-independent reference snapshot. Stream-reference joins instead bind one live cursor and
+assignment to an exact reference snapshot/version in the same output/sink cut. The current partial
+lookup path is specifically fetched/cache rows plus pending-request state; a future implementation
+must checkpoint that work or adopt a reviewed versioned-refetch/durable-response contract. Merely
+serializing current hash tables per vnode would leave routing, bounds, tail latency, and recovery
+correctness unresolved. Rejecting default vnode methods and the managed capability roster prevent a
+new stateful operator from silently opting out, while DDL remains explicitly fail-closed.
+
+The target semantics for finite interval `LEFT`/`RIGHT`/`FULL` and left/right semi/anti are specified
+with the canonical matrix above; schema-frozen natural, bounded cross, and explicit/implicit
+pairwise multiway forms remain later deliberate targets. Arbitrary dual-unbounded joins and
+correlated apply remain fail-closed; a state backend alone cannot supply their missing semantics.
 
 ### Delivery and connector constraints are independent guards
 
@@ -648,7 +756,9 @@ delete and a mature supported memory/compaction observability surface. The ADR t
 the same real state workload and fault gates before selecting a backend rather than assuming the
 historical dependency is fit. Cycle 40 later selected the official `tidesdb/tidesdb-rs` binding,
 Cargo package `tidesdb`, as the TidesDB integration line. Cycle 41 stopped exact v0.11.1 at T0;
-qualification and production admission remain outstanding.
+qualification and production admission remain outstanding. There is no `tidesdb` dependency or
+selectable bounded working-state implementation in the current manifests or runtime. The existing
+injectable `StateBackend` is instead checkpoint-artifact storage, as distinguished below.
 
 ## Empirical validation
 
@@ -672,15 +782,16 @@ The rendered error is an outer generic invalid-operation `[LDB-0005]` containing
 The integration test `sealed_materialized_view_manifest_is_rejected_by_every_node_after_restart`
 injects a persisted keyed MV and verifies that each node rejects both initial startup and restart
 with `[LDB-4007]`.
-Local unit/integration tests separately execute grouped aggregates, window-close aggregates, ASOF
-joins, temporal joins, and incremental changelog joins. Those local tests establish operator
-availability; they do not imply that every unbounded SQL join is semantically admissible.
+Local unit/integration tests separately execute grouped aggregates, window-close aggregates, a
+backward ASOF path, temporal lookup, and incremental changelog joins. Those tests establish only
+the named local paths; they do not close the ASOF finality, temporal-probe loss, join-type coercion,
+extra-key, overflow, or distributed-lifecycle blockers above.
 
 Clean targeted commands use `--no-default-features --features cluster` throughout. Results:
 
 | Test filter | Result | Evidence |
 |---|---:|---|
-| `db::tests::cluster_query_shape_admission_is_pre_mutation_and_mode_derived` (`--lib --exact`) | PASS, 1/1 | Exact admission matrix and no-residue rollback; rerun after adding explicit plain-keyed and global-window assertions |
+| `db::tests::cluster_query_shape_admission_is_pre_mutation_and_mode_derived` (`--lib --exact`) | PASS, 1/1 | Named-route admission matrix and no-residue rollback; explicit plain-keyed and global-window assertions are covered, but specialized join DDL coverage remains partial |
 | `pipeline_lifecycle::connector_admission_tests::source_contract_admission_matrix_is_fail_closed` (`--lib --exact`) | PASS, 1/1 | Exhaustive delivery/consistency/topology source matrix |
 | `pipeline_lifecycle::connector_admission_tests::sink_contract_admission_matrix_is_fail_closed` (`--lib --exact`) | PASS, 1/1 | Exhaustive delivery/consistency/topology/output-mode sink matrix |
 | `incremental_emit_snapshot_matches_full_recompute` (`--test incremental_emit --exact`) | PASS, 1/1 | Embedded grouped aggregate matches full recomputation across four multi-key batches |
@@ -720,6 +831,19 @@ The current branch's admission-neutral hardening was then checked separately:
 | Core Cycle 6 full cluster-feature library suite | PASS, 1,787 passed / 0 failed / 1 profiling test ignored | Includes durable-authority fixtures for final-owner rejection and boot recovery assignment history |
 | Core Cycle 6 cluster test-target compilation | PASS | `cargo check -p laminar-db --tests --no-default-features --features cluster` passed after the integrated transition and poison changes |
 | Core Cycle 6 rebalance module and final lint matrix | PASS | Rebalance passed 31/31; warnings-denied cluster/no-cluster Clippy, formatting, and diff checks passed after final fixes |
+| Core Cycle 7 full no-cluster library suite | PASS, 1,310 passed / 0 failed / 1 profiling test ignored | Embedded/single-node deterministic regression coverage after the shared managed-state initialization changes; not mode-parity or soak evidence |
+| Core Cycle 7 full cluster-feature library suite | PASS, 1,811 passed / 0 failed / 1 profiling test ignored | Deterministic library recertification after managed-state initialization, exact participant rosters, replacement-process adoption, stale-process drain fixes, and vnode-state readiness gating; not soak evidence |
+| Core Cycle 7 serialized full cluster integration target | PASS, 23 passed / 0 failed | Rerun with one Cargo job after `142dadf7`; includes committed global aggregate and source-cut restore across a stale-drain Abort generation, continuation under fresh process incarnations, and a subsequent checkpoint bound to the replacement assignment; not an independent soak |
+| Core Cycle 7 serialized embedded recovery integration target | PASS, 3 passed / 0 failed | Run with one Cargo job; checkpoint hard-kill restart and no-loss recovery stayed green without cluster features; not mode-parity or soak evidence |
+| Core Cycle 7 serialized server binary suites | PASS, 238/238 without cluster and 316/316 with cluster | Run with one Cargo job; covers both configuration/startup surfaces, including fail-closed delivery policy and replacement startup choreography; not a real-process soak |
+| Core Cycle 7 final lint/document hygiene | PASS | Warnings-denied DB/server Clippy passed with and without cluster; formatting and diff checks were green at the recorded gate |
+| Core Cycle 7 exact fail-closed sentinels | PASS, 6/6 | Cluster EO, query-shape admission, fixed operator inventory, server durability scope, and source/sink capability matrices still reject before unsupported runtime work |
+| Core Cycle 7 ownerless-latest recovery correction | PASS, 38/38 focused tests plus strict sentinel and cluster Clippy | `142dadf7` makes only a nonparticipant rebuild its gated connector from the latest durable head and clear a stale target; owners remain exact. The strict test still rejects an explicit recovery target E when Commit E+1 is authoritative. The complete connector-bearing E/E+1 race remains open |
+| Core Cycle 7 pre-fix real three-node ALO hard-kill/rejoin engineering soak | **FAIL** | Subject SHA-256 `bef33cb62c397dc6486d062d09d4c0f5df808eb8124a11e986614d8629a41904`; logs `target/tmp/soak-942164-1785198920573674300`. It exposed an over-strict acquisition-handoff comparison, a recursive audit inconsistent with bounded retained lineage, and successor publication overtaking remote unapplied state. This failed attempt is retained and is not certification evidence |
+| Core Cycle 7 second real three-node ALO hard-kill/rejoin engineering soak | **FAIL** | Subject SHA-256 `91fe9d2c2ef734e1fad4f148da9e69a2eebed92057a74b70702b9b77fb490b10`; logs `target/tmp/soak-989812-1785220503643922100`. Survivors reached checkpoint 5 after the leader kill, but the restarted ownerless process timed out in a Release-E/newer-Commit-E+1 recovery loop. Strict `[LDB-6041]` rejected the rewind as designed; this is retained failure evidence, not certification |
+| Core Cycle 7 executable-digest preflight rejection | PASS for harness protection; **NO RUNTIME RESULT** | An attempted subject whose SHA-256 began `5ee...` did not match the configured digest, so the harness stopped before spawning LaminarDB. It is neither a runtime failure nor soak evidence |
+| Core Cycle 7 post-`142dadf7` real three-node ALO hard-kill/rejoin engineering rerun | **PASS engineering gate** | Server SHA-256 `089197fa82d20cc9c83118036d8820d3168f6c3752125f05c6677ac6418f81d5`; harness SHA-256 `b88df679bc4acc93739a4d4462bf208ac9c3b684bc58afc3f09a62a5d096b7b6`; logs `target/tmp/soak-996548-1785223178826043700`. Runtime 339.97 s; three kill/rejoin convergence pairs 43.721/36.441, 37.089/30.020, and 34.586/31.053 s; end-of-steady-soak checkpoint 170/epoch 170; frozen durable input cut checkpoint 187/epoch 187; 400 rps target; all 132,899 expected IDs observed with 7,898 ALO duplicates; 100% of 514 observed stalls at or below 1,024 ms; zero deadline/SLO violations. Engineering only; the deterministic E/E+1/passive-connector race and independent immutable RC soak remain open |
+| Independent immutable release-candidate soak | **NOT RUN** | Production certification remains unavailable |
 | Core Cycle 3 `operator_graph::tests` with cluster | PASS, 111/111 | Full graph unit module after opaque final-exit authority, rotation-fence, endpoint, restore-drift, assignment-drift, callback-failure, and sticky-poison checks |
 | Core Cycle 3 `final_owner_exit` focused filter | PASS, 8/8 | Audited committed last-vnode cleanup succeeds only for the exact predecessor/target identity and retains staging on every indeterminate result |
 | `snapshot_watcher_handles_draining_phase` multi-node integration | PASS, 1/1 | A zero-vnode follower completes committed revoke without polling its source, remains intake-fenced and non-authoritative, and exposes inactive transport endpoints; not an independent soak |
@@ -760,10 +884,36 @@ The current branch's admission-neutral hardening was then checked separately:
 | Cycle 67 paced observer/evidence contract | DESIGN ONLY; live/production blocked | Freezes absolute monotonic pacing, parallel node lanes, cross-slot rate shaping, complete transcript evidence, observed-prefix timing coverage, launcher-prebound loopback sockets, and a separate future mTLS listener; no code, request, or measurement |
 | Cycle 68 paced owned-fake primitives | PASS for the partial library boundary; live/production blocked | Externally bound fake plan/READY, byte-golden START/ACK, anchor-after-decode ordering, absolute timing cuts, and atomic seven-start shaping pass 20 focused tests; no executable, network, evidence/result framing, lane, or measurement |
 
-Both corrective-tree feature checks, the focused test record above, both warnings-denied Clippy
-matrices, formatting, the current diff check, and the five-file relative-link scan passed. No
-Cycle 4 result exercises an admitted distributed keyed SQL operator, a local-spill backend,
-production latency/RSS, delivery composition, or an independent soak.
+For Cycle 7, the deterministic suite results above are claimed at their recorded scope. The first
+three-node ALO engineering soak is a retained failure, not evidence to average away: subject
+SHA-256 `bef33cb62c397dc6486d062d09d4c0f5df808eb8124a11e986614d8629a41904`, logs
+`target/tmp/soak-942164-1785198920573674300`. Its checkpoint-17/assignment-2 recovery was compared
+against the acquisition handoff at checkpoint 2/assignment 1; bounded retention then made a
+recursive predecessor audit impossible, while a successor assignment could publish before one
+remote participant had applied the current assignment.
+
+The second real run is also retained as a failure: subject SHA-256
+`91fe9d2c2ef734e1fad4f148da9e69a2eebed92057a74b70702b9b77fb490b10`, logs
+`target/tmp/soak-989812-1785220503643922100`. Its survivors reached checkpoint 5 after the leader
+kill, but the ownerless restarted process repeatedly tried to recover Release E after the owners
+had durably committed E+1. Strict `[LDB-6041]` correctly refused that older explicit target. Commit
+`142dadf7` makes only the passive nonparticipant clear the stale target and recover latest while
+gated; owners remain pinned to their exact released cut. The 38/38 focused gates, strict sentinel,
+cluster Clippy, and serialized 23/23 integration target pass at that scope. The full deterministic
+Release-E/Commit-E+1/passive-connector interleaving is still open. The next real three-node run
+passed its engineering gate: server SHA-256
+`089197fa82d20cc9c83118036d8820d3168f6c3752125f05c6677ac6418f81d5`, harness SHA-256
+`b88df679bc4acc93739a4d4462bf208ac9c3b684bc58afc3f09a62a5d096b7b6`, logs
+`target/tmp/soak-996548-1785223178826043700`, 339.97-second runtime, and three kill/rejoin pairs of
+43.721/36.441, 37.089/30.020, and 34.586/31.053 seconds. End-of-steady-soak progress was checkpoint
+170/epoch 170, and the frozen durable input cut was checkpoint 187/epoch 187. It observed all
+132,899 expected IDs plus
+7,898 ALO duplicates at a 400 rps target, kept all 514 observed stalls at or below 1,024 ms, and
+recorded zero deadline/SLO violations. The earlier `5ee...` executable hash mismatch was a pre-spawn
+harness rejection, not a third runtime result. This pass is engineering-only: it does not exercise an
+admitted distributed keyed SQL operator or bounded working-state backend, prove exactly-once or
+production latency/RSS, close complete delivery composition, or replace the **NOT RUN** independently
+operated immutable release-candidate soak.
 
 Cycle 57's real commands used a Windows optimized soak-profile binary with Docker Desktop's WSL2
 engine, static discovery, MinIO, Redpanda v26.1.13, 64 key groups, 96 input partitions, shared
@@ -883,14 +1033,19 @@ a managed keyed working-state capability connected to the distributed execution 
 4. **Checkpoint bridge:** atomic state mutation plus dirty-journal update, cheap generation freeze
    at an aligned barrier, asynchronous full/delta artifact production, exact-attempt sealing, and
    safe retry/rebase after failed capture.
-5. **Ownership lifecycle:** preserve one exact committed-cut/target-assignment transition; require
-   an authoritative operator roster and explicit empty state; preflight all acquired/revoked
-   vnodes and prepare every operator off-side; publish only infallible graph-wide shard swaps under
-   the execution fence; activate the complete set once; retain the exact transition on failure;
-   fence the old owner before revoke; and drop local ranges only after authority changes.
+5. **Ownership lifecycle:** preserve one exact committed-cut/target-assignment transition; consume
+   the landed authoritative participant roster and named decoded-empty FULL payloads; preflight all
+   acquired/revoked vnodes and prepare every operator off-side; publish only infallible graph-wide
+   shard swaps under the execution fence; activate the complete set once; retain the exact
+   transition on failure; fence the old owner before revoke; and drop local ranges only after
+   authority changes.
 6. **Operator contracts:** aggregates externalize accumulators/emission state; windows externalize
-   event-time timers and firing state; joins co-partition both inputs and externalize both indexed
-   sides plus unmatched-output state.
+   event-time timers and firing state. Dual-live joins declare both inputs' distributions, indexed
+   sides, and cursors; stream-reference joins declare one live distribution/cursor plus exact
+   reference identity or durable pending/response state. Both declare applicable
+   frontiers/timers/retention, matched or emitted-output state, and append/upsert/changelog delivery
+   mode. This applies independently to every persistent streaming-state family and finite planned
+   form; syntax or translator configuration alone is not an operator contract.
 7. **Materialized output lifecycle:** separately partition, checkpoint, restore, and serve retained
    MV output before cluster MVs can be admitted.
 8. **Delivery composition:** bind supported source handoff, operator state/timers/output identity,
@@ -900,11 +1055,13 @@ a managed keyed working-state capability connected to the distributed execution 
    tests, process-death/rebalance output oracles, recovery compatibility, and published latency and
    resource profiles.
 
-Core Cycle 6 implements the transition-identity and failure-containment subset of item 5. It does
-not complete item 5: the current raw callback path still lacks an authoritative operator/state-table
-roster, explicit semantic empty state, abortable off-side preparation, and infallible bounded shard
-publication. `QueryState::Uninit` also has no plan/codec installation boundary, and transition-wide
-encoded bytes, object count, decode scratch, decoded RSS, and apply pause remain unreserved.
+Core Cycles 6–7 implement the transition identity, authoritative participant roster, named FULL
+payloads whose decoded aggregate image is empty, placement scoping, structural preflight, and
+failure-containment subsets of item 5. They do not complete it: operator payload decoding and
+mutation still occur in sequential callbacks, so a later corrupt participant can follow an earlier
+live mutation. Poison and fresh recovery contain that ambiguity, but production requires abortable
+off-side preparation and infallible graph-wide shard publication. Transition-wide encoded bytes,
+object count, decode scratch, decoded RSS, and apply pause also remain unreserved.
 
 The existing `StateBackend` must not be mistaken for item 2. Its contract explicitly persists
 immutable per-checkpoint-attempt vnode artifacts and an exact-attempt durability seal. It has no

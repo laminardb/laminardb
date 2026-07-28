@@ -4,6 +4,53 @@
 
 ### Changed
 
+- Managed aggregate candidates are now planned and initialized before checkpoint recovery in
+  embedded, single-node, and cluster pipelines. Catalog-bridged and intermediate source schemas are
+  registered before that planning boundary.
+- Managed per-vnode checkpoint participants are graph-authoritative. Capture uses the exact local
+  ownership roster, global state is scoped to vnode zero, required empty state is represented by a
+  named FULL payload whose decoded state is empty, and restore/revoke reject missing, unexpected,
+  duplicate-within-link, or placement-invalid state before activation. Implemented local keyed,
+  windowed, and stateful-join candidates that reach cluster admission remain fail-closed with
+  `[LDB-4007]`. The physical-route boundary is family-specific: bounded interval joins other than
+  `INNER` fail in planning, while temporal and lookup translation can still coerce unsupported join
+  types into a physical candidate which cluster admission then rejects with `[LDB-4007]`.
+- Replacement cluster processes now start fenced and use the audited recovery-successor path to
+  recertify durable vnode owners. Pristine vnode-zero bootstrap remains distinct from stale owner
+  or drain state, and a stale-process drain terminal is settled before successor recovery.
+- A passive replacement process outside a recovery round's frozen owner quorum now clears any
+  stale recovery target and rebuilds its assignment-closed connector runtime from the latest
+  durable checkpoint. Data-owning participants still restore the exact released epoch, and the
+  strict `[LDB-6041]` rejection of a requested epoch behind a newer durable Commit remains intact
+  (`142dadf7`). The triggering three-node ALO engineering rerun failed after its surviving owners
+  reached checkpoint 5: the restarted ownerless node repeatedly tried Release epoch E after the
+  owners had committed E+1 and timed out. Its subject SHA-256 was
+  `91fe9d2c2ef734e1fad4f148da9e69a2eebed92057a74b70702b9b77fb490b10`, with logs at
+  `target/tmp/soak-989812-1785220503643922100`; it is retained failure evidence, not a pass. The
+  post-`142dadf7` rerun passed the engineering gate in 339.97 seconds with three kill/rejoin rounds
+  (43.721/36.441, 37.089/30.020, and 34.586/31.053 seconds), all 132,899 expected IDs observed,
+  7,898 at-least-once duplicates, and all 514 observed stalls at or below 1,024 ms with no
+  deadline or SLO violation. It used server SHA-256
+  `089197fa82d20cc9c83118036d8820d3168f6c3752125f05c6677ac6418f81d5`, harness SHA-256
+  `b88df679bc4acc93739a4d4462bf208ac9c3b684bc58afc3f09a62a5d096b7b6`, and logs
+  `target/tmp/soak-996548-1785223178826043700`; its end-of-steady-soak progress was checkpoint
+  170/epoch 170 and its frozen durable input cut was checkpoint 187/epoch 187 at a 400 rps target.
+  This is engineering evidence
+  only: the independent immutable release-candidate soak is **NOT RUN**, and a deterministic
+  Release-E/Commit-E+1 passive connector regression remains open.
+- A separate attempted soak launch against an executable whose SHA-256 began `5ee...` stopped at
+  the harness's configured-digest mismatch guard. No LaminarDB subject ran, so that event is
+  preflight protection rather than runtime or soak evidence.
+- Assignment-adoption reports now distinguish process/fence adoption from installed vnode-state
+  readiness. Startup and recovery publish `vnode_state_ready = false`; successor assignment
+  publication requires `true` from every exact participant after its registry fence and installed
+  state binding match. The report is refreshed through bounded control storage every two seconds,
+  and all pre-publication waits share one absolute checkpoint deadline. This is a current-state
+  scan, not an atomic lease across the final compare-and-swap; observability, cost, race injection,
+  large-state deadline validation, and independent release-candidate soak evidence remain open.
+- The operator-graph checkpoint/state ABI is version 5. Raw `VnodePartial` layout remains unchanged,
+  but version-4 graph checkpoints are intentionally rejected; upgrade requires an explicit state
+  reset until a separate migration bridge is designed.
 - Key-group topology is mode-scoped: embedded and single-node use one group, while cluster uses
   optional `server.key_groups` (default 256). Checkpoints and assignment certificates now bind the
   partitioning ABI so incompatible recovery or shuffle peers fail closed.
