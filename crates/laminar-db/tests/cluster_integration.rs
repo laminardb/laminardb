@@ -1363,7 +1363,7 @@ mod rebalance {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn rebalance_restores_all_target_vnodes_without_an_installed_binding() {
+    async fn rebalance_restores_only_acquired_vnodes_with_an_exact_installed_binding() {
         let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
 
         // Drive the production checkpoint path so the fixture contains a participant-ready
@@ -1444,15 +1444,12 @@ mod rebalance {
         assert_eq!(adoption.version, rotated.version);
         let requiring_restore: std::collections::BTreeSet<u32> =
             adoption.vnodes_requiring_restore.iter().copied().collect();
-        let expected: std::collections::BTreeSet<u32> = (0..VNODE_COUNT).collect();
+        let expected: std::collections::BTreeSet<u32> = follower_vnodes.iter().copied().collect();
         assert_eq!(
             requiring_restore, expected,
-            "without an exact installed binding the leader must restore every target-owned vnode",
+            "an exact installed binding must retain prior local state and restore only acquired vnodes",
         );
-        assert!(follower_vnodes
-            .iter()
-            .all(|vnode| requiring_restore.contains(vnode)));
-        assert_eq!(adoption.restored_vnode_count, VNODE_COUNT as usize);
+        assert_eq!(adoption.restored_vnode_count, follower_vnodes.len());
         assert_eq!(adoption.restore_epoch, Some(checkpoint.epoch));
 
         harness.shutdown().await;
