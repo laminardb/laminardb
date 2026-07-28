@@ -9197,8 +9197,10 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
         SourceTopology,
     };
     use laminar_connectors::error::ConnectorError;
-    use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
-    use laminar_core::cluster::control::{CatalogManifest, CatalogManifestEntry};
+    use laminar_core::checkpoint::CheckpointParticipant;
+    use laminar_core::cluster::control::{
+        AssignmentSnapshot, AssignmentSnapshotStore, CatalogManifest, CatalogManifestEntry,
+    };
     use laminar_core::state::{NodeId, ObjectStoreBackend, VnodeRegistry};
     use object_store::ObjectStore;
 
@@ -9272,17 +9274,20 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
         .unwrap();
     let controller = Arc::clone(&authority.controller);
     controller.publish_recovery_incarnation().await.unwrap();
-    controller.publish_checkpoint_assignment_fence(Some(
-        CheckpointAssignmentFence::from_owner_map(
-            1,
-            &[1],
+    let assignment_store = Arc::new(AssignmentSnapshotStore::new(Arc::clone(
+        &authority.checkpoint_store,
+    )));
+    let assignment = AssignmentSnapshot::empty()
+        .next_for_participants(
+            std::collections::BTreeMap::from([(0, NodeId(1))]),
             vec![CheckpointParticipant {
                 node_id: 1,
                 boot_incarnation: controller.recovery_incarnation(),
             }],
         )
-        .unwrap(),
-    ));
+        .unwrap();
+    assignment_store.save_if_absent(&assignment).await.unwrap();
+    controller.publish_checkpoint_assignment_fence(Some(assignment.assignment_fence().unwrap()));
     controller.set_active(true);
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let db = LaminarDB::builder()
@@ -9294,6 +9299,7 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
             1,
         )))
         .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, NodeId(1))))
+        .assignment_snapshot_store(assignment_store)
         .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
             interval_ms: Some(3_600_000),
             ..Default::default()
