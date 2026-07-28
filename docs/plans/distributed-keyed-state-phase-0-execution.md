@@ -1,10 +1,10 @@
 # Phase 0 execution plan: distributed keyed state
 
 - **Status:** Certification/qualification work paused; backend-neutral core reference work resumed;
-  stock Fjall 3.1.8 failed adapter entry; no runtime dependency, backend selection, qualification
-  evidence, independent production-soak result, or admission change
+  TidesDB is preferred but empirically blocked pending upstream releases; no runtime dependency,
+  backend qualification, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-28 after the Fjall 3.1.8 source closure
+- **Last reconciled:** 2026-07-28 after the TidesDB empirical re-entry
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -29,8 +29,10 @@ It is not Phase 0 completion, backend qualification, or permission to execute a 
 The [2026-07-28 Fjall source closure](../reports/fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md)
 supersedes the earlier Fjall priority amendment. TidesDB-specific T0/T1 and campaign text retained
 below is historical Cycle 40/41 evidence unless the current numbered implementation order explicitly
-says otherwise. A new bounded re-entry must identify and audit the current official Rust/native
-subject; it does not inherit adapter or execution authority from that history.
+says otherwise. The subsequent
+[TidesDB empirical re-entry](../reports/tidesdb-current-package-reentry-2026-07-28.md) validates
+ordinary execution and reproduces current-native false-success faults; it does not inherit adapter
+or qualification authority from that history.
 
 Core Cycles 2–10 add a fail-closed runtime containment path for staged local vnode transitions and a
 narrow audited, committed final-owner revoke path. Cycles 4–6 pin restore to the capsule-validated
@@ -872,8 +874,9 @@ lineage reader/staging receipt. The managed artifact-v1 and `VnodePartialV2` rea
 
 Remaining work is kept reviewable in this dependency order:
 
-1. retain the Cycle 40 TidesDB selection and Cycle 41 T0 stop as historical evidence; the stale
-   package/native pair grants no dependency, adapter, or execution authority;
+1. retain the Cycle 40/41 TidesDB design/T0 as historical evidence and the current executable
+   re-entry as backend authority; TidesDB is preferred but no released package grants dependency,
+   adapter, or qualification authority;
 2. `docs: close stock Fjall 3.1.8 at adapter entry` — the one-engineer-day,
    zero-candidate-machine-hour closure is complete. Fatal worker exit can leave database destruction
    waiting indefinitely on a private active-thread count, and the frozen v2 background-failure
@@ -895,14 +898,20 @@ Remaining work is kept reviewable in this dependency order:
    reservation; wrapper/seal/request/spool/decode/RSS/pause limits, vnode sharding, and a second
    state family remain open. The latest exact boundary is recorded in the
    [Cycle 10 review](../reviews/distributed-keyed-state-core-cycle-10.md);
-4. under the owner's stated pivot, separately scope a current official TidesDB Rust/native re-entry;
-   verify package and native source identity afresh, then apply a short source-first atomicity,
-   failure-lifecycle, resource and public-health gate. Stop on the first decisive veto; do not add a
-   dependency, adapter, fork, object-store coupling, or candidate run in that source slice;
-5. only after a source pass and under a separately reviewed implementation scope, build the smallest
-   adapter/conformance vertical required to prove the contract in embedded, single-node, and
-   cluster-with-admission-closed modes. Remove it if entry correctness/resource containment fails;
-   do not build a generic runtime-selectable backend framework or speculative alternate adapters;
+4. `test: complete the current TidesDB empirical re-entry` — complete. Released 0.11.1 passes the
+   ordinary baseline and clean-reopen smoke. Under tmpfs capacity exhaustion, commit returned an
+   error and Rust `Drop` returned within its deadline while native close logged a flush failure.
+   Unmodified native 9.3.14 unified mode and a separate short-return contract test exposed
+   false-success commit paths;
+5. **Current scope:** [TidesDB PR 664](https://github.com/tidesdb/tidesdb/pull/664) contains the
+   focused native fault regressions and small fix; complete upstream CI/review and merge it.
+   **Release-gated:** obtain a fixed successor tag, publish the matching official source crate/Rust
+   release, and repeat entry against those immutable artifacts; Laminar never depends on the
+   contributor fork. **Future, separately reviewed:** build
+   the smallest adapter/conformance vertical required to prove the contract in embedded,
+   single-node, and cluster-with-admission-closed modes. Remove it if entry correctness/resource
+   containment fails; do not build a generic runtime-selectable backend framework or speculative
+   alternate adapters;
 6. `docs: authorize an exact keyed-state qualification run`
    - the project owner may revise the candidate before explicitly authorizing exact thresholds, case
      matrix, Zipf sampler, runner source/build identity, target/isolation/limits/cost, and evidence

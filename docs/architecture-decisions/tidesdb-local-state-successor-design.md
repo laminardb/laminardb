@@ -1,9 +1,8 @@
 # TidesDB local working-state design
 
-- **Status:** Historical stopped candidate design; superseded by ADR-008's Fjall 3.1.8 priority
-  amendment
+- **Status:** Historical candidate design; current authority is ADR-008 and the empirical report
 - **Date:** 2026-07-25
-- **Last reconciled:** 2026-07-27 during Core Cycle 1
+- **Last reconciled:** 2026-07-28 after empirical entry validation
 - **Selected integration line:** the official `tidesdb/tidesdb-rs` binding, published on crates.io
   as package and library `tidesdb`; the unrelated `tidesdb-rs` crate is excluded
 - **Stopped exact prescreen subject:** Cargo package `tidesdb v0.11.1`, tag commit
@@ -13,14 +12,14 @@
 - **Production verdict:** **NO-GO** until package closure, qualification, integration, and the
   independent soak all pass
 - **Related evidence:** [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md),
+  [TidesDB empirical re-entry](../reports/tidesdb-current-package-reentry-2026-07-28.md),
   [TidesDB static prescreen](../reports/tidesdb-static-prescreen-2026-07-25.md), and
   [ADR-008](ADR-008-managed-vnode-keyed-state.md)
 
-**2026-07-28 supersession:** [ADR-008](ADR-008-managed-vnode-keyed-state.md#2026-07-28-fjall-318-priority-amendment)
-makes stock official Fjall 3.1.8 the sole preferred worker-local qualification-entry subject. This
-file preserves the exact Cycle 40 design and Cycle 41 T0 stop as decision evidence; its
-present-tense TidesDB work order is no longer current. No TidesDB package, fork, upstream-wait task,
-adapter, or qualification run is scheduled.
+**2026-07-28 authority note:** [ADR-008](ADR-008-managed-vnode-keyed-state.md) and the
+[empirical report](../reports/tidesdb-current-package-reentry-2026-07-28.md) retain TidesDB as the
+preferred direction while leaving every exact package unadmitted. This file preserves the Cycle
+40/41 design record; it does not authorize a Laminar dependency or adapter.
 
 ## Decision
 
@@ -310,9 +309,10 @@ is attributable to the package/backend path.
 
 On stop, `[LDB-4007]` and `[LDB-0013]` remain fail-closed. No alternative activates automatically.
 At Cycle 41 the next action was to wait for a new official Cargo package `tidesdb`, freeze that exact
-pair, and repeat T0. The 2026-07-28 Fjall amendment cancels that scheduled wait. A new owner decision
-is required to restart TidesDB or reconsider another candidate. Bounded memory remains
-reference-only.
+pair, and repeat T0. The later Fjall amendment cancelled that scheduled wait; current ADR authority
+now permits only the bounded native patch, regression, and release work. Adding a Laminar dependency
+or adapter, or starting qualification, still requires its explicit release-entry gate. Bounded
+memory remains reference-only.
 
 ## Consequences
 

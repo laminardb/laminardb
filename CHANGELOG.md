@@ -4,13 +4,14 @@
 
 ### Changed
 
-- The bounded stock-Fjall 3.1.8 adapter-entry source closure stops the candidate before dependency,
-  adapter, or execution. A background worker that returns an error poisons and exits without
-  decrementing Fjall's private active-thread count, while database destruction waits without a
-  deadline for that count to reach zero. Laminar cannot repair this all-mode lifecycle defect
-  through the stock public API, and the no-fork boundary remains. No backend is selected or
-  production-qualified; `[LDB-4007]`/`[LDB-0013]` remain closed and TidesDB requires a separate
-  bounded re-entry decision.
+- TidesDB remains the preferred local-state direction after executable entry tests. Released
+  `tidesdb` 0.11.1 passed 71 default-feature library tests and ordinary clean-reopen smoke; native
+  9.3.14 unified mode and a separate short-return contract test exposed false-success commit paths.
+  The focused native fix is open as TidesDB PR 664, but upstream CI/review and fixed native/Rust
+  releases are required before integration. `[LDB-4007]` and `[LDB-0013]` remain fail-closed.
+- A bounded stock-Fjall 3.1.8 source audit found a worker-error/database-destruction hazard. Fjall is
+  inactive while TidesDB is preferred; a targeted lifecycle reproduction would still be required
+  before calling Fjall empirically rejected. No runtime Fjall dependency or fork was added.
 - Managed aggregate candidates are now planned and initialized before checkpoint recovery in
   embedded, single-node, and cluster pipelines. Catalog-bridged and intermediate source schemas are
   registered before that planning boundary.
