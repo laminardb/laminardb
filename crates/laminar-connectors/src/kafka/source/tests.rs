@@ -7,6 +7,7 @@ use laminar_core::checkpoint::{
 };
 use laminar_core::state::CheckpointAttempt;
 use rdkafka::mocking::MockCluster;
+use rdkafka::producer::{FutureProducer, FutureRecord};
 use std::{collections::BTreeMap, time::Duration};
 
 fn test_schema() -> SchemaRef {
@@ -32,6 +33,26 @@ fn committed_kafka_handoff(
     source_assignment_version: Option<NonZeroU64>,
     connector: Option<&str>,
 ) -> Result<CommittedSourceHandoff, String> {
+    committed_kafka_handoff_at(
+        source_name,
+        COMMITTED_HANDOFF_CHECKPOINT_ID,
+        checkpoint_assignment_version,
+        source_assignment_version,
+        connector,
+        41,
+        42,
+    )
+}
+
+fn committed_kafka_handoff_at(
+    source_name: &str,
+    checkpoint_id: u64,
+    checkpoint_assignment_version: u64,
+    source_assignment_version: Option<NonZeroU64>,
+    connector: Option<&str>,
+    consumed_offset: i64,
+    next_offset: i64,
+) -> Result<CommittedSourceHandoff, String> {
     let participant = CheckpointParticipant {
         node_id: 1,
         boot_incarnation: uuid::Uuid::from_u128(1),
@@ -46,10 +67,7 @@ fn committed_kafka_handoff(
     });
     let capsule = ClusterRecoveryCapsule {
         version: CLUSTER_RECOVERY_CAPSULE_VERSION,
-        attempt: CheckpointAttempt::new(
-            COMMITTED_HANDOFF_CHECKPOINT_ID,
-            COMMITTED_HANDOFF_CHECKPOINT_ID,
-        ),
+        attempt: CheckpointAttempt::new(checkpoint_id, checkpoint_id),
         deployment_id: uuid::Uuid::from_u128(2).to_string(),
         pipeline_identity: PipelineIdentity {
             canonical_version: PIPELINE_IDENTITY_VERSION,
@@ -71,8 +89,8 @@ fn committed_kafka_handoff(
         source_offsets: BTreeMap::from([(
             source_name.to_string(),
             BTreeMap::from([
-                ("events:0".into(), "41".into()),
-                (partition_baseline_key("events", 0), "42".into()),
+                ("events:0".into(), consumed_offset.to_string()),
+                (partition_baseline_key("events", 0), next_offset.to_string()),
             ]),
         )]),
         source_metadata: BTreeMap::from([(source_name.to_string(), metadata)]),
@@ -1159,6 +1177,155 @@ async fn vnode_start_publishes_the_exact_active_kafka_assignment() {
             .unwrap()
             .assignment_version(),
         NonZeroU64::new(registry.assignment_version())
+    );
+
+    source.close().await.expect("close mock consumer");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vnode_resume_cut_wins_over_older_acquisition_handoff_on_first_reader_turn() {
+    let cluster = MockCluster::new(1).expect("create in-process Kafka mock cluster");
+    cluster
+        .create_topic("events", 1, 1)
+        .expect("create explicit topic inventory");
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", cluster.bootstrap_servers())
+        .set("message.timeout.ms", "5000")
+        .create()
+        .expect("create mock producer");
+    for id in 0..=17_i64 {
+        let payload = format!(r#"{{"id":{id},"value":"event-{id}"}}"#);
+        producer
+            .send(
+                FutureRecord::<(), _>::to("events")
+                    .partition(0)
+                    .payload(&payload),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("seed deterministic Kafka offsets");
+    }
+
+    let node1 = laminar_core::state::NodeId(1);
+    let node2 = laminar_core::state::NodeId(2);
+    let registry = Arc::new(laminar_core::state::VnodeRegistry::new_unassigned(1));
+    registry.set_assignment_and_version([node2].into(), 1);
+    let acquisition_handoff = Arc::new(
+        committed_kafka_handoff_at(
+            "events-source",
+            2,
+            1,
+            NonZeroU64::new(1),
+            Some("kafka"),
+            1,
+            2,
+        )
+        .expect("build H2 acquisition handoff"),
+    );
+    registry.set_assignment_and_version_with_source_handoff([node1].into(), 2, acquisition_handoff);
+    let published = registry.versioned_snapshot();
+    assert_eq!(published.version(), 2);
+    assert_eq!(
+        published.source_handoff_attempt(),
+        Some(CheckpointAttempt::canonical(2))
+    );
+    assert_eq!(published.source_handoff_assignment_version(), Some(1));
+    assert_eq!(published.source_handoff_installed_version(), Some(2));
+
+    let inventory = KafkaPartitionSet::from([("events".to_string(), 0)]);
+    let mut recovered_cut = SourceCheckpoint::with_offsets(std::collections::HashMap::from([
+        ("events:0".to_string(), "16".to_string()),
+        (partition_baseline_key("events", 0), "17".to_string()),
+    ]));
+    recovered_cut.bind_assignment_version(NonZeroU64::new(2).unwrap());
+    recovered_cut.set_metadata(
+        KAFKA_PARTITION_INVENTORY_METADATA,
+        encode_partition_inventory(&inventory),
+    );
+
+    let mut config = test_config();
+    config.bootstrap_servers = cluster.bootstrap_servers();
+    config.group_id = "vnode-resume-newer-cut".into();
+    config.startup_mode = StartupMode::Earliest;
+    let mut source = KafkaSource::new(test_schema(), config, None);
+    source
+        .set_vnode_assignment("events-source", Arc::clone(&registry), node1)
+        .unwrap();
+    source
+        .start(
+            SourceStart::new(
+                ConnectorConfig::new("kafka"),
+                SourcePosition::Resume {
+                    attempt: CheckpointAttempt::canonical(17),
+                    checkpoint: recovered_cut,
+                },
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("C17 resume cut must activate at assignment 2");
+
+    let assigned_offset = |source: &KafkaSource| {
+        source
+            .consumer
+            .as_ref()
+            .expect("active consumer")
+            .assignment()
+            .expect("read Kafka assignment")
+            .find_partition("events", 0)
+            .map(|element| element.offset())
+    };
+    assert_eq!(assigned_offset(&source), Some(rdkafka::Offset::Offset(17)));
+    assert_eq!(
+        source.reconciled_assignment_version.load(Ordering::Acquire),
+        2,
+        "startup must publish the C17 assignment fence before reader rotation can run"
+    );
+    let active_cut = source.try_checkpoint().unwrap().unwrap();
+    assert_eq!(active_cut.assignment_version(), NonZeroU64::new(2));
+    assert_eq!(active_cut.get_offset("events:0"), Some("16"));
+
+    source.drive_control_plane();
+    assert!(source.reader_handle.is_some());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let first_batch = loop {
+        if let Some(batch) = source.poll_batch(1).await.unwrap() {
+            break batch;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Kafka reader did not return the first row from C17"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let ids = first_batch.records.column(0);
+    let ids = ids
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .expect("decoded id column");
+    assert_eq!(
+        ids.value(0),
+        17,
+        "a same-version H2 rebind would have resumed at Kafka offset 2"
+    );
+
+    assert_eq!(assigned_offset(&source), Some(rdkafka::Offset::Offset(17)));
+    assert_eq!(
+        source
+            .rotation_partition_baseline_count
+            .load(Ordering::Acquire),
+        0,
+        "the first reader turn must not rebind through H2 at offset 2"
+    );
+    assert!(lock_or_recover(&source.assignment_publication)
+        .baselines
+        .is_empty());
+    assert!(lock_or_recover(&source.reader_fault).is_none());
+    assert_eq!(
+        source.reconciled_assignment_version.load(Ordering::Acquire),
+        2
     );
 
     source.close().await.expect("close mock consumer");
