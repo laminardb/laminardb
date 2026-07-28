@@ -307,6 +307,7 @@ struct DecodedAggMutation {
 struct StagedAggMutation {
     groups: AHashMap<arrow::row::OwnedRow, GroupEntry>,
     last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
+    #[cfg(test)]
     affected: AHashSet<arrow::row::OwnedRow>,
 }
 
@@ -501,7 +502,7 @@ fn concat_columnar_ipc(a: &[u8], b: &[u8]) -> Result<Vec<u8>, DbError> {
         .map_err(|e| DbError::Pipeline(format!("columnar concat encode: {e}")))
 }
 
-#[cfg(feature = "cluster")]
+#[cfg(all(feature = "cluster", test))]
 fn validate_checkpoint_layout_and_keys(
     checkpoint: &AggStateCheckpoint,
     operation: &str,
@@ -608,7 +609,7 @@ fn validate_checkpoint_layout_and_keys(
     Ok(keys)
 }
 
-#[cfg(feature = "cluster")]
+#[cfg(all(feature = "cluster", test))]
 pub(crate) fn validate_agg_checkpoint_slice(
     checkpoint: &AggStateCheckpoint,
 ) -> Result<(), DbError> {
@@ -616,7 +617,7 @@ pub(crate) fn validate_agg_checkpoint_slice(
 }
 
 /// Merge serialized aggregate slices over disjoint keys into one checkpoint.
-#[cfg(feature = "cluster")]
+#[cfg(all(feature = "cluster", test))]
 pub(crate) fn merge_serialized_agg_cps(slices: &[bytes::Bytes]) -> Result<Vec<u8>, DbError> {
     let checkpoints = slices
         .iter()
@@ -732,7 +733,7 @@ pub(crate) fn merge_serialized_agg_cps(slices: &[bytes::Bytes]) -> Result<Vec<u8
         .map_err(|e| DbError::Pipeline(format!("merge agg slices: encode: {e}")))
 }
 
-#[cfg(feature = "cluster")]
+#[cfg(all(feature = "cluster", test))]
 fn decode_columnar_stream(bytes: &[u8], label: &str) -> Result<(RecordBatch, usize), DbError> {
     let batch = laminar_core::serialization::deserialize_batch_stream(bytes)
         .map_err(|e| DbError::Pipeline(format!("merge agg {label} decode: {e}")))?;
@@ -740,7 +741,7 @@ fn decode_columnar_stream(bytes: &[u8], label: &str) -> Result<(RecordBatch, usi
     Ok((batch, rows))
 }
 
-#[cfg(feature = "cluster")]
+#[cfg(all(feature = "cluster", test))]
 fn merge_columnar_streams<'a>(
     streams: impl Iterator<Item = &'a [u8]>,
     label: &str,
@@ -912,6 +913,47 @@ pub(crate) struct GroupEntry {
 #[cfg(feature = "cluster")]
 pub(crate) struct AggVnodeDelta {
     pub(crate) changed: AggStateCheckpoint,
+}
+
+/// One decoded authoritative vnode chain supplied to an aggregate transition preparation.
+///
+/// The graph owns the serialized recovery artifacts. `SqlQuery` decodes them once, then lends the
+/// complete operator roster here so every vnode is validated and staged before publication.
+#[cfg(feature = "cluster")]
+pub(crate) struct AggVnodeRestore<'a> {
+    pub(crate) vnode: u32,
+    pub(crate) base: &'a AggStateCheckpoint,
+    pub(crate) deltas: &'a [AggVnodeDelta],
+}
+
+/// Fully decoded aggregate replacement prepared off the live side of the publication fence.
+/// Fields stay private so callers cannot publish a partial vnode roster.
+#[cfg(feature = "cluster")]
+pub(crate) struct PreparedAggVnodeTransition {
+    transitioned_vnodes: Vec<u32>,
+    remove_group_keys: Vec<arrow::row::OwnedRow>,
+    remove_last_emitted_keys: Vec<arrow::row::OwnedRow>,
+    remove_dirty_keys: Vec<arrow::row::OwnedRow>,
+    replacement_groups: AHashMap<arrow::row::OwnedRow, GroupEntry>,
+    replacement_last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
+    replacement_dirty_keys: Vec<arrow::row::OwnedRow>,
+    replacement_dirty_by_vnode: AHashMap<u32, AHashSet<arrow::row::OwnedRow>>,
+    retired_groups: Vec<(arrow::row::OwnedRow, GroupEntry)>,
+    retired_last_emitted: Vec<(arrow::row::OwnedRow, Vec<ScalarValue>)>,
+    retired_dirty_keys: Vec<arrow::row::OwnedRow>,
+    retired_dirty_by_vnode: Vec<(u32, AHashSet<arrow::row::OwnedRow>)>,
+    retired_last_emitted_dirty_by_vnode: Vec<(u32, AHashSet<arrow::row::OwnedRow>)>,
+    retired_delta_chain_len: Vec<(u32, u32)>,
+    retired_force_rebase_vnodes: Vec<u32>,
+}
+
+/// State and staging allocations displaced by one published aggregate transition.
+///
+/// Destruction can release accumulator- and checkpoint-owned allocations, so publication returns
+/// this opaque owner and the graph drops it only after leaving the publication section.
+#[cfg(feature = "cluster")]
+pub(crate) struct RetiredAggVnodeTransition {
+    _prepared: PreparedAggVnodeTransition,
 }
 
 /// What a per-vnode capture emits for one vnode under delta-enabled checkpointing.
@@ -1250,7 +1292,7 @@ impl IncrementalAggState {
         self.last_emitted.insert(key, values);
     }
 
-    #[cfg(feature = "cluster")]
+    #[cfg(all(feature = "cluster", test))]
     fn remove_last_emitted(&mut self, key: &arrow::row::OwnedRow) -> Option<Vec<ScalarValue>> {
         self.last_emitted.remove(key)
     }
@@ -2109,7 +2151,7 @@ impl IncrementalAggState {
     }
 
     /// Rebuild one live group for an off-side recovery transaction.
-    #[cfg(feature = "cluster")]
+    #[cfg(all(feature = "cluster", test))]
     fn clone_group_for_recovery(
         &mut self,
         key: &arrow::row::OwnedRow,
@@ -2145,7 +2187,7 @@ impl IncrementalAggState {
         staged.map(Some)
     }
 
-    #[cfg(feature = "cluster")]
+    #[cfg(all(feature = "cluster", test))]
     fn build_delta_recovery_image(
         &mut self,
         affected: AHashSet<arrow::row::OwnedRow>,
@@ -2238,7 +2280,7 @@ impl IncrementalAggState {
         Ok(())
     }
 
-    #[cfg(feature = "cluster")]
+    #[cfg(all(feature = "cluster", test))]
     fn commit_recovery_image(
         &mut self,
         mut staged: StagedAggMutation,
@@ -2276,7 +2318,396 @@ impl IncrementalAggState {
         }
     }
 
+    /// Decode and build one aggregate state transition without changing live map contents or any
+    /// dirty/delta bookkeeping. Every restored vnode is authoritative: keys absent from its final
+    /// base-plus-delta image are removed alongside every explicitly revoked vnode.
+    ///
+    /// Capacity for both publication and retirement is reserved here. Once this returns, the graph
+    /// must keep the operator quiescent until it either drops the prepared value or publishes it.
     #[cfg(feature = "cluster")]
+    pub(crate) fn prepare_vnode_transition(
+        &mut self,
+        vnode_count: u32,
+        restores: &[AggVnodeRestore<'_>],
+        revoked: &rustc_hash::FxHashSet<u32>,
+    ) -> Result<PreparedAggVnodeTransition, DbError> {
+        let vnode_count = self.validate_delta_vnode_count(vnode_count)?;
+        let reserve_error = |component: &str, error: std::collections::TryReserveError| {
+            DbError::Pipeline(format!(
+                "aggregate vnode transition could not reserve {component}: {error}"
+            ))
+        };
+
+        let mut transitioned = rustc_hash::FxHashSet::default();
+        transitioned
+            .try_reserve(restores.len().saturating_add(revoked.len()))
+            .map_err(|error| reserve_error("vnode roster", error))?;
+        for vnode in revoked {
+            if *vnode >= vnode_count.get() {
+                return Err(DbError::Pipeline(format!(
+                    "revoked vnode {vnode} is outside vnode_count {}",
+                    vnode_count.get()
+                )));
+            }
+            transitioned.insert(*vnode);
+        }
+
+        // Decode and validate the complete roster before building any replacement accumulator.
+        // A corrupt late chain therefore cannot leave an earlier chain partly published.
+        let mut decoded = Vec::new();
+        decoded
+            .try_reserve_exact(restores.len())
+            .map_err(|error| reserve_error("decoded restore roster", error))?;
+        let mut restored_vnodes = rustc_hash::FxHashSet::default();
+        restored_vnodes
+            .try_reserve(restores.len())
+            .map_err(|error| reserve_error("restored vnode roster", error))?;
+        for restore in restores {
+            if restore.vnode >= vnode_count.get() {
+                return Err(DbError::Pipeline(format!(
+                    "restored vnode {} is outside vnode_count {}",
+                    restore.vnode,
+                    vnode_count.get()
+                )));
+            }
+            if !restored_vnodes.insert(restore.vnode) {
+                return Err(DbError::Pipeline(format!(
+                    "aggregate vnode transition repeats restored vnode {}",
+                    restore.vnode
+                )));
+            }
+            transitioned.insert(restore.vnode);
+
+            let base = self.decode_recovery_mutation(restore.base, "vnode transition base")?;
+            let deltas = restore
+                .deltas
+                .iter()
+                .map(|delta| self.decode_recovery_delta(delta))
+                .collect::<Result<Vec<_>, _>>()?;
+            let belongs_to_vnode = |key: &arrow::row::OwnedRow| {
+                Self::vnode_for_group_key(self.num_group_cols, key, vnode_count) == restore.vnode
+            };
+            let base_has_foreign_key = base.groups.iter().any(|(key, _, _)| !belongs_to_vnode(key))
+                || base.last_emitted.keys().any(|key| !belongs_to_vnode(key));
+            let delta_has_foreign_key = deltas.iter().any(|delta| {
+                delta
+                    .groups
+                    .iter()
+                    .any(|(key, _, _)| !belongs_to_vnode(key))
+                    || delta.last_emitted.keys().any(|key| !belongs_to_vnode(key))
+            });
+            if base_has_foreign_key || delta_has_foreign_key {
+                return Err(DbError::Pipeline(format!(
+                    "authoritative vnode {} recovery chain contains a key for another vnode",
+                    restore.vnode
+                )));
+            }
+            decoded.push((restore.vnode, base, deltas));
+        }
+
+        let capacity_overflow =
+            || DbError::Pipeline("aggregate vnode transition capacity overflow".into());
+        let replacement_group_capacity = decoded.iter().try_fold(
+            0_usize,
+            |total, (_, base, deltas)| -> Result<usize, DbError> {
+                let chain = deltas.iter().try_fold(base.groups.len(), |chain, delta| {
+                    chain
+                        .checked_add(delta.groups.len())
+                        .ok_or_else(capacity_overflow)
+                })?;
+                total.checked_add(chain).ok_or_else(capacity_overflow)
+            },
+        )?;
+        let replacement_emitted_capacity = decoded.iter().try_fold(
+            0_usize,
+            |total, (_, base, deltas)| -> Result<usize, DbError> {
+                let chain = deltas
+                    .iter()
+                    .try_fold(base.last_emitted.len(), |chain, delta| {
+                        chain
+                            .checked_add(delta.last_emitted.len())
+                            .ok_or_else(capacity_overflow)
+                    })?;
+                total.checked_add(chain).ok_or_else(capacity_overflow)
+            },
+        )?;
+        let mut replacement_groups = AHashMap::new();
+        replacement_groups
+            .try_reserve(replacement_group_capacity)
+            .map_err(|error| reserve_error("replacement groups", error))?;
+        let mut replacement_last_emitted = AHashMap::new();
+        replacement_last_emitted
+            .try_reserve(replacement_emitted_capacity)
+            .map_err(|error| reserve_error("replacement changelog state", error))?;
+        for (_vnode, base, deltas) in decoded {
+            let group_capacity = deltas.iter().try_fold(base.groups.len(), |total, delta| {
+                total
+                    .checked_add(delta.groups.len())
+                    .ok_or_else(capacity_overflow)
+            })?;
+            let emitted_capacity =
+                deltas
+                    .iter()
+                    .try_fold(base.last_emitted.len(), |total, delta| {
+                        total
+                            .checked_add(delta.last_emitted.len())
+                            .ok_or_else(capacity_overflow)
+                    })?;
+            let mut staged_groups = AHashMap::new();
+            staged_groups
+                .try_reserve(group_capacity)
+                .map_err(|error| reserve_error("staged groups", error))?;
+            let mut staged_last_emitted = AHashMap::new();
+            staged_last_emitted
+                .try_reserve(emitted_capacity)
+                .map_err(|error| reserve_error("staged changelog state", error))?;
+            let mut staged = StagedAggMutation {
+                groups: staged_groups,
+                last_emitted: staged_last_emitted,
+                #[cfg(test)]
+                affected: AHashSet::new(),
+            };
+            self.install_recovery_base(&mut staged, base)?;
+            for delta in deltas {
+                self.apply_recovery_delta_to_image(&mut staged, delta)?;
+            }
+            for (key, group) in staged.groups {
+                if replacement_groups.insert(key, group).is_some() {
+                    return Err(DbError::Pipeline(
+                        "aggregate vnode transition contains the same group in multiple restored vnodes"
+                            .into(),
+                    ));
+                }
+            }
+            for (key, values) in staged.last_emitted {
+                if replacement_last_emitted.insert(key, values).is_some() {
+                    return Err(DbError::Pipeline(
+                        "aggregate vnode transition contains the same changelog key in multiple restored vnodes"
+                            .into(),
+                    ));
+                }
+            }
+        }
+
+        let num_group_cols = self.num_group_cols;
+        let in_transition = |key: &arrow::row::OwnedRow| {
+            transitioned.contains(&Self::vnode_for_group_key(num_group_cols, key, vnode_count))
+        };
+        let remove_group_keys = self
+            .groups
+            .keys()
+            .filter(|key| in_transition(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        let remove_last_emitted_keys = self
+            .last_emitted
+            .keys()
+            .filter(|key| in_transition(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        let remove_dirty_keys = self
+            .dirty_keys
+            .iter()
+            .filter(|key| in_transition(key))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let retained_group_count = self
+            .groups
+            .len()
+            .checked_sub(remove_group_keys.len())
+            .ok_or_else(capacity_overflow)?;
+        let final_group_count = retained_group_count
+            .checked_add(replacement_groups.len())
+            .ok_or_else(capacity_overflow)?;
+        if final_group_count > self.max_groups {
+            return Err(DbError::Pipeline(format!(
+                "aggregate group limit exceeded during vnode transition: retained={retained_group_count}, replacement={}, limit={}",
+                replacement_groups.len(),
+                self.max_groups
+            )));
+        }
+
+        let mut replacement_dirty_keys = Vec::new();
+        let mut replacement_dirty_by_vnode = AHashMap::new();
+        if self.emit_changelog {
+            replacement_dirty_keys
+                .try_reserve_exact(replacement_groups.len())
+                .map_err(|error| reserve_error("changelog dirty keys", error))?;
+            replacement_dirty_keys.extend(replacement_groups.keys().cloned());
+        }
+        if let Some(delta_vnode_count) = self.delta_vnode_count {
+            replacement_dirty_by_vnode
+                .try_reserve(restores.len())
+                .map_err(|error| reserve_error("delta dirty vnode roster", error))?;
+            for key in replacement_groups.keys() {
+                let vnode = Self::vnode_for_group_key(num_group_cols, key, delta_vnode_count);
+                replacement_dirty_by_vnode
+                    .entry(vnode)
+                    .or_insert_with(AHashSet::new)
+                    .insert(key.clone());
+            }
+        }
+
+        // Reserving additional capacity is conservative: publication first removes every old
+        // transitioned key, but reserve against the current length avoids relying on that ordering.
+        self.groups
+            .try_reserve(replacement_groups.len())
+            .map_err(|error| reserve_error("live groups", error))?;
+        self.last_emitted
+            .try_reserve(replacement_last_emitted.len())
+            .map_err(|error| reserve_error("live changelog state", error))?;
+        self.dirty_keys
+            .try_reserve(replacement_dirty_keys.len())
+            .map_err(|error| reserve_error("live changelog dirty keys", error))?;
+        self.dirty_keys_by_vnode
+            .try_reserve(replacement_dirty_by_vnode.len())
+            .map_err(|error| reserve_error("live delta dirty vnode roster", error))?;
+
+        let mut transitioned_vnodes = transitioned.into_iter().collect::<Vec<_>>();
+        transitioned_vnodes.sort_unstable();
+        let mut retired_groups = Vec::new();
+        retired_groups
+            .try_reserve_exact(
+                remove_group_keys
+                    .len()
+                    .saturating_add(replacement_groups.len()),
+            )
+            .map_err(|error| reserve_error("retired groups", error))?;
+        let mut retired_last_emitted = Vec::new();
+        retired_last_emitted
+            .try_reserve_exact(
+                remove_last_emitted_keys
+                    .len()
+                    .saturating_add(replacement_last_emitted.len()),
+            )
+            .map_err(|error| reserve_error("retired changelog state", error))?;
+        let mut retired_dirty_keys = Vec::new();
+        retired_dirty_keys
+            .try_reserve_exact(
+                remove_dirty_keys
+                    .len()
+                    .saturating_add(replacement_dirty_keys.len()),
+            )
+            .map_err(|error| reserve_error("retired changelog dirty keys", error))?;
+        let tracking_retirement_capacity = transitioned_vnodes
+            .len()
+            .saturating_add(replacement_dirty_by_vnode.len());
+        let mut retired_dirty_by_vnode = Vec::new();
+        retired_dirty_by_vnode
+            .try_reserve_exact(tracking_retirement_capacity)
+            .map_err(|error| reserve_error("retired delta dirty state", error))?;
+        let mut retired_last_emitted_dirty_by_vnode = Vec::new();
+        retired_last_emitted_dirty_by_vnode
+            .try_reserve_exact(transitioned_vnodes.len())
+            .map_err(|error| reserve_error("retired changelog delta state", error))?;
+        let mut retired_delta_chain_len = Vec::new();
+        retired_delta_chain_len
+            .try_reserve_exact(transitioned_vnodes.len())
+            .map_err(|error| reserve_error("retired delta chain state", error))?;
+        let mut retired_force_rebase_vnodes = Vec::new();
+        retired_force_rebase_vnodes
+            .try_reserve_exact(transitioned_vnodes.len())
+            .map_err(|error| reserve_error("retired forced re-base state", error))?;
+
+        Ok(PreparedAggVnodeTransition {
+            transitioned_vnodes,
+            remove_group_keys,
+            remove_last_emitted_keys,
+            remove_dirty_keys,
+            replacement_groups,
+            replacement_last_emitted,
+            replacement_dirty_keys,
+            replacement_dirty_by_vnode,
+            retired_groups,
+            retired_last_emitted,
+            retired_dirty_keys,
+            retired_dirty_by_vnode,
+            retired_last_emitted_dirty_by_vnode,
+            retired_delta_chain_len,
+            retired_force_rebase_vnodes,
+        })
+    }
+
+    /// Publish an already prepared aggregate transition. All validation, accumulator construction,
+    /// and capacity growth happened in [`Self::prepare_vnode_transition`], so this section is
+    /// allocation-free and has no recoverable error branch.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn publish_prepared_vnode_transition(
+        &mut self,
+        mut prepared: PreparedAggVnodeTransition,
+    ) -> RetiredAggVnodeTransition {
+        for key in &prepared.remove_group_keys {
+            if let Some(retired) = self.groups.remove_entry(key) {
+                prepared.retired_groups.push(retired);
+            }
+        }
+        for key in &prepared.remove_last_emitted_keys {
+            if let Some(retired) = self.last_emitted.remove_entry(key) {
+                prepared.retired_last_emitted.push(retired);
+            }
+        }
+        for key in &prepared.remove_dirty_keys {
+            if let Some(retired) = self.dirty_keys.take(key) {
+                prepared.retired_dirty_keys.push(retired);
+            }
+        }
+        for vnode in &prepared.transitioned_vnodes {
+            if let Some(retired) = self.dirty_keys_by_vnode.remove_entry(vnode) {
+                prepared.retired_dirty_by_vnode.push(retired);
+            }
+            if let Some(retired) = self.last_emitted_dirty_by_vnode.remove_entry(vnode) {
+                prepared.retired_last_emitted_dirty_by_vnode.push(retired);
+            }
+            if let Some(retired) = self.delta_chain_len.remove_entry(vnode) {
+                prepared.retired_delta_chain_len.push(retired);
+            }
+            if self.force_rebase_vnodes.remove(vnode) {
+                prepared.retired_force_rebase_vnodes.push(*vnode);
+            }
+        }
+
+        // The second exact-key removal makes publication robust to an equal staged key while still
+        // retaining the displaced allocation for post-fence cleanup. Under the quiescent graph
+        // contract these branches are empty because the vnode-wide removals above already won.
+        for (key, group) in prepared.replacement_groups.drain() {
+            if let Some(retired) = self.groups.remove_entry(&key) {
+                prepared.retired_groups.push(retired);
+            }
+            self.groups.insert(key, group);
+        }
+        for (key, values) in prepared.replacement_last_emitted.drain() {
+            if let Some(retired) = self.last_emitted.remove_entry(&key) {
+                prepared.retired_last_emitted.push(retired);
+            }
+            self.last_emitted.insert(key, values);
+        }
+        for key in prepared.replacement_dirty_keys.drain(..) {
+            if let Some(retired) = self.dirty_keys.take(&key) {
+                prepared.retired_dirty_keys.push(retired);
+            }
+            self.dirty_keys.insert(key);
+        }
+        for (vnode, keys) in prepared.replacement_dirty_by_vnode.drain() {
+            if let Some(retired) = self.dirty_keys_by_vnode.remove_entry(&vnode) {
+                prepared.retired_dirty_by_vnode.push(retired);
+            }
+            self.dirty_keys_by_vnode.insert(vnode, keys);
+        }
+
+        RetiredAggVnodeTransition {
+            _prepared: prepared,
+        }
+    }
+
+    /// Release state retired by [`Self::publish_prepared_vnode_transition`] after the graph leaves
+    /// its publication fence.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn finish_vnode_transition(retired: RetiredAggVnodeTransition) {
+        drop(retired);
+    }
+
+    #[cfg(all(feature = "cluster", test))]
     fn apply_recovery_transaction(
         &mut self,
         base: Option<&AggStateCheckpoint>,
@@ -2382,7 +2813,7 @@ impl IncrementalAggState {
     }
 
     /// Apply a delta atomically: changed groups replace existing state per key.
-    #[cfg(feature = "cluster")]
+    #[cfg(all(feature = "cluster", test))]
     pub(crate) fn apply_delta(&mut self, delta: &AggVnodeDelta) -> Result<(), DbError> {
         self.apply_recovery_transaction(None, std::slice::from_ref(delta), None)
             .map(|_| ())
@@ -2401,7 +2832,7 @@ impl IncrementalAggState {
 
     /// Replace one vnode from a recovered chain and publish it once after every delta succeeds.
     /// Keys absent from the authoritative image are removed, so retry cannot retain post-cut state.
-    #[cfg(feature = "cluster")]
+    #[cfg(all(feature = "cluster", test))]
     pub(crate) fn replace_vnode_chain(
         &mut self,
         vnode: u32,
@@ -2455,7 +2886,7 @@ impl IncrementalAggState {
     /// Drop in-memory state for revoked (lost) vnodes. Ownership movement is a physical state
     /// transition, not a logical relation change, so it must not emit changelog rows. Purging
     /// prevents stale keys absent from a later FULL image from surviving a re-acquire.
-    #[cfg(feature = "cluster")]
+    #[cfg(all(feature = "cluster", test))]
     pub(crate) fn drop_vnodes(
         &mut self,
         revoked: &rustc_hash::FxHashSet<u32>,

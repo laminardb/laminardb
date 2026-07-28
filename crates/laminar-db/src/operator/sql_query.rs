@@ -22,18 +22,28 @@ use sqlparser::ast::{
     visit_expressions, Expr, GroupByExpr, Query, Select, SetExpr, Statement, TableFactor,
 };
 
+#[cfg(all(feature = "cluster", test))]
+use crate::aggregate_state::merge_serialized_agg_cps;
+#[cfg(all(feature = "cluster", test))]
+use crate::aggregate_state::validate_agg_checkpoint_slice;
 use crate::aggregate_state::{
     apply_compiled_having, AggStateCheckpoint, CompiledProjection, IncrementalAggState,
 };
 #[cfg(feature = "cluster")]
-use crate::aggregate_state::{merge_serialized_agg_cps, validate_agg_checkpoint_slice};
+use crate::aggregate_state::{
+    AggVnodeRestore, PreparedAggVnodeTransition, RetiredAggVnodeTransition,
+};
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
+#[cfg(feature = "cluster")]
+use crate::operator::capability::{ManagedStateContract, OperatorStateClass};
 use crate::operator::capability::{OperatorCapability, OperatorImplementation};
+#[cfg(feature = "cluster")]
+use crate::operator_graph::ManagedVnodeTransition;
 use crate::operator_graph::{try_evaluate_compiled, GraphOperator, OperatorCheckpoint};
 use crate::sql_analysis::{extract_projection_filter, single_source_table};
 
-#[cfg(feature = "cluster")]
+#[cfg(all(feature = "cluster", test))]
 use bytes::Bytes;
 
 // Resolved on first `process()` call by introspecting the SQL.
@@ -45,6 +55,21 @@ enum QueryState {
     CachedPlan(Arc<dyn datafusion::physical_plan::ExecutionPlan>),
     // Multi-source JOIN; the hash table is rebuilt each cycle from fresh live-source data.
     CachedPhysical(Arc<dyn datafusion::physical_plan::ExecutionPlan>),
+}
+
+#[cfg(feature = "cluster")]
+struct PreparedSqlVnodeTransition {
+    aggregate: PreparedAggVnodeTransition,
+    next_prev_owned: rustc_hash::FxHashSet<u32>,
+}
+
+#[cfg(feature = "cluster")]
+enum SqlVnodeTransitionCleanup {
+    Aborted(PreparedSqlVnodeTransition),
+    Published {
+        aggregate: RetiredAggVnodeTransition,
+        prev_owned: rustc_hash::FxHashSet<u32>,
+    },
 }
 
 /// Pre-aggregate row-shuffle config for cluster mode.
@@ -238,9 +263,9 @@ pub(crate) struct SqlQueryOperator {
     // Validated vnode bases retained in their original serialized form while the SQL aggregate is
     // still uninitialized. Lazy initialization merges the entire set once, avoiding a whole-state
     // clone and IPC rewrite for every recovered vnode.
-    #[cfg(feature = "cluster")]
+    #[cfg(all(feature = "cluster", test))]
     pending_restore_slices: Vec<Bytes>,
-    #[cfg(feature = "cluster")]
+    #[cfg(all(feature = "cluster", test))]
     pending_restore_slice_fingerprint: Option<u64>,
     execution_path_logged: bool,
     having_cache: Option<super::HavingSqlCache>,
@@ -260,15 +285,19 @@ pub(crate) struct SqlQueryOperator {
     #[cfg(feature = "cluster")]
     vnode_partials_authoritative: bool,
     // Deltas seen during restart (state Uninit), replayed after `lazy_init` restores the base.
-    #[cfg(feature = "cluster")]
+    #[cfg(all(feature = "cluster", test))]
     pending_restore_deltas: Vec<crate::aggregate_state::AggVnodeDelta>,
     // Vnodes revoked while still Uninit: their groups sit in `pending_restore`/`pending_restore_deltas`
     // and can't be dropped yet. Re-applied via `drop_vnodes` once `lazy_init` folds the restore so
     // ownership loss is reflected before any output or later re-acquire.
-    #[cfg(feature = "cluster")]
+    #[cfg(all(feature = "cluster", test))]
     deferred_revoke_vnodes: rustc_hash::FxHashSet<u32>,
     #[cfg(feature = "cluster")]
     aligned_replay: VecDeque<(u64, i64, crate::operator::RetainedBatch)>,
+    #[cfg(feature = "cluster")]
+    prepared_vnode_transition: Option<PreparedSqlVnodeTransition>,
+    #[cfg(feature = "cluster")]
+    vnode_transition_cleanup: Option<SqlVnodeTransitionCleanup>,
 }
 
 /// Classify a failure from a step that may already have changed operator state.
@@ -303,9 +332,9 @@ impl SqlQueryOperator {
             state: QueryState::Uninit,
             prom,
             pending_restore: None,
-            #[cfg(feature = "cluster")]
+            #[cfg(all(feature = "cluster", test))]
             pending_restore_slices: Vec::new(),
-            #[cfg(feature = "cluster")]
+            #[cfg(all(feature = "cluster", test))]
             pending_restore_slice_fingerprint: None,
             execution_path_logged: false,
             having_cache: None,
@@ -318,12 +347,16 @@ impl SqlQueryOperator {
             delta_chain_bound: None,
             #[cfg(feature = "cluster")]
             vnode_partials_authoritative: false,
-            #[cfg(feature = "cluster")]
+            #[cfg(all(feature = "cluster", test))]
             pending_restore_deltas: Vec::new(),
-            #[cfg(feature = "cluster")]
+            #[cfg(all(feature = "cluster", test))]
             deferred_revoke_vnodes: rustc_hash::FxHashSet::default(),
             #[cfg(feature = "cluster")]
             aligned_replay: VecDeque::new(),
+            #[cfg(feature = "cluster")]
+            prepared_vnode_transition: None,
+            #[cfg(feature = "cluster")]
+            vnode_transition_cleanup: None,
         }
     }
 
@@ -366,7 +399,12 @@ impl SqlQueryOperator {
         newly
     }
 
-    #[cfg(feature = "cluster")]
+    #[cfg(all(feature = "cluster", not(test)))]
+    fn staged_pending_restore(&self) -> Option<AggStateCheckpoint> {
+        self.pending_restore.clone()
+    }
+
+    #[cfg(all(feature = "cluster", test))]
     fn staged_pending_restore(&self) -> Result<Option<AggStateCheckpoint>, DbError> {
         if self.pending_restore_slices.is_empty() {
             return Ok(self.pending_restore.clone());
@@ -406,8 +444,27 @@ impl SqlQueryOperator {
         match IncrementalAggState::try_from_sql(&self.ctx, &self.sql, self.emit_changelog).await {
             Ok(Some(mut agg_state)) => {
                 #[cfg(feature = "cluster")]
+                if self.cluster_shuffle.is_some() {
+                    let expected_state_class = if agg_state.num_group_cols() == 0 {
+                        OperatorStateClass::GlobalSingleton
+                    } else {
+                        OperatorStateClass::VnodeKeyed
+                    };
+                    if self.capability.managed_state != Some(ManagedStateContract::SqlAggregateV1)
+                        || self.capability.state_class != expected_state_class
+                    {
+                        return Err(DbError::Pipeline(format!(
+                            "[{}] query '{}': initialized aggregate state does not match its immutable cluster capability ({:?}, {:?})",
+                            laminar_core::error_codes::CLUSTER_STATE_LIFECYCLE_UNSUPPORTED,
+                            self.op_name,
+                            self.capability.state_class,
+                            self.capability.managed_state
+                        )));
+                    }
+                }
+                #[cfg(all(feature = "cluster", test))]
                 let staged_pending_restore = self.staged_pending_restore()?;
-                #[cfg(not(feature = "cluster"))]
+                #[cfg(any(not(feature = "cluster"), all(feature = "cluster", not(test))))]
                 let staged_pending_restore = self.staged_pending_restore();
                 if let Some(ref cp) = staged_pending_restore {
                     let restored = agg_state.restore_groups(cp).map_err(|error| {
@@ -422,7 +479,7 @@ impl SqlQueryOperator {
                         "lazy_init fold: restored pending aggregate baseline"
                     );
                 }
-                #[cfg(feature = "cluster")]
+                #[cfg(all(feature = "cluster", test))]
                 for delta in &self.pending_restore_deltas {
                     agg_state.apply_delta(delta).map_err(|error| {
                         DbError::Checkpoint(format!(
@@ -433,7 +490,7 @@ impl SqlQueryOperator {
                 }
                 // Vnodes revoked while we were Uninit: drop them now that the restore is folded in,
                 // before any output or later re-acquire can expose state this node no longer owns.
-                #[cfg(feature = "cluster")]
+                #[cfg(all(feature = "cluster", test))]
                 if !self.deferred_revoke_vnodes.is_empty() {
                     let vc = self
                         .cluster_shuffle
@@ -454,7 +511,7 @@ impl SqlQueryOperator {
                 }
 
                 self.pending_restore = None;
-                #[cfg(feature = "cluster")]
+                #[cfg(all(feature = "cluster", test))]
                 {
                     self.pending_restore_slices.clear();
                     self.pending_restore_slice_fingerprint = None;
@@ -969,6 +1026,7 @@ fn hash_rows_to_vnodes(
 
 #[cfg(feature = "cluster")]
 impl SqlQueryOperator {
+    #[cfg(test)]
     fn stage_uninit_vnode_slice(
         &mut self,
         vnode: u32,
@@ -1139,11 +1197,11 @@ impl GraphOperator for SqlQueryOperator {
         } else {
             match self.state {
                 QueryState::Uninit => {
-                    #[cfg(feature = "cluster")]
+                    #[cfg(all(feature = "cluster", test))]
                     {
                         self.staged_pending_restore()?
                     }
-                    #[cfg(not(feature = "cluster"))]
+                    #[cfg(any(not(feature = "cluster"), all(feature = "cluster", not(test))))]
                     {
                         self.staged_pending_restore()
                     }
@@ -1263,7 +1321,7 @@ impl GraphOperator for SqlQueryOperator {
                         self.op_name
                     )));
                 }
-                #[cfg(feature = "cluster")]
+                #[cfg(all(feature = "cluster", test))]
                 if let (Some(checkpoint), Some(fingerprint)) =
                     (agg.as_ref(), self.pending_restore_slice_fingerprint)
                 {
@@ -1437,6 +1495,158 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
+    fn prepare_vnode_transition(
+        &mut self,
+        transition: ManagedVnodeTransition<'_>,
+    ) -> Result<(), DbError> {
+        if self.prepared_vnode_transition.is_some() || self.vnode_transition_cleanup.is_some() {
+            return Err(DbError::Checkpoint(format!(
+                "aggregate '{}' already owns vnode transition state",
+                self.op_name
+            )));
+        }
+        let config = self.cluster_shuffle.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "aggregate '{}' cannot prepare vnode state without cluster ownership",
+                self.op_name
+            ))
+        })?;
+        let assignment = config.registry.versioned_snapshot();
+        let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
+        if transition.target.vnode_count != config.registry.vnode_count()
+            || transition.target.assignment_version != assignment.version()
+            || !transition.target.matches_owner_map(&owners)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "aggregate '{}' vnode transition target does not match assignment {}",
+                self.op_name,
+                assignment.version()
+            )));
+        }
+
+        let mut decoded = Vec::new();
+        decoded
+            .try_reserve_exact(transition.restores.len())
+            .map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "aggregate '{}' could not reserve decoded vnode transition metadata",
+                    self.op_name
+                ))
+            })?;
+        for restore in transition.restores {
+            let base = rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(restore.base)
+                .map_err(|error| {
+                    DbError::Pipeline(format!(
+                        "per-vnode base deserialization for '{}' vnode {}: {error}",
+                        self.op_name, restore.vnode
+                    ))
+                })?;
+            let deltas = restore
+                .deltas
+                .iter()
+                .map(|changed| {
+                    rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(changed)
+                        .map(|changed| crate::aggregate_state::AggVnodeDelta { changed })
+                        .map_err(|error| {
+                            DbError::Pipeline(format!(
+                                "per-vnode delta deserialization for '{}' vnode {}: {error}",
+                                self.op_name, restore.vnode
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            decoded.push((restore.vnode, base, deltas));
+        }
+        let restore_refs: Vec<AggVnodeRestore<'_>> = decoded
+            .iter()
+            .map(|(vnode, base, deltas)| AggVnodeRestore {
+                vnode: *vnode,
+                base,
+                deltas,
+            })
+            .collect();
+
+        let mut next_prev_owned = rustc_hash::FxHashSet::default();
+        next_prev_owned
+            .try_reserve(self.prev_owned.len())
+            .map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "aggregate '{}' could not reserve ownership transition metadata",
+                    self.op_name
+                ))
+            })?;
+        next_prev_owned.extend(self.prev_owned.iter().copied());
+        for vnode in transition.revoked {
+            next_prev_owned.remove(vnode);
+        }
+
+        let QueryState::Agg(ref mut aggregate) = self.state else {
+            return Err(DbError::Checkpoint(format!(
+                "managed vnode transition for '{}' targeted a non-aggregate query",
+                self.op_name
+            )));
+        };
+        let aggregate = aggregate.prepare_vnode_transition(
+            transition.target.vnode_count,
+            &restore_refs,
+            transition.revoked,
+        )?;
+        self.prepared_vnode_transition = Some(PreparedSqlVnodeTransition {
+            aggregate,
+            next_prev_owned,
+        });
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn abort_vnode_transition(&mut self) {
+        let Some(prepared) = self.prepared_vnode_transition.take() else {
+            return;
+        };
+        assert!(
+            self.vnode_transition_cleanup.is_none(),
+            "aggregate vnode transition cleanup must finish before abort"
+        );
+        self.vnode_transition_cleanup = Some(SqlVnodeTransitionCleanup::Aborted(prepared));
+    }
+
+    #[cfg(feature = "cluster")]
+    fn publish_vnode_transition(&mut self) {
+        let prepared = self
+            .prepared_vnode_transition
+            .take()
+            .expect("aggregate vnode transition must be prepared before publication");
+        assert!(
+            self.vnode_transition_cleanup.is_none(),
+            "aggregate vnode transition cleanup must finish before publication"
+        );
+        let QueryState::Agg(ref mut aggregate) = self.state else {
+            panic!("managed vnode transition publication targeted a non-aggregate query");
+        };
+        let retired_aggregate = aggregate.publish_prepared_vnode_transition(prepared.aggregate);
+        let retired_prev_owned = std::mem::replace(&mut self.prev_owned, prepared.next_prev_owned);
+        self.vnode_transition_cleanup = Some(SqlVnodeTransitionCleanup::Published {
+            aggregate: retired_aggregate,
+            prev_owned: retired_prev_owned,
+        });
+    }
+
+    #[cfg(feature = "cluster")]
+    fn finish_vnode_transition(&mut self) {
+        match self.vnode_transition_cleanup.take() {
+            Some(SqlVnodeTransitionCleanup::Aborted(prepared)) => drop(prepared),
+            Some(SqlVnodeTransitionCleanup::Published {
+                aggregate,
+                prev_owned,
+            }) => {
+                IncrementalAggState::finish_vnode_transition(aggregate);
+                drop(prev_owned);
+            }
+            None => {}
+        }
+    }
+
+    #[cfg(all(feature = "cluster", test))]
     fn apply_vnode_chain(
         &mut self,
         vnode: u32,
@@ -1502,7 +1712,7 @@ impl GraphOperator for SqlQueryOperator {
         Ok(())
     }
 
-    #[cfg(feature = "cluster")]
+    #[cfg(all(feature = "cluster", test))]
     fn drop_owned_vnodes(&mut self, revoked: &rustc_hash::FxHashSet<u32>) -> Result<(), DbError> {
         if revoked.is_empty() {
             return Ok(());
@@ -1612,6 +1822,7 @@ mod checkpoint_tests {
             "SELECT COUNT(*) FROM events a JOIN other b ON a.key = b.key",
             "SELECT DISTINCT COUNT(*) FROM events",
             "SELECT key FROM events ORDER BY key",
+            "SELECT COUNT(*) AS n FROM events LIMIT 1",
             "SELECT key FROM events; SELECT key FROM events",
         ] {
             let ambiguous = classify(ambiguous_sql);
@@ -1961,6 +2172,33 @@ mod delta_primary_tests {
     }
 
     #[tokio::test]
+    async fn cluster_aggregate_cannot_outgrow_its_immutable_managed_capability() {
+        let (context, batch) = super::checkpoint_tests::context_and_batch();
+        let mut operator = SqlQueryOperator::new(
+            "limited-count",
+            "SELECT COUNT(*) AS n FROM events LIMIT 1",
+            context,
+            None,
+            false,
+        );
+        assert_eq!(operator.capability.managed_state, None);
+        let (shuffle, _) = single_owner_shuffle().await;
+        operator.attach_cluster_shuffle(shuffle);
+
+        let error = operator
+            .process(&[vec![batch]], &[i64::MIN])
+            .await
+            .expect_err("an unmanaged classifier result must not become cluster aggregate state");
+
+        assert!(error.to_string().contains("LDB-4007"), "{error}");
+        assert!(
+            error.to_string().contains("immutable cluster capability"),
+            "{error}"
+        );
+        assert!(matches!(operator.state, QueryState::Uninit));
+    }
+
+    #[tokio::test]
     async fn empty_aggregate_capture_names_every_required_vnode() {
         for (sql, required) in [
             (
@@ -2035,6 +2273,85 @@ mod delta_primary_tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(weights.values(), &[1]);
+    }
+
+    #[tokio::test]
+    async fn prepared_global_restore_aborts_cleanly_then_publishes_exact_image() {
+        fn current_state_bytes(operator: &mut SqlQueryOperator) -> Vec<u8> {
+            let QueryState::Agg(ref mut aggregate) = operator.state else {
+                panic!("expected initialized aggregate state");
+            };
+            serialize_agg_cp(&aggregate.checkpoint_groups().unwrap(), &operator.op_name).unwrap()
+        }
+
+        let (context, batch) = super::checkpoint_tests::context_and_batch();
+        let sql = "SELECT SUM(value) AS total FROM events";
+        let (donor_shuffle, version) = single_owner_shuffle().await;
+        let mut donor = SqlQueryOperator::new("total", sql, context.clone(), None, false);
+        donor.attach_cluster_shuffle(donor_shuffle);
+        donor
+            .process(&[vec![batch.clone()]], &[i64::MIN])
+            .await
+            .unwrap();
+        let donor_slice = donor
+            .checkpoint_by_vnode(&[0], 8)
+            .unwrap()
+            .expect("global vnode must emit an explicit image")
+            .remove(&0)
+            .expect("global vnode zero image");
+        let crate::checkpoint_coordinator::StagedSlice::Bytes(donor_slice) = donor_slice else {
+            panic!("global aggregate capture must be materialized bytes");
+        };
+
+        let (subject_shuffle, subject_version) = single_owner_shuffle().await;
+        assert_eq!(subject_version, version);
+        let mut subject = SqlQueryOperator::new("total", sql, context, None, false);
+        subject.attach_cluster_shuffle(subject_shuffle);
+        subject
+            .process(&[vec![batch.clone()]], &[i64::MIN])
+            .await
+            .unwrap();
+        subject.process(&[vec![batch]], &[i64::MIN]).await.unwrap();
+        let before = current_state_bytes(&mut subject);
+        let target = laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
+            version,
+            &[1; 8],
+            vec![laminar_core::checkpoint::CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: uuid::Uuid::from_u128(1),
+            }],
+        )
+        .unwrap();
+        let no_deltas: [&[u8]; 0] = [];
+        let restores = [crate::operator_graph::ManagedVnodeRestore {
+            vnode: 0,
+            base: &donor_slice,
+            deltas: &no_deltas,
+        }];
+        let revoked = rustc_hash::FxHashSet::default();
+
+        subject
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                target: &target,
+                revoked: &revoked,
+                restores: &restores,
+            })
+            .unwrap();
+        assert_eq!(current_state_bytes(&mut subject), before);
+        subject.abort_vnode_transition();
+        subject.finish_vnode_transition();
+        assert_eq!(current_state_bytes(&mut subject), before);
+
+        subject
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                target: &target,
+                revoked: &revoked,
+                restores: &restores,
+            })
+            .unwrap();
+        subject.publish_vnode_transition();
+        subject.finish_vnode_transition();
+        assert_eq!(current_state_bytes(&mut subject), donor_slice.as_ref());
     }
 
     async fn aggregate_state_checkpoint() -> (SessionContext, AggStateCheckpoint) {

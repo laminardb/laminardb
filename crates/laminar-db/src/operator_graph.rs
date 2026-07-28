@@ -17,7 +17,7 @@ use crate::db::exact_table_reference;
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
 #[cfg(feature = "cluster")]
-use crate::operator::capability::OperatorStateClass;
+use crate::operator::capability::{ClusterExecutionStatus, OperatorStateClass};
 use crate::operator::capability::{OperatorCapability, OperatorImplementation};
 #[cfg(feature = "cluster")]
 use crate::operator::RetainedBatch;
@@ -116,9 +116,41 @@ pub(crate) trait GraphOperator: Send {
         Ok(None)
     }
 
-    /// Replace one vnode from its authoritative recovery chain: a FULL base then ordered deltas.
-    /// Implementations must remove live keys absent from that recovered image.
+    /// Prepare this operator's exact revoke/restore batch without mutating live state.
+    ///
+    /// A successful implementation owns one unpublished prepared replacement until `abort` or
+    /// `publish`. The assignment fence is part of the input so preparation cannot be reused under
+    /// different ownership authority.
     #[cfg(feature = "cluster")]
+    fn prepare_vnode_transition(
+        &mut self,
+        _transition: ManagedVnodeTransition<'_>,
+    ) -> Result<(), DbError> {
+        Err(DbError::Checkpoint(
+            "operator declares managed vnode state but does not implement transition preparation"
+                .into(),
+        ))
+    }
+
+    /// Discard an unpublished prepared replacement. This must not mutate live state.
+    #[cfg(feature = "cluster")]
+    fn abort_vnode_transition(&mut self) {}
+
+    /// Publish the previously prepared replacement synchronously.
+    ///
+    /// Preparation must reserve and validate everything needed by this operation. Publication is
+    /// deliberately infallible so the graph can expose all managed operators at one authority cut.
+    #[cfg(feature = "cluster")]
+    fn publish_vnode_transition(&mut self) {
+        panic!("operator published vnode state without a prepared lifecycle implementation");
+    }
+
+    /// Retire state displaced by publication after graph authority locks have been released.
+    #[cfg(feature = "cluster")]
+    fn finish_vnode_transition(&mut self) {}
+
+    /// Test-only adapter for fault-containment probes that deliberately mutate live state.
+    #[cfg(all(feature = "cluster", test))]
     fn apply_vnode_chain(
         &mut self,
         vnode: u32,
@@ -126,16 +158,15 @@ pub(crate) trait GraphOperator: Send {
         _deltas: &[&[u8]],
     ) -> Result<(), DbError> {
         Err(DbError::Checkpoint(format!(
-            "operator does not accept vnode checkpoint state for vnode {vnode}"
+            "test operator does not accept vnode checkpoint state for vnode {vnode}"
         )))
     }
 
-    /// Drop in-memory state for vnodes this node lost on a rebalance, before a later authoritative
-    /// vnode image is installed. Managed vnode-state operators must implement this callback.
-    #[cfg(feature = "cluster")]
+    /// Test-only adapter for legacy live-mutation fault probes.
+    #[cfg(all(feature = "cluster", test))]
     fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) -> Result<(), DbError> {
         Err(DbError::Checkpoint(
-            "operator declares vnode state but does not implement vnode revocation".into(),
+            "test operator does not implement vnode revocation".into(),
         ))
     }
 
@@ -143,6 +174,22 @@ pub(crate) trait GraphOperator: Send {
     /// cleared the dirty sets before durability). Default no-op; only delta aggregates act.
     #[cfg(feature = "cluster")]
     fn force_full_rebase(&mut self) {}
+}
+
+/// One authoritative FULL base and ordered delta chain prepared for a managed operator.
+#[cfg(feature = "cluster")]
+pub(crate) struct ManagedVnodeRestore<'a> {
+    pub(crate) vnode: u32,
+    pub(crate) base: &'a [u8],
+    pub(crate) deltas: &'a [&'a [u8]],
+}
+
+/// Exact operator-local projection of one graph vnode transition.
+#[cfg(feature = "cluster")]
+pub(crate) struct ManagedVnodeTransition<'a> {
+    pub(crate) target: &'a laminar_core::checkpoint::CheckpointAssignmentFence,
+    pub(crate) revoked: &'a FxHashSet<u32>,
+    pub(crate) restores: &'a [ManagedVnodeRestore<'a>],
 }
 
 pub(crate) struct OperatorCheckpoint {
@@ -1135,6 +1182,24 @@ impl OperatorGraph {
                 "managed state must be initialized before graph recovery or execution".into(),
             ));
         }
+        #[cfg(feature = "cluster")]
+        let cluster_graph = self.cluster_shuffle.is_some();
+        #[cfg(feature = "cluster")]
+        if cluster_graph {
+            for node in &self.nodes {
+                if node.removed {
+                    continue;
+                }
+                if let ClusterExecutionStatus::Rejected { reason } = node.capability.cluster_status
+                {
+                    return Err(DbError::Pipeline(format!(
+                        "[{}] operator '{}' is not cluster-admissible: {reason}",
+                        laminar_core::error_codes::CLUSTER_STATE_LIFECYCLE_UNSUPPORTED,
+                        node.name
+                    )));
+                }
+            }
+        }
         for node in &mut self.nodes {
             if node.removed || node.capability.managed_state.is_none() {
                 continue;
@@ -1149,6 +1214,21 @@ impl OperatorGraph {
                     ))
                 })?;
             let resolved = node.operator.cluster_capability();
+            #[cfg(feature = "cluster")]
+            if cluster_graph && resolved != node.capability {
+                let detail = match resolved.cluster_status {
+                    ClusterExecutionStatus::Rejected { reason } => reason.to_string(),
+                    _ => format!(
+                        "managed-state initialization changed the capability descriptor from {:?} to {:?}",
+                        node.capability, resolved
+                    ),
+                };
+                return Err(DbError::Pipeline(format!(
+                    "[{}] operator '{}' is not cluster-admissible after managed-state initialization: {detail}",
+                    laminar_core::error_codes::CLUSTER_STATE_LIFECYCLE_UNSUPPORTED,
+                    node.name
+                )));
+            }
             if resolved.implementation != node.capability.implementation {
                 return Err(DbError::Checkpoint(format!(
                     "managed-state initialization changed operator '{}' implementation from {:?} to {:?}",

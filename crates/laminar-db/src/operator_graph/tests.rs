@@ -481,6 +481,108 @@ impl GraphOperator for RecordingVnodeRestoreOperator {
 }
 
 #[cfg(feature = "cluster")]
+#[derive(Debug, Default)]
+struct PreparedVnodeProbeState {
+    prepared: bool,
+    prepare_count: usize,
+    abort_count: usize,
+    publish_count: usize,
+    finish_count: usize,
+}
+
+#[cfg(feature = "cluster")]
+enum PreparedVnodeProbeAction {
+    Succeed,
+    Fail(&'static str),
+    PanicOnPublish,
+    ReplacePending {
+        handle: TestPendingVnodeTransitionHandle,
+        replacement: Arc<crate::vnode_transition_staging::PendingVnodeTransition>,
+    },
+}
+
+/// Exercises the production managed-state protocol without opting legacy callback probes into it.
+#[cfg(feature = "cluster")]
+struct PreparedVnodeProbe {
+    state: Arc<parking_lot::Mutex<PreparedVnodeProbeState>>,
+    action: PreparedVnodeProbeAction,
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait]
+impl GraphOperator for PreparedVnodeProbe {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability {
+            implementation: crate::operator::capability::OperatorImplementation::TestProbe,
+            state_class: crate::operator::capability::OperatorStateClass::VnodeKeyed,
+            cluster_status: crate::operator::capability::ClusterExecutionStatus::InternalOnly,
+            managed_state: Some(crate::operator::capability::ManagedStateContract::SqlAggregateV1),
+        }
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn prepare_vnode_transition(
+        &mut self,
+        _transition: ManagedVnodeTransition<'_>,
+    ) -> Result<(), DbError> {
+        let mut state = self.state.lock();
+        assert!(
+            !std::mem::replace(&mut state.prepared, true),
+            "probe received a second prepare without abort or publication"
+        );
+        state.prepare_count += 1;
+        drop(state);
+
+        match &self.action {
+            PreparedVnodeProbeAction::Succeed | PreparedVnodeProbeAction::PanicOnPublish => Ok(()),
+            PreparedVnodeProbeAction::Fail(message) => {
+                Err(DbError::Pipeline((*message).to_string()))
+            }
+            PreparedVnodeProbeAction::ReplacePending {
+                handle,
+                replacement,
+            } => {
+                *handle.lock() = Some(Arc::clone(replacement));
+                Ok(())
+            }
+        }
+    }
+
+    fn abort_vnode_transition(&mut self) {
+        let mut state = self.state.lock();
+        state.prepared = false;
+        state.abort_count += 1;
+    }
+
+    fn publish_vnode_transition(&mut self) {
+        if matches!(self.action, PreparedVnodeProbeAction::PanicOnPublish) {
+            panic!("injected managed-state publication panic");
+        }
+        let mut state = self.state.lock();
+        assert!(
+            std::mem::take(&mut state.prepared),
+            "probe published without a prepared replacement"
+        );
+        state.publish_count += 1;
+    }
+
+    fn finish_vnode_transition(&mut self) {
+        self.state.lock().finish_count += 1;
+    }
+}
+
+#[cfg(feature = "cluster")]
 struct RestoringRosterProbe {
     label: &'static str,
     registry: Arc<laminar_core::state::VnodeRegistry>,
@@ -3081,6 +3183,48 @@ async fn committed_final_owner_exit_runs_only_on_the_control_path() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn committed_final_owner_exit_publishes_prepared_managed_state() {
+    let FinalOwnerExitHarness {
+        mut graph,
+        registry,
+        pending,
+        published,
+        ..
+    } = final_owner_exit_harness(uuid::Uuid::from_u128(1)).await;
+    let installed = set_test_installed_vnode_state(
+        &mut graph,
+        test_assignment_fence(1, &[laminar_core::state::NodeId(1)]),
+        published.pipeline_identity().clone(),
+    );
+    let state = Arc::new(parking_lot::Mutex::new(PreparedVnodeProbeState::default()));
+    graph.push_test_node(
+        "prepared",
+        Box::new(PreparedVnodeProbe {
+            state: Arc::clone(&state),
+            action: PreparedVnodeProbeAction::Succeed,
+        }),
+    );
+
+    assert!(graph
+        .complete_pending_vnode_transition()
+        .await
+        .expect("final-owner-exit managed-state publication should complete"));
+
+    let state = state.lock();
+    assert_eq!(state.prepare_count, 1);
+    assert!(!state.prepared);
+    assert_eq!(state.abort_count, 0);
+    assert_eq!(state.publish_count, 1);
+    assert_eq!(state.finish_count, 1);
+    drop(state);
+    assert!(registry.restoring_vnodes().is_empty());
+    assert!(pending.lock().is_none());
+    assert!(installed.lock().is_none());
+    assert!(graph.execution_poison_reason().is_none());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn final_owner_exit_rejects_process_mismatch_and_active_transport_before_callbacks() {
     struct RevokeCounter(Arc<std::sync::atomic::AtomicUsize>);
 
@@ -3936,6 +4080,119 @@ async fn declared_managed_state_requires_an_initializer() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn cluster_graph_startup_rejects_rejected_capability_inventory() {
+    struct RejectedStatefulProbe;
+
+    #[async_trait]
+    impl GraphOperator for RejectedStatefulProbe {
+        fn cluster_capability(&self) -> OperatorCapability {
+            OperatorCapability::fixed(
+                crate::operator::capability::OperatorImplementation::IncrementalJoin,
+            )
+        }
+
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+    }
+
+    let empty_full = crate::vnode_partial::VnodePartial {
+        operators: Vec::new(),
+        base: None,
+        deltas: Vec::new(),
+    };
+    let VnodeTransitionHarness { mut graph, .. } =
+        vnode_transition_harness(1, &[0], vec![(0, vec![encoded_vnode_partial(&empty_full)])])
+            .await;
+    graph.push_test_node("rejected-stateful", Box::new(RejectedStatefulProbe));
+
+    let error = graph
+        .initialize_managed_state()
+        .await
+        .err()
+        .expect("rejected capability inventory must fail cluster graph startup");
+
+    assert!(error.to_string().contains("LDB-4007"), "{error}");
+    assert!(error.to_string().contains("rejected-stateful"), "{error}");
+    assert!(error.to_string().contains("join state"), "{error}");
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_graph_startup_rejects_capability_drift_after_managed_initialization() {
+    struct CapabilityDriftProbe {
+        initialized: bool,
+    }
+
+    #[async_trait]
+    impl GraphOperator for CapabilityDriftProbe {
+        fn cluster_capability(&self) -> OperatorCapability {
+            if self.initialized {
+                OperatorCapability::fixed(
+                    crate::operator::capability::OperatorImplementation::SqlQuery,
+                )
+            } else {
+                OperatorCapability::global_sql_aggregate()
+            }
+        }
+
+        async fn initialize_managed_state(&mut self) -> Result<(), DbError> {
+            self.initialized = true;
+            Ok(())
+        }
+
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+    }
+
+    let empty_full = crate::vnode_partial::VnodePartial {
+        operators: Vec::new(),
+        base: None,
+        deltas: Vec::new(),
+    };
+    let VnodeTransitionHarness { mut graph, .. } =
+        vnode_transition_harness(1, &[0], vec![(0, vec![encoded_vnode_partial(&empty_full)])])
+            .await;
+    graph.push_test_node(
+        "capability-drift",
+        Box::new(CapabilityDriftProbe { initialized: false }),
+    );
+
+    let error = graph
+        .initialize_managed_state()
+        .await
+        .err()
+        .expect("cluster initialization must reject a changed managed-state descriptor");
+
+    assert!(error.to_string().contains("LDB-4007"), "{error}");
+    assert!(error.to_string().contains("capability-drift"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("after managed-state initialization"),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn checkpoint_quiescence_requires_pending_vnode_transitions_to_apply() {
     let partial = crate::vnode_partial::VnodePartial {
         operators: vec![("global".to_string(), vec![1])],
@@ -4538,6 +4795,242 @@ async fn encoded_empty_full_cannot_omit_a_managed_participant() {
     assert!(registry.is_restoring(0));
     assert!(pending_is_exact(&pending, &published));
     assert!(graph.execution_poison_reason().is_none());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn prepared_managed_state_publishes_with_exact_graph_authority() {
+    let partial = crate::vnode_partial::VnodePartial {
+        operators: vec![("prepared".to_string(), vec![1])],
+        base: None,
+        deltas: Vec::new(),
+    };
+    let VnodeTransitionHarness {
+        mut graph,
+        registry,
+        pending,
+        published,
+    } = vnode_transition_harness(1, &[0], vec![(0, vec![encoded_vnode_partial(&partial)])]).await;
+    let installed = Arc::clone(
+        graph
+            .installed_vnode_state
+            .as_ref()
+            .expect("test graph must share installed-state publication"),
+    );
+    let state = Arc::new(parking_lot::Mutex::new(PreparedVnodeProbeState::default()));
+    graph.push_test_node(
+        "prepared",
+        Box::new(PreparedVnodeProbe {
+            state: Arc::clone(&state),
+            action: PreparedVnodeProbeAction::Succeed,
+        }),
+    );
+
+    graph
+        .apply_pending_vnode_transition()
+        .expect("prepared managed state should publish at the exact authority cut");
+
+    let state = state.lock();
+    assert_eq!(state.prepare_count, 1);
+    assert!(!state.prepared);
+    assert_eq!(state.abort_count, 0);
+    assert_eq!(state.publish_count, 1);
+    assert_eq!(state.finish_count, 1);
+    drop(state);
+    assert!(registry.restoring_vnodes().is_empty());
+    assert!(pending.lock().is_none());
+    let installed = installed.lock();
+    let binding = installed
+        .as_ref()
+        .expect("successful publication must install an exact state binding");
+    assert!(binding.matches(published.target(), published.pipeline_identity()));
+    assert!(graph.execution_poison_reason().is_none());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn later_prepare_failure_aborts_all_prepared_state_without_poisoning() {
+    let partial = crate::vnode_partial::VnodePartial {
+        operators: vec![
+            ("prepared-first".to_string(), vec![1]),
+            ("prepared-later".to_string(), vec![2]),
+        ],
+        base: None,
+        deltas: Vec::new(),
+    };
+    let VnodeTransitionHarness {
+        mut graph,
+        registry,
+        pending,
+        published,
+    } = vnode_transition_harness(1, &[0], vec![(0, vec![encoded_vnode_partial(&partial)])]).await;
+    let installed = Arc::clone(
+        graph
+            .installed_vnode_state
+            .as_ref()
+            .expect("test graph must share installed-state publication"),
+    );
+    let first = Arc::new(parking_lot::Mutex::new(PreparedVnodeProbeState::default()));
+    let later = Arc::new(parking_lot::Mutex::new(PreparedVnodeProbeState::default()));
+    // Insert in reverse order to prove participant order is canonical by operator name.
+    graph.push_test_node(
+        "prepared-later",
+        Box::new(PreparedVnodeProbe {
+            state: Arc::clone(&later),
+            action: PreparedVnodeProbeAction::Fail("injected later prepare failure"),
+        }),
+    );
+    graph.push_test_node(
+        "prepared-first",
+        Box::new(PreparedVnodeProbe {
+            state: Arc::clone(&first),
+            action: PreparedVnodeProbeAction::Succeed,
+        }),
+    );
+
+    let error = graph
+        .apply_pending_vnode_transition()
+        .expect_err("a later preparation failure must abort the complete private batch");
+
+    assert!(error.to_string().contains("prepared-later"), "{error}");
+    assert!(
+        error.to_string().contains("injected later prepare failure"),
+        "{error}"
+    );
+    for state in [&first, &later] {
+        let state = state.lock();
+        assert_eq!(state.prepare_count, 1);
+        assert!(!state.prepared);
+        assert_eq!(state.abort_count, 1);
+        assert_eq!(state.publish_count, 0);
+        assert_eq!(state.finish_count, 1);
+    }
+    assert_eq!(registry.restoring_vnodes(), vec![0]);
+    assert!(pending_is_exact(&pending, &published));
+    assert!(installed.lock().is_none());
+    assert!(graph.execution_poison_reason().is_none());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn pending_slot_change_after_prepare_aborts_private_state_without_poisoning() {
+    let partial = crate::vnode_partial::VnodePartial {
+        operators: vec![("prepared".to_string(), vec![1])],
+        base: None,
+        deltas: Vec::new(),
+    };
+    let encoded = encoded_vnode_partial(&partial);
+    let VnodeTransitionHarness {
+        mut graph,
+        registry,
+        pending,
+        published,
+    } = vnode_transition_harness(1, &[0], vec![(0, vec![encoded.clone()])]).await;
+    let installed = Arc::clone(
+        graph
+            .installed_vnode_state
+            .as_ref()
+            .expect("test graph must share installed-state publication"),
+    );
+    let replacement = Arc::new(
+        build_boot_transition(&[laminar_core::state::NodeId(1)], vec![(0, vec![encoded])])
+            .expect("replacement transition must be valid"),
+    );
+    assert!(!Arc::ptr_eq(&published, &replacement));
+    let state = Arc::new(parking_lot::Mutex::new(PreparedVnodeProbeState::default()));
+    graph.push_test_node(
+        "prepared",
+        Box::new(PreparedVnodeProbe {
+            state: Arc::clone(&state),
+            action: PreparedVnodeProbeAction::ReplacePending {
+                handle: Arc::clone(&pending),
+                replacement: Arc::clone(&replacement),
+            },
+        }),
+    );
+
+    let error = graph
+        .apply_pending_vnode_transition()
+        .expect_err("a changed pending slot must prevent publication");
+
+    assert!(matches!(error, DbError::ShuffleNotReady(_)), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("pending vnode transition changed"),
+        "{error}"
+    );
+    let state = state.lock();
+    assert_eq!(state.prepare_count, 1);
+    assert!(!state.prepared);
+    assert_eq!(state.abort_count, 1);
+    assert_eq!(state.publish_count, 0);
+    assert_eq!(state.finish_count, 1);
+    drop(state);
+    assert!(pending_is_exact(&pending, &replacement));
+    assert!(!pending_is_exact(&pending, &published));
+    assert_eq!(registry.restoring_vnodes(), vec![0]);
+    assert!(installed.lock().is_none());
+    assert!(graph.execution_poison_reason().is_none());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn managed_publication_panic_poisons_without_deadlocking_installed_state() {
+    let partial = crate::vnode_partial::VnodePartial {
+        operators: vec![("prepared".to_string(), vec![1])],
+        base: None,
+        deltas: Vec::new(),
+    };
+    let VnodeTransitionHarness {
+        mut graph,
+        registry,
+        pending,
+        published,
+    } = vnode_transition_harness(1, &[0], vec![(0, vec![encoded_vnode_partial(&partial)])]).await;
+    let installed = set_test_installed_vnode_state(
+        &mut graph,
+        published.target().clone(),
+        published.pipeline_identity().clone(),
+    );
+    let poisoned = Arc::clone(&graph.execution_poisoned);
+    let state = Arc::new(parking_lot::Mutex::new(PreparedVnodeProbeState::default()));
+    graph.push_test_node(
+        "prepared",
+        Box::new(PreparedVnodeProbe {
+            state: Arc::clone(&state),
+            action: PreparedVnodeProbeAction::PanicOnPublish,
+        }),
+    );
+
+    let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);
+    let publication_thread = std::thread::spawn(move || {
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            graph.apply_pending_vnode_transition()
+        }))
+        .is_err();
+        outcome_tx
+            .send(panicked)
+            .expect("publication outcome receiver must remain live");
+    });
+    let panicked = outcome_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("publication panic containment deadlocked on installed-state invalidation");
+    publication_thread
+        .join()
+        .expect("publication containment thread must catch the injected panic");
+
+    assert!(panicked, "the injected publication panic was not observed");
+    assert!(poisoned.load(std::sync::atomic::Ordering::Acquire));
+    assert!(installed.lock().is_none());
+    assert_eq!(registry.restoring_vnodes(), vec![0]);
+    assert!(pending_is_exact(&pending, &published));
+    let state = state.lock();
+    assert_eq!(state.prepare_count, 1);
+    assert!(state.prepared);
+    assert_eq!(state.abort_count, 0);
+    assert_eq!(state.publish_count, 0);
+    assert_eq!(state.finish_count, 0);
 }
 
 #[cfg(feature = "cluster")]
