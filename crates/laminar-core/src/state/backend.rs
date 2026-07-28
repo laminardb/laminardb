@@ -134,7 +134,155 @@ impl CheckpointAttempt {
 }
 
 /// Current on-storage checkpoint-seal payload format.
-pub(crate) const CHECKPOINT_SEAL_VERSION: u32 = 7;
+pub(crate) const CHECKPOINT_SEAL_VERSION: u32 = 8;
+
+/// Immutable transitive payload-size and artifact-count metadata for one vnode partial.
+///
+/// A root partial accounts only for its own raw payload. An incremental or reference partial
+/// names its immediate parent and carries totals for the complete lineage through that parent.
+/// Writers use the checked constructors below. Durable decoders reconstruct persisted values
+/// internally and must call [`Self::validate`] before accepting their attestation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VnodePartialLineage {
+    parent: Option<CheckpointAttempt>,
+    total_payload_bytes: u64,
+    artifact_count: u32,
+}
+
+impl VnodePartialLineage {
+    pub(crate) fn from_persisted(
+        parent: Option<CheckpointAttempt>,
+        total_payload_bytes: u64,
+        artifact_count: u32,
+    ) -> Self {
+        Self {
+            parent,
+            total_payload_bytes,
+            artifact_count,
+        }
+    }
+
+    /// Construct lineage metadata for a root partial.
+    #[must_use]
+    pub const fn root(current_payload_bytes: u64) -> Self {
+        Self {
+            parent: None,
+            total_payload_bytes: current_payload_bytes,
+            artifact_count: 1,
+        }
+    }
+
+    /// Extend an already validated parent lineage for a later canonical attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either attempt is noncanonical, the parent does not strictly precede
+    /// the child, or either transitive total overflows its storage representation.
+    pub fn extend(
+        current_attempt: CheckpointAttempt,
+        current_payload_bytes: u64,
+        parent_attempt: CheckpointAttempt,
+        parent_lineage: Self,
+    ) -> Result<Self, String> {
+        if !current_attempt.is_canonical() {
+            return Err("vnode partial attempt must be canonical".into());
+        }
+        if !parent_attempt.is_canonical() {
+            return Err("vnode partial parent attempt must be canonical".into());
+        }
+        if parent_attempt.relation_to(current_attempt) != CheckpointAttemptRelation::Older {
+            return Err("vnode partial parent must strictly precede its current attempt".into());
+        }
+        parent_lineage.validate_shape(parent_attempt)?;
+        let total_payload_bytes = parent_lineage
+            .total_payload_bytes
+            .checked_add(current_payload_bytes)
+            .ok_or_else(|| "vnode partial lineage payload total overflows u64".to_owned())?;
+        let artifact_count = parent_lineage
+            .artifact_count
+            .checked_add(1)
+            .ok_or_else(|| "vnode partial lineage artifact count overflows u32".to_owned())?;
+        let lineage = Self {
+            parent: Some(parent_attempt),
+            total_payload_bytes,
+            artifact_count,
+        };
+        lineage.validate(current_attempt, current_payload_bytes)?;
+        Ok(lineage)
+    }
+
+    /// Validate this metadata against the attempt and raw payload it attests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current or parent identity is noncanonical, the parent is not
+    /// older, a root does not exactly describe its payload, or a child has impossible totals.
+    pub fn validate(
+        &self,
+        current_attempt: CheckpointAttempt,
+        current_payload_bytes: u64,
+    ) -> Result<(), String> {
+        if !current_attempt.is_canonical() {
+            return Err("vnode partial attempt must be canonical".into());
+        }
+        match self.parent {
+            None if self.total_payload_bytes == current_payload_bytes
+                && self.artifact_count == 1 =>
+            {
+                Ok(())
+            }
+            None => Err(
+                "root vnode partial lineage must equal its payload and contain one artifact".into(),
+            ),
+            Some(parent)
+                if parent.is_canonical()
+                    && parent.relation_to(current_attempt) == CheckpointAttemptRelation::Older
+                    && self.total_payload_bytes >= current_payload_bytes
+                    && self.artifact_count >= 2 =>
+            {
+                Ok(())
+            }
+            Some(_) => {
+                Err("child vnode partial lineage has a noncanonical parent, order, or total".into())
+            }
+        }
+    }
+
+    fn validate_shape(&self, current_attempt: CheckpointAttempt) -> Result<(), String> {
+        if !current_attempt.is_canonical() {
+            return Err("vnode partial attempt must be canonical".into());
+        }
+        match self.parent {
+            None if self.artifact_count == 1 => Ok(()),
+            Some(parent)
+                if parent.is_canonical()
+                    && parent.relation_to(current_attempt) == CheckpointAttemptRelation::Older
+                    && self.artifact_count >= 2 =>
+            {
+                Ok(())
+            }
+            _ => Err("vnode partial lineage has a noncanonical parent, order, or count".into()),
+        }
+    }
+
+    /// Immediate parent attempt, or `None` for a root partial.
+    #[must_use]
+    pub const fn parent(&self) -> Option<CheckpointAttempt> {
+        self.parent
+    }
+
+    /// Raw payload bytes across this partial and its complete parent lineage.
+    #[must_use]
+    pub const fn total_payload_bytes(&self) -> u64 {
+        self.total_payload_bytes
+    }
+
+    /// Artifact count across this partial and its complete parent lineage.
+    #[must_use]
+    pub const fn artifact_count(&self) -> u32 {
+        self.artifact_count
+    }
+}
 
 /// Cluster identity that produced one immutable vnode partial.
 ///
@@ -189,6 +337,8 @@ pub struct SealedVnodePartial {
     pub payload_len: u64,
     /// SHA-256 of the raw partial payload.
     pub payload_sha256: String,
+    /// Immediate parent identity and checked totals for the complete artifact lineage.
+    pub lineage: VnodePartialLineage,
 }
 
 impl SealedVnodePartial {
@@ -196,6 +346,7 @@ impl SealedVnodePartial {
         vnode: u32,
         assignment_version: u64,
         writer: Option<SealedVnodeWriter>,
+        lineage: VnodePartialLineage,
         payload: &[u8],
     ) -> Self {
         Self {
@@ -204,6 +355,7 @@ impl SealedVnodePartial {
             writer,
             payload_len: payload.len() as u64,
             payload_sha256: digest_hex(&sha256(payload)),
+            lineage,
         }
     }
 }
@@ -355,7 +507,7 @@ pub struct CheckpointSealInventory {
     pub assignment_version: u64,
     /// Sorted, duplicate-free vnode partials required by the seal.
     pub required_vnodes: Vec<u32>,
-    /// Per-vnode writer, assignment-generation, length, and digest attestations.
+    /// Per-vnode writer, assignment-generation, lineage, length, and digest attestations.
     pub sealed_partials: Vec<SealedVnodePartial>,
     /// Sorted, duplicate-free commit-descriptor keys required by the seal.
     pub required_descriptors: Vec<String>,
@@ -368,7 +520,8 @@ impl CheckpointSealInventory {
     ///
     /// This is the recovery-side validation boundary for inventories returned by custom backend
     /// implementations. It deliberately excludes commit descriptors, whose authority is checked
-    /// independently by [`Self::descriptor_leader_proof`].
+    /// independently by [`Self::descriptor_leader_proof`]. This validates each lineage's local
+    /// shape; exact child-to-parent arithmetic is verified while recovery traverses parent seals.
     ///
     /// # Errors
     ///
@@ -510,6 +663,15 @@ fn validate_vnode_seal_inventory(
                 partial.vnode
             ));
         }
+        partial
+            .lineage
+            .validate(attempt, partial.payload_len)
+            .map_err(|error| {
+                format!(
+                    "checkpoint seal has invalid lineage for vnode {}: {error}",
+                    partial.vnode
+                )
+            })?;
         match (assignment_fence, &partial.writer) {
             (Some(fence), Some(writer)) if writer.matches_fence(fence) => {}
             (None, None) => {}
@@ -739,8 +901,9 @@ pub enum StateBackendError {
 /// ## Idempotence
 ///
 /// [`write_partial`](Self::write_partial) must be idempotent for a given
-/// `(attempt, vnode)` pair. An identical retry succeeds; conflicting bytes
-/// return [`StateBackendError::Conflict`] and must never overwrite the winner.
+/// `(attempt, vnode)` pair. An identical payload-and-provenance retry succeeds; conflicting
+/// payload or provenance returns [`StateBackendError::Conflict`] and must never overwrite the
+/// winner.
 /// Once [`seal_checkpoint`](Self::seal_checkpoint) succeeds, that attempt permanently names one
 /// exact [`CheckpointSealInventory`] in the bound state namespace. The inventory must remain
 /// stable until the attempt is retired; an implementation must never make the same attempt name
@@ -788,6 +951,8 @@ pub trait StateBackend: Send + Sync + 'static {
     /// implement the assignment fence compare it against their exact
     /// authoritative version and reject both stale and future writers.
     /// Backends that opt out of fencing accept any version.
+    /// `lineage` must describe `bytes` at this exact attempt; it is persisted as immutable
+    /// provenance and copied into the checkpoint seal.
     ///
     /// [`VnodeRegistry::assignment_version`]: crate::state::VnodeRegistry::assignment_version
     async fn write_partial(
@@ -795,19 +960,22 @@ pub trait StateBackend: Send + Sync + 'static {
         attempt: CheckpointAttempt,
         vnode: u32,
         assignment_version: u64,
+        lineage: VnodePartialLineage,
         bytes: Bytes,
     ) -> Result<(), StateBackendError>;
 
     /// Persist a cluster partial certified by the exact active assignment and writer process.
     ///
     /// Cluster coordinators must use this method. The default fails closed so a custom backend
-    /// cannot silently discard provenance and later publish an apparently certified seal.
+    /// cannot silently discard writer or lineage provenance and later publish an apparently
+    /// certified seal.
     async fn write_certified_partial(
         &self,
         attempt: CheckpointAttempt,
         vnode: u32,
         assignment_fence: &CheckpointAssignmentFence,
         writer_node_id: u64,
+        _lineage: VnodePartialLineage,
         _bytes: Bytes,
     ) -> Result<(), StateBackendError> {
         Err(StateBackendError::Conflict {
@@ -832,8 +1000,8 @@ pub trait StateBackend: Send + Sync + 'static {
     /// Read a vnode partial admitted by an exact checkpoint seal under an allocation bound.
     ///
     /// Implementations must compare the currently stored vnode, assignment generation, writer
-    /// certificate, payload length, and payload digest with `sealed` before returning the
-    /// payload. Durable implementations must reject an impossible or oversized object from
+    /// certificate, lineage, payload length, and payload digest with `sealed` before returning
+    /// the payload. Durable implementations must reject an impossible or oversized object from
     /// metadata before loading its body. The default fails closed because [`Self::read_partial`]
     /// cannot prove that a self-consistent replacement still belongs to the sealed recovery cut.
     /// The caller must obtain `sealed` from an inventory already validated against recovery
@@ -1089,5 +1257,75 @@ mod tests {
         let malformed = CheckpointAttempt::new(41, 43);
         assert!(!malformed.is_canonical());
         assert_eq!(malformed.relation_to(attempt), Conflict);
+    }
+
+    #[test]
+    fn vnode_partial_lineage_extends_checked_transitive_totals() {
+        let root_attempt = CheckpointAttempt::canonical(4);
+        let child_attempt = CheckpointAttempt::canonical(7);
+        let root = VnodePartialLineage::root(11);
+        assert_eq!(root.parent(), None);
+        assert_eq!(root.total_payload_bytes(), 11);
+        assert_eq!(root.artifact_count(), 1);
+        root.validate(root_attempt, 11).unwrap();
+
+        let child = VnodePartialLineage::extend(child_attempt, 5, root_attempt, root).unwrap();
+        assert_eq!(child.parent(), Some(root_attempt));
+        assert_eq!(child.total_payload_bytes(), 16);
+        assert_eq!(child.artifact_count(), 2);
+        child.validate(child_attempt, 5).unwrap();
+
+        let json = serde_json::to_vec(&child).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<VnodePartialLineage>(&json).unwrap(),
+            child
+        );
+    }
+
+    #[test]
+    fn vnode_partial_lineage_rejects_order_shape_and_arithmetic_overflow() {
+        let current = CheckpointAttempt::canonical(8);
+        let parent = CheckpointAttempt::canonical(7);
+
+        assert!(
+            VnodePartialLineage::extend(current, 1, current, VnodePartialLineage::root(1)).is_err()
+        );
+        assert!(VnodePartialLineage::extend(
+            current,
+            1,
+            CheckpointAttempt::new(6, 7),
+            VnodePartialLineage::root(1),
+        )
+        .is_err());
+        assert!(VnodePartialLineage::root(2).validate(current, 1).is_err());
+
+        let byte_overflow = VnodePartialLineage::from_persisted(None, u64::MAX, 1);
+        assert!(VnodePartialLineage::extend(current, 1, parent, byte_overflow).is_err());
+        let count_overflow =
+            VnodePartialLineage::from_persisted(Some(CheckpointAttempt::canonical(6)), 1, u32::MAX);
+        assert!(VnodePartialLineage::extend(current, 1, parent, count_overflow).is_err());
+    }
+
+    #[test]
+    fn checkpoint_seal_inventory_rejects_lineage_payload_mismatch() {
+        let attempt = CheckpointAttempt::canonical(3);
+        let inventory = CheckpointSealInventory {
+            attempt,
+            assignment_fence: None,
+            assignment_version: 0,
+            required_vnodes: vec![0],
+            sealed_partials: vec![SealedVnodePartial::new(
+                0,
+                0,
+                None,
+                VnodePartialLineage::root(3),
+                b"xx",
+            )],
+            required_descriptors: Vec::new(),
+            sealed_descriptors: Vec::new(),
+        };
+
+        let error = inventory.validate_vnode_partials().unwrap_err();
+        assert!(error.contains("invalid lineage for vnode 0"), "{error}");
     }
 }

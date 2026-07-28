@@ -119,14 +119,28 @@ mod failures {
 
         fresh.set_authoritative_version(3);
         let attempt = CheckpointAttempt::new(1, 1);
+        let fresh_payload = Bytes::from_static(b"fresh");
         fresh
-            .write_partial(attempt, 0, 3, Bytes::from_static(b"fresh"))
+            .write_partial(
+                attempt,
+                0,
+                3,
+                laminar_core::state::VnodePartialLineage::root(fresh_payload.len() as u64),
+                fresh_payload,
+            )
             .await
             .expect("fresh write at current version");
 
         stale.set_authoritative_version(3);
+        let stale_payload = Bytes::from_static(b"stale");
         let err = stale
-            .write_partial(attempt, 0, 2, Bytes::from_static(b"stale"))
+            .write_partial(
+                attempt,
+                0,
+                2,
+                laminar_core::state::VnodePartialLineage::root(stale_payload.len() as u64),
+                stale_payload,
+            )
             .await
             .expect_err("stale write must be rejected");
         match err {
@@ -345,13 +359,15 @@ mod failures {
         let node = &harness.nodes[0];
         let authoritative = node.state_backend.authoritative_version();
         let stale_caller = authoritative - 1;
+        let payload = Bytes::from_static(b"stale");
         let err = node
             .state_backend
             .write_partial(
                 CheckpointAttempt::new(9_999, 9_999),
                 0,
                 stale_caller,
-                Bytes::from_static(b"stale"),
+                laminar_core::state::VnodePartialLineage::root(payload.len() as u64),
+                payload,
             )
             .await
             .expect_err("stale write must be rejected by the live fence");
@@ -2752,8 +2768,16 @@ mod minio {
 
         // Node 1 writes its vnode slice and its commit descriptor.
         for v in [0u32, 1] {
+            let payload = Bytes::from_static(b"a");
             node1
-                .write_certified_partial(attempt, v, &fence, 1, Bytes::from_static(b"a"))
+                .write_certified_partial(
+                    attempt,
+                    v,
+                    &fence,
+                    1,
+                    laminar_core::state::VnodePartialLineage::root(payload.len() as u64),
+                    payload,
+                )
                 .await
                 .unwrap();
         }
@@ -2777,8 +2801,16 @@ mod minio {
 
         // Node 2 writes its slice and descriptor to the same bucket.
         for v in [2u32, 3] {
+            let payload = Bytes::from_static(b"b");
             node2
-                .write_certified_partial(attempt, v, &fence, 2, Bytes::from_static(b"b"))
+                .write_certified_partial(
+                    attempt,
+                    v,
+                    &fence,
+                    2,
+                    laminar_core::state::VnodePartialLineage::root(payload.len() as u64),
+                    payload,
+                )
                 .await
                 .unwrap();
         }

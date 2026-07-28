@@ -10,7 +10,7 @@ use laminar_core::state::{CheckpointAttempt, NodeId};
 use super::{PendingVnodeTransition, VnodeTransitionKind, VnodeTransitionOrigin};
 use crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut;
 use crate::rebalance::AuditedCommittedDrainTransition;
-use crate::recovery_manager::vnode_chains::LoadedVnodeChains;
+use crate::recovery_manager::vnode_chains::{LoadedVnodeChains, VnodeRestoreInputUsage};
 
 fn participant(node_id: u64, incarnation: u128) -> CheckpointParticipant {
     CheckpointParticipant {
@@ -28,13 +28,11 @@ fn fence(
 }
 
 fn loaded(attempt: CheckpointAttempt, vnodes: &[u32]) -> LoadedVnodeChains {
-    LoadedVnodeChains {
-        attempt: Some(attempt),
-        chains: vnodes
-            .iter()
-            .map(|vnode| (*vnode, vec![Bytes::from_static(b"full")]))
-            .collect::<HashMap<_, _>>(),
-    }
+    let chains = vnodes
+        .iter()
+        .map(|vnode| (*vnode, vec![Bytes::from_static(b"full")]))
+        .collect::<HashMap<_, _>>();
+    LoadedVnodeChains::from_chains_for_test(Some(attempt), chains)
 }
 
 #[test]
@@ -303,6 +301,66 @@ fn boot_recovery_accepts_an_older_cut_for_every_target_owned_vnode() {
             .map(super::PendingVnodeRestore::vnode)
             .collect::<Vec<_>>(),
         vec![0, 1]
+    );
+}
+
+#[test]
+fn nonempty_restore_requires_a_complete_input_usage_receipt() {
+    let local = participant(1, 1);
+    let owners = [NodeId(1)];
+    let target = fence(5, &[1], vec![local]);
+    let attempt = CheckpointAttempt::canonical(9);
+    let identity = PipelineIdentity::empty();
+    let cut = ValidatedClusterVnodeRestoreCut::synthetic_for_transition_test(
+        attempt,
+        identity.clone(),
+        target.clone(),
+        &[1],
+        &[0],
+    )
+    .unwrap();
+    let loaded = LoadedVnodeChains::from_parts_with_usage_for_test(
+        Some(attempt),
+        HashMap::from([(0, vec![Bytes::from_static(b"not decoded")])]),
+        VnodeRestoreInputUsage::default(),
+    );
+
+    let error =
+        PendingVnodeTransition::boot_recovery(target, &owners, local, identity, cut, loaded)
+            .unwrap_err();
+    assert!(
+        error.to_string().contains("incomplete input usage"),
+        "{error}"
+    );
+}
+
+#[test]
+fn verified_usage_must_cover_every_retained_apply_body_before_decode() {
+    let local = participant(1, 1);
+    let owners = [NodeId(1)];
+    let target = fence(5, &[1], vec![local]);
+    let attempt = CheckpointAttempt::canonical(9);
+    let identity = PipelineIdentity::empty();
+    let cut = ValidatedClusterVnodeRestoreCut::synthetic_for_transition_test(
+        attempt,
+        identity.clone(),
+        target.clone(),
+        &[1],
+        &[0],
+    )
+    .unwrap();
+    let loaded = LoadedVnodeChains::from_parts_with_usage_for_test(
+        Some(attempt),
+        HashMap::from([(0, vec![Bytes::from_static(b"not decoded")])]),
+        VnodeRestoreInputUsage::from_counts_for_test(32, 1, 1, 1),
+    );
+
+    let error =
+        PendingVnodeTransition::boot_recovery(target, &owners, local, identity, cut, loaded)
+            .unwrap_err();
+    assert!(
+        error.to_string().contains("retained apply chains require"),
+        "{error}"
     );
 }
 

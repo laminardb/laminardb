@@ -232,13 +232,15 @@ async fn seal_with_fence<B: StateBackend>(
     if let Some(fence) = assignment_fence {
         for (vnode, &owner) in vnode_owners.iter().enumerate() {
             let vnode = u32::try_from(vnode).unwrap();
+            let payload = Bytes::from_static(b"test-vnode-state");
             backend
                 .write_certified_partial(
                     attempt,
                     vnode,
                     fence,
                     owner,
-                    Bytes::from_static(b"test-vnode-state"),
+                    laminar_core::state::VnodePartialLineage::root(payload.len() as u64),
+                    payload,
                 )
                 .await
                 .unwrap();
@@ -1379,13 +1381,15 @@ async fn cluster_commit_rejects_marker_written_by_another_certified_participant(
     let fence = assignment_fence(4, &[7, 9]);
     let decisions = cluster_decisions(&fence, 7).await;
     backend.set_authoritative_version(fence.assignment_version);
+    let payload = Bytes::from_static(b"test-vnode-state");
     backend
         .write_certified_partial(
             attempt,
             0,
             &fence,
             7,
-            Bytes::from_static(b"test-vnode-state"),
+            laminar_core::state::VnodePartialLineage::root(payload.len() as u64),
+            payload.clone(),
         )
         .await
         .unwrap();
@@ -1395,7 +1399,8 @@ async fn cluster_commit_rejects_marker_written_by_another_certified_participant(
             1,
             &fence,
             9,
-            Bytes::from_static(b"test-vnode-state"),
+            laminar_core::state::VnodePartialLineage::root(payload.len() as u64),
+            payload,
         )
         .await
         .unwrap();

@@ -584,13 +584,15 @@ mod tests {
     ) -> CheckpointSealInventory {
         let backend = InProcessBackend::new(2);
         for (vnode, writer) in vnode_writers {
+            let payload = Bytes::from_static(b"state");
             backend
                 .write_certified_partial(
                     attempt,
                     vnode,
                     fence,
                     writer,
-                    Bytes::from_static(b"state"),
+                    laminar_core::state::VnodePartialLineage::root(payload.len() as u64),
+                    payload,
                 )
                 .await
                 .unwrap();

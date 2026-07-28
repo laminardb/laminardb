@@ -11,7 +11,7 @@ use laminar_core::state::NodeId;
 use crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut;
 use crate::error::DbError;
 use crate::rebalance::AuditedCommittedDrainTransition;
-use crate::recovery_manager::vnode_chains::LoadedVnodeChains;
+use crate::recovery_manager::vnode_chains::{LoadedVnodeChains, VnodeRestoreInputUsage};
 
 pub(crate) type PendingVnodeTransitionHandle =
     Arc<parking_lot::Mutex<Option<Arc<PendingVnodeTransition>>>>;
@@ -225,7 +225,10 @@ impl PendingVnodeTransition {
         };
 
         let restores = match (acquired_vnodes.is_empty(), restore_cut.as_ref()) {
-            (true, None) if loaded.attempt.is_none() && loaded.chains.is_empty() => Vec::new(),
+            (true, None) if loaded.attempt.is_none() && loaded.chains.is_empty() => {
+                validate_restore_input_usage(&[], loaded.input_usage())?;
+                Vec::new()
+            }
             (true, _) => {
                 return Err(transition_error(
                     "a transition without acquired vnodes carried restore state",
@@ -328,8 +331,9 @@ impl PendingVnodeTransition {
                 "restore cut seal does not attest every acquired vnode",
             ));
         }
+        let usage = loaded.input_usage();
         let mut chains = loaded.chains;
-        acquired_vnodes
+        let restores = acquired_vnodes
             .iter()
             .map(|vnode| {
                 let chain = chains.remove(vnode).ok_or_else(|| {
@@ -345,7 +349,9 @@ impl PendingVnodeTransition {
                     chain: chain.into_boxed_slice(),
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, DbError>>()?;
+        validate_restore_input_usage(&restores, usage)?;
+        Ok(restores)
     }
 
     #[must_use]
@@ -387,6 +393,54 @@ impl PendingVnodeTransition {
     pub(crate) fn restores(&self) -> &[PendingVnodeRestore] {
         &self.restores
     }
+}
+
+fn validate_restore_input_usage(
+    restores: &[PendingVnodeRestore],
+    usage: VnodeRestoreInputUsage,
+) -> Result<(), DbError> {
+    usage
+        .validate_for_loaded_chains(restores.len())
+        .map_err(|message| {
+            transition_error(format!("invalid vnode restore input usage: {message}"))
+        })?;
+
+    let (retained_bytes, retained_artifacts) =
+        restores
+            .iter()
+            .try_fold((0_u64, 0_u64), |(total_bytes, total_artifacts), restore| {
+                let chain_bytes = restore.chain.iter().try_fold(0_u64, |total, body| {
+                    let body_bytes = u64::try_from(body.len()).map_err(|_| {
+                        transition_error("retained vnode restore body size does not fit u64")
+                    })?;
+                    total.checked_add(body_bytes).ok_or_else(|| {
+                        transition_error("retained vnode restore body byte accounting overflow")
+                    })
+                })?;
+                let chain_artifacts = u64::try_from(restore.chain.len()).map_err(|_| {
+                    transition_error("retained vnode restore link count does not fit u64")
+                })?;
+                let total_bytes = total_bytes.checked_add(chain_bytes).ok_or_else(|| {
+                    transition_error("retained vnode restore body byte accounting overflow")
+                })?;
+                let total_artifacts =
+                    total_artifacts
+                        .checked_add(chain_artifacts)
+                        .ok_or_else(|| {
+                            transition_error("retained vnode restore artifact accounting overflow")
+                        })?;
+                Ok::<_, DbError>((total_bytes, total_artifacts))
+            })?;
+    if retained_bytes > usage.verified_body_bytes()
+        || retained_artifacts > usage.verified_body_artifacts()
+    {
+        return Err(transition_error(format!(
+            "vnode restore input usage covers {} bytes/{} artifacts, but the retained apply chains require {retained_bytes} bytes/{retained_artifacts} artifacts",
+            usage.verified_body_bytes(),
+            usage.verified_body_artifacts()
+        )));
+    }
+    Ok(())
 }
 
 fn owned_vnodes(owners: &[NodeId], node_id: u64) -> Result<Vec<u32>, DbError> {

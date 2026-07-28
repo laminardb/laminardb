@@ -696,10 +696,11 @@ fn test_loaded_vnode_chains(
     attempt: laminar_core::state::CheckpointAttempt,
     chains: Vec<(u32, Vec<bytes::Bytes>)>,
 ) -> crate::recovery_manager::vnode_chains::LoadedVnodeChains {
-    crate::recovery_manager::vnode_chains::LoadedVnodeChains {
-        attempt: Some(attempt),
-        chains: chains.into_iter().collect(),
-    }
+    let chains: std::collections::HashMap<_, _> = chains.into_iter().collect();
+    crate::recovery_manager::vnode_chains::LoadedVnodeChains::from_chains_for_test(
+        Some(attempt),
+        chains,
+    )
 }
 
 #[cfg(feature = "cluster")]

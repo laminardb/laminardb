@@ -128,18 +128,25 @@ fn boot_restore_authority(
     (fence, participant, cut)
 }
 
+fn loaded_vnode_chains(
+    attempt: CheckpointAttempt,
+    chains: HashMap<u32, Vec<Bytes>>,
+) -> LoadedVnodeChains {
+    LoadedVnodeChains::from_chains_for_test(Some(attempt), chains)
+}
+
 #[tokio::test]
 async fn boot_report_marks_and_stages_the_exact_owned_roster() {
     let registry = Arc::new(VnodeRegistry::single_owner(2, NodeId(1)));
     let db = boot_test_db(Arc::clone(&registry)).await;
     let attempt = CheckpointAttempt::canonical(7);
-    let report = LoadedVnodeChains {
-        attempt: Some(attempt),
-        chains: HashMap::from([
+    let report = loaded_vnode_chains(
+        attempt,
+        HashMap::from([
             (1, vec![Bytes::from_static(b"vnode-1")]),
             (0, vec![Bytes::from_static(b"vnode-0")]),
         ]),
-    };
+    );
     let target_assignment = registry.versioned_snapshot();
     let (target_fence, participant, restore_cut) =
         boot_restore_authority(&target_assignment, attempt, &[0, 1]);
@@ -201,10 +208,10 @@ async fn invalid_boot_report_changes_neither_staging_nor_lifecycle() {
     let registry = Arc::new(VnodeRegistry::single_owner(2, NodeId(1)));
     let db = boot_test_db(Arc::clone(&registry)).await;
     let attempt = CheckpointAttempt::canonical(7);
-    let report = LoadedVnodeChains {
-        attempt: Some(attempt),
-        chains: HashMap::from([(0, vec![Bytes::from_static(b"vnode-0")])]),
-    };
+    let report = loaded_vnode_chains(
+        attempt,
+        HashMap::from([(0, vec![Bytes::from_static(b"vnode-0")])]),
+    );
     let target_assignment = registry.versioned_snapshot();
     let (target_fence, participant, restore_cut) =
         boot_restore_authority(&target_assignment, attempt, &[0, 1]);
@@ -235,13 +242,13 @@ async fn changed_boot_assignment_rejects_report_without_mutation() {
     let (target_fence, participant, restore_cut) =
         boot_restore_authority(&target_assignment, attempt, &[0, 1]);
     registry.set_assignment_and_version(vec![NodeId(2), NodeId(2)].into(), 2);
-    let report = LoadedVnodeChains {
-        attempt: Some(attempt),
-        chains: HashMap::from([
+    let report = loaded_vnode_chains(
+        attempt,
+        HashMap::from([
             (0, vec![Bytes::from_static(b"vnode-0")]),
             (1, vec![Bytes::from_static(b"vnode-1")]),
         ]),
-    };
+    );
 
     let error = db
         .publish_boot_vnode_restore_transition(
@@ -268,13 +275,13 @@ async fn wrong_boot_attempt_rejects_report_without_mutation() {
     let attempt = CheckpointAttempt::canonical(7);
     let (target_fence, participant, restore_cut) =
         boot_restore_authority(&target_assignment, attempt, &[0, 1]);
-    let report = LoadedVnodeChains {
-        attempt: Some(CheckpointAttempt::canonical(8)),
-        chains: HashMap::from([
+    let report = loaded_vnode_chains(
+        CheckpointAttempt::canonical(8),
+        HashMap::from([
             (0, vec![Bytes::from_static(b"vnode-0")]),
             (1, vec![Bytes::from_static(b"vnode-1")]),
         ]),
-    };
+    );
 
     let error = db
         .publish_boot_vnode_restore_transition(
@@ -307,13 +314,13 @@ async fn failed_boot_preparation_retains_prior_exact_transition_and_lifecycle() 
         prior_fence,
         participant,
         prior_cut,
-        LoadedVnodeChains {
-            attempt: Some(prior_attempt),
-            chains: HashMap::from([
+        loaded_vnode_chains(
+            prior_attempt,
+            HashMap::from([
                 (0, vec![Bytes::from_static(b"prior-0")]),
                 (1, vec![Bytes::from_static(b"prior-1")]),
             ]),
-        },
+        ),
     )
     .await
     .unwrap();
@@ -361,10 +368,10 @@ async fn successful_boot_replacement_publishes_exact_arc_and_target_lifecycle() 
         prior_fence,
         participant,
         prior_cut,
-        LoadedVnodeChains {
-            attempt: Some(prior_attempt),
-            chains: HashMap::from([(0, vec![Bytes::from_static(b"prior")])]),
-        },
+        loaded_vnode_chains(
+            prior_attempt,
+            HashMap::from([(0, vec![Bytes::from_static(b"prior")])]),
+        ),
     )
     .await
     .unwrap();
@@ -385,10 +392,10 @@ async fn successful_boot_replacement_publishes_exact_arc_and_target_lifecycle() 
         replacement_fence.clone(),
         participant,
         replacement_cut,
-        LoadedVnodeChains {
-            attempt: Some(replacement_attempt),
-            chains: HashMap::from([(0, vec![Bytes::from_static(b"replacement")])]),
-        },
+        loaded_vnode_chains(
+            replacement_attempt,
+            HashMap::from([(0, vec![Bytes::from_static(b"replacement")])]),
+        ),
     )
     .await
     .unwrap();
@@ -491,13 +498,13 @@ async fn zero_owned_boot_target_retires_prior_transition_only_after_authority_au
             prior_participant,
             identity.clone(),
             prior_cut,
-            LoadedVnodeChains {
-                attempt: Some(attempt),
-                chains: HashMap::from([
+            loaded_vnode_chains(
+                attempt,
+                HashMap::from([
                     (0, vec![Bytes::from_static(b"prior-0")]),
                     (1, vec![Bytes::from_static(b"prior-1")]),
                 ]),
-            },
+            ),
         )
         .unwrap(),
     );
@@ -568,13 +575,13 @@ async fn fresh_cluster_start_rejects_staged_vnode_state_without_clearing_it() {
     let attempt = CheckpointAttempt::canonical(7);
     let target = registry.versioned_snapshot();
     let (fence, participant, cut) = boot_restore_authority(&target, attempt, &[0, 1]);
-    let loaded = LoadedVnodeChains {
-        attempt: Some(attempt),
-        chains: HashMap::from([
+    let loaded = loaded_vnode_chains(
+        attempt,
+        HashMap::from([
             (0, vec![Bytes::from_static(b"must-not-be-discarded-0")]),
             (1, vec![Bytes::from_static(b"must-not-be-discarded-1")]),
         ]),
-    };
+    );
     db.publish_boot_vnode_restore_transition(&registry, &target, fence, participant, cut, loaded)
         .await
         .unwrap();
@@ -622,13 +629,13 @@ async fn assert_boot_recovery_target_mismatch_is_non_mutating(
         fence,
         participant,
         cut,
-        LoadedVnodeChains {
-            attempt: Some(committed_attempt),
-            chains: HashMap::from([
+        loaded_vnode_chains(
+            committed_attempt,
+            HashMap::from([
                 (0, vec![Bytes::from_static(b"existing-stage-0")]),
                 (1, vec![Bytes::from_static(b"existing-stage-1")]),
             ]),
-        },
+        ),
     )
     .await
     .unwrap();

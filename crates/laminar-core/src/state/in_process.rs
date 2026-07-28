@@ -11,7 +11,8 @@ use crate::checkpoint::{CheckpointAssignmentFence, LeaderProof, PipelineIdentity
 use super::backend::{
     digest_hex, sha256, CheckpointAttempt, CheckpointSeal, CheckpointSealInventory,
     SealedCommitDescriptor, SealedCommitDescriptorWriter, SealedVnodePartial, SealedVnodeWriter,
-    StateBackend, StateBackendError, StateNamespaceBinding, STATE_NAMESPACE_RESOURCE,
+    StateBackend, StateBackendError, StateNamespaceBinding, VnodePartialLineage,
+    STATE_NAMESPACE_RESOURCE,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,12 +119,28 @@ impl InProcessBackend {
         vnode: u32,
         assignment_version: u64,
         writer: Option<SealedVnodeWriter>,
+        lineage: VnodePartialLineage,
         bytes: Bytes,
     ) -> Result<(), StateBackendError> {
         let _live_attempt = self.live_attempt_guard(attempt)?;
         self.check_vnode(vnode)?;
+        lineage
+            .validate(attempt, bytes.len() as u64)
+            .map_err(|message| StateBackendError::Conflict {
+                resource: format!(
+                    "state-v2/epoch={}/checkpoint={}/vnode={vnode}/partial.bin",
+                    attempt.epoch, attempt.checkpoint_id
+                ),
+                message,
+            })?;
         let stored = StoredPartial {
-            attestation: SealedVnodePartial::new(vnode, assignment_version, writer, &bytes),
+            attestation: SealedVnodePartial::new(
+                vnode,
+                assignment_version,
+                writer,
+                lineage,
+                &bytes,
+            ),
             bytes,
         };
         let mut partials = self.partials.write();
@@ -134,7 +151,7 @@ impl InProcessBackend {
                     "state-v2/epoch={}/checkpoint={}/vnode={vnode}/partial.bin",
                     attempt.epoch, attempt.checkpoint_id
                 ),
-                message: "partial already exists with different bytes or writer certificate".into(),
+                message: "partial already exists with different payload or provenance".into(),
             }),
             None => {
                 partials.insert((attempt, vnode), stored);
@@ -226,9 +243,10 @@ impl StateBackend for InProcessBackend {
         attempt: CheckpointAttempt,
         vnode: u32,
         assignment_version: u64,
+        lineage: VnodePartialLineage,
         bytes: Bytes,
     ) -> Result<(), StateBackendError> {
-        self.store_partial(attempt, vnode, assignment_version, None, bytes)
+        self.store_partial(attempt, vnode, assignment_version, None, lineage, bytes)
     }
 
     async fn write_certified_partial(
@@ -237,6 +255,7 @@ impl StateBackend for InProcessBackend {
         vnode: u32,
         assignment_fence: &CheckpointAssignmentFence,
         writer_node_id: u64,
+        lineage: VnodePartialLineage,
         bytes: Bytes,
     ) -> Result<(), StateBackendError> {
         let writer =
@@ -264,6 +283,7 @@ impl StateBackend for InProcessBackend {
             vnode,
             assignment_fence.assignment_version,
             Some(writer),
+            lineage,
             bytes,
         )
     }
@@ -646,6 +666,10 @@ mod tests {
         CheckpointAttempt::canonical(checkpoint_id)
     }
 
+    fn root_lineage(payload: &[u8]) -> VnodePartialLineage {
+        VnodePartialLineage::root(payload.len() as u64)
+    }
+
     #[tokio::test]
     async fn namespace_binding_is_create_once_and_idempotent() {
         let backend = InProcessBackend::new(1);
@@ -683,9 +707,15 @@ mod tests {
         let b = InProcessBackend::new(4);
         let checkpoint = attempt(7);
         let payload = Bytes::from_static(b"hello");
-        b.write_partial(checkpoint, 2, 0, payload.clone())
-            .await
-            .unwrap();
+        b.write_partial(
+            checkpoint,
+            2,
+            0,
+            VnodePartialLineage::root(payload.len() as u64),
+            payload.clone(),
+        )
+        .await
+        .unwrap();
         let got = b.read_partial(checkpoint, 2).await.unwrap().unwrap();
         assert_eq!(got, payload);
         assert!(b.read_partial(attempt(8), 2).await.unwrap().is_none());
@@ -696,7 +726,13 @@ mod tests {
         let backend = InProcessBackend::new(1);
         let checkpoint = attempt(7);
         backend
-            .write_partial(checkpoint, 0, 0, Bytes::from_static(b"state"))
+            .write_partial(
+                checkpoint,
+                0,
+                0,
+                root_lineage(b"state"),
+                Bytes::from_static(b"state"),
+            )
             .await
             .unwrap();
         assert!(backend
@@ -743,7 +779,13 @@ mod tests {
         let invalid = CheckpointAttempt::new(1, 2);
 
         let error = backend
-            .write_partial(invalid, 0, 0, Bytes::from_static(b"invalid"))
+            .write_partial(
+                invalid,
+                0,
+                0,
+                root_lineage(b"invalid"),
+                Bytes::from_static(b"invalid"),
+            )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("canonical checkpoint ID"));
@@ -755,21 +797,78 @@ mod tests {
     async fn immutable_partial_accepts_identical_retry_and_rejects_conflict() {
         let b = InProcessBackend::new(4);
         let checkpoint = attempt(1);
-        b.write_partial(checkpoint, 0, 0, Bytes::from_static(b"first"))
-            .await
-            .unwrap();
-        b.write_partial(checkpoint, 0, 0, Bytes::from_static(b"first"))
-            .await
-            .unwrap();
+        b.write_partial(
+            checkpoint,
+            0,
+            0,
+            root_lineage(b"first"),
+            Bytes::from_static(b"first"),
+        )
+        .await
+        .unwrap();
+        b.write_partial(
+            checkpoint,
+            0,
+            0,
+            root_lineage(b"first"),
+            Bytes::from_static(b"first"),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
-            b.write_partial(checkpoint, 0, 0, Bytes::from_static(b"different"))
-                .await,
+            b.write_partial(
+                checkpoint,
+                0,
+                0,
+                root_lineage(b"different"),
+                Bytes::from_static(b"different"),
+            )
+            .await,
             Err(StateBackendError::Conflict { .. })
         ));
         assert_eq!(
             b.read_partial(checkpoint, 0).await.unwrap().unwrap(),
             Bytes::from_static(b"first")
         );
+    }
+
+    #[tokio::test]
+    async fn immutable_partial_and_seal_bind_lineage_metadata() {
+        let backend = InProcessBackend::new(1);
+        let parent_attempt = attempt(1);
+        let checkpoint = attempt(2);
+        let payload = Bytes::from_static(b"child");
+        let lineage = VnodePartialLineage::extend(
+            checkpoint,
+            payload.len() as u64,
+            parent_attempt,
+            VnodePartialLineage::root(9),
+        )
+        .unwrap();
+
+        backend
+            .write_partial(checkpoint, 0, 0, lineage, payload.clone())
+            .await
+            .unwrap();
+        let conflicting_lineage = VnodePartialLineage::root(payload.len() as u64);
+        assert!(matches!(
+            backend
+                .write_partial(checkpoint, 0, 0, conflicting_lineage, payload)
+                .await,
+            Err(StateBackendError::Conflict { .. })
+        ));
+
+        assert!(backend
+            .seal_checkpoint(checkpoint, None, &[0], &[])
+            .await
+            .unwrap());
+        let inventory = backend
+            .checkpoint_seal_inventory(checkpoint)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inventory.sealed_partials[0].lineage, lineage);
+        inventory.validate_vnode_partials().unwrap();
     }
 
     #[tokio::test]
@@ -890,10 +989,10 @@ mod tests {
         let b = InProcessBackend::new(2);
         let old = CheckpointAttempt::canonical(5);
         let new = CheckpointAttempt::canonical(99);
-        b.write_partial(old, 0, 0, Bytes::from_static(b"old"))
+        b.write_partial(old, 0, 0, root_lineage(b"old"), Bytes::from_static(b"old"))
             .await
             .unwrap();
-        b.write_partial(new, 0, 0, Bytes::from_static(b"new"))
+        b.write_partial(new, 0, 0, root_lineage(b"new"), Bytes::from_static(b"new"))
             .await
             .unwrap();
         assert_eq!(
@@ -923,19 +1022,37 @@ mod tests {
             .seal_checkpoint(checkpoint, None, &vnodes, &[])
             .await
             .unwrap());
-        b.write_partial(checkpoint, 0, 0, Bytes::from_static(b"a"))
-            .await
-            .unwrap();
-        b.write_partial(checkpoint, 1, 0, Bytes::from_static(b"b"))
-            .await
-            .unwrap();
+        b.write_partial(
+            checkpoint,
+            0,
+            0,
+            root_lineage(b"a"),
+            Bytes::from_static(b"a"),
+        )
+        .await
+        .unwrap();
+        b.write_partial(
+            checkpoint,
+            1,
+            0,
+            root_lineage(b"b"),
+            Bytes::from_static(b"b"),
+        )
+        .await
+        .unwrap();
         assert!(!b
             .seal_checkpoint(checkpoint, None, &vnodes, &[])
             .await
             .unwrap());
-        b.write_partial(checkpoint, 2, 0, Bytes::from_static(b"c"))
-            .await
-            .unwrap();
+        b.write_partial(
+            checkpoint,
+            2,
+            0,
+            root_lineage(b"c"),
+            Bytes::from_static(b"c"),
+        )
+        .await
+        .unwrap();
         assert!(b
             .seal_checkpoint(checkpoint, None, &vnodes, &[])
             .await
@@ -970,7 +1087,13 @@ mod tests {
     async fn out_of_range_vnode_errors() {
         let b = InProcessBackend::new(2);
         let r = b
-            .write_partial(attempt(1), 5, 0, Bytes::from_static(b"x"))
+            .write_partial(
+                attempt(1),
+                5,
+                0,
+                root_lineage(b"x"),
+                Bytes::from_static(b"x"),
+            )
             .await
             .unwrap_err();
         assert!(matches!(r, StateBackendError::Io(_)));
@@ -985,12 +1108,24 @@ mod tests {
     async fn prune_before_drops_old_epochs() {
         let b = InProcessBackend::new(4);
         for epoch in 1..=5 {
-            b.write_partial(attempt(epoch), 0, 0, Bytes::from_static(b"x"))
-                .await
-                .unwrap();
-            b.write_partial(attempt(epoch), 1, 0, Bytes::from_static(b"y"))
-                .await
-                .unwrap();
+            b.write_partial(
+                attempt(epoch),
+                0,
+                0,
+                root_lineage(b"x"),
+                Bytes::from_static(b"x"),
+            )
+            .await
+            .unwrap();
+            b.write_partial(
+                attempt(epoch),
+                1,
+                0,
+                root_lineage(b"y"),
+                Bytes::from_static(b"y"),
+            )
+            .await
+            .unwrap();
         }
         // Retain epochs >= 4. Entries for 1,2,3 must go away.
         b.prune_before(4).await.unwrap();
@@ -1008,9 +1143,15 @@ mod tests {
     async fn prune_floor_irreversibly_retires_attempt_name() {
         let b = InProcessBackend::new(1);
         let retired = attempt(1);
-        b.write_partial(retired, 0, 0, Bytes::from_static(b"original"))
-            .await
-            .unwrap();
+        b.write_partial(
+            retired,
+            0,
+            0,
+            root_lineage(b"original"),
+            Bytes::from_static(b"original"),
+        )
+        .await
+        .unwrap();
         b.write_commit_descriptor(retired, "ready", Bytes::from_static(b"ready"))
             .await
             .unwrap();
@@ -1039,12 +1180,24 @@ mod tests {
             .unwrap()
             .is_none());
         let retry_error = b
-            .write_partial(retired, 0, 0, Bytes::from_static(b"original"))
+            .write_partial(
+                retired,
+                0,
+                0,
+                root_lineage(b"original"),
+                Bytes::from_static(b"original"),
+            )
             .await
             .unwrap_err();
         assert!(matches!(retry_error, StateBackendError::Conflict { .. }));
         let write_error = b
-            .write_partial(retired, 0, 0, Bytes::from_static(b"replacement"))
+            .write_partial(
+                retired,
+                0,
+                0,
+                root_lineage(b"replacement"),
+                Bytes::from_static(b"replacement"),
+            )
             .await
             .unwrap_err();
         assert!(matches!(write_error, StateBackendError::Conflict { .. }));
@@ -1062,8 +1215,14 @@ mod tests {
             .unwrap_err();
         assert!(matches!(seal_error, StateBackendError::Conflict { .. }));
 
-        b.write_partial(attempt(2), 0, 0, Bytes::from_static(b"live"))
-            .await
-            .unwrap();
+        b.write_partial(
+            attempt(2),
+            0,
+            0,
+            root_lineage(b"live"),
+            Bytes::from_static(b"live"),
+        )
+        .await
+        .unwrap();
     }
 }

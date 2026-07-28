@@ -408,7 +408,13 @@ url = "s3://bucket/laminar"
         assert_eq!(backend.durability_scope(), StateBackendDurability::Volatile);
         let attempt = CheckpointAttempt::new(1, 1);
         backend
-            .write_partial(attempt, 0, 0, Bytes::from_static(b"ok"))
+            .write_partial(
+                attempt,
+                0,
+                0,
+                crate::state::VnodePartialLineage::root(2),
+                Bytes::from_static(b"ok"),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -429,7 +435,13 @@ url = "s3://bucket/laminar"
         );
         let attempt = CheckpointAttempt::new(1, 1);
         backend
-            .write_partial(attempt, 0, 0, bytes::Bytes::from_static(b"z"))
+            .write_partial(
+                attempt,
+                0,
+                0,
+                crate::state::VnodePartialLineage::root(1),
+                bytes::Bytes::from_static(b"z"),
+            )
             .await
             .unwrap();
         assert!(backend
@@ -480,7 +492,13 @@ url = "s3://bucket/laminar"
         );
         let attempt = CheckpointAttempt::new(1, 1);
         backend
-            .write_partial(attempt, 0, 0, bytes::Bytes::from_static(b"z"))
+            .write_partial(
+                attempt,
+                0,
+                0,
+                crate::state::VnodePartialLineage::root(1),
+                bytes::Bytes::from_static(b"z"),
+            )
             .await
             .unwrap();
         assert!(backend

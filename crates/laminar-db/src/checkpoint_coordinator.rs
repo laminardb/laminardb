@@ -18,7 +18,9 @@ use laminar_core::checkpoint::{
 use laminar_core::checkpoint::{CheckpointWatermark, LeaderProof};
 #[cfg(feature = "cluster")]
 use laminar_core::state::CheckpointSealInventory;
-use laminar_core::state::{CheckpointAttempt, StateBackend, StateBackendError};
+use laminar_core::state::{
+    CheckpointAttempt, StateBackend, StateBackendError, VnodePartialLineage,
+};
 use laminar_core::storage::checkpoint_manifest::{
     CheckpointManifest, ConnectorCheckpoint, PipelineIdentity,
 };
@@ -161,6 +163,7 @@ struct PendingSinkWitnessClear {
 struct PreparedVnodePartial {
     vnode: u32,
     payload: bytes::Bytes,
+    lineage: VnodePartialLineage,
     upload_update: VnodeUploadUpdate,
     is_reference: bool,
     delta_depth: u32,
@@ -829,6 +832,7 @@ impl ValidatedClusterVnodeRestoreCut {
                     }),
                     payload_len: 1,
                     payload_sha256: "22".repeat(32),
+                    lineage: VnodePartialLineage::root(1),
                 })
             })
             .collect::<Result<Vec<_>, DbError>>()?;
@@ -1698,11 +1702,14 @@ pub struct CheckpointCoordinator {
     last_partial_attempt: std::collections::HashMap<u32, CheckpointAttempt>,
     #[allow(clippy::disallowed_types)]
     last_partial_delta_depth: std::collections::HashMap<u32, u32>,
+    last_partial_lineage: std::collections::HashMap<u32, VnodePartialLineage>,
     // Candidates above advance after all writes land. Reuse is allowed only after the exact
     // state seal proves that the candidate is durable for this vnode.
     last_sealed_partial_attempt: std::collections::HashMap<u32, CheckpointAttempt>,
     last_sealed_delta_depth: std::collections::HashMap<u32, u32>,
+    last_sealed_partial_lineage: std::collections::HashMap<u32, VnodePartialLineage>,
     last_sealed_upload_attempt: std::collections::HashMap<u32, CheckpointAttempt>,
+    last_sealed_upload_lineage: std::collections::HashMap<u32, VnodePartialLineage>,
     #[cfg(feature = "cluster")]
     cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
     // A single watch slot coalesces checkpoint retention requests at a monotonically advancing
@@ -1874,9 +1881,12 @@ impl CheckpointCoordinator {
             last_vnode_uploads: std::collections::HashMap::new(),
             last_partial_attempt: std::collections::HashMap::new(),
             last_partial_delta_depth: std::collections::HashMap::new(),
+            last_partial_lineage: std::collections::HashMap::new(),
             last_sealed_partial_attempt: std::collections::HashMap::new(),
             last_sealed_delta_depth: std::collections::HashMap::new(),
+            last_sealed_partial_lineage: std::collections::HashMap::new(),
             last_sealed_upload_attempt: std::collections::HashMap::new(),
+            last_sealed_upload_lineage: std::collections::HashMap::new(),
             #[cfg(feature = "cluster")]
             cluster_controller: None,
             retention_requests,
@@ -3014,19 +3024,28 @@ impl CheckpointCoordinator {
             self.gate_vnode_set.clone_from(&vnodes);
         }
         self.rotation_epoch_floor = self.allocator.peek_epoch();
+        let vnode_membership: HashSet<u32> = vnodes.iter().copied().collect();
         // Drop bases for shed vnodes; the new owner builds its own from a full upload.
-        self.last_vnode_uploads.retain(|v, _| vnodes.contains(v));
+        self.last_vnode_uploads
+            .retain(|v, _| vnode_membership.contains(v));
         // Drop parent links for shed vnodes so a newly-acquired vnode has no stale parent — it must
         // re-base FULL before any delta chains to it.
-        self.last_partial_attempt.retain(|v, _| vnodes.contains(v));
+        self.last_partial_attempt
+            .retain(|v, _| vnode_membership.contains(v));
         self.last_partial_delta_depth
-            .retain(|v, _| vnodes.contains(v));
+            .retain(|v, _| vnode_membership.contains(v));
+        self.last_partial_lineage
+            .retain(|v, _| vnode_membership.contains(v));
         self.last_sealed_partial_attempt
-            .retain(|v, _| vnodes.contains(v));
+            .retain(|v, _| vnode_membership.contains(v));
         self.last_sealed_delta_depth
-            .retain(|v, _| vnodes.contains(v));
+            .retain(|v, _| vnode_membership.contains(v));
+        self.last_sealed_partial_lineage
+            .retain(|v, _| vnode_membership.contains(v));
         self.last_sealed_upload_attempt
-            .retain(|v, _| vnodes.contains(v));
+            .retain(|v, _| vnode_membership.contains(v));
+        self.last_sealed_upload_lineage
+            .retain(|v, _| vnode_membership.contains(v));
         self.vnode_set = vnodes;
     }
 
@@ -4425,22 +4444,49 @@ impl CheckpointCoordinator {
         Ok(())
     }
 
-    fn mark_vnode_partials_sealed(&mut self, attempt: CheckpointAttempt) {
+    fn mark_vnode_partials_sealed(&mut self, attempt: CheckpointAttempt) -> Result<(), DbError> {
+        // Validate the complete local inventory before advancing any durable parent. A poisoned
+        // coordinator must fail closed without leaving only a prefix of the owned vnode set
+        // eligible for later delta/reference capture.
+        for &vnode in &self.vnode_set {
+            let seals_partial = self.last_partial_attempt.get(&vnode) == Some(&attempt);
+            if seals_partial && !self.last_partial_lineage.contains_key(&vnode) {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6025] sealed attempt {attempt:?} has no local lineage metadata for \
+                     vnode {vnode}"
+                )));
+            }
+            if seals_partial && !self.last_partial_delta_depth.contains_key(&vnode) {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6025] sealed attempt {attempt:?} has no local delta-depth metadata for \
+                     vnode {vnode}"
+                )));
+            }
+        }
+
         for &vnode in &self.vnode_set {
             if self.last_partial_attempt.get(&vnode) == Some(&attempt) {
+                // The complete inventory was validated above, before any map was mutated.
+                let lineage = self.last_partial_lineage[&vnode];
                 self.last_sealed_partial_attempt.insert(vnode, attempt);
                 if let Some(depth) = self.last_partial_delta_depth.get(&vnode).copied() {
                     self.last_sealed_delta_depth.insert(vnode, depth);
                 }
+                self.last_sealed_partial_lineage.insert(vnode, lineage);
             }
             if self
                 .last_vnode_uploads
                 .get(&vnode)
                 .is_some_and(|(base, _)| *base == attempt)
+                && self.last_partial_attempt.get(&vnode) == Some(&attempt)
             {
+                // The complete inventory was validated above, before any map was mutated.
+                let lineage = self.last_partial_lineage[&vnode];
                 self.last_sealed_upload_attempt.insert(vnode, attempt);
+                self.last_sealed_upload_lineage.insert(vnode, lineage);
             }
         }
+        Ok(())
     }
 
     /// Write each owned vnode's `partial.bin` to seal the durability gate.
@@ -4513,7 +4559,7 @@ impl CheckpointCoordinator {
         let mut prepared = Vec::with_capacity(self.vnode_set.len());
         let mut remaining_bytes = self.config.max_staged_bytes;
         for &v in &self.vnode_set {
-            let partial = self.prepare_vnode_partial(v, epoch, max_ref_age)?;
+            let partial = self.prepare_vnode_partial(v, attempt, max_ref_age)?;
             let payload_bytes = u64::try_from(partial.payload.len())
                 .map_err(|_| DbError::Checkpoint("vnode partial size does not fit u64".into()))?;
             remaining_bytes = remaining_bytes.checked_sub(payload_bytes).ok_or_else(|| {
@@ -4531,17 +4577,20 @@ impl CheckpointCoordinator {
                 let backend = Arc::clone(backend);
                 let v = partial.vnode;
                 let payload = partial.payload.clone();
+                let lineage = partial.lineage;
                 let certified_writer = certified_writer.clone();
                 async move {
                     let write = match certified_writer {
                         Some((fence, node_id)) => {
                             backend
-                                .write_certified_partial(attempt, v, &fence, node_id, payload)
+                                .write_certified_partial(
+                                    attempt, v, &fence, node_id, lineage, payload,
+                                )
                                 .await
                         }
                         None => {
                             backend
-                                .write_partial(attempt, v, caller_version, payload)
+                                .write_partial(attempt, v, caller_version, lineage, payload)
                                 .await
                         }
                     };
@@ -4562,6 +4611,8 @@ impl CheckpointCoordinator {
             self.last_partial_attempt.insert(partial.vnode, attempt);
             self.last_partial_delta_depth
                 .insert(partial.vnode, partial.delta_depth);
+            self.last_partial_lineage
+                .insert(partial.vnode, partial.lineage);
             match partial.upload_update {
                 VnodeUploadUpdate::Retain => {}
                 VnodeUploadUpdate::Replace(ops) => {
@@ -4570,6 +4621,8 @@ impl CheckpointCoordinator {
                 }
                 VnodeUploadUpdate::Remove => {
                     self.last_vnode_uploads.remove(&partial.vnode);
+                    self.last_sealed_upload_attempt.remove(&partial.vnode);
+                    self.last_sealed_upload_lineage.remove(&partial.vnode);
                 }
             }
             if partial.is_reference {
@@ -4587,9 +4640,10 @@ impl CheckpointCoordinator {
     fn prepare_vnode_partial(
         &self,
         vnode: u32,
-        epoch: u64,
+        attempt: CheckpointAttempt,
         max_ref_age: u64,
     ) -> Result<PreparedVnodePartial, DbError> {
+        let epoch = attempt.epoch;
         let ops = self.pending_vnode_states.get(&vnode);
         let has_delta =
             ops.is_some_and(|ops| ops.values().any(|s| matches!(s, StagedSlice::Delta(_))));
@@ -4603,9 +4657,51 @@ impl CheckpointCoordinator {
             (partial, update, is_reference, 0)
         };
 
+        let parent = partial.base;
+        let payload = bytes::Bytes::from(partial.encode()?);
+        let payload_bytes = u64::try_from(payload.len()).map_err(|_| {
+            DbError::Checkpoint("vnode partial size does not fit lineage accounting".into())
+        })?;
+        let lineage = match parent {
+            None => VnodePartialLineage::root(payload_bytes),
+            Some(parent) => {
+                let parent_lineage = if is_reference {
+                    if self.last_sealed_upload_attempt.get(&vnode) != Some(&parent) {
+                        return Err(DbError::Checkpoint(format!(
+                            "[LDB-6025] reference partial for vnode {vnode} has no exact sealed \
+                             root lineage at {parent:?}"
+                        )));
+                    }
+                    self.last_sealed_upload_lineage.get(&vnode)
+                } else {
+                    if self.last_sealed_partial_attempt.get(&vnode) != Some(&parent) {
+                        return Err(DbError::Checkpoint(format!(
+                            "[LDB-6025] delta partial for vnode {vnode} has no exact sealed \
+                             parent lineage at {parent:?}"
+                        )));
+                    }
+                    self.last_sealed_partial_lineage.get(&vnode)
+                }
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6025] sealed parent lineage metadata is missing for vnode {vnode} \
+                         at {parent:?}"
+                    ))
+                })?;
+                VnodePartialLineage::extend(attempt, payload_bytes, parent, *parent_lineage)
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6025] invalid vnode {vnode} restore lineage at {attempt:?}: \
+                             {error}"
+                        ))
+                    })?
+            }
+        };
+
         Ok(PreparedVnodePartial {
             vnode,
-            payload: bytes::Bytes::from(partial.encode()?),
+            payload,
+            lineage,
             upload_update,
             is_reference,
             delta_depth,
@@ -6808,7 +6904,7 @@ impl CheckpointCoordinator {
         let clean = if committed {
             // A valid Commit can only be published after the leader created the exact state seal.
             // Record that durable fact before this follower admits a successor delta/reference.
-            self.mark_vnode_partials_sealed(attempt);
+            self.mark_vnode_partials_sealed(attempt)?;
             // Followers never publish external sink state. The exact decision makes their
             // prepared state recoverable; finalization merely publishes the local recovery cut.
             self.finalize_manifest(checkpoint_id).await.map_err(|e| {
@@ -7239,7 +7335,16 @@ impl CheckpointCoordinator {
         }
         // Only the exact immutable seal, never a completed callback or a successful upload, makes
         // this attempt eligible as a future delta/reference parent.
-        self.mark_vnode_partials_sealed(CheckpointAttempt::new(epoch, checkpoint_id));
+        if let Err(error) =
+            self.mark_vnode_partials_sealed(CheckpointAttempt::new(epoch, checkpoint_id))
+        {
+            return Ok(self.fail_after_irrevocable_work(
+                checkpoint_id,
+                epoch,
+                start,
+                error.to_string(),
+            ));
+        }
 
         // The durable decision is the sole commit point. External sinks publish later from the
         // exact sealed descriptor inventory; no connector phase-2 mutation occurs inline here.

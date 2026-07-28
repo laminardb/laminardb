@@ -2,6 +2,10 @@ use super::*;
 
 use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
 
+fn root_lineage(payload: &[u8]) -> laminar_core::state::VnodePartialLineage {
+    laminar_core::state::VnodePartialLineage::root(payload.len() as u64)
+}
+
 fn at_least_once_sink_contract() -> laminar_connectors::connector::SinkContract {
     laminar_connectors::connector::SinkContract::new(
         laminar_connectors::connector::SinkConsistency::DurableAtLeastOnce,
@@ -93,6 +97,23 @@ fn one_vnode_delta_state(bytes: &'static [u8]) -> StagedVnodeStates {
             StagedSlice::Delta(bytes::Bytes::from_static(bytes)),
         )]),
     )])
+}
+
+async fn sealed_vnode_partial(
+    backend: &dyn StateBackend,
+    attempt: CheckpointAttempt,
+    vnode: u32,
+) -> laminar_core::state::SealedVnodePartial {
+    let inventory = backend
+        .checkpoint_seal_inventory(attempt)
+        .await
+        .unwrap()
+        .expect("checkpoint must have an exact seal");
+    inventory
+        .sealed_partials
+        .into_iter()
+        .find(|partial| partial.vnode == vnode)
+        .expect("sealed vnode must have an attestation")
 }
 
 fn committed_outcome_result(
@@ -2530,6 +2551,7 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
                 vnode,
                 &assignment_fence,
                 owner,
+                root_lineage(&partial),
                 Bytes::from(partial.clone()),
             )
             .await
@@ -4194,7 +4216,13 @@ async fn gate_checks_full_registry_not_just_owned() {
     let attempt = CheckpointAttempt::canonical(1);
     for vnode in [0, 1] {
         backend
-            .write_partial(attempt, vnode, 0, bytes::Bytes::from_static(b"leader"))
+            .write_partial(
+                attempt,
+                vnode,
+                0,
+                root_lineage(b"leader"),
+                bytes::Bytes::from_static(b"leader"),
+            )
             .await
             .unwrap();
     }
@@ -4265,6 +4293,7 @@ async fn source_offset_handoff_round_trip() {
                 v,
                 coord.active_assignment_fence.as_ref().unwrap(),
                 1,
+                root_lineage(b"x"),
                 Bytes::from_static(b"x"),
             )
             .await
@@ -4390,6 +4419,7 @@ async fn source_handoff_ignores_a_newer_undecided_seal() {
                 0,
                 coord.active_assignment_fence.as_ref().unwrap(),
                 1,
+                root_lineage(b"state"),
                 bytes::Bytes::from_static(b"state"),
             )
             .await
@@ -4457,6 +4487,7 @@ async fn source_handoff_rejects_a_highest_decision_without_its_exact_seal() {
             0,
             coord.active_assignment_fence.as_ref().unwrap(),
             1,
+            root_lineage(b"state"),
             bytes::Bytes::from_static(b"state"),
         )
         .await
@@ -4531,6 +4562,7 @@ async fn recovery_capsules_preserve_each_decided_source_cut() {
                     v,
                     coord.active_assignment_fence.as_ref().unwrap(),
                     1,
+                    root_lineage(b"x"),
                     Bytes::from_static(b"x"),
                 )
                 .await
@@ -4669,6 +4701,7 @@ async fn readiness_rejects_overlapping_vnode_ownership() {
             0,
             coord.active_assignment_fence.as_ref().unwrap(),
             1,
+            root_lineage(b"state"),
             Bytes::from_static(b"state"),
         )
         .await
@@ -4679,6 +4712,7 @@ async fn readiness_rejects_overlapping_vnode_ownership() {
             1,
             coord.active_assignment_fence.as_ref().unwrap(),
             2,
+            root_lineage(b"peer-state"),
             Bytes::from_static(b"peer-state"),
         )
         .await
@@ -4804,6 +4838,7 @@ async fn recovery_rejects_decision_with_a_different_sealed_assignment() {
             0,
             coord.active_assignment_fence.as_ref().unwrap(),
             1,
+            root_lineage(b"state"),
             bytes::Bytes::from_static(b"state"),
         )
         .await
@@ -4867,20 +4902,38 @@ async fn restorable_gate_waits_for_async_follower_uploads() {
     // upload completing while the leader polls.
     let attempt = CheckpointAttempt::canonical(1);
     backend
-        .write_partial(attempt, 0, 0, Bytes::from_static(b"leader"))
+        .write_partial(
+            attempt,
+            0,
+            0,
+            root_lineage(b"leader"),
+            Bytes::from_static(b"leader"),
+        )
         .await
         .unwrap();
     backend
-        .write_partial(attempt, 1, 0, Bytes::from_static(b"leader"))
+        .write_partial(
+            attempt,
+            1,
+            0,
+            root_lineage(b"leader"),
+            Bytes::from_static(b"leader"),
+        )
         .await
         .unwrap();
     let late = Arc::clone(&backend);
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(300)).await;
         for v in [2u32, 3] {
-            late.write_partial(attempt, v, 0, Bytes::from_static(b"follower"))
-                .await
-                .unwrap();
+            late.write_partial(
+                attempt,
+                v,
+                0,
+                root_lineage(b"follower"),
+                Bytes::from_static(b"follower"),
+            )
+            .await
+            .unwrap();
         }
     });
     coord.set_state_backend(backend).unwrap();
@@ -4927,7 +4980,13 @@ async fn restorable_gate_exits_when_assignment_fence_changes_while_waiting() {
     });
     let attempt = CheckpointAttempt::canonical(1);
     backend
-        .write_partial(attempt, 0, 1, Bytes::from_static(b"leader"))
+        .write_partial(
+            attempt,
+            0,
+            1,
+            root_lineage(b"leader"),
+            Bytes::from_static(b"leader"),
+        )
         .await
         .unwrap();
     coord.set_state_backend(backend).unwrap();
@@ -4991,7 +5050,13 @@ async fn restorable_gate_rejects_same_version_roster_replacement() {
     });
     let attempt = CheckpointAttempt::canonical(2);
     backend
-        .write_partial(attempt, 0, 1, Bytes::from_static(b"leader"))
+        .write_partial(
+            attempt,
+            0,
+            1,
+            root_lineage(b"leader"),
+            Bytes::from_static(b"leader"),
+        )
         .await
         .unwrap();
     coord.set_state_backend(backend).unwrap();
@@ -5049,11 +5114,23 @@ async fn gate_passes_when_all_registry_markers_present() {
     // epoch the leader is about to use (fresh store starts at 1).
     let attempt = CheckpointAttempt::canonical(1);
     backend
-        .write_partial(attempt, 2, 0, Bytes::from_static(b"follower"))
+        .write_partial(
+            attempt,
+            2,
+            0,
+            root_lineage(b"follower"),
+            Bytes::from_static(b"follower"),
+        )
         .await
         .unwrap();
     backend
-        .write_partial(attempt, 3, 0, Bytes::from_static(b"follower"))
+        .write_partial(
+            attempt,
+            3,
+            0,
+            root_lineage(b"follower"),
+            Bytes::from_static(b"follower"),
+        )
         .await
         .unwrap();
     coord.set_state_backend(backend).unwrap();
@@ -5089,6 +5166,92 @@ async fn marker_write_failure_aborts_checkpoint() {
     );
     let err = result.error.expect("failure produces an error message");
     assert!(err.contains("vnode partial write failed"), "got: {err}");
+}
+
+#[tokio::test]
+async fn sealed_parent_promotion_is_atomic_across_owned_vnodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator_with_key_groups(dir.path(), 2).await;
+    let attempt = CheckpointAttempt::canonical(1);
+    coord.set_vnode_set(vec![0, 1]);
+    coord.last_partial_attempt.insert(0, attempt);
+    coord.last_partial_attempt.insert(1, attempt);
+    coord
+        .last_partial_lineage
+        .insert(0, laminar_core::state::VnodePartialLineage::root(1));
+    coord.last_partial_delta_depth.insert(0, 0);
+
+    let error = coord
+        .mark_vnode_partials_sealed(attempt)
+        .expect_err("missing lineage must poison the complete promotion");
+
+    assert!(error.to_string().contains("vnode 1"), "{error}");
+    assert!(coord.last_sealed_partial_attempt.is_empty());
+    assert!(coord.last_sealed_partial_lineage.is_empty());
+    assert!(coord.last_sealed_delta_depth.is_empty());
+}
+
+#[tokio::test]
+async fn vnode_revoke_then_reacquire_discards_lineage_and_rebases_full() {
+    use laminar_core::state::InProcessBackend;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator_with_key_groups(dir.path(), 1).await;
+    let backend = Arc::new(InProcessBackend::new(1));
+    coord
+        .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
+        .unwrap();
+    coord.set_vnode_set(vec![0]);
+    let slices = || {
+        std::collections::HashMap::from([(
+            0,
+            std::collections::HashMap::from([(
+                "agg".to_owned(),
+                StagedSlice::Bytes(bytes::Bytes::from_static(b"stable")),
+            )]),
+        )])
+    };
+
+    coord.set_pending_vnode_states(slices());
+    let first = coord
+        .checkpoint(CheckpointRequest::default())
+        .await
+        .unwrap();
+    assert!(first.success, "{:?}", first.error);
+    assert!(coord.last_partial_lineage.contains_key(&0));
+    assert!(coord.last_sealed_partial_lineage.contains_key(&0));
+    assert!(coord.last_sealed_upload_lineage.contains_key(&0));
+
+    coord.set_vnode_set(Vec::new());
+    assert!(!coord.last_partial_attempt.contains_key(&0));
+    assert!(!coord.last_partial_delta_depth.contains_key(&0));
+    assert!(!coord.last_partial_lineage.contains_key(&0));
+    assert!(!coord.last_sealed_partial_attempt.contains_key(&0));
+    assert!(!coord.last_sealed_delta_depth.contains_key(&0));
+    assert!(!coord.last_sealed_partial_lineage.contains_key(&0));
+    assert!(!coord.last_vnode_uploads.contains_key(&0));
+    assert!(!coord.last_sealed_upload_attempt.contains_key(&0));
+    assert!(!coord.last_sealed_upload_lineage.contains_key(&0));
+
+    coord.set_vnode_set(vec![0]);
+    coord.set_pending_vnode_states(slices());
+    let reacquired = coord
+        .checkpoint(CheckpointRequest::default())
+        .await
+        .unwrap();
+    assert!(reacquired.success, "{:?}", reacquired.error);
+    let attempt = CheckpointAttempt::canonical(reacquired.checkpoint_id);
+    let bytes = backend.read_partial(attempt, 0).await.unwrap().unwrap();
+    let partial = crate::vnode_partial::VnodePartial::decode(&bytes).unwrap();
+    assert_eq!(
+        partial.base, None,
+        "a reacquired vnode must establish a new root"
+    );
+    assert_eq!(partial.operators[0].1, b"stable");
+    let sealed = sealed_vnode_partial(backend.as_ref(), attempt, 0).await;
+    assert_eq!(sealed.lineage.parent(), None);
+    assert_eq!(sealed.lineage.total_payload_bytes(), sealed.payload_len);
+    assert_eq!(sealed.lineage.artifact_count(), 1);
 }
 
 /// A vnode whose slices didn't change uploads a
@@ -5138,6 +5301,10 @@ async fn unchanged_vnode_state_becomes_reference_partial() {
     .unwrap();
     assert_eq!(p1.base, None, "first upload must be full");
     assert!(!p1.operators.is_empty());
+    let sealed1 = sealed_vnode_partial(backend.as_ref(), a1, 0).await;
+    assert_eq!(sealed1.lineage.parent(), None);
+    assert_eq!(sealed1.lineage.total_payload_bytes(), sealed1.payload_len);
+    assert_eq!(sealed1.lineage.artifact_count(), 1);
 
     // Epoch 2: identical slices → reference to epoch 1.
     coord.set_pending_vnode_states(slices());
@@ -5153,6 +5320,23 @@ async fn unchanged_vnode_state_becomes_reference_partial() {
     .unwrap();
     assert_eq!(p2.base, Some(a1), "unchanged slice must reference its base");
     assert!(p2.operators.is_empty());
+    let sealed2 = sealed_vnode_partial(backend.as_ref(), a2, 0).await;
+    assert_eq!(sealed2.lineage.parent(), Some(a1));
+    assert_eq!(
+        sealed2.lineage.total_payload_bytes(),
+        sealed2.payload_len + sealed1.lineage.total_payload_bytes()
+    );
+    assert_eq!(sealed2.lineage.artifact_count(), 2);
+
+    // A duplicate/stale completion callback for the original FULL must not copy the newer
+    // reference candidate's lineage onto that root. The next reference must still attest only
+    // itself plus the exact FULL payload.
+    coord.mark_vnode_partials_sealed(a1).unwrap();
+    assert_eq!(coord.last_sealed_upload_attempt.get(&0), Some(&a1));
+    assert_eq!(
+        coord.last_sealed_upload_lineage.get(&0),
+        Some(&sealed1.lineage)
+    );
 
     // Another successful no-change checkpoint points directly to the same sealed FULL. Reference
     // markers never chain through the prior reference marker.
@@ -5169,6 +5353,13 @@ async fn unchanged_vnode_state_becomes_reference_partial() {
     .unwrap();
     assert_eq!(p3.base, Some(a1));
     assert!(p3.operators.is_empty());
+    let sealed3 = sealed_vnode_partial(backend.as_ref(), a3, 0).await;
+    assert_eq!(sealed3.lineage.parent(), Some(a1));
+    assert_eq!(
+        sealed3.lineage.total_payload_bytes(),
+        sealed3.payload_len + sealed1.lineage.total_payload_bytes()
+    );
+    assert_eq!(sealed3.lineage.artifact_count(), 2);
     let loaded =
         crate::recovery_manager::vnode_chains::SealedVnodeChainReader::new(backend.as_ref())
             .load_at(&[0], a3)
@@ -5431,6 +5622,21 @@ async fn reference_resets_bounded_delta_depth_without_hiding_its_root() {
     )
     .unwrap();
     assert_eq!(delta.base, Some(referenced_attempt));
+    let full_lineage = sealed_vnode_partial(backend.as_ref(), full_attempt, 0).await;
+    let reference_lineage = sealed_vnode_partial(backend.as_ref(), referenced_attempt, 0).await;
+    let delta_lineage = sealed_vnode_partial(backend.as_ref(), allowed_attempt, 0).await;
+    assert_eq!(reference_lineage.lineage.parent(), Some(full_attempt));
+    assert_eq!(reference_lineage.lineage.artifact_count(), 2);
+    assert_eq!(
+        reference_lineage.lineage.total_payload_bytes(),
+        reference_lineage.payload_len + full_lineage.lineage.total_payload_bytes()
+    );
+    assert_eq!(delta_lineage.lineage.parent(), Some(referenced_attempt));
+    assert_eq!(delta_lineage.lineage.artifact_count(), 3);
+    assert_eq!(
+        delta_lineage.lineage.total_payload_bytes(),
+        delta_lineage.payload_len + reference_lineage.lineage.total_payload_bytes()
+    );
 
     coord.set_pending_vnode_states(one_vnode_delta_state(b"too-deep"));
     let rejected = coord
@@ -5442,6 +5648,151 @@ async fn reference_resets_bounded_delta_depth_without_hiding_its_root() {
         .error
         .as_deref()
         .is_some_and(|error| error.contains("runtime-derived chain bound 1")));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn aborted_full_upload_cannot_become_a_reusable_reference_root() {
+    use laminar_core::state::InProcessBackend;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+    let backend = Arc::new(InProcessBackend::new(1));
+    coord
+        .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
+        .unwrap();
+    coord.set_vnode_set(vec![0]);
+
+    coord.set_pending_vnode_states(one_vnode_full_state(b"durable-root"));
+    let durable = coord
+        .checkpoint(CheckpointRequest::default())
+        .await
+        .unwrap();
+    assert!(durable.success, "{:?}", durable.error);
+    let durable_attempt = CheckpointAttempt::canonical(durable.checkpoint_id);
+
+    let aborted_attempt = coord.epoch_allocator().allocate().await.unwrap();
+    coord.set_pending_vnode_states(one_vnode_full_state(b"aborted-root"));
+    coord
+        .write_vnode_partials_inner(aborted_attempt.epoch, aborted_attempt.checkpoint_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        coord
+            .last_vnode_uploads
+            .get(&0)
+            .map(|(attempt, _)| *attempt),
+        Some(aborted_attempt)
+    );
+    assert_eq!(
+        coord.last_sealed_upload_attempt.get(&0),
+        Some(&durable_attempt)
+    );
+    let aborted = coord
+        .fail_epoch(
+            aborted_attempt.checkpoint_id,
+            aborted_attempt.epoch,
+            Instant::now(),
+            "injected abort before sealing staged FULL".into(),
+        )
+        .await;
+    assert!(!aborted.success);
+
+    let successor = coord.epoch_allocator().allocate().await.unwrap();
+    coord.set_pending_vnode_states(one_vnode_full_state(b"aborted-root"));
+    coord
+        .write_vnode_partials_inner(successor.epoch, successor.checkpoint_id)
+        .await
+        .unwrap();
+    let bytes = backend.read_partial(successor, 0).await.unwrap().unwrap();
+    let partial = crate::vnode_partial::VnodePartial::decode(&bytes).unwrap();
+    assert_eq!(
+        partial.base, None,
+        "an unsealed FULL candidate must force the successor to re-base"
+    );
+    assert_eq!(partial.operators[0].1, b"aborted-root");
+    let lineage = coord.last_partial_lineage[&0];
+    assert_eq!(lineage.parent(), None);
+    assert_eq!(lineage.artifact_count(), 1);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn aborted_reference_cannot_become_a_delta_parent_or_reference_root() {
+    use laminar_core::state::InProcessBackend;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+    coord.configure_state_ancestry(Some(2));
+    let backend = Arc::new(InProcessBackend::new(1));
+    coord
+        .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
+        .unwrap();
+    coord.set_vnode_set(vec![0]);
+
+    coord.set_pending_vnode_states(one_vnode_full_state(b"stable"));
+    let durable = coord
+        .checkpoint(CheckpointRequest::default())
+        .await
+        .unwrap();
+    assert!(durable.success, "{:?}", durable.error);
+    let durable_attempt = CheckpointAttempt::canonical(durable.checkpoint_id);
+    let durable_lineage = coord.last_sealed_upload_lineage[&0];
+
+    let aborted_attempt = coord.epoch_allocator().allocate().await.unwrap();
+    coord.set_pending_vnode_states(one_vnode_full_state(b"stable"));
+    coord
+        .write_vnode_partials_inner(aborted_attempt.epoch, aborted_attempt.checkpoint_id)
+        .await
+        .unwrap();
+    let bytes = backend
+        .read_partial(aborted_attempt, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    let reference = crate::vnode_partial::VnodePartial::decode(&bytes).unwrap();
+    assert_eq!(reference.base, Some(durable_attempt));
+    assert_eq!(coord.last_partial_attempt.get(&0), Some(&aborted_attempt));
+    assert_eq!(
+        coord.last_sealed_partial_attempt.get(&0),
+        Some(&durable_attempt)
+    );
+    let aborted = coord
+        .fail_epoch(
+            aborted_attempt.checkpoint_id,
+            aborted_attempt.epoch,
+            Instant::now(),
+            "injected abort before sealing staged reference".into(),
+        )
+        .await;
+    assert!(!aborted.success);
+
+    let successor = coord.epoch_allocator().allocate().await.unwrap();
+    coord.set_pending_vnode_states(one_vnode_delta_state(b"unsafe-delta"));
+    let error = coord
+        .validate_staged_delta_parents(successor.epoch)
+        .expect_err("an aborted reference must not become the successor delta parent");
+    assert!(error.to_string().contains("unsealed attempt"), "{error}");
+
+    coord.set_pending_vnode_states(one_vnode_full_state(b"stable"));
+    coord
+        .write_vnode_partials_inner(successor.epoch, successor.checkpoint_id)
+        .await
+        .unwrap();
+    let bytes = backend.read_partial(successor, 0).await.unwrap().unwrap();
+    let reference = crate::vnode_partial::VnodePartial::decode(&bytes).unwrap();
+    assert_eq!(
+        reference.base,
+        Some(durable_attempt),
+        "the successor may only reuse the exact sealed FULL root"
+    );
+    let lineage = coord.last_partial_lineage[&0];
+    assert_eq!(lineage.parent(), Some(durable_attempt));
+    assert_eq!(lineage.artifact_count(), 2);
+    assert_eq!(
+        lineage.total_payload_bytes(),
+        bytes.len() as u64 + durable_lineage.total_payload_bytes()
+    );
 }
 
 #[cfg(feature = "cluster")]
@@ -5675,6 +6026,7 @@ impl StateBackend for FaultBackend {
         attempt: CheckpointAttempt,
         vnode: u32,
         assignment_version: u64,
+        lineage: laminar_core::state::VnodePartialLineage,
         bytes: bytes::Bytes,
     ) -> Result<(), laminar_core::state::StateBackendError> {
         let _probe = if let Some(probe) = &self.write_probe {
@@ -5689,7 +6041,7 @@ impl StateBackend for FaultBackend {
             ));
         }
         self.inner
-            .write_partial(attempt, vnode, assignment_version, bytes)
+            .write_partial(attempt, vnode, assignment_version, lineage, bytes)
             .await
     }
 
@@ -5699,6 +6051,7 @@ impl StateBackend for FaultBackend {
         vnode: u32,
         assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
         writer_node_id: u64,
+        lineage: laminar_core::state::VnodePartialLineage,
         bytes: bytes::Bytes,
     ) -> Result<(), laminar_core::state::StateBackendError> {
         let _probe = if let Some(probe) = &self.write_probe {
@@ -5713,7 +6066,14 @@ impl StateBackend for FaultBackend {
             ));
         }
         self.inner
-            .write_certified_partial(attempt, vnode, assignment_fence, writer_node_id, bytes)
+            .write_certified_partial(
+                attempt,
+                vnode,
+                assignment_fence,
+                writer_node_id,
+                lineage,
+                bytes,
+            )
             .await
     }
 

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use laminar_core::state::{
     CheckpointAttempt, ObjectStoreBackend, StateBackend, StateBackendConfig,
-    StateBackendDurability, LOCAL_KEY_GROUP_COUNT,
+    StateBackendDurability, VnodePartialLineage, LOCAL_KEY_GROUP_COUNT,
 };
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
@@ -18,9 +18,15 @@ async fn config_roundtrip_in_process_local_object_store() {
     let c = StateBackendConfig::in_process();
     let b = c.build(LOCAL_KEY_GROUP_COUNT).unwrap();
     assert_eq!(b.durability_scope(), StateBackendDurability::Volatile);
-    b.write_partial(attempt, 0, 0, Bytes::from_static(b"a"))
-        .await
-        .unwrap();
+    b.write_partial(
+        attempt,
+        0,
+        0,
+        VnodePartialLineage::root(1),
+        Bytes::from_static(b"a"),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         &b.read_partial(attempt, 0).await.unwrap().unwrap()[..],
         b"a"
@@ -30,9 +36,15 @@ async fn config_roundtrip_in_process_local_object_store() {
     let c = StateBackendConfig::local(dir.path());
     let b = c.build(LOCAL_KEY_GROUP_COUNT).unwrap();
     assert_eq!(b.durability_scope(), StateBackendDurability::NodeDurable);
-    b.write_partial(attempt, 0, 0, Bytes::from_static(b"b"))
-        .await
-        .unwrap();
+    b.write_partial(
+        attempt,
+        0,
+        0,
+        VnodePartialLineage::root(1),
+        Bytes::from_static(b"b"),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         &b.read_partial(attempt, 0).await.unwrap().unwrap()[..],
         b"b"
@@ -48,9 +60,15 @@ async fn config_roundtrip_in_process_local_object_store() {
     let c = StateBackendConfig::object_store(url);
     let b = c.build(LOCAL_KEY_GROUP_COUNT).unwrap();
     assert_eq!(b.durability_scope(), StateBackendDurability::NodeDurable);
-    b.write_partial(attempt, 0, 0, Bytes::from_static(b"c"))
-        .await
-        .unwrap();
+    b.write_partial(
+        attempt,
+        0,
+        0,
+        VnodePartialLineage::root(1),
+        Bytes::from_static(b"c"),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         &b.read_partial(attempt, 0).await.unwrap().unwrap()[..],
         b"c"
@@ -78,19 +96,43 @@ async fn cluster_shared_two_instances_share_state_and_fence_seals() {
     let attempt = CheckpointAttempt::new(1, 1);
 
     node_a
-        .write_partial(attempt, 0, 0, Bytes::from_static(b"A0"))
+        .write_partial(
+            attempt,
+            0,
+            0,
+            VnodePartialLineage::root(2),
+            Bytes::from_static(b"A0"),
+        )
         .await
         .unwrap();
     node_a
-        .write_partial(attempt, 1, 0, Bytes::from_static(b"A1"))
+        .write_partial(
+            attempt,
+            1,
+            0,
+            VnodePartialLineage::root(2),
+            Bytes::from_static(b"A1"),
+        )
         .await
         .unwrap();
     node_b
-        .write_partial(attempt, 2, 0, Bytes::from_static(b"B2"))
+        .write_partial(
+            attempt,
+            2,
+            0,
+            VnodePartialLineage::root(2),
+            Bytes::from_static(b"B2"),
+        )
         .await
         .unwrap();
     node_b
-        .write_partial(attempt, 3, 0, Bytes::from_static(b"B3"))
+        .write_partial(
+            attempt,
+            3,
+            0,
+            VnodePartialLineage::root(2),
+            Bytes::from_static(b"B3"),
+        )
         .await
         .unwrap();
 
@@ -121,7 +163,13 @@ async fn cluster_shared_two_instances_share_state_and_fence_seals() {
 
     let next = CheckpointAttempt::new(2, 2);
     node_a
-        .write_partial(next, 0, 0, Bytes::from_static(b"A0@2"))
+        .write_partial(
+            next,
+            0,
+            0,
+            VnodePartialLineage::root(4),
+            Bytes::from_static(b"A0@2"),
+        )
         .await
         .unwrap();
     assert!(!node_a

@@ -500,10 +500,7 @@ fn synthetic_boot_transition(
             participant,
             identity,
             cut,
-            LoadedVnodeChains {
-                attempt: Some(attempt),
-                chains,
-            },
+            LoadedVnodeChains::from_chains_for_test(Some(attempt), chains),
         )
         .unwrap(),
     )

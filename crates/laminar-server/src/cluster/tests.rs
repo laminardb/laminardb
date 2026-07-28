@@ -829,9 +829,16 @@ async fn cluster_state_seal_records_runtime_node_id() {
         laminar_core::state::LOCAL_KEY_GROUP_COUNT,
     );
     let attempt = laminar_core::state::CheckpointAttempt::canonical(17);
+    let payload = bytes::Bytes::from_static(b"state");
 
     backend
-        .write_partial(attempt, 0, 0, bytes::Bytes::from_static(b"state"))
+        .write_partial(
+            attempt,
+            0,
+            0,
+            laminar_core::state::VnodePartialLineage::root(payload.len() as u64),
+            payload,
+        )
         .await
         .unwrap();
     assert!(backend

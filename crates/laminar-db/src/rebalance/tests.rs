@@ -288,10 +288,10 @@ fn synthetic_pending_boot_transition(
             participant,
             identity,
             restore_cut,
-            crate::recovery_manager::vnode_chains::LoadedVnodeChains {
-                attempt: Some(attempt),
+            crate::recovery_manager::vnode_chains::LoadedVnodeChains::from_chains_for_test(
+                Some(attempt),
                 chains,
-            },
+            ),
         )
         .unwrap(),
     )

@@ -27,12 +27,12 @@ use super::backend::{
     digest_hex, sha256, CheckpointAttempt, CheckpointSeal, CheckpointSealInventory,
     SealedCommitDescriptor, SealedCommitDescriptorWriter, SealedVnodePartial, SealedVnodeWriter,
     StateBackend, StateBackendDurability, StateBackendError, StateNamespaceBinding,
-    CHECKPOINT_SEAL_VERSION, STATE_NAMESPACE_RESOURCE,
+    VnodePartialLineage, CHECKPOINT_SEAL_VERSION, STATE_NAMESPACE_RESOURCE,
 };
 
-const VNODE_PARTIAL_MAGIC: &[u8; 8] = b"LDBVP2\0\0";
-const VNODE_PARTIAL_VERSION: u32 = 2;
-const VNODE_PARTIAL_HEADER_LEN: usize = 136;
+const VNODE_PARTIAL_MAGIC: &[u8; 8] = b"LDBVP3\0\0";
+const VNODE_PARTIAL_VERSION: u32 = 3;
+const VNODE_PARTIAL_HEADER_LEN: usize = 164;
 const PARTIAL_ATTESTATION_READ_CONCURRENCY: usize = 32;
 const COMMIT_DESCRIPTOR_MAGIC: &[u8; 8] = b"LDBCD2\0\0";
 const COMMIT_DESCRIPTOR_VERSION: u32 = 2;
@@ -441,6 +441,7 @@ impl ObjectStoreBackend {
         vnode: u32,
         assignment_version: u64,
         writer: Option<&SealedVnodeWriter>,
+        lineage: VnodePartialLineage,
         payload: &Bytes,
     ) -> Bytes {
         let payload_digest = sha256(payload);
@@ -462,6 +463,15 @@ impl ObjectStoreBackend {
         }
         encoded.extend_from_slice(&(payload.len() as u64).to_be_bytes());
         encoded.extend_from_slice(&payload_digest);
+        if let Some(parent) = lineage.parent() {
+            encoded.extend_from_slice(&parent.epoch.to_be_bytes());
+            encoded.extend_from_slice(&parent.checkpoint_id.to_be_bytes());
+        } else {
+            encoded.extend_from_slice(&0_u64.to_be_bytes());
+            encoded.extend_from_slice(&0_u64.to_be_bytes());
+        }
+        encoded.extend_from_slice(&lineage.total_payload_bytes().to_be_bytes());
+        encoded.extend_from_slice(&lineage.artifact_count().to_be_bytes());
         debug_assert_eq!(encoded.len(), VNODE_PARTIAL_HEADER_LEN);
         encoded.extend_from_slice(payload);
         Bytes::from(encoded)
@@ -538,12 +548,29 @@ impl ObjectStoreBackend {
         };
         let payload_len = u64::from_be_bytes(field(header, 96)?);
         let payload_digest = field::<32>(header, 104)?;
+        let parent_epoch = u64::from_be_bytes(field(header, 136)?);
+        let parent_checkpoint_id = u64::from_be_bytes(field(header, 144)?);
+        let parent = match (parent_epoch, parent_checkpoint_id) {
+            (0, 0) => None,
+            _ => Some(CheckpointAttempt::new(parent_epoch, parent_checkpoint_id)),
+        };
+        let lineage = VnodePartialLineage::from_persisted(
+            parent,
+            u64::from_be_bytes(field(header, 152)?),
+            u32::from_be_bytes(field(header, 160)?),
+        );
+        lineage.validate(attempt, payload_len).map_err(|message| {
+            StateBackendError::Serialization(format!(
+                "invalid vnode partial lineage metadata: {message}"
+            ))
+        })?;
         Ok(SealedVnodePartial {
             vnode,
             assignment_version,
             writer,
             payload_len,
             payload_sha256: digest_hex(&payload_digest),
+            lineage,
         })
     }
 
@@ -1135,12 +1162,20 @@ impl StateBackend for ObjectStoreBackend {
         attempt: CheckpointAttempt,
         vnode: u32,
         assignment_version: u64,
+        lineage: VnodePartialLineage,
         bytes: Bytes,
     ) -> Result<(), StateBackendError> {
+        Self::ensure_canonical_attempt(attempt)?;
         self.check_vnode(vnode)?;
         self.check_assignment_version(assignment_version)?;
         let path = Self::partial_path(attempt, vnode);
-        let bytes = Self::encode_partial(attempt, vnode, assignment_version, None, &bytes);
+        lineage
+            .validate(attempt, bytes.len() as u64)
+            .map_err(|message| StateBackendError::Conflict {
+                resource: path.to_string(),
+                message,
+            })?;
+        let bytes = Self::encode_partial(attempt, vnode, assignment_version, None, lineage, &bytes);
         self.put_live_immutable(attempt, &path, bytes).await
     }
 
@@ -1150,8 +1185,10 @@ impl StateBackend for ObjectStoreBackend {
         vnode: u32,
         assignment_fence: &CheckpointAssignmentFence,
         writer_node_id: u64,
+        lineage: VnodePartialLineage,
         bytes: Bytes,
     ) -> Result<(), StateBackendError> {
+        Self::ensure_canonical_attempt(attempt)?;
         self.check_vnode(vnode)?;
         if !assignment_fence.is_canonical() {
             return Err(StateBackendError::Conflict {
@@ -1159,6 +1196,12 @@ impl StateBackend for ObjectStoreBackend {
                 message: "assignment certificate is not canonical".into(),
             });
         }
+        lineage
+            .validate(attempt, bytes.len() as u64)
+            .map_err(|message| StateBackendError::Conflict {
+                resource: Self::partial_path(attempt, vnode).to_string(),
+                message,
+            })?;
         self.check_assignment_version(assignment_fence.assignment_version)?;
         let writer =
             SealedVnodeWriter::from_fence(assignment_fence, writer_node_id).ok_or_else(|| {
@@ -1173,6 +1216,7 @@ impl StateBackend for ObjectStoreBackend {
             vnode,
             assignment_fence.assignment_version,
             Some(&writer),
+            lineage,
             &bytes,
         );
         let path = Self::partial_path(attempt, vnode);

@@ -1,6 +1,10 @@
 use super::*;
 use futures::StreamExt as _;
 
+fn root_lineage(payload: &[u8]) -> VnodePartialLineage {
+    VnodePartialLineage::root(payload.len() as u64)
+}
+
 /// Records retention publication and deletion order while delegating storage to the real
 /// local backend.
 struct RetentionLogStore {
@@ -480,11 +484,201 @@ async fn write_read_roundtrip() {
     let dir = tempdir().unwrap();
     let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
     backend
-        .write_partial(attempt(1), 0, 0, Bytes::from_static(b"hello"))
+        .write_partial(
+            attempt(1),
+            0,
+            0,
+            root_lineage(b"hello"),
+            Bytes::from_static(b"hello"),
+        )
         .await
         .unwrap();
     let got = backend.read_partial(attempt(1), 0).await.unwrap().unwrap();
     assert_eq!(&got[..], b"hello");
+}
+
+#[tokio::test]
+async fn vnode_partial_v3_persists_child_lineage_without_changing_payload() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let backend = ObjectStoreBackend::new(Arc::clone(&store), "node-0", 1);
+    let parent_attempt = attempt(1);
+    let parent_payload = Bytes::from_static(b"parent");
+    let parent_lineage = VnodePartialLineage::root(parent_payload.len() as u64);
+    backend
+        .write_partial(parent_attempt, 0, 0, parent_lineage, parent_payload)
+        .await
+        .unwrap();
+    assert!(backend
+        .seal_checkpoint(parent_attempt, None, &[0], &[])
+        .await
+        .unwrap());
+
+    let child_attempt = attempt(2);
+    let child_payload = Bytes::from_static(b"child");
+    let child_lineage = VnodePartialLineage::extend(
+        child_attempt,
+        child_payload.len() as u64,
+        parent_attempt,
+        parent_lineage,
+    )
+    .unwrap();
+    backend
+        .write_partial(child_attempt, 0, 0, child_lineage, child_payload.clone())
+        .await
+        .unwrap();
+
+    let stored = store
+        .get(&ObjectStoreBackend::partial_path(child_attempt, 0))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(&stored[..8], b"LDBVP3\0\0");
+    assert_eq!(u32::from_be_bytes(stored[8..12].try_into().unwrap()), 3);
+    assert_eq!(stored.len(), 164 + child_payload.len());
+    assert_eq!(u64::from_be_bytes(stored[136..144].try_into().unwrap()), 1);
+    assert_eq!(u64::from_be_bytes(stored[144..152].try_into().unwrap()), 1);
+    assert_eq!(u64::from_be_bytes(stored[152..160].try_into().unwrap()), 11);
+    assert_eq!(u32::from_be_bytes(stored[160..164].try_into().unwrap()), 2);
+    assert_eq!(&stored[164..], child_payload.as_ref());
+
+    assert!(backend
+        .seal_checkpoint(child_attempt, None, &[0], &[])
+        .await
+        .unwrap());
+    let inventory = backend
+        .checkpoint_seal_inventory(child_attempt)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(inventory.sealed_partials[0].lineage, child_lineage);
+    inventory.validate_vnode_partials().unwrap();
+}
+
+#[test]
+fn vnode_partial_v2_is_an_explicit_reset_boundary() {
+    let checkpoint = attempt(1);
+    let mut legacy = vec![0_u8; 136];
+    legacy[..8].copy_from_slice(b"LDBVP2\0\0");
+    legacy[8..12].copy_from_slice(&2_u32.to_be_bytes());
+
+    let error =
+        ObjectStoreBackend::decode_partial(&Bytes::from(legacy), checkpoint, 0).unwrap_err();
+
+    assert!(matches!(error, StateBackendError::Serialization(_)));
+    assert!(error.to_string().contains("provenance header"), "{error}");
+}
+
+#[tokio::test]
+async fn checkpoint_seal_v7_is_an_explicit_reset_boundary() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let backend = ObjectStoreBackend::new(Arc::clone(&store), "node-0", 1);
+    let checkpoint = attempt(1);
+    backend
+        .write_partial(
+            checkpoint,
+            0,
+            0,
+            root_lineage(b"state"),
+            Bytes::from_static(b"state"),
+        )
+        .await
+        .unwrap();
+    assert!(backend
+        .seal_checkpoint(checkpoint, None, &[0], &[])
+        .await
+        .unwrap());
+
+    let path = ObjectStoreBackend::seal_path(checkpoint);
+    let bytes = store.get(&path).await.unwrap().bytes().await.unwrap();
+    let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    legacy["version"] = serde_json::Value::from(7);
+    store
+        .put(
+            &path,
+            PutPayload::from(Bytes::from(serde_json::to_vec(&legacy).unwrap())),
+        )
+        .await
+        .unwrap();
+
+    let error = backend
+        .checkpoint_seal_inventory(checkpoint)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported checkpoint seal version 7; expected 8"),
+        "{error}"
+    );
+}
+
+#[test]
+fn vnode_partial_v3_rejects_tampered_or_truncated_lineage_header() {
+    let checkpoint = attempt(2);
+    let payload = Bytes::from_static(b"child");
+    let lineage = VnodePartialLineage::extend(
+        checkpoint,
+        payload.len() as u64,
+        attempt(1),
+        VnodePartialLineage::root(6),
+    )
+    .unwrap();
+    let encoded = ObjectStoreBackend::encode_partial(checkpoint, 0, 0, None, lineage, &payload);
+
+    let truncated = encoded.slice(..VNODE_PARTIAL_HEADER_LEN - 1);
+    let error = ObjectStoreBackend::decode_partial(&truncated, checkpoint, 0).unwrap_err();
+    assert!(matches!(error, StateBackendError::Serialization(_)));
+    assert!(error.to_string().contains("provenance header"));
+
+    let mut tampered = encoded.to_vec();
+    tampered[152..160].copy_from_slice(&4_u64.to_be_bytes());
+    let error =
+        ObjectStoreBackend::decode_partial(&Bytes::from(tampered), checkpoint, 0).unwrap_err();
+    assert!(matches!(error, StateBackendError::Serialization(_)));
+    assert!(error.to_string().contains("lineage metadata"));
+}
+
+#[tokio::test]
+async fn object_store_immutable_retry_binds_lineage_and_seal_inventory() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let backend = ObjectStoreBackend::new(store, "node-0", 1);
+    let checkpoint = attempt(2);
+    let payload = Bytes::from_static(b"same");
+    let lineage = VnodePartialLineage::extend(
+        checkpoint,
+        payload.len() as u64,
+        attempt(1),
+        VnodePartialLineage::root(3),
+    )
+    .unwrap();
+    backend
+        .write_partial(checkpoint, 0, 0, lineage, payload.clone())
+        .await
+        .unwrap();
+    let error = backend
+        .write_partial(
+            checkpoint,
+            0,
+            0,
+            VnodePartialLineage::root(payload.len() as u64),
+            payload,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StateBackendError::Conflict { .. }));
+
+    assert!(backend
+        .seal_checkpoint(checkpoint, None, &[0], &[])
+        .await
+        .unwrap());
+    let inventory = backend
+        .checkpoint_seal_inventory(checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(inventory.sealed_partials[0].lineage, lineage);
 }
 
 #[tokio::test]
@@ -495,7 +689,14 @@ async fn sealed_partial_read_rejects_a_valid_replacement_envelope() {
     let fence = assignment_fence(7, 1);
     backend.set_authoritative_version(7);
     backend
-        .write_certified_partial(checkpoint, 0, &fence, 1, Bytes::from_static(b"state"))
+        .write_certified_partial(
+            checkpoint,
+            0,
+            &fence,
+            1,
+            root_lineage(b"state"),
+            Bytes::from_static(b"state"),
+        )
         .await
         .unwrap();
     assert!(backend
@@ -528,6 +729,7 @@ async fn sealed_partial_read_rejects_a_valid_replacement_envelope() {
         0,
         fence.assignment_version,
         None,
+        root_lineage(b"state"),
         &Bytes::from_static(b"state"),
     );
     store
@@ -565,7 +767,13 @@ async fn sealed_partial_read_rejects_bad_metadata_before_polling_body() {
     });
     let backend = ObjectStoreBackend::new(store, "node-0", 1);
     backend
-        .write_partial(checkpoint, 0, 0, Bytes::from_static(b"state"))
+        .write_partial(
+            checkpoint,
+            0,
+            0,
+            root_lineage(b"state"),
+            Bytes::from_static(b"state"),
+        )
         .await
         .unwrap();
     assert!(backend
@@ -594,7 +802,13 @@ async fn noncanonical_attempt_is_rejected_before_object_creation() {
     let invalid = CheckpointAttempt::new(1, 2);
 
     let error = backend
-        .write_partial(invalid, 0, 0, Bytes::from_static(b"invalid"))
+        .write_partial(
+            invalid,
+            0,
+            0,
+            root_lineage(b"invalid"),
+            Bytes::from_static(b"invalid"),
+        )
         .await
         .unwrap_err();
     assert!(error.to_string().contains("canonical checkpoint ID"));
@@ -613,7 +827,14 @@ fn decode_partial_realigns_an_unaligned_transport_buffer() {
 
     let checkpoint = attempt(1);
     let payload = Bytes::from_static(b"archived vnode state");
-    let encoded = ObjectStoreBackend::encode_partial(checkpoint, 0, 0, None, &payload);
+    let encoded = ObjectStoreBackend::encode_partial(
+        checkpoint,
+        0,
+        0,
+        None,
+        VnodePartialLineage::root(payload.len() as u64),
+        &payload,
+    );
 
     let mut transport = bytes::BytesMut::zeroed(encoded.len() + ARCHIVE_ALIGNMENT);
     let offset = (0..ARCHIVE_ALIGNMENT)
@@ -638,16 +859,34 @@ async fn immutable_artifact_accepts_identical_retry_and_rejects_conflict() {
     let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
     let checkpoint = attempt(1);
     backend
-        .write_partial(checkpoint, 0, 0, Bytes::from_static(b"first"))
+        .write_partial(
+            checkpoint,
+            0,
+            0,
+            root_lineage(b"first"),
+            Bytes::from_static(b"first"),
+        )
         .await
         .unwrap();
     backend
-        .write_partial(checkpoint, 0, 0, Bytes::from_static(b"first"))
+        .write_partial(
+            checkpoint,
+            0,
+            0,
+            root_lineage(b"first"),
+            Bytes::from_static(b"first"),
+        )
         .await
         .unwrap();
     assert!(matches!(
         backend
-            .write_partial(checkpoint, 0, 0, Bytes::from_static(b"different"))
+            .write_partial(
+                checkpoint,
+                0,
+                0,
+                root_lineage(b"different"),
+                Bytes::from_static(b"different"),
+            )
             .await,
         Err(StateBackendError::Conflict { .. })
     ));
@@ -729,11 +968,11 @@ async fn checkpoint_attempts_are_isolated() {
     let old = CheckpointAttempt::canonical(5);
     let new = CheckpointAttempt::canonical(99);
     backend
-        .write_partial(old, 0, 0, Bytes::from_static(b"old"))
+        .write_partial(old, 0, 0, root_lineage(b"old"), Bytes::from_static(b"old"))
         .await
         .unwrap();
     backend
-        .write_partial(new, 0, 0, Bytes::from_static(b"new"))
+        .write_partial(new, 0, 0, root_lineage(b"new"), Bytes::from_static(b"new"))
         .await
         .unwrap();
     assert_eq!(
@@ -758,7 +997,13 @@ async fn seal_checkpoint_cas_fixes_attempt_inventory() {
         .unwrap());
     for v in &vnodes {
         backend
-            .write_partial(attempt(1), *v, 0, Bytes::from_static(b"y"))
+            .write_partial(
+                attempt(1),
+                *v,
+                0,
+                root_lineage(b"y"),
+                Bytes::from_static(b"y"),
+            )
             .await
             .unwrap();
     }
@@ -793,7 +1038,13 @@ async fn sealed_artifact_metadata_rejects_a_missing_or_wrong_sized_vnode_object(
     let backend = ObjectStoreBackend::new(Arc::clone(&store), "node-0", 1);
     let checkpoint = attempt(1);
     backend
-        .write_partial(checkpoint, 0, 0, Bytes::from_static(b"state"))
+        .write_partial(
+            checkpoint,
+            0,
+            0,
+            root_lineage(b"state"),
+            Bytes::from_static(b"state"),
+        )
         .await
         .unwrap();
     assert!(backend
@@ -846,7 +1097,13 @@ async fn node_durable_seal_uses_local_authoritative_assignment_without_cluster_f
     let checkpoint = attempt(1);
     backend.set_authoritative_version(2);
     backend
-        .write_partial(checkpoint, 0, 2, Bytes::from_static(b"state"))
+        .write_partial(
+            checkpoint,
+            0,
+            2,
+            root_lineage(b"state"),
+            Bytes::from_static(b"state"),
+        )
         .await
         .unwrap();
 
@@ -871,7 +1128,14 @@ async fn seal_body_binds_attempt_writer_fence_and_artifact_inventory() {
     let fence = assignment_fence(7, 2);
     backend.set_authoritative_version(7);
     backend
-        .write_certified_partial(checkpoint, 0, &fence, 1, Bytes::from_static(b"state"))
+        .write_certified_partial(
+            checkpoint,
+            0,
+            &fence,
+            1,
+            root_lineage(b"state"),
+            Bytes::from_static(b"state"),
+        )
         .await
         .unwrap();
     let descriptors = ["participant=7/sink=orders".to_string()];
@@ -961,7 +1225,13 @@ async fn seal_checkpoint_requires_commit_descriptors() {
     let need = [key.to_string()];
 
     backend
-        .write_partial(attempt(1), 0, 0, Bytes::from_static(b"s"))
+        .write_partial(
+            attempt(1),
+            0,
+            0,
+            root_lineage(b"s"),
+            Bytes::from_static(b"s"),
+        )
         .await
         .unwrap();
     // Partial present but the descriptor is missing → epoch not sealed.
@@ -1120,7 +1390,14 @@ async fn installed_assignment_rejects_uncertified_descriptor_before_publication(
     let key = "participant=1/ready";
     backend.set_authoritative_version(7);
     backend
-        .write_certified_partial(checkpoint, 0, &fence, 1, Bytes::from_static(b"state"))
+        .write_certified_partial(
+            checkpoint,
+            0,
+            &fence,
+            1,
+            root_lineage(b"state"),
+            Bytes::from_static(b"state"),
+        )
         .await
         .unwrap();
     let error = backend
@@ -1174,7 +1451,14 @@ async fn cluster_seal_rejects_stale_boot_descriptor_poison() {
     let key = "participant=1/ready";
     backend.set_authoritative_version(7);
     backend
-        .write_certified_partial(checkpoint, 0, &current, 1, Bytes::from_static(b"state"))
+        .write_certified_partial(
+            checkpoint,
+            0,
+            &current,
+            1,
+            root_lineage(b"state"),
+            Bytes::from_static(b"state"),
+        )
         .await
         .unwrap();
     backend
@@ -1217,7 +1501,14 @@ async fn cluster_seal_rejects_descriptors_from_different_leader_terms() {
     let fence = assignment_fence(7, 1);
     backend.set_authoritative_version(7);
     backend
-        .write_certified_partial(checkpoint, 0, &fence, 1, Bytes::from_static(b"state"))
+        .write_certified_partial(
+            checkpoint,
+            0,
+            &fence,
+            1,
+            root_lineage(b"state"),
+            Bytes::from_static(b"state"),
+        )
         .await
         .unwrap();
     for (key, token) in [("participant=1/ready", 11), ("coordinator", 12)] {
@@ -1326,7 +1617,13 @@ async fn seal_rejects_descriptor_with_truncated_payload() {
     let checkpoint = attempt(1);
     let key = "ready";
     backend
-        .write_partial(checkpoint, 0, 0, Bytes::from_static(b"state"))
+        .write_partial(
+            checkpoint,
+            0,
+            0,
+            root_lineage(b"state"),
+            Bytes::from_static(b"state"),
+        )
         .await
         .unwrap();
     let mut encoded = ObjectStoreBackend::encode_commit_descriptor(
@@ -1367,7 +1664,13 @@ async fn seal_rejects_different_execution_incarnation() {
     // Both "nodes" wrote partials for the epoch.
     for v in &vnodes {
         winner
-            .write_partial(attempt(7), *v, 0, Bytes::from_static(b"w"))
+            .write_partial(
+                attempt(7),
+                *v,
+                0,
+                root_lineage(b"w"),
+                Bytes::from_static(b"w"),
+            )
             .await
             .unwrap();
     }
@@ -1406,7 +1709,13 @@ async fn seal_cas_loser_rejects_different_execution() {
     let vnodes = [0u32, 1];
     for v in &vnodes {
         winner
-            .write_partial(attempt(3), *v, 0, Bytes::from_static(b"w"))
+            .write_partial(
+                attempt(3),
+                *v,
+                0,
+                root_lineage(b"w"),
+                Bytes::from_static(b"w"),
+            )
             .await
             .unwrap();
     }
@@ -1468,7 +1777,13 @@ async fn stale_version_rejected() {
 
     // Fresh writes at the current version: accepted.
     fresh
-        .write_partial(attempt(1), 0, 2, Bytes::from_static(b"fresh"))
+        .write_partial(
+            attempt(1),
+            0,
+            2,
+            root_lineage(b"fresh"),
+            Bytes::from_static(b"fresh"),
+        )
         .await
         .unwrap();
 
@@ -1478,7 +1793,13 @@ async fn stale_version_rejected() {
     // durable version-broadcast channel is out of scope for this test.
     stale.set_authoritative_version(2);
     let err = stale
-        .write_partial(attempt(1), 0, 1, Bytes::from_static(b"stale"))
+        .write_partial(
+            attempt(1),
+            0,
+            1,
+            root_lineage(b"stale"),
+            Bytes::from_static(b"stale"),
+        )
         .await
         .unwrap_err();
     match err {
@@ -1496,7 +1817,13 @@ async fn stale_version_rejected() {
     // any version — preserves legacy single-instance behavior.
     let unfenced = ObjectStoreBackend::new(Arc::clone(&store), "node-unfenced", 4);
     unfenced
-        .write_partial(attempt(1), 1, 0, Bytes::from_static(b"ok"))
+        .write_partial(
+            attempt(1),
+            1,
+            0,
+            root_lineage(b"ok"),
+            Bytes::from_static(b"ok"),
+        )
         .await
         .unwrap();
 }
@@ -1509,7 +1836,14 @@ async fn future_assignment_version_is_rejected_before_publication() {
     let future = assignment_fence(8, 1);
 
     let error = backend
-        .write_certified_partial(attempt(1), 0, &future, 1, Bytes::from_static(b"future"))
+        .write_certified_partial(
+            attempt(1),
+            0,
+            &future,
+            1,
+            root_lineage(b"future"),
+            Bytes::from_static(b"future"),
+        )
         .await
         .unwrap_err();
     assert!(matches!(
@@ -1526,7 +1860,14 @@ async fn future_assignment_version_is_rejected_before_publication() {
     let bypass =
         ObjectStoreBackend::new(Arc::new(object_store::memory::InMemory::new()), "node-1", 1);
     bypass
-        .write_certified_partial(attempt(2), 0, &future, 1, Bytes::from_static(b"future"))
+        .write_certified_partial(
+            attempt(2),
+            0,
+            &future,
+            1,
+            root_lineage(b"future"),
+            Bytes::from_static(b"future"),
+        )
         .await
         .unwrap();
     bypass.set_authoritative_version(7);
@@ -1555,7 +1896,14 @@ async fn seal_rejects_stale_boot_writer_certificate() {
     )
     .unwrap();
     backend
-        .write_certified_partial(attempt(1), 0, &stale, 1, Bytes::from_static(b"stale-boot"))
+        .write_certified_partial(
+            attempt(1),
+            0,
+            &stale,
+            1,
+            root_lineage(b"stale-boot"),
+            Bytes::from_static(b"stale-boot"),
+        )
         .await
         .unwrap();
 
@@ -1588,7 +1936,14 @@ async fn seal_rejects_assignment_certificate_digest_mismatch() {
         CheckpointAssignmentFence::from_owner_map(7, &[1, 2], participants.clone()).unwrap();
     let sealing = CheckpointAssignmentFence::from_owner_map(7, &[2, 1], participants).unwrap();
     backend
-        .write_certified_partial(attempt(1), 0, &written, 1, Bytes::from_static(b"wrong-map"))
+        .write_certified_partial(
+            attempt(1),
+            0,
+            &written,
+            1,
+            root_lineage(b"wrong-map"),
+            Bytes::from_static(b"wrong-map"),
+        )
         .await
         .unwrap();
 
@@ -1610,7 +1965,13 @@ async fn stale_generation_partial_cannot_satisfy_fresh_seal() {
 
     // The stale process has not learned generation 2 and wins the create-once path first.
     stale
-        .write_partial(checkpoint, 0, 1, Bytes::from_static(b"stale-state"))
+        .write_partial(
+            checkpoint,
+            0,
+            1,
+            root_lineage(b"stale-state"),
+            Bytes::from_static(b"stale-state"),
+        )
         .await
         .unwrap();
     fresh.set_authoritative_version(2);
@@ -1675,7 +2036,13 @@ async fn prune_before_deletes_old_epochs() {
     // Seed epochs 1..=5 with one vnode each.
     for epoch in 1..=5u64 {
         backend
-            .write_partial(attempt(epoch), 0, 0, Bytes::from_static(b"x"))
+            .write_partial(
+                attempt(epoch),
+                0,
+                0,
+                root_lineage(b"x"),
+                Bytes::from_static(b"x"),
+            )
             .await
             .unwrap();
     }
@@ -1711,7 +2078,13 @@ async fn prune_before_completes_on_durable_local_store() {
     for epoch in 1..=3_u64 {
         for vnode in 0..4 {
             backend
-                .write_partial(attempt(epoch), vnode, 0, Bytes::from_static(b"state"))
+                .write_partial(
+                    attempt(epoch),
+                    vnode,
+                    0,
+                    root_lineage(b"state"),
+                    Bytes::from_static(b"state"),
+                )
                 .await
                 .unwrap();
         }
@@ -1819,11 +2192,23 @@ async fn prune_before_discovers_sparse_epochs_without_scanning_the_id_gap() {
     let retained = attempt(65_537);
 
     backend
-        .write_partial(retired, 0, 0, Bytes::from_static(b"retired"))
+        .write_partial(
+            retired,
+            0,
+            0,
+            root_lineage(b"retired"),
+            Bytes::from_static(b"retired"),
+        )
         .await
         .unwrap();
     backend
-        .write_partial(retained, 0, 0, Bytes::from_static(b"retained"))
+        .write_partial(
+            retained,
+            0,
+            0,
+            root_lineage(b"retained"),
+            Bytes::from_static(b"retained"),
+        )
         .await
         .unwrap();
 
@@ -1863,7 +2248,13 @@ async fn cluster_shared_prune_requires_native_conditional_update() {
     let dir = tempdir().unwrap();
     let backend = ObjectStoreBackend::cluster_shared(make_store(dir.path()), "cluster", 2);
     backend
-        .write_partial(attempt(1), 0, 0, Bytes::from_static(b"state"))
+        .write_partial(
+            attempt(1),
+            0,
+            0,
+            root_lineage(b"state"),
+            Bytes::from_static(b"state"),
+        )
         .await
         .unwrap();
 
@@ -1890,7 +2281,13 @@ async fn retention_publishes_one_floor_before_deleting_attested_artifacts() {
 
     for epoch in 1..=3u64 {
         backend
-            .write_partial(attempt(epoch), 0, 0, Bytes::from_static(b"state"))
+            .write_partial(
+                attempt(epoch),
+                0,
+                0,
+                root_lineage(b"state"),
+                Bytes::from_static(b"state"),
+            )
             .await
             .unwrap();
         backend
@@ -1952,7 +2349,13 @@ async fn prune_wins_after_sealer_verifies_but_before_seal_publication() {
     let collector = Arc::new(ObjectStoreBackend::new(store, "collector", 2));
 
     sealer
-        .write_partial(checkpoint, 0, 0, Bytes::from_static(b"state"))
+        .write_partial(
+            checkpoint,
+            0,
+            0,
+            root_lineage(b"state"),
+            Bytes::from_static(b"state"),
+        )
         .await
         .unwrap();
 
@@ -2005,7 +2408,13 @@ async fn prune_failure_preserves_completed_prefix_progress_and_repairs_the_rest(
     let backend = ObjectStoreBackend::new(store, "node-0", 2);
     for checkpoint_id in 1..=2 {
         backend
-            .write_partial(attempt(checkpoint_id), 0, 0, Bytes::from_static(b"state"))
+            .write_partial(
+                attempt(checkpoint_id),
+                0,
+                0,
+                root_lineage(b"state"),
+                Bytes::from_static(b"state"),
+            )
             .await
             .unwrap();
     }
@@ -2049,7 +2458,13 @@ async fn prune_before_is_incremental_and_advances_horizon() {
     for epoch in 1..=6u64 {
         for v in 0..2u32 {
             backend
-                .write_partial(attempt(epoch), v, 0, Bytes::from_static(b"x"))
+                .write_partial(
+                    attempt(epoch),
+                    v,
+                    0,
+                    root_lineage(b"x"),
+                    Bytes::from_static(b"x"),
+                )
                 .await
                 .unwrap();
         }
@@ -2104,7 +2519,13 @@ async fn durable_floor_rejects_late_writes_after_restart() {
     let backend = ObjectStoreBackend::new(Arc::clone(&store), "node-0", 4);
 
     backend
-        .write_partial(attempt(1), 0, 0, Bytes::from_static(b"x"))
+        .write_partial(
+            attempt(1),
+            0,
+            0,
+            root_lineage(b"x"),
+            Bytes::from_static(b"x"),
+        )
         .await
         .unwrap();
     backend.prune_before(3).await.unwrap();
@@ -2112,7 +2533,13 @@ async fn durable_floor_rejects_late_writes_after_restart() {
 
     let restarted = ObjectStoreBackend::new(store, "node-0", 4);
     let error = restarted
-        .write_partial(attempt(1), 0, 0, Bytes::from_static(b"late"))
+        .write_partial(
+            attempt(1),
+            0,
+            0,
+            root_lineage(b"late"),
+            Bytes::from_static(b"late"),
+        )
         .await
         .unwrap_err();
     assert!(matches!(error, StateBackendError::Conflict { .. }));
@@ -2122,7 +2549,13 @@ async fn durable_floor_rejects_late_writes_after_restart() {
         .unwrap()
         .is_none());
     assert!(restarted
-        .write_partial(attempt(3), 0, 0, Bytes::from_static(b"live"))
+        .write_partial(
+            attempt(3),
+            0,
+            0,
+            root_lineage(b"live"),
+            Bytes::from_static(b"live")
+        )
         .await
         .is_ok());
 }
