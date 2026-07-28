@@ -523,9 +523,9 @@ async fn restore_lineage_payload_cap_accepts_exact_and_rejects_max_plus_one_befo
             .await
             .expect("the exact transition payload envelope is admissible");
     let usage = loaded.input_usage();
-    assert_eq!(usage.reserved_lineage_bytes(), exact_transition_bytes);
+    assert_eq!(usage.declared_lineage_bytes(), exact_transition_bytes);
     assert_eq!(usage.verified_body_bytes(), exact_transition_bytes);
-    assert_eq!(usage.reserved_lineage_artifacts(), 2);
+    assert_eq!(usage.declared_lineage_artifacts(), 2);
     assert_eq!(usage.verified_body_artifacts(), 2);
 
     let body_reads_before_rejection = backend.sealed_partial_body_reads();
@@ -738,9 +738,9 @@ async fn rehydrate_resolves_reference_partials() {
     );
     assert_eq!(restored.operators[0].1, vec![1, 2, 3]);
     let usage = report.input_usage();
-    assert_eq!(usage.reserved_lineage_artifacts(), 2);
+    assert_eq!(usage.declared_lineage_artifacts(), 2);
     assert_eq!(usage.verified_body_artifacts(), 2);
-    assert_eq!(usage.reserved_lineage_bytes(), usage.verified_body_bytes());
+    assert_eq!(usage.declared_lineage_bytes(), usage.verified_body_bytes());
     assert!(
         usage.verified_body_bytes() > chain[0].len() as u64,
         "the verified input receipt must include the consumed reference-only body"
@@ -1391,17 +1391,17 @@ async fn validated_reader_restores_global_state_and_empty_owned_vnodes_within_cu
         .await
         .unwrap()
         .expect("the delta attempt is sealed");
-    let expected_reserved_bytes = inventory
+    let expected_declared_bytes = inventory
         .sealed_partials
         .iter()
         .map(|partial| partial.lineage.total_payload_bytes())
         .sum::<u64>();
-    let expected_reserved_artifacts = inventory
+    let expected_declared_artifacts = inventory
         .sealed_partials
         .iter()
         .map(|partial| u64::from(partial.lineage.artifact_count()))
         .sum::<u64>();
-    assert_eq!(expected_reserved_artifacts, 9);
+    assert_eq!(expected_declared_artifacts, 9);
     let head =
         crate::checkpoint_coordinator::ValidatedVnodeRestoreHead::from_unchecked_inventory_for_test(
             inventory,
@@ -1411,7 +1411,7 @@ async fn validated_reader_restores_global_state_and_empty_owned_vnodes_within_cu
     let production_chain_limit = crate::pipeline_lifecycle::MAX_ARTIFACTS_PER_CLUSTER_VNODE_CHAIN;
     assert_eq!(production_chain_limit, 6);
     assert!(
-        expected_reserved_bytes
+        expected_declared_bytes
             <= checkpoint_cap
                 .checked_mul(u64::try_from(production_chain_limit).unwrap())
                 .unwrap()
@@ -1446,15 +1446,15 @@ async fn validated_reader_restores_global_state_and_empty_owned_vnodes_within_cu
     }
 
     let usage = loaded.input_usage();
-    assert_eq!(usage.reserved_lineage_bytes(), expected_reserved_bytes);
+    assert_eq!(usage.declared_lineage_bytes(), expected_declared_bytes);
     assert_eq!(
-        usage.reserved_lineage_artifacts(),
-        expected_reserved_artifacts
+        usage.declared_lineage_artifacts(),
+        expected_declared_artifacts
     );
-    assert_eq!(usage.verified_body_bytes(), expected_reserved_bytes);
+    assert_eq!(usage.verified_body_bytes(), expected_declared_bytes);
     assert_eq!(
         usage.verified_body_artifacts(),
-        expected_reserved_artifacts,
+        expected_declared_artifacts,
         "the receipt must include reference-only bodies consumed while resolving empty vnodes"
     );
     let retained_artifacts = loaded.chains.values().map(Vec::len).sum::<usize>();

@@ -89,7 +89,6 @@ async fn boot_test_db(registry: Arc<VnodeRegistry>) -> Arc<LaminarDB> {
 fn boot_restore_authority(
     target: &laminar_core::state::VnodeAssignmentSnapshot,
     attempt: CheckpointAttempt,
-    required_vnodes: &[u32],
 ) -> (
     CheckpointAssignmentFence,
     CheckpointParticipant,
@@ -123,7 +122,6 @@ fn boot_restore_authority(
         identity,
         fence.clone(),
         &owner_ids,
-        required_vnodes,
     )
     .unwrap();
     (fence, participant, cut)
@@ -150,7 +148,7 @@ async fn boot_report_marks_and_stages_the_exact_owned_roster() {
     );
     let target_assignment = registry.versioned_snapshot();
     let (target_fence, participant, restore_cut) =
-        boot_restore_authority(&target_assignment, attempt, &[0, 1]);
+        boot_restore_authority(&target_assignment, attempt);
     let controller = db.cluster_controller.lock().clone().unwrap();
     db.publish_local_vnode_state_report(&controller, &target_assignment, true)
         .await
@@ -215,7 +213,7 @@ async fn invalid_boot_report_changes_neither_staging_nor_lifecycle() {
     );
     let target_assignment = registry.versioned_snapshot();
     let (target_fence, participant, restore_cut) =
-        boot_restore_authority(&target_assignment, attempt, &[0, 1]);
+        boot_restore_authority(&target_assignment, attempt);
 
     let error = db
         .publish_boot_vnode_restore_transition(
@@ -241,7 +239,7 @@ async fn changed_boot_assignment_rejects_report_without_mutation() {
     let target_assignment = registry.versioned_snapshot();
     let attempt = CheckpointAttempt::canonical(7);
     let (target_fence, participant, restore_cut) =
-        boot_restore_authority(&target_assignment, attempt, &[0, 1]);
+        boot_restore_authority(&target_assignment, attempt);
     registry.set_assignment_and_version(vec![NodeId(2), NodeId(2)].into(), 2);
     let report = loaded_vnode_chains(
         attempt,
@@ -275,7 +273,7 @@ async fn wrong_boot_attempt_rejects_report_without_mutation() {
     let target_assignment = registry.versioned_snapshot();
     let attempt = CheckpointAttempt::canonical(7);
     let (target_fence, participant, restore_cut) =
-        boot_restore_authority(&target_assignment, attempt, &[0, 1]);
+        boot_restore_authority(&target_assignment, attempt);
     let report = loaded_vnode_chains(
         CheckpointAttempt::canonical(8),
         HashMap::from([
@@ -307,8 +305,7 @@ async fn failed_boot_preparation_retains_prior_exact_transition_and_lifecycle() 
     let db = boot_test_db(Arc::clone(&registry)).await;
     let target = registry.versioned_snapshot();
     let prior_attempt = CheckpointAttempt::canonical(7);
-    let (prior_fence, participant, prior_cut) =
-        boot_restore_authority(&target, prior_attempt, &[0, 1]);
+    let (prior_fence, participant, prior_cut) = boot_restore_authority(&target, prior_attempt);
     db.publish_boot_vnode_restore_transition(
         &registry,
         &target,
@@ -333,7 +330,7 @@ async fn failed_boot_preparation_retains_prior_exact_transition_and_lifecycle() 
 
     let replacement_attempt = CheckpointAttempt::canonical(8);
     let (_replacement_fence, _participant, replacement_cut) =
-        boot_restore_authority(&target, replacement_attempt, &[0, 1]);
+        boot_restore_authority(&target, replacement_attempt);
     let error = db
         .prepare_boot_vnode_restore_transition(&replacement_cut)
         .await
@@ -361,8 +358,7 @@ async fn successful_boot_replacement_publishes_exact_arc_and_target_lifecycle() 
     let db = boot_test_db(Arc::clone(&registry)).await;
     let target = registry.versioned_snapshot();
     let prior_attempt = CheckpointAttempt::canonical(7);
-    let (prior_fence, participant, prior_cut) =
-        boot_restore_authority(&target, prior_attempt, &[0]);
+    let (prior_fence, participant, prior_cut) = boot_restore_authority(&target, prior_attempt);
     db.publish_boot_vnode_restore_transition(
         &registry,
         &target,
@@ -386,7 +382,7 @@ async fn successful_boot_replacement_publishes_exact_arc_and_target_lifecycle() 
 
     let replacement_attempt = CheckpointAttempt::canonical(8);
     let (replacement_fence, participant, replacement_cut) =
-        boot_restore_authority(&target, replacement_attempt, &[0]);
+        boot_restore_authority(&target, replacement_attempt);
     db.publish_boot_vnode_restore_transition(
         &registry,
         &target,
@@ -489,7 +485,6 @@ async fn zero_owned_boot_target_retires_prior_transition_only_after_authority_au
         identity.clone(),
         prior_fence.clone(),
         &[self_id.0, self_id.0],
-        &[0, 1],
     )
     .unwrap();
     let prior = Arc::new(
@@ -518,7 +513,6 @@ async fn zero_owned_boot_target_retires_prior_transition_only_after_authority_au
         identity,
         target_fence,
         &[peer_id.0, peer_id.0],
-        &[],
     )
     .unwrap();
     db.prepare_boot_vnode_restore_transition(&target_cut)
@@ -535,8 +529,7 @@ async fn unassigned_replacement_boot_defers_restore_without_publishing_state() {
     let registry = Arc::new(VnodeRegistry::new_unassigned(2));
     let db = boot_test_db(Arc::clone(&registry)).await;
     let donor = VnodeRegistry::single_owner(2, NodeId(1)).versioned_snapshot();
-    let (_, _, restore_cut) =
-        boot_restore_authority(&donor, CheckpointAttempt::canonical(7), &[0, 1]);
+    let (_, _, restore_cut) = boot_restore_authority(&donor, CheckpointAttempt::canonical(7));
 
     db.prepare_boot_vnode_restore_transition(&restore_cut)
         .await
@@ -554,8 +547,7 @@ async fn unassigned_replacement_boot_rejects_retained_lifecycle_state() {
     registry.mark_restoring(&[0]);
     let db = boot_test_db(Arc::clone(&registry)).await;
     let donor = VnodeRegistry::single_owner(2, NodeId(1)).versioned_snapshot();
-    let (_, _, restore_cut) =
-        boot_restore_authority(&donor, CheckpointAttempt::canonical(7), &[0, 1]);
+    let (_, _, restore_cut) = boot_restore_authority(&donor, CheckpointAttempt::canonical(7));
 
     let error = db
         .prepare_boot_vnode_restore_transition(&restore_cut)
@@ -575,7 +567,7 @@ async fn fresh_cluster_start_rejects_staged_vnode_state_without_clearing_it() {
     let db = boot_test_db(Arc::clone(&registry)).await;
     let attempt = CheckpointAttempt::canonical(7);
     let target = registry.versioned_snapshot();
-    let (fence, participant, cut) = boot_restore_authority(&target, attempt, &[0, 1]);
+    let (fence, participant, cut) = boot_restore_authority(&target, attempt);
     let loaded = loaded_vnode_chains(
         attempt,
         HashMap::from([
@@ -623,7 +615,7 @@ async fn assert_boot_recovery_target_mismatch_is_non_mutating(
         committed_source_handoff(committed_attempt, sealed_assignment_version),
     );
     let target = registry.versioned_snapshot();
-    let (fence, participant, cut) = boot_restore_authority(&target, committed_attempt, &[0, 1]);
+    let (fence, participant, cut) = boot_restore_authority(&target, committed_attempt);
     db.publish_boot_vnode_restore_transition(
         &registry,
         &target,

@@ -294,13 +294,18 @@ pub(crate) fn assemble_capsule(
         let mut canonical_vnodes = ready.owned_vnodes.clone();
         canonical_vnodes.sort_unstable();
         canonical_vnodes.dedup();
+        if ready.vnode_restore_limits != vnode_restore_contract.limits {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] participant {key_participant} vnode restore limits {:?} do not match the checkpoint contract {:?}",
+                ready.vnode_restore_limits, vnode_restore_contract.limits
+            )));
+        }
         if ready.version != PARTICIPANT_READY_VERSION
             || ready.attempt != attempt
             || ready.participant_id != key_participant
             || ready.assignment_fence != *fence
             || ready.deployment_id != expected_deployment
             || ready.pipeline_identity != *expected_identity
-            || ready.vnode_restore_limits != vnode_restore_contract.limits
             || canonical_vnodes != ready.owned_vnodes
             || ready.source_offsets.keys().ne(ready.source_metadata.keys())
             || ready
@@ -775,7 +780,8 @@ mod tests {
         )
         .expect_err("every certified participant must attest the same restore limits");
 
-        assert!(error.to_string().contains("does not match its sealed cut"));
+        assert!(error.to_string().contains("vnode restore limits"));
+        assert!(error.to_string().contains("do not match"));
     }
 
     #[tokio::test]

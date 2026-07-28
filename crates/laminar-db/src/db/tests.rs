@@ -486,7 +486,6 @@ fn synthetic_boot_transition(
         identity.clone(),
         fence.clone(),
         &owner_ids,
-        &acquired,
     )
     .unwrap();
     let chains = acquired

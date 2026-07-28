@@ -4,10 +4,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use laminar_core::{
     checkpoint::{VnodeRestoreContract, VnodeRestoreLimits},
-    state::{
-        CheckpointAttempt, CheckpointSealInventory, SealedVnodePartial, StateBackend,
-        VnodePartialLineage,
-    },
+    state::{CheckpointAttempt, CheckpointSealInventory, StateBackend, VnodePartialLineage},
 };
 
 use crate::error::DbError;
@@ -55,10 +52,16 @@ fn validate_inventory(
         .map_err(|error| invalid_lineage(format!("seal {expected_attempt:?}: {error}")))
 }
 
-fn sealed_partial(
+#[derive(Clone, Copy)]
+struct SealedLineageStep {
+    payload_len: u64,
+    lineage: VnodePartialLineage,
+}
+
+fn sealed_lineage_step(
     inventory: &CheckpointSealInventory,
     vnode: u32,
-) -> Result<SealedVnodePartial, DbError> {
+) -> Result<SealedLineageStep, DbError> {
     let index = inventory
         .sealed_partials
         .binary_search_by_key(&vnode, |partial| partial.vnode)
@@ -68,7 +71,11 @@ fn sealed_partial(
                 inventory.attempt
             ))
         })?;
-    Ok(inventory.sealed_partials[index].clone())
+    let partial = &inventory.sealed_partials[index];
+    Ok(SealedLineageStep {
+        payload_len: partial.payload_len,
+        lineage: partial.lineage,
+    })
 }
 
 fn checked_declared_totals(head: &CheckpointSealInventory) -> Result<(u64, u64), DbError> {
@@ -146,7 +153,7 @@ pub(crate) async fn validate_vnode_restore_lineage(
     let mut cluster_artifacts = 0_u64;
 
     for &vnode in &head.required_vnodes {
-        let head_partial = sealed_partial(&head, vnode)?;
+        let head_partial = sealed_lineage_step(&head, vnode)?;
         let declared_payload_bytes = head_partial.lineage.total_payload_bytes();
         let declared_artifacts = u64::from(head_partial.lineage.artifact_count());
         if declared_artifacts > max_chain_artifacts {
@@ -191,7 +198,7 @@ pub(crate) async fn validate_vnode_restore_lineage(
             };
             let parent_inventory =
                 load_parent_inventory(backend, &mut inventories, parent_attempt).await?;
-            let parent = sealed_partial(&parent_inventory, vnode)?;
+            let parent = sealed_lineage_step(&parent_inventory, vnode)?;
             let expected = VnodePartialLineage::extend(
                 current_attempt,
                 current.payload_len,

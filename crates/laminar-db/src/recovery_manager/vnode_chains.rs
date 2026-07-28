@@ -19,15 +19,15 @@ const VNODE_CHAIN_LOAD_CONCURRENCY: usize = 32;
 type SealInventoryLoad = Result<Arc<CheckpointSealInventory>, String>;
 type SealInventoryCell = tokio::sync::OnceCell<Arc<CheckpointSealInventory>>;
 
-/// Immutable accounting for the checkpoint bodies admitted and verified by one restore load.
+/// Immutable accounting for the checkpoint bodies declared and verified by one restore load.
 ///
-/// The reservation comes from sealed transitive lineage metadata before any vnode body read. The
-/// actual counters include every verified body, including reference-only artifacts omitted from
-/// the returned apply chain.
+/// The declared ceilings come from sealed transitive lineage metadata before any vnode body read.
+/// They do not acquire memory or request permits. The actual counters include every verified body,
+/// including reference-only artifacts omitted from the returned apply chain.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VnodeRestoreInputUsage {
-    reserved_lineage_bytes: u64,
-    reserved_lineage_artifacts: u64,
+    declared_lineage_bytes: u64,
+    declared_lineage_artifacts: u64,
     verified_body_bytes: u64,
     verified_body_artifacts: u64,
 }
@@ -36,7 +36,7 @@ impl VnodeRestoreInputUsage {
     /// Validate that the receipt can describe the returned vnode-chain collection.
     ///
     /// A nonempty load verifies at least one body per chain. It may consume less than its complete
-    /// lineage reservation when every requested operator finds a newer FULL base.
+    /// declared lineage ceiling when every requested operator finds a newer FULL base.
     pub(crate) fn validate_for_loaded_chains(self, chain_count: usize) -> Result<(), &'static str> {
         if chain_count == 0 {
             return if self == Self::default() {
@@ -47,31 +47,31 @@ impl VnodeRestoreInputUsage {
         }
         let chain_count = u64::try_from(chain_count)
             .map_err(|_| "vnode restore chain count does not fit usage accounting")?;
-        if self.reserved_lineage_bytes == 0
+        if self.declared_lineage_bytes == 0
             || self.verified_body_bytes == 0
-            || self.reserved_lineage_artifacts < chain_count
+            || self.declared_lineage_artifacts < chain_count
             || self.verified_body_artifacts < chain_count
         {
             return Err("a nonempty vnode restore has incomplete input usage");
         }
-        if self.verified_body_bytes > self.reserved_lineage_bytes
-            || self.verified_body_artifacts > self.reserved_lineage_artifacts
+        if self.verified_body_bytes > self.declared_lineage_bytes
+            || self.verified_body_artifacts > self.declared_lineage_artifacts
         {
-            return Err("verified vnode restore input exceeds its lineage reservation");
+            return Err("verified vnode restore input exceeds its declared lineage ceiling");
         }
         Ok(())
     }
 
     #[must_use]
     #[cfg(test)]
-    pub(crate) const fn reserved_lineage_bytes(self) -> u64 {
-        self.reserved_lineage_bytes
+    pub(crate) const fn declared_lineage_bytes(self) -> u64 {
+        self.declared_lineage_bytes
     }
 
     #[must_use]
     #[cfg(test)]
-    pub(crate) const fn reserved_lineage_artifacts(self) -> u64 {
-        self.reserved_lineage_artifacts
+    pub(crate) const fn declared_lineage_artifacts(self) -> u64 {
+        self.declared_lineage_artifacts
     }
 
     #[must_use]
@@ -86,14 +86,14 @@ impl VnodeRestoreInputUsage {
 
     #[cfg(test)]
     pub(crate) const fn from_counts_for_test(
-        reserved_lineage_bytes: u64,
-        reserved_lineage_artifacts: u64,
+        declared_lineage_bytes: u64,
+        declared_lineage_artifacts: u64,
         verified_body_bytes: u64,
         verified_body_artifacts: u64,
     ) -> Self {
         Self {
-            reserved_lineage_bytes,
-            reserved_lineage_artifacts,
+            declared_lineage_bytes,
+            declared_lineage_artifacts,
             verified_body_bytes,
             verified_body_artifacts,
         }
@@ -127,7 +127,7 @@ pub(crate) struct LoadedVnodeChains {
     pub(crate) attempt: Option<CheckpointAttempt>,
     /// vnode → recovery chain (oldest→newest): a FULL base followed by any delta partials.
     pub(crate) chains: HashMap<u32, Vec<Bytes>>,
-    /// Restore input reserved from seals and actually verified from immutable bodies.
+    /// Restore input declared by seals and actually verified from immutable bodies.
     usage: VnodeRestoreInputUsage,
 }
 
@@ -181,7 +181,7 @@ impl LoadedVnodeChains {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ChainInputReservation {
+struct ChainLineageCeiling {
     bytes: u64,
     artifacts: u64,
 }
@@ -190,7 +190,7 @@ struct ChainInputReservation {
 struct ChainLoadRequest {
     vnode: u32,
     head: SealedVnodePartial,
-    reservation: ChainInputReservation,
+    lineage_ceiling: ChainLineageCeiling,
 }
 
 #[derive(Debug)]
@@ -213,8 +213,8 @@ pub(crate) struct SealedVnodeChainReader<'a> {
     validated_head_attempt: Option<CheckpointAttempt>,
     max_partial_bytes: u64,
     max_artifacts_per_vnode_chain: usize,
-    max_cluster_lineage_payload_bytes: u64,
-    max_cluster_lineage_artifacts: u64,
+    committed_full_cut_lineage_payload_bytes: u64,
+    committed_full_cut_lineage_artifacts: u64,
 }
 
 impl<'a> SealedVnodeChainReader<'a> {
@@ -228,8 +228,8 @@ impl<'a> SealedVnodeChainReader<'a> {
             validated_head_attempt: None,
             max_partial_bytes: u64::MAX,
             max_artifacts_per_vnode_chain: usize::MAX,
-            max_cluster_lineage_payload_bytes: u64::MAX,
-            max_cluster_lineage_artifacts: u64::MAX,
+            committed_full_cut_lineage_payload_bytes: u64::MAX,
+            committed_full_cut_lineage_artifacts: u64::MAX,
         }
     }
 
@@ -269,14 +269,14 @@ impl<'a> SealedVnodeChainReader<'a> {
                 "[LDB-6050] vnode chain artifact limit does not fit accounting".into(),
             )
         })?;
-        let max_cluster_lineage_payload_bytes = max_partial_bytes
+        let test_full_cut_lineage_payload_bytes = max_partial_bytes
             .checked_mul(artifact_multiplier)
             .ok_or_else(|| {
                 DbError::Checkpoint(
                     "[LDB-6050] test vnode restore payload envelope overflows u64".into(),
                 )
             })?;
-        let max_cluster_lineage_artifacts = u64::try_from(head.inventory().required_vnodes.len())
+        let test_full_cut_lineage_artifacts = u64::try_from(head.inventory().required_vnodes.len())
             .ok()
             .and_then(|vnodes| vnodes.checked_mul(artifact_multiplier))
             .ok_or_else(|| {
@@ -289,8 +289,8 @@ impl<'a> SealedVnodeChainReader<'a> {
             head,
             max_partial_bytes,
             max_artifacts_per_vnode_chain,
-            max_cluster_lineage_payload_bytes,
-            max_cluster_lineage_artifacts,
+            test_full_cut_lineage_payload_bytes,
+            test_full_cut_lineage_artifacts,
         )
     }
 
@@ -300,8 +300,8 @@ impl<'a> SealedVnodeChainReader<'a> {
         head: &crate::checkpoint_coordinator::ValidatedVnodeRestoreHead,
         max_partial_bytes: u64,
         max_artifacts_per_vnode_chain: usize,
-        max_cluster_lineage_payload_bytes: u64,
-        max_cluster_lineage_artifacts: u64,
+        committed_full_cut_lineage_payload_bytes: u64,
+        committed_full_cut_lineage_artifacts: u64,
     ) -> Result<Self, DbError> {
         if max_partial_bytes == 0 {
             return Err(DbError::Checkpoint(
@@ -347,8 +347,8 @@ impl<'a> SealedVnodeChainReader<'a> {
             validated_head_attempt: Some(attempt),
             max_partial_bytes,
             max_artifacts_per_vnode_chain,
-            max_cluster_lineage_payload_bytes,
-            max_cluster_lineage_artifacts,
+            committed_full_cut_lineage_payload_bytes,
+            committed_full_cut_lineage_artifacts,
         })
     }
 
@@ -446,7 +446,7 @@ impl<'a> SealedVnodeChainReader<'a> {
         &self,
         attempt: CheckpointAttempt,
         attestation: &SealedVnodePartial,
-        reservation: ChainInputReservation,
+        lineage_ceiling: ChainLineageCeiling,
         usage: &mut ChainInputUsage,
     ) -> Result<Bytes, DbError> {
         let vnode = attestation.vnode;
@@ -463,10 +463,10 @@ impl<'a> SealedVnodeChainReader<'a> {
                 "[LDB-6051] vnode {vnode} verified body artifact accounting overflow"
             ))
         })?;
-        if next_bytes > reservation.bytes || next_artifacts > reservation.artifacts {
+        if next_bytes > lineage_ceiling.bytes || next_artifacts > lineage_ceiling.artifacts {
             return Err(DbError::Checkpoint(format!(
-                "[LDB-6051] vnode {vnode} recovery traversal exceeds its sealed lineage reservation of {} bytes and {} artifacts",
-                reservation.bytes, reservation.artifacts
+                "[LDB-6051] vnode {vnode} recovery traversal exceeds its sealed lineage ceiling of {} bytes and {} artifacts",
+                lineage_ceiling.bytes, lineage_ceiling.artifacts
             )));
         }
         let bytes = self
@@ -534,11 +534,11 @@ impl<'a> SealedVnodeChainReader<'a> {
             .try_reserve_exact(requested_vnodes.len())
             .map_err(|_| {
                 DbError::Checkpoint(
-                    "[LDB-6050] vnode restore request reservation allocation failed".into(),
+                    "[LDB-6050] vnode restore request-vector allocation failed".into(),
                 )
             })?;
-        let mut reserved_lineage_bytes = 0_u64;
-        let mut reserved_lineage_artifacts = 0_u64;
+        let mut declared_lineage_bytes = 0_u64;
+        let mut declared_lineage_artifacts = 0_u64;
         for &vnode in requested_vnodes {
             let attestation = Self::sealed_attestation(inventory, attempt, vnode)?;
             let lineage_artifacts =
@@ -555,46 +555,46 @@ impl<'a> SealedVnodeChainReader<'a> {
             }
             let lineage_bytes = attestation.lineage.total_payload_bytes();
             let lineage_artifacts_u64 = u64::from(attestation.lineage.artifact_count());
-            reserved_lineage_bytes = reserved_lineage_bytes
+            declared_lineage_bytes = declared_lineage_bytes
                 .checked_add(lineage_bytes)
                 .ok_or_else(|| {
                     DbError::Checkpoint(
-                        "[LDB-6050] vnode restore lineage byte reservation overflow".into(),
+                        "[LDB-6050] vnode restore declared lineage byte total overflow".into(),
                     )
                 })?;
-            reserved_lineage_artifacts = reserved_lineage_artifacts
+            declared_lineage_artifacts = declared_lineage_artifacts
                 .checked_add(lineage_artifacts_u64)
                 .ok_or_else(|| {
                     DbError::Checkpoint(
-                        "[LDB-6050] vnode restore lineage artifact reservation overflow".into(),
+                        "[LDB-6050] vnode restore declared lineage artifact total overflow".into(),
                     )
                 })?;
             requests.push(ChainLoadRequest {
                 vnode,
                 head: attestation,
-                reservation: ChainInputReservation {
+                lineage_ceiling: ChainLineageCeiling {
                     bytes: lineage_bytes,
                     artifacts: lineage_artifacts_u64,
                 },
             });
         }
-        if reserved_lineage_bytes > self.max_cluster_lineage_payload_bytes {
+        if declared_lineage_bytes > self.committed_full_cut_lineage_payload_bytes {
             return Err(DbError::Checkpoint(format!(
-                "[LDB-6050] vnode restore reserves {reserved_lineage_bytes} lineage bytes, exceeding the committed cluster contract of {} bytes",
-                self.max_cluster_lineage_payload_bytes
+                "[LDB-6050] vnode restore declares {declared_lineage_bytes} lineage bytes, exceeding the committed full-cut total of {} bytes",
+                self.committed_full_cut_lineage_payload_bytes
             )));
         }
-        if reserved_lineage_artifacts > self.max_cluster_lineage_artifacts {
+        if declared_lineage_artifacts > self.committed_full_cut_lineage_artifacts {
             return Err(DbError::Checkpoint(format!(
-                "[LDB-6050] vnode restore reserves {reserved_lineage_artifacts} lineage artifacts, exceeding the committed cluster contract of {} artifacts",
-                self.max_cluster_lineage_artifacts
+                "[LDB-6050] vnode restore declares {declared_lineage_artifacts} lineage artifacts, exceeding the committed full-cut total of {} artifacts",
+                self.committed_full_cut_lineage_artifacts
             )));
         }
         Ok(RestoreInputPreflight {
             requests,
             usage: VnodeRestoreInputUsage {
-                reserved_lineage_bytes,
-                reserved_lineage_artifacts,
+                declared_lineage_bytes,
+                declared_lineage_artifacts,
                 ..VnodeRestoreInputUsage::default()
             },
         })
@@ -636,7 +636,12 @@ impl<'a> SealedVnodeChainReader<'a> {
         let chains =
             futures::stream::iter(preflight.requests.into_iter().map(|request| async move {
                 let (chain, usage) = self
-                    .collect_chain(request.vnode, attempt, request.head, request.reservation)
+                    .collect_chain(
+                        request.vnode,
+                        attempt,
+                        request.head,
+                        request.lineage_ceiling,
+                    )
                     .await?;
                 Ok::<_, DbError>((request.vnode, chain, usage))
             }))
@@ -667,7 +672,7 @@ impl<'a> SealedVnodeChainReader<'a> {
             epoch = attempt.epoch,
             checkpoint_id = attempt.checkpoint_id,
             chains = loaded.chains.len(),
-            reserved_lineage_bytes = loaded.usage.reserved_lineage_bytes,
+            declared_lineage_bytes = loaded.usage.declared_lineage_bytes,
             verified_body_bytes = loaded.usage.verified_body_bytes,
             verified_body_artifacts = loaded.usage.verified_body_artifacts,
             "sealed vnode chain load complete"
@@ -682,13 +687,19 @@ impl<'a> SealedVnodeChainReader<'a> {
         vnode: u32,
         attempt: CheckpointAttempt,
         head_attestation: SealedVnodePartial,
-        reservation: ChainInputReservation,
+        lineage_ceiling: ChainLineageCeiling,
     ) -> Result<(Vec<Bytes>, ChainInputUsage), DbError> {
         use crate::vnode_partial::VnodePartial;
 
         let mut usage = ChainInputUsage::default();
         let (bytes, mut current, head, mut current_attestation) = self
-            .resolve_reference_head(vnode, attempt, head_attestation, reservation, &mut usage)
+            .resolve_reference_head(
+                vnode,
+                attempt,
+                head_attestation,
+                lineage_ceiling,
+                &mut usage,
+            )
             .await?;
         let mut need: std::collections::HashSet<String> = head
             .deltas
@@ -722,7 +733,7 @@ impl<'a> SealedVnodeChainReader<'a> {
                 .read_verified_partial(
                     parent_attempt,
                     &parent_attestation,
-                    reservation,
+                    lineage_ceiling,
                     &mut usage,
                 )
                 .await
@@ -761,7 +772,7 @@ impl<'a> SealedVnodeChainReader<'a> {
         vnode: u32,
         attempt: CheckpointAttempt,
         mut attestation: SealedVnodePartial,
-        reservation: ChainInputReservation,
+        lineage_ceiling: ChainLineageCeiling,
         usage: &mut ChainInputUsage,
     ) -> Result<
         (
@@ -775,7 +786,7 @@ impl<'a> SealedVnodeChainReader<'a> {
         use crate::vnode_partial::VnodePartial;
 
         let mut bytes = self
-            .read_verified_partial(attempt, &attestation, reservation, usage)
+            .read_verified_partial(attempt, &attestation, lineage_ceiling, usage)
             .await?;
         let mut current = attempt;
         loop {
@@ -803,7 +814,7 @@ impl<'a> SealedVnodeChainReader<'a> {
                     ))
                 })?;
             bytes = self
-                .read_verified_partial(base_attempt, &base_attestation, reservation, usage)
+                .read_verified_partial(base_attempt, &base_attestation, lineage_ceiling, usage)
                 .await
                 .map_err(|error| {
                     DbError::Checkpoint(format!(

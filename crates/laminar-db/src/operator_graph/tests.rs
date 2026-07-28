@@ -726,13 +726,6 @@ fn build_boot_transition_with_loaded_attempt(
 
     let target = test_assignment_fence(2, owners);
     let owner_ids: Vec<u64> = owners.iter().map(|owner| owner.0).collect();
-    let owned: Vec<u32> = owners
-        .iter()
-        .enumerate()
-        .filter_map(|(vnode, owner)| {
-            (owner.0 == 1).then(|| u32::try_from(vnode).expect("test vnode fits u32"))
-        })
-        .collect();
     let attempt = CheckpointAttempt::canonical(7);
     let restore_cut =
         crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut::synthetic_for_transition_test(
@@ -740,7 +733,6 @@ fn build_boot_transition_with_loaded_attempt(
             PipelineIdentity::empty(),
             target.clone(),
             &owner_ids,
-            &owned,
         )?;
     crate::vnode_transition_staging::PendingVnodeTransition::boot_recovery(
         target,
@@ -790,7 +782,6 @@ fn build_assignment_transition(
                     PipelineIdentity::empty(),
                     predecessor.clone(),
                     &predecessor_owner_ids,
-                    &acquired,
                 )?,
             ),
             test_loaded_vnode_chains(attempt, chains),
@@ -5335,7 +5326,6 @@ async fn transition_authority_rejects_shuffle_endpoints_for_another_node_before_
         PipelineIdentity::empty(),
         target.clone(),
         &owner_ids,
-        &[0],
     )
     .unwrap();
     let partial = crate::vnode_partial::VnodePartial {

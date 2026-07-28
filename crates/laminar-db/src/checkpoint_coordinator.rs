@@ -761,11 +761,10 @@ pub(crate) struct ValidatedVnodeRestoreHead {
 #[cfg(feature = "cluster")]
 impl ValidatedVnodeRestoreHead {
     fn new(
-        inventory: CheckpointSealInventory,
+        inventory: Arc<CheckpointSealInventory>,
         contract: VnodeRestoreContract,
         mut lineage_inventories: HashMap<CheckpointAttempt, Arc<CheckpointSealInventory>>,
     ) -> Self {
-        let inventory = Arc::new(inventory);
         lineage_inventories.insert(inventory.attempt, Arc::clone(&inventory));
         Self {
             inventory,
@@ -809,9 +808,7 @@ impl ValidatedVnodeRestoreHead {
         let contract =
             VnodeRestoreContract::new(limits, exact_payload_bytes, exact_artifacts, vnode_count)
                 .expect("test restore contract");
-        let mut lineage_inventories = HashMap::new();
-        lineage_inventories.insert(inventory.attempt, Arc::new(inventory.clone()));
-        Self::new(inventory, contract, lineage_inventories)
+        Self::new(Arc::new(inventory), contract, HashMap::new())
     }
 
     #[must_use]
@@ -862,16 +859,16 @@ impl ValidatedClusterVnodeRestoreCut {
         pipeline_identity: PipelineIdentity,
         assignment_fence: laminar_core::checkpoint::CheckpointAssignmentFence,
         owners: &[u64],
-        required_vnodes: &[u32],
     ) -> Result<Self, DbError> {
         if !attempt.is_canonical() || !assignment_fence.matches_owner_map(owners) {
             return Err(DbError::Checkpoint(
                 "synthetic transition restore cut has invalid attempt or assignment".into(),
             ));
         }
-        let mut required_vnodes = required_vnodes.to_vec();
-        required_vnodes.sort_unstable();
-        required_vnodes.dedup();
+        // A committed cluster head always covers the complete certified vnode domain. The
+        // transition that consumes this synthetic cut may acquire only a subset, but that subset
+        // belongs to the transition/loaded-chain fixture rather than the durable cut itself.
+        let required_vnodes = (0..assignment_fence.vnode_count).collect::<Vec<_>>();
         let sealed_partials = required_vnodes
             .iter()
             .map(|vnode| {
@@ -959,14 +956,16 @@ impl ValidatedClusterVnodeRestoreCut {
         .map_err(|error| DbError::Checkpoint(format!("synthetic restore limits: {error}")))?;
         let contract =
             crate::vnode_restore_lineage::declared_vnode_restore_contract(&inventory, limits)?;
-        let mut lineage_inventories = HashMap::new();
-        lineage_inventories.insert(attempt, Arc::new(inventory.clone()));
         let cut = Self {
             outcome,
             recovery_capsule_ref,
             pipeline_identity,
             seal_inventory_sha256,
-            restore_head: ValidatedVnodeRestoreHead::new(inventory, contract, lineage_inventories),
+            restore_head: ValidatedVnodeRestoreHead::new(
+                Arc::new(inventory),
+                contract,
+                HashMap::new(),
+            ),
         };
         cut.validate_transition_binding().map_err(|error| {
             DbError::Checkpoint(format!("synthetic transition restore cut: {error}"))
@@ -3691,6 +3690,7 @@ impl CheckpointCoordinator {
                 attempt.checkpoint_id, attempt.epoch
             )
         })?;
+        let inventory = Arc::new(inventory);
         if inventory
             .descriptor_leader_proof()
             .map_err(|error| format!("[LDB-6041] invalid descriptor provenance: {error}"))?
@@ -3751,7 +3751,7 @@ impl CheckpointCoordinator {
             deadline,
             crate::vnode_restore_lineage::validate_vnode_restore_lineage(
                 backend.as_ref(),
-                Arc::new(inventory.clone()),
+                Arc::clone(&inventory),
                 capsule.vnode_restore_contract.limits.clone(),
             ),
         )
@@ -7988,6 +7988,7 @@ impl CheckpointCoordinator {
                     outcome.checkpoint_id, outcome.epoch
                 ))
             })?;
+        let inventory = Arc::new(inventory);
         Self::validate_cluster_recovery_capsule(
             outcome,
             &inventory,
@@ -8040,7 +8041,7 @@ impl CheckpointCoordinator {
         }
         let validated_lineage = crate::vnode_restore_lineage::validate_vnode_restore_lineage(
             backend,
-            Arc::new(inventory.clone()),
+            Arc::clone(&inventory),
             capsule.vnode_restore_contract.limits.clone(),
         )
         .await?;

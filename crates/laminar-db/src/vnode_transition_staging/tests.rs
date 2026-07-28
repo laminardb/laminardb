@@ -50,7 +50,6 @@ fn adjacent_assignment_derives_exact_local_rosters() {
         identity.clone(),
         predecessor.clone(),
         &[1, 1, 2, 2],
-        &[2],
     )
     .unwrap();
 
@@ -98,7 +97,6 @@ fn replacement_incarnation_restores_target_without_revoking_old_process_state() 
         identity.clone(),
         predecessor.clone(),
         &[1, 1, 2],
-        &[0],
     )
     .unwrap();
 
@@ -207,7 +205,6 @@ fn full_local_restore_is_explicit_and_cut_bound() {
         identity.clone(),
         predecessor.clone(),
         &[1, 2, 1],
-        &[0, 2],
     )
     .unwrap();
 
@@ -244,7 +241,6 @@ fn live_assignment_change_rejects_a_cut_older_than_the_predecessor() {
         identity.clone(),
         older_cut_fence,
         &[2, 2],
-        &[1],
     )
     .unwrap();
 
@@ -280,7 +276,6 @@ fn boot_recovery_accepts_an_older_cut_for_every_target_owned_vnode() {
         identity.clone(),
         older_cut_fence,
         &[1, 1],
-        &[0, 1],
     )
     .unwrap();
 
@@ -316,7 +311,6 @@ fn nonempty_restore_requires_a_complete_input_usage_receipt() {
         identity.clone(),
         target.clone(),
         &[1],
-        &[0],
     )
     .unwrap();
     let loaded = LoadedVnodeChains::from_parts_with_usage_for_test(
@@ -346,7 +340,6 @@ fn verified_usage_must_cover_every_retained_apply_body_before_decode() {
         identity.clone(),
         target.clone(),
         &[1],
-        &[0],
     )
     .unwrap();
     let loaded = LoadedVnodeChains::from_parts_with_usage_for_test(

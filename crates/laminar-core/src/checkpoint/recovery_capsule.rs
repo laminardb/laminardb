@@ -1082,6 +1082,12 @@ mod tests {
 
     #[test]
     fn vnode_restore_limits_recompute_profile_derived_bounds() {
+        assert!(
+            VnodeRestoreLimits::global_singleton_compatibility(u64::MAX, 2, 1)
+                .unwrap_err()
+                .contains("payload limit overflowed")
+        );
+
         let mut limits = VnodeRestoreLimits::global_singleton_compatibility(10, 2, 3).unwrap();
         limits.max_cluster_lineage_payload_bytes += 1;
         assert!(limits

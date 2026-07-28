@@ -270,15 +270,12 @@ fn synthetic_pending_boot_transition(
     )
     .unwrap();
     let identity = laminar_core::checkpoint::PipelineIdentity::empty();
-    let mut required_vnodes: Vec<u32> = chains.keys().copied().collect();
-    required_vnodes.sort_unstable();
     let restore_cut =
         crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut::synthetic_for_transition_test(
             attempt,
             identity.clone(),
             target.clone(),
             &owner_ids,
-            &required_vnodes,
         )
         .unwrap();
     Arc::new(

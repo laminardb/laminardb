@@ -5305,6 +5305,116 @@ async fn capsule_validation_abort_never_promotes_a_successor_parent() {
     );
 }
 
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn forged_parent_lineage_aborts_without_body_reads_or_parent_promotion() {
+    use laminar_core::checkpoint_decision::CheckpointVerdict;
+    use laminar_core::state::StateBackend;
+    use std::sync::atomic::Ordering;
+
+    let probe = Arc::new(RetentionReadProbe::default());
+    let backend = Arc::new(FaultBackend {
+        inner: laminar_core::state::InProcessBackend::new(1),
+        fail: parking_lot::Mutex::new(std::collections::HashSet::new()),
+        write_delay: Duration::ZERO,
+        seal_delay: Duration::ZERO,
+        write_probe: None,
+        descriptor_error_after_write: false,
+        retention_read_probe: Some(Arc::clone(&probe)),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_cluster_coordinator(dir.path(), 1).await;
+    coord
+        .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
+        .unwrap();
+    coord.set_vnode_set(vec![0]);
+    coord.set_gate_vnode_set(vec![0]);
+    let _leader_lease = attach_cluster_controller(&mut coord, 1, &[]).await;
+
+    coord.set_pending_vnode_states(one_vnode_full_state(b"stable-parent"));
+    let request = certified_cluster_request(&coord);
+    let parent = coord.checkpoint(request).await.unwrap();
+    assert!(parent.success, "{:?}", parent.error);
+    let parent_attempt = CheckpointAttempt::canonical(parent.checkpoint_id);
+    assert_eq!(
+        coord.last_sealed_partial_attempt.get(&0),
+        Some(&parent_attempt)
+    );
+
+    *probe.forge_parent_lineage_at.lock() = Some(parent_attempt);
+    probe.deny_vnode_payload_reads.store(true, Ordering::SeqCst);
+    let body_reads_before = probe.vnode_payload_reads.load(Ordering::SeqCst);
+    coord.set_pending_vnode_states(one_vnode_full_state(b"stable-parent"));
+    let request = certified_cluster_request(&coord);
+    let rejected = coord.checkpoint(request).await.unwrap();
+
+    assert!(!rejected.success);
+    assert!(
+        rejected
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("does not exactly extend parent")),
+        "{:?}",
+        rejected.error
+    );
+    assert_eq!(
+        probe.vnode_payload_reads.load(Ordering::SeqCst),
+        body_reads_before,
+        "pre-Commit lineage validation must remain metadata-only"
+    );
+    let rejected_attempt = CheckpointAttempt::canonical(rejected.checkpoint_id);
+    assert!(backend
+        .checkpoint_seal_inventory(rejected_attempt)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        coord.last_sealed_partial_attempt.get(&0),
+        Some(&parent_attempt),
+        "the rejected child must not replace its committed parent"
+    );
+    assert_ne!(
+        coord.last_sealed_partial_attempt.get(&0),
+        Some(&rejected_attempt)
+    );
+    let outcome = coord
+        .cluster_controller
+        .as_ref()
+        .unwrap()
+        .checkpoint_authority()
+        .unwrap()
+        .cluster_outcome(rejected.epoch)
+        .await
+        .unwrap()
+        .expect("lineage rejection must resolve under the available test authority");
+    assert_eq!(outcome.verdict, CheckpointVerdict::Abort);
+    assert!(outcome.recovery_capsule.is_none());
+
+    *probe.forge_parent_lineage_at.lock() = None;
+    probe
+        .deny_vnode_payload_reads
+        .store(false, Ordering::SeqCst);
+    coord.set_pending_vnode_states(one_vnode_full_state(b"stable-parent"));
+    let request = certified_cluster_request(&coord);
+    let retry = coord.checkpoint(request).await.unwrap();
+    assert!(retry.success, "{:?}", retry.error);
+    let retry_attempt = CheckpointAttempt::canonical(retry.checkpoint_id);
+    let retry_partial = crate::vnode_partial::VnodePartial::decode(
+        &backend
+            .read_partial(retry_attempt, 0)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(retry_partial.base, Some(parent_attempt));
+    assert_ne!(retry_partial.base, Some(rejected_attempt));
+    assert_eq!(
+        coord.last_sealed_partial_attempt.get(&0),
+        Some(&retry_attempt)
+    );
+}
+
 #[tokio::test]
 async fn vnode_revoke_then_reacquire_discards_lineage_and_rebases_full() {
     use laminar_core::state::InProcessBackend;
@@ -6088,6 +6198,7 @@ struct RetentionReadProbe {
     vnode_payload_reads: std::sync::atomic::AtomicUsize,
     deny_vnode_payload_reads: std::sync::atomic::AtomicBool,
     hide_seal: std::sync::atomic::AtomicBool,
+    forge_parent_lineage_at: parking_lot::Mutex<Option<CheckpointAttempt>>,
     reject_artifact_metadata: std::sync::atomic::AtomicBool,
     reject_readiness: std::sync::atomic::AtomicBool,
 }
@@ -6314,7 +6425,27 @@ impl StateBackend for FaultBackend {
         {
             return Ok(None);
         }
-        self.inner.checkpoint_seal_inventory(attempt).await
+        let mut inventory = self.inner.checkpoint_seal_inventory(attempt).await?;
+        #[cfg(feature = "cluster")]
+        if self
+            .retention_read_probe
+            .as_ref()
+            .is_some_and(|probe| *probe.forge_parent_lineage_at.lock() == Some(attempt))
+        {
+            let inventory = inventory
+                .as_mut()
+                .expect("a forged parent-lineage fixture must name an existing seal");
+            let partial = inventory
+                .sealed_partials
+                .first_mut()
+                .expect("a forged parent-lineage fixture must contain a vnode");
+            partial.payload_len = partial
+                .payload_len
+                .checked_add(1)
+                .expect("test payload length must fit u64");
+            partial.lineage = VnodePartialLineage::root(partial.payload_len);
+        }
+        Ok(inventory)
     }
 
     async fn verify_checkpoint_artifact_metadata(
