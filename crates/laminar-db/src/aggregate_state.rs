@@ -956,7 +956,25 @@ pub(crate) struct PreparedAggVnodeTransition {
 /// this opaque owner and the graph drops it only after leaving the publication section.
 #[cfg(feature = "cluster")]
 pub(crate) struct RetiredAggVnodeTransition {
-    _prepared: PreparedAggVnodeTransition,
+    _retired_transition: PreparedAggVnodeTransition,
+}
+
+#[cfg(feature = "cluster")]
+fn checked_vnode_transition_capacity(left: usize, right: usize) -> Result<usize, DbError> {
+    left.checked_add(right)
+        .ok_or_else(|| DbError::Pipeline("aggregate vnode transition capacity overflow".into()))
+}
+
+#[cfg(feature = "cluster")]
+fn checked_vnode_transition_final_count(
+    current: usize,
+    removed: usize,
+    replacement: usize,
+) -> Result<usize, DbError> {
+    let retained = current
+        .checked_sub(removed)
+        .ok_or_else(|| DbError::Pipeline("aggregate vnode transition capacity overflow".into()))?;
+    checked_vnode_transition_capacity(retained, replacement)
 }
 
 /// What a per-vnode capture emits for one vnode under delta-enabled checkpointing.
@@ -2218,15 +2236,13 @@ impl IncrementalAggState {
     }
 
     #[cfg(feature = "cluster")]
-    fn install_recovery_base(
+    fn stage_recovery_base(
         &self,
         staged: &mut StagedAggMutation,
         mutation: DecodedAggMutation,
-    ) -> Result<Vec<arrow::row::OwnedRow>, DbError> {
+    ) -> Result<(), DbError> {
         let retractable = self.weight_col_idx.is_some();
-        let mut merged_keys = Vec::with_capacity(mutation.groups.len());
         for (row_key, last_updated_ms, state_arrays) in mutation.groups {
-            merged_keys.push(row_key.clone());
             let entry = GroupEntry {
                 accs: build_accumulators_from_state(&self.agg_specs, retractable, &state_arrays)?,
                 last_updated_ms,
@@ -2249,7 +2265,7 @@ impl IncrementalAggState {
                 ));
             }
         }
-        Ok(merged_keys)
+        Ok(())
     }
 
     #[cfg(feature = "cluster")]
@@ -2343,9 +2359,11 @@ impl IncrementalAggState {
             ))
         };
 
+        let transitioned_capacity =
+            checked_vnode_transition_capacity(restores.len(), revoked.len())?;
         let mut transitioned = rustc_hash::FxHashSet::default();
         transitioned
-            .try_reserve(restores.len().saturating_add(revoked.len()))
+            .try_reserve(transitioned_capacity)
             .map_err(|error| reserve_error("vnode roster", error))?;
         for vnode in revoked {
             if *vnode >= vnode_count.get() {
@@ -2410,17 +2428,13 @@ impl IncrementalAggState {
             decoded.push((restore.vnode, base, deltas));
         }
 
-        let capacity_overflow =
-            || DbError::Pipeline("aggregate vnode transition capacity overflow".into());
         let replacement_group_capacity = decoded.iter().try_fold(
             0_usize,
             |total, (_, base, deltas)| -> Result<usize, DbError> {
                 let chain = deltas.iter().try_fold(base.groups.len(), |chain, delta| {
-                    chain
-                        .checked_add(delta.groups.len())
-                        .ok_or_else(capacity_overflow)
+                    checked_vnode_transition_capacity(chain, delta.groups.len())
                 })?;
-                total.checked_add(chain).ok_or_else(capacity_overflow)
+                checked_vnode_transition_capacity(total, chain)
             },
         )?;
         let replacement_emitted_capacity = decoded.iter().try_fold(
@@ -2429,11 +2443,9 @@ impl IncrementalAggState {
                 let chain = deltas
                     .iter()
                     .try_fold(base.last_emitted.len(), |chain, delta| {
-                        chain
-                            .checked_add(delta.last_emitted.len())
-                            .ok_or_else(capacity_overflow)
+                        checked_vnode_transition_capacity(chain, delta.last_emitted.len())
                     })?;
-                total.checked_add(chain).ok_or_else(capacity_overflow)
+                checked_vnode_transition_capacity(total, chain)
             },
         )?;
         let mut replacement_groups = AHashMap::new();
@@ -2446,18 +2458,13 @@ impl IncrementalAggState {
             .map_err(|error| reserve_error("replacement changelog state", error))?;
         for (_vnode, base, deltas) in decoded {
             let group_capacity = deltas.iter().try_fold(base.groups.len(), |total, delta| {
-                total
-                    .checked_add(delta.groups.len())
-                    .ok_or_else(capacity_overflow)
+                checked_vnode_transition_capacity(total, delta.groups.len())
             })?;
-            let emitted_capacity =
-                deltas
-                    .iter()
-                    .try_fold(base.last_emitted.len(), |total, delta| {
-                        total
-                            .checked_add(delta.last_emitted.len())
-                            .ok_or_else(capacity_overflow)
-                    })?;
+            let emitted_capacity = deltas
+                .iter()
+                .try_fold(base.last_emitted.len(), |total, delta| {
+                    checked_vnode_transition_capacity(total, delta.last_emitted.len())
+                })?;
             let mut staged_groups = AHashMap::new();
             staged_groups
                 .try_reserve(group_capacity)
@@ -2472,7 +2479,7 @@ impl IncrementalAggState {
                 #[cfg(test)]
                 affected: AHashSet::new(),
             };
-            self.install_recovery_base(&mut staged, base)?;
+            self.stage_recovery_base(&mut staged, base)?;
             for delta in deltas {
                 self.apply_recovery_delta_to_image(&mut staged, delta)?;
             }
@@ -2517,14 +2524,10 @@ impl IncrementalAggState {
             .cloned()
             .collect::<Vec<_>>();
 
-        let retained_group_count = self
-            .groups
-            .len()
-            .checked_sub(remove_group_keys.len())
-            .ok_or_else(capacity_overflow)?;
-        let final_group_count = retained_group_count
-            .checked_add(replacement_groups.len())
-            .ok_or_else(capacity_overflow)?;
+        let retained_group_count =
+            checked_vnode_transition_final_count(self.groups.len(), remove_group_keys.len(), 0)?;
+        let final_group_count =
+            checked_vnode_transition_capacity(retained_group_count, replacement_groups.len())?;
         if final_group_count > self.max_groups {
             return Err(DbError::Pipeline(format!(
                 "aggregate group limit exceeded during vnode transition: retained={retained_group_count}, replacement={}, limit={}",
@@ -2554,50 +2557,34 @@ impl IncrementalAggState {
             }
         }
 
-        // Reserving additional capacity is conservative: publication first removes every old
-        // transitioned key, but reserve against the current length avoids relying on that ordering.
-        self.groups
-            .try_reserve(replacement_groups.len())
-            .map_err(|error| reserve_error("live groups", error))?;
-        self.last_emitted
-            .try_reserve(replacement_last_emitted.len())
-            .map_err(|error| reserve_error("live changelog state", error))?;
-        self.dirty_keys
-            .try_reserve(replacement_dirty_keys.len())
-            .map_err(|error| reserve_error("live changelog dirty keys", error))?;
-        self.dirty_keys_by_vnode
-            .try_reserve(replacement_dirty_by_vnode.len())
-            .map_err(|error| reserve_error("live delta dirty vnode roster", error))?;
-
         let mut transitioned_vnodes = transitioned.into_iter().collect::<Vec<_>>();
         transitioned_vnodes.sort_unstable();
+        let retired_group_capacity =
+            checked_vnode_transition_capacity(remove_group_keys.len(), replacement_groups.len())?;
         let mut retired_groups = Vec::new();
         retired_groups
-            .try_reserve_exact(
-                remove_group_keys
-                    .len()
-                    .saturating_add(replacement_groups.len()),
-            )
+            .try_reserve_exact(retired_group_capacity)
             .map_err(|error| reserve_error("retired groups", error))?;
+        let retired_emitted_capacity = checked_vnode_transition_capacity(
+            remove_last_emitted_keys.len(),
+            replacement_last_emitted.len(),
+        )?;
         let mut retired_last_emitted = Vec::new();
         retired_last_emitted
-            .try_reserve_exact(
-                remove_last_emitted_keys
-                    .len()
-                    .saturating_add(replacement_last_emitted.len()),
-            )
+            .try_reserve_exact(retired_emitted_capacity)
             .map_err(|error| reserve_error("retired changelog state", error))?;
+        let retired_dirty_capacity = checked_vnode_transition_capacity(
+            remove_dirty_keys.len(),
+            replacement_dirty_keys.len(),
+        )?;
         let mut retired_dirty_keys = Vec::new();
         retired_dirty_keys
-            .try_reserve_exact(
-                remove_dirty_keys
-                    .len()
-                    .saturating_add(replacement_dirty_keys.len()),
-            )
+            .try_reserve_exact(retired_dirty_capacity)
             .map_err(|error| reserve_error("retired changelog dirty keys", error))?;
-        let tracking_retirement_capacity = transitioned_vnodes
-            .len()
-            .saturating_add(replacement_dirty_by_vnode.len());
+        let tracking_retirement_capacity = checked_vnode_transition_capacity(
+            transitioned_vnodes.len(),
+            replacement_dirty_by_vnode.len(),
+        )?;
         let mut retired_dirty_by_vnode = Vec::new();
         retired_dirty_by_vnode
             .try_reserve_exact(tracking_retirement_capacity)
@@ -2614,6 +2601,50 @@ impl IncrementalAggState {
         retired_force_rebase_vnodes
             .try_reserve_exact(transitioned_vnodes.len())
             .map_err(|error| reserve_error("retired forced re-base state", error))?;
+
+        // Grow live collections only after every validation and private fallible allocation has
+        // succeeded. Publication removes the complete transitioned key set before inserting its
+        // replacement, so reserve only the net final growth. An authority failure after this
+        // point can still retain capacity/RSS, but never capacity proportional to a same-sized
+        // replacement.
+        let final_last_emitted_count = checked_vnode_transition_final_count(
+            self.last_emitted.len(),
+            remove_last_emitted_keys.len(),
+            replacement_last_emitted.len(),
+        )?;
+        let final_dirty_key_count = checked_vnode_transition_final_count(
+            self.dirty_keys.len(),
+            remove_dirty_keys.len(),
+            replacement_dirty_keys.len(),
+        )?;
+        let removed_dirty_vnode_count = transitioned_vnodes
+            .iter()
+            .filter(|vnode| self.dirty_keys_by_vnode.contains_key(vnode))
+            .count();
+        let final_dirty_vnode_count = checked_vnode_transition_final_count(
+            self.dirty_keys_by_vnode.len(),
+            removed_dirty_vnode_count,
+            replacement_dirty_by_vnode.len(),
+        )?;
+
+        let additional_groups = final_group_count.saturating_sub(self.groups.len());
+        let additional_last_emitted =
+            final_last_emitted_count.saturating_sub(self.last_emitted.len());
+        let additional_dirty_keys = final_dirty_key_count.saturating_sub(self.dirty_keys.len());
+        let additional_dirty_vnodes =
+            final_dirty_vnode_count.saturating_sub(self.dirty_keys_by_vnode.len());
+        self.groups
+            .try_reserve(additional_groups)
+            .map_err(|error| reserve_error("live groups", error))?;
+        self.last_emitted
+            .try_reserve(additional_last_emitted)
+            .map_err(|error| reserve_error("live changelog state", error))?;
+        self.dirty_keys
+            .try_reserve(additional_dirty_keys)
+            .map_err(|error| reserve_error("live changelog dirty keys", error))?;
+        self.dirty_keys_by_vnode
+            .try_reserve(additional_dirty_vnodes)
+            .map_err(|error| reserve_error("live delta dirty vnode roster", error))?;
 
         Ok(PreparedAggVnodeTransition {
             transitioned_vnodes,
@@ -2701,7 +2732,7 @@ impl IncrementalAggState {
         }
 
         RetiredAggVnodeTransition {
-            _prepared: prepared,
+            _retired_transition: prepared,
         }
     }
 
@@ -2806,7 +2837,15 @@ impl IncrementalAggState {
             self.build_delta_recovery_image(affected)?
         };
         let merged_keys = match decoded_base {
-            Some(mutation) => self.install_recovery_base(&mut staged, mutation)?,
+            Some(mutation) => {
+                let merged_keys = mutation
+                    .groups
+                    .iter()
+                    .map(|(key, _, _)| key.clone())
+                    .collect::<Vec<_>>();
+                self.stage_recovery_base(&mut staged, mutation)?;
+                merged_keys
+            }
             None => Vec::new(),
         };
         for delta in decoded_deltas {

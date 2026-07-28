@@ -2,6 +2,21 @@ use super::*;
 
 const VNODES: u32 = 16;
 
+#[test]
+fn vnode_transition_capacity_arithmetic_accepts_boundaries_and_rejects_overflow() {
+    assert_eq!(
+        checked_vnode_transition_capacity(usize::MAX - 1, 1).unwrap(),
+        usize::MAX
+    );
+    assert!(checked_vnode_transition_capacity(usize::MAX, 1)
+        .unwrap_err()
+        .to_string()
+        .contains("capacity overflow"));
+    assert_eq!(checked_vnode_transition_final_count(2, 1, 1).unwrap(), 2);
+    assert!(checked_vnode_transition_final_count(0, 1, 0).is_err());
+    assert!(checked_vnode_transition_final_count(usize::MAX, 0, 1).is_err());
+}
+
 fn pre_agg_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("symbol", DataType::Utf8, true),
@@ -391,6 +406,60 @@ async fn prepared_vnode_transition_drop_leaves_live_state_unpublished() {
 }
 
 #[tokio::test]
+async fn same_sized_prepared_vnode_transition_does_not_grow_live_group_capacity() {
+    const GROUPS: u32 = 8;
+    let vnode = 0;
+
+    let mut donor = fresh_state().await;
+    let donor_keys = (0..GROUPS)
+        .map(|index| symbol_for_vnode(&donor, vnode, index * 100_000))
+        .collect::<Vec<_>>();
+    let donor_rows = donor_keys
+        .iter()
+        .map(|key| (key.as_str(), 10))
+        .collect::<Vec<_>>();
+    feed(&mut donor, &donor_rows);
+    let restored_base = donor
+        .checkpoint_groups_by_vnode(VNODES)
+        .unwrap()
+        .remove(&vnode)
+        .unwrap();
+
+    let mut live = fresh_state().await;
+    let live_keys = (0..GROUPS)
+        .map(|index| symbol_for_vnode(&live, vnode, 1_000_000 + index * 100_000))
+        .collect::<Vec<_>>();
+    let live_rows = live_keys
+        .iter()
+        .map(|key| (key.as_str(), 20))
+        .collect::<Vec<_>>();
+    feed(&mut live, &live_rows);
+    live.groups.shrink_to_fit();
+    let capacity_before = live.groups.capacity();
+    assert!(
+        capacity_before < live.groups.len() + restored_base.last_updated_ms.len(),
+        "the fixture must require growth under the former replacement-sized reservation"
+    );
+    let restores = [AggVnodeRestore {
+        vnode,
+        base: &restored_base,
+        deltas: &[],
+    }];
+
+    let prepared = live
+        .prepare_vnode_transition(VNODES, &restores, &Default::default())
+        .unwrap();
+
+    assert_eq!(live.groups.len(), GROUPS as usize);
+    assert_eq!(
+        live.groups.capacity(),
+        capacity_before,
+        "a same-sized replacement must not reserve its full cardinality against the live map"
+    );
+    drop(prepared);
+}
+
+#[tokio::test]
 async fn prepared_vnode_transition_revoke_clears_forced_rebase_marker() {
     let revoked_vnode = 1;
     let mut live = fresh_state().await;
@@ -475,6 +544,8 @@ async fn prepared_vnode_transition_group_limit_failure_preserves_live_image() {
     let retained = symbol_for_vnode(&live, 2, 0);
     feed(&mut live, &[(retained.as_str(), 30)]);
     live.set_max_groups_for_test(2);
+    live.groups.shrink_to_fit();
+    let capacity_before = live.groups.capacity();
     let before = checkpoint_bytes(&mut live);
     let restores = [AggVnodeRestore {
         vnode: restored_vnode,
@@ -491,6 +562,42 @@ async fn prepared_vnode_transition_group_limit_failure_preserves_live_image() {
         "{error}"
     );
     assert_eq!(checkpoint_bytes(&mut live), before);
+    assert_eq!(live.groups.capacity(), capacity_before);
+}
+
+#[tokio::test]
+async fn prepared_vnode_transition_accepts_exact_final_group_limit() {
+    let restored_vnode = 0;
+    let mut donor = fresh_state().await;
+    let restored = symbol_for_vnode(&donor, restored_vnode, 0);
+    feed(&mut donor, &[(restored.as_str(), 10)]);
+    let restored_base = donor
+        .checkpoint_groups_by_vnode(VNODES)
+        .unwrap()
+        .remove(&restored_vnode)
+        .unwrap();
+
+    let mut live = fresh_state().await;
+    let retained = symbol_for_vnode(&live, 2, 0);
+    feed(&mut live, &[(retained.as_str(), 30)]);
+    live.set_max_groups_for_test(2);
+    let restores = [AggVnodeRestore {
+        vnode: restored_vnode,
+        base: &restored_base,
+        deltas: &[],
+    }];
+
+    let prepared = live
+        .prepare_vnode_transition(VNODES, &restores, &Default::default())
+        .unwrap();
+    let retired = live.publish_prepared_vnode_transition(prepared);
+    IncrementalAggState::finish_vnode_transition(retired);
+
+    assert_eq!(live.groups.len(), 2);
+    assert_eq!(
+        totals(&mut live),
+        std::collections::BTreeMap::from([(restored, 10), (retained, 30)])
+    );
 }
 
 #[tokio::test]
