@@ -2217,7 +2217,7 @@ impl LaminarDB {
                 snapshot.version
             )));
         }
-        let audited_drain = crate::rebalance::audit_assignment_snapshot_authority_outcome(
+        let audited_target = crate::rebalance::audit_assignment_snapshot_authority_outcome(
             &assignment_snapshot_store,
             Some(controller.as_ref()),
             &snapshot,
@@ -2229,6 +2229,8 @@ impl LaminarDB {
                 snapshot.version
             ))
         })?;
+        let audited_predecessor = audited_target.predecessor().cloned();
+        let audited_drain = audited_target.into_terminal();
         let self_id = laminar_core::state::NodeId(controller.instance_id().0);
         let observed_assignment = registry.versioned_snapshot();
         let observed_version = observed_assignment.version();
@@ -2283,6 +2285,9 @@ impl LaminarDB {
         let predecessor_snapshot = if observed_version == 0 {
             None
         } else {
+            // The target authority audit above certified the immediate target -> predecessor
+            // edge. Retention intentionally keeps that predecessor, not its complete ancestry;
+            // recursively auditing older generations would reject a valid successor after GC.
             let predecessor = assignment_snapshot_store
                 .load_version(observed_version)
                 .await
@@ -2296,20 +2301,17 @@ impl LaminarDB {
                         "[LDB-6053] predecessor assignment {observed_version} is unavailable"
                     ))
                 })?;
-            crate::rebalance::audit_assignment_snapshot_authority(
-                &assignment_snapshot_store,
-                Some(controller.as_ref()),
-                &predecessor,
-            )
-            .await
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "[LDB-6053] predecessor assignment {observed_version} authority audit failed: {error}"
-                ))
-            })?;
             let predecessor_owners = predecessor
                 .to_vnode_vec(vnode_count)
                 .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+            let predecessor_fence = predecessor
+                .assignment_fence()
+                .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+            if audited_predecessor.as_ref() != Some(&predecessor_fence) {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6053] predecessor assignment {observed_version} does not match the audited target edge"
+                )));
+            }
             if predecessor_owners.as_slice() != observed_assignment.owners() {
                 return Err(DbError::Checkpoint(format!(
                     "[LDB-6053] local owner map at assignment {observed_version} does not match durable history"

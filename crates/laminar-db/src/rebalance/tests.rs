@@ -608,6 +608,7 @@ struct PendingPredecessorAuthorityFixture {
     receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
     _leader_lease: tokio::sync::watch::Sender<Option<laminar_core::cluster::control::LeaderLease>>,
     pending_transition: Arc<crate::vnode_transition_staging::PendingVnodeTransition>,
+    audited_successor: AuditedAssignmentAuthority,
     current: AssignmentSnapshot,
     successor: AssignmentSnapshot,
 }
@@ -619,18 +620,44 @@ async fn pending_predecessor_authority_fixture(
     let boot = uuid::Uuid::from_u128(1);
     let durable = Arc::new(store());
     let current = snapshot(BTreeMap::from([(0, self_id)]));
-    let successor = current
-        .next_for_participants(BTreeMap::from([(0, self_id)]), current.participants.clone())
-        .unwrap();
     durable.save_if_absent(&current).await.unwrap();
-    durable
-        .save_if_version(&successor, current.version)
-        .await
-        .unwrap();
 
     let controller = test_cluster_controller(self_id, boot, Some(Arc::clone(&durable)));
     install_test_process_authority(&controller, &current.participants).await;
     let leader_lease = grant_test_leadership(&controller).await;
+    let leader_proof = controller.capture_leader_proof().unwrap();
+    let draining = current
+        .next_draining(
+            current.vnodes.clone(),
+            current.participants.clone(),
+            leader_proof.clone(),
+        )
+        .unwrap();
+    let successor = draining.committed_target().unwrap();
+    durable
+        .save_if_version(&draining, current.version)
+        .await
+        .unwrap();
+    let decision = AssignmentDrainDecision::new(
+        draining.drain_transition.as_ref().unwrap(),
+        leader_proof.clone(),
+        AssignmentDrainVerdict::Commit,
+    )
+    .unwrap();
+    controller
+        .checkpoint_authority()
+        .unwrap()
+        .record_assignment_drain_decision(&leader_proof, decision)
+        .await
+        .unwrap();
+    durable.finalize_drain(&draining, &successor).await.unwrap();
+    let audited_successor = audit_assignment_snapshot_authority_outcome(
+        &durable,
+        Some(controller.as_ref()),
+        &successor,
+    )
+    .await
+    .unwrap();
     controller.set_active(true);
     controller.set_recovering(recovering);
     let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
@@ -685,6 +712,7 @@ async fn pending_predecessor_authority_fixture(
         receiver,
         _leader_lease: leader_lease,
         pending_transition,
+        audited_successor,
         current,
         successor,
     }
@@ -703,7 +731,7 @@ async fn assert_pending_predecessor_authority_is_repaired(recovering: bool) {
 
     fixture
         .watcher
-        .ensure_current_assignment_authority_cached(deadline)
+        .ensure_current_assignment_authority_cached(&fixture.audited_successor, deadline)
         .await
         .expect("the exact predecessor must be recoverable from durable history");
     assert_eq!(
@@ -1697,6 +1725,221 @@ async fn bare_recovery_successor_without_an_authority_decision_is_rejected() {
     assert!(
         error.contains("no drain transition or recovery authority decision"),
         "{error}"
+    );
+}
+
+#[tokio::test]
+async fn successor_adoption_accepts_a_retained_predecessor_after_ancestry_pruning() {
+    let self_id = NodeId(1);
+    let (db, controller, durable, registry, current, _process_authority, _checkpoint_dir) =
+        dead_predecessor_fixture().await;
+    controller.note_unresponsive(&[NodeId(2)]);
+
+    let error = try_rebalance(
+        &db,
+        &controller,
+        &durable,
+        &registry,
+        &[self_id, NodeId(2)],
+        RebalanceConfig::test_defaults(),
+    )
+    .await
+    .expect_err("the test recovery has no checkpoint handoff namespace");
+    assert!(
+        error.contains("requires an active cluster recovery namespace"),
+        "{error}"
+    );
+    let recovery = durable.load().await.unwrap().unwrap();
+    assert_eq!(recovery.version, current.version + 1);
+
+    let leader_proof = controller
+        .capture_leader_proof()
+        .expect("the test leader lease must remain live");
+    let draining = recovery
+        .next_draining(
+            recovery.vnodes.clone(),
+            recovery.participants.clone(),
+            leader_proof.clone(),
+        )
+        .unwrap();
+    let terminal = draining.committed_target().unwrap();
+    assert!(matches!(
+        durable
+            .save_if_version(&draining, recovery.version)
+            .await
+            .unwrap(),
+        RotateOutcome::Rotated
+    ));
+    let decision = AssignmentDrainDecision::new(
+        draining.drain_transition.as_ref().unwrap(),
+        leader_proof.clone(),
+        AssignmentDrainVerdict::Commit,
+    )
+    .unwrap();
+    controller
+        .checkpoint_authority()
+        .unwrap()
+        .record_assignment_drain_decision(&leader_proof, decision)
+        .await
+        .unwrap();
+    durable.finalize_drain(&draining, &terminal).await.unwrap();
+
+    durable.prune_before(recovery.version).await.unwrap();
+    assert!(durable
+        .load_version(current.version)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        durable.load_version(recovery.version).await.unwrap(),
+        Some(recovery.clone())
+    );
+    let ancestry_error =
+        audit_assignment_snapshot_authority(&durable, Some(controller.as_ref()), &recovery)
+            .await
+            .expect_err("the recovery generation's pruned ancestry is intentionally unavailable");
+    assert!(
+        ancestry_error.contains("lost predecessor"),
+        "{ancestry_error}"
+    );
+    let audited_target =
+        audit_assignment_snapshot_authority_outcome(&durable, Some(controller.as_ref()), &terminal)
+            .await
+            .expect("the terminal target must certify only its retained predecessor edge");
+
+    let recovered_owners = recovery.to_vnode_vec(registry.vnode_count()).unwrap();
+    registry.set_assignment_and_version(recovered_owners.into(), recovery.version);
+    *db.installed_vnode_state.lock() = Some(
+        crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
+            recovery.assignment_fence().unwrap(),
+            laminar_core::checkpoint::PipelineIdentity::empty(),
+        )
+        .unwrap(),
+    );
+    let mut watcher = SnapshotWatcher::new(
+        Arc::clone(&db),
+        Arc::clone(&durable),
+        Arc::clone(&registry),
+        CancellationToken::new(),
+        RebalanceConfig::test_defaults(),
+        Some(Arc::clone(&controller)),
+    );
+    watcher
+        .ensure_current_assignment_authority_cached(
+            &audited_target,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("watcher recertification must use the retained audited edge");
+    assert_eq!(watcher.durable_snapshot.as_ref(), Some(&recovery));
+    let adoption = db
+        .adopt_assignment_snapshot(
+            terminal,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("adoption must not recursively audit pruned predecessor ancestry");
+    assert!(adoption.adopted);
+    assert_eq!(registry.assignment_version(), draining.version);
+}
+
+#[tokio::test]
+async fn materialized_drain_rejects_missing_corrupt_or_mismatched_predecessor() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let durable = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&object_store)));
+    let self_id = NodeId(1);
+    let boot = uuid::Uuid::from_u128(11);
+    let controller = test_cluster_controller(self_id, boot, Some(Arc::clone(&durable)));
+    let _leader_lease = grant_test_leadership(&controller).await;
+    let leader_proof = controller.capture_leader_proof().unwrap();
+    let participant = CheckpointParticipant {
+        node_id: self_id.0,
+        boot_incarnation: boot,
+    };
+    let first = AssignmentSnapshot::empty()
+        .next_for_participants(BTreeMap::from([(0, self_id)]), vec![participant])
+        .unwrap();
+    let predecessor = first
+        .next_for_participants(BTreeMap::from([(0, self_id)]), vec![participant])
+        .unwrap();
+    durable.save_if_absent(&first).await.unwrap();
+    assert!(matches!(
+        durable
+            .save_if_version(&predecessor, first.version)
+            .await
+            .unwrap(),
+        RotateOutcome::Rotated
+    ));
+    let draining = predecessor
+        .next_draining(
+            predecessor.vnodes.clone(),
+            predecessor.participants.clone(),
+            leader_proof.clone(),
+        )
+        .unwrap();
+    let terminal = draining.committed_target().unwrap();
+    assert!(matches!(
+        durable
+            .save_if_version(&draining, predecessor.version)
+            .await
+            .unwrap(),
+        RotateOutcome::Rotated
+    ));
+    let decision = AssignmentDrainDecision::new(
+        draining.drain_transition.as_ref().unwrap(),
+        leader_proof.clone(),
+        AssignmentDrainVerdict::Commit,
+    )
+    .unwrap();
+    controller
+        .checkpoint_authority()
+        .unwrap()
+        .record_assignment_drain_decision(&leader_proof, decision)
+        .await
+        .unwrap();
+    durable.finalize_drain(&draining, &terminal).await.unwrap();
+    audit_assignment_snapshot_authority(&durable, Some(controller.as_ref()), &terminal)
+        .await
+        .expect("the exact retained predecessor must pass");
+
+    let predecessor_path =
+        object_store::path::Path::from("control/assignment-snapshots/v00000000000000000002.json");
+    object_store.delete(&predecessor_path).await.unwrap();
+    let missing =
+        audit_assignment_snapshot_authority(&durable, Some(controller.as_ref()), &terminal)
+            .await
+            .expect_err("a missing immediate predecessor must fail closed");
+    assert!(missing.contains("lost predecessor"), "{missing}");
+
+    object_store
+        .put(
+            &predecessor_path,
+            object_store::PutPayload::from(bytes::Bytes::from_static(b"{not-json")),
+        )
+        .await
+        .unwrap();
+    audit_assignment_snapshot_authority(&durable, Some(controller.as_ref()), &terminal)
+        .await
+        .expect_err("a corrupt immediate predecessor must fail closed");
+
+    let mut mismatched = predecessor.clone();
+    mismatched.participants[0].boot_incarnation = uuid::Uuid::from_u128(111);
+    object_store
+        .put(
+            &predecessor_path,
+            object_store::PutPayload::from(bytes::Bytes::from(
+                serde_json::to_vec_pretty(&mismatched).unwrap(),
+            )),
+        )
+        .await
+        .unwrap();
+    let mismatch =
+        audit_assignment_snapshot_authority(&durable, Some(controller.as_ref()), &terminal)
+            .await
+            .expect_err("a different immediate predecessor fence must fail closed");
+    assert!(
+        mismatch.contains("does not bind its exact committed predecessor"),
+        "{mismatch}"
     );
 }
 

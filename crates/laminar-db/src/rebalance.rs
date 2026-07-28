@@ -286,14 +286,19 @@ impl SnapshotWatcher {
 
     async fn ensure_current_assignment_authority_cached(
         &mut self,
+        audited_successor: &AuditedAssignmentAuthority,
         deadline: tokio::time::Instant,
     ) -> Result<(), String> {
         let assignment = self.registry.versioned_snapshot();
         let version = assignment.version();
+        let expected_predecessor = audited_successor.retained_predecessor(version)?;
         let cache_is_exact = self.durable_snapshot.as_ref().is_some_and(|snapshot| {
             !snapshot.draining
                 && snapshot.version == version
                 && snapshot.has_canonical_participants()
+                && snapshot
+                    .assignment_fence()
+                    .is_ok_and(|fence| &fence == expected_predecessor)
                 && snapshot
                     .to_vnode_vec(self.registry.vnode_count())
                     .is_ok_and(|owners| owners.as_slice() == assignment.owners())
@@ -319,12 +324,15 @@ impl SnapshotWatcher {
                 "assignment {version} durable history does not match the current registry"
             ));
         }
-        tokio::time::timeout_at(
-            deadline,
-            audit_assignment_snapshot_authority(&self.store, self.controller.as_deref(), &snapshot),
-        )
-        .await
-        .map_err(|_| format!("assignment {version} authority audit timed out"))??;
+        if snapshot
+            .assignment_fence()
+            .map_err(|error| error.to_string())?
+            != *expected_predecessor
+        {
+            return Err(format!(
+                "assignment {version} durable history is not the audited successor's exact predecessor"
+            ));
+        }
         self.durable_drain_transition = None;
         self.durable_snapshot = Some(snapshot);
         Ok(())
@@ -679,6 +687,7 @@ impl SnapshotWatcher {
                 () = self.shutdown.cancelled() => return,
                 result = tokio::time::timeout_at(head_deadline, self.store.load()) => result,
             };
+            let mut audited_target = None;
             let mut audited_terminal = None;
             let mut audited_recovery = false;
             if let Ok(Ok(Some(snapshot))) = &audit {
@@ -694,8 +703,9 @@ impl SnapshotWatcher {
                     .await;
                     match materialization_audit {
                         Ok(Ok(outcome)) => {
-                            audited_recovery = snapshot.version > 1 && outcome.is_none();
-                            audited_terminal = outcome;
+                            audited_recovery = outcome.is_recovery();
+                            audited_terminal = outcome.terminal().cloned();
+                            audited_target = Some(outcome);
                         }
                         failed => {
                             self.assignment_authority_dirty = true;
@@ -873,7 +883,12 @@ impl SnapshotWatcher {
                                     "snapshot watcher: recovery assignment waits for local vnode transition"
                                 );
                                 if let Err(error) = self
-                                    .ensure_current_assignment_authority_cached(head_deadline)
+                                    .ensure_current_assignment_authority_cached(
+                                        audited_target.as_ref().expect(
+                                            "stable successor was audited before suspension",
+                                        ),
+                                        head_deadline,
+                                    )
                                     .await
                                 {
                                     warn!(%error, version = snap.version, "snapshot watcher: could not audit predecessor authority for pending vnode transition");
@@ -935,7 +950,12 @@ impl SnapshotWatcher {
                                     "snapshot watcher: successor waits for local vnode transition"
                                 );
                                 if let Err(cache_error) = self
-                                    .ensure_current_assignment_authority_cached(head_deadline)
+                                    .ensure_current_assignment_authority_cached(
+                                        audited_target
+                                            .as_ref()
+                                            .expect("stable successor was audited before adoption"),
+                                        head_deadline,
+                                    )
                                     .await
                                 {
                                     warn!(%cache_error, version = snap.version, "snapshot watcher: could not audit predecessor authority for pending vnode transition");
@@ -1129,6 +1149,77 @@ pub(crate) struct AuditedDrainOutcome {
     outcome: SourceDrainOutcome,
 }
 
+/// Durable authority proof for one materialized assignment target.
+///
+/// This capability binds only the target's immediate predecessor. Older authority history may
+/// already have been pruned and must not be reopened while installing or recertifying the target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuditedAssignmentAuthority {
+    target_version: u64,
+    predecessor: Option<CheckpointAssignmentFence>,
+    terminal: Option<AuditedDrainOutcome>,
+}
+
+impl AuditedAssignmentAuthority {
+    fn without_successor_edge(target_version: u64) -> Self {
+        Self {
+            target_version,
+            predecessor: None,
+            terminal: None,
+        }
+    }
+
+    fn recovery(target_version: u64, predecessor: CheckpointAssignmentFence) -> Self {
+        Self {
+            target_version,
+            predecessor: Some(predecessor),
+            terminal: None,
+        }
+    }
+
+    fn drain(target_version: u64, terminal: AuditedDrainOutcome) -> Self {
+        Self {
+            target_version,
+            predecessor: Some(terminal.transition.predecessor.clone()),
+            terminal: Some(terminal),
+        }
+    }
+
+    fn is_recovery(&self) -> bool {
+        self.predecessor.is_some() && self.terminal.is_none()
+    }
+
+    fn terminal(&self) -> Option<&AuditedDrainOutcome> {
+        self.terminal.as_ref()
+    }
+
+    pub(crate) fn predecessor(&self) -> Option<&CheckpointAssignmentFence> {
+        self.predecessor.as_ref()
+    }
+
+    pub(crate) fn into_terminal(self) -> Option<AuditedDrainOutcome> {
+        self.terminal
+    }
+
+    fn retained_predecessor(
+        &self,
+        local_version: u64,
+    ) -> Result<&CheckpointAssignmentFence, String> {
+        if local_version.checked_add(1) != Some(self.target_version) {
+            return Err(format!(
+                "audited assignment {} is not the exact successor of local assignment {local_version}",
+                self.target_version
+            ));
+        }
+        self.predecessor.as_ref().ok_or_else(|| {
+            format!(
+                "audited assignment {} has no predecessor certificate",
+                self.target_version
+            )
+        })
+    }
+}
+
 /// A committed drain transition returned only after durable authority audit.
 ///
 /// The private field makes this a capability: sibling modules may consume it, but cannot mint one
@@ -1265,12 +1356,16 @@ pub(crate) async fn audit_assignment_snapshot_authority_outcome(
     store: &AssignmentSnapshotStore,
     controller: Option<&ClusterController>,
     snapshot: &AssignmentSnapshot,
-) -> Result<Option<AuditedDrainOutcome>, String> {
+) -> Result<AuditedAssignmentAuthority, String> {
     if snapshot.draining {
-        return Ok(None);
+        return Ok(AuditedAssignmentAuthority::without_successor_edge(
+            snapshot.version,
+        ));
     }
     if snapshot.version == 1 {
-        return Ok(None);
+        return Ok(AuditedAssignmentAuthority::without_successor_edge(
+            snapshot.version,
+        ));
     }
     let authority = match controller {
         Some(controller) => Some(
@@ -1285,12 +1380,17 @@ pub(crate) async fn audit_assignment_snapshot_authority_outcome(
         .await
         .map_err(|error| error.to_string())?
     else {
-        audit_materialized_recovery_with_authority(store, authority.as_deref(), snapshot).await?;
-        return Ok(None);
+        let predecessor =
+            audit_materialized_recovery_with_authority(store, authority.as_deref(), snapshot)
+                .await?;
+        return Ok(AuditedAssignmentAuthority::recovery(
+            snapshot.version,
+            predecessor,
+        ));
     };
-    audit_materialized_drain_transition(authority.as_deref(), snapshot, transition)
+    audit_materialized_drain_transition(store, authority.as_deref(), snapshot, transition)
         .await
-        .map(Some)
+        .map(|terminal| AuditedAssignmentAuthority::drain(snapshot.version, terminal))
 }
 
 async fn audit_materialized_drain_with_authority(
@@ -1301,6 +1401,9 @@ async fn audit_materialized_drain_with_authority(
     if snapshot.draining {
         return Ok(None);
     }
+    if snapshot.version == 1 {
+        return Ok(None);
+    }
     let Some(transition) = store
         .load_drain_transition(snapshot.version)
         .await
@@ -1309,7 +1412,7 @@ async fn audit_materialized_drain_with_authority(
         audit_materialized_recovery_with_authority(store, authority, snapshot).await?;
         return Ok(None);
     };
-    audit_materialized_drain_transition(authority, snapshot, transition)
+    audit_materialized_drain_transition(store, authority, snapshot, transition)
         .await
         .map(Some)
 }
@@ -1318,10 +1421,7 @@ async fn audit_materialized_recovery_with_authority(
     store: &AssignmentSnapshotStore,
     authority: Option<&LeaderLeaseStore>,
     snapshot: &AssignmentSnapshot,
-) -> Result<(), String> {
-    if snapshot.version == 1 {
-        return Ok(());
-    }
+) -> Result<CheckpointAssignmentFence, String> {
     let authority = authority.ok_or_else(|| {
         format!(
             "materialized assignment recovery {} has no cluster authority",
@@ -1378,10 +1478,11 @@ async fn audit_materialized_recovery_with_authority(
             snapshot.version
         ));
     }
-    Ok(())
+    Ok(decision.predecessor)
 }
 
 async fn audit_materialized_drain_transition(
+    store: &AssignmentSnapshotStore,
     authority: Option<&LeaderLeaseStore>,
     snapshot: &AssignmentSnapshot,
     transition: AssignmentDrainTransition,
@@ -1401,6 +1502,31 @@ async fn audit_materialized_drain_transition(
     if decision.transition != transition {
         return Err(format!(
             "assignment {} materialization binds a different authority transition",
+            snapshot.version
+        ));
+    }
+    let predecessor_version = snapshot
+        .version
+        .checked_sub(1)
+        .ok_or_else(|| "materialized drain has no predecessor generation".to_string())?;
+    let predecessor = store
+        .load_version(predecessor_version)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "materialized drain assignment {} lost predecessor {predecessor_version}",
+                snapshot.version
+            )
+        })?;
+    if predecessor.draining
+        || predecessor
+            .assignment_fence()
+            .map_err(|error| error.to_string())?
+            != transition.predecessor
+    {
+        return Err(format!(
+            "assignment {} drain transition does not bind its exact committed predecessor",
             snapshot.version
         ));
     }
@@ -1507,6 +1633,7 @@ async fn settle_observed_local_drain(
                 finalized.version
             )
         })??
+        .into_terminal()
         .ok_or_else(|| {
             format!(
                 "terminal assignment {} lost drain transition history",
@@ -1607,7 +1734,7 @@ pub(crate) async fn settle_source_drain_before_recovery_release(
     )
     .await
     .map_err(|_| "recovery source-drain terminal audit timed out".to_string())??;
-    let Some(audited) = audited else {
+    let Some(audited) = audited.into_terminal() else {
         if published_transition.is_some() {
             return Err("process-local source drain has no durable terminal".into());
         }
@@ -1657,7 +1784,7 @@ pub(crate) async fn settle_source_drain_before_recovery_release(
     )
     .await
     .map_err(|_| "recovery source-drain terminal recheck timed out".to_string())??;
-    if confirmed_terminal.as_ref() != Some(&audited) {
+    if confirmed_terminal.terminal() != Some(&audited) {
         return Err("recovery source-drain terminal changed during settlement".into());
     }
     clear_settled_source_drain(controller, &audited.transition)?;
