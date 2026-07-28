@@ -13,7 +13,8 @@ use laminar_connectors::connector::CoordinatedCommitNamespace;
 #[cfg(feature = "cluster")]
 use laminar_core::checkpoint::{
     canonical_json_sha256, ClusterRecoveryCapsule, CommittedSourceHandoff,
-    PreparedCheckpointWitness, RecoveryCapsuleRef, MAX_PREPARED_CHECKPOINT_WITNESSES,
+    PreparedCheckpointWitness, RecoveryCapsuleRef, VnodeRestoreContract, VnodeRestoreLimits,
+    MAX_PREPARED_CHECKPOINT_WITNESSES,
 };
 use laminar_core::checkpoint::{CheckpointWatermark, LeaderProof};
 #[cfg(feature = "cluster")]
@@ -117,6 +118,13 @@ enum VnodeUploadUpdate {
     Retain,
     Replace(HashMap<String, UploadedSlice>),
     Remove,
+}
+
+struct SealedVnodePromotion {
+    vnode: u32,
+    lineage: VnodePartialLineage,
+    delta_depth: u32,
+    seals_upload: bool,
 }
 
 struct PendingDecisionWrite {
@@ -746,19 +754,48 @@ impl<'a> PrepareQuorum<'a> {
 #[derive(Debug, Clone)]
 pub(crate) struct ValidatedVnodeRestoreHead {
     inventory: Arc<CheckpointSealInventory>,
+    contract: VnodeRestoreContract,
+    lineage_inventories: HashMap<CheckpointAttempt, Arc<CheckpointSealInventory>>,
 }
 
 #[cfg(feature = "cluster")]
 impl ValidatedVnodeRestoreHead {
-    fn new(inventory: CheckpointSealInventory) -> Self {
+    fn new(
+        inventory: CheckpointSealInventory,
+        contract: VnodeRestoreContract,
+        lineage_inventories: HashMap<CheckpointAttempt, Arc<CheckpointSealInventory>>,
+    ) -> Self {
         Self {
             inventory: Arc::new(inventory),
+            contract,
+            lineage_inventories,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn from_unchecked_inventory_for_test(inventory: CheckpointSealInventory) -> Self {
-        Self::new(inventory)
+        let vnode_count = inventory
+            .assignment_fence
+            .as_ref()
+            .map_or(1, |fence| fence.vnode_count);
+        let max_partial_payload_bytes = inventory
+            .sealed_partials
+            .iter()
+            .map(|partial| partial.lineage.total_payload_bytes())
+            .sum::<u64>()
+            .max(1);
+        let limits = VnodeRestoreLimits::global_singleton_compatibility(
+            max_partial_payload_bytes,
+            6,
+            vnode_count,
+        )
+        .expect("test restore limits");
+        let contract =
+            crate::vnode_restore_lineage::declared_vnode_restore_contract(&inventory, limits)
+                .expect("test restore contract");
+        let mut lineage_inventories = HashMap::new();
+        lineage_inventories.insert(inventory.attempt, Arc::new(inventory.clone()));
+        Self::new(inventory, contract, lineage_inventories)
     }
 
     #[must_use]
@@ -769,6 +806,20 @@ impl ValidatedVnodeRestoreHead {
     #[must_use]
     pub(crate) fn inventory(&self) -> Arc<CheckpointSealInventory> {
         Arc::clone(&self.inventory)
+    }
+
+    #[must_use]
+    pub(crate) const fn contract(&self) -> &VnodeRestoreContract {
+        &self.contract
+    }
+
+    #[must_use]
+    pub(crate) fn lineage_inventories(
+        &self,
+    ) -> impl Iterator<Item = (CheckpointAttempt, Arc<CheckpointSealInventory>)> + '_ {
+        self.lineage_inventories
+            .iter()
+            .map(|(attempt, inventory)| (*attempt, Arc::clone(inventory)))
     }
 }
 
@@ -878,12 +929,29 @@ impl ValidatedClusterVnodeRestoreCut {
                 "synthetic transition restore-cut inventory encode: {error}"
             ))
         })?;
+        let max_partial_payload_bytes = u64::try_from(inventory.required_vnodes.len())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let limits = VnodeRestoreLimits::global_singleton_compatibility(
+            max_partial_payload_bytes,
+            6,
+            inventory
+                .assignment_fence
+                .as_ref()
+                .expect("synthetic inventory has a fence")
+                .vnode_count,
+        )
+        .map_err(|error| DbError::Checkpoint(format!("synthetic restore limits: {error}")))?;
+        let contract =
+            crate::vnode_restore_lineage::declared_vnode_restore_contract(&inventory, limits)?;
+        let mut lineage_inventories = HashMap::new();
+        lineage_inventories.insert(attempt, Arc::new(inventory.clone()));
         let cut = Self {
             outcome,
             recovery_capsule_ref,
             pipeline_identity,
             seal_inventory_sha256,
-            restore_head: ValidatedVnodeRestoreHead::new(inventory),
+            restore_head: ValidatedVnodeRestoreHead::new(inventory, contract, lineage_inventories),
         };
         cut.validate_transition_binding().map_err(|error| {
             DbError::Checkpoint(format!("synthetic transition restore cut: {error}"))
@@ -933,6 +1001,14 @@ impl ValidatedClusterVnodeRestoreCut {
             return Err("committed restore-cut authority no longer identifies one seal".into());
         }
         self.recovery_capsule_ref.validate()?;
+        self.restore_head.contract.validate(
+            self.restore_head
+                .inventory
+                .assignment_fence
+                .as_ref()
+                .ok_or("committed restore cut has no assignment fence")?
+                .vnode_count,
+        )?;
         if self.seal_inventory_sha256.len() != 64
             || !self
                 .seal_inventory_sha256
@@ -963,6 +1039,8 @@ pub(crate) struct ClusterHandoffReader {
     decision_store: Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>,
     pipeline_identity: PipelineIdentity,
     deployment_id: Option<String>,
+    max_partial_payload_bytes: u64,
+    max_artifacts_per_vnode_chain: u32,
 }
 
 #[cfg(feature = "cluster")]
@@ -1013,6 +1091,10 @@ impl ClusterHandoffReader {
             &capsule,
             deployment_id,
             &self.pipeline_identity,
+            Some((
+                self.max_partial_payload_bytes,
+                self.max_artifacts_per_vnode_chain,
+            )),
         )
         .await?;
         let sources = Arc::new(CommittedSourceHandoff::try_from(&capsule).map_err(|error| {
@@ -1039,6 +1121,8 @@ impl ClusterHandoffReader {
             && Arc::ptr_eq(&self.decision_store, &other.decision_store)
             && self.pipeline_identity == other.pipeline_identity
             && self.deployment_id == other.deployment_id
+            && self.max_partial_payload_bytes == other.max_partial_payload_bytes
+            && self.max_artifacts_per_vnode_chain == other.max_artifacts_per_vnode_chain
     }
 }
 
@@ -1277,6 +1361,7 @@ async fn preflight_cluster_retention_cut(
         &capsule,
         &capsule.deployment_id,
         &capsule.pipeline_identity,
+        None,
     )
     .await
     .map(|_| ())
@@ -3177,6 +3262,24 @@ impl CheckpointCoordinator {
         }
     }
 
+    #[cfg(feature = "cluster")]
+    fn vnode_restore_limits(&self, vnode_count: u32) -> Result<VnodeRestoreLimits, DbError> {
+        let max_artifacts_per_vnode_chain = u32::try_from(
+            crate::pipeline_lifecycle::max_artifacts_per_cluster_vnode_chain(
+                self.config.max_retained,
+            ),
+        )
+        .map_err(|_| {
+            DbError::Config("checkpoint vnode-chain limit does not fit the durable contract".into())
+        })?;
+        VnodeRestoreLimits::global_singleton_compatibility(
+            self.config.max_staged_bytes,
+            max_artifacts_per_vnode_chain,
+            vnode_count,
+        )
+        .map_err(|error| DbError::Config(format!("checkpoint vnode restore limits: {error}")))
+    }
+
     /// Capture the exact durable leadership term at checkpoint entry.
     #[cfg(feature = "cluster")]
     fn capture_checkpoint_leadership(&self) -> Result<Option<LeaderProof>, String> {
@@ -3292,6 +3395,7 @@ impl CheckpointCoordinator {
             .map(|(source, watermark)| (source.clone(), *watermark))
             .collect();
         let (manifest_sha256, portable_state_sha256) = manifest_digests(manifest)?;
+        let vnode_restore_limits = self.vnode_restore_limits(assignment_fence.vnode_count)?;
         let ready = ParticipantReady {
             version: PARTICIPANT_READY_VERSION,
             attempt,
@@ -3299,6 +3403,7 @@ impl CheckpointCoordinator {
             assignment_fence: assignment_fence.clone(),
             deployment_id: manifest.deployment_id.clone(),
             pipeline_identity: manifest.pipeline_identity.clone(),
+            vnode_restore_limits,
             owned_vnodes,
             source_offsets,
             source_metadata,
@@ -3435,6 +3540,17 @@ impl CheckpointCoordinator {
             decision_store,
             pipeline_identity: self.expected_pipeline_identity(),
             deployment_id: self.deployment_id.clone(),
+            max_partial_payload_bytes: self.config.max_staged_bytes,
+            max_artifacts_per_vnode_chain: u32::try_from(
+                crate::pipeline_lifecycle::max_artifacts_per_cluster_vnode_chain(
+                    self.config.max_retained,
+                ),
+            )
+            .map_err(|_| {
+                DbError::Config(
+                    "checkpoint vnode-chain limit does not fit the recovery reader".into(),
+                )
+            })?,
         }))
     }
 
@@ -3590,9 +3706,25 @@ impl CheckpointCoordinator {
                 .and_then(|controller| controller.cluster_min_watermark()),
             CheckpointWatermark::Uninitialized => None,
         };
+        let vnode_count = inventory
+            .assignment_fence
+            .as_ref()
+            .ok_or_else(|| {
+                "[LDB-6041] recovery capsule seal has no assignment certificate".to_owned()
+            })?
+            .vnode_count;
+        let vnode_restore_limits = self
+            .vnode_restore_limits(vnode_count)
+            .map_err(|error| error.to_string())?;
+        let declared_contract = crate::vnode_restore_lineage::declared_vnode_restore_contract(
+            &inventory,
+            vnode_restore_limits,
+        )
+        .map_err(|error| error.to_string())?;
         let capsule = assemble_capsule(
             &inventory,
             readiness,
+            declared_contract,
             self.expected_deployment_id()
                 .map_err(|error| error.to_string())?,
             &self.expected_pipeline_identity(),
@@ -3600,6 +3732,28 @@ impl CheckpointCoordinator {
             recovery_watermark_frontier,
         )
         .map_err(|error| error.to_string())?;
+        let verified_lineage = tokio::time::timeout_at(
+            deadline,
+            crate::vnode_restore_lineage::validate_vnode_restore_lineage(
+                backend.as_ref(),
+                Arc::new(inventory.clone()),
+                capsule.vnode_restore_contract.limits.clone(),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "[LDB-6046] vnode lineage validation exceeded the checkpoint deadline for epoch {} checkpoint {}",
+                attempt.epoch, attempt.checkpoint_id
+            )
+        })?
+        .map_err(|error| error.to_string())?;
+        if verified_lineage.contract() != &capsule.vnode_restore_contract {
+            return Err(format!(
+                "[LDB-6041] checkpoint {} epoch {} vnode lineage does not reproduce its recovery contract",
+                attempt.checkpoint_id, attempt.epoch
+            ));
+        }
         let decision_store = self.decision_store.as_ref().ok_or_else(|| {
             "[LDB-6050] cluster recovery capsule requires the outcome store".to_owned()
         })?;
@@ -4444,48 +4598,70 @@ impl CheckpointCoordinator {
         Ok(())
     }
 
-    fn mark_vnode_partials_sealed(&mut self, attempt: CheckpointAttempt) -> Result<(), DbError> {
+    fn prepare_vnode_partial_promotion(
+        &self,
+        attempt: CheckpointAttempt,
+    ) -> Result<Vec<SealedVnodePromotion>, DbError> {
         // Validate the complete local inventory before advancing any durable parent. A poisoned
         // coordinator must fail closed without leaving only a prefix of the owned vnode set
         // eligible for later delta/reference capture.
+        let mut promotions = Vec::new();
         for &vnode in &self.vnode_set {
             let seals_partial = self.last_partial_attempt.get(&vnode) == Some(&attempt);
-            if seals_partial && !self.last_partial_lineage.contains_key(&vnode) {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6025] sealed attempt {attempt:?} has no local lineage metadata for \
-                     vnode {vnode}"
-                )));
-            }
-            if seals_partial && !self.last_partial_delta_depth.contains_key(&vnode) {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6025] sealed attempt {attempt:?} has no local delta-depth metadata for \
-                     vnode {vnode}"
-                )));
+            if seals_partial {
+                let lineage = self.last_partial_lineage.get(&vnode).copied().ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6025] sealed attempt {attempt:?} has no local lineage metadata for vnode {vnode}"
+                    ))
+                })?;
+                let delta_depth = self
+                    .last_partial_delta_depth
+                    .get(&vnode)
+                    .copied()
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6025] sealed attempt {attempt:?} has no local delta-depth metadata for vnode {vnode}"
+                        ))
+                    })?;
+                let seals_upload = self
+                    .last_vnode_uploads
+                    .get(&vnode)
+                    .is_some_and(|(base, _)| *base == attempt);
+                promotions.push(SealedVnodePromotion {
+                    vnode,
+                    lineage,
+                    delta_depth,
+                    seals_upload,
+                });
             }
         }
+        Ok(promotions)
+    }
 
-        for &vnode in &self.vnode_set {
-            if self.last_partial_attempt.get(&vnode) == Some(&attempt) {
-                // The complete inventory was validated above, before any map was mutated.
-                let lineage = self.last_partial_lineage[&vnode];
-                self.last_sealed_partial_attempt.insert(vnode, attempt);
-                if let Some(depth) = self.last_partial_delta_depth.get(&vnode).copied() {
-                    self.last_sealed_delta_depth.insert(vnode, depth);
-                }
-                self.last_sealed_partial_lineage.insert(vnode, lineage);
-            }
-            if self
-                .last_vnode_uploads
-                .get(&vnode)
-                .is_some_and(|(base, _)| *base == attempt)
-                && self.last_partial_attempt.get(&vnode) == Some(&attempt)
-            {
-                // The complete inventory was validated above, before any map was mutated.
-                let lineage = self.last_partial_lineage[&vnode];
-                self.last_sealed_upload_attempt.insert(vnode, attempt);
-                self.last_sealed_upload_lineage.insert(vnode, lineage);
+    fn apply_vnode_partial_promotion(
+        &mut self,
+        attempt: CheckpointAttempt,
+        promotions: Vec<SealedVnodePromotion>,
+    ) {
+        for promotion in promotions {
+            self.last_sealed_partial_attempt
+                .insert(promotion.vnode, attempt);
+            self.last_sealed_delta_depth
+                .insert(promotion.vnode, promotion.delta_depth);
+            self.last_sealed_partial_lineage
+                .insert(promotion.vnode, promotion.lineage);
+            if promotion.seals_upload {
+                self.last_sealed_upload_attempt
+                    .insert(promotion.vnode, attempt);
+                self.last_sealed_upload_lineage
+                    .insert(promotion.vnode, promotion.lineage);
             }
         }
+    }
+
+    fn mark_vnode_partials_sealed(&mut self, attempt: CheckpointAttempt) -> Result<(), DbError> {
+        let promotions = self.prepare_vnode_partial_promotion(attempt)?;
+        self.apply_vnode_partial_promotion(attempt, promotions);
         Ok(())
     }
 
@@ -7333,18 +7509,22 @@ impl CheckpointCoordinator {
             );
             return Ok(self.fail_epoch(checkpoint_id, epoch, start, gate_err).await);
         }
-        // Only the exact immutable seal, never a completed callback or a successful upload, makes
-        // this attempt eligible as a future delta/reference parent.
-        if let Err(error) =
-            self.mark_vnode_partials_sealed(CheckpointAttempt::new(epoch, checkpoint_id))
+        // Validate the complete local promotion batch now, but do not make this sealed candidate a
+        // successor parent until the exact immutable Commit wins below. A capsule/budget failure
+        // can still publish Abort after `_SEAL` and must leave no parent-eligibility residue.
+        let mut vnode_partial_promotion = match self
+            .prepare_vnode_partial_promotion(CheckpointAttempt::new(epoch, checkpoint_id))
         {
-            return Ok(self.fail_after_irrevocable_work(
-                checkpoint_id,
-                epoch,
-                start,
-                error.to_string(),
-            ));
-        }
+            Ok(promotion) => Some(promotion),
+            Err(error) => {
+                return Ok(self.fail_after_irrevocable_work(
+                    checkpoint_id,
+                    epoch,
+                    start,
+                    error.to_string(),
+                ));
+            }
+        };
 
         // The durable decision is the sole commit point. External sinks publish later from the
         // exact sealed descriptor inventory; no connector phase-2 mutation occurs inline here.
@@ -7438,6 +7618,14 @@ impl CheckpointCoordinator {
                     ));
                 }
             }
+            // All fallible promotion validation occurred before the decision write. Applying the
+            // captured values after an exact Commit is an in-memory, infallible publication.
+            self.apply_vnode_partial_promotion(
+                attempt,
+                vnode_partial_promotion
+                    .take()
+                    .expect("checkpoint promotion was prepared before durable decision"),
+            );
             // Keep the write latch set until the exact immutable Commit has been validated. The
             // outer deadline can now distinguish reversible work from the committed continuation.
             commit_is_durable.store(true, std::sync::atomic::Ordering::Release);
@@ -7769,6 +7957,7 @@ impl CheckpointCoordinator {
         capsule: &ClusterRecoveryCapsule,
         expected_deployment: &str,
         expected_identity: &PipelineIdentity,
+        expected_runtime_limits: Option<(u64, u32)>,
     ) -> Result<ValidatedClusterVnodeRestoreCut, DbError> {
         let attempt = CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id);
         let inventory = backend
@@ -7790,6 +7979,25 @@ impl CheckpointCoordinator {
             expected_deployment,
             expected_identity,
         )?;
+        if let Some((max_partial_payload_bytes, max_artifacts_per_vnode_chain)) =
+            expected_runtime_limits
+        {
+            let expected_limits = VnodeRestoreLimits::global_singleton_compatibility(
+                max_partial_payload_bytes,
+                max_artifacts_per_vnode_chain,
+                capsule.assignment_fence.vnode_count,
+            )
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6050] local vnode restore limits are invalid: {error}"
+                ))
+            })?;
+            if capsule.vnode_restore_contract.limits != expected_limits {
+                return Err(DbError::Checkpoint(
+                    "[LDB-6050] committed vnode restore limits do not match this runtime".into(),
+                ));
+            }
+        }
         backend
             .verify_checkpoint_artifact_metadata(&inventory)
             .await
@@ -7802,6 +8010,7 @@ impl CheckpointCoordinator {
         let reproduced = assemble_capsule(
             &inventory,
             readiness,
+            capsule.vnode_restore_contract.clone(),
             expected_deployment,
             expected_identity,
             capsule.cluster_watermark,
@@ -7813,6 +8022,19 @@ impl CheckpointCoordinator {
                 outcome.epoch, outcome.checkpoint_id
             )));
         }
+        let validated_lineage = crate::vnode_restore_lineage::validate_vnode_restore_lineage(
+            backend,
+            Arc::new(inventory.clone()),
+            capsule.vnode_restore_contract.limits.clone(),
+        )
+        .await?;
+        if validated_lineage.contract() != &capsule.vnode_restore_contract {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] sealed vnode lineage no longer reproduces the committed recovery contract for epoch {} checkpoint {}",
+                outcome.epoch, outcome.checkpoint_id
+            )));
+        }
+        let lineage_inventories = validated_lineage.into_inventories();
         let recovery_capsule_ref = outcome.recovery_capsule.clone().ok_or_else(|| {
             DbError::Checkpoint(format!(
                 "[LDB-6041] cluster Commit for epoch {} checkpoint {} has no recovery capsule",
@@ -7824,7 +8046,11 @@ impl CheckpointCoordinator {
             recovery_capsule_ref,
             pipeline_identity: capsule.pipeline_identity.clone(),
             seal_inventory_sha256: capsule.seal_inventory_sha256.clone(),
-            restore_head: ValidatedVnodeRestoreHead::new(inventory),
+            restore_head: ValidatedVnodeRestoreHead::new(
+                inventory,
+                capsule.vnode_restore_contract.clone(),
+                lineage_inventories,
+            ),
         })
     }
 
@@ -7898,6 +8124,19 @@ impl CheckpointCoordinator {
             capsule,
             self.expected_deployment_id()?,
             &self.expected_pipeline_identity(),
+            Some((
+                self.config.max_staged_bytes,
+                u32::try_from(
+                    crate::pipeline_lifecycle::max_artifacts_per_cluster_vnode_chain(
+                        self.config.max_retained,
+                    ),
+                )
+                .map_err(|_| {
+                    DbError::Config(
+                        "checkpoint vnode-chain limit does not fit recovery validation".into(),
+                    )
+                })?,
+            )),
         )
         .await?;
         recovered.set_vnode_restore_cut(vnode_restore_cut);

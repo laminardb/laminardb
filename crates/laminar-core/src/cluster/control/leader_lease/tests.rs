@@ -392,6 +392,8 @@ async fn recovery_capsule_variant(
         pipeline_identity: crate::checkpoint::PipelineIdentity::empty(),
         assignment_fence: fence.clone(),
         seal_inventory_sha256: digest(2),
+        vnode_restore_contract:
+            crate::checkpoint::recovery_capsule::vnode_restore_contract_for_test(fence.vnode_count),
         participants: vec![crate::checkpoint::ParticipantRecoveryRef {
             participant_id: fence.participants[0].node_id,
             readiness_sha256: digest(3),

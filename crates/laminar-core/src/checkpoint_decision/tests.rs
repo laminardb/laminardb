@@ -412,6 +412,8 @@ async fn test_capsule(
         pipeline_identity: crate::checkpoint::PipelineIdentity::empty(),
         assignment_fence: fence.clone(),
         seal_inventory_sha256: digest(2),
+        vnode_restore_contract:
+            crate::checkpoint::recovery_capsule::vnode_restore_contract_for_test(fence.vnode_count),
         participants,
         source_offsets: std::collections::BTreeMap::new(),
         source_metadata: std::collections::BTreeMap::new(),

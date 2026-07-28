@@ -2592,12 +2592,9 @@ impl LaminarDB {
                 )
             })?;
             let attempt = handoff.vnode_restore_cut.attempt();
-            let max_partial_bytes = self.checkpoint_state_artifact_cap_bytes()?;
-            crate::recovery_manager::vnode_chains::SealedVnodeChainReader::from_validated_head(
+            crate::recovery_manager::vnode_chains::SealedVnodeChainReader::from_committed_head(
                 backend.as_ref(),
                 handoff.vnode_restore_cut.restore_head(),
-                max_partial_bytes,
-                crate::pipeline_lifecycle::MAX_ARTIFACTS_PER_CLUSTER_VNODE_CHAIN,
             )?
             .load_at(&vnodes_requiring_restore, attempt)
             .await?
@@ -4645,23 +4642,6 @@ impl LaminarDB {
             .map_or(runtime_default, |registry| {
                 laminar_core::state::KeyGroupCount::try_from(registry.vnode_count())
                     .expect("builder validated the vnode registry key-group count")
-            })
-    }
-
-    /// Conservative cap for one vnode-state artifact read during restore.
-    ///
-    /// This is deliberately not described as a total restore-memory bound: a recovery chain can
-    /// retain multiple individually bounded artifacts until graph publication.
-    #[cfg(feature = "cluster")]
-    pub(crate) fn checkpoint_state_artifact_cap_bytes(&self) -> Result<u64, DbError> {
-        self.config
-            .checkpoint
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.max_staged_bytes)
-            .ok_or_else(|| {
-                DbError::Config(
-                    "checkpoint.max_staged_bytes was not resolved for vnode-state restore".into(),
-                )
             })
     }
 

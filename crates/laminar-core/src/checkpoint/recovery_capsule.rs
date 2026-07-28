@@ -11,7 +11,174 @@ use crate::checkpoint::{
 use crate::state::CheckpointAttempt;
 
 /// Current canonical cluster recovery-capsule format.
-pub const CLUSTER_RECOVERY_CAPSULE_VERSION: u32 = 5;
+pub const CLUSTER_RECOVERY_CAPSULE_VERSION: u32 = 6;
+
+/// Current durable vnode-restore limit format.
+pub const VNODE_RESTORE_LIMITS_VERSION: u16 = 1;
+
+/// Capability profile that supplied a committed vnode-restore limit.
+///
+/// The current profile preserves the bounded compatibility path used by the admitted global
+/// aggregate. It is deliberately not authority to admit distributed keyed operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VnodeRestoreLimitProfile {
+    /// Existing bounded global-state compatibility profile.
+    GlobalSingletonCompatibility,
+}
+
+/// Versioned raw-input limits agreed by every participant in a cluster checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VnodeRestoreLimits {
+    /// Limit format version.
+    pub version: u16,
+    /// Capability profile whose semantics define these limits.
+    pub profile: VnodeRestoreLimitProfile,
+    /// Maximum immutable payload bytes in one sealed vnode artifact.
+    pub max_partial_payload_bytes: u64,
+    /// Maximum physical artifacts in one vnode ancestry.
+    pub max_artifacts_per_vnode_chain: u32,
+    /// Maximum summed raw lineage payload for the complete cluster cut.
+    pub max_cluster_lineage_payload_bytes: u64,
+    /// Maximum summed lineage artifacts for the complete vnode domain.
+    pub max_cluster_lineage_artifacts: u64,
+}
+
+impl VnodeRestoreLimits {
+    /// Construct the current compatibility profile with checked derived cluster limits.
+    ///
+    /// # Errors
+    /// Returns an error for zero limits or arithmetic overflow.
+    pub fn global_singleton_compatibility(
+        max_partial_payload_bytes: u64,
+        max_artifacts_per_vnode_chain: u32,
+        vnode_count: u32,
+    ) -> Result<Self, String> {
+        if max_partial_payload_bytes == 0 {
+            return Err("vnode restore partial-payload limit must be nonzero".into());
+        }
+        if max_artifacts_per_vnode_chain == 0 {
+            return Err("vnode restore chain-artifact limit must be nonzero".into());
+        }
+        if vnode_count == 0 {
+            return Err("vnode restore limit requires a nonzero vnode domain".into());
+        }
+        let artifact_multiplier = u64::from(max_artifacts_per_vnode_chain);
+        let max_cluster_lineage_payload_bytes = max_partial_payload_bytes
+            .checked_mul(artifact_multiplier)
+            .ok_or_else(|| "vnode restore cluster payload limit overflowed".to_owned())?;
+        let max_cluster_lineage_artifacts = u64::from(vnode_count)
+            .checked_mul(artifact_multiplier)
+            .ok_or_else(|| "vnode restore cluster artifact limit overflowed".to_owned())?;
+        Ok(Self {
+            version: VNODE_RESTORE_LIMITS_VERSION,
+            profile: VnodeRestoreLimitProfile::GlobalSingletonCompatibility,
+            max_partial_payload_bytes,
+            max_artifacts_per_vnode_chain,
+            max_cluster_lineage_payload_bytes,
+            max_cluster_lineage_artifacts,
+        })
+    }
+
+    /// Validate the stored derived limits for the exact vnode domain.
+    ///
+    /// # Errors
+    /// Returns an error when the record is non-canonical or its arithmetic is inconsistent.
+    pub fn validate(&self, vnode_count: u32) -> Result<(), String> {
+        let expected = Self::global_singleton_compatibility(
+            self.max_partial_payload_bytes,
+            self.max_artifacts_per_vnode_chain,
+            vnode_count,
+        )?;
+        if self.version != VNODE_RESTORE_LIMITS_VERSION {
+            return Err(format!(
+                "unsupported vnode restore limits version {}; expected {VNODE_RESTORE_LIMITS_VERSION}",
+                self.version
+            ));
+        }
+        if *self != expected {
+            return Err("vnode restore limits do not match their profile-derived bounds".into());
+        }
+        Ok(())
+    }
+}
+
+/// Verified raw vnode ancestry selected by one committed cluster cut.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VnodeRestoreContract {
+    /// Participant-agreed raw-input limits.
+    pub limits: VnodeRestoreLimits,
+    /// Exact sum of every required head's transitive payload bytes.
+    pub exact_cluster_lineage_payload_bytes: u64,
+    /// Exact sum of every required head's transitive artifact count.
+    pub exact_cluster_lineage_artifacts: u64,
+}
+
+impl VnodeRestoreContract {
+    /// Construct and validate a contract for one complete vnode domain.
+    ///
+    /// # Errors
+    /// Returns an error when exact usage is empty or exceeds the agreed limits.
+    pub fn new(
+        limits: VnodeRestoreLimits,
+        exact_cluster_lineage_payload_bytes: u64,
+        exact_cluster_lineage_artifacts: u64,
+        vnode_count: u32,
+    ) -> Result<Self, String> {
+        let contract = Self {
+            limits,
+            exact_cluster_lineage_payload_bytes,
+            exact_cluster_lineage_artifacts,
+        };
+        contract.validate(vnode_count)?;
+        Ok(contract)
+    }
+
+    /// Validate exact raw lineage usage against the participant-agreed limits.
+    ///
+    /// # Errors
+    /// Returns an error when usage is non-canonical or outside its envelope.
+    pub fn validate(&self, vnode_count: u32) -> Result<(), String> {
+        self.limits.validate(vnode_count)?;
+        if self.exact_cluster_lineage_payload_bytes == 0
+            || self.exact_cluster_lineage_artifacts < u64::from(vnode_count)
+        {
+            return Err("vnode restore contract has incomplete cluster lineage usage".into());
+        }
+        if self.exact_cluster_lineage_payload_bytes > self.limits.max_cluster_lineage_payload_bytes
+        {
+            return Err(format!(
+                "vnode restore lineage declares {} payload bytes; maximum is {}",
+                self.exact_cluster_lineage_payload_bytes,
+                self.limits.max_cluster_lineage_payload_bytes
+            ));
+        }
+        if self.exact_cluster_lineage_artifacts > self.limits.max_cluster_lineage_artifacts {
+            return Err(format!(
+                "vnode restore lineage declares {} artifacts; maximum is {}",
+                self.exact_cluster_lineage_artifacts, self.limits.max_cluster_lineage_artifacts
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn vnode_restore_contract_for_test(vnode_count: u32) -> VnodeRestoreContract {
+    let exact_payload_bytes = u64::from(vnode_count).max(1);
+    let limits =
+        VnodeRestoreLimits::global_singleton_compatibility(exact_payload_bytes, 1, vnode_count)
+            .expect("test vnode restore limits");
+    VnodeRestoreContract::new(
+        limits,
+        exact_payload_bytes,
+        u64::from(vnode_count),
+        vnode_count,
+    )
+    .expect("test vnode restore contract")
+}
 
 /// One participant's event-time position at a checkpoint cut.
 ///
@@ -242,6 +409,8 @@ pub struct ClusterRecoveryCapsule {
     pub assignment_fence: CheckpointAssignmentFence,
     /// SHA-256 of the canonical state-backend seal inventory.
     pub seal_inventory_sha256: String,
+    /// Participant-agreed limits and metadata-verified complete vnode ancestry.
+    pub vnode_restore_contract: VnodeRestoreContract,
     /// Participant artifacts, sorted by participant ID and exactly covering the fence.
     pub participants: Vec<ParticipantRecoveryRef>,
     /// Complete per-source connector offsets in canonical map order.
@@ -303,6 +472,8 @@ impl ClusterRecoveryCapsule {
         if !self.assignment_fence.is_canonical() {
             return Err("recovery capsule assignment fence is not canonical".into());
         }
+        self.vnode_restore_contract
+            .validate(self.assignment_fence.vnode_count)?;
         validate_digest("checkpoint seal inventory", &self.seal_inventory_sha256)?;
         validate_digest("portable state", &self.portable_state_sha256)?;
 
@@ -601,6 +772,7 @@ mod tests {
             ],
         )
         .unwrap();
+        let vnode_restore_contract = vnode_restore_contract_for_test(assignment_fence.vnode_count);
         ClusterRecoveryCapsule {
             version: CLUSTER_RECOVERY_CAPSULE_VERSION,
             attempt: CheckpointAttempt::canonical(10),
@@ -611,6 +783,7 @@ mod tests {
             },
             assignment_fence,
             seal_inventory_sha256: digest(2),
+            vnode_restore_contract,
             participants: vec![
                 ParticipantRecoveryRef {
                     participant_id: 2,

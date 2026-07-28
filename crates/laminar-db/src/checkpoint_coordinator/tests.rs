@@ -636,6 +636,13 @@ async fn record_solo_cluster_outcome(coord: &CheckpointCoordinator, attempt: Che
         let capsule = crate::cluster_recovery_capsule::assemble_capsule(
             &inventory,
             readiness,
+            crate::vnode_restore_lineage::declared_vnode_restore_contract(
+                &inventory,
+                coord
+                    .vnode_restore_limits(inventory.assignment_fence.as_ref().unwrap().vnode_count)
+                    .unwrap(),
+            )
+            .unwrap(),
             coord.expected_deployment_id().unwrap(),
             &coord.expected_pipeline_identity(),
             cluster_watermark,
@@ -2571,6 +2578,10 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
                 assignment_fence: assignment_fence.clone(),
                 deployment_id: deployment_id.clone(),
                 pipeline_identity: pipeline_identity.clone(),
+                vnode_restore_limits:
+                    crate::cluster_recovery_capsule::vnode_restore_limits_for_test(
+                        assignment_fence.vnode_count,
+                    ),
                 owned_vnodes: if participant_id == leader_id.0 {
                     vec![0]
                 } else {
@@ -2621,6 +2632,7 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
     let capsule = crate::cluster_recovery_capsule::assemble_capsule(
         &inventory,
         readiness,
+        crate::cluster_recovery_capsule::declared_vnode_restore_contract_for_test(&inventory),
         &deployment_id,
         &pipeline_identity,
         CheckpointWatermark::Uninitialized,
@@ -2827,6 +2839,9 @@ async fn create_test_recovery_capsule_with_watermark(
         pipeline_identity: PipelineIdentity::empty(),
         assignment_fence: fence.clone(),
         seal_inventory_sha256: seal_inventory_sha256.unwrap_or_else(|| digest(2)),
+        vnode_restore_contract: crate::cluster_recovery_capsule::vnode_restore_contract_for_test(
+            fence.vnode_count,
+        ),
         participants,
         source_offsets: Default::default(),
         source_metadata: Default::default(),
@@ -4674,6 +4689,9 @@ async fn readiness_rejects_overlapping_vnode_ownership() {
         assignment_fence: coord.active_assignment_fence.clone().unwrap(),
         deployment_id: manifest.deployment_id,
         pipeline_identity: manifest.pipeline_identity,
+        vnode_restore_limits: coord
+            .vnode_restore_limits(coord.active_assignment_fence.as_ref().unwrap().vnode_count)
+            .unwrap(),
         // The peer covers its certified vnode 1 but also forges ownership of vnode 0.
         owned_vnodes: vec![0, 1],
         source_offsets: std::collections::BTreeMap::new(),
@@ -4747,6 +4765,13 @@ async fn readiness_rejects_overlapping_vnode_ownership() {
     let error = crate::cluster_recovery_capsule::assemble_capsule(
         &inventory,
         readiness,
+        crate::vnode_restore_lineage::declared_vnode_restore_contract(
+            &inventory,
+            coord
+                .vnode_restore_limits(inventory.assignment_fence.as_ref().unwrap().vnode_count)
+                .unwrap(),
+        )
+        .unwrap(),
         coord.expected_deployment_id().unwrap(),
         &coord.expected_pipeline_identity(),
         CheckpointWatermark::Uninitialized,
@@ -4772,6 +4797,9 @@ async fn readiness_encoding_is_canonical_for_idempotent_reconstruction() {
         assignment_fence: assignment_fence.clone(),
         deployment_id: "deployment".into(),
         pipeline_identity: PipelineIdentity::empty(),
+        vnode_restore_limits: crate::cluster_recovery_capsule::vnode_restore_limits_for_test(
+            assignment_fence.vnode_count,
+        ),
         owned_vnodes: vec![0],
         source_offsets: std::collections::BTreeMap::from([(
             "orders".into(),

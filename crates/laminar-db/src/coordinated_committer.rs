@@ -987,6 +987,7 @@ impl CoordinatedCommitter {
             let reproduced = assemble_capsule(
                 inventory,
                 readiness,
+                capsule.vnode_restore_contract.clone(),
                 &self.deployment_id,
                 &self.pipeline_identity,
                 capsule.cluster_watermark,

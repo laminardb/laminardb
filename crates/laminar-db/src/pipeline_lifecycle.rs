@@ -52,6 +52,7 @@ pub(crate) const fn max_artifacts_per_cluster_vnode_chain(max_retained: usize) -
 /// `max_retained` value is not yet part of cluster identity, so using its narrower limit could
 /// strand a valid checkpoint produced by a differently configured participant.
 #[cfg(feature = "cluster")]
+#[cfg(test)]
 pub(crate) const MAX_ARTIFACTS_PER_CLUSTER_VNODE_CHAIN: usize =
     max_artifacts_per_cluster_vnode_chain(usize::MAX);
 
@@ -1562,13 +1563,10 @@ impl LaminarDB {
                     .to_string(),
             ));
         };
-        let max_partial_bytes = self.checkpoint_state_artifact_cap_bytes()?;
         let loaded =
-            crate::recovery_manager::vnode_chains::SealedVnodeChainReader::from_validated_head(
+            crate::recovery_manager::vnode_chains::SealedVnodeChainReader::from_committed_head(
                 backend.as_ref(),
                 restore_cut.restore_head(),
-                max_partial_bytes,
-                MAX_ARTIFACTS_PER_CLUSTER_VNODE_CHAIN,
             )?
             .load_at(&owned, attempt)
             .await?;

@@ -961,6 +961,8 @@ mod tests {
             node_id: 7,
             boot_incarnation: uuid::Uuid::from_u128(77),
         };
+        let assignment_fence =
+            CheckpointAssignmentFence::from_owner_map(17, &[7], vec![participant]).unwrap();
         let capsule = ClusterRecoveryCapsule {
             version: CLUSTER_RECOVERY_CAPSULE_VERSION,
             attempt: CheckpointAttempt::canonical(9),
@@ -969,13 +971,12 @@ mod tests {
                 canonical_version: PIPELINE_IDENTITY_VERSION,
                 sha256: digest(1),
             },
-            assignment_fence: CheckpointAssignmentFence::from_owner_map(
-                17,
-                &[7],
-                vec![participant],
-            )
-            .unwrap(),
+            assignment_fence: assignment_fence.clone(),
             seal_inventory_sha256: digest(2),
+            vnode_restore_contract:
+                crate::checkpoint::recovery_capsule::vnode_restore_contract_for_test(
+                    assignment_fence.vnode_count,
+                ),
             participants: vec![ParticipantRecoveryRef {
                 participant_id: 7,
                 readiness_sha256: digest(3),

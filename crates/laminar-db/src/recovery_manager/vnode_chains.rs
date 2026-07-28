@@ -213,9 +213,8 @@ pub(crate) struct SealedVnodeChainReader<'a> {
     validated_head_attempt: Option<CheckpointAttempt>,
     max_partial_bytes: u64,
     max_artifacts_per_vnode_chain: usize,
-    /// Aggregate restore-input envelope for today's admitted global-singleton state. This is not
-    /// a production keyed-transition budget; keyed cluster admission remains fail-closed.
-    global_singleton_compatibility_cap_bytes: u64,
+    max_cluster_lineage_payload_bytes: u64,
+    max_cluster_lineage_artifacts: u64,
 }
 
 impl<'a> SealedVnodeChainReader<'a> {
@@ -229,17 +228,80 @@ impl<'a> SealedVnodeChainReader<'a> {
             validated_head_attempt: None,
             max_partial_bytes: u64::MAX,
             max_artifacts_per_vnode_chain: usize::MAX,
-            global_singleton_compatibility_cap_bytes: u64::MAX,
+            max_cluster_lineage_payload_bytes: u64::MAX,
+            max_cluster_lineage_artifacts: u64::MAX,
         }
     }
 
     /// Create a reader pinned to the exact seal already validated with the committed source cut.
     #[cfg(feature = "cluster")]
+    pub(crate) fn from_committed_head(
+        backend: &'a dyn StateBackend,
+        head: &crate::checkpoint_coordinator::ValidatedVnodeRestoreHead,
+    ) -> Result<Self, DbError> {
+        let contract = head.contract();
+        let max_partial_bytes = contract.limits.max_partial_payload_bytes;
+        let max_artifacts_per_vnode_chain =
+            usize::try_from(contract.limits.max_artifacts_per_vnode_chain).map_err(|_| {
+                DbError::Checkpoint(
+                    "[LDB-6050] durable vnode chain limit does not fit this runtime".into(),
+                )
+            })?;
+        Self::from_head_limits(
+            backend,
+            head,
+            max_partial_bytes,
+            max_artifacts_per_vnode_chain,
+            contract.exact_cluster_lineage_payload_bytes,
+            contract.exact_cluster_lineage_artifacts,
+        )
+    }
+
+    #[cfg(all(feature = "cluster", test))]
     pub(crate) fn from_validated_head(
         backend: &'a dyn StateBackend,
         head: &crate::checkpoint_coordinator::ValidatedVnodeRestoreHead,
         max_partial_bytes: u64,
         max_artifacts_per_vnode_chain: usize,
+    ) -> Result<Self, DbError> {
+        let artifact_multiplier = u64::try_from(max_artifacts_per_vnode_chain).map_err(|_| {
+            DbError::Checkpoint(
+                "[LDB-6050] vnode chain artifact limit does not fit accounting".into(),
+            )
+        })?;
+        let max_cluster_lineage_payload_bytes = max_partial_bytes
+            .checked_mul(artifact_multiplier)
+            .ok_or_else(|| {
+                DbError::Checkpoint(
+                    "[LDB-6050] test vnode restore payload envelope overflows u64".into(),
+                )
+            })?;
+        let max_cluster_lineage_artifacts = u64::try_from(head.inventory().required_vnodes.len())
+            .ok()
+            .and_then(|vnodes| vnodes.checked_mul(artifact_multiplier))
+            .ok_or_else(|| {
+                DbError::Checkpoint(
+                    "[LDB-6050] test vnode restore artifact envelope overflows u64".into(),
+                )
+            })?;
+        Self::from_head_limits(
+            backend,
+            head,
+            max_partial_bytes,
+            max_artifacts_per_vnode_chain,
+            max_cluster_lineage_payload_bytes,
+            max_cluster_lineage_artifacts,
+        )
+    }
+
+    #[cfg(feature = "cluster")]
+    fn from_head_limits(
+        backend: &'a dyn StateBackend,
+        head: &crate::checkpoint_coordinator::ValidatedVnodeRestoreHead,
+        max_partial_bytes: u64,
+        max_artifacts_per_vnode_chain: usize,
+        max_cluster_lineage_payload_bytes: u64,
+        max_cluster_lineage_artifacts: u64,
     ) -> Result<Self, DbError> {
         if max_partial_bytes == 0 {
             return Err(DbError::Checkpoint(
@@ -251,18 +313,6 @@ impl<'a> SealedVnodeChainReader<'a> {
                 "[LDB-6050] vnode chain artifact limit must be nonzero".into(),
             ));
         }
-        let artifact_multiplier = u64::try_from(max_artifacts_per_vnode_chain).map_err(|_| {
-            DbError::Checkpoint(
-                "[LDB-6050] vnode chain artifact limit does not fit payload accounting".into(),
-            )
-        })?;
-        let global_singleton_compatibility_cap_bytes = max_partial_bytes
-            .checked_mul(artifact_multiplier)
-            .ok_or_else(|| {
-                DbError::Checkpoint(
-                    "[LDB-6050] global-singleton compatibility envelope overflows u64".into(),
-                )
-            })?;
         let attempt = head.attempt();
         Self::require_canonical_attempt(attempt)?;
         let inventory = head.inventory();
@@ -271,19 +321,34 @@ impl<'a> SealedVnodeChainReader<'a> {
                 "[LDB-6050] validated vnode restore head has an invalid seal inventory: {error}"
             ))
         })?;
-        let inventory_cell = SealInventoryCell::new();
-        inventory_cell
-            .set(inventory)
-            .map_err(|_| DbError::Checkpoint("[LDB-6050] validated seal cache collision".into()))?;
         let mut seal_cache = HashMap::new();
-        seal_cache.insert(attempt, Arc::new(inventory_cell));
+        for (cached_attempt, cached_inventory) in head.lineage_inventories() {
+            let inventory_cell = SealInventoryCell::new();
+            inventory_cell.set(cached_inventory).map_err(|_| {
+                DbError::Checkpoint("[LDB-6050] validated seal cache collision".into())
+            })?;
+            if seal_cache
+                .insert(cached_attempt, Arc::new(inventory_cell))
+                .is_some()
+            {
+                return Err(DbError::Checkpoint(
+                    "[LDB-6050] duplicate validated seal-cache attempt".into(),
+                ));
+            }
+        }
+        if !seal_cache.contains_key(&attempt) {
+            return Err(DbError::Checkpoint(
+                "[LDB-6050] validated seal cache is missing its committed head".into(),
+            ));
+        }
         Ok(Self {
             backend,
             seal_cache: tokio::sync::Mutex::new(seal_cache),
             validated_head_attempt: Some(attempt),
             max_partial_bytes,
             max_artifacts_per_vnode_chain,
-            global_singleton_compatibility_cap_bytes,
+            max_cluster_lineage_payload_bytes,
+            max_cluster_lineage_artifacts,
         })
     }
 
@@ -513,10 +578,16 @@ impl<'a> SealedVnodeChainReader<'a> {
                 },
             });
         }
-        if reserved_lineage_bytes > self.global_singleton_compatibility_cap_bytes {
+        if reserved_lineage_bytes > self.max_cluster_lineage_payload_bytes {
             return Err(DbError::Checkpoint(format!(
-                "[LDB-6050] vnode restore reserves {reserved_lineage_bytes} lineage bytes, exceeding the global-singleton compatibility envelope of {} bytes",
-                self.global_singleton_compatibility_cap_bytes
+                "[LDB-6050] vnode restore reserves {reserved_lineage_bytes} lineage bytes, exceeding the committed cluster contract of {} bytes",
+                self.max_cluster_lineage_payload_bytes
+            )));
+        }
+        if reserved_lineage_artifacts > self.max_cluster_lineage_artifacts {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6050] vnode restore reserves {reserved_lineage_artifacts} lineage artifacts, exceeding the committed cluster contract of {} artifacts",
+                self.max_cluster_lineage_artifacts
             )));
         }
         Ok(RestoreInputPreflight {

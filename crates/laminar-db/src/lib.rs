@@ -133,6 +133,8 @@ mod table_store;
 mod temporal_probe;
 mod vnode_partial;
 #[cfg(feature = "cluster")]
+mod vnode_restore_lineage;
+#[cfg(feature = "cluster")]
 mod vnode_transition_staging;
 
 // End-to-end tests for the crypto-sentiment demo pipeline, backed by wiremock.

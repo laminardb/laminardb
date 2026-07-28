@@ -241,6 +241,9 @@ async fn record_cluster_commit(
         pipeline_identity: manifest.pipeline_identity.clone(),
         assignment_fence: fence.clone(),
         seal_inventory_sha256: "33".repeat(32),
+        vnode_restore_contract: crate::cluster_recovery_capsule::vnode_restore_contract_for_test(
+            fence.vnode_count,
+        ),
         participants,
         source_offsets,
         source_metadata,
@@ -352,6 +355,9 @@ async fn record_cluster_commit_for_manifests(
         pipeline_identity: source_manifest.pipeline_identity.clone(),
         assignment_fence: fence.clone(),
         seal_inventory_sha256: "33".repeat(32),
+        vnode_restore_contract: crate::cluster_recovery_capsule::vnode_restore_contract_for_test(
+            fence.vnode_count,
+        ),
         participants,
         source_offsets,
         source_metadata,

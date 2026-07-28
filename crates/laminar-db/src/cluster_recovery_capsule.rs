@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use laminar_core::checkpoint::{
     canonical_json_sha256, CheckpointWatermark, ClusterRecoveryCapsule, ParticipantRecoveryRef,
-    CLUSTER_RECOVERY_CAPSULE_VERSION, MAX_RECOVERY_CAPSULE_BYTES,
+    VnodeRestoreContract, VnodeRestoreLimits, CLUSTER_RECOVERY_CAPSULE_VERSION,
+    MAX_RECOVERY_CAPSULE_BYTES,
 };
 use laminar_core::state::{CheckpointAttempt, CheckpointSealInventory};
 use laminar_core::storage::checkpoint_manifest::{
@@ -15,13 +16,46 @@ use laminar_core::storage::checkpoint_manifest::{
 
 use crate::error::DbError;
 
-pub(crate) const PARTICIPANT_READY_VERSION: u16 = 5;
-pub(crate) const PARTICIPANT_READY_PREFIX: &str = "participant-ready/v5/participant=";
+pub(crate) const PARTICIPANT_READY_VERSION: u16 = 6;
+pub(crate) const PARTICIPANT_READY_PREFIX: &str = "participant-ready/v6/participant=";
 pub(crate) const MAX_PARTICIPANT_READY_AGGREGATE_BYTES: u64 = MAX_RECOVERY_CAPSULE_BYTES as u64;
 pub(crate) const MAX_PARTICIPANT_READY_READ_CONCURRENCY: usize = 8;
 // `buffer_unordered` may retain every in-flight body until the aggregate loop is polled.
 pub(crate) const MAX_PARTICIPANT_READY_BYTES: u64 =
     MAX_PARTICIPANT_READY_AGGREGATE_BYTES / MAX_PARTICIPANT_READY_READ_CONCURRENCY as u64;
+
+#[cfg(test)]
+pub(crate) fn vnode_restore_limits_for_test(vnode_count: u32) -> VnodeRestoreLimits {
+    VnodeRestoreLimits::global_singleton_compatibility(64 * 1024 * 1024, 6, vnode_count)
+        .expect("test vnode restore limits")
+}
+
+#[cfg(test)]
+pub(crate) fn vnode_restore_contract_for_test(vnode_count: u32) -> VnodeRestoreContract {
+    VnodeRestoreContract::new(
+        vnode_restore_limits_for_test(vnode_count),
+        u64::from(vnode_count),
+        u64::from(vnode_count),
+        vnode_count,
+    )
+    .expect("test vnode restore contract")
+}
+
+#[cfg(test)]
+pub(crate) fn declared_vnode_restore_contract_for_test(
+    inventory: &CheckpointSealInventory,
+) -> VnodeRestoreContract {
+    let vnode_count = inventory
+        .assignment_fence
+        .as_ref()
+        .expect("test cluster inventory has a fence")
+        .vnode_count;
+    crate::vnode_restore_lineage::declared_vnode_restore_contract(
+        inventory,
+        vnode_restore_limits_for_test(vnode_count),
+    )
+    .expect("test declared vnode restore contract")
+}
 
 pub(crate) fn checked_participant_ready_total(
     retained_bytes: u64,
@@ -56,6 +90,7 @@ pub(crate) struct ParticipantReady {
     pub(crate) assignment_fence: laminar_core::checkpoint::CheckpointAssignmentFence,
     pub(crate) deployment_id: String,
     pub(crate) pipeline_identity: PipelineIdentity,
+    pub(crate) vnode_restore_limits: VnodeRestoreLimits,
     pub(crate) owned_vnodes: Vec<u32>,
     pub(crate) source_offsets: BTreeMap<String, BTreeMap<String, String>>,
     pub(crate) source_metadata: BTreeMap<String, BTreeMap<String, String>>,
@@ -173,6 +208,7 @@ fn merge_source_assignment_versions(
 pub(crate) fn assemble_capsule(
     inventory: &CheckpointSealInventory,
     readiness: Vec<(String, ParticipantReady)>,
+    vnode_restore_contract: VnodeRestoreContract,
     expected_deployment: &str,
     expected_identity: &PipelineIdentity,
     cluster_watermark: CheckpointWatermark,
@@ -191,6 +227,9 @@ pub(crate) fn assemble_capsule(
             attempt.checkpoint_id, attempt.epoch
         )));
     }
+    vnode_restore_contract
+        .validate(fence.vnode_count)
+        .map_err(|error| DbError::Checkpoint(format!("[LDB-6041] {error}")))?;
     if fence.vnode_count > laminar_core::state::MAX_KEY_GROUP_COUNT {
         return Err(DbError::Checkpoint(format!(
             "[LDB-6041] checkpoint assignment vnode count {} exceeds the production limit {}",
@@ -261,6 +300,7 @@ pub(crate) fn assemble_capsule(
             || ready.assignment_fence != *fence
             || ready.deployment_id != expected_deployment
             || ready.pipeline_identity != *expected_identity
+            || ready.vnode_restore_limits != vnode_restore_contract.limits
             || canonical_vnodes != ready.owned_vnodes
             || ready.source_offsets.keys().ne(ready.source_metadata.keys())
             || ready
@@ -438,6 +478,7 @@ pub(crate) fn assemble_capsule(
         pipeline_identity: expected_identity.clone(),
         assignment_fence: fence.clone(),
         seal_inventory_sha256,
+        vnode_restore_contract,
         participants,
         source_offsets,
         source_metadata,
@@ -555,6 +596,7 @@ mod tests {
             assignment_fence: fence.clone(),
             deployment_id: "deployment".into(),
             pipeline_identity: PipelineIdentity::empty(),
+            vnode_restore_limits: vnode_restore_limits_for_test(fence.vnode_count),
             owned_vnodes,
             source_offsets: BTreeMap::new(),
             source_metadata: BTreeMap::new(),
@@ -663,6 +705,7 @@ mod tests {
             let error = assemble_capsule(
                 &inventory,
                 readiness,
+                declared_vnode_restore_contract_for_test(&inventory),
                 "deployment",
                 &PipelineIdentity::empty(),
                 CheckpointWatermark::Uninitialized,
@@ -693,6 +736,7 @@ mod tests {
         let error = assemble_capsule(
             &inventory,
             readiness,
+            declared_vnode_restore_contract_for_test(&inventory),
             "deployment",
             &PipelineIdentity::empty(),
             CheckpointWatermark::Uninitialized,

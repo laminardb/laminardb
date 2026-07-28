@@ -1662,6 +1662,9 @@ fn committed_source_handoff(
             canonical_version: PIPELINE_IDENTITY_VERSION,
             sha256: digest(1),
         },
+        vnode_restore_contract: crate::cluster_recovery_capsule::vnode_restore_contract_for_test(
+            assignment_fence.vnode_count,
+        ),
         participants: vec![ParticipantRecoveryRef {
             participant_id: 1,
             readiness_sha256: digest(3),
@@ -3868,6 +3871,9 @@ async fn gate_recovery_capsule(
         pipeline_identity: PipelineIdentity::empty(),
         assignment_fence: fence.clone(),
         seal_inventory_sha256: digest(1),
+        vnode_restore_contract: crate::cluster_recovery_capsule::vnode_restore_contract_for_test(
+            fence.vnode_count,
+        ),
         participants: fence
             .participant_ids()
             .into_iter()

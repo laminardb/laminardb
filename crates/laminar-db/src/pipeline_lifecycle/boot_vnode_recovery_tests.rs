@@ -46,6 +46,7 @@ fn committed_source_handoff(
         )
         .unwrap(),
         seal_inventory_sha256: digest(2),
+        vnode_restore_contract: crate::cluster_recovery_capsule::vnode_restore_contract_for_test(2),
         participants: vec![ParticipantRecoveryRef {
             participant_id: 1,
             readiness_sha256: digest(3),

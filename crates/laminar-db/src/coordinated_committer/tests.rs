@@ -282,6 +282,11 @@ async fn seal_with_fence<B: StateBackend>(
                 .clone(),
             deployment_id: deployment_id(),
             pipeline_identity: identity(),
+            vnode_restore_limits: crate::cluster_recovery_capsule::vnode_restore_limits_for_test(
+                assignment_fence
+                    .expect("readiness requires an assignment fence")
+                    .vnode_count,
+            ),
             owned_vnodes: vnode_owners
                 .iter()
                 .enumerate()
@@ -518,6 +523,7 @@ async fn record_cluster_commit_with_inventory_digest<B: StateBackend>(
     let mut capsule = assemble_capsule(
         &inventory,
         readiness,
+        crate::cluster_recovery_capsule::declared_vnode_restore_contract_for_test(&inventory),
         &deployment_id(),
         &identity(),
         CheckpointWatermark::Uninitialized,
@@ -1429,6 +1435,9 @@ async fn cluster_commit_rejects_marker_written_by_another_certified_participant(
             assignment_fence: fence.clone(),
             deployment_id: deployment_id(),
             pipeline_identity: identity(),
+            vnode_restore_limits: crate::cluster_recovery_capsule::vnode_restore_limits_for_test(
+                fence.vnode_count,
+            ),
             owned_vnodes: match participant_id {
                 7 => vec![0],
                 9 => vec![1],

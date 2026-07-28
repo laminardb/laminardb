@@ -2028,8 +2028,8 @@ mod two_pc {
         fence: &CheckpointAssignmentFence,
     ) -> laminar_core::checkpoint::RecoveryCapsuleRef {
         use laminar_core::checkpoint::{
-            ClusterRecoveryCapsule, ParticipantRecoveryRef, PipelineIdentity,
-            CLUSTER_RECOVERY_CAPSULE_VERSION,
+            ClusterRecoveryCapsule, ParticipantRecoveryRef, PipelineIdentity, VnodeRestoreContract,
+            VnodeRestoreLimits, CLUSTER_RECOVERY_CAPSULE_VERSION,
         };
 
         fn digest(byte: u8) -> String {
@@ -2048,6 +2048,19 @@ mod two_pc {
                 portable_state_sha256: portable_state_sha256.clone(),
             })
             .collect();
+        let vnode_restore_limits = VnodeRestoreLimits::global_singleton_compatibility(
+            u64::from(fence.vnode_count),
+            1,
+            fence.vnode_count,
+        )
+        .unwrap();
+        let vnode_restore_contract = VnodeRestoreContract::new(
+            vnode_restore_limits,
+            u64::from(fence.vnode_count),
+            u64::from(fence.vnode_count),
+            fence.vnode_count,
+        )
+        .unwrap();
         let capsule = ClusterRecoveryCapsule {
             version: CLUSTER_RECOVERY_CAPSULE_VERSION,
             attempt: CheckpointAttempt::new(checkpoint_id, checkpoint_id),
@@ -2055,6 +2068,7 @@ mod two_pc {
             pipeline_identity: PipelineIdentity::empty(),
             assignment_fence: fence.clone(),
             seal_inventory_sha256: digest(2),
+            vnode_restore_contract,
             participants,
             source_offsets: Default::default(),
             source_metadata: Default::default(),
