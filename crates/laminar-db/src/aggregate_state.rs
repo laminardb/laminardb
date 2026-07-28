@@ -926,8 +926,11 @@ pub(crate) struct AggVnodeRestore<'a> {
     pub(crate) deltas: &'a [AggVnodeDelta],
 }
 
-/// Fully decoded aggregate replacement prepared off the live side of the publication fence.
-/// Fields stay private so callers cannot publish a partial vnode roster.
+/// Fully decoded aggregate mutation plan with private replacement collections.
+///
+/// Fields stay private so callers cannot publish a partial vnode roster. Preparation does not
+/// change logical map contents or dirty/delta bookkeeping, but it may grow live map capacity so
+/// publication can remain allocation-free.
 #[cfg(feature = "cluster")]
 pub(crate) struct PreparedAggVnodeTransition {
     transitioned_vnodes: Vec<u32>,
@@ -2318,12 +2321,14 @@ impl IncrementalAggState {
         }
     }
 
-    /// Decode and build one aggregate state transition without changing live map contents or any
+    /// Decode and build one aggregate state transition without changing logical map contents or
     /// dirty/delta bookkeeping. Every restored vnode is authoritative: keys absent from its final
     /// base-plus-delta image are removed alongside every explicitly revoked vnode.
     ///
-    /// Capacity for both publication and retirement is reserved here. Once this returns, the graph
-    /// must keep the operator quiescent until it either drops the prepared value or publishes it.
+    /// Capacity for both publication and retirement is reserved here, including capacity on live
+    /// maps. A failed or aborted prepare can therefore retain capacity/RSS while leaving logical
+    /// state unchanged. Once this returns, the graph must keep the operator quiescent until it
+    /// either drops the prepared value or publishes it.
     #[cfg(feature = "cluster")]
     pub(crate) fn prepare_vnode_transition(
         &mut self,

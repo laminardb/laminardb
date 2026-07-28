@@ -15,6 +15,14 @@
   `[LDB-4007]`. The physical-route boundary is family-specific: bounded interval joins other than
   `INNER` fail in planning, while temporal and lookup translation can still coerce unsupported join
   types into a physical candidate which cluster admission then rejects with `[LDB-4007]`.
+- Managed SQL aggregate vnode transitions now decode and validate complete restore chains into
+  a prepared mutation plan with private replacement collections, prepare all applicable
+  participants, abort all attempted participants on prepublication failure, publish under exact
+  graph authority through unit-returning hooks, and retire displaced state after publication locks
+  are released. Preparation preserves logical rows/bookkeeping but may reserve live-map capacity.
+  Cluster graph initialization also rejects a cached `Rejected` capability or post-initialization
+  descriptor drift. This does not add a backend or widen operator, source, sink, or delivery
+  admission; `[LDB-4007]` remains unchanged.
 - Replacement cluster processes now start fenced and use the audited recovery-successor path to
   recertify durable vnode owners. Pristine vnode-zero bootstrap remains distinct from stale owner
   or drain state, and a stale-process drain terminal is settled before successor recovery.

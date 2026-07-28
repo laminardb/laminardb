@@ -3,7 +3,7 @@
 - **Status:** Core reference implementation resumed; production qualification/certification paused;
   exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster operator is admitted
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-28 during Core Cycle 7
+- **Last reconciled:** 2026-07-28 during Core Cycle 8
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -40,7 +40,7 @@ through every phase; they are not a final cleanup sprint.
 
 The owner reset is recorded normatively in
 [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset).
-Cycle 69 and later certification work are paused. Core Cycles 1–7 add a private reference shard and
+Cycle 69 and later certification work are paused. Core Cycles 1–8 add a private reference shard and
 a fail-closed graph containment path: exact owned/restoring vnode-roster and chain preflight,
 deterministic callbacks, delayed activation, sticky poison after indeterminate mutation, boot-cut
 validation, predecessor-authority repair, control-only completion while source intake is closed,
@@ -89,8 +89,19 @@ acquisition, local validation, the report scan, and durable CAS share one absolu
 deadline; an error or timeout after CAS begins is outcome-unknown and the next pass reconciles the
 reloaded durable head. The wire change deliberately rejects old/missing-field reports and is not
 rolling-compatible without a separately designed bridge.
-Graph-wide prepare/publish/abort shadows, transition resource bounds, and bounded working-state
-storage are the next lifecycle slices.
+Cycle 8, recorded in the
+[cycle review](../reviews/distributed-keyed-state-core-cycle-08.md), connects the existing managed
+SQL aggregate to a graph-owned prepare-all/abort-all/infallible-publish lifecycle. Complete chains
+are decoded and validated into a mutation plan with private replacement collections before logical
+state changes; prepublication failure aborts every attempted participant, although live-map
+capacity reserved for allocation-free publication can remain; exact authority is revalidated while
+the pending and installed-state locks are held; and displaced state is retired after those locks
+are released. Cluster initialization also rejects cached `Rejected` capability or
+post-initialization descriptor drift with `[LDB-4007]`.
+Cycle 9 adds the transition-wide encoded-byte, object/request, retained-spool, decoder-scratch,
+decoded-RSS, live/prepared/retired-residency, and apply-pause budget. It will split the large
+aggregate prepare and vnode-transition/test modules along those real lifecycle phases rather than
+introducing a speculative storage abstraction. Bounded working-state storage remains later.
 Backend work does not block these slices. TidesDB re-entry and the upstream-contribution boundary
 are owned by the
 [TidesDB design](../architecture-decisions/tidesdb-local-state-successor-design.md).
@@ -227,10 +238,12 @@ read token from after sink FIFO fencing, through shuffle alignment and both whol
 images, with assignment-certificate checks at acquisition, post-alignment, and post-capture. The
 token ends before encoding, durable tail I/O, or awaited cleanup. This closes assignment publication
 between final quiescence and capture without adding row-path work or a second lock. Multiple
-admitted global-aggregate queries also prove sequential vnode-0 partial apply is structurally
-reachable, but an explicit apply error already forces whole-generation recovery and no output/cut;
-the future managed lifecycle still needs roster-complete off-side prepare/publish. Cluster admission,
-at-least-once delivery, backend status, and source/sink capability remain unchanged.
+admitted global-aggregate queries also proved the former sequential vnode-0 partial apply was
+structurally reachable; at Cycle 48 an explicit apply error forced whole-generation recovery and no
+output/cut. Core Cycle 8 replaces production `SqlAggregateV1` application with roster-complete
+off-side prepare-all/abort-all and authority-fenced publication. The legacy callback path remains
+test-only. Cluster admission, at-least-once delivery, backend status, and source/sink capability
+remain unchanged.
 
 Cycle 49 completes the local follower and anomalous-contention probes. Both immediate and deferred
 follower routes hold the rotation read token across whole/vnode mutable capture and release it before
@@ -715,9 +728,10 @@ Work packages:
 
 ### 1E. Ownership lifecycle
 
-Cycles 6–7 land the transition-identity, structural-preflight, authoritative-roster, explicit-empty,
-authority-revalidation, and failure-containment subsets below. Phase 1E remains open until shadow
-preparation/publication, resource bounds, and full lifecycle tests are complete.
+Cycles 6–8 land the transition identity, structural preflight, authoritative roster, explicit
+empty-state, and aggregate prepare/publish subsets below. Phase 1E remains open until transition
+resource/pause bounds, vnode-sharded bounded-cost publication, a second real state-family consumer,
+and full lifecycle/fault/performance evidence are complete.
 
 - Implement `Unowned -> Acquiring -> Restoring -> Validated -> Active` and
   `Active -> Frozen/Draining -> Revoked` in the graph/runtime.
@@ -738,15 +752,17 @@ preparation/publication, resource bounds, and full lifecycle tests are complete.
   local validation, report read, and durable CAS; CAS timeout/error is outcome-unknown and requires
   durable-head reconciliation before another rotation. The mandatory report field intentionally
   makes old/missing-field control records incompatible.
-- **Remaining:** replace the transitional managed hooks with the smallest cohesive state-lifecycle
-  boundary demonstrated by aggregate and join consumers. Stateful capability without complete
-  initialize/capture/prepare/publish/abort/revoke behavior is a preflight error; stateless
-  operators remain legitimate nonparticipants, and no successful default can discard named state.
-- Preflight the complete batch before callbacks, prepare all operator/vnode shadows, and abort all
-  shadows on error while retaining the exact inbox item. With intake closed, enter exclusive graph
-  publication, use the rotation fence to revalidate assignment/process scope, and perform only
-  infallible shard/generation swaps. Retain old handles for destruction after the short section;
-  activate the complete set and remove the inbox item only after every operator publishes.
+- **Landed in Cycle 8 for `SqlAggregateV1`:** decode and validate every restore chain into private
+  prepared state; prepare all applicable aggregate participants; abort and finish every attempted
+  participant on a prepublication error; lock and revalidate the exact pending transition,
+  installed binding, assignment, transport, registry, and roster; then run only unit-returning
+  participant publication, activate the complete set, install the exact binding, and clear the
+  exact inbox item. Retire displaced aggregate and binding state after releasing publication
+  locks; poison and clear installed authority on publication unwind.
+- **Remaining:** keep stateful capability fail-closed unless initialize, capture, prepare, publish,
+  abort, revoke, and finish are complete. Generalize this boundary only when a window or join
+  consumer proves its timer/cursor/output needs; stateless operators remain legitimate
+  nonparticipants, and no successful default may discard named state.
 - Evolve the current named FULL-with-empty-state encoding only if measurement justifies explicit
   `BODY`/`REFERENCE` and `FULL`/`DELTA`/`EMPTY` envelope tags. Preserve exact roster validation and
   ensure every resolved participant chain terminates in a semantic FULL/EMPTY base. Omission,
@@ -760,8 +776,9 @@ preparation/publication, resource bounds, and full lifecycle tests are complete.
 - Bound acquired-vnode input buffering, bulk install, post-acquire full rebase, and revoked-range
   cleanup. Prove stale owners cannot read/write/publish after rotation.
 - Add one transition-wide reservation before fetch/prepare for transitive encoded bytes, object and
-  request count, retained spool, decode scratch, decoded RSS, and publication-pause work. Per-vnode
-  limits do not substitute for this aggregate budget.
+  request count, retained spool, decode scratch, decoded RSS, simultaneous live/prepared/retired
+  residency, and publication/retirement-pause work. Per-vnode limits do not substitute for this
+  aggregate budget.
 - Introduce vnode-owned state shards before the aggregate migration so acquire/revoke publication
   is a bounded pointer swap rather than a full-map scan.
 
@@ -769,8 +786,9 @@ Tests:
 
 - backend model/conformance tests over random atomic batches, scans, deletes, snapshots, and restore;
 - crash before/after write, freeze, encode, upload, seal, install, activate, revoke, and range delete;
-- late-operator and later-vnode prepare failure leaves all live state unchanged, retains the exact
-  staged transition, and activates no vnode; an explicit `EMPTY` base removes stale state while
+- late-operator and later-vnode prepare failure leaves logical rows, dirty/delta bookkeeping,
+  ownership, and output unchanged, retains the exact staged transition, and activates no vnode;
+  capacity/RSS growth is charged separately. An explicit `EMPTY` base removes stale state while
   missing/extra/duplicate roster entries fail before prepare;
 - uninitialized operators cannot activate after byte staging alone; exact semantic/state-contract
   goldens, same-name custom UDAF rejection, global vnode-0, truncation at every envelope/row

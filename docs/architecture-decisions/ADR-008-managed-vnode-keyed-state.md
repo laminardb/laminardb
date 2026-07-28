@@ -3,7 +3,7 @@
 - **Status:** Accepted for phased implementation; core reference work resumed, production
   qualification paused, and cluster admission unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-28 during Core Cycle 7
+- **Last reconciled:** 2026-07-28 during Core Cycle 8
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -14,7 +14,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest core review](../reviews/distributed-keyed-state-core-cycle-07.md)
+  [latest core review](../reviews/distributed-keyed-state-core-cycle-08.md)
 
 ## Decision
 
@@ -36,13 +36,19 @@ No runtime backend dependency or adapter is authorized by this ADR state.
 Cycle 69 and the A/B, observer, transcript, and certification-tooling sequence remain paused. Cycle
 68 remains a completed historical boundary. One narrowly scoped Core Cycle 7 engineering rerun
 later validated its recovery fix; it did not resume certification or authorize further soak work.
-Core implementation resumes with one deliberately small reference vertical: concrete vnode-local
+Core implementation resumed with one deliberately small reference vertical: concrete vnode-local
 append-only `COUNT(*)` + nullable direct
 `SUM(Int64)` state, hard semantic-payload byte accounting, whole-batch validation before mutation,
 portable FULL/EMPTY capture, off-side restore/revoke/retained-fence preparation, and
-caller-supplied transition-batch preflight followed by infallible publication. The future graph
-owner must still prove authoritative roster completeness. This is not a generic working-state
-trait, a runtime-selectable backend, a production memory profile, or an admission consumer.
+caller-supplied transition-batch preflight followed by infallible publication. Core Cycle 8
+connects the existing SQL aggregate participant to the graph-owned transition: every restore chain
+is decoded and validated into a mutation plan with private replacement collections, the graph
+prepares all applicable aggregate participants and aborts all attempted participants on a
+prepublication error, publication occurs
+under the exact pending-transition and installed-state authority locks, and retired state is
+destroyed after those locks are released. This is still the raw in-memory aggregate reference
+lifecycle, not a generic working-state trait, runtime-selectable backend, production memory
+profile, or admission consumer.
 
 This exception permits backend-neutral reference code while the Phase 0 product gate remains open.
 It does not authorize TidesDB candidate qualification, runtime construction or execution, an
@@ -183,10 +189,15 @@ qualification must measure that write/readback load and may coalesce it only wit
 cannot hide withdrawal. Required bounded health signals and the still-open transition-wide
 encoded/object/scratch/RSS/publication budget are specified in the implementation plan.
 
-This remains transition identity and structural lifecycle validation, not complete Phase 1.
-Operator payload decoding and mutation still happen in sequential callbacks instead of graph-wide
-abortable prepare followed by infallible shadow publication. Transition-wide encoded bytes, object
-count, decode scratch, decoded RSS, publication pause, bounded hot working state, source/state/sink
+Core Cycle 8 lands graph-wide prepare-all/abort-all, authority-fenced infallible publication, and
+post-lock retirement for the existing managed SQL aggregate participant. Complete chain decoding,
+vnode membership, exact final group cardinality, changelog dirtiness, and failed-generation rebase
+bookkeeping are validated before live mutation. Cluster graph startup rejects a cached `Rejected`
+capability and rejects any post-initialization descriptor drift with `[LDB-4007]`.
+
+This remains an aggregate reference lifecycle, not complete Phase 1. Transition-wide encoded
+bytes, object and request count, decode scratch, decoded RSS, transient live-plus-prepared-plus-
+retired residency, publication/retirement pause, bounded hot working state, source/state/sink
 delivery composition, tail-latency evidence, backend qualification, and independent soak remain
 open. Every implemented local keyed/windowed/join candidate that reaches cluster admission stays
 behind `[LDB-4007]`. Some unsupported temporal/lookup forms are currently coerced to `INNER` and
@@ -495,13 +506,13 @@ supersession cancels without capture. The token is released before encoding, che
 or awaited cleanup; deadline-bounded shuffle transport and authority-settlement reads remain inside
 because aligned channel state belongs to the cut.
 
-The current global-aggregate exception is compositional: separate admitted stream queries can put
-multiple vnode-0 aggregate operators in one graph. A later transition-apply failure can follow an
-earlier mutation, but the existing checkpoint error maps to whole-generation recovery, publishes no
-output/cut, and destroys that graph before returning. This containment justifies no second poison
-for explicit returned errors. It does not authorize reuse of the sequential apply loop for future
-keyed/window/join/MV state. Those operators still require the authoritative roster, complete
-off-side prepare, and infallible whole-graph publish specified below.
+The global-aggregate exception is compositional: separate admitted stream queries can put multiple
+vnode-0 aggregate operators in one graph. At Cycle 48 the production path still applied them
+sequentially and relied on whole-generation recovery after a later failure. Core Cycle 8 replaces
+that aggregate path with roster-complete prepare-all/abort-all and authority-fenced infallible
+publication. The old mutation callbacks remain only as test fault probes. Future keyed, window,
+join, and MV state must consume the managed lifecycle and additionally close their bounded-resource,
+timer/cursor/output, and delivery contracts before admission.
 
 Cycle 48 adds no normal row-path operation and no new lock, atomic, task, backend, or abstraction.
 Checkpoint capture adds short staging-map/version checks and a deadline-bounded read acquisition on
@@ -822,22 +833,31 @@ Restore follows this protocol:
 5. complete every fallible action before publication, then perform only unit-returning pointer or
    generation swaps, mark the complete acquired set `Active`, and remove that exact transition;
    and
-6. leave the short publication section, destroy retired shard handles asynchronously, and open
-   source/shuffle/output intake only after complete publication.
+6. release publication locks, retire displaced state outside those locks, and open
+   source/shuffle/output intake only after complete publication. Off-thread retirement remains a
+   future measured design choice rather than a current guarantee.
 
-Cycle 6 implements the immutable authority envelope, complete structural preflight, post-callback
-authority revalidation, delayed all-vnode activation, exact transition retention, and poison
-containment subset. It does not yet implement abortable semantic shadows or infallible shard swaps:
-callbacks still mutate sequentially, so a later failure can follow earlier mutation. That failure
-clears installed authority, retains the exact transition, keeps acquired vnodes non-active, poisons
-the graph generation, and requires restore into a fresh graph.
+Cycles 6–8 implement the immutable authority envelope, complete structural preflight, exact
+transition retention, and the prepare/publish protocol for `SqlAggregateV1`. Each aggregate fully
+decodes and validates its complete restore/revoke batch into a mutation plan with private
+replacement collections. Any prepare or authority error aborts and finishes every attempted
+participant without poisoning or changing logical rows, dirty/delta bookkeeping, or ownership.
+Live-map capacity may remain larger after a failed prepare. The graph then locks the exact pending
+slot and installed-state handle, revalidates
+assignment, transport, registry, and roster authority, invokes only unit-returning participant
+publication, activates the complete roster, installs the exact binding, and clears that exact
+pending transition. Retired aggregate state and the previous installed binding are destroyed only
+after both locks are released. An unwind after publication begins clears installed authority and
+poisons the graph generation.
 
-Sequential in-memory swaps are logically atomic because exclusive graph/callback serialization and
-closed intake prevent a source row, shuffle row, checkpoint, or output from observing the graph
-between them; the rotation fence separately prevents assignment change. Swaps retain old handles
-so refcount drops and destructors cannot extend the fenced section. A process crash in that short
-publication section discards the process image and reconstructs from the unchanged durable cut. A
-changed assignment during asynchronous prepare aborts the shadows and publishes nothing.
+That proves logical atomicity for the current aggregate participant because graph execution and
+assignment publication are excluded across the cut. It is not a bounded-pause result. Aggregate
+publication still moves/updates collections in proportion to transitioned state, preparation can
+temporarily retain live state and prepared replacement collections, can grow live capacity even if
+later aborted, and retirement can run destructors proportional to displaced state. Cycle 9 must
+add one transition-wide resource/deadline budget and either prove the apply pause or introduce
+vnode-level indirection before admission. A process crash during
+publication still discards the process image and reconstructs from the unchanged durable cut.
 
 Before any artifact fetch, graph construction runs a pure, fallible state-contract derivation for
 every lifecycle participant and caches the exact incremental physical plan, implementation/codec
