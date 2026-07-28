@@ -6,7 +6,7 @@
   dependency, backend qualification evidence, independent production-soak result, or admission
   change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-28 during Core Cycle 9
+- **Last reconciled:** 2026-07-28 during Core Cycle 10
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -28,7 +28,7 @@ The [2026-07-27 ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed
 pauses Cycle 69 and later certification work and authorizes only the private reference core slice.
 It is not Phase 0 completion, backend qualification, or permission to execute a candidate.
 
-Core Cycles 2–9 add a fail-closed runtime containment path for staged local vnode transitions and a
+Core Cycles 2–10 add a fail-closed runtime containment path for staged local vnode transitions and a
 narrow audited, committed final-owner revoke path. Cycles 4–6 pin restore to the capsule-validated
 seal, enforce immutable attempt identity and bounded chain traversal, and replace split staging with
 one transition bound to exact checkpoint, assignment, process, pipeline, acquired, and revoked
@@ -43,9 +43,11 @@ requested subset before body reads, single-flights successful parent seal loads,
 arithmetic and decoded base identity, and validates a verified-body receipt at immutable staging.
 The outer wrapper is now `LDBVP3` version 3 with a 164-byte header and seals are version 8; older
 V2/seal-7 cuts require an explicit reset until a migration bridge exists. These cycles do not impose
-the cluster-global pre-Commit keyed budget or complete wrapper/request/spool/decode/RSS/pause
-limits, consume the proposed managed V2 format, add a hot-state backend, authorize a stateful query,
-or change delivery.
+the production keyed budget or hold the acquired raw-body envelope as a transition-lifetime
+reservation. Cycle 10 binds participant-agreed current-profile limits and exact metadata-verified
+cluster totals into capsule v6 before Commit and reproduces them before restore body reads. Complete
+wrapper/request/spool/decode/RSS/pause limits remain open; these cycles do not consume the proposed
+managed V2 format, add a hot-state backend, authorize a stateful query, or change delivery.
 
 The phase is complete only when maintainers can answer, with versioned evidence:
 
@@ -869,21 +871,24 @@ Remaining work is kept reviewable in this dependency order:
    missing later native fixes, silent short-transaction success, an unclosed general cgroup
    envelope, and missing mandatory public health facts; no build, link, candidate execution, or
    runtime code followed;
-3. complete only the remaining backend-neutral Laminar gaps required regardless of the engine:
-   metadata-traverse every required parent seal and verify exact child-parent lineage before the
-   pre-Commit cluster-global payload/artifact sum; bind restore to that same exact-subset contract;
-   then separately close wrapper/seal/request/spool/decode/RSS/pause reservations, vnode sharding,
-   minimum truthful health signals, and a second state-family consumer. The outcome, publication,
-   checkpoint/rebalance fencing, fresh-root, capability, and current raw-reader containment already
-   landed in Core Cycles 6–9 and must remain regression coverage rather than being reimplemented.
+3. complete only the remaining backend-neutral Laminar gaps required regardless of the engine.
+   Core Cycle 10 now metadata-traverses every required parent seal, verifies exact child-parent
+   lineage before the pre-Commit cluster-global payload/artifact sum, persists participant-agreed
+   limits and verified totals in capsule v6, and makes restore reproduce that contract before body
+   reads. Next, make the acquired-subset raw budget a held transition reservation with bounded
+   in-flight response/request permits and an absolute acquisition deadline/cancellation, and
+   separately close wrapper/seal/request/spool/decode/RSS/pause reservations, vnode sharding, minimum truthful
+   health signals, and a second state-family consumer. The outcome, publication,
+   checkpoint/rebalance fencing, fresh-root, capability, and current raw-lineage authority already
+   landed in Core Cycles 6–10 and must remain regression coverage rather than be reimplemented.
    Defer TidesDB's owner lane and verified-readback machinery; do not add or execute the package in
    this slice. The completed containment increments and their tests are summarized in the
-   [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md). Core Cycles 6–9
+   [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md). Core Cycles 6–10
    complete the immutable transition, aggregate prepare/publication, and current raw-lineage
-   containment subsets. The next backend-neutral slice is the exact cluster-global pre-Commit
-   lineage budget; wrapper/request/spool/decode/RSS/pause limits, vnode sharding, and a second state
-   family remain open. The latest exact boundary is recorded in the
-   [Cycle 9 review](../reviews/distributed-keyed-state-core-cycle-09.md);
+   authority subsets. The next backend-neutral slice is the held acquired-subset raw transition
+   reservation; wrapper/seal/request/spool/decode/RSS/pause limits, vnode sharding, and a second
+   state family remain open. The latest exact boundary is recorded in the
+   [Cycle 10 review](../reviews/distributed-keyed-state-core-cycle-10.md);
 4. wait for a new official Cargo package `tidesdb`, freeze its exact native pair, and repeat the
    complete four-engineer-hour/one-working-day/zero-machine-hour T0. The repeated T0 must reconcile
    every later native fix and prove exact transaction success or explicitly accept the full-key

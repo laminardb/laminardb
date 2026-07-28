@@ -3,7 +3,7 @@
 - **Status:** Core reference implementation resumed; production qualification/certification paused;
   exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster operator is admitted
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-28 during Core Cycle 9
+- **Last reconciled:** 2026-07-28 during Core Cycle 10
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -40,7 +40,7 @@ through every phase; they are not a final cleanup sprint.
 
 The owner reset is recorded normatively in
 [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset).
-Cycle 69 and later certification work are paused. Core Cycles 1–9 add a private reference shard and
+Cycle 69 and later certification work are paused. Core Cycles 1–10 add a private reference shard and
 a fail-closed graph containment path: exact owned/restoring vnode-roster and chain preflight,
 deterministic callbacks, delayed activation, sticky poison after indeterminate mutation, boot-cut
 validation, predecessor-authority repair, control-only completion while source intake is closed,
@@ -107,13 +107,25 @@ current legacy path. Its `max_partial_bytes * 6` envelope is accepted only as in
 containment for current global vnode-0 fixtures; it neither proves every committed cut restorable
 nor supplies the production keyed or multi-vnode budget.
 
-Core Cycle 10 should metadata-traverse every required parent seal, verify each child lineage as an
-exact checked extension through a root, and only then sum and validate the cluster-global raw-
-payload/artifact total after readiness and before capsule persistence/Commit. Restore must consume
-that same cluster-identity-bound contract for its acquired subset. Wrapper/seal metadata, aggregate
-object/request count, response buffering, retained spool, decoder scratch/expansion, decoded/live/
-prepared/retired RSS, and apply/retirement pause and deadline remain separate limits. Bounded
-working-state storage remains later.
+Cycle 10, recorded in the
+[cycle review](../reviews/distributed-keyed-state-core-cycle-10.md), closes the Commit-domain raw-
+lineage authority gap for the current admitted profile. Participant readiness v6 attests exact
+payload/ancestry limits. After validating that roster and before capsule persistence or Commit, the
+leader walks every required parent seal to a root, checks each lineage extension, and recomputes the
+cluster-wide payload/artifact totals stored in recovery capsule v6. Recovery repeats the same
+metadata-only proof, requires the local runtime to derive the exact committed limits, and constrains its
+acquired subset before body reads. A rejected post-seal attempt is no longer successor-parent
+eligible. The contract is deliberately tagged `global_singleton_compatibility`; it is not keyed
+admission or a memory reservation. A staged-byte or retained-depth configuration change across a
+live cut requires reset/new namespace until a capability-superset rule exists.
+
+Core Cycle 11 should make raw transition acquisition resource-owning rather than comparison-only:
+derive the exact acquired subset, reserve its raw body/artifact budget for the lifetime of the
+transition, bind request concurrency to those permits, cap retained in-flight response/spool bytes,
+apply an absolute restore/acquisition deadline with cancellation, and prove release on publish,
+abort, poison, and graph replacement. Encoded wrapper/seal metadata, decoder scratch and expansion,
+decoded/live/prepared/retired RSS, and apply/retirement pause remain separate limits.
+Bounded working-state storage remains later.
 Backend work does not block these slices. TidesDB re-entry and the upstream-contribution boundary
 are owned by the
 [TidesDB design](../architecture-decisions/tidesdb-local-state-successor-design.md).

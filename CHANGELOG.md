@@ -37,6 +37,24 @@
   bridge exists. This is not a hot-state backend, complete restore-memory/request/pause budget,
   delivery or exactly-once change, keyed/window/join/MV admission, latency/RSS result, or soak
   result; `[LDB-4007]` and `[LDB-0013]` remain closed.
+- Cluster recovery capsules now carry a versioned vnode-restore contract. Every sealed participant
+  readiness record attests the same current-profile payload and ancestry limits; the leader first
+  validates the complete readiness roster, then metadata-walks every required vnode through exact
+  parent seals to a root, recomputes checked cluster-wide payload/artifact totals, and persists the
+  capsule only if those totals match the bounded contract. Recovery repeats that full metadata
+  proof before any vnode body read, requires the target runtime to derive exactly the same limits,
+  seeds body loading with the validated seal inventory set, and preflights each acquired subset
+  against the committed totals. A post-seal validation failure publishes Abort when durable
+  authority is available; an unresolved Abort requires recovery. Neither outcome can promote that
+  attempt as a later delta/reference parent or acknowledge its source cut. Promotion is now an
+  infallible in-memory step only after the exact durable Commit wins.
+  Recovery capsules advance from version 5 to 6 and participant readiness keys/payloads from v5 to
+  v6; older cluster cuts require an explicit state/checkpoint reset or new namespace. Changing the
+  staged-byte or retained-chain configuration across a live cut has the same reset boundary until
+  a versioned capability-superset rule exists. The limits are explicitly tagged
+  `global_singleton_compatibility`: they close the Commit-domain raw-lineage authority gap but are
+  not a memory reservation, keyed admission, hot-state backend, or production resource/latency
+  result. `[LDB-4007]` and `[LDB-0013]` remain unchanged.
 - Replacement cluster processes now start fenced and use the audited recovery-successor path to
   recertify durable vnode owners. Pristine vnode-zero bootstrap remains distinct from stale owner
   or drain state, and a stale-process drain terminal is settled before successor recovery.

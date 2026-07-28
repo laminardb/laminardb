@@ -6,7 +6,7 @@
 
 **Scope:** admission and lifecycle validation only; no cluster capability is enabled by this work.
 
-**2026-07-28 core update (through Core Cycle 9):** The
+**2026-07-28 core update (through Core Cycle 10):** The
 [ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset)
 pauses later certification tooling. Core Cycle 1 adds a private reference managed vnode shard and
 caller-supplied lifecycle publication. Core Cycles 2–4 contain the existing runtime staging path
@@ -47,11 +47,21 @@ body reads, single-flights successful parent seal inventories, verifies exact ch
 arithmetic and decoded base identity before a parent body, and counts reference-only bodies in the
 receipt validated at immutable staging. The raw rkyv body is unchanged, but the outer wrapper is
 `LDBVP3` version 3 with a 164-byte header and seals are version 8. V2/seal-7 cuts require an
-explicit state/checkpoint reset until a migration bridge exists.
+explicit state/checkpoint reset until a migration bridge exists. Cycle 10 binds participant-agreed
+current-profile payload and ancestry limits plus exact verified cluster-wide lineage totals into
+recovery capsule v6. After complete readiness validation and before capsule persistence or Commit,
+the leader metadata-walks every required vnode through exact parent seals to a root. Restore repeats
+the complete proof before body reads and requires exact equality with the target runtime's derived
+limits. A post-seal failure publishes Abort when authority is available; an unresolved Abort
+requires recovery. Neither path acknowledges or makes that attempt a later reference/delta parent;
+leader parent promotion occurs only after the exact Commit wins. Readiness v5, capsule v5, and a
+staged-byte/retained-depth configuration change across a live cut require an explicit reset or new
+namespace until a capability-superset rule exists.
 
 These cycles do not add a bounded working-state backend or runtime selector, validate the exact
-cluster-global pre-Commit keyed budget, bound total transition memory/request/pause, admit a
-keyed/windowed/join operator, or relax `[LDB-4007]` or `[LDB-0013]`.
+production keyed budget, hold the acquired raw-body envelope as a transition-lifetime reservation,
+bound total transition memory/request/pause, admit a keyed/windowed/join operator, or relax
+`[LDB-4007]` or `[LDB-0013]`.
 
 Cycle 7 also separates durable assignment adoption from installed vnode-state readiness.
 `CheckpointAssignmentAdoption.vnode_state_ready` is published `false` before startup/recovery clears
@@ -1099,25 +1109,23 @@ a managed keyed working-state capability connected to the distributed execution 
    tests, process-death/rebalance output oracles, recovery compatibility, and published latency and
    resource profiles.
 
-Core Cycles 6–9 implement the transition identity, authoritative participant roster, named FULL
+Core Cycles 6–10 implement the transition identity, authoritative participant roster, named FULL
 payloads whose decoded aggregate image is empty, placement scoping, structural preflight, aggregate
 semantic prepare-all/abort-all/infallible publication, net live-growth reserve, and current-path
-sealed raw-lineage receipt subsets of item 5. They do not complete the capability: the exact
-cluster-global total is not validated before Commit, while wrapper/seal metadata, object/request
-count, retained spool, decode scratch/expansion, decoded RSS, simultaneous live/prepared/retired
-residency, and publication/retirement pause remain unreserved. The aggregate maps are not vnode-
-sharded for bounded-cost swaps, and no window/timer or join state family consumes the lifecycle.
-The hot-state service/backend, delivery composition, operator-specific contracts, and independent
-production proof in items 2–9 also remain open.
+sealed raw-lineage receipt and Commit-domain authority subsets of item 5. Cycle 10 validates the
+complete cluster-global raw lineage before Commit and binds the exact totals and participant-agreed
+limits into the durable capsule. Restore reproduces the full metadata proof before bodies and
+preflights its acquired subset under the same contract. A rejected sealed attempt cannot become a
+successor parent.
 
-Core Cycle 10 should close one durable-authority gap: starting from every required head after
-readiness validation, metadata-traverse exact parent seals and prove every child lineage is the
-checked extension of its parent through a root. Only then sum the cluster-global raw-payload/
-artifact envelope before capsule persistence/Commit and make restore consume that same cluster-
-identity-bound contract. Mismatch must fail before Commit or body GET while admission remains
-closed. Header/seal metadata, request/object count, spool/decoder/RSS, vnode-sharded publication,
-pause/deadline, backend qualification, delivery, windows/joins, and independent soak remain
-separately owned later gates.
+They do not complete the capability. The current contract is comparison-only and deliberately
+limited to the admitted global-singleton compatibility profile; it does not hold transition-lifetime
+raw-body memory or request permits. Wrapper/seal metadata, response buffering, request concurrency,
+retained spool, decode scratch/expansion, decoded RSS, simultaneous live/prepared/retired residency,
+and publication/retirement pause remain unreserved. The aggregate maps are not vnode-sharded for
+bounded-cost swaps, and no window/timer or join state family consumes the lifecycle. The hot-state
+service/backend, delivery composition, operator-specific contracts, and independent production
+proof in items 2–9 also remain open.
 
 The existing `StateBackend` must not be mistaken for item 2. Its contract explicitly persists
 immutable per-checkpoint-attempt vnode artifacts and an exact-attempt durability seal. It has no

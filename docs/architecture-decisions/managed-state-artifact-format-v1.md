@@ -352,10 +352,12 @@ These borrowed managed-V2 readers validate only bytes already admitted under the
 reservations; their encoders allocate complete vectors. They are not wired into manifest dispatch
 or the production managed restore transaction and do not relax `[LDB-4007]`. Separately, Core Cycle
 9 makes the current legacy raw-rkyv recovery path use exact V3/seal-8 lineage, requested-subset
-preflight, bounded sealed body reads, exact parent checks, and a staged verified-input receipt. That
-containment neither authenticates or decodes `VnodePartialV2` nor supplies the still-open pre-Commit
-cluster-global/keyed budget. Managed whole-transition preflight must still validate every roster
-entry, aggregate every object and decoder counter, and finish every chain before callbacks.
+preflight, bounded sealed body reads, exact parent checks, and a staged verified-input receipt. Core
+Cycle 10 adds participant-agreed current-profile limits, complete metadata-only ancestry traversal,
+and a checked cluster-global contract before Commit and again at restore. That containment neither
+authenticates or decodes `VnodePartialV2` nor holds a raw-body memory reservation. Managed whole-
+transition preflight must still validate every roster entry, aggregate every object and decoder
+counter, and finish every chain before callbacks.
 
 ## Rolling compatibility
 
@@ -366,6 +368,6 @@ participant advertises the manifest-selected reader capability and trusted seale
 wired. Legacy rkyv remains reachable only through explicit legacy inventory proof for the admitted
 global vnode-0 path. There is no magic-sniff fallback in either direction.
 
-The Cycle 9 V3/seal-8 change is an explicit reset boundary for current raw-rkyv checkpoint state,
-including the admitted global vnode-0 path; it is not evidence that this future managed rolling
-protocol has been implemented.
+The Cycle 9 V3/seal-8 and Cycle 10 capsule-v6/readiness-v6 changes are explicit reset boundaries for
+current raw-rkyv cluster checkpoint state, including the admitted global vnode-0 path; they are not
+evidence that this future managed rolling protocol has been implemented.

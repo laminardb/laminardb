@@ -115,29 +115,32 @@ unchanged. V2/136-byte partials and seal version 7 are deliberately unreadable b
 deployment requires an explicit state/checkpoint reset or new namespace until a migration bridge
 exists.
 
-Before the first requested vnode body read, recovery validates the committed head inventory and
-checks every requested head's lineage under the current writer maximum of six physical artifacts.
-Parent seal inventories use success-only, per-attempt single-flight caching, so transient failures
-remain retryable. Before each parent body read, the reader proves that the child lineage exactly
-extends that sealed parent and that the decoded `VnodePartial.base` equals the attested parent.
-Reference-only bodies count in the verified-input receipt, which is validated again at the
-immutable staging boundary before graph/operator semantic decode or apply.
+Core Cycle 10 adds the authority on both sides of the durable cut. Participant readiness v6 binds
+the exact `max_staged_bytes` and writer-derived ancestry depth supported by every certified process.
+The current `global_singleton_compatibility` profile derives the complete-cut payload ceiling as
+`max_staged_bytes * max_artifacts_per_vnode_chain` and the artifact ceiling as
+`vnode_count * max_artifacts_per_vnode_chain`. After complete readiness validation and before
+capsule persistence or Commit, the leader metadata-walks every required vnode through exact parent
+seals to a root, verifies each checked lineage extension, and recomputes the cluster-wide totals.
+Recovery capsule v6 stores those agreed limits and verified totals.
 
-This is current-profile containment, not the production keyed-state budget. The reader envelope is
-derived as `max_partial_bytes * 6` and is accepted only as interim fail-closed containment while
-cluster admission remains limited to the existing global-state compatibility shape. It has been
-tested against current fixtures; it is not proof that every otherwise valid committed cut is
-restorable, a cluster-global writer/assignment invariant, an object-store request limit, or
-authority to relax `[LDB-4007]`.
+Recovery requires the local runtime to derive limits exactly equal to the committed limits and
+repeats the complete
+metadata-only traversal before any vnode body read. Its validated head retains the successfully
+loaded ancestor inventories; the body reader then preflights the exact acquired subset against the
+same committed totals, performs bounded artifact reads, rechecks parent/base identity, and records
+reference-only bodies in the staging receipt. A post-seal validation failure publishes Abort before
+cleanup when durable authority is available; an unresolved Abort requires recovery. Neither path
+makes that attempt a successor delta/reference parent or acknowledges its source cut. Leader parent
+promotion occurs only after the exact Commit wins.
 
-Still open is the authoritative budget on the other side of the cut: after exact seal/readiness
-validation and before capsule persistence/Commit, the leader must metadata-traverse every required
-parent seal, prove each child lineage is the exact checked extension of its parent through a root,
-and only then check the cluster-global lineage byte/artifact sum. The target must consume its exact
-acquired subset under that same durable capability. Encoded wrappers and seal metadata,
-object/request count, retained/spooled bytes, decoder scratch and expansion, decoded state/RSS,
-live-plus-prepared-plus-retired residency, and apply/retirement pause remain separate production
-gates. Six is defensive current-policy containment, not a persisted compatibility invariant.
+This is still current-profile containment, not the production keyed-state budget or a memory
+reservation. Encoded wrapper/seal metadata, request concurrency and response buffering, retained
+spool, decoder scratch and expansion, decoded state/RSS, live-plus-prepared-plus-retired residency,
+and apply/retirement pause remain separate production gates. Capsule v5 and readiness v5 are an
+explicit reset/new-namespace boundary. So is changing `max_staged_bytes` or the retained-chain-
+derived depth across a live cut until a versioned capability-superset rule is designed. Nothing here
+authorizes relaxing `[LDB-4007]`.
 
 The current V3/seal-8 change deliberately takes a reset boundary rather than a rolling bridge. A
 future managed-payload migration remains reader-first: one release reads both formats while writing
@@ -203,8 +206,10 @@ capability and rejects any post-initialization descriptor drift with `[LDB-4007]
 
 Core Cycle 9 additionally reserves aggregate prepare capacity from checked net final live-group
 growth and lands the sealed-lineage, requested-subset pre-body preflight, exact parent verification,
-and staging-receipt path described above. It does not land the pre-Commit cluster-global/keyed
-budget.
+and staging-receipt path described above. Core Cycle 10 adds participant-agreed limits, complete
+pre-Commit parent-seal traversal and checked cluster totals, capsule binding, target reproduction,
+and Commit-only successor-parent promotion. The profile remains global-singleton compatibility;
+neither cycle admits keyed state.
 
 This remains an aggregate reference lifecycle, not complete Phase 1. Transition-wide encoded
 bytes, object and request count, decode scratch, decoded RSS, transient live-plus-prepared-plus-
@@ -867,13 +872,13 @@ That proves logical atomicity for the current aggregate participant because grap
 assignment publication are excluded across the cut. It is not a bounded-pause result. Aggregate
 publication still moves/updates collections in proportion to transitioned state, preparation can
 temporarily retain live state and prepared replacement collections, can grow live capacity even if
-later aborted, and retirement can run destructors proportional to displaced state. Cycle 9 accounts
-sealed raw restore-input bodies but does not prove a bounded publication pause or a complete
-transition-wide resource envelope. Core Cycle 10 must first verify the complete parent-seal lineage
-and close the pre-Commit cluster-global/keyed payload/artifact budget; decoded RSS and scratch,
-live-plus-prepared-plus-retired residency, and measured apply/retirement pause remain admission
-blockers. Vnode-level indirection remains required if measurement cannot prove the pause. A process
-crash during
+later aborted, and retirement can run destructors proportional to displaced state. Cycles 9–10
+account sealed raw restore-input bodies and bind a metadata-verified cluster-global compatibility
+contract before Commit, but do not hold an acquired-subset reservation or prove a bounded
+publication pause and complete transition-wide resource envelope. Raw response/spool ownership,
+decoded RSS and scratch, live-plus-prepared-plus-retired residency, and measured apply/retirement
+pause remain admission blockers. Vnode-level indirection remains required if measurement cannot
+prove the pause. A process crash during
 publication still discards the process image and reconstructs from the unchanged durable cut.
 
 Before any artifact fetch, graph construction runs a pure, fallible state-contract derivation for
