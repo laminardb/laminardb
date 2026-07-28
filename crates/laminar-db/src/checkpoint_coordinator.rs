@@ -829,7 +829,6 @@ impl ValidatedVnodeRestoreHead {
         &self.contract
     }
 
-    #[must_use]
     pub(crate) fn lineage_inventories(
         &self,
     ) -> impl Iterator<Item = (CheckpointAttempt, Arc<CheckpointSealInventory>)> + '_ {
