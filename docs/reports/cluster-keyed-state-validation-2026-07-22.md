@@ -6,7 +6,7 @@
 
 **Scope:** admission and lifecycle validation only; no cluster capability is enabled by this work.
 
-**2026-07-28 core update (through Core Cycle 8):** The
+**2026-07-28 core update (through Core Cycle 9):** The
 [ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset)
 pauses later certification tooling. Core Cycle 1 adds a private reference managed vnode shard and
 caller-supplied lifecycle publication. Core Cycles 2–4 contain the existing runtime staging path
@@ -33,16 +33,25 @@ managed participant roster. Capture uses one ownership snapshot, global state is
 zero, keyed state is scoped to every owned vnode, and each required empty participant emits a named
 FULL payload whose decoded aggregate image is empty. Restore rejects omitted, unexpected,
 placement-invalid, or duplicate-within-link participants before callbacks; revoke receives only
-placement-relevant vnodes. The raw vnode artifact layout remains unchanged, while graph
+placement-relevant vnodes. The raw rkyv vnode payload layout remains unchanged, while graph
 checkpoint/state ABI 5 deliberately rejects older ambiguous graph state. Cycle 8 gives the real
 managed SQL aggregate participant complete decode/validate preparation, graph-wide prepare-all and
 abort-all, unit-returning publication under exact transition authority, and post-lock retirement.
 Prepublication failure leaves logical rows/bookkeeping and graph authority unchanged, although
 live-map capacity reserved for publication may remain; publication unwind poisons the graph and
 clears installed authority. Cluster graph initialization also rejects cached `Rejected` capability
-or post-initialization descriptor drift with `[LDB-4007]`. These cycles do not add a bounded working-state
-backend or runtime selector, bound transition memory/pause, admit a keyed/windowed/join operator,
-or relax `[LDB-4007]`.
+or post-initialization descriptor drift with `[LDB-4007]`. Cycle 9 reserves aggregate live-map
+capacity from checked net final growth and adds immutable immediate-parent/transitive raw-payload
+and artifact lineage to the built-in checkpoint path. It preflights the requested subset before
+body reads, single-flights successful parent seal inventories, verifies exact child-parent
+arithmetic and decoded base identity before a parent body, and counts reference-only bodies in the
+receipt validated at immutable staging. The raw rkyv body is unchanged, but the outer wrapper is
+`LDBVP3` version 3 with a 164-byte header and seals are version 8. V2/seal-7 cuts require an
+explicit state/checkpoint reset until a migration bridge exists.
+
+These cycles do not add a bounded working-state backend or runtime selector, validate the exact
+cluster-global pre-Commit keyed budget, bound total transition memory/request/pause, admit a
+keyed/windowed/join operator, or relax `[LDB-4007]` or `[LDB-0013]`.
 
 Cycle 7 also separates durable assignment adoption from installed vnode-state readiness.
 `CheckpointAssignmentAdoption.vnode_state_ready` is published `false` before startup/recovery clears
@@ -539,7 +548,7 @@ must not be patched as an isolated assertion:
   can leave an in-memory partial batch. Cluster execution must recover from the sealed cut rather
   than retry that batch locally until the managed state write is one atomic transaction.
 
-Cycles 6–8 close staged-material loss, activation before complete validation, and mixed live
+Cycles 6–9 close staged-material loss, activation before complete validation, mixed live
 aggregate publication. The graph snapshots one exact pending-transition `Arc`, structurally
 resolves the complete raw-chain inventory against its cached participant roster, and asks every
 applicable SQL aggregate to prepare a mutation plan with private replacement collections. A
@@ -552,14 +561,17 @@ state. A publication unwind clears installed authority and poisons the graph so 
 committed cut.
 
 This is atomic semantic installation for the current aggregate participant, not production
-qualification. Preparation scans the full unsharded live aggregate maps to discover transitioned
-keys, clones those keys, can hold live state and prepared replacement collections simultaneously,
-and can leave additional live-map capacity after abort. Publication and retirement remain
-proportional to transitioned state. There is no transition-wide reservation or deadline for
-encoded bytes, object requests, retained spool, decoder scratch, decoded RSS, live/prepared/retired
-residency, or apply pause. The remaining boundary is therefore resource-governed, vnode-sharded
-bounded-cost publication plus a second real state-family consumer—not another validator around the
-raw keyed payload.
+qualification. Cycle 9 removes avoidable live-map growth by reserving only checked net final group
+growth and adds a requested-subset receipt for transitive raw body bytes/artifacts on the present
+global-singleton path. Preparation still scans the full unsharded live aggregate maps to discover
+transitioned keys, clones those keys, can hold live state and prepared replacement collections
+simultaneously, and can leave successfully reserved capacity after abort. Publication and
+retirement remain proportional to transitioned state. There is no authoritative cluster-global
+pre-Commit keyed budget or complete reservation/deadline for wrapper and seal metadata, aggregate
+objects/requests, response buffering, retained spool, decoder scratch/expansion, decoded RSS,
+live/prepared/retired residency, or apply pause. The remaining boundary is therefore resource-
+governed, vnode-sharded bounded-cost publication plus a second real state-family consumer—not
+another validator around the raw keyed payload.
 
 This code is useful implementation substrate, but it does not make the operator production safe.
 The current one-million-group guard counts entries, not bytes. The live `groups`, changelog
@@ -869,6 +881,12 @@ The current branch's admission-neutral hardening was then checked separately:
 | Core Cycle 8 aggregate transition and full cluster library | PASS, 1,826 passed / 0 failed / 1 profiling test ignored | Includes prepare-all/abort-all, normal and final-owner publication, publication-panic poison/no-deadlock, corrupt-chain unchanged logical state, exact max-groups, changelog dirtiness, rebase cleanup, and post-initialization capability-drift regressions; not a resource, latency, backend, or admission result |
 | Core Cycle 8 serialized cluster integration target | PASS, 23 passed / 0 failed | The first parallel run passed 21/23 but two tests timed out waiting for the harness shared-namespace proof; the complete serial rerun passed both affected cases and all 23 tests. This is deterministic integration evidence, not an independent soak |
 | Core Cycle 8 feature/lint and fail-closed gates | PASS | Cluster and no-default DB checks and warnings-denied Clippy passed; the cluster server feature check passed; formatting/diff hygiene passed; exact `[LDB-4007]` query-shape and two `[LDB-0013]` delivery/build sentinels passed |
+| Core Cycle 9 aggregate net-growth boundaries | PASS | Exact-limit, max-plus-one, equal-cardinality, arithmetic, and rollback regressions passed; this bounds avoidable live-map reserve growth, not total prepared/retired RSS |
+| Core Cycle 9 V3/seal-8 built-in lineage contract | PASS, 133/133 core state tests | Includes immutable payload-plus-lineage idempotence, literal V3 header offsets/raw suffix, lineage shape/arithmetic/overflow, V2 and seal-7 reset rejection, and corrupt/truncated headers |
+| Core Cycle 9 restore/staging lineage containment | PASS, 24/24 rehydration and 11/11 staging tests | Includes exact/max-plus-one rejection before body I/O, configured artifact boundary, exact child-parent and decoded-base checks, reference-only usage, success single-flight, transient retry, and inadequate-receipt rejection before graph/operator semantic decode or apply |
+| Core Cycle 9 coordinator lifecycle | PASS, 5/5 focused regressions | Includes atomic promotion, revoke/reacquire reset, late old-attempt completion, and rejection of aborted/unsealed FULL or REFERENCE lineage as a successor base |
+| Core Cycle 9 feature/lint/server gates | PASS for completed targets | Cluster DB test check; DB no-default and no-default-plus-cluster checks; warnings-denied core all-features and DB cluster library Clippy; minimal server checks/build-only cluster target; formatting and diff hygiene passed. The `[LDB-4007]`/`[LDB-0013]` admission markers have no diff |
+| Core Cycle 9 broad Windows matrices | **NOT COMPLETED / NO PASS CLAIM** | A broad non-library DB build exhausted the Windows paging file; broad default-feature server commands stalled in Cargo and timed out. Neither produced a completed suite result; rerun on a sufficiently provisioned host |
 | Independent immutable release-candidate soak | **NOT RUN** | Production certification remains unavailable |
 | Core Cycle 3 `operator_graph::tests` with cluster | PASS, 111/111 | Full graph unit module after opaque final-exit authority, rotation-fence, endpoint, restore-drift, assignment-drift, callback-failure, and sticky-poison checks |
 | Core Cycle 3 `final_owner_exit` focused filter | PASS, 8/8 | Audited committed last-vnode cleanup succeeds only for the exact predecessor/target identity and retains staging on every indeterminate result |
@@ -1081,15 +1099,25 @@ a managed keyed working-state capability connected to the distributed execution 
    tests, process-death/rebalance output oracles, recovery compatibility, and published latency and
    resource profiles.
 
-Core Cycles 6–8 implement the transition identity, authoritative participant roster, named FULL
-payloads whose decoded aggregate image is empty, placement scoping, structural preflight, and the
-aggregate semantic prepare-all/abort-all/infallible-publish subset of item 5. They do not complete
-the capability: transition-wide encoded bytes, object/request count, retained spool, decode
-scratch, decoded RSS, simultaneous live/prepared/retired residency, and publication/retirement
-pause remain unreserved; the aggregate maps are not vnode-sharded for bounded-cost swaps; and no
-window/timer or join state family consumes the lifecycle. The hot-state service/backend, delivery
-composition, operator-specific contracts, and independent production proof in items 2–9 also
-remain open.
+Core Cycles 6–9 implement the transition identity, authoritative participant roster, named FULL
+payloads whose decoded aggregate image is empty, placement scoping, structural preflight, aggregate
+semantic prepare-all/abort-all/infallible publication, net live-growth reserve, and current-path
+sealed raw-lineage receipt subsets of item 5. They do not complete the capability: the exact
+cluster-global total is not validated before Commit, while wrapper/seal metadata, object/request
+count, retained spool, decode scratch/expansion, decoded RSS, simultaneous live/prepared/retired
+residency, and publication/retirement pause remain unreserved. The aggregate maps are not vnode-
+sharded for bounded-cost swaps, and no window/timer or join state family consumes the lifecycle.
+The hot-state service/backend, delivery composition, operator-specific contracts, and independent
+production proof in items 2–9 also remain open.
+
+Core Cycle 10 should close one durable-authority gap: starting from every required head after
+readiness validation, metadata-traverse exact parent seals and prove every child lineage is the
+checked extension of its parent through a root. Only then sum the cluster-global raw-payload/
+artifact envelope before capsule persistence/Commit and make restore consume that same cluster-
+identity-bound contract. Mismatch must fail before Commit or body GET while admission remains
+closed. Header/seal metadata, request/object count, spool/decoder/RSS, vnode-sharded publication,
+pause/deadline, backend qualification, delivery, windows/joins, and independent soak remain
+separately owned later gates.
 
 The existing `StateBackend` must not be mistaken for item 2. Its contract explicitly persists
 immutable per-checkpoint-attempt vnode artifacts and an exact-attempt durability seal. It has no

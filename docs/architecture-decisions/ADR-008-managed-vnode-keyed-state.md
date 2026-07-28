@@ -3,7 +3,7 @@
 - **Status:** Accepted for phased implementation; core reference work resumed, production
   qualification paused, and cluster admission unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-28 during Core Cycle 8
+- **Last reconciled:** 2026-07-28 during Core Cycle 9
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -14,7 +14,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest core review](../reviews/distributed-keyed-state-core-cycle-08.md)
+  [latest core review](../reviews/distributed-keyed-state-core-cycle-09.md)
 
 ## Decision
 
@@ -107,37 +107,43 @@ not externally deleted or replaced, including provider lifecycle/IAM controls, o
 must add a durable ever-sealed ledger or parent content identity. Cycle 5 closes the normal
 Laminar-controlled lifecycle on the built-ins; this storage prerequisite remains a production gate.
 
-The reader also reserves one slot before each physical-artifact lookup and rejects more
-than six artifacts per vnode, the maximum this binary's writer policy can produce. It does
-not use the narrower local retention setting because that setting is not yet certified in cluster
-identity. The per-artifact byte limit and per-vnode artifact-count limit are not aggregate concurrent-read,
-RSS, decoded-expansion, alignment-copy, or publication-pause bounds.
+Core Cycle 9 adds immutable transitive lineage to the existing raw-rkyv recovery path. The outer
+vnode-partial envelope is now `LDBVP3`, format version 3, with a fixed 164-byte header; checkpoint
+seals are version 8. The header and `SealedVnodePartial` bind the immediate parent attempt, checked
+transitive raw-payload bytes, and physical-artifact count. The raw `VnodePartial` payload suffix is
+unchanged. V2/136-byte partials and seal version 7 are deliberately unreadable by this binary:
+deployment requires an explicit state/checkpoint reset or new namespace until a migration bridge
+exists.
 
-Artifact count is not object-store request count. An uncached parent may require one seal-inventory
-GET plus one body GET, and concurrent vnode loads can race the current check-then-fetch seal cache
-and duplicate metadata reads. Cycle 5 adds no single-flight/cache abstraction without measurement;
-restore request distributions and tail latency remain qualification gates.
+Before the first requested vnode body read, recovery validates the committed head inventory and
+checks every requested head's lineage under the current writer maximum of six physical artifacts.
+Parent seal inventories use success-only, per-attempt single-flight caching, so transient failures
+remain retryable. Before each parent body read, the reader proves that the child lineage exactly
+extends that sealed parent and that the decoded `VnodePartial.base` equals the attested parent.
+Reference-only bodies count in the verified-input receipt, which is validated again at the
+immutable staging boundary before graph/operator semantic decode or apply.
 
-Six is defensive current-policy containment, not a persisted compatibility invariant. Before a
-mixed-version deployment or future writer can emit a longer compatible raw chain, its maximum must
-be bound into durable cluster capability/format policy and every reader must advertise support.
-Until then rolling-upgrade compatibility for a changed writer policy remains closed.
+This is current-profile containment, not the production keyed-state budget. The reader envelope is
+derived as `max_partial_bytes * 6` and is accepted only as interim fail-closed containment while
+cluster admission remains limited to the existing global-state compatibility shape. It has been
+tested against current fixtures; it is not proof that every otherwise valid committed cut is
+restorable, a cluster-global writer/assignment invariant, an object-store request limit, or
+authority to relax `[LDB-4007]`.
 
-An aggregate restore-byte gate is deferred until it can be enforced on both sides of Commit.
-Summing `sealed_partials.payload_len` covers only heads; REFERENCE/DELTA parents remain inside the
-raw bodies. Rereading and decoding all bodies before every Commit would duplicate restore I/O on the
-checkpoint latency path. The future contract therefore attests each vnode's transitive encoded
-size in versioned lineage metadata, checks the cluster-global sum after exact seal/readiness
-validation and before capsule persistence/Commit, and makes the target reserve its acquired subset
-before the first GET. A violation must Abort before sink phase 2. Encoded fetch, retained/spooled
-bytes, decoder scratch, decoded state/RSS, and apply pause have separate reservations and evidence.
-No release-dead `max_restore_encoded_bytes` setting is added in Cycle 5.
+Still open is the authoritative budget on the other side of the cut: after exact seal/readiness
+validation and before capsule persistence/Commit, the leader must metadata-traverse every required
+parent seal, prove each child lineage is the exact checked extension of its parent through a root,
+and only then check the cluster-global lineage byte/artifact sum. The target must consume its exact
+acquired subset under that same durable capability. Encoded wrappers and seal metadata,
+object/request count, retained/spooled bytes, decoder scratch and expansion, decoded state/RSS,
+live-plus-prepared-plus-retired residency, and apply/retirement pause remain separate production
+gates. Six is defensive current-policy containment, not a persisted compatibility invariant.
 
-If the raw payload eventually changes to carry that metadata, rollout is reader-first: one release
-reads both formats while writing legacy, a durable cluster capability/format policy selects the
-writer only after every exact participant can read it, activation forces a FULL cut and forbids
-cross-format parents, and rollback is limited to a dual-reader release. Gossip version strings are
-not writer authority. This migration is a future compatibility requirement, not Cycle 5 runtime.
+The current V3/seal-8 change deliberately takes a reset boundary rather than a rolling bridge. A
+future managed-payload migration remains reader-first: one release reads both formats while writing
+legacy, durable cluster capability/format policy selects the writer only after every exact
+participant can read it, activation forces a FULL cut and forbids cross-format parents, and
+rollback is limited to a dual-reader release. Gossip version strings are not writer authority.
 
 Core Cycle 6 replaces the split mutable staging maps with one immutable
 `PendingVnodeTransition`. It binds the exact predecessor and target assignment fences, local process
@@ -194,6 +200,11 @@ post-lock retirement for the existing managed SQL aggregate participant. Complet
 vnode membership, exact final group cardinality, changelog dirtiness, and failed-generation rebase
 bookkeeping are validated before live mutation. Cluster graph startup rejects a cached `Rejected`
 capability and rejects any post-initialization descriptor drift with `[LDB-4007]`.
+
+Core Cycle 9 additionally reserves aggregate prepare capacity from checked net final live-group
+growth and lands the sealed-lineage, requested-subset pre-body preflight, exact parent verification,
+and staging-receipt path described above. It does not land the pre-Commit cluster-global/keyed
+budget.
 
 This remains an aggregate reference lifecycle, not complete Phase 1. Transition-wide encoded
 bytes, object and request count, decode scratch, decoded RSS, transient live-plus-prepared-plus-
@@ -765,9 +776,10 @@ cap, digest-verified, and then authenticates expected artifact type/version, con
 digests, checkpoint/assignment provenance, and legacy/managed dispatch. Each artifact repeats the
 same reserve-before-GET protocol. Short, long, or digest-mismatched bodies fail closed.
 
-That trusted sealed-object composition, manifest dispatch, and bounded fetch path are not wired in
-Cycle 5. The private structural reader must not be called directly on bytes fetched by the current
-whole-object `read_partial` path and must not be used as evidence to relax cluster admission.
+That managed-V2 trusted sealed-object composition, manifest dispatch, and bounded fetch path are not
+wired. The private structural reader must not be called directly on bytes fetched by the current
+legacy raw-rkyv path and must not be used as evidence to relax cluster admission. Core Cycle 9's
+bounded legacy reader does not wire the managed-V2 composition.
 
 V2 parsing runs under the encoded charge; separate task/global **scratch** reservations cover
 directory metadata, key/state bytes, rows, shadow ingestion, operators, and vnodes. Transition-owned
@@ -775,7 +787,7 @@ validated spool bytes are charged to the local-disk governor and retained until 
 they are never an unbounded in-memory copy. The candidate profile separately names per-artifact and
 per-chain encoded caps, a directory-entry cap, a global encoded-byte pool, and per-task/global
 scratch caps; that machine-readable profile remains the sole numerical source. One "artifact" is
-the complete raw `VnodePartialV2` payload (excluding the existing fixed provenance wrapper), not
+the complete raw `VnodePartialV2` payload (excluding the current 164-byte V3 provenance wrapper), not
 each inner BODY: its row, key-byte, state-byte, and encoded-byte caps are cumulative across all BODY
 entries. Inner aggregate decodes consume one caller-owned, non-`Copy` mutable
 `AggregateObjectBudget` ledger for the complete V2 object; the ledger is never reset per BODY.
@@ -837,12 +849,13 @@ Restore follows this protocol:
    source/shuffle/output intake only after complete publication. Off-thread retirement remains a
    future measured design choice rather than a current guarantee.
 
-Cycles 6–8 implement the immutable authority envelope, complete structural preflight, exact
+Cycles 6–9 implement the immutable authority envelope, complete structural preflight, exact
 transition retention, and the prepare/publish protocol for `SqlAggregateV1`. Each aggregate fully
 decodes and validates its complete restore/revoke batch into a mutation plan with private
 replacement collections. Any prepare or authority error aborts and finishes every attempted
 participant without poisoning or changing logical rows, dirty/delta bookkeeping, or ownership.
-Live-map capacity may remain larger after a failed prepare. The graph then locks the exact pending
+Live-map capacity may remain larger after a failed prepare, although Cycle 9 reserves only checked
+net final growth. The graph then locks the exact pending
 slot and installed-state handle, revalidates
 assignment, transport, registry, and roster authority, invokes only unit-returning participant
 publication, activates the complete roster, installs the exact binding, and clears that exact
@@ -854,9 +867,13 @@ That proves logical atomicity for the current aggregate participant because grap
 assignment publication are excluded across the cut. It is not a bounded-pause result. Aggregate
 publication still moves/updates collections in proportion to transitioned state, preparation can
 temporarily retain live state and prepared replacement collections, can grow live capacity even if
-later aborted, and retirement can run destructors proportional to displaced state. Cycle 9 must
-add one transition-wide resource/deadline budget and either prove the apply pause or introduce
-vnode-level indirection before admission. A process crash during
+later aborted, and retirement can run destructors proportional to displaced state. Cycle 9 accounts
+sealed raw restore-input bodies but does not prove a bounded publication pause or a complete
+transition-wide resource envelope. Core Cycle 10 must first verify the complete parent-seal lineage
+and close the pre-Commit cluster-global/keyed payload/artifact budget; decoded RSS and scratch,
+live-plus-prepared-plus-retired residency, and measured apply/retirement pause remain admission
+blockers. Vnode-level indirection remains required if measurement cannot prove the pause. A process
+crash during
 publication still discards the process image and reconstructs from the unchanged durable cut.
 
 Before any artifact fetch, graph construction runs a pure, fallible state-contract derivation for

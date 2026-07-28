@@ -231,9 +231,16 @@ event-loop hot path, and streams under the artifact budget.
 
 ## VnodePartialV2 directory
 
-The current object-store provenance wrapper already uses `LDBVP2\0\0`; the inner directory
-therefore uses distinct magic `LDBVPD\0\0`. Directory version is `2`, its header is 160 bytes, and
-each entry is 168 bytes.
+Do not confuse this proposed managed inner directory with the current legacy outer provenance
+envelope. Core Cycle 9 resets that outer envelope to magic `LDBVP3\0\0`, version `3`, and 164 bytes,
+and resets checkpoint seals to version 8. Relative to V2/136, the appended fields are parent epoch
+at offset 136, parent checkpoint ID at 144, transitive raw-payload bytes at 152, and physical-
+artifact count at 160; the unchanged raw rkyv `VnodePartial` payload begins at 164. Seal version 8
+repeats the same lineage attestation. V2/136 and seal version 7 require an explicit state reset or
+new namespace; no dual-reader or rolling bridge is claimed.
+
+The managed inner directory instead uses distinct magic `LDBVPD\0\0`. Directory version is `2`,
+its header is 160 bytes, and each entry is 168 bytes.
 
 | Offset | Width | Field |
 |---:|---:|---|
@@ -318,9 +325,11 @@ assignments. It deliberately does not include unrelated directory entries or bod
 ## Limits and composition
 
 `encoded_artifact_bytes_max` applies to the complete raw V2 directory plus bodies, excluding the
-existing 136-byte object-store provenance wrapper. Fetch admission checks the wrapper plus declared
-payload with checked addition before GET. Row, key-byte, and state-byte artifact limits are totals
-across every BODY in that V2 object. Production composition creates one caller-owned, non-`Copy`
+current 164-byte V3 object-store provenance wrapper. Fetch admission checks the wrapper plus
+declared payload with checked addition before GET. The outer lineage totals raw payload bytes and
+physical artifacts; it does not replace the managed directory's row, key, state, scratch, or
+decoded-memory budgets. Row, key-byte, and state-byte artifact limits are totals across every BODY
+in that V2 object. Production composition creates one caller-owned, non-`Copy`
 mutable `AggregateObjectBudget` for the object and passes it through every inner aggregate decode;
 resetting it per BODY is invalid. Directory metadata uses the metadata and entry caps. Chain bytes
 and parent-link count accumulate across every fetched REFERENCE/DELTA edge.
@@ -339,12 +348,14 @@ certificate forces FULL/EMPTY rather than a DELTA. During whole-chain validation
 value/replacement record: for a key found in its parent, COUNT must strictly increase and SUM
 non-null count cannot decrease. These cross-chain checks do not belong to the isolated row decoder.
 
-The borrowed readers validate bytes already admitted under those reservations. The inner reference
-encoder and test-only outer fixture encoder allocate complete output vectors. None of
-this makes the current whole-object `read_partial` bounded, verifies a trusted top-level seal,
-resolves chains, invokes operators, installs state, alters manifest dispatch, or relaxes
-`[LDB-4007]`. Whole-transition preflight must validate every roster entry, aggregate the per-object
-counters, and finish every chain before any operator callback.
+These borrowed managed-V2 readers validate only bytes already admitted under their managed
+reservations; their encoders allocate complete vectors. They are not wired into manifest dispatch
+or the production managed restore transaction and do not relax `[LDB-4007]`. Separately, Core Cycle
+9 makes the current legacy raw-rkyv recovery path use exact V3/seal-8 lineage, requested-subset
+preflight, bounded sealed body reads, exact parent checks, and a staged verified-input receipt. That
+containment neither authenticates or decodes `VnodePartialV2` nor supplies the still-open pre-Commit
+cluster-global/keyed budget. Managed whole-transition preflight must still validate every roster
+entry, aggregate every object and decoder counter, and finish every chain before callbacks.
 
 ## Rolling compatibility
 
@@ -354,3 +365,7 @@ future N+1 streaming writer is enabled only after every checkpoint
 participant advertises the manifest-selected reader capability and trusted sealed composition is
 wired. Legacy rkyv remains reachable only through explicit legacy inventory proof for the admitted
 global vnode-0 path. There is no magic-sniff fallback in either direction.
+
+The Cycle 9 V3/seal-8 change is an explicit reset boundary for current raw-rkyv checkpoint state,
+including the admitted global vnode-0 path; it is not evidence that this future managed rolling
+protocol has been implemented.

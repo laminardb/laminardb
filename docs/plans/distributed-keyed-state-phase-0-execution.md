@@ -6,7 +6,7 @@
   dependency, backend qualification evidence, independent production-soak result, or admission
   change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-27 during Core Cycle 6
+- **Last reconciled:** 2026-07-28 during Core Cycle 9
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -28,26 +28,24 @@ The [2026-07-27 ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed
 pauses Cycle 69 and later certification work and authorizes only the private reference core slice.
 It is not Phase 0 completion, backend qualification, or permission to execute a candidate.
 
-Core Cycles 2–6 add a fail-closed runtime containment path for staged local vnode transitions and a
-narrow audited, committed final-owner revoke path. The latter binds predecessor/target versions and
-owner-map digests, local process incarnation, target absence, and the exact lost-vnode roster; it
-cannot be minted from recovery authority, no-store adoption, or an unaudited transition.
-Cycle 4 pins restore reads to the capsule-validated head seal, adds exact per-artifact bounded reads
-for the built-in backends, and retains full attempt identity through graph preflight. Its corrective
-scope preserves the established raw rkyv FULL/reference/DELTA wire used by the admitted global
-vnode-0 aggregate. Cycle 5 requires the namespace-scoped attempt-to-seal mapping to remain immutable
-until irreversible retirement and independently limits a vnode restore to the current writer
-maximum of six artifacts. The built-ins enforce the contract while artifacts remain under Laminar
-control; external live-seal deletion and mixed-version policy remain qualification/fencing gaps. It
-adds no wire version or configuration. Cycle 6 replaces the split mutable restore/revoke staging
-with one immutable transition that retains the exact validated cut and binds predecessor/target
-assignment, process incarnation, pipeline identity, and acquired/revoked vnode rosters. A Running
-graph may reuse predecessor memory only while an exact installed-state binding remains valid;
-transition, fault, poison, and shutdown paths retire that authority. Structural preflight,
-post-callback authority revalidation, delayed activation, and exact-transition retention now contain
-indeterminate callbacks. These cycles do not impose an aggregate encoded-byte/RSS/decode/publication
-bound, consume the managed reference, provide prepare/publish/abort shadow publication, bind a
-  complete authoritative operator/state-table roster, or authorize a stateful query.
+Core Cycles 2–9 add a fail-closed runtime containment path for staged local vnode transitions and a
+narrow audited, committed final-owner revoke path. Cycles 4–6 pin restore to the capsule-validated
+seal, enforce immutable attempt identity and bounded chain traversal, and replace split staging with
+one transition bound to exact checkpoint, assignment, process, pipeline, acquired, and revoked
+authority. Cycle 7 initializes managed participants in embedded, single-node, and cluster modes and
+makes the cached graph capability plus exact participant roster authoritative for capture, restore,
+and revoke. Cycle 8 connects the SQL aggregate to prepare-all/abort-all, authority-fenced
+unit-returning publication, and post-lock retirement.
+
+Cycle 9 reserves aggregate capacity from checked net final live growth and adds immutable immediate-
+parent/transitive raw-payload and artifact lineage to the current legacy path. It preflights the
+requested subset before body reads, single-flights successful parent seal loads, proves exact parent
+arithmetic and decoded base identity, and validates a verified-body receipt at immutable staging.
+The outer wrapper is now `LDBVP3` version 3 with a 164-byte header and seals are version 8; older
+V2/seal-7 cuts require an explicit reset until a migration bridge exists. These cycles do not impose
+the cluster-global pre-Commit keyed budget or complete wrapper/request/spool/decode/RSS/pause
+limits, consume the proposed managed V2 format, add a hot-state backend, authorize a stateful query,
+or change delivery.
 
 The phase is complete only when maintainers can answer, with versioned evidence:
 
@@ -220,6 +218,10 @@ immutable contract at plan/init time;
 introspection, canonicalization, dependency selection, SHA-256, rkyv/format parsing, sorting, and
 post-freeze encoding never run per row or per processing batch.
 
+Core Cycle 9's V3 wrapper lineage around the unchanged legacy raw-rkyv body is not this future
+allocation-bounded managed keyed envelope or its manifest selector. It contains the current restore
+path while managed V2 composition and admission remain closed.
+
 Cycle 5 freezes the normative layout and goldens with private, admission-neutral borrowed aggregate
 and outer-structural `VnodePartialV2` readers plus full-buffer fixture encoders. Core Cycle 1 promotes
 only the inner aggregate encoder into private release code for the reference vnode shard; the outer
@@ -228,17 +230,20 @@ directory; each BODY entry hashes its exact slice, so there is no redundant whol
 outer reader does not authenticate the object or validate aggregate semantics. Production restore
 must first match the complete payload to the trusted seal/inventory digest, select the format from
 the manifest, and run every BODY through its expected inner reader while sharing the object budget.
-Production streaming writing, bounded fetch, chain resolution, shadow ingestion, and publication
-remain future work. Neither private codec is an admission consumer.
+Production managed streaming writing, managed-V2 bounded fetch and chain resolution, shadow
+ingestion, and publication remain future work. Neither private codec is an admission consumer.
 
 From the trusted checkpoint pointer, obtain the inventory object's encoded length and expected
 digest. Reject a length above `transition_metadata_bytes_max`, acquire the global encoded-byte
-charge, then stream the inventory to the exact cap before parsing it. Its verified declarations bind
-artifact lengths/digests, provenance, and decoder dispatch; each artifact repeats reserve-before-GET
-and exact-length/digest enforcement. Per-artifact/per-chain encoded caps, the per-artifact
-directory-entry cap, the global encoded pool, and per-task/global decoder/ingestion scratch are
-distinct candidate-profile fields. "Per artifact" means one complete raw `VnodePartialV2` payload,
-excluding the existing fixed provenance wrapper: rows, key bytes, state bytes, and encoded bytes are
+charge, then stream the inventory to the exact cap before parsing it. This remains future managed-
+format work. Cycle 9 preflights only the current path's requested transitive raw-payload/artifact
+lineage; it does not charge inventory/wrapper/seal bytes, an aggregate object/request count, or
+decoder scratch. The verified managed declarations must bind artifact lengths/digests, provenance,
+and decoder dispatch; each artifact repeats reserve-before-GET and exact-length/digest enforcement.
+Per-artifact/per-chain encoded caps, the per-artifact directory-entry cap, the global encoded pool,
+and per-task/global decoder/ingestion scratch are distinct candidate-profile fields. "Per artifact"
+means one complete raw `VnodePartialV2` payload, excluding the current 164-byte V3 provenance
+wrapper: rows, key bytes, state bytes, and encoded bytes are
 summed across its BODY entries rather than reset for each inner payload. Every aggregate BODY decode
 must consume one caller-owned, non-`Copy` mutable `AggregateObjectBudget` ledger for the whole V2
 object. Wrapper plus payload is checked before fetch. The resolved-parent limit counts both outer
@@ -259,8 +264,9 @@ to consume the validated spool into abortable shadow state; it cannot select a d
 The transition digest namespaces the spool. Retry retains an atomically completed spool; restart
 removes incomplete/unreferenced spools and rebuilds from remote authority; success or terminal
 rejection reclaims it outside the ownership fence.
-Keep legacy raw checkpoint compatibility limited to the admitted global vnode-0 aggregate until
-an explicit keyed migration policy exists.
+Keep legacy raw body compatibility limited to the admitted global vnode-0 aggregate until an
+explicit keyed migration policy exists. The V3 wrapper and seal-8 change is nevertheless an
+incompatible durable reset boundary; no rolling-upgrade claim follows from the unchanged body.
 
 The initial positive plan proof admits exactly one `COUNT(*)`, one `SUM` over a direct `Int64` input
 column, and one or more direct partition-ABI-v1 grouping columns. Aggregate FILTER/DISTINCT/order,
@@ -849,8 +855,10 @@ Cycle 37 freezes the aggregate-v1 journal/checkpoint-transition contract and a p
 coalescing, immutable capture/re-emission, Commit-admitted ancestry, aborted-attempt retention,
 outcome-less allocated-ID gaps, pre/post-seal DecisionInDoubt, exact generation release,
 deterministic ordering, and the existing aggregate/V2 codec seam. It is a reference model, not a
-runtime implementation or performance result. The Cycle 5 readers remain unwired; `[LDB-4007]`
-remains unchanged.
+runtime implementation or performance result. Core Cycles 6–9 additionally land exact transition
+authority, all-mode aggregate initialization, aggregate prepare/publication, and the current raw-
+lineage reader/staging receipt. The managed artifact-v1 and `VnodePartialV2` readers remain unwired;
+`[LDB-4007]` remains unchanged.
 
 Remaining work is kept reviewable in this dependency order:
 
@@ -861,16 +869,21 @@ Remaining work is kept reviewable in this dependency order:
    missing later native fixes, silent short-transaction success, an unclosed general cgroup
    envelope, and missing mandatory public health facts; no build, link, candidate execution, or
    runtime code followed;
-3. implement only backend-neutral Laminar gaps already required regardless of the engine: the
-   complete-success/failed-before-apply/unknown-poison outcome and publication-exclusion contract,
-   checkpoint/rebalance exclusion, fresh-root/fenced-attempt contract, resource-admission formula,
-   truthful capability flags, and fake-backend fault tests. Defer TidesDB's owner lane and
-   verified-readback machinery; do not add or execute the package in this slice. The completed
-   containment increments and their tests are summarized in the
-   [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md). Core Cycle 6 adds
-   the first graph-lifecycle containment slice under the reset exception; its exact boundary and
-   remaining semantic-lifecycle gaps are recorded in the
-   [Cycle 6 review](../reviews/distributed-keyed-state-core-cycle-06.md);
+3. complete only the remaining backend-neutral Laminar gaps required regardless of the engine:
+   metadata-traverse every required parent seal and verify exact child-parent lineage before the
+   pre-Commit cluster-global payload/artifact sum; bind restore to that same exact-subset contract;
+   then separately close wrapper/seal/request/spool/decode/RSS/pause reservations, vnode sharding,
+   minimum truthful health signals, and a second state-family consumer. The outcome, publication,
+   checkpoint/rebalance fencing, fresh-root, capability, and current raw-reader containment already
+   landed in Core Cycles 6–9 and must remain regression coverage rather than being reimplemented.
+   Defer TidesDB's owner lane and verified-readback machinery; do not add or execute the package in
+   this slice. The completed containment increments and their tests are summarized in the
+   [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md). Core Cycles 6–9
+   complete the immutable transition, aggregate prepare/publication, and current raw-lineage
+   containment subsets. The next backend-neutral slice is the exact cluster-global pre-Commit
+   lineage budget; wrapper/request/spool/decode/RSS/pause limits, vnode sharding, and a second state
+   family remain open. The latest exact boundary is recorded in the
+   [Cycle 9 review](../reviews/distributed-keyed-state-core-cycle-09.md);
 4. wait for a new official Cargo package `tidesdb`, freeze its exact native pair, and repeat the
    complete four-engineer-hour/one-working-day/zero-machine-hour T0. The repeated T0 must reconcile
    every later native fix and prove exact transaction success or explicitly accept the full-key
@@ -908,8 +921,8 @@ outer-directory fixture encoder remains test-only; the promoted inner reference 
 manifest-selected or production streaming writer.
 
 Each commit runs its affected feature matrix. Backend candidates do not touch runtime crates. The
-[Cycle 6 review](../reviews/distributed-keyed-state-core-cycle-06.md) records the first permitted
-Phase 1 containment exception; it neither completes Phase 1 nor bypasses the Phase 0 gates. The
+[Cycle 9 review](../reviews/distributed-keyed-state-core-cycle-09.md) records the cumulative current
+Phase 1 containment boundary; it neither completes Phase 1 nor bypasses the Phase 0 gates. The
 first guard-removal commit is reserved for the later grouped-aggregate vertical after Phase 1
 passes.
 

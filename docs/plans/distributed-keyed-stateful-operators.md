@@ -3,7 +3,7 @@
 - **Status:** Core reference implementation resumed; production qualification/certification paused;
   exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster operator is admitted
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-28 during Core Cycle 8
+- **Last reconciled:** 2026-07-28 during Core Cycle 9
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -40,7 +40,7 @@ through every phase; they are not a final cleanup sprint.
 
 The owner reset is recorded normatively in
 [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset).
-Cycle 69 and later certification work are paused. Core Cycles 1–8 add a private reference shard and
+Cycle 69 and later certification work are paused. Core Cycles 1–9 add a private reference shard and
 a fail-closed graph containment path: exact owned/restoring vnode-roster and chain preflight,
 deterministic callbacks, delayed activation, sticky poison after indeterminate mutation, boot-cut
 validation, predecessor-authority repair, control-only completion while source intake is closed,
@@ -59,14 +59,11 @@ backends, and bounds traversal for the current writer policy. It is not a durabl
 external deletion of a live seal or a mixed/future writer policy remains a backend-qualification or
 version-fencing blocker. Ancestor retention still determines availability.
 
-Cycle 5 deliberately does not add `max_restore_encoded_bytes`. Current seals expose head sizes,
-not transitive lineage totals, and a reader-only cap could make a valid committed cut unrestorable.
-The later resource slice must attest per-vnode transitive sizes, validate the cluster-global total
-after exact seal/readiness validation but before capsule persistence and Commit, and reserve the
-target subset before GET. Encoded fetch, retained/spooled bytes, decode scratch, decoded state/RSS,
-and publication pause remain separate limits. A future payload-wire change, if needed for those
-attestations, requires a reader-first, capability-fenced rollout; Cycle 5 does not start one. Cycle
-6, recorded in the [cycle review](../reviews/distributed-keyed-state-core-cycle-06.md), replaces the
+Cycle 5 deliberately did not add `max_restore_encoded_bytes`: its seals exposed only head sizes, so
+a reader-only cap could make a valid committed cut unrestorable. That constraint remains the reason
+the later Cycle 9 reader containment cannot by itself authorize keyed admission.
+
+Cycle 6, recorded in the [cycle review](../reviews/distributed-keyed-state-core-cycle-06.md), replaces the
 split mutable staging maps with one immutable record binding predecessor/target assignment, process
 incarnation, pipeline identity, exact committed restore cut, and acquired/revoked vnode rosters. It
 also fences reuse of installed heap state to the exact Running graph and clears that authority on
@@ -75,9 +72,10 @@ runtime mode and makes cached graph capabilities authoritative for per-vnode cap
 revoke. Each required participant emits a named FULL payload whose decoded state is empty when it
 has no rows; missing, extra, duplicate names within one artifact link, and placement-invalid
 participants fail before callbacks. Repetition across valid FULL/delta lineage links is expected.
-Global state is scoped to vnode zero and keyed state to the exact owned roster. The raw vnode
-artifact layout is unchanged, while graph checkpoint/state ABI 5 deliberately rejects older
-ambiguous graph state.
+Global state is scoped to vnode zero and keyed state to the exact owned roster. At Cycle 7 the raw
+rkyv `VnodePartial` payload layout was unchanged, while graph checkpoint/state ABI 5 deliberately
+rejected older ambiguous graph state. Cycle 9 later changes only the outer wrapper/seal as recorded
+below.
 Cycle 7 also makes `vnode_state_ready` a mandatory field in each exact assignment-adoption report.
 A process publishes `false` under assignment serialization before staging or recovery and, for a
 bound managed pipeline, publishes `true` only for the exact installed graph binding, assignment,
@@ -98,10 +96,24 @@ capacity reserved for allocation-free publication can remain; exact authority is
 the pending and installed-state locks are held; and displaced state is retired after those locks
 are released. Cluster initialization also rejects cached `Rejected` capability or
 post-initialization descriptor drift with `[LDB-4007]`.
-Cycle 9 adds the transition-wide encoded-byte, object/request, retained-spool, decoder-scratch,
-decoded-RSS, live/prepared/retired-residency, and apply-pause budget. It will split the large
-aggregate prepare and vnode-transition/test modules along those real lifecycle phases rather than
-introducing a speculative storage abstraction. Bounded working-state storage remains later.
+Cycle 9, recorded in the
+[cycle review](../reviews/distributed-keyed-state-core-cycle-09.md), begins the resource slice:
+aggregate prepare reserves only checked net final live growth. The outer object wrapper advances to
+`LDBVP3` version 3 with a fixed 164-byte header and seals advance to version 8; V2/seal-7 cuts
+require an explicit reset until a migration bridge exists. Immutable immediate-parent/transitive
+raw-payload and artifact attestations, requested-subset pre-GET validation, exact child-parent
+arithmetic before parent-body I/O, reference-only accounting, and a staging receipt contain the
+current legacy path. Its `max_partial_bytes * 6` envelope is accepted only as interim fail-closed
+containment for current global vnode-0 fixtures; it neither proves every committed cut restorable
+nor supplies the production keyed or multi-vnode budget.
+
+Core Cycle 10 should metadata-traverse every required parent seal, verify each child lineage as an
+exact checked extension through a root, and only then sum and validate the cluster-global raw-
+payload/artifact total after readiness and before capsule persistence/Commit. Restore must consume
+that same cluster-identity-bound contract for its acquired subset. Wrapper/seal metadata, aggregate
+object/request count, response buffering, retained spool, decoder scratch/expansion, decoded/live/
+prepared/retired RSS, and apply/retirement pause and deadline remain separate limits. Bounded
+working-state storage remains later.
 Backend work does not block these slices. TidesDB re-entry and the upstream-contribution boundary
 are owned by the
 [TidesDB design](../architecture-decisions/tidesdb-local-state-successor-design.md).
@@ -728,10 +740,11 @@ Work packages:
 
 ### 1E. Ownership lifecycle
 
-Cycles 6–8 land the transition identity, structural preflight, authoritative roster, explicit
-empty-state, and aggregate prepare/publish subsets below. Phase 1E remains open until transition
-resource/pause bounds, vnode-sharded bounded-cost publication, a second real state-family consumer,
-and full lifecycle/fault/performance evidence are complete.
+Cycles 6–9 land the transition identity, structural preflight, authoritative roster, explicit
+empty-state, aggregate prepare/publish, and current-path raw-lineage receipt subsets below. Phase 1E
+remains open until the pre-Commit global budget, remaining transition resource/pause bounds,
+vnode-sharded bounded-cost publication, a second real state-family consumer, and full lifecycle/
+fault/performance evidence are complete.
 
 - Implement `Unowned -> Acquiring -> Restoring -> Validated -> Active` and
   `Active -> Frozen/Draining -> Revoked` in the graph/runtime.
@@ -759,6 +772,12 @@ and full lifecycle/fault/performance evidence are complete.
   participant publication, activate the complete set, install the exact binding, and clear the
   exact inbox item. Retire displaced aggregate and binding state after releasing publication
   locks; poison and clear installed authority on publication unwind.
+- **Landed in Cycle 9 for the current raw-rkyv path:** reserve aggregate live maps from checked net
+  final growth; bind each immutable partial and seal to immediate-parent/transitive raw-payload and
+  artifact lineage; preflight the requested subset before body reads; single-flight successful
+  parent seal reads; verify exact parent arithmetic and decoded base identity; and validate the
+  verified-body receipt at immutable staging. This is global-singleton compatibility containment,
+  not the production keyed-transition reservation.
 - **Remaining:** keep stateful capability fail-closed unless initialize, capture, prepare, publish,
   abort, revoke, and finish are complete. Generalize this boundary only when a window or join
   consumer proves its timer/cursor/output needs; stateless operators remain legitimate
@@ -775,10 +794,11 @@ and full lifecycle/fault/performance evidence are complete.
   the current assignment has restoring vnodes or a staged transition.
 - Bound acquired-vnode input buffering, bulk install, post-acquire full rebase, and revoked-range
   cleanup. Prove stale owners cannot read/write/publish after rotation.
-- Add one transition-wide reservation before fetch/prepare for transitive encoded bytes, object and
-  request count, retained spool, decode scratch, decoded RSS, simultaneous live/prepared/retired
-  residency, and publication/retirement-pause work. Per-vnode limits do not substitute for this
-  aggregate budget.
+- Complete one transition-wide reservation before fetch/prepare for the exact Commit-admitted
+  transitive payload/artifact total, wrapper/seal metadata, object and request count, retained spool,
+  decode scratch, decoded RSS, simultaneous live/prepared/retired residency, and publication/
+  retirement-pause work. The Cycle 9 compatibility receipt and per-vnode limits do not substitute
+  for this aggregate budget.
 - Introduce vnode-owned state shards before the aggregate migration so acquire/revoke publication
   is a bounded pointer swap rather than a full-map scan.
 

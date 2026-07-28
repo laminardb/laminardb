@@ -19,10 +19,24 @@
   a prepared mutation plan with private replacement collections, prepare all applicable
   participants, abort all attempted participants on prepublication failure, publish under exact
   graph authority through unit-returning hooks, and retire displaced state after publication locks
-  are released. Preparation preserves logical rows/bookkeeping but may reserve live-map capacity.
+  are released. Preparation reserves only checked net final live-map growth; exact-limit,
+  max-plus-one, equal-cardinality, and rollback tests prove that a rejected transition does not
+  mutate logical rows/bookkeeping or reserve avoidable growth. Capacity successfully reserved for
+  publication may still remain after a later abort.
   Cluster graph initialization also rejects a cached `Rejected` capability or post-initialization
   descriptor drift. This does not add a backend or widen operator, source, sink, or delivery
   admission; `[LDB-4007]` remains unchanged.
+- Built-in checkpoint backends now bind each vnode partial to its immediate parent plus checked
+  transitive raw-payload bytes and physical-artifact count. Cluster restore preflights the requested
+  subset under the existing global-singleton compatibility envelope before its first body GET,
+  single-flights successful parent seal reads, verifies exact child-to-parent lineage and decoded
+  base identity before following a parent, and validates a verified raw-body receipt at the
+  immutable staging boundary. The raw rkyv `VnodePartial` suffix is unchanged, but the outer object
+  wrapper is now `LDBVP3` version 3 with a fixed 164-byte header and checkpoint seals are version 8.
+  V2 wrappers and version-7 seals require an explicit state/checkpoint reset until a migration
+  bridge exists. This is not a hot-state backend, complete restore-memory/request/pause budget,
+  delivery or exactly-once change, keyed/window/join/MV admission, latency/RSS result, or soak
+  result; `[LDB-4007]` and `[LDB-0013]` remain closed.
 - Replacement cluster processes now start fenced and use the audited recovery-successor path to
   recertify durable vnode owners. Pristine vnode-zero bootstrap remains distinct from stale owner
   or drain state, and a stale-process drain terminal is settled before successor recovery.
@@ -56,9 +70,10 @@
   and all pre-publication waits share one absolute checkpoint deadline. This is a current-state
   scan, not an atomic lease across the final compare-and-swap; observability, cost, race injection,
   large-state deadline validation, and independent release-candidate soak evidence remain open.
-- The operator-graph checkpoint/state ABI is version 5. Raw `VnodePartial` layout remains unchanged,
-  but version-4 graph checkpoints are intentionally rejected; upgrade requires an explicit state
-  reset until a separate migration bridge is designed.
+- The operator-graph checkpoint/state ABI is version 5. The raw rkyv `VnodePartial` payload layout
+  remains unchanged, but its outer wrapper/seal and version-4 graph checkpoints are intentionally
+  incompatible as described above; upgrade requires an explicit state/checkpoint reset until a
+  separate migration bridge is designed.
 - Key-group topology is mode-scoped: embedded and single-node use one group, while cluster uses
   optional `server.key_groups` (default 256). Checkpoints and assignment certificates now bind the
   partitioning ABI so incompatible recovery or shuffle peers fail closed.
