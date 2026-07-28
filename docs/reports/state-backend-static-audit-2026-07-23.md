@@ -6,6 +6,12 @@
 - **Selection verdict:** **BLOCK**
 - **Production/admission verdict:** **BLOCK**; `[LDB-4007]` and `[LDB-0013]` are unchanged
 
+**2026-07-28 supersession:**
+[ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-28-fjall-318-priority-amendment)
+makes stock Fjall 3.1.8 the sole preferred subject for a bounded qualification-entry recheck. This
+report's exact `BLOCK` and unsupported findings remain unchanged; no dependency, adapter, candidate
+run, or admission follows.
+
 Post-audit update (2026-07-24): Cycle 16 adds an isolated redb construction-only workspace and runs
 it on local Windows and Linux Docker. That does not change this report's static evidence class or
 any candidate disposition; the root workspace, runtime lock, profile, and adapters remain redb-free.

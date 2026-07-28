@@ -1,5 +1,9 @@
 # Official TidesDB Rust binding T0 source closure
 
+**2026-07-28 supersession:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-28-fjall-318-priority-amendment)
+makes stock Fjall 3.1.8 the preferred qualification-entry subject. This T0 stop remains historical
+evidence; no package wait or re-entry is scheduled.
+
 - **Cycle:** 41
 - **Date:** 2026-07-25
 - **Scope:** read-only package/source closure; no build, link, install, or candidate execution

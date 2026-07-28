@@ -4,8 +4,8 @@
 - **Date:** 2026-07-24
 - **Scope:** the background-maintenance part of DKS-Q2-006 only
 - **Recorded direction:** additive v2 design approved; protected-workflow approval superseded
-- **Worker-local product target:** TidesDB through official `tidesdb/tidesdb-rs`, published as Cargo
-  package `tidesdb`; production admission remains **NO-GO**
+- **Worker-local product target:** stock official Fjall 3.1.8 is the preferred qualification-entry
+  subject; no backend is selected and production admission remains **NO-GO**
 - **Execution authorized:** no
 - **Cluster admission:** unchanged; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 - **Predecessor:** [state backend qualification runner v1](state-backend-qualification-runner-v1.md)
@@ -13,8 +13,9 @@
 - **Paper mappings:** [Cycle 19 candidate designs](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
 - **Direction record:** [Cycle 21 owner decisions](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md)
 - **Stage 3 output:** [consolidated runner v2 validation contract](state-backend-qualification-runner-v2-draft.md)
-- **TidesDB successor design:** [official-binding local-state design](tidesdb-local-state-successor-design.md)
-- **TidesDB T0 evidence:** [exact-package source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md)
+- **Current candidate authority:** [ADR-008 Fjall amendment](ADR-008-managed-vnode-keyed-state.md#2026-07-28-fjall-318-priority-amendment)
+- **Exact Fjall evidence:** [pinned-source audit](../reports/state-backend-static-audit-2026-07-23.md)
+- **Historical TidesDB evidence:** [exact-package T0 closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md)
 
 Cycle 19 confirms that sampled typed gauges/counters/booleans can express the continuous health
 obligations, while exposing additional candidate gaps. It keeps RocksDB's blocking tail wait
@@ -22,18 +23,25 @@ non-gating rather than disguising an active command as a sampled boolean. The ma
 instantiate v2, rank implementation cost, or authorize source work. On 2026-07-24 the project owner
 recorded `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION`. That decision authorizes Stages 2 and 3 below;
 Cycle 38 later accepts the consolidated validation contract without a protected approval workflow.
+The 2026-07-28 Fjall amendment changes candidate priority, not these production objectives, this
+contract, or the frozen v4 bytes. The stock mapping remains
+`OBSERVED_DESIGN_UNSUPPORTED_IN_STOCK_SOURCE`. A bounded read-only recheck may propose a replacement
+mapping only when stable, truthful sources cover every enabled maintenance mechanism. Laminar-owned
+metrics may cover direct reservations, call outcomes, elapsed time, process limits, and filesystem
+limits; they cannot manufacture invisible engine debt, progress, stalls, or background errors. The
+first required internal fact that remains unavailable without a fork stops the candidate.
 
-## Cycle 41 current-state reconciliation
+## Historical Cycle 41 reconciliation
 
 The [consolidated runner](state-backend-qualification-runner-v2-draft.md) is the sole normative
 successor design only for immutable v4 Fjall/RocksDB validation/reference semantics. This proposal
 records that v1 -> v2 rationale and cannot override it. The
-[TidesDB package design](tidesdb-local-state-successor-design.md) is authoritative for the later
+[TidesDB package design](tidesdb-local-state-successor-design.md) was authoritative for the later
 one-CF/fresh-restore successor roles. Exact official Cargo package `tidesdb v0.11.1`/native 9.3.6
 failed Cycle 41 T0: the safe public surface lacks mandatory exact
 stall/background-error/cleanup/reaper facts, in addition to missing later native fixes, ambiguous
 batch acknowledgement, and an unclosed general cgroup envelope. T1 and successor identities are
-closed pending a new official package and a repeated T0. Redb is PARKED outside v4 and its older
+closed in that historical line. Redb is PARKED outside v4 and its older
 paper mapping is vocabulary provenance, not scheduled work.
 References below to exact schemas mean complete normative v4 wire and schema semantics in the
 contract, not pre-approval JSON Schema or validator implementation.
@@ -253,11 +261,11 @@ identical workload identities must measure throughput, every gate-bearing latenc
 maximum, CPU, memory, and observer-resource impact; numerical limits remain a DKS-Q2-005 owner
 decision and are not invented by this proposal.
 
-## Candidate implications
+## Historical candidate implications through Cycle 41
 
 - **[Official `tidesdb/tidesdb-rs` binding: Cargo package `tidesdb v0.11.1` with native
-  9.3.6](tidesdb-local-state-successor-design.md):** the project owner selected the official binding
-  as the worker-local implementation line;
+  9.3.6](tidesdb-local-state-successor-design.md):** at Cycle 40 the project owner selected the
+  official binding as the worker-local implementation line;
   production admission remains closed. The restricted facade permits one fixed prefixed CF, one
   dedicated owner lane, copied values, transaction-scoped iterators, and deterministic child-before-
   parent shutdown. No callbacks, private FFI, raw handles, patch/fork, native/system-library
@@ -268,8 +276,10 @@ decision and are not invented by this proposal.
   relevant missing native fixes, acknowledged partial transactions, host-based memory resolution,
   and missing required stock health signals. A future verified-commit/fail-stop protocol may address
   only transaction acknowledgement and must pass its latency/fault gates. T1 is cancelled. A new
-  official package must repeat T0 before any successor mapping. Immutable cuts, concurrency, latency, faults,
-  delivery, qualification, and independent soak remain mandatory, and v4 cannot be relabelled.
+  official package would have had to repeat T0 before any successor mapping. The 2026-07-28
+  amendment removes that package wait from the active plan. Immutable cuts, concurrency, latency,
+  faults, delivery, qualification, and independent soak remain mandatory, and v4 cannot be
+  relabelled.
 - **[RocksDB 10.4.2](../reports/rocksdb-mechanism-source-closure-2026-07-24.md):** frozen v4/reference
   provenance only. The historical design would first choose the
   smallest paper-mapped set covering the fixed objectives from
@@ -278,11 +288,11 @@ decision and are not invented by this proposal.
   objective requires them. Do not relabel any estimate as exact debt. The known complete-pressure
   stall gap still appears to need a bounded WBM/controller slow-path observer and safe bindings,
   but its mapping design may identify additional source or binding work.
-- **[Fjall 3.1.8](../reports/state-backend-static-audit-2026-07-23.md):** frozen v4/reference
-  provenance only. The exact-debt requirement
-  goes away, but its stable public pressure/progress, error, resource-control, and stall surface is
-  still insufficient. The historical mapping identified a potential telemetry/control patch, but
-  no Fjall fork, patch, source closure, or adapter is scheduled.
+- **[Fjall 3.1.8](../reports/state-backend-static-audit-2026-07-23.md):** its historical mapping is
+  unsupported because the stable public pressure/progress, error, resource-control, and stall
+  surface is insufficient. The 2026-07-28 amendment makes it the preferred subject only for a
+  bounded read-only mapping recheck. No dependency, adapter, patch, fork, or candidate run is
+  authorized.
 - **[redb 4.1.0](../reports/redb-4.1.0-prescreen-mechanism-note-2026-07-23.md):** PARKED outside v4
   after the Cycle 34 design timebox. Its archived N/A design informed the closed vocabulary, but no
   prescreen, profile, adapter, or execution is scheduled. Reopening requires a new bounded charter.
@@ -292,7 +302,7 @@ decision and are not invented by this proposal.
 
 No candidate proceeds by elimination or receives a weighted score.
 
-## Implementation stages and approval boundaries
+## Historical implementation stages through Cycle 41
 
 1. **Freeze the direction — complete.** On 2026-07-24 the project owner chose the v2 design direction.
    This originally authorized only Stages 2 and 3 design work. Cycle 38 later authorized
@@ -316,7 +326,8 @@ No candidate proceeds by elimination or receives a weighted score.
    attribution and restricted ownership containment pass; relevant later native fixes, exact or
    verified success, the general cgroup contract, and stock health gates fail. No machine work or
    dependency followed.
-6. **Wait for a new official package; T1 is not authorized for v0.11.1.** Its native payload must
+6. **The former next step was to wait for a new official package; T1 was not authorized for
+   v0.11.1.** Its native payload would have needed to
    contain every relevant later fix. The repeated T0 must prove exact transaction success or accept
    a Laminar verified-commit/fail-stop protocol with explicit hot-path/fault gates, and must close
    the resource/health contract. Only a complete pass may spend at most two working days/four machine-hours building and
@@ -330,9 +341,13 @@ No candidate proceeds by elimination or receives a weighted score.
    approvals, add the restricted adapter and run the logical/C2/C3,
    physical-fault, portable-recovery, and 24/72-hour evidence on a frozen Linux/XFS/NVMe successor
    profile. Failure activates no fallback code.
-8. **Integrate and certify separately.** The managed vnode lifecycle, grouped aggregates, windows,
+8. **Integration and certification remained separate.** The managed vnode lifecycle, grouped aggregates, windows,
    joins, connector delivery, exactly-once combinations, and independent release-candidate product
-   soak remain later, separate release gates.
+   soak remained later, separate release gates.
+
+The current next step is the ADR-008 Fjall amendment's one-engineer-day, zero-candidate-machine-hour
+read-only source/contract closure. It may only decide whether stock 3.1.8 exposes a truthful minimum
+mapping and freeze an adapter-entry contract on a pass. It does not construct or run an adapter.
 
 Every implementation cycle ends with the six-pass AI-slop, overengineering/hot-path, unused-code,
 production-readiness, documentation, and test review.

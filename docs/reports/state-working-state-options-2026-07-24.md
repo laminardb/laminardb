@@ -8,30 +8,22 @@
   cluster-shared checkpoints
 - **Bounded-memory outcome:** reference/conformance-only under the current ADR and plan; no cluster
   product profile or production-soak matrix
-- **Worker-local integration line selected:** official `tidesdb/tidesdb-rs`, published as Cargo
-  package `tidesdb`; production qualification/admission remains unqualified and closed; exact
-  v0.11.1 stopped at T0
+- **Preferred worker-local qualification-entry subject:** stock official Fjall 3.1.8; no backend is
+  selected or production-qualified, and admission remains closed
 - **Evidence:** code inspection and current primary-source review; no candidate or product run
 - **Admission:** unchanged and fail-closed under `[LDB-4007]` and `[LDB-0013]`
 
-**Cycle 42 current direction:** the engine-neutral placement conclusion remains authoritative. The
-project owner selected TidesDB over RocksDB and now requires the official Rust binding. The
-[package design](../architecture-decisions/tidesdb-local-state-successor-design.md) binds Cargo
-package `tidesdb v0.11.1`
-with native 9.3.6 as the exact prescreen subject and permits only a one-database/one-retained-
-CF, one-owner-lane restricted facade. Private FFI, raw handles, callbacks, patches/forks, native or
-system-library substitution, and unsafe workarounds are prohibited. Local state always restores
-from portable Laminar artifacts into a fresh root; native reopen, checkpoint, and remote storage are
-disabled and no per-batch `FULL` fence is added. The
-[T0 source closure](tidesdb-rs-t0-source-closure-2026-07-25.md) stops v0.11.1 on relevant missing
-native fixes, acknowledged partial transactions, an unclosed general cgroup envelope, and missing
-public health facts; T1 is cancelled. A future verified-commit/fail-stop design may address only the
-acknowledgement gap and must pass source/fault/hot-path gates. Package selection is not
-qualification, runtime admission, or a production claim. A new official package must repeat T0 before any successor profile, common
-qualification, integration, or independent product soak. Every later `current`, `continue`, `keep`,
-or `should`
-imperative in the Cycle 20 engine screen is historical and superseded by the current implementation
-order below.
+**2026-07-28 current direction:** the engine-neutral placement conclusion remains authoritative.
+The project owner prioritizes stock official Fjall 3.1.8 as the sole preferred qualification-entry
+subject. Exact source contains atomic-batch, consistent-snapshot and ordered-range primitive shapes,
+but the global write-buffer setting is unenforced and the journal limit is soft; concurrent/crash
+semantics, synchronous stalls, maintenance/error health, prefix cleanup, serialized-write tails and
+fault behavior remain open. A bounded recheck must determine whether Laminar's direct observations
+and stock public facts together satisfy the minimum contract without a Fjall fork. The Cycle 40/41 TidesDB
+design and T0 stop are retained only as historical evidence. Selection is not qualification,
+runtime admission, or a production claim. Every later `current`, `continue`, `keep`, or `should`
+imperative in the dated Cycle 20 engine screen is historical and superseded by the current
+implementation order below.
 
 ## Decision
 
@@ -98,7 +90,7 @@ durable ingress log or stays outside the claim.
 | Architecture | Hot-path and capacity consequence | Recovery/rebalance consequence | Disposition |
 |---|---|---|---|
 | Hard-bounded in-memory + shared checkpoints | Lowest local access overhead, but all charged live/frozen/scratch state and worst-case skew must fit RAM; allocator retention and snapshot-copy tails still count | Cold restore and source replay after every process loss; full/delta chains and source retention must meet RTO | **Reference/conformance-only:** no current product profile or admission evidence. The current flat operator maps are not this service. |
-| Embedded local store + shared checkpoints | Local cache/memtable for hot state and disk capacity for cold state; compaction, page faults, writer contention, sync and disk pressure enter p99.9 | Local files are disposable; the selected official-binding TidesDB profile always uses portable vnode restore into a fresh root | **Recommended general profile**, after the package and successor campaigns pass |
+| Embedded local store + shared checkpoints | Local cache/memtable for hot state and disk capacity for cold state; compaction, page faults, writer contention, sync and disk pressure enter p99.9 | Local files are disposable; any later Fjall profile must use portable vnode restore into a fresh generation/root | **Recommended general profile**, after integration and absolute qualification pass |
 | Object-store-primary embedded engine | Cold reads and durable writes are async and inherit remote latency/cost; requires caching, batching and failure isolation | Shared immutable files can reduce restore copying, but version ownership, fencing, compaction and GC become a subsystem | **Deferred architecture**, not an extra current candidate |
 | Remote transactional KV/database | Network/service queueing enters every miss/range path; client cache introduces coherence and version questions | Needs a snapshot/version that composes with Laminar's cut and a portable export; still needs vnode epoch fencing | **Reject as generic initial backend**; evaluate only a named service after measured need |
 | Kafka state changelog | Fast local state is still required; mutation traffic and recovery become Kafka-coupled | Coherent when source partitions, tasks, changelog and transactions all use Kafka; creates dual authority for other connectors | **Reject as connector-neutral authority** |
@@ -155,41 +147,36 @@ validation-only implementation.
 
 ## Current implementation and qualification order
 
-1. The bounded official-binding TidesDB successor design is complete in Cycle 40. It freezes Cargo
-   package `tidesdb v0.11.1`/native 9.3.6 as the prescreen subject, the restricted one-CF facade, always-
-   fresh portable restore, atomic-success/visibility, immutable cuts, resource/health obligations,
-   upstream-wait stops, and successor-lineage roles without adding or running the candidate.
-2. Cycle 41 T0 is complete with `STOP_WAIT_FOR_UPSTREAM`: crate/tag/nested-archive attribution and
-   restricted owner/lifetime containment pass, while relevant later native fixes, exact or verified
-   success, the general cgroup contract, and stock health gates fail. No machine work or runtime
-   dependency followed.
-3. Implement only the backend-neutral complete/failed-before-apply/unknown-poison publication,
+1. Retain the Cycle 40 TidesDB design and Cycle 41 `STOP_WAIT_FOR_UPSTREAM` only as historical
+   evidence; no package wait, fork, PR, adapter, or qualification step remains scheduled.
+2. Prioritize stock official Fjall 3.1.8 for one engineer-day and zero candidate machine-hours of
+   read-only source/contract closure. Do not fork, add the dependency, construct an adapter, execute
+   the candidate, or rely on its unenforced global write-buffer option or soft journal limit.
+3. Continue the backend-neutral complete/failed-before-apply/unknown-poison publication,
    fresh-root/fencing, resource-admission, and health-capability contracts plus fake-backend fault
    tests. Cycle 42 completes the current aggregate classification/publication slice: an error after
    aggregate state application may begin requires coordinated recovery, and the recovery path
    excludes output and a due checkpoint. The backend-owned sticky native-root poison and remaining
-   admission contracts stay open. Defer TidesDB's owner lane and verified readback; do not add the
-   stopped package.
-4. Wait for a new official Rust package, then repeat the entire
-   one-day/zero-machine-hour T0. Merely rebundling native 9.3.14 is insufficient. Only after a pass
-   and separately reviewed execution scope may T1 spend at most two working days/four machine-hours
-   in an isolated workspace. Compilation, linkage, diagnostics, and smoke execution prove only
-   package-facade feasibility. Later closure and exact-run authorities bind source, candidate,
-   profile, plan, target, isolation, limits, and cost.
-5. After a future package passes T0/T1, implement only genuinely reusable validation primitives
-   directly required by the successor, retaining v4 fixture/delta regression coverage without
-   speculative containers.
-6. Qualify TidesDB for the general local-spill profile only through the successor common evidence.
-   A hard failure disqualifies the target and returns alternatives to an explicit owner decision;
-   it never silently activates RocksDB, Fjall, redb, or bounded memory.
-7. Then implement the already-required in-memory semantic backend as the first lifecycle consumer,
-   followed by the Phase-0-selected local-spill backend behind the same contract. Use the memory
+   admission contracts stay open. Do not add Fjall in those core slices.
+4. Freeze the smallest testable adapter-entry contract only if the read-only closure proves truthful
+   sources for every required pressure, progress, error and fail-stop fact. The first required
+   internal fact unavailable without a fork stops Fjall.
+5. Only after that pass, seek separate implementation authority for the smallest all-mode adapter/
+   conformance vertical. Remove it on a correctness or resource-containment failure; do not add
+   alternative adapters or a generic runtime backend framework.
+6. Qualify the exact Fjall subject using the actual uniform/Zipf aggregate, window/timer and join
+   operations plus checkpoint, cleanup, rebalance, crash, corruption, disk-pressure, N/N-1 and
+   p99/p99.9/max gates. A hard failure or required fork disqualifies it and returns alternatives to
+   an explicit owner decision.
+7. Use the already-required in-memory semantic backend as the first lifecycle consumer and the
+   qualified local-spill backend behind the same contract. Use the memory
    implementation to prove atomic pre-mutation reads/batch writes, ordered timers/ranges, generation
    freeze, whole-graph acquire/revoke and the external oracle. This is implementation evidence, not
    production admission.
 8. Keep bounded memory as the semantic reference only. Any later product proposal must amend the ADR
    and restart applicability, hard-limit, recovery/RTO, and independent-soak approval before a run.
-9. Run a separately chartered independent release-candidate product soak for the sole current
+9. After existing failover, ALO, and EO-eligible regressions and final cleanup pass, run a separately chartered
+   independent release-candidate product soak for the sole current
    local-spill production profile. It forces cold cache, maintenance stalls, disk fill/corruption,
    local-disk loss, object-store faults, repeated process loss and rebalances. A backend endurance
    run is not this soak. A future memory product proposal must first amend the ADR and charter with

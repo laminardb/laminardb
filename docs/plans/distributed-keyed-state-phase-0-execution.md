@@ -1,10 +1,9 @@
 # Phase 0 execution plan: distributed keyed state
 
 - **Status:** Certification/qualification work paused; backend-neutral core reference work resumed;
-  official `tidesdb/tidesdb-rs`, published as Cargo package `tidesdb`, remains the worker-local
-  integration line, while exact v0.11.1 is stopped at T0 pending a new official package; no runtime
-  dependency, backend qualification evidence, independent production-soak result, or admission
-  change
+  stock official Fjall 3.1.8 is the preferred worker-local qualification-entry subject; no runtime
+  dependency, backend selection, qualification evidence, independent production-soak result, or
+  admission change
 - **Started:** 2026-07-22
 - **Last reconciled:** 2026-07-28 during Core Cycle 10
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
@@ -13,12 +12,13 @@
 
 ## Outcome
 
-Phase 0 proves the contracts needed before the selected official-binding TidesDB working-state
-implementation can begin or a profile can be admitted in production. Exact Cargo package
-`tidesdb v0.11.1` with native 9.3.6 failed Cycle 41 T0; native 9.3.14 cannot be substituted and
-retains the transaction defect. The next package attempt waits for a new official package and
-repeats T0. Backend-neutral Laminar lifecycle/checkpoint, publication-boundary, resource-admission,
-and truthful health-composition work may continue without adding the stopped dependency.
+Phase 0 proves the contracts needed before any stock-Fjall working-state implementation can be
+considered for production admission. Exact-source review finds the required atomic-batch, snapshot
+and ordered-range primitive shapes but leaves concurrent/crash semantics, pressure bounds,
+synchronous-call deadlines, maintenance/error health, prefix cleanup, tail latency and fault
+behavior to prove. Backend-neutral
+Laminar lifecycle/checkpoint, publication-boundary, resource-admission and truthful health-
+composition work may continue without adding a backend dependency.
 Cycle 20 does not split the existing Phase 0 review gate;
 Phase 1 remains blocked until that gate completes or an accepted ADR/plan amendment defines a
 smaller owner-approved entry gate. This phase does not add a state backend to the runtime, relax
@@ -27,6 +27,11 @@ smaller owner-approved entry gate. This phase does not add a state backend to th
 The [2026-07-27 ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset)
 pauses Cycle 69 and later certification work and authorizes only the private reference core slice.
 It is not Phase 0 completion, backend qualification, or permission to execute a candidate.
+
+The [2026-07-28 Fjall amendment](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-28-fjall-318-priority-amendment)
+supersedes the former TidesDB work order. TidesDB-specific T0/T1 and campaign text retained below is
+historical Cycle 40/41 evidence unless the current numbered implementation order explicitly says
+otherwise. It does not schedule a package wait, fork, adapter, or run.
 
 Core Cycles 2–10 add a fail-closed runtime containment path for staged local vnode transitions and a
 narrow audited, committed final-owner revoke path. Cycles 4–6 pin restore to the capsule-validated
@@ -566,7 +571,7 @@ nonce-bound v2 response preflight, still not
 an A/B sample; (3) engineering effect-estimation under Cycle 60 only after review; (4) a separate
 provider-neutral diagnostics-only TLS 1.3 mTLS listener and hostile identity tests for multi-host;
 and (5) powered equivalence and the independently operated production soak only after their own
-frozen inputs. None authorizes a TidesDB package attempt, runtime backend dependency, keyed-state
+frozen inputs. None authorizes candidate construction, a runtime backend dependency, keyed-state
 admission, or delivery-guarantee change.
 
 Cycle 68 completes only the control-primitives prefix of step (1), in `1b6a06ed`. The isolated tool
@@ -709,6 +714,10 @@ adapter work is scheduled. It may reopen only through the protocol's one-page, t
 four-machine-hour, separately versioned micro-prescreen charter and separate candidate-execution
 authority. A favorable observation merely funds mechanism/persistence mapping, an additive profile/
 schema proposal, and adapter review; no prescreen artifact may satisfy or be pooled into C1/C2/C3.
+
+**Historical candidate record:** The following Cycle 17–41 RocksDB/TidesDB sequence and its
+TidesDB-specific facade/campaign details are retained as exact decision provenance. The Fjall
+priority amendment and current implementation order below supersede their future imperatives.
 
 Cycle 17 stopped the proposed RocksDB stall-only workspace at read-only source proof: the stall
 observer appeared bounded but v1's debt arm required broader engine instrumentation/configuration
@@ -864,14 +873,13 @@ lineage reader/staging receipt. The managed artifact-v1 and `VnodePartialV2` rea
 
 Remaining work is kept reviewable in this dependency order:
 
-1. `docs: select the official tidesdb/tidesdb-rs binding (Cargo package tidesdb) and design its
-   restricted successor contract` — complete in Cycle 40 without adding, downloading, building,
-   linking, or executing TidesDB;
-2. `docs: stop Cargo package tidesdb v0.11.1 at T0` — complete in Cycle 41 after exact source proved
-   missing later native fixes, silent short-transaction success, an unclosed general cgroup
-   envelope, and missing mandatory public health facts; no build, link, candidate execution, or
-   runtime code followed;
-3. complete only the remaining backend-neutral Laminar gaps required regardless of the engine.
+1. retain the Cycle 40 TidesDB selection and Cycle 41 T0 stop as historical evidence; no package
+   wait, fork, PR, adapter, or qualification work remains scheduled for that line;
+2. `docs: prioritize stock official Fjall 3.1.8 for bounded qualification-entry review` — the
+   2026-07-28 amendment changes candidate priority without adding or executing the crate. Source
+   review finds required KV primitive shapes and disproves a hard global write-buffer cap and hard
+   journal cap; the one-engineer-day, zero-candidate-machine-hour source/contract closure remains;
+3. complete the remaining backend-neutral Laminar gaps required regardless of the engine.
    Core Cycle 10 now metadata-traverses every required parent seal, verifies exact child-parent
    lineage before the pre-Commit cluster-global payload/artifact sum, persists participant-agreed
    limits and verified totals in capsule v6, and makes restore reproduce that contract before body
@@ -881,35 +889,35 @@ Remaining work is kept reviewable in this dependency order:
    health signals, and a second state-family consumer. The outcome, publication,
    checkpoint/rebalance fencing, fresh-root, capability, and current raw-lineage authority already
    landed in Core Cycles 6–10 and must remain regression coverage rather than be reimplemented.
-   Defer TidesDB's owner lane and verified-readback machinery; do not add or execute the package in
-   this slice. The completed containment increments and their tests are summarized in the
+   Do not add or execute Fjall in this slice. The completed containment increments and their tests are summarized in the
    [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md). Core Cycles 6–10
    complete the immutable transition, aggregate prepare/publication, and current raw-lineage
    authority subsets. The next backend-neutral slice is the held acquired-subset raw transition
    reservation; wrapper/seal/request/spool/decode/RSS/pause limits, vnode sharding, and a second
    state family remain open. The latest exact boundary is recorded in the
    [Cycle 10 review](../reviews/distributed-keyed-state-core-cycle-10.md);
-4. wait for a new official Cargo package `tidesdb`, freeze its exact native pair, and repeat the
-   complete four-engineer-hour/one-working-day/zero-machine-hour T0. The repeated T0 must reconcile
-   every later native fix and prove exact transaction success or explicitly accept the full-key
-   verified-commit/fail-stop protocol. Only after a pass and separately reviewed execution scope may
-   T1 spend at most one engineer-day/one machine-hour in an isolated workspace; compilation,
-   linkage, diagnostics, and smoke execution are facade-feasibility evidence only. Freeze successor
-   identities after a pass and add an adapter only under its own later authority;
-5. after a future package passes T0/T1, implement only genuinely reusable parsers/evaluators,
-   formulas, bounded readers, synthetic execution-ineligible fixtures, and negative-capability tests
-   directly required by the
-   successor; retain v4 fixture/delta regression tests, but do not build speculative containers;
+4. use the one-engineer-day, zero-candidate-machine-hour read-only closure to prove truthful stable
+   sources for every required Fjall pressure, progress, error, resource and fail-stop fact. Freeze
+   the smallest testable entry contract only on a pass; the first unavailable internal fact or
+   required fork stops the candidate;
+5. only after that pass and under a separately reviewed implementation scope, build the smallest adapter/conformance
+   vertical required to prove that contract in embedded, single-node, and cluster-with-admission-
+   closed modes. Remove it if entry correctness/resource containment fails; do not build a generic
+   runtime-selectable backend framework or speculative alternate adapters;
 6. `docs: authorize an exact keyed-state qualification run`
    - the project owner may revise the candidate before explicitly authorizing exact thresholds, case
      matrix, Zipf sampler, runner source/build identity, target/isolation/limits/cost, and evidence
      rules. The current validator continues to accept only null approvals and
      `qualification_eligible=false` until that separate execution design lands;
-7. `test: exercise backend crash resource and endurance gates` using only the authorized artifacts;
-8. `docs: record the TidesDB qualification verdict`; a hard failure disqualifies the selected target
-   and returns alternatives to an explicit owner decision rather than silently activating one;
-9. `tools: remove rejected state backend spike`; and
-10. `docs: review distributed keyed state phase zero`.
+7. `test: exercise Fjall uniform/Zipf aggregate, timer/window and join-family C2/C3 plus checkpoint,
+   cleanup, rebalance, crash, resource and endurance gates` using only the authorized artifacts;
+8. `docs: record the Fjall qualification verdict`; a hard failure or required fork disqualifies the
+   target and returns alternatives to an explicit owner decision rather than silently activating
+   one;
+9. run the existing cluster failover, ALO and EO-eligible regression matrices, then complete the
+   final code/unused-helper/document cleanup before an independently operated immutable RC soak; and
+10. `docs: review distributed keyed state phase zero and authorize only the operator families whose
+    full distribution/state/delivery evidence passes`.
 
 The parked redb prescreen is not a prerequisite or active side branch in this numbered candidate
 sequence. If a future bounded charter yields a favorable administrative recommendation, a later
@@ -925,8 +933,9 @@ reference module is removed. All three exits must land before any admission guar
 outer-directory fixture encoder remains test-only; the promoted inner reference encoder is not a
 manifest-selected or production streaming writer.
 
-Each commit runs its affected feature matrix. Backend candidates do not touch runtime crates. The
-[Cycle 9 review](../reviews/distributed-keyed-state-core-cycle-09.md) records the cumulative current
+Each commit runs its affected feature matrix. Backend candidates do not touch runtime crates before
+the separately reviewed adapter step. The
+[Cycle 10 review](../reviews/distributed-keyed-state-core-cycle-10.md) records the cumulative current
 Phase 1 containment boundary; it neither completes Phase 1 nor bypasses the Phase 0 gates. The
 first guard-removal commit is reserved for the later grouped-aggregate vertical after Phase 1
 passes.

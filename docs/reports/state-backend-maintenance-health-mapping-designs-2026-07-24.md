@@ -12,7 +12,12 @@
 - **Cluster admission:** unchanged; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 - **Production verdict:** **NO-GO**
 
-**Current authority:** these mappings remain frozen source-gap provenance, not a product ranking.
+**2026-07-28 supersession:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-28-fjall-318-priority-amendment)
+makes stock Fjall 3.1.8 the preferred qualification-entry subject. Its source gaps below remain
+entry gates, not a current instruction to build a fork.
+
+**Historical authority through Cycle 41:** these mappings remain frozen source-gap provenance, not a
+product ranking.
 The [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
 selects the official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb v0.11.1`/native 9.3.6,
 as the restricted-facade T0 subject. [Cycle 41 T0](tidesdb-rs-t0-source-closure-2026-07-25.md)

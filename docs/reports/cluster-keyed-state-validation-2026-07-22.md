@@ -120,11 +120,14 @@ refusal reason, last successful report, or outcome-unknown reconciliation. Fixed
 recovery, and startup-checkpoint budgets also lack large-state validation. None of this is a row
 hot-path change or production-readiness evidence.
 
-**Current authority:** the [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
-selects the official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb`, as the intended
-qualification line. No Cargo dependency, bounded working-state integration, or runtime backend
-selector has landed. [Cycle 41 T0](tidesdb-rs-t0-source-closure-2026-07-25.md) stops exact v0.11.1/
-native 9.3.6 pending a new official package. [Cycle 42](../reviews/distributed-keyed-state-cycle-42.md)
+**Current authority:** the
+[2026-07-28 ADR amendment](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-28-fjall-318-priority-amendment)
+makes stock official Fjall 3.1.8 the sole preferred qualification-entry subject.
+No Cargo dependency, bounded working-state integration, or runtime backend selector has landed.
+Exact source contains the required local KV primitive shapes but leaves concurrent/crash behavior,
+synchronous stalls, maintenance/error health, prefix cleanup, latency and faults unproved. The
+Cycle 40/41 TidesDB selection and v0.11.1/native 9.3.6 T0 stop remain historical evidence.
+[Cycle 42](../reviews/distributed-keyed-state-cycle-42.md)
 corrects current aggregate failure classification and proves synchronous output/checkpoint
 exclusion after an indeterminate apply. [Cycle 43](../reviews/distributed-keyed-state-cycle-43.md)
 keeps analytic frame history unchanged until residual projection succeeds. [Cycle 44](../reviews/distributed-keyed-state-cycle-44.md)
@@ -784,7 +787,7 @@ current three-node engineering harness consume exact local adoption evidence. Du
 authority and admission-neutral transactional runtime integration remain open. The independent
 soak remains later and separately operated.
 
-### Fjall is historical, not current infrastructure
+### Fjall is the qualification-entry subject; its former cold tier is historical
 
 The current baseline contains no Fjall dependency or state-tier module. Fjall 3.1 was previously
 used by the v0.26-era optional `state-tier` feature as a rebuildable cold cache for demoted
@@ -799,11 +802,13 @@ copied returned values. Formal target-Linux/NVMe testing never ran. Current Fjal
 atomic batches, snapshots, range scans, and sorted ingestion, but lacks native multi-get/range
 delete and a mature supported memory/compaction observability surface. The ADR therefore requires
 the same real state workload and fault gates before selecting a backend rather than assuming the
-historical dependency is fit. Cycle 40 later selected the official `tidesdb/tidesdb-rs` binding,
-Cargo package `tidesdb`, as the TidesDB integration line. Cycle 41 stopped exact v0.11.1 at T0;
-qualification and production admission remain outstanding. There is no `tidesdb` dependency or
-selectable bounded working-state implementation in the current manifests or runtime. The existing
-injectable `StateBackend` is instead checkpoint-artifact storage, as distinguished below.
+historical dependency is fit. The 2026-07-28 owner amendment prioritizes the exact stock 3.1.8
+release as the sole qualification-entry subject, not the removed tier. Its unenforced global write-
+buffer option, soft journal limit, synchronous stalls, incomplete stable maintenance/error surface,
+missing multi-get/range delete, serialized journal writer, cleanup cost and p99.9/max behavior are
+still gates. There is no `fjall` or `tidesdb` dependency or selectable bounded working-state
+implementation in the current manifests or runtime. The existing injectable `StateBackend` is
+instead checkpoint-artifact storage, as distinguished below.
 
 ## Empirical validation
 

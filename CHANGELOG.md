@@ -4,6 +4,13 @@
 
 ### Changed
 
+- Stock official Fjall 3.1.8 is now the sole preferred worker-local managed-state
+  qualification-entry subject, replacing the stopped TidesDB work order. Exact-source review finds
+  the required atomic-batch, snapshot, and ordered-range primitive shapes but leaves concurrent and
+  crash behavior, hard pressure bounds, maintenance/error health, prefix cleanup, p99.9/max
+  latency, and fault/resource qualification open. No backend dependency, adapter, candidate
+  execution, admission, delivery, or production-readiness change follows; no Fjall fork is
+  permitted and `[LDB-4007]`/`[LDB-0013]` remain closed.
 - Managed aggregate candidates are now planned and initialized before checkpoint recovery in
   embedded, single-node, and cluster pipelines. Catalog-bridged and intermediate source schemas are
   registered before that planning boundary.

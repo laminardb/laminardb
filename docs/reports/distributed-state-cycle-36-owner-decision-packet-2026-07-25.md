@@ -7,6 +7,10 @@
 - **Runtime dependency, adapter, or admission change:** none
 - **Production verdict:** **NO-GO**; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 
+**2026-07-28 supersession:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-28-fjall-318-priority-amendment)
+makes stock Fjall 3.1.8 the preferred qualification-entry subject; this packet remains historical
+review input.
+
 ## Outcome
 
 The v4 profile bytes and preparatory independent exact-delta evidence were ready for owner review.

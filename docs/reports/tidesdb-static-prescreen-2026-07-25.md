@@ -1,5 +1,9 @@
 # TidesDB static backend prescreen and Zipf claim audit
 
+**2026-07-28 supersession:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-28-fjall-318-priority-amendment)
+makes stock Fjall 3.1.8 the preferred qualification-entry subject. This file is historical TidesDB
+evidence; its present-tense work order is no longer current.
+
 - **Date:** 2026-07-25
 - **Cycle:** 28; bounded Cycle 35 recheck; Cycle 38/39 priority history; Cycle 40 package selection;
   Cycle 41 exact-package T0 stop
@@ -14,7 +18,7 @@
   reopens the exact package only for restricted-facade validation
 - **Cycle 28/35 track:** **STOP** unrestricted use of the inspected official Rust subject; no build,
   benchmark, adapter, or candidate execution was authorized
-- **Current direction:** the official TidesDB Rust binding remains the sole selected integration
+- **Cycle 41 direction (superseded):** the official TidesDB Rust binding remains the sole selected integration
   line; the unrelated crates.io package `tidesdb-rs` is excluded; exact official Cargo package
   `tidesdb v0.11.1`/native 9.3.6 is `STOP_WAIT_FOR_UPSTREAM` after Cycle 41 T0
 - **Production and cluster admission:** **NO-GO**; `[LDB-4007]` and `[LDB-0013]` remain fail-closed

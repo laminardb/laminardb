@@ -8,7 +8,11 @@
 - **Candidate execution authorized:** no
 - **Runtime/admission effect:** none; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 
-**Current authority:** Cycle 38 replaced the proposed protected-workflow mechanism and accepts the
+**2026-07-28 supersession:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-28-fjall-318-priority-amendment)
+makes stock Fjall 3.1.8 the preferred qualification-entry subject. The TidesDB statements below are
+historical.
+
+**Authority through Cycle 41:** Cycle 38 replaced the proposed protected-workflow mechanism and accepts the
 [consolidated runner](../architecture-decisions/state-backend-qualification-runner-v2-draft.md) only
 for validation implementation. The [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
 selects the official TidesDB Rust binding as the integration policy. The later
@@ -42,9 +46,9 @@ protected approval workflow. Candidate-native numerical
 thresholds remain separately frozen in each immutable mapping and later qualification approval; the
 direction decision does not approve them.
 
-## Current profile and work authority
+## Profile and work authority through Cycle 41
 
-| Item | Current treatment | Next authority |
+| Item | Treatment through Cycle 41 | Then-next authority |
 |---|---|---|
 | In-memory working state | Semantic reference/conformance subject only | Separate future ADR amendment before any product profile |
 | Local-spill working state | Sole current broad-state product target; the official TidesDB Rust binding is selected, while exact Cargo package v0.11.1 is stopped, unqualified, and unadmitted | Continue backend-neutral Laminar gaps; wait for a new official package, repeat T0, then complete T1, successor non-v4 profile/mapping, qualification, integration, and independent product soak |

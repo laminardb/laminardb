@@ -10,6 +10,10 @@
   mechanism-closure task; carry redb only into its separately approved native prescreen; do not
   carry unmodified Fjall or SurrealKV
 
+**2026-07-28 supersession:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-28-fjall-318-priority-amendment)
+makes stock Fjall 3.1.8 the preferred qualification-entry subject. This matrix's carry order is
+historical; its exact source risks remain evidence.
+
 **Cycle 17 supersession:** the bounded
 [RocksDB mechanism-source closure](rocksdb-mechanism-source-closure-2026-07-24.md) stopped at Stage
 0. An apparently bounded stall observer is plausible but unproved, and this matrix's assumption
@@ -26,7 +30,7 @@ separately versioned micro-prescreen charter and new candidate-execution authori
 imperative, recommendation, work-order step, and “hedge” statement in this dated report is historical
 and superseded. This matrix does not authorize further redb protocol or adapter work.
 
-**Current authority:** this report remains dated source/gap history; its RocksDB work order is
+**Historical authority through Cycle 41:** this report remains dated source/gap history; its RocksDB work order is
 superseded. The [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
 selects the official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb v0.11.1`/native 9.3.6,
 as the restricted-facade T0 subject. [Cycle 41 T0](tidesdb-rs-t0-source-closure-2026-07-25.md)

@@ -1,7 +1,8 @@
 # Phased plan: distributed keyed and stateful operators
 
-- **Status:** Core reference implementation resumed; production qualification/certification paused;
-  exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster operator is admitted
+- **Status:** Core reference implementation resumed; stock Fjall 3.1.8 is the preferred local-spill
+  qualification-entry subject, but no backend is selected; production qualification/certification
+  is paused and no new cluster operator is admitted
 - **Date:** 2026-07-22
 - **Last reconciled:** 2026-07-28 during Core Cycle 10
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
@@ -126,9 +127,9 @@ apply an absolute restore/acquisition deadline with cancellation, and prove rele
 abort, poison, and graph replacement. Encoded wrapper/seal metadata, decoder scratch and expansion,
 decoded/live/prepared/retired RSS, and apply/retirement pause remain separate limits.
 Bounded working-state storage remains later.
-Backend work does not block these slices. TidesDB re-entry and the upstream-contribution boundary
-are owned by the
-[TidesDB design](../architecture-decisions/tidesdb-local-state-successor-design.md).
+Backend work does not block these slices. The bounded stock-Fjall entry and no-fork boundary are
+owned by the
+[ADR amendment](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-28-fjall-318-priority-amendment).
 
 **DKS-CLEANUP-001 — final maintainability gate.** The distributed keyed-state feature maintainer
 owns this gate. Low-risk cleanup lands as each core slice stabilizes; the final sweep runs after the
@@ -197,11 +198,13 @@ The Cycle 20 [working-state placement analysis](../reports/state-working-state-o
 separates the capability from a named engine but does not change sequencing authority. Phase 1
 remains blocked by the existing Phase 0 review gate. Any later gate split requires an accepted ADR/
 plan amendment with named scope and owners. The intended broad/variable-state production profile
-  still waits for the selected official-binding TidesDB local-spill target to qualify. Cycle 41
-  stops exact v0.11.1/native 9.3.6 at T0 and cancels T1; backend-neutral Laminar lifecycle,
-  publication-boundary, checkpoint, resource-admission, and health-composition work may continue,
-  while the TidesDB path waits for a new official package and repeated source closure. The package choice is not runtime
-  authorization or production admission; alternatives require an explicit owner decision. The
+  still waits for stock official Fjall 3.1.8 to pass bounded integration and absolute qualification.
+  Source review finds the required KV primitive shapes, while concurrent/crash semantics,
+  unenforced global write-buffer configuration, soft journal limits, synchronous stalls, incomplete
+  maintenance visibility, prefix cleanup and tail/fault evidence remain open. Backend-neutral
+  Laminar lifecycle, publication-boundary,
+checkpoint, resource-admission and health-composition work may continue. Candidate priority is not
+runtime authorization or production admission. The
   project decision keeps bounded memory as a reference/conformance implementation
   only; it has no cluster product schedule or production-soak matrix under this plan.
 
@@ -239,7 +242,7 @@ a direct-API/future-refactor invariant rather than evidence of a formerly reacha
 fault. It adds one atomic check and one `Arc` clone/drop per graph cycle, not per row/operator. A
 future cancellable checkpoint-delivery path and any native operation that can outlive the graph still
 need their own owner-level poison/publication fence. Distribution, rebalance, source/sink delivery,
-TidesDB qualification, cluster admission, and the independent soak remain open.
+Fjall integration/qualification, cluster admission, and the independent soak remain open.
 
 Cycle 47 closes the audit—not the implementation—of post-graph drain publication cancellation. A
 one-slot real sink-actor probe reproduced an unclassified retained-callback drop after graph input
@@ -429,7 +432,7 @@ real-child tests. No LaminarDB process or workload was used, and configured loop
 fake-process attestation. The sealed common driver has not yet been upgraded to launch and consume
 the network-mode observer; that fake-only non-feedback proof was then the next gate before this
 workstream was suspended. Runtime admission,
-TidesDB qualification, source/state/sink delivery, multi-host security, latency A/B, and the
+Fjall integration/qualification, source/state/sink delivery, multi-host security, latency A/B, and the
 independent release soak remain open.
 
 The fake path accelerates all 58 logical slots and does not validate the 0..285-second cadence or
@@ -469,7 +472,7 @@ trusted release-process descriptors, and nonce-bound v2 responses in a non-measu
 preflight before any A/B. Multi-host work remains a
 separate diagnostics-only TLS 1.3 mTLS listener with signed node-specific roster/identity and
 attempt-bound credentials; it cannot reuse current cluster mTLS as HTTP evidence. Live A/B,
-powered equivalence, TidesDB qualification, runtime admission, delivery/exactly-once work, and the
+powered equivalence, Fjall integration/qualification, runtime admission, delivery/exactly-once work, and the
 independent release-binary soak remain separate later gates.
 
 ## Scope and non-goals
@@ -599,38 +602,23 @@ Work:
    [decision matrix](../reports/state-backend-contract-decision-matrix-2026-07-24.md) recommends an
    additive maintenance-health successor. Cycle 21 records the direction approval, and Cycle 38
    accepts the consolidated contract for validation-only implementation without a GitHub approval
-    workflow. No candidate construction or execution authority follows. Cycle 38 made TidesDB the
-    preferred local-spill candidate instead of RocksDB; Cycle 40 selects the official
-    `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb v0.11.1`, with native 9.3.6 as the exact
-    prescreen subject and only integration line, without
-    qualifying or admitting it. Cycle 41's
-    [T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md) stops that release:
-    later one-CF correctness/memory-safety fixes are absent; transactions can acknowledge a short
-    partial batch; and the general cgroup envelope and mandatory public health facts remain
-    unclosed. Restricted owner/lifetime containment passes. A future full-key verified-commit/
-    fail-stop design can address only acknowledgement and must pass hot-path/fault gates. The accepted
-    [package design](../architecture-decisions/tidesdb-local-state-successor-design.md) permits only
-    a restricted facade with one database, one retained fixed CF, one dedicated bounded blocking
-    lane, copied values, transaction-scoped iterators, and deterministic child-before-parent
-    shutdown. It prohibits callbacks, package handles crossing the facade, private FFI, raw handles,
-    patches/forks, native/system-library substitution, and unsafe workarounds. Opening or serving
-    prior native state, native checkpoint, remote mode, strict replay, and per-batch `FULL` are
-    outside the initial profile. T1, a runtime dependency, an adapter, and successor profile
-    identities are cancelled for v0.11.1. A future official native/package release repeats the
-    complete four-engineer-hour/one-working-day/zero-machine-hour T0; only a pass may fund T1's
-    at-most-one-engineer-day/one-machine-hour isolated package feasibility. Cgroup
-    resources, maintenance health, immutable cuts, concurrency, tails, faults, portable restore,
-    delivery, and independent soak remain hard gates. TidesDB native remote storage stays disabled.
-    Cycle 19's reviewed
+   workflow. The 2026-07-28 owner amendment makes stock official Fjall 3.1.8 the sole preferred
+   qualification-entry subject; Cycle 40/41 TidesDB selection and stop remain historical. Exact-
+   source review finds Fjall's atomic-batch, consistent-snapshot and ordered-range primitive shapes
+   but disproves a hard global memtable cap and hard journal cap and retains synchronous-stall,
+   maintenance-health and prefix-cleanup risks. The bounded recheck must prove that stable stock and
+   directly observed Laminar facts truthfully cover every required mechanism. It may not substitute
+   a watchdog for invisible engine debt, progress, stalls, or background errors. No missing signal
+   is zero and no Fjall fork or git dependency is allowed. Cycle 19's reviewed
    [candidate mappings](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
    define the historical RocksDB source/binding closure and Fjall scheduler/lifecycle closure used
    by the immutable v4 reference lineage. Redb 4.1.0 is parked after its Cycle 34 design timebox; it has no scheduled
    protocol or adapter work and may reopen only under the bounded micro-prescreen charter recorded
-   in its canonical protocol. Unmodified Fjall 3.1.8 and SurrealKV 0.21.2 do not proceed to adapters.
-   These engine gates apply to the general local-spill profile. They are not an architectural need
-   of the in-memory reference, but the current Phase 0 gate still blocks Phase 1. Run any later
-   package-admitted TidesDB subject through the bounded successor profile: Arrow-batch-sized atomic
-   requests, realistic
+   in its canonical protocol. SurrealKV 0.21.2 remains rejected. These engine gates apply to the
+   general local-spill profile. They are not an architectural need of the in-memory reference, but
+   the current Phase 0 gate still blocks Phase 1. Run an authorized exact Fjall subject through an
+   execution profile that binds stock 3.1.8, `lsm-tree`, adapter, configuration, target and limits:
+   Arrow-batch-sized atomic requests, realistic
    hot/cold multi-key reads, timer scans, snapshot/export overlap, sorted restore, vnode drop/GC,
    maintenance pressure/write stalls, hard memory/disk/FD limits, `kill -9`, torn/corrupt data,
    `ENOSPC`, and N/N-1 format rehearsal. Include 24–72-hour churn/TTL soak. A pass qualifies the
@@ -666,7 +654,7 @@ Exit gate:
 - benchmark and numerical SLO/RTO profile is reproducible on a clean runner;
 - golden ABI/schema vectors and compatibility policy pass;
 - the placement-neutral service/lifecycle and in-memory conformance subject are reviewable without
-  implying admission; before broad-profile admission, the selected official-binding TidesDB target passes
+  implying admission; before broad-profile admission, the exact stock-Fjall target passes
   reproducible conformance, latency, resource, fault and operability gates, or it is disqualified
   and the profile stays closed; the in-memory subject remains reference/conformance-only and
   supplies no admission evidence;
@@ -685,7 +673,7 @@ No DDL guard is relaxed in this phase.
 
 The service and operator codecs are required to become identical in embedded, single-node, and
 cluster modes. That is a target contract, not the current implementation: there is no runtime
-backend selector or TidesDB dependency today. Embedded and single-node currently use a local
+backend selector or Fjall dependency today. Embedded and single-node currently use a local
 one-key-group topology; cluster uses configured vnode ownership and adds exchange, fencing, and
 transfer. The in-memory reference path and any future qualified local-spill backend must share SQL
 semantics and portable recovery artifacts, while remaining different capacity/maintenance
@@ -702,11 +690,12 @@ Work packages:
 - Provide the in-memory semantic/lifecycle implementation first and the Phase-0-selected local-
   spill backend behind the same contract and conformance suite. Neither implementation changes
   admission by existing; do not retain losing disk qualification adapters.
-- For TidesDB local spill, use only the official `tidesdb/tidesdb-rs` binding (Cargo package
-  `tidesdb`) behind the restricted package facade: one
-  worker-local database, one retained fixed physical managed-state CF, one dedicated bounded
-  blocking lane, and logical pipeline/operator/table/vnode/generation prefixes. Do not allocate a
-  database or physical tree per vnode or expose package types outside the facade.
+- If Fjall passes the ADR-008 entry closure, use only the reviewed exact official crates.io release
+  behind the managed-state facade. Every Fjall API call uses a bounded foreground blocking lane;
+  Fjall's internal maintenance remains engine-owned and un-cancellable. Freeze the exact database/
+  keyspace layout and limits in the entry contract. Do not allocate a database or keyspace per
+  vnode, expose Fjall types outside the facade, depend on a fork, or credit its deprecated global
+  write-buffer option as a resource bound.
 - Encode hot values with a compact schema-versioned binary format. Do not use per-group Arrow IPC,
   live DataFusion/rkyv checkpoint types, read-before-write accounting, or the removed cold-tier
   wrapper.
@@ -720,8 +709,9 @@ Work packages:
   off the compute/event-loop thread.
 - Deduplicate state keys per Arrow batch and submit one logical multi-read plus one atomic mutation
   batch; a backend without native multi-get must still satisfy the same batched latency contract.
-- Complete cache-only work inline only when it cannot block. Route every disk-capable call to a
-  long-lived bounded blocking-worker pool; do not create a future or `spawn_blocking` task per row.
+- Complete only Laminar-owned in-memory cache hits inline. Route every Fjall or other disk-capable
+  call to a long-lived bounded blocking-worker pool; do not create a future or `spawn_blocking` task
+  per row.
 - Preserve mutation order within each vnode/table lane while allowing independent lanes to run in
   parallel. Bound queue bytes, age, and concurrency, and propagate storage pressure to ingestion.
 - Defer a cold Arrow batch as one unit with bounded input and watermark holds. Aligned barriers drain

@@ -1,6 +1,7 @@
 # TidesDB local working-state design
 
-- **Status:** Accepted integration direction; exact Cargo package `tidesdb v0.11.1` stopped at T0
+- **Status:** Historical stopped candidate design; superseded by ADR-008's Fjall 3.1.8 priority
+  amendment
 - **Date:** 2026-07-25
 - **Last reconciled:** 2026-07-27 during Core Cycle 1
 - **Selected integration line:** the official `tidesdb/tidesdb-rs` binding, published on crates.io
@@ -15,9 +16,15 @@
   [TidesDB static prescreen](../reports/tidesdb-static-prescreen-2026-07-25.md), and
   [ADR-008](ADR-008-managed-vnode-keyed-state.md)
 
+**2026-07-28 supersession:** [ADR-008](ADR-008-managed-vnode-keyed-state.md#2026-07-28-fjall-318-priority-amendment)
+makes stock official Fjall 3.1.8 the sole preferred worker-local qualification-entry subject. This
+file preserves the exact Cycle 40 design and Cycle 41 T0 stop as decision evidence; its
+present-tense TidesDB work order is no longer current. No TidesDB package, fork, upstream-wait task,
+adapter, or qualification run is scheduled.
+
 ## Decision
 
-LaminarDB will pursue TidesDB for worker-local keyed state through the official
+At Cycle 40 LaminarDB chose to pursue TidesDB for worker-local keyed state through the official
 [`tidesdb/tidesdb-rs`](https://github.com/tidesdb/tidesdb-rs) binding, whose Cargo package and
 library are named `tidesdb`. The package is a private
 implementation dependency behind a Laminar-owned safe facade; its database, column-family,
@@ -285,7 +292,7 @@ Every phase produces raw evidence, an explicit pass/fail/blocked verdict, and a 
 AI slop, overengineering/hot-path cost, unused code, production readiness, documentation, and tests.
 A benchmark win, successful smoke test, or vendor Zipf result cannot replace any gate.
 
-## Stop and fallback policy
+## Historical Cycle 41 stop and fallback policy
 
 The TidesDB track stops for the exact release when:
 
@@ -302,16 +309,14 @@ run and blocks production pending cause analysis; it disqualifies the package on
 is attributable to the package/backend path.
 
 On stop, `[LDB-4007]` and `[LDB-0013]` remain fail-closed. No alternative activates automatically.
-The current action is to wait for a new official Cargo package `tidesdb` carrying the relevant
-native correctness/memory-safety fixes, then freeze that exact pair and repeat T0. The repeated T0
-must decide whether transaction success is exact upstream or a Laminar verified-commit/fail-stop
-protocol can meet correctness and latency; it must also close the resource/health contract. A new owner
-decision is required to reconsider RocksDB or another candidate. Bounded memory remains
+At Cycle 41 the next action was to wait for a new official Cargo package `tidesdb`, freeze that exact
+pair, and repeat T0. The 2026-07-28 Fjall amendment cancels that scheduled wait. A new owner decision
+is required to restart TidesDB or reconsider another candidate. Bounded memory remains
 reference-only.
 
 ## Consequences
 
-This direction honors the selected TidesDB package and removes the maintenance burden of a private
+This historical direction honored the selected TidesDB package and removed the maintenance burden of a private
 FFI or engine fork. It makes upstream transaction semantics, package surface, and release cadence
 explicit schedule dependencies. Cycle 41 proves that one-CF/fresh-root confinement can contain the
 ownership tree. It can support a future fail-stop verification design for ambiguous mutation, but

@@ -10,11 +10,16 @@
 - **Cluster admission:** unchanged; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 - **Proposal:** [maintenance-health contract v2](../architecture-decisions/state-backend-maintenance-health-v2-proposal.md)
 
+**2026-07-28 supersession:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-28-fjall-318-priority-amendment)
+makes stock Fjall 3.1.8 the preferred qualification-entry subject. The v2 direction and frozen
+evidence remain; the older candidate order is historical.
+
 **Superseded approval mechanism:** Cycle 38 retains this technical direction but removes the later
 two-owner/protected-workflow ceremony for validation-only implementation. The consolidated contract
 and current ADR are authoritative; candidate execution and production gates remain closed.
 
-**Current authority:** the dated RocksDB recommendation below remains v4/source-gap provenance only.
+**Historical authority through Cycle 41:** the dated RocksDB recommendation below remains
+v4/source-gap provenance only.
 The [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
 selects the official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb v0.11.1`/native 9.3.6,
 as the restricted-facade T0 subject. [Cycle 41 T0](tidesdb-rs-t0-source-closure-2026-07-25.md)
