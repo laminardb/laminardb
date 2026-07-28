@@ -5548,16 +5548,16 @@ impl LaminarDB {
                 startup_generation_fence,
             )
             .await;
-        if let Err(error) = launch {
-            #[cfg(feature = "cluster")]
+        #[cfg(feature = "cluster")]
+        let launch = launch.inspect_err(|_| {
             if let Some(expected) = graph_ready_vnode_state.as_ref() {
                 let mut installed = self.installed_vnode_state.lock();
                 if installed.as_ref() == Some(expected) {
                     installed.take();
                 }
             }
-            return Err(error);
-        }
+        });
+        launch?;
 
         // Readiness has transferred the exact captured assignment and its staged state to the
         // live graph. A watcher may now prepare a successor generation.
