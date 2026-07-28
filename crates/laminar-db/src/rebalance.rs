@@ -2342,11 +2342,50 @@ fn execute_graceful_rotation_owned(
             .as_ref()
             .expect("validated draining snapshot has a transition")
             .clone();
-        match store
-            .save_if_version(&drain, current.version)
-            .await
-            .map_err(|e| e.to_string())?
-        {
+        let current_owners = current
+            .to_vnode_vec(registry.vnode_count())
+            .map_err(|error| error.to_string())?;
+        let rotate_outcome = {
+            // Assignment adoption and startup recovery create pending/restoring vnode work under
+            // this lock. Keep it through the durable CAS so neither can appear after preflight but
+            // before V+1 is published. The scope must end before conflict adoption or drain
+            // finalization, both of which acquire the same lock.
+            let _adoption = db.assignment_adoption_lock.lock().await;
+            let local = registry.versioned_snapshot();
+            if local.version() != current.version || local.owners() != current_owners.as_slice() {
+                return Err(format!(
+                    "graceful rotation predecessor assignment {} does not match local assignment {}",
+                    current.version,
+                    local.version()
+                ));
+            }
+            if db.has_unapplied_vnode_transition(&registry) {
+                debug!(
+                    version = current.version,
+                    "graceful rotation deferred while vnode transition work remains unapplied"
+                );
+                return Ok(None);
+            }
+            let Some(published_fence) = controller.checkpoint_assignment_fence(current.version)
+            else {
+                debug!(
+                    version = current.version,
+                    "graceful rotation deferred until the predecessor is owner-complete"
+                );
+                return Ok(None);
+            };
+            if published_fence != transition.predecessor {
+                return Err(format!(
+                    "graceful rotation predecessor assignment {} does not match the exact owner-complete certificate",
+                    current.version
+                ));
+            }
+            store
+                .save_if_version(&drain, current.version)
+                .await
+                .map_err(|error| error.to_string())?
+        };
+        match rotate_outcome {
             RotateOutcome::Rotated => {
                 let drain_deadline = tokio::time::Instant::now() + config.drain_ack_timeout;
                 db.validate_source_drain_snapshot(&drain)

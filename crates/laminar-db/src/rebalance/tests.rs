@@ -988,6 +988,59 @@ async fn at_least_once_live_rotation_uses_the_global_drain_protocol() {
     config.checkpoint_timeout = Duration::from_secs(2);
     config.drain_ack_timeout = Duration::from_secs(1);
 
+    let wrong_fence = CheckpointAssignmentFence::from_owner_map(
+        current.version,
+        &vec![self_id.0; (vnode_count - 1) as usize],
+        current.participants.clone(),
+    )
+    .unwrap();
+    controller.publish_checkpoint_assignment_fence(Some(wrong_fence.clone()));
+    assert_eq!(
+        controller.checkpoint_assignment_fence(current.version),
+        Some(wrong_fence)
+    );
+    let error = try_rebalance(
+        &db,
+        &controller,
+        &durable,
+        &registry,
+        &[self_id, peer_id],
+        config,
+    )
+    .await
+    .expect_err("a wrong same-version owner-complete fence must block rotation");
+    assert!(
+        error.contains("exact owner-complete certificate"),
+        "{error}"
+    );
+    assert_eq!(durable.load().await.unwrap(), Some(current.clone()));
+    assert!(durable
+        .load_version(current.version + 1)
+        .await
+        .unwrap()
+        .is_none());
+
+    controller.publish_checkpoint_assignment_fence(Some(current.assignment_fence().unwrap()));
+    registry.mark_restoring(&[0]);
+    let deferred = try_rebalance(
+        &db,
+        &controller,
+        &durable,
+        &registry,
+        &[self_id, peer_id],
+        config,
+    )
+    .await
+    .expect("restoring vnode work should defer rather than fail rotation");
+    assert_eq!(deferred, None);
+    assert_eq!(durable.load().await.unwrap(), Some(current.clone()));
+    assert!(durable
+        .load_version(current.version + 1)
+        .await
+        .unwrap()
+        .is_none());
+    registry.mark_active(&[0]);
+
     let error = try_rebalance(
         &db,
         &controller,
