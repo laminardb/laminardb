@@ -4674,6 +4674,7 @@ impl CheckpointCoordinator {
         }
     }
 
+    #[cfg(any(feature = "cluster", test))]
     fn mark_vnode_partials_sealed(&mut self, attempt: CheckpointAttempt) -> Result<(), DbError> {
         let promotions = self.prepare_vnode_partial_promotion(attempt)?;
         self.apply_vnode_partial_promotion(attempt, promotions);
