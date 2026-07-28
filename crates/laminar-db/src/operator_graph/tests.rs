@@ -3784,7 +3784,10 @@ fn managed_state_placement_scopes_capture_and_restore_rosters() {
         let captured = graph.snapshot_state_by_vnode().unwrap();
         let expected_global = owned.contains(&0).then_some(vec![0]).unwrap_or_default();
         assert_eq!(global_observed.lock().as_slice(), &[expected_global]);
-        assert_eq!(keyed_observed.lock().as_slice(), &[owned.clone()]);
+        assert_eq!(
+            keyed_observed.lock().as_slice(),
+            std::slice::from_ref(&owned)
+        );
 
         let mut captured_vnodes: Vec<u32> = captured.keys().copied().collect();
         captured_vnodes.sort_unstable();
