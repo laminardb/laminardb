@@ -750,4 +750,57 @@ mod tests {
             "{error}"
         );
     }
+
+    #[tokio::test]
+    async fn assembly_rejects_divergent_participant_restore_limits() {
+        let attempt = CheckpointAttempt::canonical(31);
+        let fence = fence();
+        let inventory = sealed_inventory(attempt, &fence, [(0, 1), (1, 2)]).await;
+        let mut second = ready(attempt, &fence, 2, vec![1]);
+        second.vnode_restore_limits =
+            VnodeRestoreLimits::global_singleton_compatibility(32 * 1024 * 1024, 6, 2).unwrap();
+        let readiness = vec![
+            (participant_ready_key(1), ready(attempt, &fence, 1, vec![0])),
+            (participant_ready_key(2), second),
+        ];
+
+        let error = assemble_capsule(
+            &inventory,
+            readiness,
+            declared_vnode_restore_contract_for_test(&inventory),
+            "deployment",
+            &PipelineIdentity::empty(),
+            CheckpointWatermark::Uninitialized,
+            None,
+        )
+        .expect_err("every certified participant must attest the same restore limits");
+
+        assert!(error.to_string().contains("does not match its sealed cut"));
+    }
+
+    #[tokio::test]
+    async fn participant_readiness_v5_is_an_explicit_reset_boundary() {
+        let attempt = CheckpointAttempt::canonical(32);
+        let fence = fence();
+        let inventory = sealed_inventory(attempt, &fence, [(0, 1), (1, 2)]).await;
+        let mut old = ready(attempt, &fence, 1, vec![0]);
+        old.version = 5;
+        let readiness = vec![
+            (participant_ready_key(1), old),
+            (participant_ready_key(2), ready(attempt, &fence, 2, vec![1])),
+        ];
+
+        let error = assemble_capsule(
+            &inventory,
+            readiness,
+            declared_vnode_restore_contract_for_test(&inventory),
+            "deployment",
+            &PipelineIdentity::empty(),
+            CheckpointWatermark::Uninitialized,
+            None,
+        )
+        .expect_err("participant readiness v5 requires an explicit reset");
+
+        assert!(error.to_string().contains("does not match its sealed cut"));
+    }
 }

@@ -1064,4 +1064,47 @@ mod tests {
         at_source.recovery_watermark_frontier = Some(1_000);
         at_source.validate().unwrap();
     }
+
+    #[test]
+    fn vnode_restore_contract_accepts_exact_limits_and_rejects_max_plus_one() {
+        let limits = VnodeRestoreLimits::global_singleton_compatibility(10, 2, 3).unwrap();
+        assert_eq!(limits.max_cluster_lineage_payload_bytes, 20);
+        assert_eq!(limits.max_cluster_lineage_artifacts, 6);
+
+        VnodeRestoreContract::new(limits.clone(), 20, 6, 3).unwrap();
+        assert!(VnodeRestoreContract::new(limits.clone(), 21, 6, 3)
+            .unwrap_err()
+            .contains("maximum is 20"));
+        assert!(VnodeRestoreContract::new(limits, 20, 7, 3)
+            .unwrap_err()
+            .contains("maximum is 6"));
+    }
+
+    #[test]
+    fn vnode_restore_limits_recompute_profile_derived_bounds() {
+        let mut limits = VnodeRestoreLimits::global_singleton_compatibility(10, 2, 3).unwrap();
+        limits.max_cluster_lineage_payload_bytes += 1;
+        assert!(limits
+            .validate(3)
+            .unwrap_err()
+            .contains("profile-derived bounds"));
+
+        let mut wrong_version =
+            VnodeRestoreLimits::global_singleton_compatibility(10, 2, 3).unwrap();
+        wrong_version.version -= 1;
+        assert!(wrong_version
+            .validate(3)
+            .unwrap_err()
+            .contains("unsupported vnode restore limits version"));
+    }
+
+    #[test]
+    fn capsule_v5_is_an_explicit_reset_boundary() {
+        let mut old = capsule();
+        old.version = 5;
+        assert!(old
+            .validate()
+            .unwrap_err()
+            .contains("unsupported recovery capsule version 5"));
+    }
 }

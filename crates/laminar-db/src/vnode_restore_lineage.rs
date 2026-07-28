@@ -237,3 +237,201 @@ pub(crate) async fn validate_vnode_restore_lineage(
         inventories,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use laminar_core::{
+        checkpoint::{CheckpointAssignmentFence, CheckpointParticipant},
+        state::{InProcessBackend, StateBackend},
+    };
+
+    use super::*;
+
+    fn fence(vnode_count: u32) -> CheckpointAssignmentFence {
+        CheckpointAssignmentFence::from_owner_map(
+            7,
+            &vec![1; usize::try_from(vnode_count).unwrap()],
+            vec![CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: uuid::Uuid::from_u128(1),
+            }],
+        )
+        .unwrap()
+    }
+
+    async fn write_and_seal(
+        backend: &InProcessBackend,
+        fence: &CheckpointAssignmentFence,
+        attempt: CheckpointAttempt,
+        partials: &[(u32, VnodePartialLineage, &'static [u8])],
+    ) -> Arc<CheckpointSealInventory> {
+        for (vnode, lineage, payload) in partials {
+            backend
+                .write_certified_partial(
+                    attempt,
+                    *vnode,
+                    fence,
+                    1,
+                    *lineage,
+                    Bytes::from_static(payload),
+                )
+                .await
+                .unwrap();
+        }
+        let vnodes = partials
+            .iter()
+            .map(|(vnode, _, _)| *vnode)
+            .collect::<Vec<_>>();
+        assert!(backend
+            .seal_checkpoint(attempt, Some(fence), &vnodes, &[])
+            .await
+            .unwrap());
+        Arc::new(
+            backend
+                .checkpoint_seal_inventory(attempt)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn complete_metadata_traversal_reproduces_exact_contract() {
+        let backend = InProcessBackend::new(2);
+        let fence = fence(2);
+        let parent_attempt = CheckpointAttempt::canonical(1);
+        let parent_payload = b"parent";
+        let parent = write_and_seal(
+            &backend,
+            &fence,
+            parent_attempt,
+            &[
+                (0, VnodePartialLineage::root(6), parent_payload),
+                (1, VnodePartialLineage::root(6), parent_payload),
+            ],
+        )
+        .await;
+        let child_attempt = CheckpointAttempt::canonical(2);
+        let child_payload = b"child";
+        let child = write_and_seal(
+            &backend,
+            &fence,
+            child_attempt,
+            &[
+                (
+                    0,
+                    VnodePartialLineage::extend(
+                        child_attempt,
+                        5,
+                        parent_attempt,
+                        parent.sealed_partials[0].lineage,
+                    )
+                    .unwrap(),
+                    child_payload,
+                ),
+                (
+                    1,
+                    VnodePartialLineage::extend(
+                        child_attempt,
+                        5,
+                        parent_attempt,
+                        parent.sealed_partials[1].lineage,
+                    )
+                    .unwrap(),
+                    child_payload,
+                ),
+            ],
+        )
+        .await;
+        let limits = VnodeRestoreLimits::global_singleton_compatibility(11, 2, 2).unwrap();
+
+        let validated = validate_vnode_restore_lineage(&backend, child, limits)
+            .await
+            .unwrap();
+
+        assert_eq!(validated.contract().exact_cluster_lineage_payload_bytes, 22);
+        assert_eq!(validated.contract().exact_cluster_lineage_artifacts, 4);
+        assert_eq!(validated.inventories.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn forged_parent_arithmetic_fails_before_body_loading() {
+        let backend = InProcessBackend::new(1);
+        let fence = fence(1);
+        let parent_attempt = CheckpointAttempt::canonical(1);
+        write_and_seal(
+            &backend,
+            &fence,
+            parent_attempt,
+            &[(0, VnodePartialLineage::root(6), b"parent")],
+        )
+        .await;
+        let child_attempt = CheckpointAttempt::canonical(2);
+        let forged = VnodePartialLineage::extend(
+            child_attempt,
+            5,
+            parent_attempt,
+            VnodePartialLineage::root(7),
+        )
+        .unwrap();
+        let child = write_and_seal(&backend, &fence, child_attempt, &[(0, forged, b"child")]).await;
+        let limits = VnodeRestoreLimits::global_singleton_compatibility(12, 2, 1).unwrap();
+
+        let error = validate_vnode_restore_lineage(&backend, child, limits)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("does not exactly extend parent"));
+    }
+
+    #[tokio::test]
+    async fn missing_parent_seal_fails_closed() {
+        let backend = InProcessBackend::new(1);
+        let fence = fence(1);
+        let parent_attempt = CheckpointAttempt::canonical(1);
+        let child_attempt = CheckpointAttempt::canonical(2);
+        let child_lineage = VnodePartialLineage::extend(
+            child_attempt,
+            5,
+            parent_attempt,
+            VnodePartialLineage::root(6),
+        )
+        .unwrap();
+        let child = write_and_seal(
+            &backend,
+            &fence,
+            child_attempt,
+            &[(0, child_lineage, b"child")],
+        )
+        .await;
+        let limits = VnodeRestoreLimits::global_singleton_compatibility(11, 2, 1).unwrap();
+
+        let error = validate_vnode_restore_lineage(&backend, child, limits)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("parent seal"));
+        assert!(error.to_string().contains("is missing"));
+    }
+
+    #[tokio::test]
+    async fn declared_cluster_payload_max_plus_one_is_rejected() {
+        let backend = InProcessBackend::new(1);
+        let fence = fence(1);
+        let attempt = CheckpointAttempt::canonical(1);
+        let head = write_and_seal(
+            &backend,
+            &fence,
+            attempt,
+            &[(0, VnodePartialLineage::root(6), b"parent")],
+        )
+        .await;
+        let limits = VnodeRestoreLimits::global_singleton_compatibility(5, 1, 1).unwrap();
+
+        let error = declared_vnode_restore_contract(&head, limits).unwrap_err();
+
+        assert!(error.to_string().contains("declares 6 payload bytes"));
+        assert!(error.to_string().contains("maximum is 5"));
+    }
+}

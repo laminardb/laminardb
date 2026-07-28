@@ -82,6 +82,27 @@ impl StateBackend for ReadCountingBackend {
             .await
     }
 
+    async fn write_certified_partial(
+        &self,
+        attempt: CheckpointAttempt,
+        vnode: u32,
+        assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        writer_node_id: u64,
+        lineage: VnodePartialLineage,
+        bytes: Bytes,
+    ) -> Result<(), StateBackendError> {
+        self.inner
+            .write_certified_partial(
+                attempt,
+                vnode,
+                assignment_fence,
+                writer_node_id,
+                lineage,
+                bytes,
+            )
+            .await
+    }
+
     async fn read_partial(
         &self,
         attempt: CheckpointAttempt,
@@ -514,15 +535,88 @@ async fn restore_lineage_payload_cap_accepts_exact_and_rejects_max_plus_one_befo
             .load_at(&[0, 1], attempt)
             .await
             .expect_err("one byte over the transition payload cap must fail closed");
-    assert!(
-        error.to_string().contains("compatibility envelope"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("exceeding"), "{error}");
     assert_eq!(
         backend.sealed_partial_body_reads(),
         body_reads_before_rejection,
         "lineage preflight must reject before any partial body read"
     );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn metadata_lineage_rejection_performs_zero_partial_body_reads() {
+    use laminar_core::checkpoint::{
+        CheckpointAssignmentFence, CheckpointParticipant, VnodeRestoreLimits,
+    };
+
+    let backend = ReadCountingBackend::new(1);
+    let fence = CheckpointAssignmentFence::from_owner_map(
+        7,
+        &[1],
+        vec![CheckpointParticipant {
+            node_id: 1,
+            boot_incarnation: uuid::Uuid::from_u128(1),
+        }],
+    )
+    .unwrap();
+    let parent_attempt = CheckpointAttempt::canonical(1);
+    backend
+        .write_certified_partial(
+            parent_attempt,
+            0,
+            &fence,
+            1,
+            VnodePartialLineage::root(6),
+            Bytes::from_static(b"parent"),
+        )
+        .await
+        .unwrap();
+    assert!(backend
+        .seal_checkpoint(parent_attempt, Some(&fence), &[0], &[])
+        .await
+        .unwrap());
+    let child_attempt = CheckpointAttempt::canonical(2);
+    let forged_lineage = VnodePartialLineage::extend(
+        child_attempt,
+        5,
+        parent_attempt,
+        VnodePartialLineage::root(7),
+    )
+    .unwrap();
+    backend
+        .write_certified_partial(
+            child_attempt,
+            0,
+            &fence,
+            1,
+            forged_lineage,
+            Bytes::from_static(b"child"),
+        )
+        .await
+        .unwrap();
+    assert!(backend
+        .seal_checkpoint(child_attempt, Some(&fence), &[0], &[])
+        .await
+        .unwrap());
+    let head = Arc::new(
+        backend
+            .inner
+            .checkpoint_seal_inventory(child_attempt)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    let limits = VnodeRestoreLimits::global_singleton_compatibility(12, 2, 1).unwrap();
+
+    let error =
+        crate::vnode_restore_lineage::validate_vnode_restore_lineage(&backend, head, limits)
+            .await
+            .unwrap_err();
+
+    assert!(error.to_string().contains("does not exactly extend parent"));
+    assert_eq!(backend.seal_inventory_reads(), 1);
+    assert_eq!(backend.sealed_partial_body_reads(), 0);
 }
 
 #[cfg(feature = "cluster")]

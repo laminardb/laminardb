@@ -763,10 +763,12 @@ impl ValidatedVnodeRestoreHead {
     fn new(
         inventory: CheckpointSealInventory,
         contract: VnodeRestoreContract,
-        lineage_inventories: HashMap<CheckpointAttempt, Arc<CheckpointSealInventory>>,
+        mut lineage_inventories: HashMap<CheckpointAttempt, Arc<CheckpointSealInventory>>,
     ) -> Self {
+        let inventory = Arc::new(inventory);
+        lineage_inventories.insert(inventory.attempt, Arc::clone(&inventory));
         Self {
-            inventory: Arc::new(inventory),
+            inventory,
             contract,
             lineage_inventories,
         }
@@ -777,21 +779,35 @@ impl ValidatedVnodeRestoreHead {
         let vnode_count = inventory
             .assignment_fence
             .as_ref()
-            .map_or(1, |fence| fence.vnode_count);
-        let max_partial_payload_bytes = inventory
-            .sealed_partials
-            .iter()
-            .map(|partial| partial.lineage.total_payload_bytes())
-            .sum::<u64>()
+            .map_or_else(
+                || u32::try_from(inventory.required_vnodes.len()).unwrap_or(u32::MAX),
+                |fence| fence.vnode_count,
+            )
             .max(1);
+        let (exact_payload_bytes, exact_artifacts, max_chain_artifacts) =
+            inventory.sealed_partials.iter().fold(
+                (0_u64, 0_u64, 1_u32),
+                |(payload_bytes, artifacts, max_chain_artifacts), partial| {
+                    (
+                        payload_bytes
+                            .checked_add(partial.lineage.total_payload_bytes())
+                            .expect("test restore payload accounting"),
+                        artifacts
+                            .checked_add(u64::from(partial.lineage.artifact_count()))
+                            .expect("test restore artifact accounting"),
+                        max_chain_artifacts.max(partial.lineage.artifact_count()),
+                    )
+                },
+            );
+        let max_partial_payload_bytes = exact_payload_bytes.max(1);
         let limits = VnodeRestoreLimits::global_singleton_compatibility(
             max_partial_payload_bytes,
-            6,
+            max_chain_artifacts,
             vnode_count,
         )
         .expect("test restore limits");
         let contract =
-            crate::vnode_restore_lineage::declared_vnode_restore_contract(&inventory, limits)
+            VnodeRestoreContract::new(limits, exact_payload_bytes, exact_artifacts, vnode_count)
                 .expect("test restore contract");
         let mut lineage_inventories = HashMap::new();
         lineage_inventories.insert(inventory.attempt, Arc::new(inventory.clone()));

@@ -5219,6 +5219,92 @@ async fn sealed_parent_promotion_is_atomic_across_owned_vnodes() {
     assert!(coord.last_sealed_delta_depth.is_empty());
 }
 
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn capsule_validation_abort_never_promotes_a_successor_parent() {
+    use laminar_core::checkpoint_decision::CheckpointVerdict;
+    use laminar_core::state::StateBackend;
+    use std::sync::atomic::Ordering;
+
+    let probe = Arc::new(RetentionReadProbe::default());
+    probe.reject_readiness.store(true, Ordering::SeqCst);
+    let backend = Arc::new(FaultBackend {
+        inner: laminar_core::state::InProcessBackend::new(1),
+        fail: parking_lot::Mutex::new(std::collections::HashSet::new()),
+        write_delay: Duration::ZERO,
+        seal_delay: Duration::ZERO,
+        write_probe: None,
+        descriptor_error_after_write: false,
+        retention_read_probe: Some(Arc::clone(&probe)),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_cluster_coordinator(dir.path(), 1).await;
+    coord
+        .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
+        .unwrap();
+    coord.set_vnode_set(vec![0]);
+    coord.set_gate_vnode_set(vec![0]);
+    let _leader_lease = attach_cluster_controller(&mut coord, 1, &[]).await;
+    coord.set_pending_vnode_states(one_vnode_full_state(b"sealed-but-aborted"));
+
+    let request = certified_cluster_request(&coord);
+    let rejected = coord.checkpoint(request).await.unwrap();
+
+    assert!(!rejected.success);
+    assert!(
+        rejected
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("readiness")),
+        "{:?}",
+        rejected.error
+    );
+    let rejected_attempt = CheckpointAttempt::canonical(rejected.checkpoint_id);
+    assert!(backend
+        .checkpoint_seal_inventory(rejected_attempt)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(coord.last_sealed_partial_attempt.is_empty());
+    assert!(coord.last_sealed_upload_attempt.is_empty());
+    let outcome = coord
+        .cluster_controller
+        .as_ref()
+        .unwrap()
+        .checkpoint_authority()
+        .unwrap()
+        .cluster_outcome(rejected.epoch)
+        .await
+        .unwrap()
+        .expect("capsule validation failure must durably Abort");
+    assert_eq!(outcome.verdict, CheckpointVerdict::Abort);
+    assert!(outcome.recovery_capsule.is_none());
+
+    probe.reject_readiness.store(false, Ordering::SeqCst);
+    coord.set_pending_vnode_states(one_vnode_full_state(b"sealed-but-aborted"));
+    let request = certified_cluster_request(&coord);
+    let retry = coord.checkpoint(request).await.unwrap();
+    assert!(retry.success, "{:?}", retry.error);
+    let retry_attempt = CheckpointAttempt::canonical(retry.checkpoint_id);
+    let retry_partial = crate::vnode_partial::VnodePartial::decode(
+        &backend
+            .read_partial(retry_attempt, 0)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(retry_partial.base, None);
+    assert_eq!(
+        coord.last_sealed_partial_attempt.get(&0),
+        Some(&retry_attempt)
+    );
+    assert_ne!(
+        coord.last_sealed_partial_attempt.get(&0),
+        Some(&rejected_attempt)
+    );
+}
+
 #[tokio::test]
 async fn vnode_revoke_then_reacquire_discards_lineage_and_rebases_full() {
     use laminar_core::state::InProcessBackend;
