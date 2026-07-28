@@ -648,6 +648,34 @@ async fn assert_boot_recovery_target_mismatch_is_non_mutating(
 }
 
 #[tokio::test]
+async fn boot_recovery_accepts_newer_committed_cut_under_the_installed_assignment() {
+    let registry = Arc::new(VnodeRegistry::single_owner(2, NodeId(1)));
+    let db = boot_test_db(Arc::clone(&registry)).await;
+    let assignment_handoff_attempt = CheckpointAttempt::canonical(2);
+    registry.set_assignment_and_version_with_source_handoff(
+        vec![NodeId(1), NodeId(1)].into(),
+        2,
+        committed_source_handoff(assignment_handoff_attempt, 1),
+    );
+
+    let reconciled_handoff_version = db
+        .validate_boot_vnode_recovery_target(CheckpointAttempt::canonical(17), 2)
+        .expect(
+            "a newer committed cut sealed under the current assignment must supersede its older acquisition handoff",
+        );
+
+    assert_eq!(reconciled_handoff_version, Some(2));
+    let assignment = registry.versioned_snapshot();
+    assert_eq!(assignment.version(), 2);
+    assert_eq!(assignment.source_handoff_installed_version(), Some(2));
+    assert_eq!(
+        assignment.source_handoff_attempt(),
+        Some(assignment_handoff_attempt)
+    );
+    assert_eq!(assignment.source_handoff_assignment_version(), Some(1));
+}
+
+#[tokio::test]
 async fn boot_recovery_rejects_committed_handoff_attempt_mismatch_without_mutation() {
     assert_boot_recovery_target_mismatch_is_non_mutating(CheckpointAttempt::canonical(8), 11).await;
 }
