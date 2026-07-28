@@ -1604,11 +1604,11 @@ impl LaminarDB {
         *self.supervisor_self.lock() = Arc::downgrade(self);
     }
 
-    /// Make the next [`Self::start`] restore to `epoch` (the cluster-agreed cut) instead
-    /// of the local latest. Cleared on start.
+    /// Select the next coordinated start's recovery cut. `None` selects the latest durable head.
+    /// The value is taken by startup when a checkpoint coordinator is present.
     #[cfg(feature = "cluster")]
-    pub fn set_recover_target_epoch(&self, epoch: u64) {
-        *self.recover_target_epoch.lock() = Some(epoch);
+    pub(crate) fn set_recover_target_epoch(&self, epoch: Option<u64>) {
+        *self.recover_target_epoch.lock() = epoch;
     }
 
     /// Open or close the source-intake gate. Closed (`true`) during a coordinated round until

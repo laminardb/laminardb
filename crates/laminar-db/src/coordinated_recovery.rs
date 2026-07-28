@@ -930,10 +930,15 @@ impl RecoveryMonitor {
                 return false;
             }
         };
-        if !start_pipeline(db, Some(epoch)).await {
+        // This process is outside the frozen owner quorum. By the time it observes the committed
+        // terminal, released owners may already have committed a newer checkpoint. Rebuilding
+        // the passive, assignment-closed runtime at the old release epoch would then violate the
+        // no-rewind guard and request successor rounds forever. Recover the current durable head;
+        // any later vnode acquisition still stages its exact committed handoff before intake opens.
+        if !start_pipeline(db, None).await {
             tracing::error!(
                 gen = release.round.id.generation,
-                target_epoch = epoch,
+                release_epoch = epoch,
                 "ownerless process could not rebuild its assignment-closed connector runtime"
             );
             return false;
@@ -2158,9 +2163,7 @@ async fn start_pipeline(db: &Arc<LaminarDB>, target: Option<u64>) -> bool {
         return false;
     }
     run_lifecycle(db, move |db| async move {
-        if let Some(t) = target {
-            db.set_recover_target_epoch(t);
-        }
+        db.set_recover_target_epoch(target);
         db.start_for_coordinated_recovery().await
     })
     .await

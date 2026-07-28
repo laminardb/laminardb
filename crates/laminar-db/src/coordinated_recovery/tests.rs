@@ -852,6 +852,7 @@ async fn evidence_only_worker_consumes_tombstoned_release_after_stopped_quorum()
         "control:recovery-incarnation",
         controller.recovery_incarnation().to_string(),
     );
+    db.set_recover_target_epoch(Some(2));
     let local_fault = monitor.pending_local_fault(&controller).await.unwrap();
     monitor.observe(&db, &controller, local_fault).await;
     let pending = monitor.pending_faults(&controller).await.unwrap();
@@ -862,6 +863,10 @@ async fn evidence_only_worker_consumes_tombstoned_release_after_stopped_quorum()
     assert!(db.cluster_intake_fenced());
     assert!(monitor.stopped_for.is_none());
     assert!(monitor.restored_for.is_none());
+    assert!(
+        db.recover_target_epoch.lock().is_none(),
+        "an evidence-only worker must recover the latest durable head instead of arming the owners' release epoch"
+    );
     assert_eq!(db.pending_recovery_fault.load(Ordering::Acquire), 0);
     assert_eq!(monitor.applied_gen, round.id.generation);
     assert_eq!(
