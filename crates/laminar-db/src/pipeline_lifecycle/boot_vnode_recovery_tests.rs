@@ -676,8 +676,41 @@ async fn boot_recovery_accepts_newer_committed_cut_under_the_installed_assignmen
 }
 
 #[tokio::test]
+async fn boot_recovery_accepts_newer_cut_before_a_roster_only_successor() {
+    let registry = Arc::new(VnodeRegistry::single_owner(2, NodeId(1)));
+    let db = boot_test_db(Arc::clone(&registry)).await;
+    let assignment_handoff_attempt = CheckpointAttempt::canonical(2);
+    let owners: Arc<[NodeId]> = vec![NodeId(1), NodeId(1)].into();
+    registry.set_assignment_and_version_with_source_handoff(
+        Arc::clone(&owners),
+        2,
+        committed_source_handoff(assignment_handoff_attempt, 1),
+    );
+    registry.set_assignment_and_version_carrying_source_handoff(owners, 3);
+
+    let reconciled_handoff_version = db
+        .validate_boot_vnode_recovery_target(CheckpointAttempt::canonical(17), 2)
+        .expect("a newer cut may precede a successor that carried the acquisition handoff");
+
+    assert_eq!(reconciled_handoff_version, Some(2));
+    let assignment = registry.versioned_snapshot();
+    assert_eq!(assignment.version(), 3);
+    assert_eq!(assignment.source_handoff_installed_version(), Some(2));
+    assert_eq!(
+        assignment.source_handoff_attempt(),
+        Some(assignment_handoff_attempt)
+    );
+    assert_eq!(assignment.source_handoff_assignment_version(), Some(1));
+}
+
+#[tokio::test]
 async fn boot_recovery_rejects_committed_handoff_attempt_mismatch_without_mutation() {
     assert_boot_recovery_target_mismatch_is_non_mutating(CheckpointAttempt::canonical(8), 11).await;
+}
+
+#[tokio::test]
+async fn boot_recovery_rejects_newer_cut_before_handoff_installation() {
+    assert_boot_recovery_target_mismatch_is_non_mutating(CheckpointAttempt::canonical(8), 1).await;
 }
 
 #[tokio::test]

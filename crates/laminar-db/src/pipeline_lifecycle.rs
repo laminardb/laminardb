@@ -1186,9 +1186,19 @@ impl LaminarDB {
         let Some(handoff_attempt) = assignment.source_handoff_attempt() else {
             return Ok(None);
         };
-        if handoff_attempt != recovered_attempt
-            || assignment.source_handoff_assignment_version() != Some(recovered_assignment_version)
-        {
+        let matches_installed_handoff = handoff_attempt == recovered_attempt
+            && assignment.source_handoff_assignment_version() == Some(recovered_assignment_version);
+        // The registry handoff records the cut used to acquire this assignment; it is not a
+        // moving latest-checkpoint pointer. A later committed checkpoint may therefore supersede
+        // it without changing ownership. Its fence must be no older than the handoff publication
+        // and no newer than the registry generation this process is rebuilding.
+        let supersedes_installed_handoff = recovered_attempt.relation_to(handoff_attempt)
+            == laminar_core::state::CheckpointAttemptRelation::Newer
+            && assignment
+                .source_handoff_installed_version()
+                .is_some_and(|installed| installed <= recovered_assignment_version)
+            && recovered_assignment_version <= assignment.version();
+        if !matches_installed_handoff && !supersedes_installed_handoff {
             return Err(DbError::Checkpoint(format!(
                 "[LDB-6031] recovered vnode attempt {recovered_attempt:?} at assignment \
                  {recovered_assignment_version} does not match installed source handoff \
@@ -4187,7 +4197,7 @@ impl LaminarDB {
                                     )
                                 })?
                                 .get();
-                            startup_reconciled_source_handoff_version = self
+                            let reconciled_source_handoff_version = self
                                 .validate_boot_vnode_recovery_target(
                                     recovered_attempt,
                                     recovered_assignment_version,
@@ -4200,6 +4210,8 @@ impl LaminarDB {
                             })?;
                             self.prepare_boot_vnode_restore_transition(restore_cut)
                                 .await?;
+                            startup_reconciled_source_handoff_version =
+                                reconciled_source_handoff_version;
                         }
 
                         if !mv_states.is_empty() {
