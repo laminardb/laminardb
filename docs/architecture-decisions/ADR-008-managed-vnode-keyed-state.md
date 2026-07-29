@@ -1,18 +1,19 @@
 # ADR-008: Managed vnode-keyed working state for distributed operators
 
-- **Status:** Accepted for phased implementation; core reference work resumed, production
-  qualification paused, and cluster admission unchanged
+- **Status:** Accepted for phased implementation; one released backend path selected for bounded
+  adapter entry, production qualification paused, and cluster admission unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-28 after Core Cycle 10 and the TidesDB empirical re-entry
+- **Last reconciled:** 2026-07-29 after the official-release backend selection
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
-- **Production/backend verdict:** TidesDB is the preferred candidate but is empirically blocked
-  pending a fixed native release and matching official Rust package; no backend is
-  production-qualified and admission is **NO-GO**
+- **Production/backend verdict:** carry only canonical `rocksdb` 0.24.0 with bundled RocksDB 10.4.2
+  into bounded adapter entry; qualification remains separately gated, no backend is
+  production-qualified, and admission is **NO-GO**
 - **Related:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md),
   [implementation plan](../plans/distributed-keyed-stateful-operators.md),
   [historical Cycle 21 owner decisions](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md),
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [exact backend source audit](../reports/state-backend-static-audit-2026-07-23.md),
+  [official-release backend selection](../reports/official-release-state-backend-selection-2026-07-29.md),
   [Fjall 3.1.8 source closure](../reports/fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md),
   [TidesDB empirical re-entry](../reports/tidesdb-current-package-reentry-2026-07-28.md), and
   [latest core review](../reviews/distributed-keyed-state-core-cycle-10.md)
@@ -22,20 +23,47 @@
 LaminarDB will add one common, byte-governed, batch-oriented working-state service scoped by stable
 pipeline, operator, table, vnode, and ownership identities. State access stays local; cold or
 blocking work is coalesced per Arrow batch and kept off compute/event-loop threads. The in-memory
-implementation is the semantic/lifecycle conformance subject only. Stock Fjall 3.1.8 failed the
-bounded source gate before integration. The architecture does not intrinsically require an LSM or
-make any future product choice production evidence.
+implementation is the semantic/lifecycle conformance subject only. Canonical `rocksdb` 0.24.0 with
+bundled RocksDB 10.4.2 is the sole released local-spill path carried into bounded adapter entry;
+that selection is not qualification or production evidence. The architecture does not intrinsically
+require an LSM.
 
 Cluster-shared checkpoint storage and the existing `StateBackend` remain recovery authority. A
 local store is disposable capacity/latency infrastructure: it cannot assign a vnode, authorize an
 epoch, replace restore-before-activate/revoke fencing, or create source/sink exactly-once semantics.
-No runtime backend dependency or adapter is authorized by this ADR state.
+No runtime backend dependency or adapter has landed. The selection below authorizes only the next
+small, fail-fast adapter-entry slice against the exact released pair; a required fork, git
+dependency, native patch, unbounded teardown, or inadequate released error surface stops it.
 
-### 2026-07-28 TidesDB empirical re-entry
+### 2026-07-29 official-release backend selection
+
+The
+[selection report](../reports/official-release-state-backend-selection-2026-07-29.md) ends the broad
+backend search. Under Laminar's practical release-only definition—canonical crates.io release,
+released bundled engine, and no fork, git dependency, local native patch, or unreleased fix—the
+sole carry candidate is `rocksdb = 0.24.0` -> `librocksdb-sys = 0.17.3+10.4.2` -> bundled RocksDB
+10.4.2. `rust-rocksdb/rust-rocksdb` is a canonical community binding, not a Meta-published official
+Rust binding. If vendor-authored Rust provenance is mandatory, the eligible set is empty.
+
+This is selection for adapter entry only, not qualification or production selection by elimination.
+The wrapper's void close path, native/C++ build and memory accounting, background maintenance,
+resource limits, cleanup, teardown, and tail latency remain gates. The wrapper cannot bound
+in-process Drop. Lifecycle faults must run in a child process whose parent deadlines/terminates the
+subject and quarantines its disposable root; this proves process containment only. Production stays
+blocked until that containment is accepted for all supported modes or an official wrapper exposes
+a sufficiently bounded/fallible lifecycle. The selection report owns the complete entry checklist.
+
+Current official TidesDB releases remain correctness-ineligible; current Fjall 3.1.8 remains
+lifecycle-ineligible; and redb 4.1.0 remains stopped on resource/lifecycle evidence. They are not
+runtime fallbacks. New official releases may trigger a bounded re-entry decision but do not create
+an automatic alternative track. Shared checkpoint and exactly-once authority remain Laminar-owned
+and provider-neutral; engine object storage is neither selected nor required.
+
+### 2026-07-28 TidesDB empirical re-entry (superseded for selection)
 
 The executable
-[entry report](../reports/tidesdb-current-package-reentry-2026-07-28.md) retains TidesDB as the
-preferred direction without admitting either tested subject. Official `tidesdb` 0.11.1/native
+[entry report](../reports/tidesdb-current-package-reentry-2026-07-28.md) historically retained
+TidesDB as the preferred direction without admitting either tested subject. Official `tidesdb` 0.11.1/native
 9.3.6 passed 71 default-feature Rust library tests and ordinary clean-reopen checks. Unmodified
 native 9.3.14 unified mode then reproduced a false-success allocation fault at 0/1,024 keys. A
 test-only short-return injection separately proved that classic and unified callers can acknowledge
@@ -73,8 +101,9 @@ The source result remains `OBSERVED_DESIGN_UNSUPPORTED_IN_STOCK_SOURCE`, but the
 method review corrects its decision reach: Fjall is `SOURCE_BLOCKED_PENDING_TARGETED_REPRO`, not
 empirically or permanently rejected. A definitive lifecycle result requires a bounded test that
 forces the observed worker-error branch and destroys the database under an external deadline. No
-such Fjall candidate test has run. TidesDB is the active preferred direction; backend-neutral core
-work may continue.
+such Fjall candidate test has run. The later official-release selection rejects Fjall 3.1.8 for
+current use and carries RocksDB as the sole adapter-entry candidate; backend-neutral core work may
+continue.
 
 ### 2026-07-28 Fjall 3.1.8 priority amendment
 
@@ -311,15 +340,16 @@ seal, coordinator decision, or restore-before-activate authority.
 | Track | Current disposition | Required next authority/evidence |
 |---|---|---|
 | In-memory | Reference/conformance-only; no product profile, admission schedule, fallback, or soak matrix | A separate future ADR/charter amendment before any bounded-memory product claim |
-| Local-spill product profile | Sole current broad-state product target; TidesDB is preferred but blocked pending upstream work, and no backend is qualified or admitted | Validate and release the native false-success fix, publish the matching official Rust source feature, repeat entry, then fund the smallest adapter and full workload/fault qualification |
+| Local-spill product profile | Sole current broad-state product target; canonical `rocksdb` 0.24.0 with bundled RocksDB 10.4.2 is the only released path carried forward, but it is not qualified or admitted | Run the one-cycle adapter entry against the exact released pair; stop on any required fork/patch or unbounded lifecycle, otherwise request separate qualification authority |
 | Qualification contract | Cycle 38 maintenance-health v2 and exact v4 remain immutable validation/reference lineage; no GitHub approval workflow exists or is required for that scope; v1 remains immutable regression lineage | Do not relabel frozen evidence. Any later candidate run needs exact source/build/profile/plan/target/limits authority and may use only truthful candidate or Laminar-owned bounded signals; unsupported is never zero |
-| RocksDB 10.4.2 via `rocksdb` 0.24.0 | Mature operational LSM reference and immutable v1-v4 regression/comparison subject; not the product backend | No new adapter, source-closure, or qualification work is scheduled absent a new project-owner direction |
-| Fjall 3.1.8, official tag `6debe706` | **SOURCE_BLOCKED_PENDING_TARGETED_REPRO.** Source shows a worker-error/drop hazard and incomplete frozen-v2 failure coverage; neither has an empirical candidate result | Not active while TidesDB is preferred. Before an outright rejection, inject the existing worker-error branch and bound database destruction externally |
-| redb 4.1.0 | **Stop 4.1.0; reconsider only an official successor.** The 2026-07-29 bounded review found unresolved physical-allocation, durability-barrier, offline-compaction, and non-fallible-drop risks; it is not a formal qualification result | No adapter or runtime dependency. A newer official release may begin with the same two-profile resource/maintenance control; no upstream change is pre-credited |
-| Official `tidesdb/tidesdb-rs` binding | **PREFERRED; BLOCKED PENDING UPSTREAM RELEASE.** Released 0.11.1 ordinary-path tests pass; unmodified 9.3.14 unified mode and a separate short-return contract test expose false-success paths | Land focused native regressions/fix, publish a fixed successor tag and matching official Rust package, then repeat entry before adapter work |
+| RocksDB 10.4.2 via `rocksdb` 0.24.0 | **SOLE CARRY CANDIDATE; ADAPTER ENTRY ONLY.** Canonical community Rust release, not a Meta-authored official Rust binding; close status, native resources, maintenance, teardown, and tails remain unproved | Build only the smallest private owner/conformance slice. Quiesce, checkpoint, flush, wait/cancel, externally bound Drop, quarantine, and fresh-root restore; no fork, generic selector, qualification execution, admission change, or production claim |
+| Fjall 3.1.8, official tag `6debe706` | **REJECT CURRENT RELEASE.** The worker-error/drop lifecycle hazard remains in the released source and cannot be repaired by a Laminar wrapper under the no-fork rule | Re-enter only after a newer official release fixes successful-spawn/worker-exit accounting, proves bounded teardown, and permits a new maintenance/error-surface review |
+| redb 4.1.0 | **Stop 4.1.0; reconsider only an official successor.** Physical allocation stayed above the reference until offline compaction; there is no public fallible database close, and Drop performs maintenance/close while discarding errors. This is not a formal qualification result | No adapter or runtime dependency. A newer official release may begin with the same two-profile resource/maintenance control; no upstream change is pre-credited |
+| Official `tidesdb/tidesdb-rs` repository, Cargo package `tidesdb` | **REJECT CURRENT RELEASE; WATCHLIST ONLY.** Released 0.11.1 selects native 9.3.6; current native 9.3.14 and a separate short-return contract test expose false-success paths, and PR 664 is unreleased | Re-enter only after an equivalent fix ships in a native successor and matching official source/Rust packages, then repeat bounded entry |
 | SurrealKV 0.21.2 | Rejected unmodified; no active candidate track | Correctness/liveness fork and new bounded prescreen authority before reconsideration |
 
 The current source detail and rationale live in the
+[official-release selection](../reports/official-release-state-backend-selection-2026-07-29.md),
 [placement analysis](../reports/state-working-state-options-2026-07-24.md),
 [v2 direction](state-backend-maintenance-health-v2-proposal.md),
 [v2 validation contract](state-backend-qualification-runner-v2-draft.md),
@@ -331,7 +361,7 @@ The current source detail and rationale live in the
 [historical TidesDB package design](tidesdb-local-state-successor-design.md), and
 [historical TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
 [TidesDB empirical re-entry](../reports/tidesdb-current-package-reentry-2026-07-28.md). These
-are evidence and gate records. The TidesDB empirical re-entry is current backend authority; no
+are evidence and gate records. The official-release selection is current candidate authority; no
 runtime dependency, qualification result, or production admission follows.
 
 The existing fixed vnode ABI, bounded shuffle, assignment/process fencing, aligned barriers,
@@ -488,7 +518,7 @@ The service contract is local and batch-oriented:
 
 There is no `await`, database call, or object-store request per row. Operators deduplicate encoded
 keys while evaluating an Arrow batch, reserve resources, and submit one state request. Only a
-Laminar-owned in-memory cache hit may complete inline; every Fjall API call runs on a long-lived
+Laminar-owned in-memory cache hit may complete inline; every disk-backend API call runs on a long-lived
 bounded blocking-worker pool because the stock API has no guaranteed cache-only read. Independent
 vnode/table lanes may run in parallel, while mutations for one
 lane preserve order. A cold batch is deferred as a unit with bounded input and watermark holds;

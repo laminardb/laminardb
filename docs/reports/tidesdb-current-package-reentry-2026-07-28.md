@@ -8,7 +8,11 @@
   `6fe1e83104b70255a694239d360a14bae51d0c70`
 - **Upstream patch:** [TidesDB PR 664](https://github.com/tidesdb/tidesdb/pull/664), commit
   `b80e424ae98540c61be81d83c85f03f43d93b1d0`; open, DCO passed, CI/review pending
-- **Product-line decision:** retain TidesDB as the preferred integration direction
+- **Historical product-line decision:** retained TidesDB as the preferred integration direction on
+  2026-07-28
+- **Current selection status:** superseded by the
+  [2026-07-29 official-release selection](official-release-state-backend-selection-2026-07-29.md);
+  current TidesDB releases are rejected and are not a runtime fallback
 - **Entry decision:** both exact subjects remain unadmitted; TidesDB is not qualification-eligible
 - **Admission:** `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 

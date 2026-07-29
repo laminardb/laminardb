@@ -508,75 +508,12 @@ jobs:
       - name: Test standalone MPFR oracle (NOT evidence)
         run: python -m unittest discover -s tools/state-backend-zipf-oracle -p 'test_*.py' -v
 
-  redb-prescreen-construction:
-    name: Ineligible redb construction runner (NOT evidence)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95.0"
-          components: clippy, rustfmt
-      - name: Verify isolated exact redb subject
-        shell: bash
-        run: |
-          set -euo pipefail
-          lock=tools/state-backend-redb-prescreen/Cargo.lock
-          grep -A5 -F 'name = "redb"' "$lock" | grep -Fqx 'checksum = "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839"'
-          if grep -Fqx 'name = "redb"' Cargo.lock; then
-            echo "LaminarDB runtime lock unexpectedly contains redb"
-            exit 1
-          fi
-          gate_tree="$(cargo tree --locked --manifest-path tools/state-backend-redb-prescreen/Cargo.toml -p state-backend-redb-prescreen-gate --prefix none)"
-          if grep -Eq '^redb([[:space:]]|$)' <<< "$gate_tree"; then
-            echo "redb-free construction gate unexpectedly depends on redb"
-            exit 1
-          fi
-      - name: Format construction workspace
-        run: cargo fmt --manifest-path tools/state-backend-redb-prescreen/Cargo.toml --all -- --check
-      - name: Lint construction workspace
-        run: cargo clippy --locked --manifest-path tools/state-backend-redb-prescreen/Cargo.toml --workspace --all-targets -- -D warnings
-      - name: Test construction workspace
-        run: cargo test --locked --manifest-path tools/state-backend-redb-prescreen/Cargo.toml --workspace --all-targets
-      - name: Build exact construction binaries
-        run: cargo build --locked --release --manifest-path tools/state-backend-redb-prescreen/Cargo.toml --workspace
-      - name: Exercise disposable construction lane (NO DECISION)
-        shell: bash
-        run: |
-          set -euo pipefail
-          run_dir="$RUNNER_TEMP/redb-construction-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir -- "$run_dir"
-          candidate=tools/state-backend-redb-prescreen/target/release/state-backend-redb-prescreen-candidate
-          gate=tools/state-backend-redb-prescreen/target/release/state-backend-redb-prescreen-gate
-          db="$run_dir/construction.redb"
-          report="$run_dir/construction-report.json"
-          export_file="$run_dir/construction-export.bin"
-
-          # Bash measures this 512 MiB maximum in 1024-byte blocks. The timeout is
-          # an external kill boundary for
-          # redb's intentionally unbounded database-wide writer acquisition.
-          ulimit -f 524288
-          timeout --signal=KILL 60s "$candidate" construction-only-no-decision run "$db" "$report"
-          chmod a-w "$db"
-          db_sha_before="$(sha256sum "$db" | cut -d' ' -f1)"
-          timeout --signal=KILL 60s "$candidate" construction-only-no-decision scan "$db" "$export_file"
-          db_sha_after="$(sha256sum "$db" | cut -d' ' -f1)"
-          [[ "$db_sha_before" == "$db_sha_after" ]]
-          gate_output="$(timeout --signal=KILL 60s "$gate" verify-construction "$report" "$export_file" 2>&1)"
-          echo "$gate_output"
-          grep -Fqx 'CONSTRUCTION ONLY / NO DECISION / NOT PRESCREEN OR QUALIFICATION EVIDENCE' <<< "$gate_output"
-          grep -Fq 'VALID_REDB_CONSTRUCTION_NO_DECISION rows=65536 export_bytes=67174456 export_sha256=a82240b51daf373ce03bbff9cd70bede90eda1b8433ef39e6be0754dd76e7290' <<< "$gate_output"
-
-          # The ephemeral runner discards these files. They are deliberately not
-          # uploaded and cannot become qualification or backend-selection evidence.
-
   # ============================================
   # CI Success Gate
   # ============================================
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, msrv, docs, soak-contract-scaffold, state-zipf-oracle-linux, state-qualification-windows, state-qualification-arm64, redb-prescreen-construction]
+    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, msrv, docs, soak-contract-scaffold, state-zipf-oracle-linux, state-qualification-windows, state-qualification-arm64]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -592,8 +529,7 @@ jobs:
              [[ "${{ needs.soak-contract-scaffold.result }}" != "success" ]] || \
              [[ "${{ needs.state-zipf-oracle-linux.result }}" != "success" ]] || \
              [[ "${{ needs.state-qualification-windows.result }}" != "success" ]] || \
-             [[ "${{ needs.state-qualification-arm64.result }}" != "success" ]] || \
-             [[ "${{ needs.redb-prescreen-construction.result }}" != "success" ]]; then
+             [[ "${{ needs.state-qualification-arm64.result }}" != "success" ]]; then
             echo "One or more required jobs failed"
             exit 1
           fi

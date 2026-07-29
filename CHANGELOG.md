@@ -4,14 +4,16 @@
 
 ### Changed
 
-- TidesDB remains the preferred local-state direction after executable entry tests. Released
-  `tidesdb` 0.11.1 passed 71 default-feature library tests and ordinary clean-reopen smoke; native
-  9.3.14 unified mode and a separate short-return contract test exposed false-success commit paths.
-  The focused native fix is open as TidesDB PR 664, but upstream CI/review and fixed native/Rust
-  releases are required before integration. `[LDB-4007]` and `[LDB-0013]` remain fail-closed.
-- A bounded stock-Fjall 3.1.8 source audit found a worker-error/database-destruction hazard. Fjall is
-  inactive while TidesDB is preferred; a targeted lifecycle reproduction would still be required
-  before calling Fjall empirically rejected. No runtime Fjall dependency or fork was added.
+- The official-release backend search is narrowed to one carry candidate: canonical `rocksdb`
+  0.24.0 with `librocksdb-sys 0.17.3+10.4.2` and bundled RocksDB 10.4.2 may enter a bounded,
+  fail-fast adapter/conformance cycle. It is a community Rust binding rather than a Meta-authored
+  official binding, and it is not production-qualified. No runtime dependency or adapter is added
+  by this decision; `[LDB-4007]` and `[LDB-0013]` remain fail-closed.
+- Current TidesDB releases are rejected after native 9.3.14 and a separate short-return contract
+  test exposed false-success commit paths; PR 664 is not an eligible released artifact. Fjall 3.1.8
+  is rejected for current use because its released worker-error/drop path can wait indefinitely,
+  and redb 4.1.0 remains stopped on resource/lifecycle evidence. They are watch/re-entry subjects,
+  not runtime fallbacks. The stopped redb construction job is removed from required CI.
 - Managed aggregate candidates are now planned and initialized before checkpoint recovery in
   embedded, single-node, and cluster pipelines. Catalog-bridged and intermediate source schemas are
   registered before that planning boundary.

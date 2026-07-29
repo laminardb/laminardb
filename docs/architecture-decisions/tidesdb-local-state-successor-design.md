@@ -1,8 +1,9 @@
 # TidesDB local working-state design
 
-- **Status:** Historical candidate design; current authority is ADR-008 and the empirical report
+- **Status:** Historical candidate design; current authority is ADR-008 and the official-release
+  selection
 - **Date:** 2026-07-25
-- **Last reconciled:** 2026-07-28 after empirical entry validation
+- **Last reconciled:** 2026-07-29 after the official-release backend selection
 - **Selected integration line:** the official `tidesdb/tidesdb-rs` binding, published on crates.io
   as package and library `tidesdb`; the unrelated `tidesdb-rs` crate is excluded
 - **Stopped exact prescreen subject:** Cargo package `tidesdb v0.11.1`, tag commit
@@ -14,12 +15,14 @@
 - **Related evidence:** [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md),
   [TidesDB empirical re-entry](../reports/tidesdb-current-package-reentry-2026-07-28.md),
   [TidesDB static prescreen](../reports/tidesdb-static-prescreen-2026-07-25.md), and
+  [official-release backend selection](../reports/official-release-state-backend-selection-2026-07-29.md), and
   [ADR-008](ADR-008-managed-vnode-keyed-state.md)
 
-**2026-07-28 authority note:** [ADR-008](ADR-008-managed-vnode-keyed-state.md) and the
-[empirical report](../reports/tidesdb-current-package-reentry-2026-07-28.md) retain TidesDB as the
-preferred direction while leaving every exact package unadmitted. This file preserves the Cycle
-40/41 design record; it does not authorize a Laminar dependency or adapter.
+**2026-07-29 authority note:** the
+[official-release selection](../reports/official-release-state-backend-selection-2026-07-29.md)
+supersedes the 2026-07-28 TidesDB preference. Current TidesDB releases are rejected and are not a
+runtime fallback. This file preserves the Cycle 40/41 design record; it does not authorize a
+Laminar dependency or adapter.
 
 ## Decision
 

@@ -8,12 +8,20 @@
   cluster-shared checkpoints
 - **Bounded-memory outcome:** reference/conformance-only under the current ADR and plan; no cluster
   product profile or production-soak matrix
-- **Current worker-local result:** stock official Fjall 3.1.8 failed adapter entry; no backend is
-  selected or production-qualified, and admission remains closed
+- **Current worker-local result:** the later official-release decision carries only canonical
+  `rocksdb` 0.24.0 with bundled RocksDB 10.4.2 into bounded adapter entry; no backend is
+  production-qualified and admission remains closed
 - **Evidence:** code inspection and current primary-source review; no candidate or product run
 - **Admission:** unchanged and fail-closed under `[LDB-4007]` and `[LDB-0013]`
 
-**2026-07-28 current direction:** the engine-neutral placement conclusion remains authoritative.
+**2026-07-29 selection reconciliation:** the engine-neutral placement conclusion remains
+authoritative. The
+[official-release selection](official-release-state-backend-selection-2026-07-29.md) supersedes
+this report's dated candidate ordering: RocksDB is the sole carry candidate for bounded adapter
+entry, while current TidesDB, Fjall, and redb releases are not live alternatives. The matrix below
+is retained as research provenance, not a current multi-engine queue.
+
+**2026-07-28 historical direction:** the engine-neutral placement conclusion remains authoritative.
 The bounded stock-Fjall 3.1.8
 [source closure](fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md) stops before dependency,
 adapter, or execution. Fatal worker exit can leave database destruction waiting indefinitely on
