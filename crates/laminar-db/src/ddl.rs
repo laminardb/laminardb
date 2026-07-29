@@ -2397,6 +2397,7 @@ impl LaminarDB {
                 &self.ctx,
                 query_sql,
                 emit_changelog,
+                self.checkpoint_key_groups(),
             )
             .await
             {

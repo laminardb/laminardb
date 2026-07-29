@@ -1,5 +1,28 @@
 use super::*;
 
+async fn try_from_sql_local(
+    ctx: &SessionContext,
+    sql: &str,
+    emit_changelog: bool,
+) -> Result<Option<IncrementalAggState>, DbError> {
+    try_from_sql_for_key_groups(
+        ctx,
+        sql,
+        emit_changelog,
+        laminar_core::state::LOCAL_KEY_GROUP_COUNT,
+    )
+    .await
+}
+
+async fn try_from_sql_for_key_groups(
+    ctx: &SessionContext,
+    sql: &str,
+    emit_changelog: bool,
+    key_group_count: KeyGroupCount,
+) -> Result<Option<IncrementalAggState>, DbError> {
+    IncrementalAggState::try_from_sql(ctx, sql, emit_changelog, key_group_count).await
+}
+
 #[tokio::test]
 async fn test_try_from_sql_rejects_post_aggregate_projection() {
     let ctx = laminar_sql::create_session_context();
@@ -22,7 +45,7 @@ async fn test_try_from_sql_rejects_post_aggregate_projection() {
 
     // SUM(a)/SUM(b) collapses 2 aggregates into 1 derived column →
     // top_schema fields != agg_schema fields → should return None.
-    let result = IncrementalAggState::try_from_sql(
+    let result = try_from_sql_local(
         &ctx,
         "SELECT name, SUM(a) / SUM(b) AS ratio FROM events GROUP BY name",
         false,
@@ -112,7 +135,7 @@ async fn test_try_from_sql_non_aggregate() {
     let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let result = IncrementalAggState::try_from_sql(&ctx, "SELECT * FROM events", false)
+    let result = try_from_sql_local(&ctx, "SELECT * FROM events", false)
         .await
         .unwrap();
     assert!(result.is_none(), "Non-aggregate query should return None");
@@ -136,7 +159,7 @@ async fn test_try_from_sql_with_group_by() {
     let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let result = IncrementalAggState::try_from_sql(
+    let result = try_from_sql_local(
         &ctx,
         "SELECT name, SUM(value) as total FROM events GROUP BY name",
         false,
@@ -147,6 +170,10 @@ async fn test_try_from_sql_with_group_by() {
     let state = result.unwrap();
     assert_eq!(state.num_group_cols, 1);
     assert_eq!(state.agg_specs.len(), 1);
+    assert_eq!(
+        state.key_group_count(),
+        laminar_core::state::LOCAL_KEY_GROUP_COUNT
+    );
 }
 
 #[tokio::test]
@@ -167,7 +194,7 @@ async fn embedded_float_grouping_remains_supported_without_partition_codec_gate(
     let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![dummy]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT bucket, SUM(value) AS total FROM events GROUP BY bucket",
         false,
@@ -231,7 +258,7 @@ async fn test_incremental_aggregation_across_batches() {
             .unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT name, SUM(value) as total FROM events GROUP BY name",
         false,
@@ -317,6 +344,19 @@ async fn setup_agg_state_with_changelog(
     sql: &str,
     emit_changelog: bool,
 ) -> (SessionContext, IncrementalAggState) {
+    setup_agg_state_for_key_groups(
+        sql,
+        emit_changelog,
+        laminar_core::state::LOCAL_KEY_GROUP_COUNT,
+    )
+    .await
+}
+
+async fn setup_agg_state_for_key_groups(
+    sql: &str,
+    emit_changelog: bool,
+    key_group_count: KeyGroupCount,
+) -> (SessionContext, IncrementalAggState) {
     let ctx = laminar_sql::create_session_context();
     let schema = Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, false),
@@ -333,7 +373,7 @@ async fn setup_agg_state_with_changelog(
     let mem_table =
         datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
-    let state = IncrementalAggState::try_from_sql(&ctx, sql, emit_changelog)
+    let state = try_from_sql_for_key_groups(&ctx, sql, emit_changelog, key_group_count)
         .await
         .unwrap()
         .expect("expected aggregate state");
@@ -379,7 +419,7 @@ async fn test_distinct_flag_extracted() {
         datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let state = IncrementalAggState::try_from_sql(
+    let state = try_from_sql_local(
         &ctx,
         "SELECT name, COUNT(DISTINCT value) as cnt FROM events GROUP BY name",
         false,
@@ -481,7 +521,7 @@ async fn test_filter_clause_extracted() {
         datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let state = IncrementalAggState::try_from_sql(
+    let state = try_from_sql_local(
         &ctx,
         "SELECT name, SUM(value) FILTER (WHERE value > 0) as pos_sum FROM events GROUP BY name",
         false,
@@ -575,7 +615,7 @@ async fn test_having_clause_detected() {
         datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let state = IncrementalAggState::try_from_sql(
+    let state = try_from_sql_local(
         &ctx,
         "SELECT name, SUM(value) as total FROM events GROUP BY name HAVING SUM(value) > 100",
         false,
@@ -630,7 +670,7 @@ async fn test_sum_int32_input_is_coerced_before_accumulator_update() {
         datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
     ctx.register_table("orders", Arc::new(mem_table)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT name, SUM(amount) as total FROM orders GROUP BY name",
         false,
@@ -691,7 +731,7 @@ async fn test_avg_float32_input_is_coerced_before_accumulator_update() {
         datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
     ctx.register_table("products", Arc::new(mem_table)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT name, AVG(price) as avg_price FROM products GROUP BY name",
         false,
@@ -752,7 +792,7 @@ async fn test_type_inference_literal_expr() {
         datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let state = IncrementalAggState::try_from_sql(
+    let state = try_from_sql_local(
         &ctx,
         "SELECT name, MIN(value) as min_val FROM events GROUP BY name",
         false,
@@ -970,7 +1010,7 @@ async fn test_group_by_expression_scalar_function() {
         datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let state = IncrementalAggState::try_from_sql(
+    let state = try_from_sql_local(
         &ctx,
         "SELECT upper(name), SUM(value) as total FROM events GROUP BY upper(name)",
         false,
@@ -1028,7 +1068,7 @@ async fn group_cardinality_limit_rejects_the_whole_batch_and_retry() {
 #[tokio::test]
 async fn replay_rejects_changelog_state_without_its_group() {
     async fn changelog_sum_state(ctx: &SessionContext) -> IncrementalAggState {
-        IncrementalAggState::try_from_sql(
+        try_from_sql_local(
             ctx,
             "SELECT name, SUM(value) as total FROM events GROUP BY name",
             true,
@@ -1101,8 +1141,12 @@ async fn replay_rejects_changelog_state_without_its_group() {
 #[tokio::test]
 async fn delta_tracking_records_dirty_keys_per_vnode_and_resets_on_capture() {
     const VNODES: u32 = 4;
-    let (_, mut state) =
-        setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
+    let (_, mut state) = setup_agg_state_for_key_groups(
+        "SELECT name, SUM(value) as total FROM events GROUP BY name",
+        false,
+        KeyGroupCount::try_from(VNODES).unwrap(),
+    )
+    .await;
     state.set_delta_enabled(true);
 
     // First per-vnode capture establishes the delta baseline and starts a window.
@@ -1176,7 +1220,7 @@ async fn delta_chain_replay_reproduces_full_baseline() {
     }
     // Non-changelog agg: `checkpoint_delta_by_vnode` emits deltas (a changelog agg re-bases FULL).
     async fn agg(ctx: &SessionContext) -> IncrementalAggState {
-        IncrementalAggState::try_from_sql(
+        try_from_sql_local(
             ctx,
             "SELECT name, SUM(value) as total FROM events GROUP BY name",
             false,
@@ -1270,7 +1314,7 @@ async fn force_full_rebase_recaptures_full_after_failed_epoch() {
         state.process_batch(&batch, ts).unwrap();
     }
     async fn agg(ctx: &SessionContext) -> IncrementalAggState {
-        IncrementalAggState::try_from_sql(
+        try_from_sql_local(
             ctx,
             "SELECT name, SUM(value) as total FROM events GROUP BY name",
             false,
@@ -1376,7 +1420,7 @@ async fn delta_chain_replay_reproduces_changelog_last_emitted() {
         (groups, emitted)
     }
     async fn agg(ctx: &SessionContext) -> IncrementalAggState {
-        IncrementalAggState::try_from_sql(
+        try_from_sql_local(
             ctx,
             "SELECT name, SUM(value) as total FROM events GROUP BY name",
             true, // emit_changelog
@@ -1492,7 +1536,7 @@ async fn delta_chain_replay_reproduces_changelog_last_emitted() {
 #[tokio::test]
 async fn global_changelog_delta_checkpoint_roundtrips() {
     async fn agg(ctx: &SessionContext) -> IncrementalAggState {
-        IncrementalAggState::try_from_sql(ctx, "SELECT SUM(value) as total FROM events", true)
+        try_from_sql_local(ctx, "SELECT SUM(value) as total FROM events", true)
             .await
             .unwrap()
             .unwrap()
@@ -1588,10 +1632,11 @@ async fn drop_vnodes_purges_revoked_keeps_sibling() {
         state.process_batch(&batch, ts).unwrap();
     }
     async fn agg(ctx: &SessionContext) -> IncrementalAggState {
-        IncrementalAggState::try_from_sql(
+        try_from_sql_for_key_groups(
             ctx,
             "SELECT name, SUM(value) as total FROM events GROUP BY name",
             true,
+            KeyGroupCount::try_from(VC).unwrap(),
         )
         .await
         .unwrap()
@@ -1905,17 +1950,11 @@ async fn vnode_chain_failure_is_atomic_and_successful_retry_is_idempotent() {
     };
     live.process_batch(&batch("a", 10.0), 1).unwrap();
 
-    let mut base_donor = IncrementalAggState::try_from_sql(&ctx, sql, false)
-        .await
-        .unwrap()
-        .unwrap();
+    let mut base_donor = try_from_sql_local(&ctx, sql, false).await.unwrap().unwrap();
     base_donor.process_batch(&batch("a", 1.0), 2).unwrap();
     let base = base_donor.checkpoint_groups().unwrap();
 
-    let mut delta_donor = IncrementalAggState::try_from_sql(&ctx, sql, false)
-        .await
-        .unwrap()
-        .unwrap();
+    let mut delta_donor = try_from_sql_local(&ctx, sql, false).await.unwrap().unwrap();
     delta_donor.process_batch(&batch("b", 5.0), 3).unwrap();
     let valid_changed = delta_donor.checkpoint_groups().unwrap();
     let mut invalid_changed = valid_changed.clone();
@@ -2269,7 +2308,7 @@ async fn test_changelog_delta_emit() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("t", Arc::new(mem)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT symbol, SUM(price) AS total FROM t GROUP BY symbol",
         true, // changelog mode
@@ -2364,10 +2403,7 @@ async fn changelog_restore_emits_no_duplicates_then_resumes() {
     ctx.register_table("t", Arc::new(mem)).unwrap();
 
     let sql = "SELECT symbol, SUM(price) AS total FROM t GROUP BY symbol";
-    let mut state = IncrementalAggState::try_from_sql(&ctx, sql, true)
-        .await
-        .unwrap()
-        .unwrap();
+    let mut state = try_from_sql_local(&ctx, sql, true).await.unwrap().unwrap();
 
     let pre_agg = Arc::new(Schema::new(vec![
         Field::new("symbol", DataType::Utf8, true),
@@ -2394,10 +2430,7 @@ async fn changelog_restore_emits_no_duplicates_then_resumes() {
 
     // Recover into a fresh state from the post-emit checkpoint.
     let cp = state.checkpoint_groups().unwrap();
-    let mut restored = IncrementalAggState::try_from_sql(&ctx, sql, true)
-        .await
-        .unwrap()
-        .unwrap();
+    let mut restored = try_from_sql_local(&ctx, sql, true).await.unwrap().unwrap();
     restored.restore_groups(&cp).unwrap();
 
     // First emit after restore: nothing new → empty (no duplicate inserts).
@@ -2451,7 +2484,7 @@ async fn test_cascaded_agg_retract_batch() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT symbol, SUM(total) AS grand_total FROM upstream GROUP BY symbol",
         false,
@@ -2539,7 +2572,7 @@ async fn test_min_accepted_over_changelog_upstream() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let result = IncrementalAggState::try_from_sql(
+    let result = try_from_sql_local(
         &ctx,
         "SELECT symbol, MIN(price) AS low FROM upstream GROUP BY symbol",
         false,
@@ -2569,7 +2602,7 @@ async fn test_unsupported_agg_rejected_over_changelog() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let result = IncrementalAggState::try_from_sql(
+    let result = try_from_sql_local(
         &ctx,
         "SELECT symbol, STDDEV(price) AS sd FROM upstream GROUP BY symbol",
         false,
@@ -2604,7 +2637,7 @@ async fn test_cascaded_count_star_over_changelog() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT region, COUNT(*) AS cnt FROM upstream GROUP BY region",
         false,
@@ -2693,7 +2726,7 @@ async fn changelog_retractable_survives_checkpoint() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT region, COUNT(*) AS cnt FROM upstream GROUP BY region",
         false,
@@ -2773,7 +2806,7 @@ async fn test_cascaded_avg_over_changelog() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT region, AVG(price) AS avg_price FROM upstream GROUP BY region",
         false,
@@ -2853,7 +2886,7 @@ async fn test_cascaded_min_over_changelog() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT region, MIN(price) AS lo FROM upstream GROUP BY region",
         false,
@@ -2951,7 +2984,7 @@ async fn test_cascaded_max_retract_over_changelog() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT region, MAX(price) AS hi FROM upstream GROUP BY region",
         false,
@@ -3030,7 +3063,7 @@ async fn test_cascaded_mixed_aggregates_over_changelog() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let result = IncrementalAggState::try_from_sql(
+    let result = try_from_sql_local(
         &ctx,
         "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt, \
          AVG(amount) AS avg_amt, MIN(amount) AS lo, MAX(amount) AS hi \
@@ -3205,7 +3238,7 @@ async fn profile_checkpoint_capture_cost() {
         let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
             .unwrap();
         ctx.register_table("events", Arc::new(mem)).unwrap();
-        let mut state = IncrementalAggState::try_from_sql(
+        let mut state = try_from_sql_local(
             &ctx,
             "SELECT id, SUM(value) AS total FROM events GROUP BY id",
             false,

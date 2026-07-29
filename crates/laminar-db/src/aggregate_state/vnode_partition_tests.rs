@@ -49,6 +49,7 @@ async fn state_with_changelog(emit_changelog: bool) -> IncrementalAggState {
         &ctx,
         "SELECT symbol, SUM(total) AS grand_total FROM upstream GROUP BY symbol",
         emit_changelog,
+        KeyGroupCount::try_from(VNODES).unwrap(),
     )
     .await
     .unwrap()
@@ -277,6 +278,33 @@ async fn prepared_vnode_transition_late_corruption_aborts_the_complete_roster() 
     assert_eq!(live.last_emitted_dirty_by_vnode, emitted_dirty_before);
     assert_eq!(live.delta_chain_len, chain_len_before);
     assert_eq!(live.force_rebase_vnodes, force_rebase_before);
+}
+
+#[tokio::test]
+async fn vnode_transition_rejects_key_group_count_mismatch_before_mutation() {
+    let mut state = fresh_state().await;
+    state.set_delta_enabled(true);
+    feed(&mut state, &[("AAPL", 1), ("GOOG", 2)]);
+    state.checkpoint_delta_by_vnode(VNODES, 8).unwrap();
+    feed(&mut state, &[("AAPL", 3)]);
+
+    let state_before = checkpoint_bytes(&mut state);
+    let dirty_before = state.dirty_keys_by_vnode.clone();
+    let emission_dirty_before = state.last_emitted_dirty_by_vnode.clone();
+    let chains_before = state.delta_chain_len.clone();
+    let force_rebase_before = state.force_rebase_vnodes.clone();
+
+    let error = state
+        .prepare_vnode_transition(VNODES * 2, &[], &Default::default())
+        .err()
+        .expect("transition must not reinterpret the aggregate routing topology");
+    assert!(error.to_string().contains("state=16, requested=32"));
+    assert_eq!(checkpoint_bytes(&mut state), state_before);
+    assert_eq!(state.dirty_keys_by_vnode, dirty_before);
+    assert_eq!(state.last_emitted_dirty_by_vnode, emission_dirty_before);
+    assert_eq!(state.delta_chain_len, chains_before);
+    assert_eq!(state.force_rebase_vnodes, force_rebase_before);
+    assert!(state.delta_tracking_active);
 }
 
 #[tokio::test]
@@ -614,9 +642,13 @@ async fn aggregate_key_mapping_matches_shuffle_capture_and_drop() {
     ];
     let batch = pre_agg_batch(&rows);
     let expected = laminar_core::shuffle::row_vnodes(&batch, &[0], VNODES).unwrap();
-    let vnode_count = NonZeroU32::new(VNODES).unwrap();
 
     let mut state = fresh_state().await;
+    assert_eq!(
+        state.key_group_count(),
+        KeyGroupCount::try_from(VNODES).unwrap()
+    );
+    let vnode_count = state.routing_vnode_count();
     let encoded = state
         .row_converter
         .convert_columns(&[Arc::clone(batch.column(0))])
@@ -662,12 +694,41 @@ async fn aggregate_key_mapping_matches_shuffle_capture_and_drop() {
 }
 
 #[tokio::test]
-async fn delta_capture_rejects_vnode_count_change_before_mutation() {
+async fn vnode_capture_rejects_key_group_count_mismatch_before_mutation() {
     let mut state = fresh_state().await;
     state.set_delta_enabled(true);
     feed(&mut state, &[("AAPL", 1), ("GOOG", 2), ("MSFT", 3)]);
+    let state_before = checkpoint_bytes(&mut state);
+    let groups_before = state.groups.len();
+    let dirty_before = state.dirty_keys_by_vnode.clone();
+    let emission_dirty_before = state.last_emitted_dirty_by_vnode.clone();
+    let chains_before = state.delta_chain_len.clone();
+    let force_rebase_before = state.force_rebase_vnodes.clone();
+    assert!(dirty_before.is_empty());
+    assert!(emission_dirty_before.is_empty());
+
+    let full_error = state
+        .checkpoint_groups_by_vnode(VNODES * 2)
+        .err()
+        .expect("a first full capture must not choose a different routing topology");
+    assert!(full_error
+        .to_string()
+        .contains("aggregate key-group count mismatch: state=16, requested=32"));
+    let delta_error = state
+        .checkpoint_delta_by_vnode(VNODES * 2, 8)
+        .err()
+        .expect("a first delta capture must not choose a different routing topology");
+    assert!(delta_error.to_string().contains("state=16, requested=32"));
+    assert!(!state.delta_tracking_active);
+    assert_eq!(checkpoint_bytes(&mut state), state_before);
+    assert_eq!(state.groups.len(), groups_before);
+    assert_eq!(state.dirty_keys_by_vnode, dirty_before);
+    assert_eq!(state.last_emitted_dirty_by_vnode, emission_dirty_before);
+    assert_eq!(state.delta_chain_len, chains_before);
+    assert_eq!(state.force_rebase_vnodes, force_rebase_before);
+
     state.checkpoint_delta_by_vnode(VNODES, 8).unwrap();
-    assert_eq!(state.delta_vnode_count, NonZeroU32::new(VNODES));
+    assert!(state.delta_tracking_active);
 
     feed(&mut state, &[("AAPL", 10)]);
     let dirty_before = state.dirty_keys_by_vnode.clone();
@@ -679,10 +740,8 @@ async fn delta_capture_rejects_vnode_count_change_before_mutation() {
         .checkpoint_delta_by_vnode(VNODES * 2, 8)
         .err()
         .expect("a delta generation must not reinterpret its vnode space");
-    assert!(error.to_string().contains(
-        "aggregate delta vnode_count changed within one partition epoch: active=16, requested=32"
-    ));
-    assert_eq!(state.delta_vnode_count, NonZeroU32::new(VNODES));
+    assert!(error.to_string().contains("state=16, requested=32"));
+    assert!(state.delta_tracking_active);
     assert_eq!(state.dirty_keys_by_vnode, dirty_before);
     assert_eq!(state.last_emitted_dirty_by_vnode, emission_dirty_before);
     assert_eq!(state.delta_chain_len, chains_before);
@@ -692,7 +751,7 @@ async fn delta_capture_rejects_vnode_count_change_before_mutation() {
         .checkpoint_groups_by_vnode(VNODES * 2)
         .err()
         .expect("a full capture cannot silently rotate an active delta generation");
-    assert!(full_error.to_string().contains("active=16, requested=32"));
+    assert!(full_error.to_string().contains("state=16, requested=32"));
     assert_eq!(state.dirty_keys_by_vnode, dirty_before);
     assert_eq!(state.delta_chain_len, chains_before);
 

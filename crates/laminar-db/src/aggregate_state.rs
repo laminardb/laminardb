@@ -19,7 +19,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_common::ScalarValue;
 use datafusion_expr::function::AccumulatorArgs;
 use datafusion_expr::AggregateUDF;
-use laminar_core::state::PartitionKeyCodecV1;
+use laminar_core::state::{KeyGroupCount, PartitionKeyCodecV1};
 
 use crate::db::exact_table_reference;
 use crate::error::DbError;
@@ -778,6 +778,7 @@ pub(crate) struct IncrementalAggState {
     #[cfg(test)]
     pre_agg_sql: String,
     num_group_cols: usize,
+    key_group_count: KeyGroupCount,
     group_types: Vec<DataType>,
     agg_specs: Vec<AggFuncSpec>,
     groups: AHashMap<arrow::row::OwnedRow, GroupEntry>,
@@ -796,14 +797,15 @@ pub(crate) struct IncrementalAggState {
     dirty_keys: AHashSet<arrow::row::OwnedRow>,
     weight_col_idx: Option<usize>,
     // Delta-state tracking: keys mutated since the last per-vnode capture, bucketed by vnode.
-    // Populated only while `delta_vnode_count` is set (off by default → zero cost).
+    // Populated only after a per-vnode baseline activates tracking; while inactive, the guard
+    // performs no tracking hash, insert, or allocation.
     #[cfg(feature = "cluster")]
     delta_enabled: bool,
-    delta_vnode_count: Option<NonZeroU32>,
+    delta_tracking_active: bool,
     dirty_keys_by_vnode: AHashMap<u32, AHashSet<arrow::row::OwnedRow>>,
     // Changelog emission keys whose `last_emitted` changed since the last per-vnode
-    // capture (set in `emit_changelog_delta`). Populated only while `delta_vnode_count`
-    // is set; lets changelog aggregates take the delta path.
+    // capture (set in `emit_changelog_delta`). Populated only while delta tracking is active;
+    // lets changelog aggregates take the delta path.
     last_emitted_dirty_by_vnode: AHashMap<u32, AHashSet<arrow::row::OwnedRow>>,
     // Deltas emitted since the last full capture, per vnode — bounds the chain so the full
     // base never ages out of the prune window; cleared to a full re-base on restore/acquire.
@@ -989,12 +991,15 @@ pub(crate) enum VnodeCapture {
 impl IncrementalAggState {
     /// Attempt to build an `IncrementalAggState` by introspecting the logical
     /// plan of the given SQL query. Returns `None` if the query does not
-    /// contain an `Aggregate` node (not an aggregation query).
+    /// contain an `Aggregate` node (not an aggregation query). `key_group_count`
+    /// becomes the state's immutable routing identity; a global aggregate still
+    /// retains the complete topology while mapping its only key to vnode zero.
     #[allow(clippy::too_many_lines)]
     pub async fn try_from_sql(
         ctx: &SessionContext,
         sql: &str,
         emit_changelog: bool,
+        key_group_count: KeyGroupCount,
     ) -> Result<Option<Self>, DbError> {
         let df = ctx
             .sql(sql)
@@ -1221,6 +1226,7 @@ impl IncrementalAggState {
             #[cfg(test)]
             pre_agg_sql,
             num_group_cols,
+            key_group_count,
             group_types,
             agg_specs,
             groups: AHashMap::new(),
@@ -1237,7 +1243,7 @@ impl IncrementalAggState {
             weight_col_idx,
             #[cfg(feature = "cluster")]
             delta_enabled: false,
-            delta_vnode_count: None,
+            delta_tracking_active: false,
             dirty_keys_by_vnode: AHashMap::new(),
             last_emitted_dirty_by_vnode: AHashMap::new(),
             #[cfg(feature = "cluster")]
@@ -1257,6 +1263,16 @@ impl IncrementalAggState {
         self.delta_enabled = enabled;
     }
 
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn key_group_count(&self) -> KeyGroupCount {
+        self.key_group_count
+    }
+
+    fn routing_vnode_count(&self) -> NonZeroU32 {
+        NonZeroU32::from(self.key_group_count.into_non_zero())
+    }
+
     /// Map an already Arrow-row-encoded aggregate key through partitioning ABI v1.
     ///
     /// The aggregate hot path already owns these bytes, so this deliberately uses the
@@ -1274,29 +1290,28 @@ impl IncrementalAggState {
         }
     }
 
-    /// Freeze vnode cardinality for one delta-chain generation. Changing it would reinterpret
-    /// already-bucketed dirty keys, so a future repartition lifecycle must rotate the generation
-    /// explicitly instead of silently changing this value at capture time.
+    /// Require lifecycle callers to use the immutable routing topology selected at construction.
+    /// A future key-group-count change requires a new state identity and explicit repartition;
+    /// capture or restore must never reinterpret live keys in place.
     #[cfg(feature = "cluster")]
-    fn validate_delta_vnode_count(&self, requested: u32) -> Result<NonZeroU32, DbError> {
-        let requested = NonZeroU32::new(requested)
-            .ok_or_else(|| DbError::Pipeline("vnode_count must be > 0".to_string()))?;
-        if let Some(active) = self.delta_vnode_count {
-            if active != requested {
-                return Err(DbError::Pipeline(format!(
-                    "aggregate delta vnode_count changed within one partition epoch: active={}, requested={}",
-                    active.get(),
-                    requested.get()
-                )));
-            }
+    pub(crate) fn validate_vnode_count(&self, requested: u32) -> Result<NonZeroU32, DbError> {
+        let requested = KeyGroupCount::try_from(requested).map_err(|error| {
+            DbError::Pipeline(format!("aggregate vnode_count is invalid: {error}"))
+        })?;
+        if requested != self.key_group_count {
+            return Err(DbError::Pipeline(format!(
+                "aggregate key-group count mismatch: state={}, requested={requested}",
+                self.key_group_count
+            )));
         }
-        Ok(requested)
+        Ok(self.routing_vnode_count())
     }
 
-    /// Mark a changelog emission key dirty for the delta path. No-op unless delta
-    /// capture is enabled (`delta_vnode_count` set), so it costs nothing by default.
+    /// Mark a changelog emission key dirty for the delta path. No-op until delta tracking has an
+    /// established baseline.
     fn mark_last_emitted_dirty(&mut self, key: &arrow::row::OwnedRow) {
-        if let Some(count) = self.delta_vnode_count {
+        if self.delta_tracking_active {
+            let count = self.routing_vnode_count();
             let v = Self::vnode_for_group_key(self.num_group_cols, key, count);
             self.last_emitted_dirty_by_vnode
                 .entry(v)
@@ -1406,7 +1421,8 @@ impl IncrementalAggState {
             if self.emit_changelog {
                 self.mark_emit_dirty(key.clone());
             }
-            if let Some(count) = self.delta_vnode_count {
+            if self.delta_tracking_active {
+                let count = self.routing_vnode_count();
                 let v = Self::vnode_for_group_key(self.num_group_cols, &key, count);
                 insert_vnode_tracking_key(&mut self.dirty_keys_by_vnode, v, key);
             }
@@ -1450,7 +1466,7 @@ impl IncrementalAggState {
             &self.agg_specs,
             self.weight_col_idx,
         );
-        if self.delta_vnode_count.is_some() {
+        if self.delta_tracking_active {
             let key = global_aggregate_key();
             insert_vnode_tracking_key(&mut self.dirty_keys_by_vnode, 0, key);
         }
@@ -1889,7 +1905,7 @@ impl IncrementalAggState {
         &mut self,
         vnode_count: u32,
     ) -> Result<std::collections::HashMap<u32, AggStateCheckpoint>, DbError> {
-        let vnode_count = self.validate_delta_vnode_count(vnode_count)?;
+        let vnode_count = self.validate_vnode_count(vnode_count)?;
         let fingerprint = self.query_fingerprint();
         let num_group_cols = self.num_group_cols;
         let retractable = self.weight_col_idx.is_some();
@@ -1956,7 +1972,7 @@ impl IncrementalAggState {
         // Delta tracking re-bases on this capture: the dirty sets reset, so the next
         // checkpoint's delta is measured against the state staged here.
         if self.delta_enabled {
-            self.delta_vnode_count = Some(vnode_count);
+            self.delta_tracking_active = true;
             self.dirty_keys_by_vnode.clear();
             self.last_emitted_dirty_by_vnode.clear();
         }
@@ -2010,7 +2026,7 @@ impl IncrementalAggState {
         vnode_count: u32,
         chain_bound: u32,
     ) -> Result<std::collections::HashMap<u32, VnodeCapture>, DbError> {
-        let vnode_count = self.validate_delta_vnode_count(vnode_count)?;
+        let vnode_count = self.validate_vnode_count(vnode_count)?;
 
         let retractable = self.weight_col_idx.is_some();
         let fingerprint = self.query_fingerprint();
@@ -2051,7 +2067,7 @@ impl IncrementalAggState {
             self.last_emitted_dirty_by_vnode.remove(&v);
         }
 
-        self.delta_vnode_count = Some(vnode_count);
+        self.delta_tracking_active = true;
         Ok(out)
     }
 
@@ -2115,11 +2131,12 @@ impl IncrementalAggState {
         let (keys_ipc, acc_state_ipc, last_updated_ms) = encoded?;
 
         // Changed emission entries ride in `changed.last_emitted`.
-        let vnode_count = self.delta_vnode_count.ok_or_else(|| {
-            DbError::Pipeline(
-                "aggregate delta encoding requires an established vnode_count".to_string(),
-            )
-        })?;
+        if !self.delta_tracking_active {
+            return Err(DbError::Pipeline(
+                "aggregate delta encoding requires an established baseline".to_string(),
+            ));
+        }
+        let vnode_count = self.routing_vnode_count();
         let last_emitted = self.last_emitted_for_vnode(
             vnode,
             vnode_count,
@@ -2330,7 +2347,8 @@ impl IncrementalAggState {
             if self.emit_changelog {
                 self.mark_emit_dirty(row_key.clone());
             }
-            if let Some(count) = self.delta_vnode_count {
+            if self.delta_tracking_active {
+                let count = self.routing_vnode_count();
                 let vnode = Self::vnode_for_group_key(self.num_group_cols, row_key, count);
                 insert_vnode_tracking_key(&mut self.dirty_keys_by_vnode, vnode, row_key.clone());
             }
@@ -2352,7 +2370,7 @@ impl IncrementalAggState {
         restores: &[AggVnodeRestore<'_>],
         revoked: &rustc_hash::FxHashSet<u32>,
     ) -> Result<PreparedAggVnodeTransition, DbError> {
-        let vnode_count = self.validate_delta_vnode_count(vnode_count)?;
+        let vnode_count = self.validate_vnode_count(vnode_count)?;
         let reserve_error = |component: &str, error: std::collections::TryReserveError| {
             DbError::Pipeline(format!(
                 "aggregate vnode transition could not reserve {component}: {error}"
@@ -2544,12 +2562,13 @@ impl IncrementalAggState {
                 .map_err(|error| reserve_error("changelog dirty keys", error))?;
             replacement_dirty_keys.extend(replacement_groups.keys().cloned());
         }
-        if let Some(delta_vnode_count) = self.delta_vnode_count {
+        if self.delta_tracking_active {
+            let routing_vnode_count = self.routing_vnode_count();
             replacement_dirty_by_vnode
                 .try_reserve(restores.len())
                 .map_err(|error| reserve_error("delta dirty vnode roster", error))?;
             for key in replacement_groups.keys() {
-                let vnode = Self::vnode_for_group_key(num_group_cols, key, delta_vnode_count);
+                let vnode = Self::vnode_for_group_key(num_group_cols, key, routing_vnode_count);
                 replacement_dirty_by_vnode
                     .entry(vnode)
                     .or_insert_with(AHashSet::new)
@@ -2762,7 +2781,7 @@ impl IncrementalAggState {
 
         let replacement_scope = replacement
             .map(|(vnode, vnode_count)| {
-                let vnode_count = self.validate_delta_vnode_count(vnode_count)?;
+                let vnode_count = self.validate_vnode_count(vnode_count)?;
                 if vnode >= vnode_count.get() {
                     return Err(DbError::Pipeline(format!(
                         "vnode {vnode} is outside vnode_count {}",
@@ -2939,7 +2958,7 @@ impl IncrementalAggState {
         if revoked.is_empty() {
             return Ok(());
         }
-        let vnode_count = self.validate_delta_vnode_count(vnode_count)?;
+        let vnode_count = self.validate_vnode_count(vnode_count)?;
         let num_group_cols = self.num_group_cols;
         let vnode_of = |k: &arrow::row::OwnedRow| -> u32 {
             Self::vnode_for_group_key(num_group_cols, k, vnode_count)

@@ -8247,6 +8247,10 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
     }
 
     let db = one_owner_cluster().await;
+    assert_eq!(
+        db.checkpoint_key_groups(),
+        laminar_core::state::KeyGroupCount::try_from(8_u32).unwrap()
+    );
     let persisted_unsafe = std::collections::HashMap::from([(
         "persisted_final".to_string(),
         crate::connector_manager::StreamRegistration {

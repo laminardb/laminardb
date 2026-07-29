@@ -18,6 +18,9 @@ use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
 #[cfg(feature = "cluster")]
 use laminar_core::shuffle::ShuffleMessage;
+#[cfg(feature = "cluster")]
+use laminar_core::state::KeyGroupCount;
+use laminar_core::state::LOCAL_KEY_GROUP_COUNT;
 use sqlparser::ast::{
     visit_expressions, Expr, GroupByExpr, Query, Select, SetExpr, Statement, TableFactor,
 };
@@ -441,7 +444,29 @@ impl SqlQueryOperator {
 
     #[allow(clippy::too_many_lines)]
     async fn lazy_init(&mut self) -> Result<(), DbError> {
-        match IncrementalAggState::try_from_sql(&self.ctx, &self.sql, self.emit_changelog).await {
+        #[cfg(feature = "cluster")]
+        let key_group_count = self.cluster_shuffle.as_ref().map_or_else(
+            || Ok(LOCAL_KEY_GROUP_COUNT),
+            |config| {
+                KeyGroupCount::try_from(config.registry.vnode_count()).map_err(|error| {
+                    DbError::Pipeline(format!(
+                        "aggregate '{}' has invalid cluster key-group topology: {error}",
+                        self.op_name
+                    ))
+                })
+            },
+        )?;
+        #[cfg(not(feature = "cluster"))]
+        let key_group_count = LOCAL_KEY_GROUP_COUNT;
+
+        match IncrementalAggState::try_from_sql(
+            &self.ctx,
+            &self.sql,
+            self.emit_changelog,
+            key_group_count,
+        )
+        .await
+        {
             Ok(Some(mut agg_state)) => {
                 #[cfg(feature = "cluster")]
                 if self.cluster_shuffle.is_some() {
@@ -1419,6 +1444,9 @@ impl GraphOperator for SqlQueryOperator {
                 self.op_name
             )));
         }
+        if let QueryState::Agg(ref agg_state) = self.state {
+            agg_state.validate_vnode_count(vnode_count)?;
+        }
         // Re-base the delta chain of any vnode acquired since the last capture (its parent epoch is
         // gone), before deciding FULL-vs-DELTA below. Must run before the `agg_state` borrow.
         let newly_acquired = self.take_newly_acquired(required_vnodes);
@@ -1511,6 +1539,14 @@ impl GraphOperator for SqlQueryOperator {
                 self.op_name
             ))
         })?;
+        let QueryState::Agg(ref aggregate) = self.state else {
+            return Err(DbError::Checkpoint(format!(
+                "managed vnode transition for '{}' targeted a non-aggregate query",
+                self.op_name
+            )));
+        };
+        aggregate.validate_vnode_count(transition.target.vnode_count)?;
+
         let assignment = config.registry.versioned_snapshot();
         let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
         if transition.target.vnode_count != config.registry.vnode_count()
@@ -1861,7 +1897,10 @@ mod checkpoint_tests {
 
         operator.initialize_managed_state().await.unwrap();
 
-        assert!(matches!(operator.state, QueryState::Agg(_)));
+        let QueryState::Agg(ref aggregate) = operator.state else {
+            panic!("expected initialized aggregate state");
+        };
+        assert_eq!(aggregate.key_group_count(), LOCAL_KEY_GROUP_COUNT);
         assert!(operator.checkpoint().unwrap().is_some());
     }
 
@@ -2092,10 +2131,10 @@ mod delta_primary_tests {
     use laminar_core::cluster::control::LeaseDeadline;
     use laminar_core::state::{NodeId, VnodeRegistry};
 
-    async fn single_owner_shuffle() -> (ClusterShuffleConfig, u64) {
+    async fn single_owner_shuffle_for(vnode_count: u32) -> (ClusterShuffleConfig, u64) {
         let self_id = NodeId(1);
         let incarnation = uuid::Uuid::from_u128(1);
-        let registry = Arc::new(VnodeRegistry::single_owner(8, self_id));
+        let registry = Arc::new(VnodeRegistry::single_owner(vnode_count, self_id));
         let receiver = Arc::new(
             laminar_core::shuffle::ShuffleReceiver::bind(
                 self_id.0,
@@ -2118,21 +2157,18 @@ mod delta_primary_tests {
             .install_process_lease_deadline(process_deadline)
             .unwrap();
         let version = registry.assignment_version();
+        let owners = vec![self_id.0; usize::try_from(vnode_count).unwrap()];
         let fence = laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
             version,
-            &[self_id.0; 8],
+            &owners,
             vec![laminar_core::checkpoint::CheckpointParticipant {
                 node_id: self_id.0,
                 boot_incarnation: incarnation,
             }],
         )
         .unwrap();
-        sender
-            .install_assignment_fence(&fence, &[self_id.0; 8])
-            .unwrap();
-        receiver
-            .install_assignment_fence(&fence, &[self_id.0; 8])
-            .unwrap();
+        sender.install_assignment_fence(&fence, &owners).unwrap();
+        receiver.install_assignment_fence(&fence, &owners).unwrap();
         (
             ClusterShuffleConfig {
                 registry,
@@ -2142,6 +2178,10 @@ mod delta_primary_tests {
             },
             version,
         )
+    }
+
+    async fn single_owner_shuffle() -> (ClusterShuffleConfig, u64) {
+        single_owner_shuffle_for(8).await
     }
 
     #[tokio::test]
@@ -2212,6 +2252,13 @@ mod delta_primary_tests {
             let (shuffle, _) = single_owner_shuffle().await;
             operator.attach_cluster_shuffle(shuffle);
             operator.initialize_managed_state().await.unwrap();
+            let QueryState::Agg(ref aggregate) = operator.state else {
+                panic!("expected initialized aggregate state");
+            };
+            assert_eq!(
+                aggregate.key_group_count(),
+                KeyGroupCount::try_from(8_u32).unwrap()
+            );
 
             let captured = operator
                 .checkpoint_by_vnode(&required, 8)
@@ -2233,6 +2280,34 @@ mod delta_primary_tests {
                 assert!(checkpoint.last_emitted.is_empty());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_count_mismatch_preserves_owned_baseline() {
+        let (context, _) = super::checkpoint_tests::context_and_batch();
+        let mut operator = SqlQueryOperator::new(
+            "total",
+            "SELECT COUNT(*) AS total FROM events",
+            context,
+            None,
+            false,
+        );
+        let (shuffle, _) = single_owner_shuffle().await;
+        operator.attach_cluster_shuffle(shuffle);
+        operator.initialize_managed_state().await.unwrap();
+
+        let error = operator
+            .checkpoint_by_vnode(&[0], 16)
+            .err()
+            .expect("capture must reject a count outside its immutable topology");
+        assert!(error.to_string().contains("state=8, requested=16"));
+        assert!(operator.prev_owned.is_empty());
+
+        assert!(operator.checkpoint_by_vnode(&[0], 8).unwrap().is_some());
+        assert_eq!(
+            operator.prev_owned,
+            [0].into_iter().collect::<rustc_hash::FxHashSet<_>>()
+        );
     }
 
     #[tokio::test]
@@ -2568,6 +2643,8 @@ mod delta_primary_tests {
         )
         .unwrap();
         let mut donor = SqlQueryOperator::new("totals", sql, context.clone(), None, false);
+        let (donor_shuffle, _) = single_owner_shuffle_for(64).await;
+        donor.attach_cluster_shuffle(donor_shuffle);
         donor.process(&[vec![batch]], &[i64::MIN]).await.unwrap();
         let QueryState::Agg(ref mut aggregate) = donor.state else {
             panic!("expected aggregate state");
@@ -2579,6 +2656,8 @@ mod delta_primary_tests {
         );
 
         let mut restored = SqlQueryOperator::new("totals", sql, context, None, false);
+        let (restored_shuffle, _) = single_owner_shuffle_for(64).await;
+        restored.attach_cluster_shuffle(restored_shuffle);
         for (vnode, checkpoint) in &slices {
             let bytes = serialize_agg_cp(checkpoint, "totals").unwrap();
             restored.apply_vnode_state(*vnode, &bytes).unwrap();
