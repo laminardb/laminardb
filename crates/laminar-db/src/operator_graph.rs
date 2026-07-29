@@ -2989,14 +2989,20 @@ impl OperatorGraph {
     ) -> Result<(), DbError> {
         let assignment_version = received.assignment_version();
         let (message, admission) = received.into_parts();
-        let laminar_core::shuffle::ShuffleMessage::Data { stage, batch, .. } = message else {
+        let laminar_core::shuffle::ShuffleMessage::Data {
+            stage,
+            routed_vnodes,
+            batch,
+        } = message
+        else {
             return Err(DbError::Pipeline(
                 "non-data frame entered shuffle data staging".into(),
             ));
         };
+        let uniform_vnode = crate::operator::uniform_vnode_hint(&routed_vnodes);
         self.stage_checkpointed_shuffle(
             &stage,
-            RetainedBatch::admitted(batch, admission, assignment_version),
+            RetainedBatch::admitted(batch, admission, assignment_version, uniform_vnode),
             watermark,
         )
     }

@@ -105,6 +105,12 @@ fn checkpoint_bytes(state: &mut IncrementalAggState) -> Vec<u8> {
         .to_vec()
 }
 
+fn vnode_slot_identities(state: &IncrementalAggState) -> Vec<Option<*const ()>> {
+    (0..VNODES)
+        .map(|vnode| state.vnode_slot_identity_for_test(vnode))
+        .collect()
+}
+
 fn symbol_for_vnode(state: &IncrementalAggState, vnode: u32, start: u32) -> String {
     let vnode_count = NonZeroU32::new(VNODES).unwrap();
     for suffix in start..start + 100_000 {
@@ -162,6 +168,59 @@ async fn per_vnode_checkpoint_merge_round_trips() {
         totals(&mut a),
         "merging the per-vnode slices reproduces the original aggregate",
     );
+}
+
+#[tokio::test]
+async fn whole_state_restore_clears_stale_vnode_delta_metadata_as_the_new_baseline() {
+    let mut donor = fresh_state().await;
+    let donor_key = symbol_for_vnode(&donor, 3, 0);
+    feed(&mut donor, &[(donor_key.as_str(), 91)]);
+    let donor_checkpoint = donor.checkpoint_groups().unwrap();
+    let donor_totals = totals(&mut donor);
+
+    let mut live = fresh_state().await;
+    live.set_delta_enabled(true);
+    let first_live_key = symbol_for_vnode(&live, 0, 0);
+    let second_live_key = symbol_for_vnode(&live, 1, 0);
+    feed(
+        &mut live,
+        &[
+            (first_live_key.as_str(), 10),
+            (second_live_key.as_str(), 20),
+        ],
+    );
+    live.checkpoint_delta_by_vnode(VNODES, 8).unwrap();
+    assert_eq!(
+        live.working_set_snapshot_for_test().delta_chain_len.len(),
+        2,
+        "fixture must install stale per-vnode chain metadata"
+    );
+
+    live.restore_groups(&donor_checkpoint).unwrap();
+    let restored = live.working_set_snapshot_for_test();
+    assert!(restored.checkpoint_dirty_keys.is_empty());
+    assert!(restored.last_emitted_dirty_keys.is_empty());
+    assert!(restored.delta_chain_len.is_empty());
+    assert!(restored.force_full_rebase_vnodes.is_empty());
+    assert_eq!(live.logical_group_count_for_test(), 1);
+    assert_eq!(totals(&mut live), donor_totals);
+
+    live.checkpoint_delta_by_vnode(VNODES, 8).unwrap();
+    live.force_full_rebase();
+    let forced = live.working_set_snapshot_for_test();
+    assert!(forced.delta_chain_len.is_empty());
+    assert_eq!(
+        forced.force_full_rebase_vnodes,
+        std::collections::BTreeSet::from([3]),
+        "fixture must install a stale forced-rebase marker"
+    );
+
+    live.restore_groups(&donor_checkpoint).unwrap();
+    let restored = live.working_set_snapshot_for_test();
+    assert!(restored.delta_chain_len.is_empty());
+    assert!(restored.force_full_rebase_vnodes.is_empty());
+    assert_eq!(live.logical_group_count_for_test(), 1);
+    assert_eq!(totals(&mut live), donor_totals);
 }
 
 #[tokio::test]
@@ -245,12 +304,9 @@ async fn prepared_vnode_transition_late_corruption_aborts_the_complete_roster() 
     live.checkpoint_delta_by_vnode(VNODES, 8).unwrap();
     feed(&mut live, &[(live_first.as_str(), 7)]);
 
-    let before = checkpoint_bytes(&mut live);
-    let dirty_before = live.dirty_keys.clone();
-    let dirty_by_vnode_before = live.dirty_keys_by_vnode.clone();
-    let emitted_dirty_before = live.last_emitted_dirty_by_vnode.clone();
-    let chain_len_before = live.delta_chain_len.clone();
-    let force_rebase_before = live.force_rebase_vnodes.clone();
+    let checkpoint_before = checkpoint_bytes(&mut live);
+    let working_set_before = live.working_set_snapshot_for_test();
+    let slot_identities_before = vnode_slot_identities(&live);
     let restores = [
         AggVnodeRestore {
             vnode: 0,
@@ -272,12 +328,9 @@ async fn prepared_vnode_transition_late_corruption_aborts_the_complete_roster() 
         error.to_string().contains("fingerprint mismatch"),
         "{error}"
     );
-    assert_eq!(checkpoint_bytes(&mut live), before);
-    assert_eq!(live.dirty_keys, dirty_before);
-    assert_eq!(live.dirty_keys_by_vnode, dirty_by_vnode_before);
-    assert_eq!(live.last_emitted_dirty_by_vnode, emitted_dirty_before);
-    assert_eq!(live.delta_chain_len, chain_len_before);
-    assert_eq!(live.force_rebase_vnodes, force_rebase_before);
+    assert_eq!(checkpoint_bytes(&mut live), checkpoint_before);
+    assert_eq!(live.working_set_snapshot_for_test(), working_set_before);
+    assert_eq!(vnode_slot_identities(&live), slot_identities_before);
 }
 
 #[tokio::test]
@@ -288,22 +341,18 @@ async fn vnode_transition_rejects_key_group_count_mismatch_before_mutation() {
     state.checkpoint_delta_by_vnode(VNODES, 8).unwrap();
     feed(&mut state, &[("AAPL", 3)]);
 
-    let state_before = checkpoint_bytes(&mut state);
-    let dirty_before = state.dirty_keys_by_vnode.clone();
-    let emission_dirty_before = state.last_emitted_dirty_by_vnode.clone();
-    let chains_before = state.delta_chain_len.clone();
-    let force_rebase_before = state.force_rebase_vnodes.clone();
+    let checkpoint_before = checkpoint_bytes(&mut state);
+    let working_set_before = state.working_set_snapshot_for_test();
+    let slot_identities_before = vnode_slot_identities(&state);
 
     let error = state
         .prepare_vnode_transition(VNODES * 2, &[], &Default::default())
         .err()
         .expect("transition must not reinterpret the aggregate routing topology");
     assert!(error.to_string().contains("state=16, requested=32"));
-    assert_eq!(checkpoint_bytes(&mut state), state_before);
-    assert_eq!(state.dirty_keys_by_vnode, dirty_before);
-    assert_eq!(state.last_emitted_dirty_by_vnode, emission_dirty_before);
-    assert_eq!(state.delta_chain_len, chains_before);
-    assert_eq!(state.force_rebase_vnodes, force_rebase_before);
+    assert_eq!(checkpoint_bytes(&mut state), checkpoint_before);
+    assert_eq!(state.working_set_snapshot_for_test(), working_set_before);
+    assert_eq!(vnode_slot_identities(&state), slot_identities_before);
     assert!(state.delta_tracking_active);
 }
 
@@ -354,6 +403,95 @@ async fn prepared_vnode_transition_mixed_revoke_restore_publishes_exact_image() 
     let revoked = [revoked_vnode]
         .into_iter()
         .collect::<rustc_hash::FxHashSet<_>>();
+    let slot_identities_before = vnode_slot_identities(&live);
+    assert!(slot_identities_before[restore_vnode as usize].is_some());
+    assert!(slot_identities_before[revoked_vnode as usize].is_some());
+    assert!(slot_identities_before[retained_vnode as usize].is_some());
+    let prepared = live
+        .prepare_vnode_transition(VNODES, &restores, &revoked)
+        .unwrap();
+    let retired = live.publish_prepared_vnode_transition(prepared);
+    IncrementalAggState::finish_vnode_transition(retired);
+
+    let slot_identities_after = vnode_slot_identities(&live);
+    for vnode in 0..VNODES {
+        if vnode == restore_vnode || vnode == revoked_vnode {
+            assert_ne!(
+                slot_identities_after[vnode as usize], slot_identities_before[vnode as usize],
+                "transitioned vnode {vnode} retained its old slot"
+            );
+        } else {
+            assert_eq!(
+                slot_identities_after[vnode as usize], slot_identities_before[vnode as usize],
+                "retained vnode {vnode} changed slot identity"
+            );
+        }
+    }
+    assert!(slot_identities_after[restore_vnode as usize].is_some());
+    assert!(slot_identities_after[revoked_vnode as usize].is_none());
+
+    let output = totals(&mut live);
+    assert!(!output.contains_key(&post_cut_key));
+    assert!(!output.contains_key(&revoked_key));
+    assert_eq!(
+        output,
+        std::collections::BTreeMap::from([
+            (restored_key, 10),
+            (restored_new_key, 20),
+            (retained_key, 40),
+        ])
+    );
+    assert_eq!(live.logical_group_count_for_test(), 3);
+    let snapshot = live.working_set_snapshot_for_test();
+    assert!(!snapshot.checkpoint_dirty_keys.contains_key(&revoked_vnode));
+    assert!(!snapshot.delta_chain_len.contains_key(&restore_vnode));
+    assert!(!snapshot.delta_chain_len.contains_key(&revoked_vnode));
+}
+
+#[tokio::test]
+async fn prepared_vnode_transition_restore_wins_overlap_and_empty_image_stays_sparse() {
+    let restored_vnode = 0;
+    let emptied_vnode = 1;
+    let retained_vnode = 2;
+
+    let mut donor = fresh_state().await;
+    let restored_key = symbol_for_vnode(&donor, restored_vnode, 0);
+    feed(&mut donor, &[(restored_key.as_str(), 10)]);
+    let restored_base = donor
+        .checkpoint_groups_by_vnode(VNODES)
+        .unwrap()
+        .remove(&restored_vnode)
+        .unwrap();
+
+    let mut live = fresh_state().await;
+    let stale_restored_key = symbol_for_vnode(&live, restored_vnode, 10_000);
+    let emptied_key = symbol_for_vnode(&live, emptied_vnode, 0);
+    let retained_key = symbol_for_vnode(&live, retained_vnode, 0);
+    feed(
+        &mut live,
+        &[
+            (stale_restored_key.as_str(), 90),
+            (emptied_key.as_str(), 20),
+            (retained_key.as_str(), 30),
+        ],
+    );
+    let empty_base = live.empty_checkpoint();
+    let restores = [
+        AggVnodeRestore {
+            vnode: restored_vnode,
+            base: &restored_base,
+            deltas: &[],
+        },
+        AggVnodeRestore {
+            vnode: emptied_vnode,
+            base: &empty_base,
+            deltas: &[],
+        },
+    ];
+    let revoked = [restored_vnode, emptied_vnode]
+        .into_iter()
+        .collect::<rustc_hash::FxHashSet<_>>();
+
     let prepared = live
         .prepare_vnode_transition(VNODES, &restores, &revoked)
         .unwrap();
@@ -362,20 +500,20 @@ async fn prepared_vnode_transition_mixed_revoke_restore_publishes_exact_image() 
 
     assert_eq!(
         totals(&mut live),
-        std::collections::BTreeMap::from([
-            (restored_key, 10),
-            (restored_new_key, 20),
-            (retained_key, 40),
-        ])
+        std::collections::BTreeMap::from([(restored_key, 10), (retained_key, 30)]),
+        "an authoritative restore must win over the same vnode's revoke marker",
     );
-    assert!(!totals(&mut live).contains_key(&post_cut_key));
-    assert!(!totals(&mut live).contains_key(&revoked_key));
-    assert!(!live.dirty_keys_by_vnode.contains_key(&revoked_vnode));
-    assert!(!live.delta_chain_len.contains_key(&revoked_vnode));
+    assert!(live.vnode_slot_identity_for_test(restored_vnode).is_some());
+    assert!(live.vnode_slot_identity_for_test(emptied_vnode).is_none());
+    assert_eq!(
+        live.active_vnodes_for_test(),
+        &[restored_vnode, retained_vnode]
+    );
+    assert_eq!(live.logical_group_count_for_test(), 2);
 }
 
 #[tokio::test]
-async fn prepared_vnode_transition_drop_leaves_live_state_unpublished() {
+async fn prepared_vnode_transition_abort_preserves_every_live_slot_and_snapshot() {
     let mut donor = fresh_state().await;
     let restored_key = symbol_for_vnode(&donor, 0, 0);
     feed(&mut donor, &[(restored_key.as_str(), 10)]);
@@ -397,16 +535,9 @@ async fn prepared_vnode_transition_drop_leaves_live_state_unpublished() {
     feed(&mut live, &[(live_key.as_str(), 7)]);
 
     let totals_before = totals(&mut live);
-    let timestamps_before = live
-        .groups
-        .iter()
-        .map(|(key, entry)| (key.as_ref().to_vec(), entry.last_updated_ms))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let dirty_before = live.dirty_keys.clone();
-    let dirty_by_vnode_before = live.dirty_keys_by_vnode.clone();
-    let emitted_dirty_before = live.last_emitted_dirty_by_vnode.clone();
-    let chain_len_before = live.delta_chain_len.clone();
-    let force_rebase_before = live.force_rebase_vnodes.clone();
+    let checkpoint_before = checkpoint_bytes(&mut live);
+    let working_set_before = live.working_set_snapshot_for_test();
+    let slot_identities_before = vnode_slot_identities(&live);
     let restores = [AggVnodeRestore {
         vnode: 0,
         base: &restored_base,
@@ -419,72 +550,9 @@ async fn prepared_vnode_transition_drop_leaves_live_state_unpublished() {
     drop(prepared);
 
     assert_eq!(totals(&mut live), totals_before);
-    assert_eq!(
-        live.groups
-            .iter()
-            .map(|(key, entry)| (key.as_ref().to_vec(), entry.last_updated_ms))
-            .collect::<std::collections::BTreeMap<_, _>>(),
-        timestamps_before
-    );
-    assert_eq!(live.dirty_keys, dirty_before);
-    assert_eq!(live.dirty_keys_by_vnode, dirty_by_vnode_before);
-    assert_eq!(live.last_emitted_dirty_by_vnode, emitted_dirty_before);
-    assert_eq!(live.delta_chain_len, chain_len_before);
-    assert_eq!(live.force_rebase_vnodes, force_rebase_before);
-}
-
-#[tokio::test]
-async fn same_sized_prepared_vnode_transition_does_not_grow_live_group_capacity() {
-    const GROUPS: u32 = 8;
-    let vnode = 0;
-
-    let mut donor = fresh_state().await;
-    let donor_keys = (0..GROUPS)
-        .map(|index| symbol_for_vnode(&donor, vnode, index * 100_000))
-        .collect::<Vec<_>>();
-    let donor_rows = donor_keys
-        .iter()
-        .map(|key| (key.as_str(), 10))
-        .collect::<Vec<_>>();
-    feed(&mut donor, &donor_rows);
-    let restored_base = donor
-        .checkpoint_groups_by_vnode(VNODES)
-        .unwrap()
-        .remove(&vnode)
-        .unwrap();
-
-    let mut live = fresh_state().await;
-    let live_keys = (0..GROUPS)
-        .map(|index| symbol_for_vnode(&live, vnode, 1_000_000 + index * 100_000))
-        .collect::<Vec<_>>();
-    let live_rows = live_keys
-        .iter()
-        .map(|key| (key.as_str(), 20))
-        .collect::<Vec<_>>();
-    feed(&mut live, &live_rows);
-    live.groups.shrink_to_fit();
-    let capacity_before = live.groups.capacity();
-    assert!(
-        capacity_before < live.groups.len() + restored_base.last_updated_ms.len(),
-        "the fixture must require growth under the former replacement-sized reservation"
-    );
-    let restores = [AggVnodeRestore {
-        vnode,
-        base: &restored_base,
-        deltas: &[],
-    }];
-
-    let prepared = live
-        .prepare_vnode_transition(VNODES, &restores, &Default::default())
-        .unwrap();
-
-    assert_eq!(live.groups.len(), GROUPS as usize);
-    assert_eq!(
-        live.groups.capacity(),
-        capacity_before,
-        "a same-sized replacement must not reserve its full cardinality against the live map"
-    );
-    drop(prepared);
+    assert_eq!(checkpoint_bytes(&mut live), checkpoint_before);
+    assert_eq!(live.working_set_snapshot_for_test(), working_set_before);
+    assert_eq!(vnode_slot_identities(&live), slot_identities_before);
 }
 
 #[tokio::test]
@@ -499,7 +567,10 @@ async fn prepared_vnode_transition_revoke_clears_forced_rebase_marker() {
         .unwrap()
         .contains_key(&revoked_vnode));
     live.force_full_rebase();
-    assert!(live.force_rebase_vnodes.contains(&revoked_vnode));
+    assert!(live
+        .working_set_snapshot_for_test()
+        .force_full_rebase_vnodes
+        .contains(&revoked_vnode));
 
     let revoked = [revoked_vnode]
         .into_iter()
@@ -510,7 +581,9 @@ async fn prepared_vnode_transition_revoke_clears_forced_rebase_marker() {
     let retired = live.publish_prepared_vnode_transition(prepared);
     IncrementalAggState::finish_vnode_transition(retired);
 
-    assert!(!live.force_rebase_vnodes.contains(&revoked_vnode));
+    let snapshot = live.working_set_snapshot_for_test();
+    assert!(!snapshot.force_full_rebase_vnodes.contains(&revoked_vnode));
+    assert!(!snapshot.delta_chain_len.contains_key(&revoked_vnode));
     assert!(
         !live
             .checkpoint_delta_by_vnode(VNODES, 8)
@@ -547,10 +620,18 @@ async fn prepared_vnode_transition_delta_only_new_changelog_group_is_dirty() {
     let retired = live.publish_prepared_vnode_transition(prepared);
     IncrementalAggState::finish_vnode_transition(retired);
 
-    assert_eq!(live.groups.len(), 1);
-    let final_key = live.groups.keys().next().unwrap();
+    assert_eq!(live.logical_group_count_for_test(), 1);
+    let final_key = live
+        .group_keys_for_test()
+        .into_iter()
+        .next()
+        .expect("restored delta group");
+    assert!(live.contains_group_for_test(&final_key));
+    let final_key_bytes: &[u8] = final_key.as_ref();
     assert!(
-        live.dirty_keys.contains(final_key),
+        live.working_set_snapshot_for_test()
+            .emit_dirty_keys
+            .contains(final_key_bytes),
         "a group introduced only by a delta must be emitted after restore"
     );
 }
@@ -572,9 +653,9 @@ async fn prepared_vnode_transition_group_limit_failure_preserves_live_image() {
     let retained = symbol_for_vnode(&live, 2, 0);
     feed(&mut live, &[(retained.as_str(), 30)]);
     live.set_max_groups_for_test(2);
-    live.groups.shrink_to_fit();
-    let capacity_before = live.groups.capacity();
-    let before = checkpoint_bytes(&mut live);
+    let checkpoint_before = checkpoint_bytes(&mut live);
+    let working_set_before = live.working_set_snapshot_for_test();
+    let slot_identities_before = vnode_slot_identities(&live);
     let restores = [AggVnodeRestore {
         vnode: restored_vnode,
         base: &restored_base,
@@ -589,8 +670,9 @@ async fn prepared_vnode_transition_group_limit_failure_preserves_live_image() {
         error.to_string().contains("group limit exceeded"),
         "{error}"
     );
-    assert_eq!(checkpoint_bytes(&mut live), before);
-    assert_eq!(live.groups.capacity(), capacity_before);
+    assert_eq!(checkpoint_bytes(&mut live), checkpoint_before);
+    assert_eq!(live.working_set_snapshot_for_test(), working_set_before);
+    assert_eq!(vnode_slot_identities(&live), slot_identities_before);
 }
 
 #[tokio::test]
@@ -621,7 +703,7 @@ async fn prepared_vnode_transition_accepts_exact_final_group_limit() {
     let retired = live.publish_prepared_vnode_transition(prepared);
     IncrementalAggState::finish_vnode_transition(retired);
 
-    assert_eq!(live.groups.len(), 2);
+    assert_eq!(live.logical_group_count_for_test(), 2);
     assert_eq!(
         totals(&mut live),
         std::collections::BTreeMap::from([(restored, 10), (retained, 30)])
@@ -673,6 +755,11 @@ async fn aggregate_key_mapping_matches_shuffle_capture_and_drop() {
             counts
         },
     );
+    assert_eq!(
+        state.active_vnodes_for_test(),
+        expected_counts.keys().copied().collect::<Vec<_>>(),
+        "the active roster must contain exactly the resident vnode slots",
+    );
     let captures = state.checkpoint_groups_by_vnode(VNODES).unwrap();
     let capture_counts = captures
         .iter()
@@ -684,10 +771,18 @@ async fn aggregate_key_mapping_matches_shuffle_capture_and_drop() {
     let revoked = [revoked_vnode].into_iter().collect();
     state.drop_vnodes(&revoked, VNODES).unwrap();
     assert_eq!(
-        state.groups.len(),
+        state.active_vnodes_for_test(),
+        expected_counts
+            .keys()
+            .copied()
+            .filter(|vnode| *vnode != revoked_vnode)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        state.logical_group_count_for_test(),
         rows.len() - expected_counts[&revoked_vnode]
     );
-    assert!(state.groups.keys().all(|key| {
+    assert!(state.group_keys_for_test().iter().all(|key| {
         IncrementalAggState::vnode_for_group_key(state.num_group_cols, key, vnode_count)
             != revoked_vnode
     }));
@@ -698,14 +793,11 @@ async fn vnode_capture_rejects_key_group_count_mismatch_before_mutation() {
     let mut state = fresh_state().await;
     state.set_delta_enabled(true);
     feed(&mut state, &[("AAPL", 1), ("GOOG", 2), ("MSFT", 3)]);
-    let state_before = checkpoint_bytes(&mut state);
-    let groups_before = state.groups.len();
-    let dirty_before = state.dirty_keys_by_vnode.clone();
-    let emission_dirty_before = state.last_emitted_dirty_by_vnode.clone();
-    let chains_before = state.delta_chain_len.clone();
-    let force_rebase_before = state.force_rebase_vnodes.clone();
-    assert!(dirty_before.is_empty());
-    assert!(emission_dirty_before.is_empty());
+    let checkpoint_before = checkpoint_bytes(&mut state);
+    let working_set_before = state.working_set_snapshot_for_test();
+    let slot_identities_before = vnode_slot_identities(&state);
+    assert!(working_set_before.checkpoint_dirty_keys.is_empty());
+    assert!(working_set_before.last_emitted_dirty_keys.is_empty());
 
     let full_error = state
         .checkpoint_groups_by_vnode(VNODES * 2)
@@ -720,21 +812,16 @@ async fn vnode_capture_rejects_key_group_count_mismatch_before_mutation() {
         .expect("a first delta capture must not choose a different routing topology");
     assert!(delta_error.to_string().contains("state=16, requested=32"));
     assert!(!state.delta_tracking_active);
-    assert_eq!(checkpoint_bytes(&mut state), state_before);
-    assert_eq!(state.groups.len(), groups_before);
-    assert_eq!(state.dirty_keys_by_vnode, dirty_before);
-    assert_eq!(state.last_emitted_dirty_by_vnode, emission_dirty_before);
-    assert_eq!(state.delta_chain_len, chains_before);
-    assert_eq!(state.force_rebase_vnodes, force_rebase_before);
+    assert_eq!(checkpoint_bytes(&mut state), checkpoint_before);
+    assert_eq!(state.working_set_snapshot_for_test(), working_set_before);
+    assert_eq!(vnode_slot_identities(&state), slot_identities_before);
 
     state.checkpoint_delta_by_vnode(VNODES, 8).unwrap();
     assert!(state.delta_tracking_active);
 
     feed(&mut state, &[("AAPL", 10)]);
-    let dirty_before = state.dirty_keys_by_vnode.clone();
-    let emission_dirty_before = state.last_emitted_dirty_by_vnode.clone();
-    let chains_before = state.delta_chain_len.clone();
-    let force_rebase_before = state.force_rebase_vnodes.clone();
+    let working_set_before = state.working_set_snapshot_for_test();
+    let slot_identities_before = vnode_slot_identities(&state);
 
     let error = state
         .checkpoint_delta_by_vnode(VNODES * 2, 8)
@@ -742,18 +829,16 @@ async fn vnode_capture_rejects_key_group_count_mismatch_before_mutation() {
         .expect("a delta generation must not reinterpret its vnode space");
     assert!(error.to_string().contains("state=16, requested=32"));
     assert!(state.delta_tracking_active);
-    assert_eq!(state.dirty_keys_by_vnode, dirty_before);
-    assert_eq!(state.last_emitted_dirty_by_vnode, emission_dirty_before);
-    assert_eq!(state.delta_chain_len, chains_before);
-    assert_eq!(state.force_rebase_vnodes, force_rebase_before);
+    assert_eq!(state.working_set_snapshot_for_test(), working_set_before);
+    assert_eq!(vnode_slot_identities(&state), slot_identities_before);
 
     let full_error = state
         .checkpoint_groups_by_vnode(VNODES * 2)
         .err()
         .expect("a full capture cannot silently rotate an active delta generation");
     assert!(full_error.to_string().contains("state=16, requested=32"));
-    assert_eq!(state.dirty_keys_by_vnode, dirty_before);
-    assert_eq!(state.delta_chain_len, chains_before);
+    assert_eq!(state.working_set_snapshot_for_test(), working_set_before);
+    assert_eq!(vnode_slot_identities(&state), slot_identities_before);
 
     state.checkpoint_delta_by_vnode(VNODES, 8).unwrap();
 }

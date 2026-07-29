@@ -1262,6 +1262,7 @@ async fn terminal_barrier_retirement_unblocks_data_and_preserves_data_holdover()
 
     let after = receiver.drain_checkpointed_data_for("after");
     assert_eq!(after.len(), 1);
+    assert_eq!(after[0].routed_vnodes(), &[0]);
     assert_eq!(
         after[0]
             .batch()
@@ -1275,6 +1276,7 @@ async fn terminal_barrier_retirement_unblocks_data_and_preserves_data_holdover()
 
     let held = receiver.drain_checkpointed_data_for("held");
     assert_eq!(held.len(), 1);
+    assert_eq!(held[0].routed_vnodes(), &[0]);
     assert_eq!(
         held[0]
             .batch()

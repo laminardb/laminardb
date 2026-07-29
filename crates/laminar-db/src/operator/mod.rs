@@ -19,6 +19,15 @@ pub(crate) struct RetainedBatch {
     batch: RecordBatch,
     _admissions: Arc<[laminar_core::shuffle::ShuffleBatchAdmission]>,
     assignment_version: Option<u64>,
+    uniform_vnode: Option<u32>,
+}
+
+#[cfg(feature = "cluster")]
+pub(crate) fn uniform_vnode_hint(routed_vnodes: &[u32]) -> Option<u32> {
+    match routed_vnodes {
+        [vnode] => Some(*vnode),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "cluster")]
@@ -28,17 +37,20 @@ impl RetainedBatch {
             batch,
             _admissions: Arc::from([]),
             assignment_version: None,
+            uniform_vnode: None,
         }
     }
 
     #[cfg(feature = "cluster")]
     pub(crate) fn from_received(received: laminar_core::shuffle::ReceivedBatch) -> Self {
         let assignment_version = received.assignment_version();
+        let uniform_vnode = uniform_vnode_hint(received.routed_vnodes());
         let (batch, admission) = received.into_parts();
         Self {
             batch,
             _admissions: Arc::from([admission]),
             assignment_version: Some(assignment_version),
+            uniform_vnode,
         }
     }
 
@@ -47,11 +59,13 @@ impl RetainedBatch {
         batch: RecordBatch,
         admission: laminar_core::shuffle::ShuffleBatchAdmission,
         assignment_version: u64,
+        uniform_vnode: Option<u32>,
     ) -> Self {
         Self {
             batch,
             _admissions: Arc::from([admission]),
             assignment_version: Some(assignment_version),
+            uniform_vnode,
         }
     }
 
@@ -62,6 +76,10 @@ impl RetainedBatch {
     #[cfg(feature = "cluster")]
     pub(crate) const fn assignment_version(&self) -> Option<u64> {
         self.assignment_version
+    }
+
+    pub(crate) const fn uniform_vnode(&self) -> Option<u32> {
+        self.uniform_vnode
     }
 }
 
@@ -324,6 +342,13 @@ mod shuffle_tests {
         sender.install_assignment_fence(&fence, &[1, 2, 3]).unwrap();
         sender.register_peer(2, receiver.local_addr());
         (sender, receiver)
+    }
+
+    #[test]
+    fn uniform_vnode_hint_requires_exactly_one_route() {
+        assert_eq!(uniform_vnode_hint(&[7]), Some(7));
+        assert_eq!(uniform_vnode_hint(&[]), None);
+        assert_eq!(uniform_vnode_hint(&[3, 7]), None);
     }
 
     #[tokio::test]

@@ -312,6 +312,7 @@ impl Default for Holdover {
 /// retain the envelope while processing shallow clones of the batch.
 pub struct ReceivedBatch {
     batch: arrow_array::RecordBatch,
+    routed_vnodes: std::sync::Arc<[u32]>,
     reservation: Option<std::sync::Arc<InboundReservation>>,
     peer: ShufflePeerId,
     sender_incarnation: uuid::Uuid,
@@ -341,6 +342,12 @@ impl ReceivedBatch {
     #[must_use]
     pub const fn batch(&self) -> &arrow_array::RecordBatch {
         &self.batch
+    }
+
+    /// Canonical receiver-owned vnode set carried with this batch.
+    #[must_use]
+    pub fn routed_vnodes(&self) -> &[u32] {
+        &self.routed_vnodes
     }
 
     /// Peer and exact transport stream that delivered this batch.
@@ -385,8 +392,9 @@ impl ReceivedBatch {
         self.checkpoint_sequence
     }
 
-    /// Split the decoded batch from its admission so a retaining consumer can
-    /// keep the charge for exactly as long as shallow Arrow views remain live.
+    /// Split the decoded batch from its admission so a retaining consumer can keep the charge for
+    /// exactly as long as shallow Arrow views remain live. Route metadata is not returned; callers
+    /// that need it must inspect [`Self::routed_vnodes`] before consuming this envelope.
     pub fn into_parts(self) -> (arrow_array::RecordBatch, ShuffleBatchAdmission) {
         (self.batch, ShuffleBatchAdmission(self.reservation))
     }
@@ -396,6 +404,7 @@ impl std::fmt::Debug for ReceivedBatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReceivedBatch")
             .field("batch", &self.batch)
+            .field("routed_vnodes", &self.routed_vnodes)
             .field("peer", &self.peer)
             .field("sender_incarnation", &self.sender_incarnation)
             .field("receiver_incarnation", &self.receiver_incarnation)
@@ -3685,10 +3694,13 @@ mod grpc {
                 } = received;
                 match message {
                     ShuffleMessage::Data {
-                        stage: s, batch, ..
+                        stage: s,
+                        routed_vnodes,
+                        batch,
                     } => {
                         staged.entry(s).or_default().push(ReceivedBatch {
                             batch,
+                            routed_vnodes,
                             reservation,
                             peer,
                             sender_incarnation,
@@ -5334,9 +5346,14 @@ mod shim {
                         checkpoint_sequence,
                     } = received;
                     match message {
-                        ShuffleMessage::Data { stage, batch, .. } => {
+                        ShuffleMessage::Data {
+                            stage,
+                            routed_vnodes,
+                            batch,
+                        } => {
                             staged.entry(stage).or_default().push(ReceivedBatch {
                                 batch,
+                                routed_vnodes,
                                 reservation,
                                 peer,
                                 sender_incarnation,

@@ -401,6 +401,61 @@ fn checkpoint_bytes(state: &mut IncrementalAggState) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn local_keyed_state_uses_only_vnode_zero_and_roundtrips_whole_checkpoint() {
+    let sql = "SELECT name, SUM(value) as total FROM events GROUP BY name";
+    let (_, mut state) = setup_agg_state(sql).await;
+    state
+        .process_batch(&sum_pre_agg_batch(&["a", "b", "a"], &[1.0, 2.0, 3.0]), 42)
+        .unwrap();
+
+    assert_eq!(
+        state.key_group_count(),
+        laminar_core::state::LOCAL_KEY_GROUP_COUNT
+    );
+    assert_eq!(state.logical_group_count_for_test(), 2);
+    assert_eq!(state.active_vnodes_for_test(), &[0]);
+    let vnode_zero_slot = state
+        .vnode_slot_identity_for_test(0)
+        .expect("local keyed state must allocate vnode zero");
+    assert!(state.vnode_slot_identity_for_test(1).is_none());
+    let before = state.working_set_snapshot_for_test();
+
+    let checkpoint = state.checkpoint_groups().unwrap();
+    assert_eq!(
+        state.vnode_slot_identity_for_test(0),
+        Some(vnode_zero_slot),
+        "whole-state capture must not replace the live local shard",
+    );
+
+    let (_, mut restored) = setup_agg_state(sql).await;
+    assert_eq!(restored.restore_groups(&checkpoint).unwrap(), 2);
+    assert_eq!(restored.logical_group_count_for_test(), 2);
+    assert_eq!(restored.active_vnodes_for_test(), &[0]);
+    assert!(restored.vnode_slot_identity_for_test(0).is_some());
+    assert!(restored.vnode_slot_identity_for_test(1).is_none());
+    assert_eq!(restored.working_set_snapshot_for_test(), before);
+
+    let mut totals = std::collections::BTreeMap::new();
+    for batch in restored.emit().unwrap() {
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("group name output");
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .expect("aggregate total output");
+        for row in 0..batch.num_rows() {
+            totals.insert(names.value(row).to_owned(), values.value(row));
+        }
+    }
+    assert_eq!(totals.get("a"), Some(&4.0));
+    assert_eq!(totals.get("b"), Some(&2.0));
+}
+
+#[tokio::test]
 async fn test_distinct_flag_extracted() {
     let ctx = laminar_sql::create_session_context();
     let schema = Arc::new(Schema::new(vec![
@@ -1049,7 +1104,7 @@ async fn test_group_by_simple_column_still_works() {
 async fn group_cardinality_limit_rejects_the_whole_batch_and_retry() {
     let (_, mut state) =
         setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
-    state.max_groups = 2;
+    state.set_max_groups_for_test(2);
     state
         .process_batch(&sum_pre_agg_batch(&["a", "b"], &[10.0, 20.0]), 1)
         .unwrap();
@@ -1120,13 +1175,16 @@ async fn replay_rejects_changelog_state_without_its_group() {
         .restore_groups(&empty_checkpoint)
         .expect_err("whole-state restore must reject orphaned changelog state");
     assert!(error.to_string().contains("non-canonical empty"));
-    assert!(restored.groups.is_empty());
-    assert!(restored.last_emitted.is_empty());
+    assert_eq!(restored.logical_group_count_for_test(), 0);
+    assert!(restored
+        .working_set_snapshot_for_test()
+        .last_emitted
+        .is_empty());
 
     let mut merged = changelog_sum_state(&ctx).await;
     let error = merged.merge_groups(&empty_checkpoint).unwrap_err();
     assert!(error.to_string().contains("non-canonical empty"));
-    assert!(merged.groups.is_empty());
+    assert_eq!(merged.logical_group_count_for_test(), 0);
 
     let delta = AggVnodeDelta {
         changed: empty_checkpoint,
@@ -1134,7 +1192,7 @@ async fn replay_rejects_changelog_state_without_its_group() {
     let mut applied = changelog_sum_state(&ctx).await;
     let error = applied.apply_delta(&delta).unwrap_err();
     assert!(error.to_string().contains("non-canonical empty"));
-    assert!(applied.groups.is_empty());
+    assert_eq!(applied.logical_group_count_for_test(), 0);
 }
 
 #[cfg(feature = "cluster")]
@@ -1151,7 +1209,10 @@ async fn delta_tracking_records_dirty_keys_per_vnode_and_resets_on_capture() {
 
     // First per-vnode capture establishes the delta baseline and starts a window.
     state.checkpoint_groups_by_vnode(VNODES).unwrap();
-    assert!(state.dirty_keys_by_vnode.is_empty());
+    assert!(state
+        .working_set_snapshot_for_test()
+        .checkpoint_dirty_keys
+        .is_empty());
 
     let pre_agg = Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, true),
@@ -1168,13 +1229,21 @@ async fn delta_tracking_records_dirty_keys_per_vnode_and_resets_on_capture() {
     state.process_batch(&batch, 1000).unwrap();
 
     // Every mutated key is recorded, bucketed by vnode.
-    let tracked: usize = state.dirty_keys_by_vnode.values().map(|s| s.len()).sum();
+    let tracked: usize = state
+        .working_set_snapshot_for_test()
+        .checkpoint_dirty_keys
+        .values()
+        .map(std::collections::BTreeSet::len)
+        .sum();
     assert_eq!(tracked, 3, "all mutated keys tracked in the delta window");
 
     // The next capture resets the window.
     state.checkpoint_groups_by_vnode(VNODES).unwrap();
     assert!(
-        state.dirty_keys_by_vnode.is_empty(),
+        state
+            .working_set_snapshot_for_test()
+            .checkpoint_dirty_keys
+            .is_empty(),
         "capture resets the per-vnode dirty set",
     );
 }
@@ -1207,16 +1276,26 @@ async fn delta_chain_replay_reproduces_full_baseline() {
         state.process_batch(&batch, ts).unwrap();
     }
     fn group_vals(state: &mut IncrementalAggState) -> BTreeMap<Vec<u8>, String> {
-        state
-            .groups
-            .iter_mut()
-            .map(|(k, v)| {
-                (
-                    k.as_ref().to_vec(),
-                    format!("{:?}", v.accs[0].evaluate().unwrap()),
-                )
-            })
-            .collect()
+        let mut values = BTreeMap::new();
+        for batch in state.emit().unwrap() {
+            let names = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("group name output");
+            let totals = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .expect("aggregate total output");
+            for row in 0..batch.num_rows() {
+                values.insert(
+                    names.value(row).as_bytes().to_vec(),
+                    totals.value(row).to_string(),
+                );
+            }
+        }
+        values
     }
     // Non-changelog agg: `checkpoint_delta_by_vnode` emits deltas (a changelog agg re-bases FULL).
     async fn agg(ctx: &SessionContext) -> IncrementalAggState {
@@ -1398,26 +1477,16 @@ async fn delta_chain_replay_reproduces_changelog_last_emitted() {
         .unwrap();
         state.process_batch(&batch, ts).unwrap();
     }
-    // (groups, last_emitted) as comparable string maps.
+    // (evaluated groups, last_emitted) as deterministic maps.
     fn snapshot(
         state: &mut IncrementalAggState,
-    ) -> (BTreeMap<Vec<u8>, String>, BTreeMap<Vec<u8>, String>) {
-        let groups = state
-            .groups
-            .iter_mut()
-            .map(|(k, v)| {
-                (
-                    k.as_ref().to_vec(),
-                    format!("{:?}", v.accs[0].evaluate().unwrap()),
-                )
-            })
-            .collect();
-        let emitted = state
-            .last_emitted
-            .iter()
-            .map(|(k, v)| (k.as_ref().to_vec(), format!("{v:?}")))
-            .collect();
-        (groups, emitted)
+    ) -> (
+        BTreeMap<Vec<u8>, Vec<ScalarValue>>,
+        BTreeMap<Vec<u8>, Vec<ScalarValue>>,
+    ) {
+        let groups = state.evaluated_groups_for_test().unwrap();
+        let working_set = state.working_set_snapshot_for_test();
+        (groups, working_set.last_emitted)
     }
     async fn agg(ctx: &SessionContext) -> IncrementalAggState {
         try_from_sql_local(
@@ -1511,21 +1580,41 @@ async fn delta_chain_replay_reproduces_changelog_last_emitted() {
     // A genuine change emits identically on both.
     feed(&mut producer, &[("a", 100.0)], 4000);
     feed(&mut consumer, &[("a", 100.0)], 4000);
-    let pr: usize = producer
-        .emit()
-        .unwrap()
-        .iter()
-        .map(RecordBatch::num_rows)
-        .sum();
-    let cr: usize = consumer
-        .emit()
-        .unwrap()
-        .iter()
-        .map(RecordBatch::num_rows)
-        .sum();
+    let producer_output = producer.emit().unwrap();
+    let consumer_output = consumer.emit().unwrap();
     assert_eq!(
-        cr, pr,
+        consumer_output, producer_output,
         "post-recovery emit must produce identical changelog output"
+    );
+}
+
+/// An idle changelog epoch has no changed groups or dedup entries. It must not turn the absence
+/// of emitted dirty keys into a FULL `last_emitted` capture for the vnode.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn idle_changelog_delta_omits_unchanged_state() {
+    let sql = "SELECT name, SUM(value) as total FROM events GROUP BY name";
+    let (_, mut state) = setup_agg_state_with_changelog(sql, true).await;
+    state.set_delta_enabled(true);
+    state
+        .process_batch(&sum_pre_agg_batch(&["a", "b"], &[1.0, 2.0]), 1_000)
+        .unwrap();
+    state.emit().unwrap();
+    assert!(matches!(
+        state.checkpoint_delta_by_vnode(1, 8).unwrap().get(&0),
+        Some(VnodeCapture::Full(_))
+    ));
+
+    let captures = state.checkpoint_delta_by_vnode(1, 8).unwrap();
+    let Some(VnodeCapture::Delta(delta)) = captures.get(&0) else {
+        panic!("an idle epoch after a baseline must produce a delta");
+    };
+    assert!(delta.changed.keys_ipc.is_empty());
+    assert!(delta.changed.acc_state_ipc.is_empty());
+    assert!(delta.changed.last_updated_ms.is_empty());
+    assert!(
+        delta.changed.last_emitted.is_empty(),
+        "an idle delta must not serialize the complete changelog dedup map",
     );
 }
 
@@ -1593,13 +1682,14 @@ async fn global_changelog_delta_checkpoint_roundtrips() {
             restored.apply_delta(d).unwrap();
         }
     }
+    let global_key = global_aggregate_key().as_ref().to_vec();
     let value = restored
-        .groups
-        .get_mut(&global_aggregate_key())
-        .expect("global group restored")
-        .accs[0]
-        .evaluate()
-        .unwrap();
+        .evaluated_groups_for_test()
+        .unwrap()
+        .get(&global_key)
+        .and_then(|values| values.first())
+        .cloned()
+        .expect("global group restored");
     assert_eq!(value, ScalarValue::Float64(Some(6.0)));
 }
 
@@ -1714,11 +1804,11 @@ async fn drop_vnodes_purges_revoked_keeps_sibling() {
     let y_first_row = row_of(&state, &y_first);
     let x_row = row_of(&state, &x_key);
     assert!(
-        state.groups.contains_key(&y_first_row),
+        state.contains_group_for_test(&y_first_row),
         "precondition: first y group present"
     );
     assert!(
-        state.groups.contains_key(&x_row),
+        state.contains_group_for_test(&x_row),
         "precondition: x resident"
     );
 
@@ -1728,35 +1818,41 @@ async fn drop_vnodes_purges_revoked_keeps_sibling() {
 
     // Every vy entry is gone.
     assert!(
-        !state.groups.contains_key(&y_first_row),
+        !state.contains_group_for_test(&y_first_row),
         "revoked first group dropped"
     );
     assert!(
-        !state.groups.contains_key(&y_second_row),
+        !state.contains_group_for_test(&y_second_row),
         "revoked second group dropped"
     );
+    let working_set = state.working_set_snapshot_for_test();
     assert!(
-        !state.last_emitted.contains_key(&y_first_row),
+        !working_set.last_emitted.contains_key(y_first_row.as_ref()),
         "revoked last_emitted dropped"
     );
-    assert!(!state.dirty_keys_by_vnode.contains_key(&vy));
-    assert!(!state.last_emitted_dirty_by_vnode.contains_key(&vy));
-    assert!(!state.delta_chain_len.contains_key(&vy));
+    assert!(!working_set.checkpoint_dirty_keys.contains_key(&vy));
+    assert!(!working_set.last_emitted_dirty_keys.contains_key(&vy));
+    assert!(!working_set.delta_chain_len.contains_key(&vy));
 
     // The sibling vnode is untouched.
     assert!(
-        state.groups.contains_key(&x_row),
+        state.contains_group_for_test(&x_row),
         "sibling resident group kept"
     );
     assert!(
-        state.delta_chain_len.contains_key(&vx),
+        working_set.delta_chain_len.contains_key(&vx),
         "sibling chain kept"
     );
 
     // Invariant preserved: the dedup map stays a subset of resident groups.
-    for k in state.last_emitted.keys() {
+    let group_keys: std::collections::BTreeSet<Vec<u8>> = state
+        .group_keys_for_test()
+        .into_iter()
+        .map(|key| key.as_ref().to_vec())
+        .collect();
+    for key in working_set.last_emitted.keys() {
         assert!(
-            state.groups.contains_key(k),
+            group_keys.contains(key),
             "last_emitted must remain a subset of groups",
         );
     }
@@ -1782,8 +1878,11 @@ async fn empty_restore_rejects_every_noncanonical_payload() {
     for checkpoint in [keys_only, accumulators_only, changelog_only] {
         let error = state.restore_groups(&checkpoint).unwrap_err();
         assert!(error.to_string().contains("non-canonical empty"));
-        assert!(state.groups.is_empty());
-        assert!(state.last_emitted.is_empty());
+        assert_eq!(state.logical_group_count_for_test(), 0);
+        assert!(state
+            .working_set_snapshot_for_test()
+            .last_emitted
+            .is_empty());
     }
 }
 
@@ -1913,12 +2012,12 @@ async fn bulk_merge_and_restore_reject_duplicate_group_keys() {
     let (_, mut restored) = setup_agg_state(sql).await;
     let error = restored.restore_groups(&duplicated).unwrap_err();
     assert!(error.to_string().contains("duplicate group key"));
-    assert!(restored.groups.is_empty());
+    assert_eq!(restored.logical_group_count_for_test(), 0);
 
     let (_, mut merged) = setup_agg_state(sql).await;
     let error = merged.merge_groups(&duplicated).unwrap_err();
     assert!(error.to_string().contains("duplicate group key"));
-    assert!(merged.groups.is_empty());
+    assert_eq!(merged.logical_group_count_for_test(), 0);
 
     let (_, mut applied) = setup_agg_state(sql).await;
     let error = applied
@@ -1927,7 +2026,7 @@ async fn bulk_merge_and_restore_reject_duplicate_group_keys() {
         })
         .unwrap_err();
     assert!(error.to_string().contains("duplicate group key"));
-    assert!(applied.groups.is_empty());
+    assert_eq!(applied.logical_group_count_for_test(), 0);
 }
 
 #[cfg(feature = "cluster")]
@@ -1935,6 +2034,24 @@ async fn bulk_merge_and_restore_reject_duplicate_group_keys() {
 async fn vnode_chain_failure_is_atomic_and_successful_retry_is_idempotent() {
     let sql = "SELECT name, SUM(value) as total FROM events GROUP BY name";
     let (ctx, mut live) = setup_agg_state(sql).await;
+    fn emitted_totals(state: &mut IncrementalAggState) -> Vec<f64> {
+        let mut values = state
+            .emit()
+            .unwrap()
+            .into_iter()
+            .flat_map(|batch| {
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Float64Array>()
+                    .expect("aggregate total output")
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        values.sort_by(f64::total_cmp);
+        values
+    }
     let batch = |name: &str, value: f64| {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -1986,28 +2103,12 @@ async fn vnode_chain_failure_is_atomic_and_successful_retry_is_idempotent() {
     };
     live.apply_vnode_chain(&base, std::slice::from_ref(&valid_delta))
         .unwrap();
-    let mut first_values: Vec<f64> = live
-        .groups
-        .values_mut()
-        .map(|entry| match entry.accs[0].evaluate().unwrap() {
-            ScalarValue::Float64(Some(value)) => value,
-            other => panic!("unexpected aggregate value {other:?}"),
-        })
-        .collect();
-    first_values.sort_by(f64::total_cmp);
+    let first_values = emitted_totals(&mut live);
     assert_eq!(first_values, vec![1.0, 5.0]);
 
     live.apply_vnode_chain(&base, std::slice::from_ref(&valid_delta))
         .unwrap();
-    let mut retry_values: Vec<f64> = live
-        .groups
-        .values_mut()
-        .map(|entry| match entry.accs[0].evaluate().unwrap() {
-            ScalarValue::Float64(Some(value)) => value,
-            other => panic!("unexpected aggregate value {other:?}"),
-        })
-        .collect();
-    retry_values.sort_by(f64::total_cmp);
+    let retry_values = emitted_totals(&mut live);
     assert_eq!(retry_values, first_values);
 }
 
@@ -2016,7 +2117,7 @@ async fn group_cardinality_existing_groups_update_at_the_limit() {
     let (_, mut state) =
         setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
 
-    state.max_groups = 2;
+    state.set_max_groups_for_test(2);
 
     let pre_agg_schema = Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, true),

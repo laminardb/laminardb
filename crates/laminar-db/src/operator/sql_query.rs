@@ -784,6 +784,15 @@ impl SqlQueryOperator {
             let QueryState::Agg(ref mut aggregate) = self.state else {
                 unreachable!();
             };
+            #[cfg(feature = "cluster")]
+            for (batch, vnode) in &pre_agg_batches {
+                aggregate
+                    .process_batch_for_vnode(batch, watermark, *vnode)
+                    .map_err(|error| {
+                        stateful_apply_outcome_unknown(op_name, "state update", error)
+                    })?;
+            }
+            #[cfg(not(feature = "cluster"))]
             for batch in &pre_agg_batches {
                 aggregate.process_batch(batch, watermark).map_err(|error| {
                     stateful_apply_outcome_unknown(op_name, "state update", error)
@@ -834,7 +843,7 @@ impl SqlQueryOperator {
             )));
         };
         aggregate
-            .process_batch(batch.batch(), replay_watermark)
+            .process_batch_for_vnode(batch.batch(), replay_watermark, batch.uniform_vnode())
             .map_err(|error| {
                 DbError::Checkpoint(format!(
                     "aggregate '{}' aligned shuffle replay failed and requires recovery: {error}",
@@ -974,14 +983,23 @@ async fn shuffle_pre_agg_batches(
     op_name: &str,
     num_group_cols: usize,
     batches: Vec<RecordBatch>,
-) -> Result<(Vec<RecordBatch>, Vec<laminar_core::shuffle::ReceivedBatch>), DbError> {
+) -> Result<
+    (
+        Vec<(RecordBatch, Option<u32>)>,
+        Vec<laminar_core::shuffle::ReceivedBatch>,
+    ),
+    DbError,
+> {
     let Some(cfg) = config else {
-        return Ok((batches, Vec::new()));
+        return Ok((
+            batches.into_iter().map(|batch| (batch, None)).collect(),
+            Vec::new(),
+        ));
     };
 
     let vnode_count = cfg.registry.vnode_count();
     let assignment = cfg.registry.versioned_snapshot();
-    let mut local: Vec<RecordBatch> = Vec::new();
+    let mut local: Vec<(RecordBatch, Option<u32>)> = Vec::new();
 
     // Build the complete plan before any transport admission. Unassigned ownership can then defer
     // safely, while permanent structural failures halt rather than loop through recovery.
@@ -1002,7 +1020,7 @@ async fn shuffle_pre_agg_batches(
         .map_err(|error| crate::operator::shuffle_routing_error(&context, &error))?;
 
         for route in plan.local {
-            local.push(route.batch);
+            local.push((route.batch, Some(route.vnode)));
         }
         for route in plan.remote {
             outbound.push((
@@ -1029,7 +1047,10 @@ async fn shuffle_pre_agg_batches(
     let admitted = cfg.receiver.drain_checkpointed_data_for(op_name);
     for received in &admitted {
         if received.batch().num_rows() > 0 {
-            local.push(received.batch().clone());
+            local.push((
+                received.batch().clone(),
+                crate::operator::uniform_vnode_hint(received.routed_vnodes()),
+            ));
         }
     }
 
@@ -1616,7 +1637,7 @@ impl GraphOperator for SqlQueryOperator {
             next_prev_owned.remove(vnode);
         }
 
-        let QueryState::Agg(ref mut aggregate) = self.state else {
+        let QueryState::Agg(ref aggregate) = self.state else {
             return Err(DbError::Checkpoint(format!(
                 "managed vnode transition for '{}' targeted a non-aggregate query",
                 self.op_name
@@ -2185,6 +2206,41 @@ mod delta_primary_tests {
     }
 
     #[tokio::test]
+    async fn pre_agg_shuffle_preserves_local_hints_and_marks_configless_batches_mixed() {
+        let (_, batch) = super::checkpoint_tests::context_and_batch();
+        let (configless, admitted) =
+            shuffle_pre_agg_batches(None, "totals", 1, vec![batch.clone()])
+                .await
+                .unwrap();
+        assert!(admitted.is_empty());
+        assert_eq!(configless.len(), 1);
+        assert_eq!(configless[0].1, None);
+
+        let (shuffle, _) = single_owner_shuffle().await;
+        let (routed, admitted) = shuffle_pre_agg_batches(Some(&shuffle), "totals", 1, vec![batch])
+            .await
+            .unwrap();
+        assert!(admitted.is_empty());
+        assert_eq!(
+            routed
+                .iter()
+                .map(|(batch, _)| batch.num_rows())
+                .sum::<usize>(),
+            2
+        );
+        for (batch, hint) in routed {
+            let vnode = hint.expect("a local route must retain its exact vnode");
+            assert!(
+                hash_rows_to_vnodes(&batch, 1, 8)
+                    .unwrap()
+                    .into_iter()
+                    .all(|derived| derived == vnode),
+                "a local route hint must describe every row in its batch",
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn cluster_aggregate_never_falls_back_to_node_local_execution() {
         let (context, batch) = super::checkpoint_tests::context_and_batch();
         let mut operator = SqlQueryOperator::new(
@@ -2568,6 +2624,43 @@ mod delta_primary_tests {
         assert!(error.requires_pipeline_recovery());
         assert_eq!(operator.aligned_replay.len(), 1);
         assert!(!operator.wants_input());
+    }
+
+    #[tokio::test]
+    async fn aligned_replay_applies_retained_vnode_hint_before_mutation() {
+        let (context, batch) = super::checkpoint_tests::context_and_batch();
+        let (shuffle, version) = single_owner_shuffle().await;
+        let mut operator = SqlQueryOperator::new(
+            "totals",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            true,
+        );
+        operator.attach_cluster_shuffle(shuffle);
+        operator.lazy_init().await.unwrap();
+        operator.aligned_replay.push_back((
+            version,
+            41,
+            crate::operator::RetainedBatch {
+                batch,
+                _admissions: Arc::from([]),
+                assignment_version: Some(version),
+                uniform_vnode: Some(8),
+            },
+        ));
+
+        let error = operator
+            .process(&[Vec::new()], &[100])
+            .await
+            .expect_err("an out-of-range retained vnode hint must fail before state mutation");
+        assert!(matches!(error, DbError::Checkpoint(_)));
+        assert!(error.to_string().contains("outside key-group count 8"));
+        assert_eq!(operator.aligned_replay.len(), 1);
+        let QueryState::Agg(ref aggregate) = operator.state else {
+            panic!("expected initialized aggregate state");
+        };
+        assert_eq!(aggregate.logical_group_count_for_test(), 0);
     }
 
     #[tokio::test]

@@ -1538,6 +1538,7 @@ async fn align_shuffle_barriers_retains_peer_rows_then_aligns_exact_attempt() {
         "peer's pre-barrier row retained by the operator"
     );
     assert_eq!(got[0].num_rows(), batch.num_rows());
+    assert_eq!(got[0].uniform_vnode(), Some(0));
 }
 
 #[cfg(feature = "cluster")]

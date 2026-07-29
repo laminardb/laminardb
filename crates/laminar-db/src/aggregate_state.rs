@@ -30,6 +30,7 @@ mod compile;
 mod keys;
 mod managed_v1;
 mod scalar_ipc;
+mod vnode_state;
 pub(crate) use checkpoints::{
     query_fingerprint, query_fingerprint_with_config, AggStateCheckpoint, EmittedCheckpoint,
     EowcStateCheckpoint, GroupCheckpoint, JoinStateCheckpoint, WindowCheckpoint,
@@ -42,6 +43,9 @@ pub(crate) use keys::{
     global_aggregate_key, row_to_scalar_key_with_types, scalar_key_to_owned_row,
 };
 pub(crate) use scalar_ipc::{ipc_to_scalars, scalars_to_ipc};
+use vnode_state::AggregateVnodeSlots;
+#[cfg(feature = "cluster")]
+use vnode_state::AggregateVnodeState;
 
 /// Builds the per-window result batch for one closed window.
 /// Output schema: `[group_cols..., agg_outputs...]`.
@@ -765,14 +769,6 @@ fn merge_columnar_streams<'a>(
     Ok((encoded, rows))
 }
 
-fn insert_vnode_tracking_key(
-    map: &mut AHashMap<u32, AHashSet<arrow::row::OwnedRow>>,
-    vnode: u32,
-    key: arrow::row::OwnedRow,
-) {
-    map.entry(vnode).or_default().insert(key);
-}
-
 pub(crate) struct IncrementalAggState {
     query_sql: String,
     #[cfg(test)]
@@ -781,7 +777,7 @@ pub(crate) struct IncrementalAggState {
     key_group_count: KeyGroupCount,
     group_types: Vec<DataType>,
     agg_specs: Vec<AggFuncSpec>,
-    groups: AHashMap<arrow::row::OwnedRow, GroupEntry>,
+    vnode_states: AggregateVnodeSlots,
     row_converter: arrow::row::RowConverter,
     output_schema: SchemaRef,
     compiled_projection: Option<CompiledProjection>,
@@ -790,31 +786,27 @@ pub(crate) struct IncrementalAggState {
     having_sql: Option<String>,
     max_groups: usize,
     emit_changelog: bool,
-    last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
-    // Group keys touched since the last emit. The changelog path re-evaluates only
-    // these instead of scanning every group. Transient (cleared each emit),
-    // populated only when emit_changelog, so not checkpointed.
-    dirty_keys: AHashSet<arrow::row::OwnedRow>,
     weight_col_idx: Option<usize>,
-    // Delta-state tracking: keys mutated since the last per-vnode capture, bucketed by vnode.
-    // Populated only after a per-vnode baseline activates tracking; while inactive, the guard
-    // performs no tracking hash, insert, or allocation.
     #[cfg(feature = "cluster")]
     delta_enabled: bool,
     delta_tracking_active: bool,
-    dirty_keys_by_vnode: AHashMap<u32, AHashSet<arrow::row::OwnedRow>>,
-    // Changelog emission keys whose `last_emitted` changed since the last per-vnode
-    // capture (set in `emit_changelog_delta`). Populated only while delta tracking is active;
-    // lets changelog aggregates take the delta path.
-    last_emitted_dirty_by_vnode: AHashMap<u32, AHashSet<arrow::row::OwnedRow>>,
-    // Deltas emitted since the last full capture, per vnode — bounds the chain so the full
-    // base never ages out of the prune window; cleared to a full re-base on restore/acquire.
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+/// Bookkeeping-only test snapshot; accumulator values are evaluated separately when relevant.
+pub(crate) struct AggregateWorkingSetSnapshot {
+    pub(crate) group_timestamps: std::collections::BTreeMap<Vec<u8>, i64>,
+    pub(crate) last_emitted: std::collections::BTreeMap<Vec<u8>, Vec<ScalarValue>>,
+    pub(crate) emit_dirty_keys: std::collections::BTreeSet<Vec<u8>>,
+    pub(crate) checkpoint_dirty_keys:
+        std::collections::BTreeMap<u32, std::collections::BTreeSet<Vec<u8>>>,
+    pub(crate) last_emitted_dirty_keys:
+        std::collections::BTreeMap<u32, std::collections::BTreeSet<Vec<u8>>>,
     #[cfg(feature = "cluster")]
-    delta_chain_len: AHashMap<u32, u32>,
-    // Vnodes a failed epoch must re-base FULL next capture; re-armed into `touched` so an emptied
-    // vnode (which otherwise drops out of it) doesn't resurrect its dropped groups on recovery.
+    pub(crate) delta_chain_len: std::collections::BTreeMap<u32, u32>,
     #[cfg(feature = "cluster")]
-    force_rebase_vnodes: rustc_hash::FxHashSet<u32>,
+    pub(crate) force_full_rebase_vnodes: std::collections::BTreeSet<u32>,
 }
 
 impl IncrementalAggState {
@@ -856,6 +848,131 @@ impl IncrementalAggState {
     #[cfg(test)]
     pub(crate) fn set_max_groups_for_test(&mut self, max_groups: usize) {
         self.max_groups = max_groups;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn logical_group_count_for_test(&self) -> usize {
+        self.vnode_states.resident_group_count()
+    }
+
+    #[cfg(all(test, feature = "cluster"))]
+    pub(crate) fn contains_group_for_test(&self, key: &arrow::row::OwnedRow) -> bool {
+        let vnode = Self::vnode_for_group_key(self.num_group_cols, key, self.routing_vnode_count());
+        self.vnode_states
+            .get(vnode)
+            .is_some_and(|state| state.groups.contains_key(key))
+    }
+
+    #[cfg(all(test, feature = "cluster"))]
+    pub(crate) fn group_keys_for_test(&self) -> Vec<arrow::row::OwnedRow> {
+        self.vnode_states
+            .iter()
+            .flat_map(|(_, state)| state.groups.keys().cloned())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn vnode_slot_identity_for_test(&self, vnode: u32) -> Option<*const ()> {
+        self.vnode_states
+            .get(vnode)
+            .map(|state| std::ptr::from_ref(state).cast())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_vnodes_for_test(&self) -> &[u32] {
+        self.vnode_states.active_vnodes_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn working_set_snapshot_for_test(&self) -> AggregateWorkingSetSnapshot {
+        let mut snapshot = AggregateWorkingSetSnapshot {
+            group_timestamps: std::collections::BTreeMap::new(),
+            last_emitted: std::collections::BTreeMap::new(),
+            emit_dirty_keys: std::collections::BTreeSet::new(),
+            checkpoint_dirty_keys: std::collections::BTreeMap::new(),
+            last_emitted_dirty_keys: std::collections::BTreeMap::new(),
+            #[cfg(feature = "cluster")]
+            delta_chain_len: std::collections::BTreeMap::new(),
+            #[cfg(feature = "cluster")]
+            force_full_rebase_vnodes: std::collections::BTreeSet::new(),
+        };
+        for (vnode, state) in self.vnode_states.iter() {
+            snapshot.group_timestamps.extend(
+                state
+                    .groups
+                    .iter()
+                    .map(|(key, entry)| (key.as_ref().to_vec(), entry.last_updated_ms)),
+            );
+            snapshot.last_emitted.extend(
+                state
+                    .last_emitted
+                    .iter()
+                    .map(|(key, values)| (key.as_ref().to_vec(), values.clone())),
+            );
+            snapshot.emit_dirty_keys.extend(
+                state
+                    .emit_dirty_keys
+                    .iter()
+                    .map(|key| key.as_ref().to_vec()),
+            );
+            if !state.checkpoint_dirty_keys.is_empty() {
+                snapshot.checkpoint_dirty_keys.insert(
+                    vnode,
+                    state
+                        .checkpoint_dirty_keys
+                        .iter()
+                        .map(|key| key.as_ref().to_vec())
+                        .collect(),
+                );
+            }
+            if !state.last_emitted_dirty_keys.is_empty() {
+                snapshot.last_emitted_dirty_keys.insert(
+                    vnode,
+                    state
+                        .last_emitted_dirty_keys
+                        .iter()
+                        .map(|key| key.as_ref().to_vec())
+                        .collect(),
+                );
+            }
+            #[cfg(feature = "cluster")]
+            if let Some(chain_len) = state.delta_chain_len {
+                snapshot.delta_chain_len.insert(vnode, chain_len);
+            }
+            #[cfg(feature = "cluster")]
+            if state.force_full_rebase {
+                snapshot.force_full_rebase_vnodes.insert(vnode);
+            }
+        }
+        snapshot
+    }
+
+    #[cfg(all(test, feature = "cluster"))]
+    pub(crate) fn evaluated_groups_for_test(
+        &mut self,
+    ) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<ScalarValue>>, DbError> {
+        let mut evaluated = std::collections::BTreeMap::new();
+        for (_, state) in self.vnode_states.iter_mut() {
+            for (key, entry) in &mut state.groups {
+                let values = entry
+                    .accs
+                    .iter_mut()
+                    .map(|accumulator| {
+                        accumulator.evaluate().map_err(|error| {
+                            DbError::Pipeline(format!(
+                                "test aggregate accumulator evaluation: {error}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if evaluated.insert(key.as_ref().to_vec(), values).is_some() {
+                    return Err(DbError::Pipeline(
+                        "test aggregate snapshot contains a duplicate group key".into(),
+                    ));
+                }
+            }
+        }
+        Ok(evaluated)
     }
 }
 
@@ -928,28 +1045,12 @@ pub(crate) struct AggVnodeRestore<'a> {
     pub(crate) deltas: &'a [AggVnodeDelta],
 }
 
-/// Fully decoded aggregate mutation plan with private replacement collections.
-///
-/// Fields stay private so callers cannot publish a partial vnode roster. Preparation does not
-/// change logical map contents or dirty/delta bookkeeping, but it may grow live map capacity so
-/// publication can remain allocation-free.
+/// Fully decoded aggregate transition containing one replacement decision per transitioned vnode.
 #[cfg(feature = "cluster")]
 pub(crate) struct PreparedAggVnodeTransition {
-    transitioned_vnodes: Vec<u32>,
-    remove_group_keys: Vec<arrow::row::OwnedRow>,
-    remove_last_emitted_keys: Vec<arrow::row::OwnedRow>,
-    remove_dirty_keys: Vec<arrow::row::OwnedRow>,
-    replacement_groups: AHashMap<arrow::row::OwnedRow, GroupEntry>,
-    replacement_last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
-    replacement_dirty_keys: Vec<arrow::row::OwnedRow>,
-    replacement_dirty_by_vnode: AHashMap<u32, AHashSet<arrow::row::OwnedRow>>,
-    retired_groups: Vec<(arrow::row::OwnedRow, GroupEntry)>,
-    retired_last_emitted: Vec<(arrow::row::OwnedRow, Vec<ScalarValue>)>,
-    retired_dirty_keys: Vec<arrow::row::OwnedRow>,
-    retired_dirty_by_vnode: Vec<(u32, AHashSet<arrow::row::OwnedRow>)>,
-    retired_last_emitted_dirty_by_vnode: Vec<(u32, AHashSet<arrow::row::OwnedRow>)>,
-    retired_delta_chain_len: Vec<(u32, u32)>,
-    retired_force_rebase_vnodes: Vec<u32>,
+    replacements: Vec<(u32, Option<Box<AggregateVnodeState>>)>,
+    final_active_vnodes: Vec<u32>,
+    final_group_count: usize,
 }
 
 /// State and staging allocations displaced by one published aggregate transition.
@@ -958,7 +1059,7 @@ pub(crate) struct PreparedAggVnodeTransition {
 /// this opaque owner and the graph drops it only after leaving the publication section.
 #[cfg(feature = "cluster")]
 pub(crate) struct RetiredAggVnodeTransition {
-    _retired_transition: PreparedAggVnodeTransition,
+    _retired_state: PreparedAggVnodeTransition,
 }
 
 #[cfg(feature = "cluster")]
@@ -975,7 +1076,11 @@ fn checked_vnode_transition_final_count(
 ) -> Result<usize, DbError> {
     let retained = current
         .checked_sub(removed)
-        .ok_or_else(|| DbError::Pipeline("aggregate vnode transition capacity overflow".into()))?;
+        .ok_or_else(|| {
+            DbError::Pipeline(format!(
+                "aggregate vnode transition group-count invariant failed: current={current}, removed={removed}"
+            ))
+        })?;
     checked_vnode_transition_capacity(retained, replacement)
 }
 
@@ -1220,6 +1325,7 @@ impl IncrementalAggState {
             .collect();
         let row_converter = arrow::row::RowConverter::new(sort_fields)
             .map_err(|e| DbError::Pipeline(format!("row converter init: {e}")))?;
+        let vnode_states = AggregateVnodeSlots::try_new(key_group_count)?;
 
         Ok(Some(Self {
             query_sql: sql.to_string(),
@@ -1229,7 +1335,7 @@ impl IncrementalAggState {
             key_group_count,
             group_types,
             agg_specs,
-            groups: AHashMap::new(),
+            vnode_states,
             row_converter,
             output_schema,
             compiled_projection,
@@ -1238,18 +1344,10 @@ impl IncrementalAggState {
             having_sql,
             max_groups: 1_000_000,
             emit_changelog,
-            last_emitted: AHashMap::new(),
-            dirty_keys: AHashSet::new(),
             weight_col_idx,
             #[cfg(feature = "cluster")]
             delta_enabled: false,
             delta_tracking_active: false,
-            dirty_keys_by_vnode: AHashMap::new(),
-            last_emitted_dirty_by_vnode: AHashMap::new(),
-            #[cfg(feature = "cluster")]
-            delta_chain_len: AHashMap::new(),
-            #[cfg(feature = "cluster")]
-            force_rebase_vnodes: rustc_hash::FxHashSet::default(),
         }))
     }
 
@@ -1283,7 +1381,7 @@ impl IncrementalAggState {
         key: &arrow::row::OwnedRow,
         vnode_count: NonZeroU32,
     ) -> u32 {
-        if num_group_cols == 0 {
+        if num_group_cols == 0 || vnode_count.get() == 1 {
             0
         } else {
             PartitionKeyCodecV1::vnode_for_encoded(key.as_ref(), vnode_count)
@@ -1307,33 +1405,54 @@ impl IncrementalAggState {
         Ok(self.routing_vnode_count())
     }
 
-    /// Mark a changelog emission key dirty for the delta path. No-op until delta tracking has an
-    /// established baseline.
-    fn mark_last_emitted_dirty(&mut self, key: &arrow::row::OwnedRow) {
+    /// Commit a successfully built changelog insertion to the dedup map and, once delta tracking
+    /// has a baseline, mark that entry for checkpointing.
+    fn commit_last_emitted(
+        &mut self,
+        vnode: u32,
+        key: arrow::row::OwnedRow,
+        values: Vec<ScalarValue>,
+    ) {
+        let state = self
+            .vnode_states
+            .get_mut(vnode)
+            .expect("emitted aggregate group must remain in its vnode slot");
         if self.delta_tracking_active {
-            let count = self.routing_vnode_count();
-            let v = Self::vnode_for_group_key(self.num_group_cols, key, count);
-            self.last_emitted_dirty_by_vnode
-                .entry(v)
-                .or_default()
-                .insert(key.clone());
+            state.last_emitted_dirty_keys.insert(key.clone());
         }
+        state.last_emitted.insert(key, values);
     }
 
-    fn mark_emit_dirty(&mut self, key: arrow::row::OwnedRow) {
-        self.dirty_keys.insert(key);
-    }
-
-    fn insert_last_emitted(&mut self, key: arrow::row::OwnedRow, values: Vec<ScalarValue>) {
-        self.last_emitted.insert(key, values);
-    }
-
-    #[cfg(all(feature = "cluster", test))]
-    fn remove_last_emitted(&mut self, key: &arrow::row::OwnedRow) -> Option<Vec<ScalarValue>> {
-        self.last_emitted.remove(key)
-    }
-
+    #[cfg(any(not(feature = "cluster"), test))]
     pub fn process_batch(&mut self, batch: &RecordBatch, watermark_ms: i64) -> Result<(), DbError> {
+        self.process_batch_for_vnode(batch, watermark_ms, None)
+    }
+
+    /// Apply one pre-aggregate batch. `uniform_vnode` is present only when trusted internal
+    /// shuffle metadata declares one vnode for the complete batch; owner-coalesced mixed batches
+    /// derive the vnode once per unique encoded group below. The sender's route construction, not
+    /// a receiver-side rehash, binds row keys to that metadata.
+    pub(crate) fn process_batch_for_vnode(
+        &mut self,
+        batch: &RecordBatch,
+        watermark_ms: i64,
+        uniform_vnode: Option<u32>,
+    ) -> Result<(), DbError> {
+        let vnode_count = self.routing_vnode_count();
+        if let Some(vnode) = uniform_vnode {
+            if vnode >= vnode_count.get() {
+                return Err(DbError::Pipeline(format!(
+                    "aggregate routed vnode {vnode} is outside key-group count {}",
+                    vnode_count.get()
+                )));
+            }
+            if self.num_group_cols == 0 && vnode != 0 {
+                return Err(DbError::Pipeline(format!(
+                    "global aggregate received routed vnode {vnode}; expected vnode 0"
+                )));
+            }
+        }
+
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -1370,62 +1489,82 @@ impl IncrementalAggState {
         let mut incoming_new_groups = 0usize;
         for (row_ref, indices) in group_indices {
             let key = row_ref.owned();
-            if !self.groups.contains_key(&key) {
+            let vnode = uniform_vnode.unwrap_or_else(|| {
+                Self::vnode_for_group_key(self.num_group_cols, &key, vnode_count)
+            });
+            if !self
+                .vnode_states
+                .get(vnode)
+                .is_some_and(|state| state.groups.contains_key(&key))
+            {
                 incoming_new_groups = incoming_new_groups.saturating_add(1);
             }
-            grouped_rows.push((key, indices));
+            grouped_rows.push((vnode, key, indices));
         }
-        let required_groups = self.groups.len().saturating_add(incoming_new_groups);
+        let current_groups = self.vnode_states.resident_group_count();
+        let required_groups = current_groups.saturating_add(incoming_new_groups);
         if required_groups > self.max_groups {
             return Err(DbError::Pipeline(format!(
                 "aggregate group limit exceeded: current={}, incoming_new={}, limit={}",
-                self.groups.len(),
-                incoming_new_groups,
-                self.max_groups
+                current_groups, incoming_new_groups, self.max_groups
             )));
         }
 
-        for (owned_key, indices) in grouped_rows {
+        let agg_specs = &self.agg_specs;
+        let weight_col_idx = self.weight_col_idx;
+        let emit_changelog = self.emit_changelog;
+        let delta_tracking_active = self.delta_tracking_active;
+        for (vnode, owned_key, indices) in grouped_rows {
             let key;
-            let entry = match self.groups.entry(owned_key) {
-                std::collections::hash_map::Entry::Occupied(e) => {
-                    key = e.key().clone();
-                    e.into_mut()
-                }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    key = e.key().clone();
-                    let mut accs = Vec::with_capacity(self.agg_specs.len());
-                    for spec in &self.agg_specs {
-                        let acc = if self.weight_col_idx.is_some() {
-                            spec.create_retractable_accumulator()?
-                        } else {
-                            spec.create_accumulator()?
-                        };
-                        accs.push(acc);
+            let (inserted, update_result) = {
+                let vnode_state = self.vnode_states.get_or_insert(vnode);
+                let (entry, inserted) = match vnode_state.groups.entry(owned_key) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        key = e.key().clone();
+                        (e.into_mut(), false)
                     }
-                    e.insert(GroupEntry {
-                        accs,
-                        last_updated_ms: watermark_ms,
-                    })
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        key = e.key().clone();
+                        let mut accs = Vec::with_capacity(agg_specs.len());
+                        for spec in agg_specs {
+                            let acc = if weight_col_idx.is_some() {
+                                spec.create_retractable_accumulator()?
+                            } else {
+                                spec.create_accumulator()?
+                            };
+                            accs.push(acc);
+                        }
+                        (
+                            e.insert(GroupEntry {
+                                accs,
+                                last_updated_ms: watermark_ms,
+                            }),
+                            true,
+                        )
+                    }
+                };
+                let update_result = Self::update_group_accumulators(
+                    &mut entry.accs,
+                    batch,
+                    &indices,
+                    agg_specs,
+                    weight_col_idx,
+                );
+                entry.last_updated_ms = watermark_ms;
+                if update_result.is_ok() {
+                    if emit_changelog {
+                        vnode_state.emit_dirty_keys.insert(key.clone());
+                    }
+                    if delta_tracking_active {
+                        vnode_state.checkpoint_dirty_keys.insert(key.clone());
+                    }
                 }
+                (inserted, update_result)
             };
-            let update_result = Self::update_group_accumulators(
-                &mut entry.accs,
-                batch,
-                &indices,
-                &self.agg_specs,
-                self.weight_col_idx,
-            );
-            entry.last_updated_ms = watermark_ms;
+            if inserted {
+                self.vnode_states.increment_resident_groups();
+            }
             update_result?;
-            if self.emit_changelog {
-                self.mark_emit_dirty(key.clone());
-            }
-            if self.delta_tracking_active {
-                let count = self.routing_vnode_count();
-                let v = Self::vnode_for_group_key(self.num_group_cols, &key, count);
-                insert_vnode_tracking_key(&mut self.dirty_keys_by_vnode, v, key);
-            }
         }
         Ok(())
     }
@@ -1437,7 +1576,11 @@ impl IncrementalAggState {
         watermark_ms: i64,
     ) -> Result<(), DbError> {
         let empty_key = global_aggregate_key();
-        if !self.groups.contains_key(&empty_key) {
+        let inserted = !self
+            .vnode_states
+            .get(0)
+            .is_some_and(|state| state.groups.contains_key(&empty_key));
+        if inserted {
             let mut accs = Vec::with_capacity(self.agg_specs.len());
             for spec in &self.agg_specs {
                 let acc = if self.weight_col_idx.is_some() {
@@ -1447,18 +1590,20 @@ impl IncrementalAggState {
                 };
                 accs.push(acc);
             }
-            self.groups.insert(
+            self.vnode_states.get_or_insert(0).groups.insert(
                 empty_key.clone(),
                 GroupEntry {
                     accs,
                     last_updated_ms: watermark_ms,
                 },
             );
+            self.vnode_states.increment_resident_groups();
         }
-        let entry = self.groups.get_mut(&empty_key).unwrap();
-        entry.last_updated_ms = watermark_ms;
         #[allow(clippy::cast_possible_truncation)]
         let all_indices: Vec<u32> = (0..batch.num_rows() as u32).collect();
+        let vnode_state = self.vnode_states.get_mut(0).unwrap();
+        let entry = vnode_state.groups.get_mut(&empty_key).unwrap();
+        entry.last_updated_ms = watermark_ms;
         let res = Self::update_group_accumulators(
             &mut entry.accs,
             batch,
@@ -1467,11 +1612,10 @@ impl IncrementalAggState {
             self.weight_col_idx,
         );
         if self.delta_tracking_active {
-            let key = global_aggregate_key();
-            insert_vnode_tracking_key(&mut self.dirty_keys_by_vnode, 0, key);
+            vnode_state.checkpoint_dirty_keys.insert(empty_key.clone());
         }
         if self.emit_changelog {
-            self.mark_emit_dirty(empty_key);
+            vnode_state.emit_dirty_keys.insert(empty_key);
         }
         res
     }
@@ -1552,15 +1696,20 @@ impl IncrementalAggState {
     }
 
     fn emit_running_state(&mut self) -> Result<Vec<RecordBatch>, DbError> {
-        if self.groups.is_empty() {
+        if self.vnode_states.resident_group_count() == 0 {
             return Ok(Vec::new());
         }
 
-        let num_rows = self.groups.len();
+        let num_rows = self.vnode_states.resident_group_count();
 
         let group_arrays = if self.num_group_cols > 0 {
             self.row_converter
-                .convert_rows(self.groups.keys().map(arrow::row::OwnedRow::row))
+                .convert_rows(
+                    self.vnode_states
+                        .iter()
+                        .flat_map(|(_, state)| state.groups.keys())
+                        .map(arrow::row::OwnedRow::row),
+                )
                 .map_err(|e| DbError::Pipeline(format!("group key array build: {e}")))?
         } else {
             Vec::new()
@@ -1569,11 +1718,13 @@ impl IncrementalAggState {
         let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(self.agg_specs.len());
         for (agg_idx, spec) in self.agg_specs.iter().enumerate() {
             let mut scalars: Vec<ScalarValue> = Vec::with_capacity(num_rows);
-            for entry in self.groups.values_mut() {
-                let sv = entry.accs[agg_idx]
-                    .evaluate()
-                    .map_err(|e| DbError::Pipeline(format!("accumulator evaluate: {e}")))?;
-                scalars.push(sv);
+            for (_, state) in self.vnode_states.iter_mut() {
+                for entry in state.groups.values_mut() {
+                    let sv = entry.accs[agg_idx]
+                        .evaluate()
+                        .map_err(|e| DbError::Pipeline(format!("accumulator evaluate: {e}")))?;
+                    scalars.push(sv);
+                }
             }
             let array = ScalarValue::iter_to_array(scalars)
                 .map_err(|e| DbError::Pipeline(format!("agg result array build: {e}")))?;
@@ -1594,73 +1745,99 @@ impl IncrementalAggState {
         Ok(vec![batch])
     }
 
+    fn finish_emit_dirty_sets(
+        &mut self,
+        dirty_by_vnode: Vec<(u32, AHashSet<arrow::row::OwnedRow>)>,
+        emission_succeeded: bool,
+    ) {
+        for (vnode, mut dirty) in dirty_by_vnode {
+            // A successful emission clears the retained set while preserving its allocation.
+            if emission_succeeded {
+                dirty.clear();
+            }
+            self.vnode_states
+                .get_mut(vnode)
+                .expect("emitting aggregate vnode must remain resident")
+                .emit_dirty_keys = dirty;
+        }
+    }
+
     fn emit_changelog_delta(&mut self) -> Result<Vec<RecordBatch>, DbError> {
+        let mut dirty_by_vnode = Vec::new();
+        for (vnode, state) in self.vnode_states.iter_mut() {
+            if !state.emit_dirty_keys.is_empty() {
+                dirty_by_vnode.push((vnode, std::mem::take(&mut state.emit_dirty_keys)));
+            }
+        }
+
         let mut retract_keys: Vec<arrow::row::OwnedRow> = Vec::new();
         let mut retract_vals: Vec<Vec<ScalarValue>> = Vec::new();
         let mut insert_keys: Vec<arrow::row::OwnedRow> = Vec::new();
         let mut insert_vals: Vec<Vec<ScalarValue>> = Vec::new();
+        let mut insert_vnodes = Vec::new();
 
-        // Only touched groups can differ from `last_emitted`. Take the set so the loop can
-        // borrow `groups`/`last_emitted`. On any error before the output batch is built, the
-        // whole set is restored and `last_emitted` is left untouched — its mutations are
-        // deferred to the commit step below — so a mid-emit failure neither silently drops
-        // pending groups nor drifts downstream from a partially-applied emit (EX-3).
-        let mut dirty = std::mem::take(&mut self.dirty_keys);
         let mut eval_err: Option<DbError> = None;
-        for key in &dirty {
-            let Some(entry) = self.groups.get_mut(key) else {
-                continue;
-            };
-            let evaluated = entry
-                .accs
-                .iter_mut()
-                .map(|a| a.evaluate())
-                .collect::<Result<Vec<_>, _>>();
-            let current: Vec<ScalarValue> = match evaluated {
-                Ok(current) => current,
-                Err(e) => {
-                    eval_err = Some(DbError::Pipeline(format!("accumulator evaluate: {e}")));
-                    break;
-                }
-            };
+        'vnodes: for (vnode, dirty) in &dirty_by_vnode {
+            let state = self
+                .vnode_states
+                .get_mut(*vnode)
+                .expect("dirty aggregate vnode must remain resident during emission");
+            for key in dirty {
+                let Some(entry) = state.groups.get_mut(key) else {
+                    continue;
+                };
+                let evaluated = entry
+                    .accs
+                    .iter_mut()
+                    .map(|a| a.evaluate())
+                    .collect::<Result<Vec<_>, _>>();
+                let current: Vec<ScalarValue> = match evaluated {
+                    Ok(current) => current,
+                    Err(e) => {
+                        eval_err = Some(DbError::Pipeline(format!("accumulator evaluate: {e}")));
+                        break 'vnodes;
+                    }
+                };
 
-            if let Some(old) = self.last_emitted.get(key) {
-                // ScalarValue::eq treats NaN != NaN; short-circuit to avoid
-                // an infinite retract+insert loop on float aggregates.
-                let changed = old.iter().zip(current.iter()).any(|(a, b)| match (a, b) {
-                    (ScalarValue::Float64(Some(x)), ScalarValue::Float64(Some(y)))
-                        if x.is_nan() && y.is_nan() =>
-                    {
-                        false
+                if let Some(old) = state.last_emitted.get(key) {
+                    // ScalarValue::eq treats NaN != NaN; short-circuit to avoid an infinite
+                    // retract+insert loop on float aggregates.
+                    let changed = old.iter().zip(current.iter()).any(|(a, b)| match (a, b) {
+                        (ScalarValue::Float64(Some(x)), ScalarValue::Float64(Some(y)))
+                            if x.is_nan() && y.is_nan() =>
+                        {
+                            false
+                        }
+                        (ScalarValue::Float32(Some(x)), ScalarValue::Float32(Some(y)))
+                            if x.is_nan() && y.is_nan() =>
+                        {
+                            false
+                        }
+                        _ => a != b,
+                    });
+                    if changed {
+                        retract_keys.push(key.clone());
+                        retract_vals.push(old.clone());
+                        insert_keys.push(key.clone());
+                        insert_vals.push(current);
+                        insert_vnodes.push(*vnode);
                     }
-                    (ScalarValue::Float32(Some(x)), ScalarValue::Float32(Some(y)))
-                        if x.is_nan() && y.is_nan() =>
-                    {
-                        false
-                    }
-                    _ => a != b,
-                });
-                if changed {
-                    retract_keys.push(key.clone());
-                    retract_vals.push(old.clone());
+                } else {
                     insert_keys.push(key.clone());
                     insert_vals.push(current);
+                    insert_vnodes.push(*vnode);
                 }
-            } else {
-                insert_keys.push(key.clone());
-                insert_vals.push(current);
             }
         }
         if let Some(e) = eval_err {
-            self.dirty_keys = dirty;
+            self.finish_emit_dirty_sets(dirty_by_vnode, false);
             return Err(e);
         }
 
         let retract_count = retract_keys.len();
         let total = retract_count + insert_keys.len();
         if total == 0 {
-            dirty.clear();
-            self.dirty_keys = dirty;
+            self.finish_emit_dirty_sets(dirty_by_vnode, true);
             return Ok(Vec::new());
         }
 
@@ -1690,26 +1867,28 @@ impl IncrementalAggState {
         ) {
             Ok(batch) => batch,
             Err(e) => {
-                self.dirty_keys = dirty;
+                self.finish_emit_dirty_sets(dirty_by_vnode, false);
                 return Err(e);
             }
         };
 
-        // Commit: advance `last_emitted` only now that the output batch is built. The insert half
-        // of `all_keys`/`all_vals` (after the retracts) is exactly the changed/new groups' new
-        // values, so derive the update from it rather than keeping a parallel Vec.
-        for (key, current) in all_keys.into_iter().zip(all_vals).skip(retract_count) {
-            self.mark_last_emitted_dirty(&key);
-            self.insert_last_emitted(key, current);
+        // Commit only after the complete combined output batch exists. The insert half of
+        // `all_keys`/`all_vals` is aligned with `insert_vnodes`.
+        for ((key, current), vnode) in all_keys
+            .into_iter()
+            .zip(all_vals)
+            .skip(retract_count)
+            .zip(insert_vnodes)
+        {
+            self.commit_last_emitted(vnode, key, current);
         }
-        dirty.clear();
-        self.dirty_keys = dirty;
+        self.finish_emit_dirty_sets(dirty_by_vnode, true);
 
-        // Chain-apply paths only admit an entry whose group is resident, so the invariant holds.
         debug_assert!(
-            self.last_emitted
+            self.vnode_states.iter().all(|(_, state)| state
+                .last_emitted
                 .keys()
-                .all(|k| self.groups.contains_key(k)),
+                .all(|key| state.groups.contains_key(key))),
             "last_emitted must be a subset of groups"
         );
 
@@ -1754,9 +1933,10 @@ impl IncrementalAggState {
         let fingerprint = self.query_fingerprint();
         let retractable = self.weight_col_idx.is_some();
         let mut entries: Vec<(arrow::row::OwnedRow, &mut GroupEntry)> = self
-            .groups
+            .vnode_states
             .iter_mut()
-            .map(|(k, v)| (k.clone(), v))
+            .flat_map(|(_, state)| state.groups.iter_mut())
+            .map(|(key, entry)| (key.clone(), entry))
             .collect();
         let encoded = encode_groups_columnar(
             &self.row_converter,
@@ -1785,14 +1965,21 @@ impl IncrementalAggState {
         if !self.emit_changelog {
             return Ok(Vec::new());
         }
-        let mut out = Vec::with_capacity(self.last_emitted.len());
-        for (row_key, vals) in &self.last_emitted {
-            let sv_key =
-                row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
-            out.push(EmittedCheckpoint {
-                key: scalars_to_ipc(&sv_key)?,
-                values: scalars_to_ipc(vals)?,
-            });
+        let emitted_count = self
+            .vnode_states
+            .iter()
+            .map(|(_, state)| state.last_emitted.len())
+            .sum();
+        let mut out = Vec::with_capacity(emitted_count);
+        for (_, state) in self.vnode_states.iter() {
+            for (row_key, vals) in &state.last_emitted {
+                let sv_key =
+                    row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
+                out.push(EmittedCheckpoint {
+                    key: scalars_to_ipc(&sv_key)?,
+                    values: scalars_to_ipc(vals)?,
+                });
+            }
         }
         Ok(out)
     }
@@ -1823,15 +2010,21 @@ impl IncrementalAggState {
             &checkpoint.last_updated_ms,
         )?;
         let restored = decoded.len();
-        let mut new_groups: AHashMap<arrow::row::OwnedRow, GroupEntry> =
-            AHashMap::with_capacity(restored);
+        let vnode_count = self.routing_vnode_count();
+        let mut new_vnode_states = AggregateVnodeSlots::try_new(self.key_group_count)?;
         for g in decoded {
-            match new_groups.entry(g.row_key) {
+            let vnode = Self::vnode_for_group_key(self.num_group_cols, &g.row_key, vnode_count);
+            match new_vnode_states
+                .get_or_insert(vnode)
+                .groups
+                .entry(g.row_key)
+            {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(GroupEntry {
                         accs: g.accs,
                         last_updated_ms: g.last_updated_ms,
                     });
+                    new_vnode_states.increment_resident_groups();
                 }
                 std::collections::hash_map::Entry::Occupied(_) => {
                     return Err(DbError::Pipeline(
@@ -1841,25 +2034,26 @@ impl IncrementalAggState {
             }
         }
 
-        if new_last_emitted
-            .keys()
-            .any(|row_key| !new_groups.contains_key(row_key))
-        {
-            return Err(DbError::Pipeline(
-                "aggregate checkpoint contains changelog state for a missing group".into(),
-            ));
+        for (row_key, values) in new_last_emitted {
+            let vnode = Self::vnode_for_group_key(self.num_group_cols, &row_key, vnode_count);
+            let state = new_vnode_states.get(vnode).ok_or_else(|| {
+                DbError::Pipeline(
+                    "aggregate checkpoint contains changelog state for a missing group".into(),
+                )
+            })?;
+            if !state.groups.contains_key(&row_key) {
+                return Err(DbError::Pipeline(
+                    "aggregate checkpoint contains changelog state for a missing group".into(),
+                ));
+            }
+            new_vnode_states
+                .get_mut(vnode)
+                .expect("validated aggregate vnode must remain present")
+                .last_emitted
+                .insert(row_key, values);
         }
 
-        self.groups = new_groups;
-        self.last_emitted = new_last_emitted;
-        // Restored state is internally consistent (groups == last_emitted), so
-        // nothing is pending for the changelog path.
-        self.dirty_keys.clear();
-        // The restored state is the new baseline — no pending delta entries.
-        self.dirty_keys_by_vnode.clear();
-        self.last_emitted_dirty_by_vnode.clear();
-        #[cfg(feature = "cluster")]
-        self.delta_chain_len.clear();
+        self.vnode_states = new_vnode_states;
         Ok(restored)
     }
 
@@ -1905,27 +2099,21 @@ impl IncrementalAggState {
         &mut self,
         vnode_count: u32,
     ) -> Result<std::collections::HashMap<u32, AggStateCheckpoint>, DbError> {
-        let vnode_count = self.validate_vnode_count(vnode_count)?;
+        self.validate_vnode_count(vnode_count)?;
         let fingerprint = self.query_fingerprint();
-        let num_group_cols = self.num_group_cols;
         let retractable = self.weight_col_idx.is_some();
 
-        // Bucket the live groups by vnode first, then columnar-encode each subset.
-        let mut by_vnode: std::collections::HashMap<
-            u32,
-            Vec<(arrow::row::OwnedRow, &mut GroupEntry)>,
-        > = std::collections::HashMap::new();
-        for (row_key, entry) in &mut self.groups {
-            let vnode = Self::vnode_for_group_key(num_group_cols, row_key, vnode_count);
-            by_vnode
-                .entry(vnode)
-                .or_default()
-                .push((row_key.clone(), entry));
-        }
-
         let mut buckets: std::collections::HashMap<u32, AggStateCheckpoint> =
-            std::collections::HashMap::with_capacity(by_vnode.len());
-        for (vnode, mut entries) in by_vnode {
+            std::collections::HashMap::new();
+        for (vnode, state) in self.vnode_states.iter_mut() {
+            if state.groups.is_empty() {
+                continue;
+            }
+            let mut entries = state
+                .groups
+                .iter_mut()
+                .map(|(key, entry)| (key.clone(), entry))
+                .collect::<Vec<_>>();
             let encoded = encode_groups_columnar(
                 &self.row_converter,
                 self.num_group_cols,
@@ -1948,24 +2136,28 @@ impl IncrementalAggState {
         }
 
         if self.emit_changelog {
-            for (row_key, vals) in &self.last_emitted {
-                let vnode = Self::vnode_for_group_key(num_group_cols, row_key, vnode_count);
-                let sv_key =
-                    row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
-                buckets
-                    .entry(vnode)
-                    .or_insert_with(|| AggStateCheckpoint {
-                        fingerprint,
-                        keys_ipc: Vec::new(),
-                        acc_state_ipc: Vec::new(),
-                        last_updated_ms: Vec::new(),
-                        last_emitted: Vec::new(),
-                    })
-                    .last_emitted
-                    .push(EmittedCheckpoint {
-                        key: scalars_to_ipc(&sv_key)?,
-                        values: scalars_to_ipc(vals)?,
-                    });
+            for (vnode, state) in self.vnode_states.iter() {
+                for (row_key, vals) in &state.last_emitted {
+                    let sv_key = row_to_scalar_key_with_types(
+                        &self.row_converter,
+                        row_key,
+                        &self.group_types,
+                    )?;
+                    buckets
+                        .entry(vnode)
+                        .or_insert_with(|| AggStateCheckpoint {
+                            fingerprint,
+                            keys_ipc: Vec::new(),
+                            acc_state_ipc: Vec::new(),
+                            last_updated_ms: Vec::new(),
+                            last_emitted: Vec::new(),
+                        })
+                        .last_emitted
+                        .push(EmittedCheckpoint {
+                            key: scalars_to_ipc(&sv_key)?,
+                            values: scalars_to_ipc(vals)?,
+                        });
+                }
             }
         }
 
@@ -1973,8 +2165,10 @@ impl IncrementalAggState {
         // checkpoint's delta is measured against the state staged here.
         if self.delta_enabled {
             self.delta_tracking_active = true;
-            self.dirty_keys_by_vnode.clear();
-            self.last_emitted_dirty_by_vnode.clear();
+            for (_, state) in self.vnode_states.iter_mut() {
+                state.checkpoint_dirty_keys.clear();
+                state.last_emitted_dirty_keys.clear();
+            }
         }
 
         Ok(buckets)
@@ -1988,13 +2182,18 @@ impl IncrementalAggState {
         fingerprint: u64,
         retractable: bool,
     ) -> Result<VnodeCapture, DbError> {
-        let num_group_cols = self.num_group_cols;
+        debug_assert!(vnode < vnode_count.get());
         let mut entries: Vec<(arrow::row::OwnedRow, &mut GroupEntry)> = self
-            .groups
-            .iter_mut()
-            .filter(|(key, _)| Self::vnode_for_group_key(num_group_cols, key, vnode_count) == vnode)
-            .map(|(key, entry)| (key.clone(), entry))
-            .collect();
+            .vnode_states
+            .get_mut(vnode)
+            .map(|state| {
+                state
+                    .groups
+                    .iter_mut()
+                    .map(|(key, entry)| (key.clone(), entry))
+                    .collect()
+            })
+            .unwrap_or_default();
         let encoded = encode_groups_columnar(
             &self.row_converter,
             self.num_group_cols,
@@ -2030,41 +2229,41 @@ impl IncrementalAggState {
 
         let retractable = self.weight_col_idx.is_some();
         let fingerprint = self.query_fingerprint();
-        let num_group_cols = self.num_group_cols;
-
-        // Vnodes holding groups remain in the chain even when this epoch has no changes.
-        let mut touched: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for row_key in self.groups.keys() {
-            touched.insert(Self::vnode_for_group_key(
-                num_group_cols,
-                row_key,
-                vnode_count,
-            ));
-        }
-        // Re-visit vnodes a failed epoch must re-base — even emptied ones that fell out of the sets
-        // above; `force_full_rebase` dropped their chain len, so each re-bases FULL below.
-        for v in self.force_rebase_vnodes.drain() {
-            touched.insert(v);
-        }
+        // Resident vnodes remain in their chain even when this epoch has no changes. A forced
+        // metadata-only shard keeps an emptied vnode visible for its required FULL re-base.
+        let touched = self
+            .vnode_states
+            .iter()
+            .filter_map(|(vnode, state)| {
+                (!state.groups.is_empty() || state.force_full_rebase).then_some(vnode)
+            })
+            .collect::<Vec<_>>();
 
         let mut out: std::collections::HashMap<u32, VnodeCapture> =
             std::collections::HashMap::with_capacity(touched.len());
         for v in touched {
-            let force_full = match self.delta_chain_len.get(&v).copied() {
-                None => true, // no base yet (fresh / just-acquired)
-                Some(n) => n >= chain_bound,
-            };
+            let force_full = self.vnode_states.get(v).is_some_and(|state| {
+                state.force_full_rebase
+                    || state
+                        .delta_chain_len
+                        .is_none_or(|chain_len| chain_len >= chain_bound)
+            });
             if force_full {
                 let cap = self.checkpoint_full_vnode(v, vnode_count, fingerprint, retractable)?;
                 out.insert(v, cap);
-                self.delta_chain_len.insert(v, 0);
+                let state = self.vnode_states.get_or_insert(v);
+                state.delta_chain_len = Some(0);
+                state.force_full_rebase = false;
             } else {
                 let delta = self.encode_delta_for_vnode(v)?;
                 out.insert(v, VnodeCapture::Delta(delta));
-                *self.delta_chain_len.entry(v).or_insert(0) += 1;
+                let state = self.vnode_states.get_or_insert(v);
+                state.delta_chain_len =
+                    Some(state.delta_chain_len.unwrap_or_default().saturating_add(1));
             }
-            self.dirty_keys_by_vnode.remove(&v);
-            self.last_emitted_dirty_by_vnode.remove(&v);
+            let state = self.vnode_states.get_or_insert(v);
+            state.checkpoint_dirty_keys.clear();
+            state.last_emitted_dirty_keys.clear();
         }
 
         self.delta_tracking_active = true;
@@ -2085,11 +2284,12 @@ impl IncrementalAggState {
         if !self.emit_changelog {
             return Ok(Vec::new());
         }
+        debug_assert!(vnode < vnode_count.get());
+        let Some(state) = self.vnode_states.get(vnode) else {
+            return Ok(Vec::new());
+        };
         let mut out = Vec::new();
-        for (row_key, vals) in &self.last_emitted {
-            if Self::vnode_for_group_key(self.num_group_cols, row_key, vnode_count) != vnode {
-                continue;
-            }
+        for (row_key, vals) in &state.last_emitted {
             if only.is_some_and(|keys| !keys.contains(row_key)) {
                 continue;
             }
@@ -2110,16 +2310,27 @@ impl IncrementalAggState {
         let retractable = self.weight_col_idx.is_some();
 
         let changed = self
-            .dirty_keys_by_vnode
-            .get(&vnode)
-            .cloned()
+            .vnode_states
+            .get(vnode)
+            .map(|state| state.checkpoint_dirty_keys.clone())
+            .unwrap_or_default();
+        let emitted_changed = self
+            .vnode_states
+            .get(vnode)
+            .map(|state| state.last_emitted_dirty_keys.clone())
             .unwrap_or_default();
         let mut entries: Vec<(arrow::row::OwnedRow, &mut GroupEntry)> = self
-            .groups
-            .iter_mut()
-            .filter(|(k, _)| changed.contains(*k))
-            .map(|(k, v)| (k.clone(), v))
-            .collect();
+            .vnode_states
+            .get_mut(vnode)
+            .map(|state| {
+                state
+                    .groups
+                    .iter_mut()
+                    .filter(|(key, _)| changed.contains(*key))
+                    .map(|(key, entry)| (key.clone(), entry))
+                    .collect()
+            })
+            .unwrap_or_default();
         let encoded = encode_groups_columnar(
             &self.row_converter,
             self.num_group_cols,
@@ -2127,7 +2338,7 @@ impl IncrementalAggState {
             retractable,
             &mut entries,
         );
-        drop(entries); // release the &mut self.groups borrow before reading last_emitted
+        drop(entries); // release the mutable vnode-state borrow before reading last_emitted
         let (keys_ipc, acc_state_ipc, last_updated_ms) = encoded?;
 
         // Changed emission entries ride in `changed.last_emitted`.
@@ -2137,11 +2348,8 @@ impl IncrementalAggState {
             ));
         }
         let vnode_count = self.routing_vnode_count();
-        let last_emitted = self.last_emitted_for_vnode(
-            vnode,
-            vnode_count,
-            self.last_emitted_dirty_by_vnode.get(&vnode),
-        )?;
+        let last_emitted =
+            self.last_emitted_for_vnode(vnode, vnode_count, Some(&emitted_changed))?;
 
         Ok(AggVnodeDelta {
             changed: AggStateCheckpoint {
@@ -2194,7 +2402,12 @@ impl IncrementalAggState {
         &mut self,
         key: &arrow::row::OwnedRow,
     ) -> Result<Option<GroupEntry>, DbError> {
-        let Some(entry) = self.groups.get_mut(key) else {
+        let vnode = Self::vnode_for_group_key(self.num_group_cols, key, self.routing_vnode_count());
+        let Some(entry) = self
+            .vnode_states
+            .get_mut(vnode)
+            .and_then(|state| state.groups.get_mut(key))
+        else {
             return Ok(None);
         };
         if entry.accs.len() != self.agg_specs.len() {
@@ -2236,8 +2449,18 @@ impl IncrementalAggState {
             if let Some(entry) = self.clone_group_for_recovery(key)? {
                 groups.insert(key.clone(), entry);
             }
-            if let Some(values) = self.last_emitted.get(key) {
-                if !self.groups.contains_key(key) {
+            let vnode =
+                Self::vnode_for_group_key(self.num_group_cols, key, self.routing_vnode_count());
+            if let Some(values) = self
+                .vnode_states
+                .get(vnode)
+                .and_then(|state| state.last_emitted.get(key))
+            {
+                if !self
+                    .vnode_states
+                    .get(vnode)
+                    .is_some_and(|state| state.groups.contains_key(key))
+                {
                     return Err(DbError::Pipeline(
                         "live aggregate contains changelog state for a missing group".into(),
                     ));
@@ -2324,48 +2547,60 @@ impl IncrementalAggState {
         replaced_vnode: Option<(u32, NonZeroU32)>,
     ) {
         if let Some((vnode, vnode_count)) = replaced_vnode {
-            let num_group_cols = self.num_group_cols;
-            self.dirty_keys
-                .retain(|key| Self::vnode_for_group_key(num_group_cols, key, vnode_count) != vnode);
-            self.dirty_keys_by_vnode.remove(&vnode);
-            self.last_emitted_dirty_by_vnode.remove(&vnode);
-            self.delta_chain_len.remove(&vnode);
+            debug_assert_eq!(vnode_count, self.routing_vnode_count());
+            if let Some(state) = self.vnode_states.get_mut(vnode) {
+                state.emit_dirty_keys.clear();
+                state.checkpoint_dirty_keys.clear();
+                state.last_emitted_dirty_keys.clear();
+                state.delta_chain_len = None;
+                state.force_full_rebase = false;
+            }
         }
+        let vnode_count = self.routing_vnode_count();
+        let mut resident_group_count = self.vnode_states.resident_group_count();
         for key in staged.affected {
-            self.groups.remove(&key);
-            if let Some(entry) = staged.groups.remove(&key) {
-                self.groups.insert(key.clone(), entry);
+            let vnode = Self::vnode_for_group_key(self.num_group_cols, &key, vnode_count);
+            let state = self.vnode_states.get_or_insert(vnode);
+            if state.groups.remove(&key).is_some() {
+                resident_group_count = resident_group_count
+                    .checked_sub(1)
+                    .expect("aggregate resident count must cover every removed group");
             }
-            self.remove_last_emitted(&key);
+            if let Some(entry) = staged.groups.remove(&key) {
+                if state.groups.insert(key.clone(), entry).is_none() {
+                    resident_group_count = resident_group_count
+                        .checked_add(1)
+                        .expect("aggregate resident group count overflow");
+                }
+            }
+            state.last_emitted.remove(&key);
             if let Some(values) = staged.last_emitted.remove(&key) {
-                self.insert_last_emitted(key, values);
+                state.last_emitted.insert(key, values);
             }
         }
+        self.vnode_states
+            .set_resident_group_count(resident_group_count);
 
         // Preserve the former merge bookkeeping, but publish it only with the state transaction.
         for row_key in merged_keys {
+            let vnode = Self::vnode_for_group_key(self.num_group_cols, row_key, vnode_count);
+            let state = self.vnode_states.get_or_insert(vnode);
             if self.emit_changelog {
-                self.mark_emit_dirty(row_key.clone());
+                state.emit_dirty_keys.insert(row_key.clone());
             }
             if self.delta_tracking_active {
-                let count = self.routing_vnode_count();
-                let vnode = Self::vnode_for_group_key(self.num_group_cols, row_key, count);
-                insert_vnode_tracking_key(&mut self.dirty_keys_by_vnode, vnode, row_key.clone());
+                state.checkpoint_dirty_keys.insert(row_key.clone());
             }
         }
     }
 
-    /// Decode and build one aggregate state transition without changing logical map contents or
-    /// dirty/delta bookkeeping. Every restored vnode is authoritative: keys absent from its final
-    /// base-plus-delta image are removed alongside every explicitly revoked vnode.
-    ///
-    /// Capacity for both publication and retirement is reserved here, including capacity on live
-    /// maps. A failed or aborted prepare can therefore retain capacity/RSS while leaving logical
-    /// state unchanged. Once this returns, the graph must keep the operator quiescent until it
-    /// either drops the prepared value or publishes it.
+    /// Decode and build complete replacement vnode slots without changing the live working set.
+    /// Every restored vnode is authoritative; a canonical empty restore and an explicitly revoked
+    /// vnode without a restore both clear the physical slot. Once this returns, the graph must keep
+    /// the operator quiescent until it aborts or publishes the prepared value.
     #[cfg(feature = "cluster")]
     pub(crate) fn prepare_vnode_transition(
-        &mut self,
+        &self,
         vnode_count: u32,
         restores: &[AggVnodeRestore<'_>],
         revoked: &rustc_hash::FxHashSet<u32>,
@@ -2393,8 +2628,8 @@ impl IncrementalAggState {
             transitioned.insert(*vnode);
         }
 
-        // Decode and validate the complete roster before building any replacement accumulator.
-        // A corrupt late chain therefore cannot leave an earlier chain partly published.
+        // Decode and validate the complete roster before constructing any replacement
+        // accumulator. A corrupt late chain cannot leave an earlier chain partly published.
         let mut decoded = Vec::new();
         decoded
             .try_reserve_exact(restores.len())
@@ -2446,35 +2681,12 @@ impl IncrementalAggState {
             decoded.push((restore.vnode, base, deltas));
         }
 
-        let replacement_group_capacity = decoded.iter().try_fold(
-            0_usize,
-            |total, (_, base, deltas)| -> Result<usize, DbError> {
-                let chain = deltas.iter().try_fold(base.groups.len(), |chain, delta| {
-                    checked_vnode_transition_capacity(chain, delta.groups.len())
-                })?;
-                checked_vnode_transition_capacity(total, chain)
-            },
-        )?;
-        let replacement_emitted_capacity = decoded.iter().try_fold(
-            0_usize,
-            |total, (_, base, deltas)| -> Result<usize, DbError> {
-                let chain = deltas
-                    .iter()
-                    .try_fold(base.last_emitted.len(), |chain, delta| {
-                        checked_vnode_transition_capacity(chain, delta.last_emitted.len())
-                    })?;
-                checked_vnode_transition_capacity(total, chain)
-            },
-        )?;
-        let mut replacement_groups = AHashMap::new();
-        replacement_groups
-            .try_reserve(replacement_group_capacity)
-            .map_err(|error| reserve_error("replacement groups", error))?;
-        let mut replacement_last_emitted = AHashMap::new();
-        replacement_last_emitted
-            .try_reserve(replacement_emitted_capacity)
-            .map_err(|error| reserve_error("replacement changelog state", error))?;
-        for (_vnode, base, deltas) in decoded {
+        let mut replacement_by_vnode = AHashMap::new();
+        replacement_by_vnode
+            .try_reserve(decoded.len())
+            .map_err(|error| reserve_error("replacement vnode roster", error))?;
+        let mut replacement_group_count = 0_usize;
+        for (vnode, base, deltas) in decoded {
             let group_capacity = deltas.iter().try_fold(base.groups.len(), |total, delta| {
                 checked_vnode_transition_capacity(total, delta.groups.len())
             })?;
@@ -2501,257 +2713,139 @@ impl IncrementalAggState {
             for delta in deltas {
                 self.apply_recovery_delta_to_image(&mut staged, delta)?;
             }
-            for (key, group) in staged.groups {
-                if replacement_groups.insert(key, group).is_some() {
-                    return Err(DbError::Pipeline(
-                        "aggregate vnode transition contains the same group in multiple restored vnodes"
-                            .into(),
-                    ));
-                }
+            if staged
+                .last_emitted
+                .keys()
+                .any(|key| !staged.groups.contains_key(key))
+            {
+                return Err(DbError::Pipeline(
+                    "aggregate vnode transition contains changelog state for a missing group"
+                        .into(),
+                ));
             }
-            for (key, values) in staged.last_emitted {
-                if replacement_last_emitted.insert(key, values).is_some() {
-                    return Err(DbError::Pipeline(
-                        "aggregate vnode transition contains the same changelog key in multiple restored vnodes"
-                            .into(),
-                    ));
-                }
+
+            replacement_group_count =
+                checked_vnode_transition_capacity(replacement_group_count, staged.groups.len())?;
+            let mut replacement = AggregateVnodeState {
+                groups: staged.groups,
+                last_emitted: staged.last_emitted,
+                ..AggregateVnodeState::default()
+            };
+            if self.emit_changelog {
+                replacement
+                    .emit_dirty_keys
+                    .try_reserve(replacement.groups.len())
+                    .map_err(|error| reserve_error("changelog dirty keys", error))?;
+                replacement
+                    .emit_dirty_keys
+                    .extend(replacement.groups.keys().cloned());
+            }
+            if self.delta_tracking_active {
+                replacement
+                    .checkpoint_dirty_keys
+                    .try_reserve(replacement.groups.len())
+                    .map_err(|error| reserve_error("checkpoint dirty keys", error))?;
+                replacement
+                    .checkpoint_dirty_keys
+                    .extend(replacement.groups.keys().cloned());
+            }
+            // Ownership lives in the graph, not in this sparse working set. An authoritative EMPTY
+            // image therefore clears any old slot without adding an inert active-roster entry.
+            if !replacement.groups.is_empty()
+                && replacement_by_vnode
+                    .insert(vnode, Box::new(replacement))
+                    .is_some()
+            {
+                return Err(DbError::Pipeline(format!(
+                    "aggregate vnode transition repeats restored vnode {vnode}"
+                )));
             }
         }
 
-        let num_group_cols = self.num_group_cols;
-        let in_transition = |key: &arrow::row::OwnedRow| {
-            transitioned.contains(&Self::vnode_for_group_key(num_group_cols, key, vnode_count))
-        };
-        let remove_group_keys = self
-            .groups
-            .keys()
-            .filter(|key| in_transition(key))
-            .cloned()
-            .collect::<Vec<_>>();
-        let remove_last_emitted_keys = self
-            .last_emitted
-            .keys()
-            .filter(|key| in_transition(key))
-            .cloned()
-            .collect::<Vec<_>>();
-        let remove_dirty_keys = self
-            .dirty_keys
-            .iter()
-            .filter(|key| in_transition(key))
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let retained_group_count =
-            checked_vnode_transition_final_count(self.groups.len(), remove_group_keys.len(), 0)?;
+        let transitioned_group_count = transitioned.iter().try_fold(0_usize, |total, vnode| {
+            checked_vnode_transition_capacity(
+                total,
+                self.vnode_states
+                    .get(*vnode)
+                    .map_or(0, |state| state.groups.len()),
+            )
+        })?;
+        let retained_group_count = checked_vnode_transition_final_count(
+            self.vnode_states.resident_group_count(),
+            transitioned_group_count,
+            0,
+        )?;
         let final_group_count =
-            checked_vnode_transition_capacity(retained_group_count, replacement_groups.len())?;
+            checked_vnode_transition_capacity(retained_group_count, replacement_group_count)?;
         if final_group_count > self.max_groups {
             return Err(DbError::Pipeline(format!(
                 "aggregate group limit exceeded during vnode transition: retained={retained_group_count}, replacement={}, limit={}",
-                replacement_groups.len(),
+                replacement_group_count,
                 self.max_groups
             )));
         }
 
-        let mut replacement_dirty_keys = Vec::new();
-        let mut replacement_dirty_by_vnode = AHashMap::new();
-        if self.emit_changelog {
-            replacement_dirty_keys
-                .try_reserve_exact(replacement_groups.len())
-                .map_err(|error| reserve_error("changelog dirty keys", error))?;
-            replacement_dirty_keys.extend(replacement_groups.keys().cloned());
-        }
-        if self.delta_tracking_active {
-            let routing_vnode_count = self.routing_vnode_count();
-            replacement_dirty_by_vnode
-                .try_reserve(restores.len())
-                .map_err(|error| reserve_error("delta dirty vnode roster", error))?;
-            for key in replacement_groups.keys() {
-                let vnode = Self::vnode_for_group_key(num_group_cols, key, routing_vnode_count);
-                replacement_dirty_by_vnode
-                    .entry(vnode)
-                    .or_insert_with(AHashSet::new)
-                    .insert(key.clone());
-            }
-        }
-
         let mut transitioned_vnodes = transitioned.into_iter().collect::<Vec<_>>();
         transitioned_vnodes.sort_unstable();
-        let retired_group_capacity =
-            checked_vnode_transition_capacity(remove_group_keys.len(), replacement_groups.len())?;
-        let mut retired_groups = Vec::new();
-        retired_groups
-            .try_reserve_exact(retired_group_capacity)
-            .map_err(|error| reserve_error("retired groups", error))?;
-        let retired_emitted_capacity = checked_vnode_transition_capacity(
-            remove_last_emitted_keys.len(),
-            replacement_last_emitted.len(),
-        )?;
-        let mut retired_last_emitted = Vec::new();
-        retired_last_emitted
-            .try_reserve_exact(retired_emitted_capacity)
-            .map_err(|error| reserve_error("retired changelog state", error))?;
-        let retired_dirty_capacity = checked_vnode_transition_capacity(
-            remove_dirty_keys.len(),
-            replacement_dirty_keys.len(),
-        )?;
-        let mut retired_dirty_keys = Vec::new();
-        retired_dirty_keys
-            .try_reserve_exact(retired_dirty_capacity)
-            .map_err(|error| reserve_error("retired changelog dirty keys", error))?;
-        let tracking_retirement_capacity = checked_vnode_transition_capacity(
-            transitioned_vnodes.len(),
-            replacement_dirty_by_vnode.len(),
-        )?;
-        let mut retired_dirty_by_vnode = Vec::new();
-        retired_dirty_by_vnode
-            .try_reserve_exact(tracking_retirement_capacity)
-            .map_err(|error| reserve_error("retired delta dirty state", error))?;
-        let mut retired_last_emitted_dirty_by_vnode = Vec::new();
-        retired_last_emitted_dirty_by_vnode
+        let mut replacements = Vec::new();
+        replacements
             .try_reserve_exact(transitioned_vnodes.len())
-            .map_err(|error| reserve_error("retired changelog delta state", error))?;
-        let mut retired_delta_chain_len = Vec::new();
-        retired_delta_chain_len
-            .try_reserve_exact(transitioned_vnodes.len())
-            .map_err(|error| reserve_error("retired delta chain state", error))?;
-        let mut retired_force_rebase_vnodes = Vec::new();
-        retired_force_rebase_vnodes
-            .try_reserve_exact(transitioned_vnodes.len())
-            .map_err(|error| reserve_error("retired forced re-base state", error))?;
-
-        // Grow live collections only after every validation and private fallible allocation has
-        // succeeded. Publication removes the complete transitioned key set before inserting its
-        // replacement, so reserve only the net final growth. An authority failure after this
-        // point can still retain capacity/RSS, but never capacity proportional to a same-sized
-        // replacement.
-        let final_last_emitted_count = checked_vnode_transition_final_count(
-            self.last_emitted.len(),
-            remove_last_emitted_keys.len(),
-            replacement_last_emitted.len(),
-        )?;
-        let final_dirty_key_count = checked_vnode_transition_final_count(
-            self.dirty_keys.len(),
-            remove_dirty_keys.len(),
-            replacement_dirty_keys.len(),
-        )?;
-        let removed_dirty_vnode_count = transitioned_vnodes
-            .iter()
-            .filter(|vnode| self.dirty_keys_by_vnode.contains_key(vnode))
-            .count();
-        let final_dirty_vnode_count = checked_vnode_transition_final_count(
-            self.dirty_keys_by_vnode.len(),
-            removed_dirty_vnode_count,
-            replacement_dirty_by_vnode.len(),
-        )?;
-
-        let additional_groups = final_group_count.saturating_sub(self.groups.len());
-        let additional_last_emitted =
-            final_last_emitted_count.saturating_sub(self.last_emitted.len());
-        let additional_dirty_keys = final_dirty_key_count.saturating_sub(self.dirty_keys.len());
-        let additional_dirty_vnodes =
-            final_dirty_vnode_count.saturating_sub(self.dirty_keys_by_vnode.len());
-        self.groups
-            .try_reserve(additional_groups)
-            .map_err(|error| reserve_error("live groups", error))?;
-        self.last_emitted
-            .try_reserve(additional_last_emitted)
-            .map_err(|error| reserve_error("live changelog state", error))?;
-        self.dirty_keys
-            .try_reserve(additional_dirty_keys)
-            .map_err(|error| reserve_error("live changelog dirty keys", error))?;
-        self.dirty_keys_by_vnode
-            .try_reserve(additional_dirty_vnodes)
-            .map_err(|error| reserve_error("live delta dirty vnode roster", error))?;
-
+            .map_err(|error| reserve_error("replacement slot roster", error))?;
+        for &vnode in &transitioned_vnodes {
+            replacements.push((vnode, replacement_by_vnode.remove(&vnode)));
+        }
+        debug_assert!(replacement_by_vnode.is_empty());
+        let mut final_active_vnodes = Vec::new();
+        let slot_count = usize::from(self.key_group_count.get());
+        // Reserve the immutable topology bound during preparation so publication can swap the
+        // complete roster without allocating under the graph's transition fence.
+        final_active_vnodes
+            .try_reserve_exact(slot_count)
+            .map_err(|error| reserve_error("final active vnode roster", error))?;
+        final_active_vnodes.extend(
+            self.vnode_states
+                .active_vnodes()
+                .iter()
+                .copied()
+                .filter(|vnode| transitioned_vnodes.binary_search(vnode).is_err()),
+        );
+        final_active_vnodes.extend(
+            replacements
+                .iter()
+                .filter_map(|(vnode, replacement)| replacement.is_some().then_some(*vnode)),
+        );
+        final_active_vnodes.sort_unstable();
+        debug_assert!(final_active_vnodes.windows(2).all(|pair| pair[0] < pair[1]));
         Ok(PreparedAggVnodeTransition {
-            transitioned_vnodes,
-            remove_group_keys,
-            remove_last_emitted_keys,
-            remove_dirty_keys,
-            replacement_groups,
-            replacement_last_emitted,
-            replacement_dirty_keys,
-            replacement_dirty_by_vnode,
-            retired_groups,
-            retired_last_emitted,
-            retired_dirty_keys,
-            retired_dirty_by_vnode,
-            retired_last_emitted_dirty_by_vnode,
-            retired_delta_chain_len,
-            retired_force_rebase_vnodes,
+            replacements,
+            final_active_vnodes,
+            final_group_count,
         })
     }
 
-    /// Publish an already prepared aggregate transition. All validation, accumulator construction,
-    /// and capacity growth happened in [`Self::prepare_vnode_transition`], so this section is
-    /// allocation-free and has no recoverable error branch.
+    /// Publish an already prepared aggregate transition with one allocation-free pointer swap per
+    /// transitioned vnode. Unchanged vnode boxes retain pointer identity.
     #[cfg(feature = "cluster")]
     pub(crate) fn publish_prepared_vnode_transition(
         &mut self,
         mut prepared: PreparedAggVnodeTransition,
     ) -> RetiredAggVnodeTransition {
-        for key in &prepared.remove_group_keys {
-            if let Some(retired) = self.groups.remove_entry(key) {
-                prepared.retired_groups.push(retired);
-            }
+        for (vnode, replacement) in &mut prepared.replacements {
+            let retired = self
+                .vnode_states
+                .replace_for_publication(*vnode, replacement.take());
+            // Reuse the prepared replacement cell to retain the displaced box. The retired
+            // transition then owns every old slot until post-fence cleanup without allocating or
+            // deallocating during publication.
+            *replacement = retired;
         }
-        for key in &prepared.remove_last_emitted_keys {
-            if let Some(retired) = self.last_emitted.remove_entry(key) {
-                prepared.retired_last_emitted.push(retired);
-            }
-        }
-        for key in &prepared.remove_dirty_keys {
-            if let Some(retired) = self.dirty_keys.take(key) {
-                prepared.retired_dirty_keys.push(retired);
-            }
-        }
-        for vnode in &prepared.transitioned_vnodes {
-            if let Some(retired) = self.dirty_keys_by_vnode.remove_entry(vnode) {
-                prepared.retired_dirty_by_vnode.push(retired);
-            }
-            if let Some(retired) = self.last_emitted_dirty_by_vnode.remove_entry(vnode) {
-                prepared.retired_last_emitted_dirty_by_vnode.push(retired);
-            }
-            if let Some(retired) = self.delta_chain_len.remove_entry(vnode) {
-                prepared.retired_delta_chain_len.push(retired);
-            }
-            if self.force_rebase_vnodes.remove(vnode) {
-                prepared.retired_force_rebase_vnodes.push(*vnode);
-            }
-        }
-
-        // The second exact-key removal makes publication robust to an equal staged key while still
-        // retaining the displaced allocation for post-fence cleanup. Under the quiescent graph
-        // contract these branches are empty because the vnode-wide removals above already won.
-        for (key, group) in prepared.replacement_groups.drain() {
-            if let Some(retired) = self.groups.remove_entry(&key) {
-                prepared.retired_groups.push(retired);
-            }
-            self.groups.insert(key, group);
-        }
-        for (key, values) in prepared.replacement_last_emitted.drain() {
-            if let Some(retired) = self.last_emitted.remove_entry(&key) {
-                prepared.retired_last_emitted.push(retired);
-            }
-            self.last_emitted.insert(key, values);
-        }
-        for key in prepared.replacement_dirty_keys.drain(..) {
-            if let Some(retired) = self.dirty_keys.take(&key) {
-                prepared.retired_dirty_keys.push(retired);
-            }
-            self.dirty_keys.insert(key);
-        }
-        for (vnode, keys) in prepared.replacement_dirty_by_vnode.drain() {
-            if let Some(retired) = self.dirty_keys_by_vnode.remove_entry(&vnode) {
-                prepared.retired_dirty_by_vnode.push(retired);
-            }
-            self.dirty_keys_by_vnode.insert(vnode, keys);
-        }
+        self.vnode_states
+            .swap_active_vnodes(&mut prepared.final_active_vnodes);
+        self.vnode_states
+            .set_resident_group_count(prepared.final_group_count);
 
         RetiredAggVnodeTransition {
-            _retired_transition: prepared,
+            _retired_state: prepared,
         }
     }
 
@@ -2828,22 +2922,11 @@ impl IncrementalAggState {
             affected.extend(delta.last_emitted.keys().cloned());
         }
         if let Some((vnode, vnode_count)) = replacement_scope {
-            let num_group_cols = self.num_group_cols;
-            let belongs_to_replaced_vnode = |key: &arrow::row::OwnedRow| {
-                Self::vnode_for_group_key(num_group_cols, key, vnode_count) == vnode
-            };
-            affected.extend(
-                self.groups
-                    .keys()
-                    .filter(|key| belongs_to_replaced_vnode(key))
-                    .cloned(),
-            );
-            affected.extend(
-                self.last_emitted
-                    .keys()
-                    .filter(|key| belongs_to_replaced_vnode(key))
-                    .cloned(),
-            );
+            debug_assert_eq!(vnode_count, self.routing_vnode_count());
+            if let Some(state) = self.vnode_states.get(vnode) {
+                affected.extend(state.groups.keys().cloned());
+                affected.extend(state.last_emitted.keys().cloned());
+            }
         }
 
         let mut staged = if decoded_base.is_some() {
@@ -2918,9 +3001,10 @@ impl IncrementalAggState {
 
     /// Re-base delta tracking for vnodes this node just ACQUIRED (owned-set grew): a just-acquired
     /// vnode has no parent epoch to chain a delta onto, so its next capture must re-upload FULL.
-    /// This is the only place the chain is reset on ownership change. The reset reaches a
-    /// re-acquired vnode even when it has no durable state to rehydrate, which would otherwise emit
-    /// a parentless delta (LDB-6025).
+    /// This is the only place a resident chain is reset on ownership change. An acquired vnode
+    /// without a resident slot is absent from delta capture; `SqlQueryOperator::checkpoint_by_vnode`
+    /// supplies its required canonical EMPTY full image instead, so it cannot emit a parentless
+    /// delta (LDB-6025).
     ///
     /// Complements (does not duplicate) `drop_vnodes`: that handles the REVOCATION transition
     /// (clearing all state for a lost vnode); this handles the ACQUISITION transition, whose
@@ -2932,18 +3016,22 @@ impl IncrementalAggState {
             return;
         }
         for v in acquired {
-            self.delta_chain_len.remove(v);
+            if let Some(state) = self.vnode_states.get_mut(*v) {
+                state.delta_chain_len = None;
+            }
         }
     }
 
     /// Force every chained vnode's next delta capture to re-base FULL after a failed epoch, whose
-    /// destructive capture cleared the dirty sets before durability. Re-arms emptied vnodes via
-    /// `force_rebase_vnodes`; no-op when delta is off.
+    /// destructive capture cleared the dirty sets before durability. Re-arms emptied vnode slots
+    /// through their `force_full_rebase` flag; no-op when delta is off.
     #[cfg(feature = "cluster")]
     pub(crate) fn force_full_rebase(&mut self) {
-        self.force_rebase_vnodes
-            .extend(self.delta_chain_len.keys().copied());
-        self.delta_chain_len.clear();
+        for (_, state) in self.vnode_states.iter_mut() {
+            if state.delta_chain_len.take().is_some() {
+                state.force_full_rebase = true;
+            }
+        }
     }
 
     /// Drop in-memory state for revoked (lost) vnodes. Ownership movement is a physical state
@@ -2959,20 +3047,22 @@ impl IncrementalAggState {
             return Ok(());
         }
         let vnode_count = self.validate_vnode_count(vnode_count)?;
-        let num_group_cols = self.num_group_cols;
-        let vnode_of = |k: &arrow::row::OwnedRow| -> u32 {
-            Self::vnode_for_group_key(num_group_cols, k, vnode_count)
-        };
-        let in_revoked = |k: &arrow::row::OwnedRow| -> bool { revoked.contains(&vnode_of(k)) };
-
-        self.groups.retain(|k, _| !in_revoked(k));
-        self.last_emitted.retain(|k, _| !in_revoked(k));
-        self.dirty_keys.retain(|k| !in_revoked(k));
-        for v in revoked {
-            self.dirty_keys_by_vnode.remove(v);
-            self.last_emitted_dirty_by_vnode.remove(v);
-            self.delta_chain_len.remove(v);
+        if let Some(vnode) = revoked.iter().find(|vnode| **vnode >= vnode_count.get()) {
+            return Err(DbError::Pipeline(format!(
+                "revoked vnode {vnode} is outside vnode_count {}",
+                vnode_count.get()
+            )));
         }
+        let mut resident_group_count = self.vnode_states.resident_group_count();
+        for v in revoked {
+            if let Some(retired) = self.vnode_states.remove(*v) {
+                resident_group_count = resident_group_count
+                    .checked_sub(retired.groups.len())
+                    .expect("aggregate resident count must cover every revoked group");
+            }
+        }
+        self.vnode_states
+            .set_resident_group_count(resident_group_count);
         Ok(())
     }
 }
