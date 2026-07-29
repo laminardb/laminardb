@@ -991,9 +991,11 @@ impl OperatorGraph {
                 )));
             }
         }
-        Ok(PreparedManagedOperators {
+        let prepared = PreparedManagedOperators {
             node_indices: attempted,
-        })
+        };
+        self.observe_managed_state_accounting(&prepared.node_indices);
+        Ok(prepared)
     }
 
     fn abort_managed_operators(&mut self, prepared: &PreparedManagedOperators) {
@@ -1003,6 +1005,7 @@ impl OperatorGraph {
     }
 
     fn abort_and_finish_managed_operators(&mut self, prepared: &PreparedManagedOperators) {
+        self.observe_managed_state_accounting(&prepared.node_indices);
         self.abort_managed_operators(prepared);
         self.finish_managed_operators(prepared);
     }
@@ -1184,6 +1187,7 @@ impl OperatorGraph {
         *pending_slot = None;
         drop(installed_state_guard);
         drop(pending_slot);
+        self.observe_managed_state_accounting(&prepared.node_indices);
         self.finish_managed_operators(prepared);
         drop(retired_installed_binding);
         publication.complete();
@@ -1257,6 +1261,7 @@ impl OperatorGraph {
         *pending_slot = None;
         drop(installed_state);
         drop(pending_slot);
+        self.observe_managed_state_accounting(&prepared.node_indices);
         self.finish_managed_operators(prepared);
         drop(retired_installed_binding);
         publication.complete();

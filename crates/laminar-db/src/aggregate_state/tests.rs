@@ -401,6 +401,79 @@ fn checkpoint_bytes(state: &mut IncrementalAggState) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn retained_state_accounting_tracks_groups_without_drifting_on_fixed_size_updates() {
+    let sql = "SELECT name, SUM(value) AS total FROM events GROUP BY name";
+    let (_, mut state) = setup_agg_state(sql).await;
+    let empty_bytes = state.accounted_state_bytes();
+    assert!(state.cached_usage_matches_structural_recompute());
+
+    state
+        .process_batch(&sum_pre_agg_batch(&["a"], &[1.0]), 10)
+        .unwrap();
+    let one_group_bytes = state.accounted_state_bytes();
+    assert!(one_group_bytes > empty_bytes);
+    assert!(state.cached_usage_matches_structural_recompute());
+
+    state
+        .process_batch(&sum_pre_agg_batch(&["a"], &[2.0]), 20)
+        .unwrap();
+    assert_eq!(
+        state.accounted_state_bytes(),
+        one_group_bytes,
+        "a fixed-size accumulator update must replace, not accumulate, its charge"
+    );
+    assert!(state.cached_usage_matches_structural_recompute());
+
+    state.emit().unwrap();
+    let checkpoint = state.checkpoint_groups().unwrap();
+    assert!(state.cached_usage_matches_structural_recompute());
+    let reconciled_bytes = state.accounted_state_bytes();
+    assert!(reconciled_bytes >= one_group_bytes);
+
+    let (_, mut restored) = setup_agg_state(sql).await;
+    restored.restore_groups(&checkpoint).unwrap();
+    assert!(restored.cached_usage_matches_structural_recompute());
+    assert_eq!(restored.accounted_state_bytes(), reconciled_bytes);
+}
+
+#[tokio::test]
+async fn retained_state_accounting_includes_topology_and_changelog_lifecycle() {
+    let sql = "SELECT name, SUM(value) AS total FROM events GROUP BY name";
+    let (_, local) = setup_agg_state(sql).await;
+    let (_, sharded) =
+        setup_agg_state_for_key_groups(sql, false, KeyGroupCount::try_from(16_u32).unwrap()).await;
+    assert!(
+        sharded.accounted_state_bytes() > local.accounted_state_bytes(),
+        "a larger immutable vnode address space must carry a larger topology charge"
+    );
+
+    let (_, mut changelog) = setup_agg_state_with_changelog(sql, true).await;
+    let empty_bytes = changelog.accounted_state_bytes();
+    changelog
+        .process_batch(
+            &sum_pre_agg_batch(&["retained-key-a", "retained-key-b"], &[1.0, 2.0]),
+            10,
+        )
+        .unwrap();
+    assert!(changelog.accounted_state_bytes() > empty_bytes);
+    assert!(changelog.cached_usage_matches_structural_recompute());
+
+    changelog.emit().unwrap();
+    assert!(changelog.accounted_state_bytes() > empty_bytes);
+    assert!(changelog.cached_usage_matches_structural_recompute());
+
+    let checkpoint = changelog.checkpoint_groups().unwrap();
+    assert!(changelog.cached_usage_matches_structural_recompute());
+    let (_, mut restored) = setup_agg_state_with_changelog(sql, true).await;
+    restored.restore_groups(&checkpoint).unwrap();
+    assert!(restored.cached_usage_matches_structural_recompute());
+    assert_eq!(
+        restored.accounted_state_bytes(),
+        changelog.accounted_state_bytes()
+    );
+}
+
+#[tokio::test]
 async fn local_keyed_state_uses_only_vnode_zero_and_roundtrips_whole_checkpoint() {
     let sql = "SELECT name, SUM(value) as total FROM events GROUP BY name";
     let (_, mut state) = setup_agg_state(sql).await;

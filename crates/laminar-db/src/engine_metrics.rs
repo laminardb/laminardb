@@ -41,6 +41,12 @@ pub struct EngineMetrics {
     pub stream_watermark_ms: IntGaugeVec,
     /// Per-stream input-port buffered bytes. Label: `stream`.
     pub input_buf_bytes: IntGaugeVec,
+    /// Operator-reported retained managed-state charge. Labels: `operator`, `phase`.
+    /// `live` is current at sampling; transient `prepared`/`retired` values are the maximum
+    /// observed since the prior sample. Current aggregate values are lower bounds between cold
+    /// reconciliation points and exclude hash buckets, nested/shared payloads, allocator overhead,
+    /// and process RSS.
+    pub managed_state_accounted_bytes: IntGaugeVec,
     /// Per-stream rows shed by the `ShedOldest` policy. Label: `stream`.
     pub shed_records_total: IntCounterVec,
     /// Completed checkpoints.
@@ -206,6 +212,15 @@ impl EngineMetrics {
             input_buf_bytes: reg!(IntGaugeVec::new(
                 Opts::new("input_buf_bytes", "Per-stream input buffer bytes"),
                 &["stream"],
+            )
+            .unwrap()),
+            // Operator names are catalog-bound and phase is one of live/prepared/retired.
+            managed_state_accounted_bytes: reg!(IntGaugeVec::new(
+                Opts::new(
+                    "managed_state_accounted_bytes",
+                    "Operator-reported retained-state charge; current aggregate values are lower bounds between checkpoint/lifecycle reconciliation and exclude hash buckets, nested/shared payloads, allocator overhead, and RSS",
+                ),
+                &["operator", "phase"],
             )
             .unwrap()),
             shed_records_total: reg!(IntCounterVec::new(

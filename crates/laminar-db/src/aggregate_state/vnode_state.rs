@@ -2,6 +2,11 @@ use ahash::{AHashMap, AHashSet};
 use datafusion_common::ScalarValue;
 use laminar_core::state::KeyGroupCount;
 
+use super::accounting::{
+    logical_collection_element_usage, owned_row_payload_usage,
+    retained_changelog_vector_element_usage, topology_element_usage, vnode_inline_usage,
+    AggregateStateUsage,
+};
 use super::GroupEntry;
 use crate::error::DbError;
 
@@ -10,7 +15,6 @@ use crate::error::DbError;
 /// The box containing this value is the unit of rebalance publication. Keeping logical state,
 /// changelog state, and checkpoint bookkeeping under the same owner prevents a vnode transition
 /// from publishing only part of a group's state.
-#[derive(Default)]
 pub(super) struct AggregateVnodeState {
     pub(super) groups: AHashMap<arrow::row::OwnedRow, GroupEntry>,
     pub(super) last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
@@ -21,6 +25,7 @@ pub(super) struct AggregateVnodeState {
     pub(super) delta_chain_len: Option<u32>,
     #[cfg(feature = "cluster")]
     pub(super) force_full_rebase: bool,
+    usage: AggregateStateUsage,
 }
 
 /// Fixed vnode address space selected from an aggregate's immutable routing identity.
@@ -28,6 +33,209 @@ pub(super) struct AggregateVnodeSlots {
     slots: Box<[Option<Box<AggregateVnodeState>>]>,
     active_vnodes: Vec<u32>,
     resident_group_count: usize,
+    fixed_topology_usage: AggregateStateUsage,
+}
+
+impl Default for AggregateVnodeState {
+    fn default() -> Self {
+        Self {
+            groups: AHashMap::new(),
+            last_emitted: AHashMap::new(),
+            emit_dirty_keys: AHashSet::new(),
+            checkpoint_dirty_keys: AHashSet::new(),
+            last_emitted_dirty_keys: AHashSet::new(),
+            #[cfg(feature = "cluster")]
+            delta_chain_len: None,
+            #[cfg(feature = "cluster")]
+            force_full_rebase: false,
+            usage: vnode_inline_usage::<AggregateVnodeState>(1),
+        }
+    }
+}
+
+impl AggregateVnodeState {
+    #[cfg(feature = "cluster")]
+    pub(super) fn try_from_recovered(
+        groups: AHashMap<arrow::row::OwnedRow, GroupEntry>,
+        last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
+        mark_emit_dirty: bool,
+        mark_checkpoint_dirty: bool,
+    ) -> Result<Self, (&'static str, std::collections::TryReserveError)> {
+        let mut state = Self {
+            groups,
+            last_emitted,
+            ..Self::default()
+        };
+        if mark_emit_dirty {
+            state
+                .emit_dirty_keys
+                .try_reserve(state.groups.len())
+                .map_err(|error| ("changelog dirty keys", error))?;
+            state.emit_dirty_keys.extend(state.groups.keys().cloned());
+        }
+        if mark_checkpoint_dirty {
+            state
+                .checkpoint_dirty_keys
+                .try_reserve(state.groups.len())
+                .map_err(|error| ("checkpoint dirty keys", error))?;
+            state
+                .checkpoint_dirty_keys
+                .extend(state.groups.keys().cloned());
+        }
+        // Reconcile once, after all fallible reservations and retained collections are complete.
+        state.refresh_usage();
+        Ok(state)
+    }
+
+    pub(super) fn group_usage(
+        key: &arrow::row::OwnedRow,
+        entry: &GroupEntry,
+    ) -> AggregateStateUsage {
+        logical_collection_element_usage::<(arrow::row::OwnedRow, GroupEntry)>(1)
+            .saturating_add(owned_row_payload_usage(key, 1))
+            .saturating_add(entry.accounted_accumulator_usage())
+    }
+
+    fn emitted_usage(key: &arrow::row::OwnedRow, values: &Vec<ScalarValue>) -> AggregateStateUsage {
+        logical_collection_element_usage::<(arrow::row::OwnedRow, Vec<ScalarValue>)>(1)
+            .saturating_add(owned_row_payload_usage(key, 1))
+            .saturating_add(retained_changelog_vector_element_usage(values))
+    }
+
+    fn dirty_key_usage(key: &arrow::row::OwnedRow) -> AggregateStateUsage {
+        logical_collection_element_usage::<arrow::row::OwnedRow>(1)
+            .saturating_add(owned_row_payload_usage(key, 1))
+    }
+
+    pub(super) fn add_usage(&mut self, usage: AggregateStateUsage) {
+        self.usage = self.usage.saturating_add(usage);
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(super) fn reconcile_accumulator_usage(
+        &mut self,
+        previous: AggregateStateUsage,
+        current: AggregateStateUsage,
+    ) {
+        self.usage = self.usage.saturating_sub(previous).saturating_add(current);
+    }
+
+    pub(super) fn insert_emit_dirty_key(&mut self, key: arrow::row::OwnedRow) {
+        let usage = Self::dirty_key_usage(&key);
+        if self.emit_dirty_keys.insert(key) {
+            self.usage = self.usage.saturating_add(usage);
+        }
+    }
+
+    pub(super) fn insert_checkpoint_dirty_key(&mut self, key: arrow::row::OwnedRow) {
+        let usage = Self::dirty_key_usage(&key);
+        if self.checkpoint_dirty_keys.insert(key) {
+            self.usage = self.usage.saturating_add(usage);
+        }
+    }
+
+    pub(super) fn insert_last_emitted_dirty_key(&mut self, key: arrow::row::OwnedRow) {
+        let usage = Self::dirty_key_usage(&key);
+        if self.last_emitted_dirty_keys.insert(key) {
+            self.usage = self.usage.saturating_add(usage);
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(super) fn clear_checkpoint_dirty_keys(&mut self) {
+        let released = self
+            .checkpoint_dirty_keys
+            .iter()
+            .fold(AggregateStateUsage::default(), |usage, key| {
+                usage.saturating_add(Self::dirty_key_usage(key))
+            });
+        self.checkpoint_dirty_keys.clear();
+        self.usage = self.usage.saturating_sub(released);
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(super) fn clear_last_emitted_dirty_keys(&mut self) {
+        let released = self
+            .last_emitted_dirty_keys
+            .iter()
+            .fold(AggregateStateUsage::default(), |usage, key| {
+                usage.saturating_add(Self::dirty_key_usage(key))
+            });
+        self.last_emitted_dirty_keys.clear();
+        self.usage = self.usage.saturating_sub(released);
+    }
+
+    pub(super) fn replace_emit_dirty_keys_after_attempt(
+        &mut self,
+        mut dirty: AHashSet<arrow::row::OwnedRow>,
+        emission_succeeded: bool,
+    ) {
+        if emission_succeeded {
+            let released = dirty
+                .iter()
+                .fold(AggregateStateUsage::default(), |usage, key| {
+                    usage.saturating_add(Self::dirty_key_usage(key))
+                });
+            dirty.clear();
+            self.usage = self.usage.saturating_sub(released);
+        }
+        self.emit_dirty_keys = dirty;
+    }
+
+    pub(super) fn insert_last_emitted(
+        &mut self,
+        key: arrow::row::OwnedRow,
+        values: Vec<ScalarValue>,
+    ) {
+        let new_usage = Self::emitted_usage(&key, &values);
+        if let Some((resident_key, previous_values)) = self.last_emitted.get_key_value(&key) {
+            let previous_usage = Self::emitted_usage(resident_key, previous_values);
+            self.usage = self
+                .usage
+                .saturating_sub(previous_usage)
+                .saturating_add(new_usage);
+        } else {
+            self.usage = self.usage.saturating_add(new_usage);
+        }
+        self.last_emitted.insert(key, values);
+    }
+
+    fn recompute_usage(&self) -> AggregateStateUsage {
+        let mut usage = vnode_inline_usage::<AggregateVnodeState>(1);
+        for (key, entry) in &self.groups {
+            usage = usage.saturating_add(Self::group_usage(key, entry));
+        }
+        for (key, values) in &self.last_emitted {
+            usage = usage.saturating_add(Self::emitted_usage(key, values));
+        }
+        for keys in [
+            &self.emit_dirty_keys,
+            &self.checkpoint_dirty_keys,
+            &self.last_emitted_dirty_keys,
+        ] {
+            for key in keys {
+                usage = usage.saturating_add(Self::dirty_key_usage(key));
+            }
+        }
+        usage
+    }
+
+    pub(super) fn refresh_usage(&mut self) {
+        for entry in self.groups.values_mut() {
+            entry.refresh_accumulator_usage();
+        }
+        self.usage = self.recompute_usage();
+    }
+
+    #[inline]
+    pub(super) const fn usage(&self) -> AggregateStateUsage {
+        self.usage
+    }
+
+    #[cfg(test)]
+    pub(super) fn cached_usage_matches_structural_recompute(&self) -> bool {
+        self.usage == self.recompute_usage()
+    }
 }
 
 /// Mutable iterator over the sorted active roster without scanning the fixed slot address space.
@@ -82,10 +290,14 @@ impl AggregateVnodeSlots {
                     "aggregate active vnode roster could not reserve {slot_count} entries: {error}"
                 ))
             })?;
+        let fixed_topology_usage = topology_element_usage::<AggregateVnodeSlots>(1).saturating_add(
+            topology_element_usage::<Option<Box<AggregateVnodeState>>>(slots.len()),
+        );
         Ok(Self {
             slots: slots.into_boxed_slice(),
             active_vnodes,
             resident_group_count: 0,
+            fixed_topology_usage,
         })
     }
 
@@ -152,6 +364,27 @@ impl AggregateVnodeSlots {
             active_vnodes: self.active_vnodes.iter(),
             next_slot_index: 0,
         }
+    }
+
+    pub(super) fn accounted_usage(&self) -> AggregateStateUsage {
+        let topology = self
+            .fixed_topology_usage
+            .saturating_add(topology_element_usage::<u32>(self.active_vnodes.capacity()));
+        self.iter().fold(topology, |usage, (_, state)| {
+            usage.saturating_add(state.usage())
+        })
+    }
+
+    pub(super) fn refresh_all_usage(&mut self) {
+        for (_, state) in self.iter_mut() {
+            state.refresh_usage();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn cached_usage_matches_structural_recompute(&self) -> bool {
+        self.iter()
+            .all(|(_, state)| state.cached_usage_matches_structural_recompute())
     }
 
     #[cfg(feature = "cluster")]

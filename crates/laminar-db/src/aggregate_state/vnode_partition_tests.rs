@@ -130,6 +130,110 @@ fn symbol_for_vnode(state: &IncrementalAggState, vnode: u32, start: u32) -> Stri
     panic!("no symbol found for vnode {vnode}");
 }
 
+#[derive(Debug)]
+struct SizeCountingAccumulator {
+    inner: Box<dyn datafusion_expr::Accumulator>,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl datafusion_expr::Accumulator for SizeCountingAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion_common::Result<()> {
+        self.inner.update_batch(values)
+    }
+
+    fn evaluate(&mut self) -> datafusion_common::Result<ScalarValue> {
+        self.inner.evaluate()
+    }
+
+    fn size(&self) -> usize {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.size()
+    }
+
+    fn state(&mut self) -> datafusion_common::Result<Vec<ScalarValue>> {
+        self.inner.state()
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion_common::Result<()> {
+        self.inner.merge_batch(states)
+    }
+}
+
+fn install_size_counter(
+    state: &mut IncrementalAggState,
+    symbol: &str,
+) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    let batch = pre_agg_batch(&[(symbol, 0)]);
+    let rows = state
+        .row_converter
+        .convert_columns(&[Arc::clone(batch.column(0))])
+        .unwrap();
+    let key = rows.row(0).owned();
+    let vnode = IncrementalAggState::vnode_for_group_key(
+        state.num_group_cols,
+        &key,
+        NonZeroU32::new(VNODES).unwrap(),
+    );
+    let entry = state
+        .vnode_states
+        .get_mut(vnode)
+        .and_then(|vnode_state| vnode_state.groups.get_mut(&key))
+        .expect("test group must exist");
+    assert_eq!(entry.accs.len(), 1);
+    let inner = entry.accs.pop().unwrap();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    entry.accs.push(Box::new(SizeCountingAccumulator {
+        inner,
+        calls: std::sync::Arc::clone(&calls),
+    }));
+    assert!(entry.accs[0].size() > 0);
+    calls.store(0, std::sync::atomic::Ordering::Relaxed);
+    calls
+}
+
+#[tokio::test]
+async fn delta_accounting_does_not_inspect_clean_groups() {
+    let mut state = fresh_state().await;
+    let dirty_symbol = symbol_for_vnode(&state, 0, 0);
+    let clean_symbol = symbol_for_vnode(&state, 0, 10_000);
+    assert_ne!(dirty_symbol, clean_symbol);
+    feed(
+        &mut state,
+        &[(dirty_symbol.as_str(), 10), (clean_symbol.as_str(), 20)],
+    );
+    state.set_delta_enabled(true);
+    let baseline = state.checkpoint_delta_by_vnode(VNODES, 4).unwrap();
+    assert!(matches!(baseline.get(&0), Some(VnodeCapture::Full(_))));
+
+    let clean_size_calls = install_size_counter(&mut state, &clean_symbol);
+    feed(&mut state, &[(dirty_symbol.as_str(), 1)]);
+    assert_eq!(
+        clean_size_calls.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        state
+            .vnode_states
+            .iter()
+            .map(|(_, vnode_state)| vnode_state.checkpoint_dirty_keys.len())
+            .sum::<usize>(),
+        1,
+        "only the updated group should be dirty"
+    );
+
+    let delta = state.checkpoint_delta_by_vnode(VNODES, 4).unwrap();
+    let Some(VnodeCapture::Delta(delta)) = delta.get(&0) else {
+        panic!("the second capture must be a delta");
+    };
+    assert_eq!(delta.changed.last_updated_ms.len(), 1);
+    assert_eq!(
+        clean_size_calls.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "an incremental checkpoint must not inspect a clean accumulator"
+    );
+}
+
 #[tokio::test]
 async fn per_vnode_checkpoint_merge_round_trips() {
     let mut a = fresh_state().await;
@@ -553,6 +657,49 @@ async fn prepared_vnode_transition_abort_preserves_every_live_slot_and_snapshot(
     assert_eq!(checkpoint_bytes(&mut live), checkpoint_before);
     assert_eq!(live.working_set_snapshot_for_test(), working_set_before);
     assert_eq!(vnode_slot_identities(&live), slot_identities_before);
+}
+
+#[tokio::test]
+async fn vnode_transition_accounting_separates_live_prepared_and_retired_ownership() {
+    let restore_vnode = 0;
+    let mut donor = fresh_state().await;
+    let restored_key = symbol_for_vnode(&donor, restore_vnode, 0);
+    feed(&mut donor, &[(restored_key.as_str(), 10)]);
+    let restored_base = donor
+        .checkpoint_groups_by_vnode(VNODES)
+        .unwrap()
+        .remove(&restore_vnode)
+        .unwrap();
+
+    let mut live = fresh_state().await;
+    let displaced_key = symbol_for_vnode(&live, restore_vnode, 10_000);
+    feed(&mut live, &[(displaced_key.as_str(), 70)]);
+    let live_before = live.accounted_state_bytes();
+    assert!(live.cached_usage_matches_structural_recompute());
+
+    let restores = [AggVnodeRestore {
+        vnode: restore_vnode,
+        base: &restored_base,
+        deltas: &[],
+    }];
+    let prepared = live
+        .prepare_vnode_transition(VNODES, &restores, &Default::default())
+        .unwrap();
+    assert!(prepared.accounted_state_bytes() > 0);
+    assert_eq!(
+        live.accounted_state_bytes(),
+        live_before,
+        "preparation must retain, not replace, the live working set"
+    );
+
+    let retired = live.publish_prepared_vnode_transition(prepared);
+    assert!(retired.accounted_state_bytes() > 0);
+    assert!(live.cached_usage_matches_structural_recompute());
+    assert_eq!(
+        totals(&mut live),
+        std::collections::BTreeMap::from([(restored_key, 10)])
+    );
+    IncrementalAggState::finish_vnode_transition(retired);
 }
 
 #[tokio::test]

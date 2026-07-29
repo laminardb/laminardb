@@ -43,7 +43,9 @@ use crate::operator::capability::{ManagedStateContract, OperatorStateClass};
 use crate::operator::capability::{OperatorCapability, OperatorImplementation};
 #[cfg(feature = "cluster")]
 use crate::operator_graph::ManagedVnodeTransition;
-use crate::operator_graph::{try_evaluate_compiled, GraphOperator, OperatorCheckpoint};
+use crate::operator_graph::{
+    try_evaluate_compiled, GraphOperator, ManagedStateAccountingSnapshot, OperatorCheckpoint,
+};
 use crate::sql_analysis::{extract_projection_filter, single_source_table};
 
 #[cfg(all(feature = "cluster", test))]
@@ -1147,6 +1149,40 @@ impl GraphOperator for SqlQueryOperator {
         self.capability
     }
 
+    fn managed_state_accounting(&self) -> Option<ManagedStateAccountingSnapshot> {
+        let QueryState::Agg(aggregate) = &self.state else {
+            return None;
+        };
+
+        // This is aggregate working-state ownership only. The small `prev_owned`/
+        // `next_prev_owned` authority sets are graph lifecycle metadata, not state-backend bytes.
+        #[cfg(feature = "cluster")]
+        let (prepared_bytes, retired_bytes) = {
+            let staged = self
+                .prepared_vnode_transition
+                .as_ref()
+                .map_or(0, |prepared| prepared.aggregate.accounted_state_bytes());
+            match self.vnode_transition_cleanup.as_ref() {
+                Some(SqlVnodeTransitionCleanup::Aborted(prepared)) => (
+                    staged.saturating_add(prepared.aggregate.accounted_state_bytes()),
+                    0,
+                ),
+                Some(SqlVnodeTransitionCleanup::Published { aggregate, .. }) => {
+                    (staged, aggregate.accounted_state_bytes())
+                }
+                None => (staged, 0),
+            }
+        };
+        #[cfg(not(feature = "cluster"))]
+        let (prepared_bytes, retired_bytes) = (0, 0);
+
+        Some(ManagedStateAccountingSnapshot {
+            live: aggregate.accounted_state_bytes(),
+            prepared: prepared_bytes,
+            retired: retired_bytes,
+        })
+    }
+
     async fn initialize_managed_state(&mut self) -> Result<(), DbError> {
         if matches!(self.state, QueryState::Uninit) {
             self.lazy_init().await?;
@@ -1907,7 +1943,7 @@ mod checkpoint_tests {
 
     #[tokio::test]
     async fn managed_aggregate_initializes_before_receiving_input() {
-        let (context, _) = context_and_batch();
+        let (context, batch) = context_and_batch();
         let mut operator = SqlQueryOperator::new(
             "sum",
             "SELECT key, SUM(value) AS total FROM events GROUP BY key",
@@ -1922,6 +1958,18 @@ mod checkpoint_tests {
             panic!("expected initialized aggregate state");
         };
         assert_eq!(aggregate.key_group_count(), LOCAL_KEY_GROUP_COUNT);
+        let empty_accounting = operator
+            .managed_state_accounting()
+            .expect("initialized aggregate must report managed state");
+        assert!(empty_accounting.live > 0);
+        assert_eq!(empty_accounting.prepared, 0);
+        assert_eq!(empty_accounting.retired, 0);
+
+        operator.process(&[vec![batch]], &[i64::MIN]).await.unwrap();
+        let populated_accounting = operator.managed_state_accounting().unwrap();
+        assert!(populated_accounting.live > empty_accounting.live);
+        assert_eq!(populated_accounting.prepared, 0);
+        assert_eq!(populated_accounting.retired, 0);
         assert!(operator.checkpoint().unwrap().is_some());
     }
 

@@ -34,6 +34,25 @@ use laminar_sql::translator::{
 #[cfg(feature = "cluster")]
 mod vnode_transition;
 
+/// Cached retained managed-state accounting reported by one operator.
+///
+/// These are operator-defined accounting bytes, not allocator usage or process RSS. Lifecycle
+/// phases are separate so a prepared or retired replacement is not hidden by the live total.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ManagedStateAccountingSnapshot {
+    pub(crate) live: usize,
+    pub(crate) prepared: usize,
+    pub(crate) retired: usize,
+}
+
+impl ManagedStateAccountingSnapshot {
+    #[cfg(any(feature = "cluster", test))]
+    fn observe_transient(&mut self, observation: Self) {
+        self.prepared = self.prepared.max(observation.prepared);
+        self.retired = self.retired.max(observation.retired);
+    }
+}
+
 #[async_trait]
 pub(crate) trait GraphOperator: Send {
     /// Admission-neutral inventory of this implementation's current cluster state shape.
@@ -41,6 +60,15 @@ pub(crate) trait GraphOperator: Send {
     /// This method is intentionally mandatory: a new physical operator must be classified before
     /// it compiles. Cluster DDL admission does not consume this descriptor yet.
     fn cluster_capability(&self) -> OperatorCapability;
+
+    /// Return cached retained-state accounting for cold-cadence metrics publication.
+    ///
+    /// Implementations must not scan per-key working state here. A bounded topology walk over
+    /// cached counters is permitted. Operators without managed accounting return `None`, which is
+    /// also the admission-neutral default.
+    fn managed_state_accounting(&self) -> Option<ManagedStateAccountingSnapshot> {
+        None
+    }
 
     /// Build and install the operator's declared managed working state before recovery.
     ///
@@ -566,6 +594,9 @@ pub(crate) struct OperatorGraph {
     query_budget_ns: u64,
     deferred_scan_offset: usize,
     stats_tick: u64,
+    // Since-last-sample high watermarks make synchronous prepare/publish/finish ownership visible
+    // without invoking Prometheus inside the vnode publication section. Indices mirror `nodes`.
+    managed_state_accounting_peaks: Vec<ManagedStateAccountingSnapshot>,
     ctx: SessionContext,
     prom: Option<Arc<EngineMetrics>>,
     lookup_registry: Option<Arc<laminar_sql::datafusion::LookupTableRegistry>>,
@@ -654,6 +685,7 @@ impl OperatorGraph {
             query_budget_ns: 8_000_000,
             deferred_scan_offset: 0,
             stats_tick: 0,
+            managed_state_accounting_peaks: Vec::new(),
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
             #[cfg(feature = "cluster")]
@@ -1299,6 +1331,7 @@ impl OperatorGraph {
             self.input_buf_bytes[id] = vec![0; input_port_count];
             self.input_sources[id] = vec![usize::MAX; input_port_count];
             self.output_watermarks[id] = i64::MIN;
+            self.managed_state_accounting_peaks[id] = ManagedStateAccountingSnapshot::default();
             if let Some(domain) = self.node_domain.get_mut(id) {
                 *domain = 0;
             }
@@ -1314,6 +1347,8 @@ impl OperatorGraph {
             self.input_buf_bytes.push(vec![0; input_port_count]);
             self.input_sources.push(vec![usize::MAX; input_port_count]);
             self.output_watermarks.push(i64::MIN);
+            self.managed_state_accounting_peaks
+                .push(ManagedStateAccountingSnapshot::default());
             id
         }
     }
@@ -2084,6 +2119,14 @@ impl OperatorGraph {
             .collect();
 
         for &id in &ids_to_remove {
+            if let Some(ref prom) = self.prom {
+                for phase in ["live", "prepared", "retired"] {
+                    let _ = prom
+                        .managed_state_accounted_bytes
+                        .remove_label_values(&[&self.nodes[id].name, phase]);
+                }
+            }
+            self.managed_state_accounting_peaks[id] = ManagedStateAccountingSnapshot::default();
             self.nodes[id].removed = true;
             self.nodes[id].replace_operator(Box::new(TombstonedOperator));
             self.nodes[id].output_routes.clear();
@@ -2952,6 +2995,49 @@ impl OperatorGraph {
                 prom.input_buf_bytes
                     .with_label_values(&[&self.nodes[id].name])
                     .set(i64::try_from(total).unwrap_or(i64::MAX));
+            }
+            for (id, node) in self.nodes.iter().enumerate() {
+                if node.removed {
+                    for phase in ["live", "prepared", "retired"] {
+                        let _ = prom
+                            .managed_state_accounted_bytes
+                            .remove_label_values(&[&node.name, phase]);
+                    }
+                    self.managed_state_accounting_peaks[id] =
+                        ManagedStateAccountingSnapshot::default();
+                    continue;
+                }
+                let Some(mut accounting) = node.operator.managed_state_accounting() else {
+                    continue;
+                };
+                let peaks = std::mem::take(&mut self.managed_state_accounting_peaks[id]);
+                accounting.prepared = accounting.prepared.max(peaks.prepared);
+                accounting.retired = accounting.retired.max(peaks.retired);
+                for (phase, bytes) in [
+                    ("live", accounting.live),
+                    ("prepared", accounting.prepared),
+                    ("retired", accounting.retired),
+                ] {
+                    prom.managed_state_accounted_bytes
+                        .with_label_values(&[&node.name, phase])
+                        .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+                }
+            }
+        }
+    }
+
+    /// Retain transient managed-state ownership until the next cold metrics sample.
+    ///
+    /// This performs no Prometheus work and is called only from vnode lifecycle paths.
+    #[cfg(feature = "cluster")]
+    fn observe_managed_state_accounting(&mut self, node_indices: &[usize]) {
+        for &node_idx in node_indices {
+            let node = &self.nodes[node_idx];
+            if node.removed {
+                continue;
+            }
+            if let Some(accounting) = node.operator.managed_state_accounting() {
+                self.managed_state_accounting_peaks[node_idx].observe_transient(accounting);
             }
         }
     }

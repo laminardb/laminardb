@@ -66,6 +66,36 @@ impl GraphOperator for RestoreProbe {
     }
 }
 
+struct ManagedStateAccountingProbe {
+    accounting: ManagedStateAccountingSnapshot,
+    samples: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl GraphOperator for ManagedStateAccountingProbe {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
+    fn managed_state_accounting(&self) -> Option<ManagedStateAccountingSnapshot> {
+        self.samples
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(self.accounting)
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+}
+
 struct RestoreFailureProbe {
     restores: Arc<std::sync::atomic::AtomicUsize>,
     drops: Arc<std::sync::atomic::AtomicUsize>,
@@ -7598,4 +7628,95 @@ async fn test_byte_budget_gates_capacity() {
 
     let producer_id = *graph.output_map.get("producer").unwrap();
     assert!(graph.is_downstream_at_capacity(producer_id));
+}
+
+#[test]
+fn managed_state_accounting_is_sampled_at_cold_cadence_and_skips_removed_nodes() {
+    let registry = prometheus::Registry::new();
+    let prom = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+    let mut graph = test_graph();
+    graph.set_metrics(Arc::clone(&prom));
+
+    let active_samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let active = graph.allocate_node(GraphNode::new(
+        Arc::from("accounted"),
+        Box::new(ManagedStateAccountingProbe {
+            accounting: ManagedStateAccountingSnapshot {
+                live: 11,
+                prepared: 22,
+                retired: 33,
+            },
+            samples: Arc::clone(&active_samples),
+        }),
+        0,
+    ));
+
+    let removed_samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let removed = graph.allocate_node(GraphNode::new(
+        Arc::from("removed"),
+        Box::new(ManagedStateAccountingProbe {
+            accounting: ManagedStateAccountingSnapshot {
+                live: 44,
+                prepared: 55,
+                retired: 66,
+            },
+            samples: Arc::clone(&removed_samples),
+        }),
+        0,
+    ));
+    graph.managed_state_accounting_peaks[active].observe_transient(
+        ManagedStateAccountingSnapshot {
+            live: 0,
+            prepared: 99,
+            retired: 88,
+        },
+    );
+
+    for _ in 1..STATS_SAMPLE_INTERVAL {
+        graph.sample_buffer_stats();
+    }
+    assert_eq!(active_samples.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    graph.sample_buffer_stats();
+
+    assert_eq!(active_samples.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(removed_samples.load(std::sync::atomic::Ordering::SeqCst), 1);
+    for (phase, expected) in [("live", 11), ("prepared", 99), ("retired", 88)] {
+        assert_eq!(
+            prom.managed_state_accounted_bytes
+                .with_label_values(&["accounted", phase])
+                .get(),
+            expected
+        );
+    }
+    assert_eq!(
+        prom.managed_state_accounted_bytes
+            .with_label_values(&["removed", "live"])
+            .get(),
+        44
+    );
+
+    graph.nodes[removed].removed = true;
+    for _ in 0..STATS_SAMPLE_INTERVAL {
+        graph.sample_buffer_stats();
+    }
+    assert_eq!(active_samples.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(removed_samples.load(std::sync::atomic::Ordering::SeqCst), 1);
+    for phase in ["live", "prepared", "retired"] {
+        assert!(
+            prom.managed_state_accounted_bytes
+                .remove_label_values(&["removed", phase])
+                .is_err(),
+            "removed operator retained its {phase} metric series"
+        );
+    }
+    for (phase, expected) in [("live", 11), ("prepared", 22), ("retired", 33)] {
+        assert_eq!(
+            prom.managed_state_accounted_bytes
+                .with_label_values(&["accounted", phase])
+                .get(),
+            expected,
+            "transient peak must reset after one sample interval"
+        );
+    }
 }
