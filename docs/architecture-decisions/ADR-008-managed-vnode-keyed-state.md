@@ -49,7 +49,8 @@ cancellation are also void/unbounded.
 A child-process deadline proves process containment only and cannot supply an in-process lifecycle
 for embedded mode. A sidecar would be a separate IPC/hot-path architecture, not a small adapter.
 The first-veto rule therefore fired before Cargo, runtime, test-executable, or admission changes.
-Backend-neutral core work may continue; the released local-spill candidate set is empty.
+Backend-neutral core work may continue; the reviewed, owner-approved released local-spill
+candidate set is empty.
 
 ### 2026-07-29 official-release backend selection (historical entry authority)
 
@@ -379,7 +380,7 @@ The current source detail and rationale live in the
 [historical TidesDB package design](tidesdb-local-state-successor-design.md), and
 [historical TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
 [TidesDB empirical re-entry](../reports/tidesdb-current-package-reentry-2026-07-28.md). These
-are evidence and gate records. The RocksDB source closure is current candidate authority: no
+are evidence and gate records. The RocksDB source closure is current backend-decision authority: no
 released backend, runtime dependency, qualification result, or production admission follows.
 
 The existing fixed vnode ABI, bounded shuffle, assignment/process fencing, aligned barriers,
@@ -2034,7 +2035,7 @@ checks, and admission flags that remain disabled until each vertical passes its 
 
 | System/research | Relevant fact | Decision taken here |
 |---|---|---|
-| [Fjall 3.1.8 API](https://docs.rs/fjall/3.1.8/fjall/) and [RocksDB operations](https://github.com/facebook/rocksdb/wiki/Basic-Operations) | Fjall offers a Rust-native API without a C++ storage engine plus batches/snapshots/ranges, but lacks native multi-get/range tombstones and sufficient governance telemetry; RocksDB offers broader batch/operations controls at native-build/accounting cost | Retain the common workload/fault lessons and portable Laminar artifacts; qualify the separately selected target against absolute gates |
+| [Fjall 3.1.8 API](https://docs.rs/fjall/3.1.8/fjall/) and [RocksDB operations](https://github.com/facebook/rocksdb/wiki/Basic-Operations) | Fjall offers a Rust-native API without a C++ storage engine plus batches/snapshots/ranges, but lacks native multi-get/range tombstones and sufficient governance telemetry; RocksDB offers broader batch/operations controls at native-build/accounting cost | Retain the common workload/fault lessons and portable Laminar artifacts; qualify any future exact-release target against absolute gates |
 | [Flink 2.3 keyed state](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/concepts/stateful-stream-processing/) and [state backends](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/ops/state/state_backends/) | Key groups are the atomic redistribution unit; heap is low-latency but memory-bound; EmbeddedRocksDB supports large local state and incremental checkpoints | Keep fixed vnodes; start with a local disk-backed backend and portable checkpoints |
 | [Arroyo state concepts](https://doc.arroyo.dev/concepts/) | The Rust engine keeps open-source working state in worker memory, explicitly limits it to worker RAM, and writes consistent remote Parquet checkpoints | Treat bounded memory plus remote recovery as a valid separately gated placement, not evidence that arbitrary state fits memory |
 | [Flink ForSt](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/ops/state/disaggregated_state/) | Remote SSTs, local cache and async State V2 access enable lightweight checkpoints, but ForSt remains experimental; synchronous state is local unless explicitly overridden, and the current implementation is slated for replacement | Do not put object storage on LaminarDB's initial hot path |

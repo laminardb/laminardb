@@ -887,7 +887,7 @@ Remaining work is kept reviewable in this dependency order:
 
 1. retain the TidesDB, Fjall, redb, and RocksDB reports as decision evidence, but use the
    [RocksDB source closure](../reports/rocksdb-0.24.0-adapter-entry-source-closure-2026-07-29.md)
-   as current candidate authority. The broad search is closed, no backend is selected, and there
+   as current backend-decision authority. The broad search is closed, no backend is selected, and there
    is no automatic fallback;
 2. `docs: select and source-screen the released backend path` — complete with STOP. The selection
    carried `rocksdb = 0.24.0` with `librocksdb-sys 0.17.3+10.4.2` and bundled RocksDB 10.4.2 into

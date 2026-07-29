@@ -641,10 +641,10 @@ Exit gate:
 - benchmark and numerical SLO/RTO profile is reproducible on a clean runner;
 - golden ABI/schema vectors and compatibility policy pass;
 - the placement-neutral service/lifecycle and in-memory conformance subject are reviewable without
-  implying admission; the selected released RocksDB path must first pass bounded adapter entry and
-  later receive and pass separately authorized reproducible conformance, latency, resource, fault,
-  and operability gates; the in-memory subject remains reference/conformance-only and supplies no
-  admission evidence;
+  implying admission; any future exact-release local-spill backend must first pass a newly
+  authorized source/re-entry gate and later receive and pass separately authorized reproducible
+  conformance, latency, resource, fault, and operability gates; the in-memory subject remains
+  reference/conformance-only and supplies no admission evidence;
 - at least one source/operator/append-sink scenario has a complete ALO oracle and every unsupported
   output/delivery combination has a fail-closed assertion;
 - the independent production-soak charter is approved before implementation results can influence
@@ -674,14 +674,14 @@ Work packages:
   Extract a crate only if dependency direction or a second non-DB consumer requires it.
 - Add canonical logical prefixes and ABI/schema validation. The local-spill implementation also adds
   persisted metadata, process locking and safe cleanup scoped to one resolved pipeline directory.
-- Provide the in-memory semantic/lifecycle implementation first and the Phase-0-selected local-
-  spill backend behind the same contract and conformance suite. Neither implementation changes
-  admission by existing; do not retain losing disk qualification adapters.
-- Do not add rejected alternatives or preserve a losing adapter. If the selected RocksDB release
-  passes adapter entry and later receives separate integration authority, use only the reviewed
-  exact package behind the managed-state facade, route blocking work through the bounded foreground
-  lane, and freeze its database/keyspace layout and limits. Do not allocate an engine instance per
-  vnode, expose backend types outside the facade, or depend on a private fork.
+- Provide the in-memory semantic/lifecycle implementation first. Add a local-spill backend behind
+  the same contract and conformance suite only after a future exact official release passes a new
+  source/re-entry decision and receives separate integration authority. Neither implementation
+  changes admission by existing; do not retain losing disk qualification adapters.
+- Do not add rejected alternatives or preserve a losing adapter. A later authorized backend must
+  use only its reviewed exact package behind the managed-state facade, route blocking work through
+  the bounded foreground lane, and freeze its database/keyspace layout and limits. Do not allocate
+  an engine instance per vnode, expose backend types outside the facade, or depend on a private fork.
 - Encode hot values with a compact schema-versioned binary format. Do not use per-group Arrow IPC,
   live DataFusion/rkyv checkpoint types, read-before-write accounting, or the removed cold-tier
   wrapper.

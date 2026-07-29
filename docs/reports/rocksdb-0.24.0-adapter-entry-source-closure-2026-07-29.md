@@ -20,14 +20,16 @@ The exact released path selected for entry was:
 
 The released API fails the first absolute adapter-entry contract. Vnode-prefix range compaction is
 synchronous, has no deadline, returns `()`, and discards the native `Status`. Laminar therefore
-cannot tell success from I/O failure or prove that logical vnode deletion reached quota-visible
-physical reclamation. The same release also lacks a bounded, fallible in-process close path.
+cannot receive its native result or bound its completion. Live-file and filesystem/quota
+postconditions can observe eventual byte state, but cannot reconstruct the discarded failure or
+make the blocking operation bounded and fallible. The same release also lacks a bounded, fallible
+in-process close path.
 
 The stop rule was explicit: the first required fork, native patch, inadequate failure surface, or
 unbounded lifecycle ends the cycle before code. Accordingly this cycle adds no Cargo dependency,
 feature, lockfile entry, adapter, runtime selector, configuration, or test executable. It does not
-silently fall back to TidesDB, Fjall, redb, or bounded memory. The eligible released local-spill set
-is now empty.
+silently fall back to TidesDB, Fjall, redb, or bounded memory. The reviewed, owner-approved released
+local-spill candidate set is now empty.
 
 ## Decisive released-API failures
 
@@ -43,7 +45,7 @@ The exact release cannot complete that sequence honestly:
 | Released surface | Source result | Contract consequence |
 |---|---|---|
 | `compact_range`, `compact_range_opt`, `compact_range_cf`, `compact_range_cf_opt` | [`rocksdb` 0.24.0 returns `()`](https://github.com/rust-rocksdb/rust-rocksdb/blob/bb7d2168eab1bc7849f23adbcb825e3aba1bd2f4/src/db.rs#L1922-L2004). The bundled [C shim calls `CompactRange` and discards its `Status`](https://github.com/facebook/rocksdb/blob/410c5623195ecbe4699b9b5a5f622c7325cec6fe/db/c.cc#L1908-L1976). | A native failure is indistinguishable from success. The synchronous call has no deadline or cancellation token. |
-| `wait_for_compact` | Fallible and optionally timed, but it waits for queued/background work only after the synchronous manual-compaction call has returned. A timeout ends waiting; it does not stop that earlier call or reconstruct its discarded status. | It cannot wrap or repair range compaction. |
+| `wait_for_compact` | Fallible and optionally timed, but it only waits for queued/background work. In the selected single-owner cleanup sequence, the synchronous call must return before this wait is reached; invoking it concurrently would neither cancel `compact_range` nor recover the discarded status. | It cannot wrap or repair range compaction. |
 | `delete_file_in_range[_cf]` | Its safe API documents that it leaves all L0 and mixed-boundary files, can leave keys in the target range, and may invalidate snapshots created before the call. | It cannot guarantee prefix reclamation and is incompatible with the held-snapshot check. |
 | `drop_cf` | Fallible, but it would require a column family per vnode rather than the selected prefix layout. | Thousands of vnode CFs would be a new storage architecture, not a small adapter; it still supplies no bounded physical-purge completion. |
 
@@ -81,8 +83,9 @@ root after abnormal shutdown or engine-version change. It does impose important 
 | [`cb43abb1`](https://github.com/facebook/rocksdb/commit/cb43abb1f125313c93ba1bd0b99d0bb77d883400) fixes silent corruption in round-robin compaction | Reachable only with `compaction_pri=kRoundRobin`, not the upstream default. | Freeze default leveled compaction with `kMinOverlappingRatio`; reject round-robin. |
 | [`2dc6d6f7`](https://github.com/facebook/rocksdb/commit/2dc6d6f765c3d4645e0f283dc63d55e0acfabc2e) preserves the underlying table-builder I/O error during an empty-output flush | 10.4.2 reports failure, but can misclassify it as corruption. | Every non-OK maintenance result must poison the root; do not retry by parsed subtype. |
 | [`3d993787`](https://github.com/facebook/rocksdb/commit/3d99378791ce6aac15672f8c0b72ebcf1c08d903) fixes a table-cache handle leak after compaction failure | Relevant to injected post-verification/metadata faults and reinforces the lifecycle risk. | Would require fail-stop process containment, root quarantine, and a fault test; it does not repair the missing compaction result. |
-| [`cb8bc56d`](https://github.com/facebook/rocksdb/commit/cb8bc56d14786b66ccb2923643ea70c4500474a9) fixes the C create-CF failure handle | Relevant only when initialization fails and the same process retries. | Fixed CF creation would be one-shot and terminal; no in-process retry. |
+| [`cb8bc56d`](https://github.com/facebook/rocksdb/commit/cb8bc56d14786b66ccb2923643ea70c4500474a9) fixes the C create-CF failure handle | 10.4.2 leaks/returns an indeterminate handle on each failed create; retries make the leak unbounded. | Fixed CF creation would be one-shot and terminal. That bounds repetition but does not erase the first embedded-process leak. |
 | [`2afb3879`](https://github.com/facebook/rocksdb/commit/2afb38791779be19c3fbe90aea487dede7da107c) fixes a `DeleteScheduler` wake-up hang | Reachable with native rate-limited file deletion. | That facility would be forbidden. |
+| [`8c7c8b8d`](https://github.com/facebook/rocksdb/commit/8c7c8b8dab04f945a3574941185bdddc3d15a1be) attempted to fix range-deletion metadata compatibility, then [`707e4054`](https://github.com/facebook/rocksdb/commit/707e405492a92d3466ac685c3820e6c55de91f4c) reverted it | Current 11.1.2 therefore does not improve this cross-version local-root issue over 10.4.2. | Never carry a local root across an engine-version change; restore the portable checkpoint into a fresh root. |
 
 Best-efforts recovery, `TransactionDB`, FIFO compaction, WAL TTL deletion, remote/resumable
 compaction, MultiScan, external-SST ingestion, read-only/secondary access to a live root, BlobDB,
@@ -95,8 +98,8 @@ fails independently and first.
 
 ## Build provenance result
 
-Bundled provenance is feasible on Windows and Linux, but was not built because the source veto
-stopped execution:
+The build script exposes a source-controlled bundled path intended for Windows and Linux. Actual
+platform build/link feasibility remains unverified because the source veto stopped before build:
 
 - pin `rocksdb =0.24.0` with `default-features = false` and only `bindgen-runtime`;
 - require `ROCKSDB_COMPILE=1`;
@@ -107,9 +110,10 @@ stopped execution:
 - exclude FreeBSD from this exact provenance profile because the sys build script selects the
   system installation there.
 
-This path requires a C++17 toolchain and libclang. The wrapper is Apache-2.0; the sys/native bundle
-requires its combined Apache/MIT/BSD notice and SBOM review. Provenance controls cannot add a
-missing result or deadline to the public API.
+This path requires a C++17 toolchain and libclang. The wrapper is Apache-2.0; the sys crate declares
+MIT/Apache-2.0/BSD-3-Clause, bundled RocksDB is GPL-2.0-or-Apache-2.0, and bundled LevelDB carries a
+BSD notice. A future release must select the Apache route and preserve the exact licenses/notices
+in its SBOM. Provenance controls cannot add a missing result or deadline to the public API.
 
 ## Decision and re-entry
 
@@ -121,7 +125,9 @@ intended broad-state production profile.
 An official release may re-enter only when the exact released path provides, without a fork, git
 dependency, direct private FFI, or local native patch:
 
-1. a fallible, deadline/cancellation-aware way to reclaim a vnode prefix and observe completion;
+1. a fallible vnode-prefix reclamation operation with deadline-enforced completion, or cancellation
+   whose acknowledgement and final return have a tested bound, plus an observable physical
+   postcondition;
 2. a bounded/fallible lifecycle usable in-process in embedded, single-node, and cluster modes, or a
    separately accepted process-isolated architecture whose IPC hot-path cost is qualified;
 3. bounded dirty-root recovery, or an explicit fresh-root-only policy proven across every abnormal
