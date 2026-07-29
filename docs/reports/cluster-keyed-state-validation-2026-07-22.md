@@ -801,8 +801,9 @@ soak remains later and separately operated.
 ### Fjall failed adapter entry; its former cold tier remains historical
 
 The current baseline contains no Fjall dependency or state-tier module. Stock Fjall 3.1.8 failed
-the bounded source gate before integration; the decisive lifecycle trace is in the
-[source closure](fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md). Fjall 3.1 was previously
+the bounded source gate before integration; its worker-error/drop trace is now both source-audited
+and empirically confirmed in the
+[lifecycle closure](fjall-3.1.8-worker-lifecycle-empirical-closure-2026-07-29.md). Fjall 3.1 was previously
 used by the v0.26-era optional `state-tier` feature as a rebuildable cold cache for demoted
 checkpoint slices/groups. The current [`CHANGELOG.md`](../../CHANGELOG.md) records why commit
 `1e2f8429` removed it: a correctness defect allowed demotion to clear vnode dirtiness before
@@ -815,8 +816,9 @@ copied returned values. Formal target-Linux/NVMe testing never ran. Current Fjal
 atomic batches, snapshots, range scans, and sorted ingestion, but lacks native multi-get/range
 delete and a mature supported memory/compaction observability surface. The ADR therefore requires
 the same real state workload and fault gates before selecting any backend rather than assuming a
-historical dependency is fit. The source closure stopped exact stock 3.1.8 before those empirical
-gates because its fatal worker-exit/drop lifecycle cannot be repaired by the public adapter. There
+historical dependency is fit. The later targeted child reproduced the exact fatal worker-exit/drop
+hang; a small RAII counterpatch made that child return but remains unreleased and does not supply a
+complete bounded/fallible lifecycle or maintenance-health surface. There
 is no `fjall` or `tidesdb` dependency or selectable bounded working-state
 implementation in the current manifests or runtime. The existing injectable `StateBackend` is
 instead checkpoint-artifact storage, as distinguished below.

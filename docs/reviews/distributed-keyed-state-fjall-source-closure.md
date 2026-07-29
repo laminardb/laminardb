@@ -1,5 +1,10 @@
 # Distributed keyed state — Fjall 3.1.8 source-closure review
 
+> **Later evidence:** the 2026-07-29
+> [empirical closure](../reports/fjall-3.1.8-worker-lifecycle-empirical-closure-2026-07-29.md)
+> confirmed this source-derived worker-error/drop defect and tested a narrow counterpatch. The
+> source-only verification table below remains a dated record, not the current empirical boundary.
+
 - **Date:** 2026-07-28
 - **Decision commit:** `924caf00`
 - **Reviewed decision head:** `924caf00c84899cabae396e9e18b623c06ae3d13`

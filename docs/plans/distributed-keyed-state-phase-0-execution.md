@@ -42,6 +42,12 @@ says otherwise. The subsequent
 ordinary execution and reproduces current-native false-success faults; it does not inherit adapter
 or qualification authority from that history.
 
+The owner-authorized
+[Fjall lifecycle reproduction](../reports/fjall-3.1.8-worker-lifecycle-empirical-closure-2026-07-29.md)
+is a completed bounded exception to the paused candidate work. It confirms stock 3.1.8's worker-
+error Drop hang and proves only that a small RAII accounting patch closes that branch. It neither
+reopens the broad search nor selects an unreleased fork.
+
 The 2026-07-29 selection superseded all prior preference ordering. Current TidesDB releases fail
 acknowledged-write correctness, Fjall 3.1.8 fails the released lifecycle gate, and redb 4.1.0 remains
 stopped on resource/lifecycle evidence. None is a runtime fallback. The exact RocksDB pair may
@@ -890,8 +896,9 @@ Remaining work is kept reviewable in this dependency order:
 
 1. retain the TidesDB, Fjall, redb, and RocksDB reports as decision evidence, but use the
    [RocksDB source closure](../reports/rocksdb-0.24.0-adapter-entry-source-closure-2026-07-29.md)
-   as current backend-decision authority. The broad search is closed, no backend is selected, and there
-   is no automatic fallback;
+   as current broad-selection authority. The separately owner-authorized Fjall lifecycle exception
+   is complete and confirms rather than reverses its stock rejection. The broad search is closed,
+   no backend is selected, and there is no automatic fallback;
 2. `docs: select and source-screen the released backend path` — complete with STOP. The selection
    carried `rocksdb = 0.24.0` with `librocksdb-sys 0.17.3+10.4.2` and bundled RocksDB 10.4.2 into
    one bounded source gate. Its released cleanup/error and lifecycle surfaces failed before code;
@@ -923,7 +930,9 @@ Remaining work is kept reviewable in this dependency order:
    are void/unbounded. The first-veto rule stopped before bundled compilation, adapter construction,
    candidate execution, or WSL2 testing. A child-process deadline would prove only process
    containment and cannot repair embedded in-process lifecycle. No backend-specific implementation
-   is currently authorized;
+   is currently authorized. The separate stock Fjall 3.1.8 lifecycle exception is also complete:
+   its worker-error Drop hang reproduced, and a validation-only RAII counterpatch closed that branch
+   but not the unbounded/fallible-close or maintenance-health gates. No fork or adapter is carried;
 6. `docs: authorize an exact keyed-state qualification run`
    - the project owner may revise the candidate before explicitly authorizing exact thresholds, case
      matrix, Zipf sampler, runner source/build identity, target/isolation/limits/cost, and evidence

@@ -20,6 +20,12 @@ The cycle therefore stopped before code, and RocksDB is no longer a carry candid
 rationale below is retained as the dated decision that authorized that screen, not as current
 adapter authority.
 
+The later owner-authorized
+[Fjall lifecycle closure](fjall-3.1.8-worker-lifecycle-empirical-closure-2026-07-29.md) confirms its
+released worker-error Drop hang. A one-file counterpatch closes the forced branch, but is unreleased
+and leaves the broader close/maintenance-health gates open. It does not reopen this selection,
+authorize a production fork, or create a fallback.
+
 ## Outcome
 
 LaminarDB will stop the broad backend search. The sole released candidate to carry is the canonical
@@ -84,7 +90,7 @@ incomplete.
 |---|---|---|---|---|
 | RocksDB | `rocksdb 0.24.0` -> `librocksdb-sys 0.17.3+10.4.2` -> bundled RocksDB 10.4.2 | Atomic cross-CF batches, snapshots, ordered ranges, flush/WAL, checkpoint, cache/write-buffer/thread/WAL controls, properties, timed compaction wait, and background-work cancellation | Canonical community binding, not Meta official; wrapper trails current native 11.1.2; void `rocksdb_close` hides native close status; C++ build/native memory and tails require measurement | **SOLE CARRY CANDIDATE.** Bounded adapter entry only; qualification remains a later, separately authorized gate |
 | TidesDB | official Cargo package `tidesdb 0.11.1`, declaring only native-version feature `v9_3_6` with bundled 9.3.6 source fallback | Required point/range/transaction shapes and active cross-platform upstream | Released path predates relevant native fixes; current native 9.3.14 still reproduced acknowledged success after an incomplete batch apply; PR 664 is open and no released Rust feature selects a fixed successor | **REJECT CURRENT RELEASE.** Watch only for a fixed native successor and matching official source/Rust releases |
-| Fjall | `fjall 3.1.8`, exact official release | Rust-native atomic cross-keyspace batches, snapshots, ordered ranges, and explicit persistence | A worker can exit on error without reconciling the pre-counted worker total; database destruction can then wait indefinitely on private state. No wrapper can repair it under the no-fork rule | **REJECT 3.1.8.** Re-enter only after an official release fixes/tests bounded teardown and the maintenance/error surface is re-evaluated |
+| Fjall | `fjall 3.1.8`, exact official release | Rust-native atomic cross-keyspace batches, snapshots, ordered ranges, and explicit persistence | A forced worker error empirically leaves Drop waiting on the pre-counted worker total. A small RAII counterpatch closes that leak, but is unreleased and leaves Drop without a deadline/fallible result plus incomplete maintenance-error signalling | **REJECT 3.1.8; NO PRODUCTION FORK.** Re-enter only an official release that fixes/tests the complete lifecycle and maintenance/error surface |
 | redb | `redb 4.1.0`, exact official release | Rust-native ACID transactions, MVCC reads, ordered ranges, simple deployment | Freed pages were reused after barriers, but physical allocation remained 3.014x versus the 2.5x reference until offline compaction reduced it to 1.94x. There is no public fallible database close; Drop performs maintenance/close and discards errors. The page-reuse improvement is merged but unreleased | **STOP 4.1.0.** Re-enter only on an official successor and repeat the bounded resource/lifecycle control |
 
 RocksDB has the strongest operating history and broadest controls, but also the heaviest build and
@@ -164,6 +170,7 @@ regression, cleanup, and the independent immutable-release soak remain mandatory
 - [RocksDB mechanism/source closure](rocksdb-mechanism-source-closure-2026-07-24.md)
 - [TidesDB empirical entry validation](tidesdb-current-package-reentry-2026-07-28.md)
 - [Fjall 3.1.8 adapter-entry source closure](fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md)
+- [Fjall 3.1.8 worker-lifecycle empirical closure](fjall-3.1.8-worker-lifecycle-empirical-closure-2026-07-29.md)
 - [redb 4.1.0 bounded review](redb-4.1.0-bounded-review-2026-07-29.md)
 - [working-state placement analysis](state-working-state-options-2026-07-24.md)
 

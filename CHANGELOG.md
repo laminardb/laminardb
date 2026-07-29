@@ -10,10 +10,13 @@
   official binding, and it is not production-qualified. No runtime dependency or adapter is added
   by this decision; `[LDB-4007]` and `[LDB-0013]` remain fail-closed.
 - Current TidesDB releases are rejected after native 9.3.14 and a separate short-return contract
-  test exposed false-success commit paths; PR 664 is not an eligible released artifact. Fjall 3.1.8
-  is rejected for current use because its released worker-error/drop path can wait indefinitely,
-  and redb 4.1.0 remains stopped on resource/lifecycle evidence. They are watch/re-entry subjects,
-  not runtime fallbacks. The stopped redb construction job is removed from required CI.
+  test exposed false-success commit paths; PR 664 is not an eligible released artifact. A bounded
+  stock Fjall 3.1.8 fault child now empirically confirms that its worker-error/drop path waits
+  indefinitely. A small worker-accounting patch closes that exact branch, but remains unreleased
+  and does not provide a bounded/fallible close or complete maintenance-error surface; no production
+  fork is carried. Redb 4.1.0 remains stopped on resource/lifecycle evidence. These are watch/re-
+  entry subjects, not runtime fallbacks. The stopped redb construction job is removed from required
+  CI.
 - Managed aggregate candidates are now planned and initialized before checkpoint recovery in
   embedded, single-node, and cluster pipelines. Catalog-bridged and intermediate source schemas are
   registered before that planning boundary.

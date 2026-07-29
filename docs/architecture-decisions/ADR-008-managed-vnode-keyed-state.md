@@ -4,7 +4,7 @@
   local-spill backend is selected, production qualification is paused, and cluster admission is
   unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-29 after the RocksDB adapter-entry source closure
+- **Last reconciled:** 2026-07-29 after Core Cycle 11 and the Fjall lifecycle reproduction
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** released `rocksdb` 0.24.0 is stopped at the cleanup/lifecycle
   source gate; no backend is selected or production-qualified, and admission is **NO-GO**
@@ -16,8 +16,9 @@
   [official-release backend selection](../reports/official-release-state-backend-selection-2026-07-29.md),
   [RocksDB adapter-entry source closure](../reports/rocksdb-0.24.0-adapter-entry-source-closure-2026-07-29.md),
   [Fjall 3.1.8 source closure](../reports/fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md),
+  [Fjall lifecycle reproduction](../reports/fjall-3.1.8-worker-lifecycle-empirical-closure-2026-07-29.md),
   [TidesDB empirical re-entry](../reports/tidesdb-current-package-reentry-2026-07-28.md), and
-  [latest core review](../reviews/distributed-keyed-state-core-cycle-10.md)
+  [latest core review](../reviews/distributed-keyed-state-core-cycle-11.md)
 
 ## Decision
 
@@ -51,6 +52,22 @@ for embedded mode. A sidecar would be a separate IPC/hot-path architecture, not 
 The first-veto rule therefore fired before Cargo, runtime, test-executable, or admission changes.
 Backend-neutral core work may continue; the reviewed, owner-approved released local-spill
 candidate set is empty.
+
+### 2026-07-29 Fjall 3.1.8 lifecycle reproduction
+
+The bounded
+[empirical closure](../reports/fjall-3.1.8-worker-lifecycle-empirical-closure-2026-07-29.md)
+forces the exact stock worker-error branch with a public compaction filter. The ordinary child
+returns from Drop, reopens, and exits zero. The fault child observes Fjall poison and reaches
+`DROP_BEGIN`, but the parent must kill and reap it after 15 seconds with no `DROP_RETURNED`.
+
+A one-file validation counterpatch based on the exact release counts each spawn attempt and uses an
+RAII worker-exit guard. It makes the same fault child return, with no record-hot-path work. That
+closes the reproduced counter leak, not the backend contract: Drop still lacks a deadline,
+fallible/joined result, and protection against a live worker stuck in synchronous I/O or its work
+queue; the warning-only maintenance-health gap remains. Submit the narrow repair upstream if
+authorized, but do not carry a production fork. Stock 3.1.8 remains rejected and no backend is
+selected.
 
 ### 2026-07-29 official-release backend selection (historical entry authority)
 
@@ -114,13 +131,12 @@ universal Fjall data-correctness failure. Native resource limits, lossy private 
 synchronous write halts, and incomplete diagnostics remain supporting qualification risks rather
 than the primary stop.
 
-The source result remains `OBSERVED_DESIGN_UNSUPPORTED_IN_STOCK_SOURCE`, but the later empirical-
-method review corrects its decision reach: Fjall is `SOURCE_BLOCKED_PENDING_TARGETED_REPRO`, not
-empirically or permanently rejected. A definitive lifecycle result requires a bounded test that
-forces the observed worker-error branch and destroys the database under an external deadline. No
-such Fjall candidate test has run. The later official-release selection rejected Fjall 3.1.8 for
-current use and carried RocksDB into its now-completed source gate; the subsequent RocksDB closure
-also stopped before adapter construction. Backend-neutral core work may continue.
+That source-only cycle correctly stopped without an executable claim. The later
+[targeted reproduction](../reports/fjall-3.1.8-worker-lifecycle-empirical-closure-2026-07-29.md)
+now confirms the exact released defect and validates only the narrow exit-accounting counterpatch.
+It does not reverse the stock rejection or select a fork. The official-release selection carried
+RocksDB into its now-completed source gate; the subsequent RocksDB closure also stopped before
+adapter construction. Backend-neutral core work may continue.
 
 ### 2026-07-28 Fjall 3.1.8 priority amendment
 
@@ -377,7 +393,7 @@ seal, coordinator decision, or restore-before-activate authority.
 | Local-spill product profile | Sole current broad-state product target, but no released engine is selected or admitted | Continue backend-neutral core work. Re-enter only an exact official release that can meet fallible/bounded vnode cleanup and all-mode lifecycle without a fork or private patch |
 | Qualification contract | Cycle 38 maintenance-health v2 and exact v4 remain immutable validation/reference lineage; no GitHub approval workflow exists or is required for that scope; v1 remains immutable regression lineage | Do not relabel frozen evidence. Any later candidate run needs exact source/build/profile/plan/target/limits authority and may use only truthful candidate or Laminar-owned bounded signals; unsupported is never zero |
 | RocksDB 10.4.2 via `rocksdb` 0.24.0 | **STOP CURRENT RELEASE.** Range compaction discards native status and has no deadline; close/cancellation are void and unbounded | Re-enter only an official release with observable bounded prefix reclamation and an acceptable all-mode lifecycle; no adapter or runtime dependency now |
-| Fjall 3.1.8, official tag `6debe706` | **REJECT CURRENT RELEASE.** The worker-error/drop lifecycle hazard remains in the released source and cannot be repaired by a Laminar wrapper under the no-fork rule | Re-enter only after a newer official release fixes successful-spawn/worker-exit accounting, proves bounded teardown, and permits a new maintenance/error-surface review |
+| Fjall 3.1.8, official tag `6debe706` | **REJECT CURRENT RELEASE; DEFECT EMPIRICALLY CONFIRMED.** A one-file RAII counterpatch closes the forced worker-error leak, but is unreleased and leaves Drop without a deadline/fallible result plus the maintenance-health gap | Prefer an upstream patch and official successor; re-enter only released source that proves the complete all-mode lifecycle. Do not carry a production fork |
 | redb 4.1.0 | **Stop 4.1.0; reconsider only an official successor.** Physical allocation stayed above the reference until offline compaction; there is no public fallible database close, and Drop performs maintenance/close while discarding errors. This is not a formal qualification result | No adapter or runtime dependency. A newer official release may begin with the same two-profile resource/maintenance control; no upstream change is pre-credited |
 | Official `tidesdb/tidesdb-rs` repository, Cargo package `tidesdb` | **REJECT CURRENT RELEASE; WATCHLIST ONLY.** Released 0.11.1 selects native 9.3.6; current native 9.3.14 and a separate short-return contract test expose false-success paths, and PR 664 is unreleased | Re-enter only after an equivalent fix ships in a native successor and matching official source/Rust packages, then repeat bounded entry |
 | SurrealKV 0.21.2 | Rejected unmodified; no active candidate track | Correctness/liveness fork and new bounded prescreen authority before reconsideration |
@@ -1894,7 +1910,8 @@ Targets are chosen before optimization results are known; “fast on a laptop”
 
 The checked-in [`linux-nvme-v4` input](../../tools/state-backend-qual/profiles/linux-nvme-v4.freeze-candidate.json)
 is accepted only for validation and immutable Fjall/RocksDB regression. Its exact roster and
-RocksDB-specific controls cannot be relabelled as a product run. Fjall 3.1.8 stopped before execution.
+RocksDB-specific controls cannot be relabelled as a product run. Fjall 3.1.8 stopped before broad
+candidate execution; the later single lifecycle reproduction is not a performance or product run.
 Any future candidate needs an exact execution profile and mapping that bind its source, Laminar
 adapter, configuration, target, limits, operation schedule, and truthful health sources. The
 standalone validator must continue to accept only explicitly ineligible forms, reject
@@ -2009,8 +2026,9 @@ correctness and risks falsely advertising end-to-end exactly-once.
 The removed tier cached checkpoint slices and used point operations; it did not own always-current
 state, and its dirty-state coupling was unsafe. Restoring it would preserve the missing lifecycle.
 Conversely, API checklists and old single-insert or vendor benchmarks are insufficient to qualify
-Fjall, RocksDB, or TidesDB for production. The bounded source closure blocks stock Fjall 3.1.8
-pending targeted reproduction without restoring the old tier. A future selected candidate still
+Fjall, RocksDB, or TidesDB for production. The bounded lifecycle reproduction now confirms stock
+Fjall 3.1.8's worker-error teardown defect without restoring the old tier; its narrow counterpatch
+does not select a fork. A future selected candidate still
 requires an absolute campaign
 because the backend directly affects the tail, resource governor, restore, cleanup, and operational
 surface; a permanent two-backend product is not planned.

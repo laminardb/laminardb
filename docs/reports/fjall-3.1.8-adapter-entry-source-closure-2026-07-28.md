@@ -1,5 +1,11 @@
 # Fjall 3.1.8 adapter-entry source closure
 
+> **2026-07-29 empirical follow-up:** the exact worker-error/drop hazard identified here is now
+> confirmed by the bounded
+> [lifecycle reproduction](fjall-3.1.8-worker-lifecycle-empirical-closure-2026-07-29.md). A one-file
+> RAII counterpatch closes that forced branch but not Fjall's complete all-mode lifecycle contract.
+> This document retains its original source-only scope and claims.
+
 - **Date:** 2026-07-28
 - **Scope:** one engineer-day, read-only source/contract closure; zero candidate machine-hours
 - **Subject:** stock official `fjall` 3.1.8, tag commit

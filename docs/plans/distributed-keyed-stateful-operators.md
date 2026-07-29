@@ -213,9 +213,10 @@ The Cycle 20 [working-state placement analysis](../reports/state-working-state-o
 separates the capability from a named engine but does not change sequencing authority. Phase 1
 remains blocked by the existing Phase 0 review gate. Any later gate split requires an accepted ADR/
 plan amendment with named scope and owners. Stock Fjall 3.1.8 failed bounded adapter entry: a fatal
-worker exit can leave database destruction waiting indefinitely on private worker accounting. The
-frozen maintenance-health contract also cannot obtain complete background-failure coverage from
-stock public facts. The later official-release decision carried canonical `rocksdb` 0.24.0 with
+worker exit leaves database destruction waiting indefinitely on private worker accounting, now
+confirmed by a deterministic child-process reproduction. A small validation counterpatch repairs
+that exact leak but remains unreleased and leaves unbounded/fallible close plus maintenance-health
+gaps, so Laminar carries no fork. The later official-release decision carried canonical `rocksdb` 0.24.0 with
 bundled RocksDB 10.4.2 into one bounded adapter-entry cycle; the completed source gate stopped it
 before code. It did not authorize qualification execution, runtime admission, or production use.
 Current RocksDB, TidesDB, Fjall, and redb releases are not runtime fallbacks. Backend-neutral Laminar lifecycle,
