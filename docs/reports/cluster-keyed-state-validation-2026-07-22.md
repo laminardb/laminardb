@@ -6,7 +6,7 @@
 
 **Scope:** admission and lifecycle validation only; no cluster capability is enabled by this work.
 
-**2026-07-28 core update (through Core Cycle 10):** The
+**2026-07-29 core update (through Core Cycle 11):** The
 [ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset)
 pauses later certification tooling. Core Cycle 1 adds a private reference managed vnode shard and
 caller-supplied lifecycle publication. Core Cycles 2–4 contain the existing runtime staging path
@@ -58,10 +58,20 @@ leader parent promotion occurs only after the exact Commit wins. Readiness v5, c
 staged-byte/retained-depth configuration change across a live cut require an explicit reset or new
 namespace until a capability-superset rule exists.
 
-These cycles do not add a bounded working-state backend or runtime selector, validate the exact
-production keyed budget, hold the acquired raw-body envelope as a transition-lifetime reservation,
-bound total transition memory/request/pause, admit a keyed/windowed/join operator, or relax
-`[LDB-4007]` or `[LDB-0013]`.
+Cycle 11 reserves the exact acquired subset's declared lineage payload bytes and artifact count
+from one worker-wide current-profile budget before its first body GET. The non-cloneable charge
+follows loaded bodies into the immutable pending transition; 32 shared request permits and the
+caller's absolute deadline/cancellation scope bound body reads. In-flight cancellation drops the
+backend future, request permit, collected bodies, and charge. For transitions that own restore
+input, exact-Arc cleanup releases abandoned input on publication, terminal poison, failed launch,
+and replacement without consuming newer work. Revoke-only final-owner exits own no charge and
+retain their durable staging authority after an indeterminate failure. Review removed an initial
+steady-state transition-slot lock/Arc retention, so record cycles have no new synchronization or
+allocation.
+
+These cycles do not add a bounded working-state backend or runtime selector, validate the complete
+production keyed budget, bound wrapper/seal/allocator/decode/RSS/publication cost, admit a keyed/
+windowed/join operator, or relax `[LDB-4007]` or `[LDB-0013]`.
 
 Cycle 7 also separates durable assignment adoption from installed vnode-state readiness.
 `CheckpointAssignmentAdoption.vnode_state_ready` is published `false` before startup/recovery clears
@@ -560,7 +570,7 @@ must not be patched as an isolated assertion:
   can leave an in-memory partial batch. Cluster execution must recover from the sealed cut rather
   than retry that batch locally until the managed state write is one atomic transaction.
 
-Cycles 6–9 close staged-material loss, activation before complete validation, mixed live
+Cycles 6–11 close staged-material loss, activation before complete validation, mixed live
 aggregate publication. The graph snapshots one exact pending-transition `Arc`, structurally
 resolves the complete raw-chain inventory against its cached participant roster, and asks every
 applicable SQL aggregate to prepare a mutation plan with private replacement collections. A
@@ -578,10 +588,12 @@ growth and adds a requested-subset receipt for transitive raw body bytes/artifac
 global-singleton path. Preparation still scans the full unsharded live aggregate maps to discover
 transitioned keys, clones those keys, can hold live state and prepared replacement collections
 simultaneously, and can leave successfully reserved capacity after abort. Publication and
-retirement remain proportional to transitioned state. There is no authoritative cluster-global
-pre-Commit keyed budget or complete reservation/deadline for wrapper and seal metadata, aggregate
-objects/requests, response buffering, retained spool, decoder scratch/expansion, decoded RSS,
-live/prepared/retired residency, or apply pause. The remaining boundary is therefore resource-
+retirement remain proportional to transitioned state. Cycle 10 supplies the current-profile
+pre-Commit raw-lineage authority, and Cycle 11 owns each acquired subset's declared bodies/
+artifacts under bounded body-read concurrency and one restore deadline. There is still no complete
+production keyed or transition-wide reservation for wrapper/seal metadata, allocator/response
+overhead, retained spool, decoder scratch/expansion, decoded RSS, live/prepared/retired residency,
+or apply pause. The remaining boundary is therefore resource-
 governed, vnode-sharded bounded-cost publication plus a second real state-family consumer—not
 another validator around the raw keyed payload.
 
@@ -901,9 +913,11 @@ The current branch's admission-neutral hardening was then checked separately:
 | Core Cycle 9 coordinator lifecycle | PASS, 5/5 focused regressions | Includes atomic promotion, revoke/reacquire reset, late old-attempt completion, and rejection of aborted/unsealed FULL or REFERENCE lineage as a successor base |
 | Core Cycle 9 feature/lint/server gates | PASS for completed targets | Cluster DB test check; DB no-default and no-default-plus-cluster checks; warnings-denied core all-features and DB cluster library Clippy; minimal server checks/build-only cluster target; formatting and diff hygiene passed. The `[LDB-4007]`/`[LDB-0013]` admission markers have no diff |
 | Core Cycle 9 broad Windows matrices | **NOT COMPLETED / NO PASS CLAIM** | A broad non-library DB build exhausted the Windows paging file; broad default-feature server commands stalled in Cargo and timed out. Neither produced a completed suite result; rerun on a sufficiently provisioned host |
+| Core Cycle 10 commit-domain lineage authority | PASS for focused current-profile scope | Participant-agreed limits and exact cluster totals, complete pre-Commit and pre-body parent-seal traversal, Abort/non-promotion on invalid ancestry, Commit-only parent promotion, affected coordinator/committer/rehydration/staging suites, feature checks, and warnings-denied Clippy passed. Broad suites and current-binary soaks were not run |
+| Core Cycle 11 raw restore-input ownership | PASS, 40 focused lifecycle/resource tests plus build/lint gates | Exact acquired-subset byte/artifact reservation before body GET, 32 shared body-read permits, in-flight cancellation/drop, publication/poison/failed-launch/replacement release, pointer-exact successor preservation, cluster and no-cluster checks, and warnings-denied Clippy passed. No backend, admission, latency/RSS result, or soak follows |
 | Independent immutable release-candidate soak | **NOT RUN** | Production certification remains unavailable |
 | Core Cycle 3 `operator_graph::tests` with cluster | PASS, 111/111 | Full graph unit module after opaque final-exit authority, rotation-fence, endpoint, restore-drift, assignment-drift, callback-failure, and sticky-poison checks |
-| Core Cycle 3 `final_owner_exit` focused filter | PASS, 8/8 | Audited committed last-vnode cleanup succeeds only for the exact predecessor/target identity and retains staging on every indeterminate result |
+| Current `final_owner_exit` focused filter | PASS, 11/11 | Audited committed last-vnode cleanup succeeds only for exact predecessor/target authority. Revoke-only exits own no raw restore-input charge; callback failure and post-callback restore, transport, or assignment drift poison the graph while retaining durable staging for retry |
 | `snapshot_watcher_handles_draining_phase` multi-node integration | PASS, 1/1 | A zero-vnode follower completes committed revoke without polling its source, remains intake-fenced and non-authoritative, and exposes inactive transport endpoints; not an independent soak |
 | Core Cycle 3 feature/lint matrices | PASS | `cargo check` and warnings-denied Clippy pass with no default features and with `cluster`; formatting and diff checks pass |
 | `state::partition_key::tests` | PASS, 15/15 | Typed row/hash/vnode ABI plus bounded routing-only schema identity, every admitted family golden, alias/order/nullability policy, dictionary hydration, and exact resource/type gates |
@@ -914,7 +928,7 @@ The current branch's admission-neutral hardening was then checked separately:
 | `aggregate_state::tests::global_changelog_delta_checkpoint_roundtrips` | PASS, 1/1 | The admitted global aggregate remains pinned to vnode 0 |
 | `db::tests::cluster_query_shape_admission_is_pre_mutation_and_mode_derived` | PASS, 1/1 | The `[LDB-4007]` feature matrix remains closed while stateless/global shapes remain admitted; two independent global aggregate streams prove admission is per query |
 | `aggregate_state::tests::embedded_float_grouping_remains_supported_without_partition_codec_gate` (`--no-default-features`) | PASS, 1/1 | Embedded planning and execution still accept a float key excluded from cluster partition ABI v1 |
-| `operator_graph::tests::later_restore_callback_failure_poisons_and_retains_complete_transition` | PASS, 1/1 | Preserves containment for the legacy `cfg(test)` mutation probe: an earlier callback can mutate, but the exact transition remains, no acquired vnode activates, installed authority is cleared, and the generation is poisoned. Production `SqlAggregateV1` uses the Cycle 8 prepared protocol instead |
+| `operator_graph::tests::later_restore_callback_failure_poisons_and_retires_exact_transition` | PASS, 1/1 | Preserves containment for the legacy `cfg(test)` mutation probe: an earlier callback can mutate, but the exact failed transition and raw-input charge are retired, no acquired vnode activates, vnode lifecycle remains `Restoring`, installed authority is cleared, and the generation is sticky-poisoned. A newer replacement would be preserved. Production `SqlAggregateV1` uses the prepared protocol instead |
 | `operator_graph::tests::checkpoint_quiescence_requires_pending_vnode_transitions_to_apply` | PASS, 1/1 | Acquire, revoke, and assignment-version changes block both snapshot APIs until graph drain applies the transition |
 | `pipeline_callback::tests::source_less_leader_holds_rotation_fence_through_whole_and_vnode_capture` | PASS, 1/1 | Production leader/source-less callback holds the existing rotation read token across both mutable capture callbacks and releases it before the tail |
 | `pipeline_callback::tests::source_less_immediate_follower_holds_rotation_fence_through_capture` | PASS, 1/1 | The real source-less `CaptureNow` follower route holds the token through both images and releases it before its blocked durable tail |
@@ -1113,23 +1127,25 @@ a managed keyed working-state capability connected to the distributed execution 
    tests, process-death/rebalance output oracles, recovery compatibility, and published latency and
    resource profiles.
 
-Core Cycles 6–10 implement the transition identity, authoritative participant roster, named FULL
+Core Cycles 6–11 implement the transition identity, authoritative participant roster, named FULL
 payloads whose decoded aggregate image is empty, placement scoping, structural preflight, aggregate
 semantic prepare-all/abort-all/infallible publication, net live-growth reserve, and current-path
 sealed raw-lineage receipt and Commit-domain authority subsets of item 5. Cycle 10 validates the
 complete cluster-global raw lineage before Commit and binds the exact totals and participant-agreed
 limits into the durable capsule. Restore reproduces the full metadata proof before bodies and
 preflights its acquired subset under the same contract. A rejected sealed attempt cannot become a
-successor parent.
+successor parent. Cycle 11 atomically reserves that acquired subset's declared raw lineage before
+body reads and transfers the charge through loaded and pending-transition ownership until exact
+publication or terminal retirement. One worker request pool and absolute deadline/cancellation
+scope bound the read phase.
 
-They do not complete the capability. The current contract is comparison-only and deliberately
-limited to the admitted global-singleton compatibility profile; it does not hold transition-lifetime
-raw-body memory or request permits. Wrapper/seal metadata, response buffering, request concurrency,
-retained spool, decode scratch/expansion, decoded RSS, simultaneous live/prepared/retired residency,
-and publication/retirement pause remain unreserved. The aggregate maps are not vnode-sharded for
-bounded-cost swaps, and no window/timer or join state family consumes the lifecycle. The hot-state
-service/backend, delivery composition, operator-specific contracts, and independent production
-proof in items 2–9 also remain open.
+They do not complete the capability. The current resource-owning slice is deliberately limited to
+the admitted global-singleton compatibility profile and its declared raw lineage. Wrapper/seal
+metadata, allocator/response overhead, decode scratch/expansion, decoded RSS, simultaneous live/
+prepared/retired residency, and publication/retirement pause remain unreserved. The aggregate maps
+are not vnode-sharded for bounded-cost swaps, and no window/timer or join state family consumes the
+lifecycle. The hot-state service/backend, delivery composition, operator-specific contracts, and
+independent production proof in items 2–9 also remain open.
 
 The existing `StateBackend` must not be mistaken for item 2. Its contract explicitly persists
 immutable per-checkpoint-attempt vnode artifacts and an exact-attempt durability seal. It has no

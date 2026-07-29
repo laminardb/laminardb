@@ -202,9 +202,11 @@ assignment may revoke exactly the vnodes it owned in the predecessor. The opaque
 binds both assignment versions and owner-map digests, the local process incarnation, predecessor
 membership, target absence, and the exact lost-vnode set. Final exit runs
 only under the rotation execution fence with inactive transport endpoints; callback failure or any
-post-callback authority drift poisons the graph and retains staging. Recovery authority, direct or
-no-store adoption, abort, and unaudited transitions remain fail-closed before intake, transport,
-registry, or staging mutation. The multi-node Windows path also now gives cluster compute workers an
+post-callback authority drift poisons the graph and retains that durable revoke-only staging for
+retry. A final-owner exit carries no restore bodies or raw-input reservation, so Cycle 11's
+terminal restore-input retirement does not apply to it. Recovery authority, direct or no-store
+adoption, abort, and unaudited transitions remain fail-closed before intake, transport, registry,
+or staging mutation. The multi-node Windows path also now gives cluster compute workers an
 explicit 4 MiB stack; this prevents the reproduced default-stack overflow but is not latency or RSS
 qualification.
 
@@ -261,13 +263,24 @@ cleanup when durable authority is available; an unresolved Abort requires recove
 makes that attempt a successor delta/reference parent or acknowledges its source cut. Leader parent
 promotion occurs only after the exact Commit wins.
 
-This is still current-profile containment, not the production keyed-state budget or a memory
-reservation. Encoded wrapper/seal metadata, request concurrency and response buffering, retained
-spool, decoder scratch and expansion, decoded state/RSS, live-plus-prepared-plus-retired residency,
-and apply/retirement pause remain separate production gates. Capsule v5 and readiness v5 are an
+Core Cycle 11 makes the current raw checkpoint-body dimension resource-owning. After metadata
+preflight and before the first body GET, a nonempty restore atomically reserves its exact acquired-
+subset declared lineage payload bytes and artifact count from one worker budget whose limits come
+from the committed contract. One non-cloneable charge follows the loaded `Bytes` into the immutable
+pending transition. Body reads share 32 worker permits and one caller-owned absolute deadline and
+cancellation scope. For a transition owning restore input, publication and terminal failure retire
+only the exact staged `Arc`; failed restore launch and replacement release abandoned input while
+vnodes remain `Restoring`. Revoke-only final-owner staging is deliberately retained on an
+indeterminate failure. No new record-path lock, allocation, I/O, or transition retention is
+introduced.
+
+This is still current-profile containment, not the complete production keyed-state budget. The
+charge covers declared raw lineage payload/artifact ownership, not encoded wrapper/seal metadata,
+allocator and response overhead, decoder scratch and expansion, decoded state/RSS, simultaneous
+live/prepared/retired residency, or apply/retirement pause. Capsule v5 and readiness v5 are an
 explicit reset/new-namespace boundary. So is changing `max_staged_bytes` or the retained-chain-
-derived depth across a live cut until a versioned capability-superset rule is designed. Nothing here
-authorizes relaxing `[LDB-4007]`.
+derived depth across a live cut until a versioned capability-superset rule is designed. Nothing
+here authorizes relaxing `[LDB-4007]`.
 
 The current V3/seal-8 change deliberately takes a reset boundary rather than a rolling bridge. A
 future managed-payload migration remains reader-first: one release reads both formats while writing
@@ -335,14 +348,17 @@ Core Cycle 9 additionally reserves aggregate prepare capacity from checked net f
 growth and lands the sealed-lineage, requested-subset pre-body preflight, exact parent verification,
 and staging-receipt path described above. Core Cycle 10 adds participant-agreed limits, complete
 pre-Commit parent-seal traversal and checked cluster totals, capsule binding, target reproduction,
-and Commit-only successor-parent promotion. The profile remains global-singleton compatibility;
-neither cycle admits keyed state.
+and Commit-only successor-parent promotion. Core Cycle 11 holds the acquired-subset raw-input
+charge through publication/failure, bounds body-read concurrency, and applies one absolute restore
+deadline/cancellation scope. The profile remains global-singleton compatibility; none of these
+cycles admits keyed state.
 
 This remains an aggregate reference lifecycle, not complete Phase 1. Transition-wide encoded
-bytes, object and request count, decode scratch, decoded RSS, transient live-plus-prepared-plus-
-retired residency, publication/retirement pause, bounded hot working state, source/state/sink
-delivery composition, tail-latency evidence, backend qualification, and independent soak remain
-open. Every implemented local keyed/windowed/join candidate that reaches cluster admission stays
+wrapper/seal and allocator overhead, decode scratch, decoded RSS, transient live-plus-prepared-plus-
+retired residency, publication/retirement pause, vnode-scalable publication, bounded hot working
+state, source/state/sink delivery composition, tail-latency evidence, backend qualification, and
+independent soak remain open. Every implemented local keyed/windowed/join candidate that reaches
+cluster admission stays
 behind `[LDB-4007]`. Some unsupported temporal/lookup forms are currently coerced to `INNER` and
 may also reach that guard; other unsupported forms fail earlier in planning. Cluster exactly-once
 stays behind `[LDB-0013]`, and production remains **NO-GO**.
@@ -981,14 +997,13 @@ Restore follows this protocol:
    source/shuffle/output intake only after complete publication. Off-thread retirement remains a
    future measured design choice rather than a current guarantee.
 
-Cycles 6–9 implement the immutable authority envelope, complete structural preflight, exact
+Cycles 6–11 implement the immutable authority envelope, complete structural preflight, exact
 transition retention, and the prepare/publish protocol for `SqlAggregateV1`. Each aggregate fully
 decodes and validates its complete restore/revoke batch into a mutation plan with private
 replacement collections. Any prepare or authority error aborts and finishes every attempted
 participant without poisoning or changing logical rows, dirty/delta bookkeeping, or ownership.
 Live-map capacity may remain larger after a failed prepare, although Cycle 9 reserves only checked
-net final growth. The graph then locks the exact pending
-slot and installed-state handle, revalidates
+net final growth. The graph then locks the exact pending slot and installed-state handle, revalidates
 assignment, transport, registry, and roster authority, invokes only unit-returning participant
 publication, activates the complete roster, installs the exact binding, and clears that exact
 pending transition. Retired aggregate state and the previous installed binding are destroyed only
@@ -999,14 +1014,15 @@ That proves logical atomicity for the current aggregate participant because grap
 assignment publication are excluded across the cut. It is not a bounded-pause result. Aggregate
 publication still moves/updates collections in proportion to transitioned state, preparation can
 temporarily retain live state and prepared replacement collections, can grow live capacity even if
-later aborted, and retirement can run destructors proportional to displaced state. Cycles 9–10
-account sealed raw restore-input bodies and bind a metadata-verified cluster-global compatibility
-contract before Commit, but do not hold an acquired-subset reservation or prove a bounded
-publication pause and complete transition-wide resource envelope. Raw response/spool ownership,
-decoded RSS and scratch, live-plus-prepared-plus-retired residency, and measured apply/retirement
-pause remain admission blockers. Vnode-level indirection remains required if measurement cannot
-prove the pause. A process crash during
-publication still discards the process image and reconstructs from the unchanged durable cut.
+later aborted, and retirement can run destructors proportional to displaced state. Cycles 9–11
+account sealed raw restore input, bind a metadata-verified cluster-global compatibility contract
+before Commit, and hold each acquired subset's declared raw payload/artifact charge through the
+pending transition. They do not prove a bounded publication pause or complete transition-wide
+resource envelope. Wrapper/seal metadata, allocator/response overhead, retained spool, decoded RSS
+and scratch, live-plus-prepared-plus-retired residency, and measured apply/retirement pause remain
+admission blockers. Vnode-level indirection remains required if measurement cannot prove the pause.
+A process crash during publication still discards the process image and reconstructs from the
+unchanged durable cut.
 
 Before any artifact fetch, graph construction runs a pure, fallible state-contract derivation for
 every lifecycle participant and caches the exact incremental physical plan, implementation/codec
@@ -1015,8 +1031,8 @@ data-plane callback may run; it does not mean that the plan contract is unknown.
 changed contract blocks the transition before row preflight. Prepare consumes the already validated
 spool using that cached implementation and builds only abortable shadow state; DataFusion node-local
 fallback remains rejected. The current flat aggregate maps are only diagnostic substrate:
-production publication first shards
-groups, emission state, dirty generations, timers, and deduplication metadata by vnode so prepare
+production publication first shards groups, emission state, dirty generations, timers, and
+deduplication metadata by vnode so prepare
 can build a replacement shard and publish/revoke it with bounded pointer swaps instead of scanning
 all groups.
 

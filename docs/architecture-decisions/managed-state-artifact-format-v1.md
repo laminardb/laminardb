@@ -354,10 +354,13 @@ or the production managed restore transaction and do not relax `[LDB-4007]`. Sep
 9 makes the current legacy raw-rkyv recovery path use exact V3/seal-8 lineage, requested-subset
 preflight, bounded sealed body reads, exact parent checks, and a staged verified-input receipt. Core
 Cycle 10 adds participant-agreed current-profile limits, complete metadata-only ancestry traversal,
-and a checked cluster-global contract before Commit and again at restore. That containment neither
-authenticates or decodes `VnodePartialV2` nor holds a raw-body memory reservation. Managed whole-
-transition preflight must still validate every roster entry, aggregate every object and decoder
-counter, and finish every chain before callbacks.
+and a checked cluster-global contract before Commit and again at restore. Cycle 11 adds a held
+acquired-subset reservation for the current legacy raw bodies/artifacts plus bounded body-read
+concurrency and an absolute deadline/cancellation scope. That containment still neither
+authenticates nor decodes `VnodePartialV2`; it does not charge this format's wrapper/directory,
+decoder, decoded-state, or allocator overhead. Managed whole-transition preflight must still
+validate every roster entry, aggregate every object and decoder counter, and finish every chain
+before callbacks.
 
 ## Rolling compatibility
 

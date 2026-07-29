@@ -63,8 +63,19 @@
   staged-byte or retained-chain configuration across a live cut has the same reset boundary until
   a versioned capability-superset rule exists. The limits are explicitly tagged
   `global_singleton_compatibility`: they close the Commit-domain raw-lineage authority gap but are
-  not a memory reservation, keyed admission, hot-state backend, or production resource/latency
-  result. `[LDB-4007]` and `[LDB-0013]` remain unchanged.
+  not themselves a memory reservation, keyed admission, hot-state backend, or production resource/
+  latency result. `[LDB-4007]` and `[LDB-0013]` remain unchanged.
+- Cluster vnode restore now atomically reserves each acquired subset's declared raw lineage bytes
+  and artifact count before its first body GET. The non-cloneable charge follows loaded bodies into
+  the exact pending transition; body reads share a 32-request worker pool and one absolute deadline/
+  cancellation scope. For transitions that own restore input, publication, terminal poison, failed
+  launch, and graph replacement release only the exact abandoned transition, preserving any newer
+  staged work. Revoke-only final-owner exits own no such charge and retain their durable staging
+  authority after an indeterminate failure. Cancellation after a
+  backend read starts drops the read future, request permit, collected bodies, and charge. This
+  adds no steady-state record-path lock or I/O and does not cover wrapper/seal metadata, allocator/
+  response overhead, decoder or decoded-state RSS, publication pause, a hot-state backend, keyed/
+  window/join admission, or exactly-once. `[LDB-4007]` and `[LDB-0013]` remain unchanged.
 - Replacement cluster processes now start fenced and use the audited recovery-successor path to
   recertify durable vnode owners. Pristine vnode-zero bootstrap remains distinct from stale owner
   or drain state, and a stale-process drain terminal is settled before successor recovery.

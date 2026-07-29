@@ -43,7 +43,7 @@ through every phase; they are not a final cleanup sprint.
 
 The owner reset is recorded normatively in
 [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset).
-Cycle 69 and later certification work are paused. Core Cycles 1–10 add a private reference shard and
+Cycle 69 and later certification work are paused. Core Cycles 1–11 add a private reference shard and
 a fail-closed graph containment path: exact owned/restoring vnode-roster and chain preflight,
 deterministic callbacks, delayed activation, sticky poison after indeterminate mutation, boot-cut
 validation, predecessor-authority repair, control-only completion while source intake is closed,
@@ -122,12 +122,21 @@ eligible. The contract is deliberately tagged `global_singleton_compatibility`; 
 admission or a memory reservation. A staged-byte or retained-depth configuration change across a
 live cut requires reset/new namespace until a capability-superset rule exists.
 
-Core Cycle 11 should make raw transition acquisition resource-owning rather than comparison-only:
-derive the exact acquired subset, reserve its raw body/artifact budget for the lifetime of the
-transition, bind request concurrency to those permits, cap retained in-flight response/spool bytes,
-apply an absolute restore/acquisition deadline with cancellation, and prove release on publish,
-abort, poison, and graph replacement. Encoded wrapper/seal metadata, decoder scratch and expansion,
-decoded/live/prepared/retired RSS, and apply/retirement pause remain separate limits.
+Core Cycle 11, recorded in the
+[cycle review](../reviews/distributed-keyed-state-core-cycle-11.md), makes the current raw-body
+dimension resource-owning. Each nonempty acquired subset atomically reserves its declared lineage
+payload bytes and artifact count from one worker budget before the first body GET. The non-cloneable
+reservation follows the loaded bodies into the immutable pending transition, while one shared
+32-request semaphore and the caller's absolute deadline/cancellation scope bound body reads.
+For transitions owning restore input, exact-Arc cleanup releases the charge on publication,
+terminal poison, failed launch, and graph replacement without removing newer work. Revoke-only
+final-owner staging has no charge and remains retryable after an indeterminate failure. Steady-state
+record cycles take no new lock or retain a transition Arc.
+
+This is current-profile raw-input containment, not the complete production keyed-state budget.
+Encoded wrapper/seal metadata, allocator and response overhead, decoder scratch and expansion,
+decoded/live/prepared/retired RSS, apply/retirement pause, and vnode-scalable publication remain
+separate limits.
 Bounded working-state storage remains later.
 Backend work does not block these slices. The selected RocksDB entry path failed its first released-
 API veto before code, as recorded in the
@@ -727,11 +736,11 @@ Work packages:
 
 ### 1E. Ownership lifecycle
 
-Cycles 6–9 land the transition identity, structural preflight, authoritative roster, explicit
-empty-state, aggregate prepare/publish, and current-path raw-lineage receipt subsets below. Phase 1E
-remains open until the pre-Commit global budget, remaining transition resource/pause bounds,
-vnode-sharded bounded-cost publication, a second real state-family consumer, and full lifecycle/
-fault/performance evidence are complete.
+Cycles 6–11 land the transition identity, structural preflight, authoritative roster, explicit
+empty-state, aggregate prepare/publish, current-profile pre-Commit raw-lineage authority, and held
+acquired-subset raw-input ownership below. Phase 1E remains open until the complete production
+transition resource/RSS/pause bounds, vnode-sharded bounded-cost publication, a second real state-
+family consumer, and full lifecycle/fault/performance evidence are complete.
 
 - Implement `Unowned -> Acquiring -> Restoring -> Validated -> Active` and
   `Active -> Frozen/Draining -> Revoked` in the graph/runtime.
@@ -765,6 +774,14 @@ fault/performance evidence are complete.
   parent seal reads; verify exact parent arithmetic and decoded base identity; and validate the
   verified-body receipt at immutable staging. This is global-singleton compatibility containment,
   not the production keyed-transition reservation.
+- **Landed in Cycle 10 for the current raw-rkyv path:** bind participant-agreed lineage limits and
+  exact metadata-verified cluster totals before Commit, reproduce the complete ancestry proof before
+  restore bodies, and permit successor-parent promotion only after the exact Commit wins.
+- **Landed in Cycle 11 for the current raw-rkyv path:** atomically reserve each acquired subset's
+  declared payload bytes/artifacts before its first body GET, hold the charge through the immutable
+  transition, share bounded body-read permits and one absolute deadline/cancellation scope, and
+  release only exact abandoned restore-input work on publication, terminal failure, launch failure,
+  or replacement. Revoke-only final-owner staging remains durable retry authority.
 - **Remaining:** keep stateful capability fail-closed unless initialize, capture, prepare, publish,
   abort, revoke, and finish are complete. Generalize this boundary only when a window or join
   consumer proves its timer/cursor/output needs; stateless operators remain legitimate
@@ -781,11 +798,10 @@ fault/performance evidence are complete.
   the current assignment has restoring vnodes or a staged transition.
 - Bound acquired-vnode input buffering, bulk install, post-acquire full rebase, and revoked-range
   cleanup. Prove stale owners cannot read/write/publish after rotation.
-- Complete one transition-wide reservation before fetch/prepare for the exact Commit-admitted
-  transitive payload/artifact total, wrapper/seal metadata, object and request count, retained spool,
-  decode scratch, decoded RSS, simultaneous live/prepared/retired residency, and publication/
-  retirement-pause work. The Cycle 9 compatibility receipt and per-vnode limits do not substitute
-  for this aggregate budget.
+- Complete the transition-wide production reservation beyond Cycle 11's declared raw-lineage
+  ownership: charge wrapper/seal metadata, allocator/response overhead, retained spool, decode
+  scratch, decoded RSS, simultaneous live/prepared/retired residency, and publication/retirement-
+  pause work. The current compatibility profile does not substitute for this complete keyed budget.
 - Introduce vnode-owned state shards before the aggregate migration so acquire/revoke publication
   is a bounded pointer swap rather than a full-map scan.
 
