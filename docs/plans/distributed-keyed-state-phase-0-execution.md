@@ -1,11 +1,11 @@
 # Phase 0 execution plan: distributed keyed state
 
 - **Status:** Certification/qualification execution paused; backend-neutral core reference work
-  resumed; canonical `rocksdb` 0.24.0 with bundled RocksDB 10.4.2 is the sole released backend
-  carried into bounded adapter entry; no runtime dependency, qualification result, independent
-  production-soak result, or admission change
+  resumed; released `rocksdb` 0.24.0 stopped at its adapter-entry source gate and no local-spill
+  backend is selected; no runtime dependency, qualification result, independent production-soak
+  result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-29 after the official-release backend selection
+- **Last reconciled:** 2026-07-29 after the RocksDB adapter-entry source closure
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -16,8 +16,12 @@ Phase 0 proves the contracts needed before any disk-backed working-state impleme
 considered for production admission. The
 [official-release selection](../reports/official-release-state-backend-selection-2026-07-29.md)
 ends the broad backend search and carries only canonical `rocksdb` 0.24.0 with bundled RocksDB
-10.4.2 into a small, fail-fast adapter-entry slice. That community Rust binding is not a
-Meta-published official binding, and the selection is not qualification or production evidence.
+10.4.2 into a small, fail-fast adapter-entry slice. The subsequent
+[source closure](../reports/rocksdb-0.24.0-adapter-entry-source-closure-2026-07-29.md) completed that
+slice with STOP before dependency or adapter because released range compaction discards native
+failure status and is unbounded, and the in-process close path is void/unbounded. No released local-
+spill backend is now selected. That community Rust binding is not a Meta-published official
+binding, and neither the selection nor source screen is qualification or production evidence.
 Backend-neutral
 Laminar lifecycle/checkpoint, publication-boundary, resource-admission and truthful health-
 composition work may continue without adding a backend dependency.
@@ -38,12 +42,11 @@ says otherwise. The subsequent
 ordinary execution and reproduces current-native false-success faults; it does not inherit adapter
 or qualification authority from that history.
 
-The 2026-07-29 selection supersedes all prior preference ordering. Current TidesDB releases fail
+The 2026-07-29 selection superseded all prior preference ordering. Current TidesDB releases fail
 acknowledged-write correctness, Fjall 3.1.8 fails the released lifecycle gate, and redb 4.1.0 remains
 stopped on resource/lifecycle evidence. None is a runtime fallback. The exact RocksDB pair may
-enter only one bounded adapter cycle; any required fork, git dependency, native patch, unbounded
-teardown, or inadequate released failure surface stops and removes it. `[LDB-4007]` and
-`[LDB-0013]` remain unchanged throughout.
+enter only the one now-completed bounded adapter cycle; its inadequate cleanup/failure and teardown
+surface stopped and removed it. `[LDB-4007]` and `[LDB-0013]` remain unchanged throughout.
 
 Core Cycles 2–10 add a fail-closed runtime containment path for staged local vnode transitions and a
 narrow audited, committed final-owner revoke path. Cycles 4–6 pin restore to the capsule-validated
@@ -882,13 +885,13 @@ lineage reader/staging receipt. The managed artifact-v1 and `VnodePartialV2` rea
 
 Remaining work is kept reviewable in this dependency order:
 
-1. retain the TidesDB, Fjall, redb, and RocksDB reports as decision evidence, but use only the
-   [official-release selection](../reports/official-release-state-backend-selection-2026-07-29.md)
-   as current candidate authority. The broad search is closed and there is no automatic fallback;
-2. `docs: select the released backend path` — complete. Carry only `rocksdb = 0.24.0` with
-   `librocksdb-sys 0.17.3+10.4.2` and bundled RocksDB 10.4.2. This canonical community binding is
-   not a Meta-authored official Rust binding. TidesDB current releases fail acknowledged-write
-   correctness, Fjall 3.1.8 fails bounded teardown, and redb 4.1.0 remains stopped;
+1. retain the TidesDB, Fjall, redb, and RocksDB reports as decision evidence, but use the
+   [RocksDB source closure](../reports/rocksdb-0.24.0-adapter-entry-source-closure-2026-07-29.md)
+   as current candidate authority. The broad search is closed, no backend is selected, and there
+   is no automatic fallback;
+2. `docs: select and source-screen the released backend path` — complete with STOP. The selection
+   carried `rocksdb = 0.24.0` with `librocksdb-sys 0.17.3+10.4.2` and bundled RocksDB 10.4.2 into
+   one bounded source gate. Its released cleanup/error and lifecycle surfaces failed before code;
 3. complete the remaining backend-neutral Laminar gaps required regardless of the engine.
    Core Cycle 10 now metadata-traverses every required parent seal, verifies exact child-parent
    lineage before the pre-Commit cluster-global payload/artifact sum, persists participant-agreed
@@ -911,18 +914,13 @@ Remaining work is kept reviewable in this dependency order:
    error and Rust `Drop` returned within its deadline while native close logged a flush failure.
    Unmodified native 9.3.14 unified mode and a separate short-return contract test exposed
    false-success commit paths;
-5. **Current backend-specific scope:** timebox one engineer-day and zero soak/qualification
-   machine-hours against the exact released RocksDB pair. First close the 10.4.2-to-current
-   correctness/security/lifecycle delta and
-   force verified bundled compilation (`ROCKSDB_COMPILE=1`; reject native-library overrides).
-   Then prove fresh-root identity, atomic two-table batch, point/range/snapshot export, explicit
-   flush, nominal Drop/reopen, vnode-prefix logical deletion plus quota-visible reclamation,
-   fresh-root restore, and foreground I/O/full-disk errors on Windows and WSL2/Linux. Teardown faults
-   run in a child process under a parent deadline; termination/quarantine proves only process-level
-   containment, not bounded in-process Drop. Remove the adapter if it needs a fork, git dependency,
-   native instrumentation, reusable-root assumption after indeterminate close, or unbounded
-   production lifecycle. Do not build a generic runtime-selectable backend framework, execute
-   qualification or the paused soak/certification track, or change cluster admission;
+5. **Backend-specific RocksDB scope — complete with STOP:** the exact release-delta and provenance
+   path were screened within the one-day/zero-machine-hour cap. Released `compact_range*` returns
+   `()` after its C shim discards native status and cannot be deadline-bound; close and cancellation
+   are void/unbounded. The first-veto rule stopped before bundled compilation, adapter construction,
+   candidate execution, or WSL2 testing. A child-process deadline would prove only process
+   containment and cannot repair embedded in-process lifecycle. No backend-specific implementation
+   is currently authorized;
 6. `docs: authorize an exact keyed-state qualification run`
    - the project owner may revise the candidate before explicitly authorizing exact thresholds, case
      matrix, Zipf sampler, runner source/build identity, target/isolation/limits/cost, and evidence

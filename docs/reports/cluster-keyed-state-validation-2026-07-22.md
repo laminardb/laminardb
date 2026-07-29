@@ -120,13 +120,12 @@ refusal reason, last successful report, or outcome-unknown reconciliation. Fixed
 recovery, and startup-checkpoint budgets also lack large-state validation. None of this is a row
 hot-path change or production-readiness evidence.
 
-**Current authority:** the
-[2026-07-28 Fjall source closure](fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md)
-disqualifies stock official Fjall 3.1.8 at adapter entry. Fatal worker exit can leave database drop
-waiting indefinitely on a private active-thread count, and the frozen v2 background-failure mapping
-cannot be completed from stock public facts. No Cargo dependency, bounded working-state integration,
-or runtime backend selector has landed. The Cycle 40/41 TidesDB v0.11.1/native 9.3.6 T0 stop remains
-historical evidence; any TidesDB re-entry must identify and audit the current official subject.
+**Current backend authority:** the
+[2026-07-29 RocksDB source closure](rocksdb-0.24.0-adapter-entry-source-closure-2026-07-29.md)
+stops released `rocksdb` 0.24.0 before dependency or adapter. Its range-compaction API discards
+native failure status and cannot be deadline-bound; close/cancellation are also void and unbounded.
+Current RocksDB, TidesDB, Fjall, and redb releases are not live fallbacks. No Cargo dependency,
+bounded working-state integration, runtime backend selector, or cluster admission has landed.
 [Cycle 42](../reviews/distributed-keyed-state-cycle-42.md)
 corrects current aggregate failure classification and proves synchronous output/checkpoint
 exclusion after an indeterminate apply. [Cycle 43](../reviews/distributed-keyed-state-cycle-43.md)

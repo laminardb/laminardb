@@ -4,9 +4,21 @@
 - **Scope:** worker-local state for embedded, single-node, and cluster execution
 - **Decision:** carry only `rocksdb = 0.24.0` with its bundled RocksDB 10.4.2 into the next
   bounded adapter-entry work
+- **Subsequent outcome:** the bounded source gate stopped that exact path before dependency or
+  adapter; there is currently no selected released local-spill backend
 - **Production status:** **NO-GO**; no backend is production-qualified and `[LDB-4007]` and
   `[LDB-0013]` remain fail-closed
 - **Runtime change:** none; no dependency or adapter is added by this decision
+
+## Subsequent adapter-entry outcome
+
+The [RocksDB adapter-entry source closure](rocksdb-0.24.0-adapter-entry-source-closure-2026-07-29.md)
+completed the authorized first-veto screen. Released `rocksdb` 0.24.0 exposes synchronous
+vnode-range compaction as `()` while its C shim discards native failure status; it also has no
+bounded, fallible in-process close. This fails the frozen cleanup and all-mode lifecycle contract.
+The cycle therefore stopped before code, and RocksDB is no longer a carry candidate. The selection
+rationale below is retained as the dated decision that authorized that screen, not as current
+adapter authority.
 
 ## Outcome
 
@@ -118,12 +130,12 @@ counters, properties, and Laminar-owned call/resource evidence with their true s
 Do not add hot-path native instrumentation, call an estimate exact, or encode unsupported data as
 zero merely to satisfy an engine-neutral schema.
 
-## Next bounded slice
+## Bounded slice authorized by this decision — completed with STOP
 
-Timebox the next backend-specific work to one engineer-day and zero soak/qualification
+The bounded work was timeboxed to one engineer-day and zero soak/qualification
 machine-hours against the exact released pair. Spend at most the first four hours on release-delta,
 build-provenance, and lifecycle closure; the first hard veto stops the cycle before an adapter. It
-may add only the minimum private owner needed to prove:
+could add only the minimum private owner needed to prove:
 
 1. a bounded 10.4.2-to-current-native delta screen for correctness, security, lifecycle, and
    resource fixes that would veto use of the older bundled engine;

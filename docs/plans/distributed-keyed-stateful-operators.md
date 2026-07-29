@@ -1,12 +1,13 @@
 # Phased plan: distributed keyed and stateful operators
 
-- **Status:** Core reference implementation resumed; canonical `rocksdb` 0.24.0 with bundled
-  RocksDB 10.4.2 is the sole released backend carried into bounded adapter entry; production
-  qualification/certification is paused and no new cluster operator is admitted
+- **Status:** Core reference implementation resumed; released `rocksdb` 0.24.0 stopped at the
+  adapter-entry cleanup/lifecycle gate, no local-spill backend is selected, production
+  qualification/certification is paused, and no new cluster operator is admitted
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-29 after the official-release backend selection
+- **Last reconciled:** 2026-07-29 after the RocksDB adapter-entry source closure
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Backend selection:** [official-release decision](../reports/official-release-state-backend-selection-2026-07-29.md)
+- **Backend result:** [RocksDB source closure](../reports/rocksdb-0.24.0-adapter-entry-source-closure-2026-07-29.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
 
@@ -128,9 +129,10 @@ apply an absolute restore/acquisition deadline with cancellation, and prove rele
 abort, poison, and graph replacement. Encoded wrapper/seal metadata, decoder scratch and expansion,
 decoded/live/prepared/retired RSS, and apply/retirement pause remain separate limits.
 Bounded working-state storage remains later.
-Backend work does not block these slices. The sole current backend-entry path and no-fork boundary
-are recorded in the
-[official-release selection](../reports/official-release-state-backend-selection-2026-07-29.md).
+Backend work does not block these slices. The selected RocksDB entry path failed its first released-
+API veto before code, as recorded in the
+[source closure](../reports/rocksdb-0.24.0-adapter-entry-source-closure-2026-07-29.md). There is no
+current backend-entry path or automatic fallback; the no-fork boundary remains.
 
 **DKS-CLEANUP-001 — final maintainability gate.** The distributed keyed-state feature maintainer
 owns this gate. Low-risk cleanup lands as each core slice stabilizes; the final sweep runs after the
@@ -139,7 +141,7 @@ admission. The independent soak must exercise the cleaned release candidate, so 
 also precedes that soak and any production-readiness claim. Its ordered inventory is:
 
 1. the official-release selection removes the obsolete redb construction job from required CI.
-   Before adding the selected adapter dependency, remove the remaining redb qualification code and
+   Before adding any future local-state adapter dependency, remove the remaining redb qualification code and
    oversized protocol document; retain the bounded decision report, and keep the minimal locked
    resource reproducer only if that report explicitly owns it as a diagnostic rather than a live
    candidate or CI surface;
@@ -204,10 +206,10 @@ remains blocked by the existing Phase 0 review gate. Any later gate split requir
 plan amendment with named scope and owners. Stock Fjall 3.1.8 failed bounded adapter entry: a fatal
 worker exit can leave database destruction waiting indefinitely on private worker accounting. The
 frozen maintenance-health contract also cannot obtain complete background-failure coverage from
-stock public facts. The later official-release decision carries canonical `rocksdb` 0.24.0 with
-bundled RocksDB 10.4.2 as the sole candidate for one bounded adapter-entry cycle. It does not
-authorize qualification execution, runtime admission, or production use. Current TidesDB, Fjall,
-and redb releases are not runtime fallbacks. Backend-neutral Laminar lifecycle,
+stock public facts. The later official-release decision carried canonical `rocksdb` 0.24.0 with
+bundled RocksDB 10.4.2 into one bounded adapter-entry cycle; the completed source gate stopped it
+before code. It did not authorize qualification execution, runtime admission, or production use.
+Current RocksDB, TidesDB, Fjall, and redb releases are not runtime fallbacks. Backend-neutral Laminar lifecycle,
 publication-boundary, checkpoint, resource-admission and health-composition work may continue.
 Bounded memory remains a reference/conformance implementation only; it has no cluster product
 schedule or production-soak matrix under this plan.
@@ -599,25 +601,16 @@ Work:
 5. Add the mandatory capability descriptor to design tests. Inventory every current operator as
    `Stateless`, `GlobalSingleton`, `VnodeKeyed`, `RebuildableReplicated`, or `LocalOnly` without
    changing admission.
-6. Complete only the bounded RocksDB adapter-entry gate defined by the
-   [official-release selection](../reports/official-release-state-backend-selection-2026-07-29.md).
-   First screen the released 10.4.2 engine against fixes through current native 11.1.2 and stop if a
-   material correctness, security, lifecycle, or resource fix cannot be consumed through an
-   official released Rust path. Otherwise pin the exact crate/sys/engine identity, force bundled
-   compilation with `ROCKSDB_COMPILE=1`, reject native-library overrides, and prove the minimum
-   all-mode conformance, fresh-root, vnode-prefix cleanup/reclamation, error, and quarantine
-   lifecycle on Windows and WSL2/Linux. Teardown fault tests use child-process containment; they do
-   not claim bounded in-process Drop. No fork, git dependency, native patch/instrumentation,
-   runtime selector, candidate execution profile, or cluster admission is authorized. The v4
-   RocksDB/Fjall contract remains immutable historical/reference evidence; its old candidate
-   preference fields have no selection authority after 2026-07-29. A successful adapter-entry
-   review may request separate qualification authority over exact features, native build, options,
-   workload, target, limits, and cost. Only that later qualification must exercise Arrow-batch
-   atomic requests, realistic hot/cold multi-key reads, timer scans, snapshot/export overlap,
-   sorted restore, vnode drop/GC, maintenance pressure/write stalls, hard memory/disk/FD limits,
-   `kill -9`, torn/corrupt data, `ENOSPC`, N/N-1 format rehearsal, and the approved endurance run.
-   A hard adapter-entry or qualification failure removes the target and returns backend choice to
-   an explicit owner decision; it never activates a fallback.
+6. Complete the bounded RocksDB adapter-entry gate defined by the
+   [official-release selection](../reports/official-release-state-backend-selection-2026-07-29.md)
+   — **complete with STOP before dependency or adapter**. The
+   [source closure](../reports/rocksdb-0.24.0-adapter-entry-source-closure-2026-07-29.md) found that
+   released range compaction discards failure status and has no deadline, while close/cancellation
+   are void and unbounded. `delete_file_in_range*` cannot guarantee vnode-prefix reclamation or
+   preserve the required held snapshot. No fork, private FFI, sidecar, generic selector, test
+   executable, candidate run, or admission change was added. Re-entry needs an exact official
+   release satisfying those gates; it never activates a fallback. The v4 RocksDB/Fjall contract
+   remains immutable historical/reference evidence.
 7. Record the complete delivery matrix: source consistency/topology and handoff; operator update
    mode and output identity; sink durability/topology/input mode; CP-5 ordering; permitted ALO
    duplicates; and combinations that remain closed. Benchmark at least one real certified source

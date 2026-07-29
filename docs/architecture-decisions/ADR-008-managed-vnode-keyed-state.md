@@ -1,19 +1,20 @@
 # ADR-008: Managed vnode-keyed working state for distributed operators
 
-- **Status:** Accepted for phased implementation; one released backend path selected for bounded
-  adapter entry, production qualification paused, and cluster admission unchanged
+- **Status:** Accepted for phased implementation; backend-neutral core work continues, no released
+  local-spill backend is selected, production qualification is paused, and cluster admission is
+  unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-29 after the official-release backend selection
+- **Last reconciled:** 2026-07-29 after the RocksDB adapter-entry source closure
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
-- **Production/backend verdict:** carry only canonical `rocksdb` 0.24.0 with bundled RocksDB 10.4.2
-  into bounded adapter entry; qualification remains separately gated, no backend is
-  production-qualified, and admission is **NO-GO**
+- **Production/backend verdict:** released `rocksdb` 0.24.0 is stopped at the cleanup/lifecycle
+  source gate; no backend is selected or production-qualified, and admission is **NO-GO**
 - **Related:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md),
   [implementation plan](../plans/distributed-keyed-stateful-operators.md),
   [historical Cycle 21 owner decisions](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md),
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [exact backend source audit](../reports/state-backend-static-audit-2026-07-23.md),
   [official-release backend selection](../reports/official-release-state-backend-selection-2026-07-29.md),
+  [RocksDB adapter-entry source closure](../reports/rocksdb-0.24.0-adapter-entry-source-closure-2026-07-29.md),
   [Fjall 3.1.8 source closure](../reports/fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md),
   [TidesDB empirical re-entry](../reports/tidesdb-current-package-reentry-2026-07-28.md), and
   [latest core review](../reviews/distributed-keyed-state-core-cycle-10.md)
@@ -24,18 +25,33 @@ LaminarDB will add one common, byte-governed, batch-oriented working-state servi
 pipeline, operator, table, vnode, and ownership identities. State access stays local; cold or
 blocking work is coalesced per Arrow batch and kept off compute/event-loop threads. The in-memory
 implementation is the semantic/lifecycle conformance subject only. Canonical `rocksdb` 0.24.0 with
-bundled RocksDB 10.4.2 is the sole released local-spill path carried into bounded adapter entry;
-that selection is not qualification or production evidence. The architecture does not intrinsically
-require an LSM.
+bundled RocksDB 10.4.2 was the sole released local-spill path carried into bounded adapter entry,
+but it failed the released cleanup/lifecycle gate before code. No released backend is now selected.
+The architecture does not intrinsically require an LSM.
 
 Cluster-shared checkpoint storage and the existing `StateBackend` remain recovery authority. A
 local store is disposable capacity/latency infrastructure: it cannot assign a vnode, authorize an
 epoch, replace restore-before-activate/revoke fencing, or create source/sink exactly-once semantics.
-No runtime backend dependency or adapter has landed. The selection below authorizes only the next
-small, fail-fast adapter-entry slice against the exact released pair; a required fork, git
-dependency, native patch, unbounded teardown, or inadequate released error surface stops it.
+No runtime backend dependency or adapter has landed. Any future candidate requires a new bounded
+re-entry decision against an exact official release; a fork, git dependency, private native patch,
+unbounded teardown, or inadequate released error surface remains disallowed.
 
-### 2026-07-29 official-release backend selection
+### 2026-07-29 RocksDB adapter-entry source closure
+
+The bounded
+[source closure](../reports/rocksdb-0.24.0-adapter-entry-source-closure-2026-07-29.md) stops
+`rocksdb` 0.24.0 before dependency or adapter. Its synchronous `compact_range*` safe methods return
+`()` and the bundled C shim discards native `Status`, so Laminar cannot observe failure or bound
+vnode-prefix physical reclamation. `delete_file_in_range*` leaves L0 and mixed-boundary files and
+is incompatible with the required held-snapshot check. Database Drop/close and background-work
+cancellation are also void/unbounded.
+
+A child-process deadline proves process containment only and cannot supply an in-process lifecycle
+for embedded mode. A sidecar would be a separate IPC/hot-path architecture, not a small adapter.
+The first-veto rule therefore fired before Cargo, runtime, test-executable, or admission changes.
+Backend-neutral core work may continue; the released local-spill candidate set is empty.
+
+### 2026-07-29 official-release backend selection (historical entry authority)
 
 The
 [selection report](../reports/official-release-state-backend-selection-2026-07-29.md) ends the broad
@@ -101,9 +117,9 @@ The source result remains `OBSERVED_DESIGN_UNSUPPORTED_IN_STOCK_SOURCE`, but the
 method review corrects its decision reach: Fjall is `SOURCE_BLOCKED_PENDING_TARGETED_REPRO`, not
 empirically or permanently rejected. A definitive lifecycle result requires a bounded test that
 forces the observed worker-error branch and destroys the database under an external deadline. No
-such Fjall candidate test has run. The later official-release selection rejects Fjall 3.1.8 for
-current use and carries RocksDB as the sole adapter-entry candidate; backend-neutral core work may
-continue.
+such Fjall candidate test has run. The later official-release selection rejected Fjall 3.1.8 for
+current use and carried RocksDB into its now-completed source gate; the subsequent RocksDB closure
+also stopped before adapter construction. Backend-neutral core work may continue.
 
 ### 2026-07-28 Fjall 3.1.8 priority amendment
 
@@ -143,7 +159,8 @@ production claim lands in this documentation amendment. `[LDB-4007]` and `[LDB-0
 closed, the existing failover, ALO, and EO-eligible regression suites remain mandatory, and an independently
 operated immutable release-candidate soak remains required after integration and qualification.
 The frozen v4 validation contract and its historical preference metadata are not rewritten; its
-wire/formula regression lineage remains immutable while this ADR is current candidate authority.
+wire/formula regression lineage remains immutable while the source closure owns current candidate
+authority.
 
 ### 2026-07-27 workstream reset
 
@@ -340,9 +357,9 @@ seal, coordinator decision, or restore-before-activate authority.
 | Track | Current disposition | Required next authority/evidence |
 |---|---|---|
 | In-memory | Reference/conformance-only; no product profile, admission schedule, fallback, or soak matrix | A separate future ADR/charter amendment before any bounded-memory product claim |
-| Local-spill product profile | Sole current broad-state product target; canonical `rocksdb` 0.24.0 with bundled RocksDB 10.4.2 is the only released path carried forward, but it is not qualified or admitted | Run the one-cycle adapter entry against the exact released pair; stop on any required fork/patch or unbounded lifecycle, otherwise request separate qualification authority |
+| Local-spill product profile | Sole current broad-state product target, but no released engine is selected or admitted | Continue backend-neutral core work. Re-enter only an exact official release that can meet fallible/bounded vnode cleanup and all-mode lifecycle without a fork or private patch |
 | Qualification contract | Cycle 38 maintenance-health v2 and exact v4 remain immutable validation/reference lineage; no GitHub approval workflow exists or is required for that scope; v1 remains immutable regression lineage | Do not relabel frozen evidence. Any later candidate run needs exact source/build/profile/plan/target/limits authority and may use only truthful candidate or Laminar-owned bounded signals; unsupported is never zero |
-| RocksDB 10.4.2 via `rocksdb` 0.24.0 | **SOLE CARRY CANDIDATE; ADAPTER ENTRY ONLY.** Canonical community Rust release, not a Meta-authored official Rust binding; close status, native resources, maintenance, teardown, and tails remain unproved | Build only the smallest private owner/conformance slice. Quiesce, checkpoint, flush, wait/cancel, externally bound Drop, quarantine, and fresh-root restore; no fork, generic selector, qualification execution, admission change, or production claim |
+| RocksDB 10.4.2 via `rocksdb` 0.24.0 | **STOP CURRENT RELEASE.** Range compaction discards native status and has no deadline; close/cancellation are void and unbounded | Re-enter only an official release with observable bounded prefix reclamation and an acceptable all-mode lifecycle; no adapter or runtime dependency now |
 | Fjall 3.1.8, official tag `6debe706` | **REJECT CURRENT RELEASE.** The worker-error/drop lifecycle hazard remains in the released source and cannot be repaired by a Laminar wrapper under the no-fork rule | Re-enter only after a newer official release fixes successful-spawn/worker-exit accounting, proves bounded teardown, and permits a new maintenance/error-surface review |
 | redb 4.1.0 | **Stop 4.1.0; reconsider only an official successor.** Physical allocation stayed above the reference until offline compaction; there is no public fallible database close, and Drop performs maintenance/close while discarding errors. This is not a formal qualification result | No adapter or runtime dependency. A newer official release may begin with the same two-profile resource/maintenance control; no upstream change is pre-credited |
 | Official `tidesdb/tidesdb-rs` repository, Cargo package `tidesdb` | **REJECT CURRENT RELEASE; WATCHLIST ONLY.** Released 0.11.1 selects native 9.3.6; current native 9.3.14 and a separate short-return contract test expose false-success paths, and PR 664 is unreleased | Re-enter only after an equivalent fix ships in a native successor and matching official source/Rust packages, then repeat bounded entry |
@@ -350,6 +367,7 @@ seal, coordinator decision, or restore-before-activate authority.
 
 The current source detail and rationale live in the
 [official-release selection](../reports/official-release-state-backend-selection-2026-07-29.md),
+[RocksDB adapter-entry source closure](../reports/rocksdb-0.24.0-adapter-entry-source-closure-2026-07-29.md),
 [placement analysis](../reports/state-working-state-options-2026-07-24.md),
 [v2 direction](state-backend-maintenance-health-v2-proposal.md),
 [v2 validation contract](state-backend-qualification-runner-v2-draft.md),
@@ -361,8 +379,8 @@ The current source detail and rationale live in the
 [historical TidesDB package design](tidesdb-local-state-successor-design.md), and
 [historical TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
 [TidesDB empirical re-entry](../reports/tidesdb-current-package-reentry-2026-07-28.md). These
-are evidence and gate records. The official-release selection is current candidate authority; no
-runtime dependency, qualification result, or production admission follows.
+are evidence and gate records. The RocksDB source closure is current candidate authority: no
+released backend, runtime dependency, qualification result, or production admission follows.
 
 The existing fixed vnode ABI, bounded shuffle, assignment/process fencing, aligned barriers,
 per-vnode checkpoint artifacts, and exact-attempt seal are retained. Cluster admission will move
