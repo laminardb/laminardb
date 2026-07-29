@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
+use laminar_core::checkpoint::VnodeRestoreLimitProfile;
 use laminar_core::state::{
     CheckpointAttempt, CheckpointSealInventory, SealedVnodePartial, StateBackend,
     VnodePartialLineage,
@@ -141,6 +142,7 @@ pub(crate) struct SealedVnodeChainReader<'a> {
     validated_head_attempt: Option<CheckpointAttempt>,
     max_partial_bytes: u64,
     max_artifacts_per_vnode_chain: usize,
+    restore_profile: VnodeRestoreLimitProfile,
     committed_full_cut_lineage_payload_bytes: u64,
     committed_full_cut_lineage_artifacts: u64,
 }
@@ -156,6 +158,7 @@ impl<'a> SealedVnodeChainReader<'a> {
             validated_head_attempt: None,
             max_partial_bytes: u64::MAX,
             max_artifacts_per_vnode_chain: usize::MAX,
+            restore_profile: VnodeRestoreLimitProfile::GlobalSingletonCompatibility,
             committed_full_cut_lineage_payload_bytes: u64::MAX,
             committed_full_cut_lineage_artifacts: u64::MAX,
         }
@@ -180,6 +183,7 @@ impl<'a> SealedVnodeChainReader<'a> {
             head,
             max_partial_bytes,
             max_artifacts_per_vnode_chain,
+            contract.limits.profile,
             contract.exact_cluster_lineage_payload_bytes,
             contract.exact_cluster_lineage_artifacts,
         )
@@ -217,6 +221,7 @@ impl<'a> SealedVnodeChainReader<'a> {
             head,
             max_partial_bytes,
             max_artifacts_per_vnode_chain,
+            head.contract().limits.profile,
             test_full_cut_lineage_payload_bytes,
             test_full_cut_lineage_artifacts,
         )
@@ -228,6 +233,7 @@ impl<'a> SealedVnodeChainReader<'a> {
         head: &crate::checkpoint_coordinator::ValidatedVnodeRestoreHead,
         max_partial_bytes: u64,
         max_artifacts_per_vnode_chain: usize,
+        restore_profile: VnodeRestoreLimitProfile,
         committed_full_cut_lineage_payload_bytes: u64,
         committed_full_cut_lineage_artifacts: u64,
     ) -> Result<Self, DbError> {
@@ -275,6 +281,7 @@ impl<'a> SealedVnodeChainReader<'a> {
             validated_head_attempt: Some(attempt),
             max_partial_bytes,
             max_artifacts_per_vnode_chain,
+            restore_profile,
             committed_full_cut_lineage_payload_bytes,
             committed_full_cut_lineage_artifacts,
         })
@@ -744,11 +751,14 @@ impl<'a> SealedVnodeChainReader<'a> {
                         "[LDB-6051] vnode {vnode} delta parent {parent_attempt:?} failed seal verification: {error}"
                     ))
                 })?;
-            let parent_partial = VnodePartial::decode(&parent_bytes).map_err(|error| {
-                DbError::Checkpoint(format!(
+            let parent_partial =
+                VnodePartial::decode_for_restore(&parent_bytes, self.restore_profile).map_err(
+                    |error| {
+                        DbError::Checkpoint(format!(
                     "[LDB-6051] vnode {vnode} delta parent {parent_attempt:?} is invalid: {error}"
                 ))
-            })?;
+                    },
+                )?;
             Self::verify_decoded_parent(
                 vnode,
                 parent_attempt,
@@ -803,13 +813,15 @@ impl<'a> SealedVnodeChainReader<'a> {
             .await?;
         let mut current = attempt;
         loop {
-            let partial = VnodePartial::decode(&bytes).map_err(|error| {
-                DbError::Checkpoint(format!(
+            let partial = VnodePartial::decode_for_restore(&bytes, self.restore_profile).map_err(
+                |error| {
+                    DbError::Checkpoint(format!(
                     "[LDB-6051] vnode {vnode} has an invalid partial at epoch {} checkpoint {}: \
                      {error}",
                     current.epoch, current.checkpoint_id
                 ))
-            })?;
+                },
+            )?;
             Self::verify_decoded_parent(vnode, current, &partial, &attestation)?;
             if !partial.operators.is_empty() || !partial.deltas.is_empty() {
                 return Ok((bytes, current, partial, attestation));

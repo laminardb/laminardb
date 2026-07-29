@@ -470,6 +470,90 @@ async fn rehydrate_reads_committed_partials_and_rejects_missing_vnodes() {
         .contains("absent from the exact state seal"));
 }
 
+#[tokio::test]
+async fn rehydrate_rejects_outer_entry_amplification_without_parent_io() {
+    let backend = ReadCountingBackend::new(1);
+    let parent = CheckpointAttempt::canonical(6);
+    write_and_seal_partial(
+        &backend,
+        parent,
+        crate::vnode_partial::VnodePartial {
+            operators: vec![("agg".to_string(), b"parent".to_vec())],
+            base: None,
+            deltas: Vec::new(),
+        },
+    )
+    .await;
+    let child = CheckpointAttempt::canonical(7);
+    write_and_seal_partial(
+        &backend,
+        child,
+        crate::vnode_partial::VnodePartial {
+            operators: vec![
+                ("agg".to_string(), Vec::new()),
+                ("unexpected".to_string(), Vec::new()),
+            ],
+            base: Some(parent),
+            deltas: Vec::new(),
+        },
+    )
+    .await;
+
+    let error = SealedVnodeChainReader::new(&backend)
+        .load_at(&[0], child)
+        .await
+        .expect_err("an over-roster legacy outer archive must fail closed");
+
+    assert!(error.to_string().contains("allows at most 1"), "{error}");
+    assert_eq!(
+        backend.sealed_partial_body_reads(),
+        1,
+        "the invalid head must fail before any parent body can be requested"
+    );
+}
+
+#[tokio::test]
+async fn rehydrate_rejects_outer_entry_amplification_in_delta_parent() {
+    let backend = ReadCountingBackend::new(1);
+    let parent = CheckpointAttempt::canonical(6);
+    write_and_seal_partial(
+        &backend,
+        parent,
+        crate::vnode_partial::VnodePartial {
+            operators: vec![
+                ("agg".to_string(), Vec::new()),
+                ("unexpected".to_string(), Vec::new()),
+            ],
+            base: None,
+            deltas: Vec::new(),
+        },
+    )
+    .await;
+    let child = CheckpointAttempt::canonical(7);
+    write_and_seal_partial(
+        &backend,
+        child,
+        crate::vnode_partial::VnodePartial {
+            operators: Vec::new(),
+            base: Some(parent),
+            deltas: vec![("agg".to_string(), b"delta".to_vec())],
+        },
+    )
+    .await;
+
+    let error = SealedVnodeChainReader::new(&backend)
+        .load_at(&[0], child)
+        .await
+        .expect_err("an over-roster delta parent must fail closed");
+
+    assert!(error.to_string().contains("allows at most 1"), "{error}");
+    assert_eq!(
+        backend.sealed_partial_body_reads(),
+        2,
+        "the accepted head and invalid parent are the only bodies read"
+    );
+}
+
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn validated_head_is_reused_and_rejects_attempt_substitution() {

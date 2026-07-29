@@ -4412,7 +4412,7 @@ async fn rehydration_delta_without_full_base_is_rejected_before_callbacks() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn duplicate_operator_in_one_partial_is_rejected_before_callbacks() {
+async fn outer_entry_amplification_is_rejected_before_callbacks() {
     let partial = crate::vnode_partial::VnodePartial {
         operators: vec![("agg".to_string(), vec![1]), ("agg".to_string(), vec![2])],
         base: None,
@@ -4436,9 +4436,49 @@ async fn duplicate_operator_in_one_partial_is_rejected_before_callbacks() {
     let error = graph
         .execute_cycle(&FxHashMap::default(), i64::MAX, None)
         .await
-        .expect_err("ambiguous legacy participant entries must fail closed");
+        .expect_err("an over-roster legacy outer archive must fail closed");
 
-    assert!(error.to_string().contains("repeats operator 'agg'"));
+    assert!(error.to_string().contains("allows at most 1"), "{error}");
+    assert!(applied.lock().is_empty());
+    assert!(registry.is_restoring(0));
+    assert!(pending_is_exact(&pending, &published));
+    assert!(graph.execution_poison_reason().is_none());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn duplicate_operator_name_is_rejected_after_bounded_preflight() {
+    let partial = crate::vnode_partial::VnodePartial {
+        operators: vec![("agg".to_string(), vec![1]), ("agg".to_string(), vec![2])],
+        base: None,
+        deltas: Vec::new(),
+    };
+    let VnodeTransitionHarness {
+        mut graph,
+        registry,
+        pending,
+        published,
+    } = vnode_transition_harness(1, &[0], vec![(0, vec![encoded_vnode_partial(&partial)])]).await;
+    let applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    for name in ["agg", "other"] {
+        graph.push_test_node(
+            name,
+            Box::new(RecordingVnodeRestoreOperator {
+                applied: Arc::clone(&applied),
+                failure_on_vnode: None,
+            }),
+        );
+    }
+
+    let error = graph
+        .execute_cycle(&FxHashMap::default(), i64::MAX, None)
+        .await
+        .expect_err("duplicate participant names must fail closed");
+
+    assert!(
+        error.to_string().contains("repeats operator 'agg'"),
+        "{error}"
+    );
     assert!(applied.lock().is_empty());
     assert!(registry.is_restoring(0));
     assert!(pending_is_exact(&pending, &published));
@@ -4477,10 +4517,7 @@ async fn operator_without_vnode_restore_contract_cannot_silently_accept_state() 
 #[tokio::test]
 async fn missing_rehydration_operator_is_rejected_before_callbacks() {
     let partial = crate::vnode_partial::VnodePartial {
-        operators: vec![
-            ("present".to_string(), vec![1]),
-            ("ghost".to_string(), vec![2]),
-        ],
+        operators: vec![("ghost".to_string(), vec![2])],
         base: None,
         deltas: Vec::new(),
     };

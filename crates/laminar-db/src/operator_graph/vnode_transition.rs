@@ -432,11 +432,15 @@ impl OperatorGraph {
             Arc::clone(&transition.pending_handle),
             Arc::clone(&transition.pending),
         );
-        let attempt = transition
-            .pending
-            .restore_cut()
+        let restore_cut = transition.pending.restore_cut();
+        let attempt = restore_cut
             .map(crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut::attempt);
-        let decoded = match self.preflight_decoded_vnodes(transition.pending.restores(), attempt) {
+        let restore_profile = restore_cut.map(|cut| cut.restore_head().contract().limits.profile);
+        let decoded = match self.preflight_decoded_vnodes(
+            transition.pending.restores(),
+            attempt,
+            restore_profile,
+        ) {
             Ok(decoded) => decoded,
             Err(error) => {
                 transition_unwind.complete();
@@ -736,6 +740,7 @@ impl OperatorGraph {
         &self,
         staged: &[PendingVnodeRestore],
         attempt: Option<laminar_core::state::CheckpointAttempt>,
+        restore_profile: Option<laminar_core::checkpoint::VnodeRestoreLimitProfile>,
     ) -> Result<Vec<DecodedVnode>, DbError> {
         // Decode and bind every participant before the first revoke or restore callback.
         let mut decoded = Vec::with_capacity(staged.len());
@@ -746,17 +751,35 @@ impl OperatorGraph {
                     "[LDB-6051] pending vnode restore has no exact committed attempt".into(),
                 ));
             };
+            let Some(restore_profile) = restore_profile else {
+                return Err(DbError::Checkpoint(
+                    "[LDB-6051] pending vnode restore has no committed restore profile".into(),
+                ));
+            };
             if rehydrated.chain().is_empty() {
                 return Err(DbError::Checkpoint(format!(
                     "[LDB-6051] vnode {vnode} rehydration chain has no links"
                 )));
             }
+            let expected = self.managed_vnode_participants(vnode)?;
             let chain: Vec<VnodePartial> = rehydrated
                 .chain()
                 .iter()
                 .enumerate()
                 .map(|(link, bytes)| {
-                    VnodePartial::decode(bytes).map_err(|error| {
+                    #[cfg(test)]
+                    let decoded = if expected.len() > 1 {
+                        VnodePartial::decode_for_restore_test_roster(
+                            bytes,
+                            restore_profile,
+                            expected.len(),
+                        )
+                    } else {
+                        VnodePartial::decode_for_restore(bytes, restore_profile)
+                    };
+                    #[cfg(not(test))]
+                    let decoded = VnodePartial::decode_for_restore(bytes, restore_profile);
+                    decoded.map_err(|error| {
                         DbError::Checkpoint(format!(
                             "[LDB-6051] vnode {vnode} rehydration chain link {link} is corrupt: \
                              {error}"
@@ -789,7 +812,6 @@ impl OperatorGraph {
                 }
             }
 
-            let expected = self.managed_vnode_participants(vnode)?;
             let expected_names: BTreeSet<&str> = expected.iter().map(|(_, name)| *name).collect();
             let missing: Vec<&str> = expected_names
                 .iter()
