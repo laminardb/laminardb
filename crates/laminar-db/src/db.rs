@@ -382,6 +382,10 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) pending_vnode_transition:
         crate::vnode_transition_staging::PendingVnodeTransitionHandle,
+    /// Worker-wide raw checkpoint-body budget shared by current and replacement transitions.
+    #[cfg(feature = "cluster")]
+    vnode_restore_input_budget:
+        parking_lot::Mutex<Option<Arc<crate::vnode_restore_input::VnodeRestoreInputBudget>>>,
     /// Exact assignment and state ABI installed in the current graph generation.
     #[cfg(feature = "cluster")]
     pub(crate) installed_vnode_state: crate::vnode_transition_staging::InstalledVnodeStateHandle,
@@ -940,6 +944,33 @@ impl LaminarDB {
             .map_or(0, |transition| transition.acquired_vnodes().len())
     }
 
+    #[cfg(feature = "cluster")]
+    pub(crate) fn vnode_restore_input_budget(
+        &self,
+        head: &crate::checkpoint_coordinator::ValidatedVnodeRestoreHead,
+    ) -> Result<Arc<crate::vnode_restore_input::VnodeRestoreInputBudget>, DbError> {
+        let limits = &head.contract().limits;
+        let expected = crate::vnode_restore_input::VnodeRestoreInputLimits {
+            max_lineage_bytes: limits.max_cluster_lineage_payload_bytes,
+            max_lineage_artifacts: limits.max_cluster_lineage_artifacts,
+        };
+        let mut installed = self.vnode_restore_input_budget.lock();
+        if let Some(current) = installed.as_ref() {
+            if current.limits() != expected {
+                return Err(DbError::Checkpoint(
+                    "[LDB-6050] committed vnode restore raw-input limits changed within one graph generation; reset or a new checkpoint namespace is required"
+                        .into(),
+                ));
+            }
+            return Ok(Arc::clone(current));
+        }
+        let budget = Arc::new(crate::vnode_restore_input::VnodeRestoreInputBudget::new(
+            expected,
+        )?);
+        *installed = Some(Arc::clone(&budget));
+        Ok(budget)
+    }
+
     /// Whether operator execution has not yet completed the prior assignment's vnode lifecycle
     /// work. Lock order matches assignment publication and graph checkpoint inspection.
     #[cfg(feature = "cluster")]
@@ -1239,6 +1270,8 @@ impl LaminarDB {
             cluster_checkpoint_object_store: None,
             #[cfg(feature = "cluster")]
             pending_vnode_transition: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(feature = "cluster")]
+            vnode_restore_input_budget: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
             installed_vnode_state: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "cluster")]
@@ -2592,12 +2625,23 @@ impl LaminarDB {
                 )
             })?;
             let attempt = handoff.vnode_restore_cut.attempt();
-            crate::recovery_manager::vnode_chains::SealedVnodeChainReader::from_committed_head(
-                backend.as_ref(),
-                handoff.vnode_restore_cut.restore_head(),
-            )?
-            .load_at(&vnodes_requiring_restore, attempt)
-            .await?
+            let restore_head = handoff.vnode_restore_cut.restore_head();
+            let budget = self.vnode_restore_input_budget(restore_head)?;
+            let cancel = self.runtime_shutdown.read().clone();
+            let reader =
+                crate::recovery_manager::vnode_chains::SealedVnodeChainReader::from_committed_head(
+                    backend.as_ref(),
+                    restore_head,
+                )?;
+            reader
+                .load_at_reserved(
+                    &vnodes_requiring_restore,
+                    attempt,
+                    &budget,
+                    deadline,
+                    &cancel,
+                )
+                .await?
         } else {
             crate::recovery_manager::vnode_chains::LoadedVnodeChains::default()
         };

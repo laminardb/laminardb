@@ -285,21 +285,50 @@ struct PreparedManagedOperators {
     node_indices: Vec<usize>,
 }
 
-/// Publication is the only phase whose unwind has an indeterminate live outcome. Preparation and
-/// authority revalidation remain abortable and therefore deliberately do not arm this guard.
-struct VnodePublicationGuard {
+/// Scope panic cleanup to the rare transition path instead of retaining checkpoint bodies or
+/// locking the transition slot for every steady-state graph cycle. Callers disarm ordinary
+/// validation/authority errors; publication arms only after every fallible check passes.
+struct VnodeTransitionUnwindGuard {
     poisoned: Arc<AtomicBool>,
     installed_state: InstalledVnodeStateHandle,
+    pending_handle: PendingVnodeTransitionHandle,
+    pending: Arc<PendingVnodeTransition>,
     armed: bool,
 }
 
-impl VnodePublicationGuard {
-    fn disarmed(poisoned: Arc<AtomicBool>, installed_state: InstalledVnodeStateHandle) -> Self {
+impl VnodeTransitionUnwindGuard {
+    fn new(
+        poisoned: Arc<AtomicBool>,
+        installed_state: InstalledVnodeStateHandle,
+        pending_handle: PendingVnodeTransitionHandle,
+        pending: Arc<PendingVnodeTransition>,
+        armed: bool,
+    ) -> Self {
         Self {
             poisoned,
             installed_state,
-            armed: false,
+            pending_handle,
+            pending,
+            armed,
         }
+    }
+
+    fn armed(
+        poisoned: Arc<AtomicBool>,
+        installed_state: InstalledVnodeStateHandle,
+        pending_handle: PendingVnodeTransitionHandle,
+        pending: Arc<PendingVnodeTransition>,
+    ) -> Self {
+        Self::new(poisoned, installed_state, pending_handle, pending, true)
+    }
+
+    fn disarmed(
+        poisoned: Arc<AtomicBool>,
+        installed_state: InstalledVnodeStateHandle,
+        pending_handle: PendingVnodeTransitionHandle,
+        pending: Arc<PendingVnodeTransition>,
+    ) -> Self {
+        Self::new(poisoned, installed_state, pending_handle, pending, false)
     }
 
     fn arm(&mut self) {
@@ -311,10 +340,14 @@ impl VnodePublicationGuard {
     }
 }
 
-impl Drop for VnodePublicationGuard {
+impl Drop for VnodeTransitionUnwindGuard {
     fn drop(&mut self) {
         if self.armed {
-            publish_cluster_execution_poison(&self.poisoned, Some(&self.installed_state));
+            publish_cluster_execution_poison(
+                &self.poisoned,
+                Some(&self.installed_state),
+                Some((&self.pending_handle, &self.pending)),
+            );
         }
     }
 }
@@ -323,10 +356,16 @@ impl Drop for VnodePublicationGuard {
 fn callback_error(
     poisoned: &AtomicBool,
     installed_state: &InstalledVnodeStateHandle,
+    pending_handle: &PendingVnodeTransitionHandle,
+    pending: &Arc<PendingVnodeTransition>,
     phase: &str,
     error: DbError,
 ) -> DbError {
-    publish_cluster_execution_poison(poisoned, Some(installed_state));
+    publish_cluster_execution_poison(
+        poisoned,
+        Some(installed_state),
+        Some((pending_handle, pending)),
+    );
     match error {
         DbError::BackpressureFail(reason) => DbError::BackpressureFail(format!(
             "[LDB-6051] vnode transition {phase} failed terminally: {reason}"
@@ -387,31 +426,59 @@ impl OperatorGraph {
         let Some(transition) = self.prepare_pending_vnode_transition()? else {
             return Ok(());
         };
+        let mut transition_unwind = VnodeTransitionUnwindGuard::armed(
+            Arc::clone(&self.execution_poisoned),
+            Arc::clone(&transition.installed_state),
+            Arc::clone(&transition.pending_handle),
+            Arc::clone(&transition.pending),
+        );
         let attempt = transition
             .pending
             .restore_cut()
             .map(crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut::attempt);
-        let decoded = self.preflight_decoded_vnodes(transition.pending.restores(), attempt)?;
-        let resolved = self.resolve_decoded_vnodes(&decoded)?;
-        let prepared = self.prepare_managed_operators(
+        let decoded = match self.preflight_decoded_vnodes(transition.pending.restores(), attempt) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                transition_unwind.complete();
+                return Err(error);
+            }
+        };
+        let resolved = match self.resolve_decoded_vnodes(&decoded) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                transition_unwind.complete();
+                return Err(error);
+            }
+        };
+        let prepared = match self.prepare_managed_operators(
             transition.pending.target(),
             &transition.revoked,
             &resolved,
-        )?;
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                transition_unwind.complete();
+                return Err(error);
+            }
+        };
         #[cfg(test)]
         let test_callbacks_mutated_state = match self.run_test_vnode_transition_callbacks(
             &transition.installed_state,
+            &transition.pending_handle,
+            &transition.pending,
             &transition.revoked,
             &resolved,
         ) {
             Ok(callbacks_run) => callbacks_run,
             Err(error) => {
                 self.abort_and_finish_managed_operators(&prepared);
+                transition_unwind.complete();
                 return Err(error);
             }
         };
         #[cfg(not(test))]
         let test_callbacks_mutated_state = false;
+        transition_unwind.complete();
         self.publish_vnode_transition(
             transition,
             &resolved,
@@ -422,22 +489,41 @@ impl OperatorGraph {
 
     pub(super) fn apply_committed_final_owner_exit(&mut self) -> Result<(), DbError> {
         let transition = self.prepare_final_owner_exit()?;
-        let prepared =
-            self.prepare_managed_operators(transition.pending.target(), &transition.revoked, &[])?;
+        let mut transition_unwind = VnodeTransitionUnwindGuard::armed(
+            Arc::clone(&self.execution_poisoned),
+            Arc::clone(&transition.installed_state),
+            Arc::clone(&transition.pending_handle),
+            Arc::clone(&transition.pending),
+        );
+        let prepared = match self.prepare_managed_operators(
+            transition.pending.target(),
+            &transition.revoked,
+            &[],
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                transition_unwind.complete();
+                return Err(error);
+            }
+        };
         #[cfg(test)]
         let test_callbacks_mutated_state = match self.run_test_vnode_transition_callbacks(
             &transition.installed_state,
+            &transition.pending_handle,
+            &transition.pending,
             &transition.revoked,
             &[],
         ) {
             Ok(callbacks_run) => callbacks_run,
             Err(error) => {
                 self.abort_and_finish_managed_operators(&prepared);
+                transition_unwind.complete();
                 return Err(error);
             }
         };
         #[cfg(not(test))]
         let test_callbacks_mutated_state = false;
+        transition_unwind.complete();
         self.publish_final_owner_exit(&transition, &prepared, test_callbacks_mutated_state)
     }
 
@@ -915,6 +1001,8 @@ impl OperatorGraph {
     fn run_test_vnode_transition_callbacks(
         &mut self,
         installed_state: &InstalledVnodeStateHandle,
+        pending_handle: &PendingVnodeTransitionHandle,
+        pending: &Arc<PendingVnodeTransition>,
         revoked: &FxHashSet<u32>,
         resolved: &[ResolvedVnode<'_>],
     ) -> Result<bool, DbError> {
@@ -949,6 +1037,8 @@ impl OperatorGraph {
                     return Err(callback_error(
                         &self.execution_poisoned,
                         installed_state,
+                        pending_handle,
+                        pending,
                         &phase,
                         error,
                     ));
@@ -976,6 +1066,8 @@ impl OperatorGraph {
                     return Err(callback_error(
                         &self.execution_poisoned,
                         installed_state,
+                        pending_handle,
+                        pending,
                         &phase,
                         error,
                     ));
@@ -989,12 +1081,18 @@ impl OperatorGraph {
         &mut self,
         prepared: &PreparedManagedOperators,
         installed_state: &InstalledVnodeStateHandle,
+        pending_handle: &PendingVnodeTransitionHandle,
+        pending: &Arc<PendingVnodeTransition>,
         test_callbacks_mutated_state: bool,
         error: DbError,
     ) -> DbError {
         self.abort_and_finish_managed_operators(prepared);
         if test_callbacks_mutated_state {
-            publish_cluster_execution_poison(&self.execution_poisoned, Some(installed_state));
+            publish_cluster_execution_poison(
+                &self.execution_poisoned,
+                Some(installed_state),
+                Some((pending_handle, pending)),
+            );
             DbError::StatefulOperatorPartialApply(format!(
                 "[LDB-6051] test vnode callback mutated live state before publication failed: \
                  {error}"
@@ -1020,6 +1118,14 @@ impl OperatorGraph {
             installed_state,
             installed_binding,
         } = transition;
+        // Declare the unwind guard before both mutex guards. On a publication panic, Rust drops
+        // those guards before exact pending cleanup attempts to lock either handle.
+        let mut publication = VnodeTransitionUnwindGuard::disarmed(
+            Arc::clone(&self.execution_poisoned),
+            Arc::clone(&installed_state),
+            Arc::clone(&pending_handle),
+            Arc::clone(&pending),
+        );
         let pending_slot =
             exact_pending_slot(&pending_handle, &pending, "vnode lifecycle callbacks");
         let mut pending_slot = match pending_slot {
@@ -1028,18 +1134,13 @@ impl OperatorGraph {
                 return Err(self.abort_prepublication(
                     prepared,
                     &installed_state,
+                    &pending_handle,
+                    &pending,
                     test_callbacks_mutated_state,
                     error,
                 ));
             }
         };
-        // Declare the unwind guard before the installed-state mutex guard. On a publication panic,
-        // Rust drops the mutex guard first, so poison publication cannot re-lock a mutex still held
-        // by this thread. It stays disarmed until every fallible authority check has passed.
-        let mut publication = VnodePublicationGuard::disarmed(
-            Arc::clone(&self.execution_poisoned),
-            Arc::clone(&installed_state),
-        );
         let mut installed_state_guard = installed_state.lock();
         if let Err(error) = authority.revalidate_for_publication(&expected_vnodes) {
             drop(installed_state_guard);
@@ -1047,6 +1148,8 @@ impl OperatorGraph {
             return Err(self.abort_prepublication(
                 prepared,
                 &installed_state,
+                &pending_handle,
+                &pending,
                 test_callbacks_mutated_state,
                 error,
             ));
@@ -1088,6 +1191,12 @@ impl OperatorGraph {
         prepared: &PreparedManagedOperators,
         test_callbacks_mutated_state: bool,
     ) -> Result<(), DbError> {
+        let mut publication = VnodeTransitionUnwindGuard::disarmed(
+            Arc::clone(&self.execution_poisoned),
+            Arc::clone(&transition.installed_state),
+            Arc::clone(&transition.pending_handle),
+            Arc::clone(&transition.pending),
+        );
         let pending_slot = exact_pending_slot(
             &transition.pending_handle,
             &transition.pending,
@@ -1099,17 +1208,13 @@ impl OperatorGraph {
                 return Err(self.abort_prepublication(
                     prepared,
                     &transition.installed_state,
+                    &transition.pending_handle,
+                    &transition.pending,
                     test_callbacks_mutated_state,
                     error,
                 ));
             }
         };
-        // As above, the publication guard must outlive the installed-state mutex guard during
-        // unwinding, but must remain disarmed through fallible authority revalidation.
-        let mut publication = VnodePublicationGuard::disarmed(
-            Arc::clone(&self.execution_poisoned),
-            Arc::clone(&transition.installed_state),
-        );
         let mut installed_state = transition.installed_state.lock();
         if let Err(error) = transition.authority.revalidate_for_publication() {
             drop(installed_state);
@@ -1117,6 +1222,8 @@ impl OperatorGraph {
             return Err(self.abort_prepublication(
                 prepared,
                 &transition.installed_state,
+                &transition.pending_handle,
+                &transition.pending,
                 test_callbacks_mutated_state,
                 error,
             ));

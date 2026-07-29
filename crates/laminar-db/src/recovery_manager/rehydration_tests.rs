@@ -19,22 +19,45 @@ struct LegacyPartialReadBackend {
     inner: InProcessBackend,
 }
 
-struct ReadCountingBackend {
+pub(super) struct ReadCountingBackend {
     inner: InProcessBackend,
     seal_inventory_reads: std::sync::atomic::AtomicUsize,
     sealed_partial_body_reads: std::sync::atomic::AtomicUsize,
     inventory_failures_remaining: std::sync::atomic::AtomicUsize,
     yield_inventory_reads: bool,
+    block_body_reads: bool,
+    body_read_entries: tokio::sync::Semaphore,
+    body_read_releases: tokio::sync::Semaphore,
+    active_body_reads: std::sync::atomic::AtomicUsize,
+}
+
+struct ActiveBodyRead<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for ActiveBodyRead<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl ReadCountingBackend {
-    fn new(key_group_capacity: u32) -> Self {
+    pub(super) fn new(key_group_capacity: u32) -> Self {
         Self {
             inner: InProcessBackend::new(key_group_capacity),
             seal_inventory_reads: std::sync::atomic::AtomicUsize::new(0),
             sealed_partial_body_reads: std::sync::atomic::AtomicUsize::new(0),
             inventory_failures_remaining: std::sync::atomic::AtomicUsize::new(0),
             yield_inventory_reads: false,
+            block_body_reads: false,
+            body_read_entries: tokio::sync::Semaphore::new(0),
+            body_read_releases: tokio::sync::Semaphore::new(0),
+            active_body_reads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub(super) fn with_blocking_body_reads(key_group_capacity: u32) -> Self {
+        Self {
+            block_body_reads: true,
+            ..Self::new(key_group_capacity)
         }
     }
 
@@ -57,8 +80,21 @@ impl ReadCountingBackend {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn sealed_partial_body_reads(&self) -> usize {
+    pub(super) fn sealed_partial_body_reads(&self) -> usize {
         self.sealed_partial_body_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(super) async fn wait_for_body_read_entry(&self) {
+        self.body_read_entries
+            .acquire()
+            .await
+            .expect("body-read entry semaphore remains open")
+            .forget();
+    }
+
+    pub(super) fn active_body_reads(&self) -> usize {
+        self.active_body_reads
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
@@ -119,6 +155,17 @@ impl StateBackend for ReadCountingBackend {
     ) -> Result<Option<Bytes>, StateBackendError> {
         self.sealed_partial_body_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.block_body_reads {
+            self.active_body_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _active = ActiveBodyRead(&self.active_body_reads);
+            self.body_read_entries.add_permits(1);
+            self.body_read_releases
+                .acquire()
+                .await
+                .expect("body-read release semaphore remains open")
+                .forget();
+        }
         self.inner
             .read_sealed_partial_bounded(attempt, sealed, max_bytes)
             .await
@@ -303,7 +350,7 @@ impl StateBackend for LegacyPartialReadBackend {
     }
 }
 
-async fn seal_epoch(backend: &dyn StateBackend, epoch: u64, vnodes: &[u32], tag: &[u8]) {
+pub(super) async fn seal_epoch(backend: &dyn StateBackend, epoch: u64, vnodes: &[u32], tag: &[u8]) {
     let attempt = CheckpointAttempt::canonical(epoch);
     for &v in vnodes {
         let partial = crate::vnode_partial::VnodePartial {

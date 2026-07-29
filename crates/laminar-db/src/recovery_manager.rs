@@ -1593,3 +1593,5 @@ mod tests;
 
 #[cfg(test)]
 mod rehydration_tests;
+#[cfg(test)]
+mod restore_input_resource_tests;

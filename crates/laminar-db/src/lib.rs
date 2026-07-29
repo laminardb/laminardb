@@ -132,6 +132,8 @@ mod table_provider;
 mod table_store;
 mod temporal_probe;
 mod vnode_partial;
+#[cfg(any(feature = "cluster", test))]
+mod vnode_restore_input;
 #[cfg(feature = "cluster")]
 mod vnode_restore_lineage;
 #[cfg(feature = "cluster")]

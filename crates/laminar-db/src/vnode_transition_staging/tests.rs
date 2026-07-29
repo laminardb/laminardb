@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use laminar_core::checkpoint::{
@@ -7,10 +8,16 @@ use laminar_core::checkpoint::{
 };
 use laminar_core::state::{CheckpointAttempt, NodeId};
 
-use super::{PendingVnodeTransition, VnodeTransitionKind, VnodeTransitionOrigin};
+use super::{
+    retire_exact_pending_vnode_transition, PendingVnodeTransition, PendingVnodeTransitionHandle,
+    VnodeTransitionKind, VnodeTransitionOrigin,
+};
 use crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut;
 use crate::rebalance::AuditedCommittedDrainTransition;
-use crate::recovery_manager::vnode_chains::{LoadedVnodeChains, VnodeRestoreInputUsage};
+use crate::recovery_manager::vnode_chains::LoadedVnodeChains;
+use crate::vnode_restore_input::{
+    VnodeRestoreInputBudget, VnodeRestoreInputLimits, VnodeRestoreInputUsage,
+};
 
 fn participant(node_id: u64, incarnation: u128) -> CheckpointParticipant {
     CheckpointParticipant {
@@ -397,4 +404,54 @@ fn final_owner_exit_requires_the_exact_committed_transition() {
         pending.kind(),
         VnodeTransitionKind::CommittedFinalOwnerExit(actual) if actual == &transition
     ));
+}
+
+#[test]
+fn retiring_exact_pending_transition_releases_its_charge_for_replacement() {
+    let local = participant(1, 1);
+    let owners = [NodeId(1)];
+    let target = fence(5, &[1], vec![local]);
+    let attempt = CheckpointAttempt::canonical(9);
+    let identity = PipelineIdentity::empty();
+    let cut = ValidatedClusterVnodeRestoreCut::synthetic_for_transition_test(
+        attempt,
+        identity.clone(),
+        target.clone(),
+        &[1],
+    )
+    .unwrap();
+    let usage = VnodeRestoreInputUsage::from_counts_for_test(4, 1, 4, 1);
+    let budget = Arc::new(
+        VnodeRestoreInputBudget::new(VnodeRestoreInputLimits {
+            max_lineage_bytes: 4,
+            max_lineage_artifacts: 1,
+        })
+        .unwrap(),
+    );
+    let loaded = LoadedVnodeChains::from_parts_with_budget_for_test(
+        Some(attempt),
+        HashMap::from([(0, vec![Bytes::from_static(b"full")])]),
+        usage,
+        &budget,
+    )
+    .unwrap();
+
+    let transition = Arc::new(
+        PendingVnodeTransition::boot_recovery(target, &owners, local, identity, cut, loaded)
+            .unwrap(),
+    );
+    let handle: PendingVnodeTransitionHandle =
+        Arc::new(parking_lot::Mutex::new(Some(Arc::clone(&transition))));
+
+    assert_eq!(budget.reserved_for_test(), (4, 1));
+    assert!(retire_exact_pending_vnode_transition(&handle, &transition));
+    assert!(handle.lock().is_none());
+    // The exact observer still owns the transition until it leaves the replacement path.
+    assert_eq!(budget.reserved_for_test(), (4, 1));
+    drop(transition);
+    assert_eq!(budget.reserved_for_test(), (0, 0));
+    let replacement = budget.try_reserve(usage).unwrap();
+    assert_eq!(budget.reserved_for_test(), (4, 1));
+    drop(replacement);
+    assert_eq!(budget.reserved_for_test(), (0, 0));
 }

@@ -721,6 +721,14 @@ fn build_boot_transition_with_loaded_attempt(
     chains: Vec<(u32, Vec<bytes::Bytes>)>,
     loaded_attempt: laminar_core::state::CheckpointAttempt,
 ) -> Result<crate::vnode_transition_staging::PendingVnodeTransition, DbError> {
+    build_boot_transition_from_loaded(owners, test_loaded_vnode_chains(loaded_attempt, chains))
+}
+
+#[cfg(feature = "cluster")]
+fn build_boot_transition_from_loaded(
+    owners: &[laminar_core::state::NodeId],
+    loaded: crate::recovery_manager::vnode_chains::LoadedVnodeChains,
+) -> Result<crate::vnode_transition_staging::PendingVnodeTransition, DbError> {
     use laminar_core::checkpoint::{CheckpointParticipant, PipelineIdentity};
     use laminar_core::state::CheckpointAttempt;
 
@@ -743,7 +751,7 @@ fn build_boot_transition_with_loaded_attempt(
         },
         PipelineIdentity::empty(),
         restore_cut,
-        test_loaded_vnode_chains(loaded_attempt, chains),
+        loaded,
     )
 }
 
@@ -4797,12 +4805,43 @@ async fn prepared_managed_state_publishes_with_exact_graph_authority() {
         base: None,
         deltas: Vec::new(),
     };
+    let encoded = encoded_vnode_partial(&partial);
+    let payload_bytes = u64::try_from(encoded.len()).unwrap();
+    let usage = crate::vnode_restore_input::VnodeRestoreInputUsage::from_counts_for_test(
+        payload_bytes,
+        1,
+        payload_bytes,
+        1,
+    );
+    let restore_budget = Arc::new(
+        crate::vnode_restore_input::VnodeRestoreInputBudget::new(
+            crate::vnode_restore_input::VnodeRestoreInputLimits {
+                max_lineage_bytes: payload_bytes,
+                max_lineage_artifacts: 1,
+            },
+        )
+        .unwrap(),
+    );
+    let loaded =
+        crate::recovery_manager::vnode_chains::LoadedVnodeChains::from_parts_with_budget_for_test(
+            Some(laminar_core::state::CheckpointAttempt::canonical(7)),
+            std::collections::HashMap::from([(0, vec![encoded])]),
+            usage,
+            &restore_budget,
+        )
+        .unwrap();
+    let owners = vec![laminar_core::state::NodeId(1)];
     let VnodeTransitionHarness {
         mut graph,
         registry,
         pending,
         published,
-    } = vnode_transition_harness(1, &[0], vec![(0, vec![encoded_vnode_partial(&partial)])]).await;
+    } = vnode_transition_harness_from_pending(
+        owners.clone(),
+        &[0],
+        build_boot_transition_from_loaded(&owners, loaded).unwrap(),
+    )
+    .await;
     let installed = Arc::clone(
         graph
             .installed_vnode_state
@@ -4836,6 +4875,14 @@ async fn prepared_managed_state_publishes_with_exact_graph_authority() {
         .as_ref()
         .expect("successful publication must install an exact state binding");
     assert!(binding.matches(published.target(), published.pipeline_identity()));
+    drop(installed);
+    assert_eq!(
+        restore_budget.reserved_for_test(),
+        (usage.declared_lineage_bytes(), 1),
+        "the test observer still owns the published transition"
+    );
+    drop(published);
+    assert_eq!(restore_budget.reserved_for_test(), (0, 0));
     assert!(graph.execution_poison_reason().is_none());
 }
 
@@ -4968,7 +5015,7 @@ async fn pending_slot_change_after_prepare_aborts_private_state_without_poisonin
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn managed_publication_panic_poisons_without_deadlocking_installed_state() {
+async fn managed_publication_panic_poisons_and_retires_exact_pending_input() {
     let partial = crate::vnode_partial::VnodePartial {
         operators: vec![("prepared".to_string(), vec![1])],
         base: None,
@@ -5016,7 +5063,7 @@ async fn managed_publication_panic_poisons_without_deadlocking_installed_state()
     assert!(poisoned.load(std::sync::atomic::Ordering::Acquire));
     assert!(installed.lock().is_none());
     assert_eq!(registry.restoring_vnodes(), vec![0]);
-    assert!(pending_is_exact(&pending, &published));
+    assert!(pending.lock().is_none());
     let state = state.lock();
     assert_eq!(state.prepare_count, 1);
     assert!(state.prepared);
@@ -5027,7 +5074,7 @@ async fn managed_publication_panic_poisons_without_deadlocking_installed_state()
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn later_restore_callback_failure_poisons_and_retains_complete_transition() {
+async fn later_restore_callback_failure_poisons_and_retires_exact_transition() {
     let partial = crate::vnode_partial::VnodePartial {
         operators: vec![("agg".to_string(), vec![1])],
         base: None,
@@ -5073,7 +5120,7 @@ async fn later_restore_callback_failure_poisons_and_retains_complete_transition(
     assert!(message.contains("injected vnode apply failure"));
     assert_eq!(&*applied.lock(), &[0], "the first callback did mutate");
     assert_eq!(registry.restoring_vnodes(), vec![0, 1]);
-    assert!(pending_is_exact(&pending, &published));
+    assert!(pending.lock().is_none());
     assert!(installed.lock().is_none());
     assert!(graph.execution_poison_reason().is_some());
 
@@ -5166,7 +5213,7 @@ async fn transport_certificate_change_after_callback_poisons_before_activation()
         .contains("shuffle assignment certificate changed"));
     assert_eq!(&*applied.lock(), &[0]);
     assert!(registry.is_restoring(0));
-    assert!(pending_is_exact(&pending, &published));
+    assert!(pending.lock().is_none());
     assert!(graph.execution_poison_reason().is_some());
     assert!(installed.lock().is_none());
     assert_eq!(graph.last_execution_assignment_version(), None);
@@ -5180,7 +5227,7 @@ async fn transport_certificate_change_after_callback_poisons_before_activation()
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn unowned_restoring_lifecycle_appearing_during_callback_poisons_and_retains_transition() {
+async fn unowned_restoring_lifecycle_after_callback_poisons_and_retires_transition() {
     struct RestoringLifecycleInjector {
         registry: Arc<laminar_core::state::VnodeRegistry>,
         applied: Arc<parking_lot::Mutex<Vec<u32>>>,
@@ -5229,7 +5276,7 @@ async fn unowned_restoring_lifecycle_appearing_during_callback_poisons_and_retai
         mut graph,
         registry,
         pending,
-        published,
+        published: _,
     } = vnode_transition_harness_for_assignment(
         vec![
             laminar_core::state::NodeId(1),
@@ -5257,7 +5304,7 @@ async fn unowned_restoring_lifecycle_appearing_during_callback_poisons_and_retai
     assert!(error.to_string().contains("restoring vnode roster changed"));
     assert_eq!(&*applied.lock(), &[0]);
     assert_eq!(registry.restoring_vnodes(), vec![0, 1]);
-    assert!(pending_is_exact(&pending, &published));
+    assert!(pending.lock().is_none());
     assert!(graph.execution_poison_reason().is_some());
 }
 

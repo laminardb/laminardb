@@ -1006,6 +1006,7 @@ pub trait StateBackend: Send + Sync + 'static {
     /// cannot prove that a self-consistent replacement still belongs to the sealed recovery cut.
     /// The caller must obtain `sealed` from an inventory already validated against recovery
     /// authority; this storage operation proves a matching artifact, not the authority itself.
+    /// Dropping the returned future must not leave detached body reads or allocations running.
     async fn read_sealed_partial_bounded(
         &self,
         attempt: CheckpointAttempt,

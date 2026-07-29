@@ -11,13 +11,30 @@ use laminar_core::state::NodeId;
 use crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut;
 use crate::error::DbError;
 use crate::rebalance::AuditedCommittedDrainTransition;
-use crate::recovery_manager::vnode_chains::{LoadedVnodeChains, VnodeRestoreInputUsage};
+use crate::recovery_manager::vnode_chains::LoadedVnodeChains;
+use crate::vnode_restore_input::{VnodeRestoreInputReservation, VnodeRestoreInputUsage};
 
 pub(crate) type PendingVnodeTransitionHandle =
     Arc<parking_lot::Mutex<Option<Arc<PendingVnodeTransition>>>>;
 
 pub(crate) type InstalledVnodeStateHandle =
     Arc<parking_lot::Mutex<Option<InstalledVnodeStateBinding>>>;
+
+/// Remove one abandoned transition without consuming a newer replacement in the shared slot.
+pub(crate) fn retire_exact_pending_vnode_transition(
+    handle: &PendingVnodeTransitionHandle,
+    expected: &Arc<PendingVnodeTransition>,
+) -> bool {
+    let mut pending = handle.lock();
+    if !pending
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, expected))
+    {
+        return false;
+    }
+    pending.take();
+    true
+}
 
 /// Exact assignment and logical state ABI installed in the current graph generation.
 ///
@@ -109,6 +126,13 @@ pub(crate) struct PendingVnodeTransition {
     acquired_vnodes: Box<[u32]>,
     revoked_vnodes: Box<[u32]>,
     restores: Box<[PendingVnodeRestore]>,
+    /// Held for exactly as long as the raw checkpoint bodies in `restores`.
+    _restore_input_reservation: Option<VnodeRestoreInputReservation>,
+}
+
+struct ValidatedVnodeRestores {
+    restores: Vec<PendingVnodeRestore>,
+    reservation: VnodeRestoreInputReservation,
 }
 
 impl PendingVnodeTransition {
@@ -128,7 +152,7 @@ impl PendingVnodeTransition {
                 "boot recovery cannot publish an empty vnode transition",
             ));
         }
-        let restores =
+        let validated =
             Self::validate_restores(&acquired_vnodes, &pipeline_identity, &restore_cut, loaded)?;
         Ok(Self {
             origin: VnodeTransitionOrigin::BootRecovery,
@@ -138,7 +162,8 @@ impl PendingVnodeTransition {
             restore_cut: Some(restore_cut),
             acquired_vnodes: acquired_vnodes.into_boxed_slice(),
             revoked_vnodes: Box::default(),
-            restores: restores.into_boxed_slice(),
+            restores: validated.restores.into_boxed_slice(),
+            _restore_input_reservation: Some(validated.reservation),
         })
     }
 
@@ -224,25 +249,34 @@ impl PendingVnodeTransition {
             _ => VnodeTransitionKind::OwnershipChange,
         };
 
-        let restores = match (acquired_vnodes.is_empty(), restore_cut.as_ref()) {
-            (true, None) if loaded.attempt.is_none() && loaded.chains.is_empty() => {
-                validate_restore_input_usage(&[], loaded.input_usage())?;
-                Vec::new()
-            }
-            (true, _) => {
-                return Err(transition_error(
-                    "a transition without acquired vnodes carried restore state",
-                ));
-            }
-            (false, Some(cut)) => {
-                Self::validate_restores(&acquired_vnodes, &pipeline_identity, cut, loaded)?
-            }
-            (false, None) => {
-                return Err(transition_error(
-                    "acquired vnodes require one exact committed restore cut",
-                ));
-            }
-        };
+        let (restores, restore_input_reservation) =
+            match (acquired_vnodes.is_empty(), restore_cut.as_ref()) {
+                (true, None) if loaded.attempt.is_none() && loaded.chains.is_empty() => {
+                    validate_restore_input_usage(&[], loaded.input_usage())?;
+                    let mut loaded = loaded;
+                    if loaded.take_input_reservation().is_some() {
+                        return Err(transition_error(
+                            "a transition without acquired vnodes carried a raw-input reservation",
+                        ));
+                    }
+                    (Vec::new(), None)
+                }
+                (true, _) => {
+                    return Err(transition_error(
+                        "a transition without acquired vnodes carried restore state",
+                    ));
+                }
+                (false, Some(cut)) => {
+                    let validated =
+                        Self::validate_restores(&acquired_vnodes, &pipeline_identity, cut, loaded)?;
+                    (validated.restores, Some(validated.reservation))
+                }
+                (false, None) => {
+                    return Err(transition_error(
+                        "acquired vnodes require one exact committed restore cut",
+                    ));
+                }
+            };
         if acquired_vnodes.is_empty() && revoked_vnodes.is_empty() {
             return Err(transition_error(
                 "assignment transition contains no local vnode work",
@@ -258,6 +292,7 @@ impl PendingVnodeTransition {
             acquired_vnodes: acquired_vnodes.into_boxed_slice(),
             revoked_vnodes: revoked_vnodes.into_boxed_slice(),
             restores: restores.into_boxed_slice(),
+            _restore_input_reservation: restore_input_reservation,
         })
     }
 
@@ -298,8 +333,8 @@ impl PendingVnodeTransition {
         acquired_vnodes: &[u32],
         pipeline_identity: &PipelineIdentity,
         restore_cut: &ValidatedClusterVnodeRestoreCut,
-        loaded: LoadedVnodeChains,
-    ) -> Result<Vec<PendingVnodeRestore>, DbError> {
+        mut loaded: LoadedVnodeChains,
+    ) -> Result<ValidatedVnodeRestores, DbError> {
         restore_cut
             .validate_transition_binding()
             .map_err(|error| transition_error(format!("invalid committed restore cut: {error}")))?;
@@ -332,6 +367,7 @@ impl PendingVnodeTransition {
             ));
         }
         let usage = loaded.input_usage();
+        let reservation = loaded.take_input_reservation();
         let mut chains = loaded.chains;
         let restores = acquired_vnodes
             .iter()
@@ -351,7 +387,18 @@ impl PendingVnodeTransition {
             })
             .collect::<Result<Vec<_>, DbError>>()?;
         validate_restore_input_usage(&restores, usage)?;
-        Ok(restores)
+        let reservation = reservation.ok_or_else(|| {
+            transition_error("a nonempty vnode restore has no raw-input reservation")
+        })?;
+        if !reservation.matches(usage) {
+            return Err(transition_error(
+                "vnode restore raw-input reservation does not match its declared lineage",
+            ));
+        }
+        Ok(ValidatedVnodeRestores {
+            restores,
+            reservation,
+        })
     }
 
     #[must_use]

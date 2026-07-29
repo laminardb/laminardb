@@ -1144,6 +1144,46 @@ impl Drop for StartupDriverGuard {
     }
 }
 
+/// Retire only the transition handed to a graph generation that never launches. Vnodes remain
+/// `Restoring`; a later generation must reload the durable cut before source intake can open.
+#[cfg(feature = "cluster")]
+struct PendingVnodeTransitionLaunchGuard {
+    handle: crate::vnode_transition_staging::PendingVnodeTransitionHandle,
+    expected: Option<Arc<crate::vnode_transition_staging::PendingVnodeTransition>>,
+    armed: bool,
+}
+
+#[cfg(feature = "cluster")]
+impl PendingVnodeTransitionLaunchGuard {
+    fn capture(db: &LaminarDB) -> Self {
+        Self {
+            handle: Arc::clone(&db.pending_vnode_transition),
+            expected: db.pending_vnode_transition.lock().clone(),
+            armed: true,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl Drop for PendingVnodeTransitionLaunchGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(expected) = self.expected.as_ref() else {
+            return;
+        };
+        crate::vnode_transition_staging::retire_exact_pending_vnode_transition(
+            &self.handle,
+            expected,
+        );
+    }
+}
+
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
     panic
         .downcast_ref::<String>()
@@ -1428,6 +1468,39 @@ impl LaminarDB {
         &self,
         restore_cut: &crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut,
     ) -> Result<(), DbError> {
+        let timeout = self
+            .config
+            .checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.timeout_ms)
+            .map_or_else(
+                || crate::checkpoint_coordinator::CheckpointConfig::default().checkpoint_timeout,
+                std::time::Duration::from_millis,
+            );
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| {
+                DbError::Checkpoint("[LDB-6050] boot vnode restore deadline overflow".into())
+            })?;
+        let cancel = self.runtime_shutdown.read().clone();
+        let prepare =
+            self.prepare_boot_vnode_restore_transition_until(restore_cut, deadline, &cancel);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(crate::vnode_restore_input::restore_cancelled()),
+            result = tokio::time::timeout_at(deadline, prepare) => {
+                result.unwrap_or_else(|_| Err(crate::vnode_restore_input::restore_timed_out()))
+            }
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn prepare_boot_vnode_restore_transition_until(
+        &self,
+        restore_cut: &crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut,
+        deadline: tokio::time::Instant,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), DbError> {
         let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
             DbError::Checkpoint("[LDB-6031] cluster recovery has no live cluster controller".into())
         })?;
@@ -1563,12 +1636,26 @@ impl LaminarDB {
                     .to_string(),
             ));
         };
-        let loaded =
+        let restore_head = restore_cut.restore_head();
+        let budget = self.vnode_restore_input_budget(restore_head)?;
+        let reader =
             crate::recovery_manager::vnode_chains::SealedVnodeChainReader::from_committed_head(
                 backend.as_ref(),
-                restore_cut.restore_head(),
-            )?
-            .load_at(&owned, attempt)
+                restore_head,
+            )?;
+        // A replacement graph cannot reuse an earlier graph's staged bytes. Retire only the exact
+        // observed transition after all durable target/reader validation, then reload while the
+        // vnode lifecycle remains `Restoring` and source intake remains fenced.
+        let displaced = self.pending_vnode_transition.lock().clone();
+        if let Some(displaced) = displaced {
+            crate::vnode_transition_staging::retire_exact_pending_vnode_transition(
+                &self.pending_vnode_transition,
+                &displaced,
+            );
+            drop(displaced);
+        }
+        let loaded = reader
+            .load_at_reserved(&owned, attempt, &budget, deadline, cancel)
             .await?;
         self.publish_boot_vnode_restore_transition(
             &registry,
@@ -4137,6 +4224,13 @@ impl LaminarDB {
         let mut restored_reference_tables = false;
         {
             let mut guard = self.coordinator.lock().await;
+            #[cfg(feature = "cluster")]
+            if runtime_mode == RuntimeMode::Cluster && guard.is_none() {
+                // Validate before any boot transition can be staged. Once exact restore input is
+                // published below, recovery must return without another await or fallible check so
+                // the caller can immediately install its failed-launch ownership guard.
+                self.validate_fresh_cluster_vnode_start()?;
+            }
             if let Some(ref mut coord) = *guard {
                 // Restore to the cluster-agreed epoch if one was armed, else the local
                 // latest. Take it owned first so the guard isn't held across the await.
@@ -4363,6 +4457,9 @@ impl LaminarDB {
                                     recovered.manifest.checkpoint_id
                                 ))
                             })?;
+                            // This is deliberately the final suspend/failure boundary in recovered
+                            // cluster startup. The caller captures the exact staged Arc as soon as
+                            // this function returns.
                             self.prepare_boot_vnode_restore_transition(restore_cut)
                                 .await?;
                             startup_reconciled_source_handoff_version =
@@ -4394,11 +4491,6 @@ impl LaminarDB {
                     }
                 }
             }
-        }
-
-        #[cfg(feature = "cluster")]
-        if runtime_mode == RuntimeMode::Cluster && self.coordinator.lock().await.is_none() {
-            self.validate_fresh_cluster_vnode_start()?;
         }
 
         Ok(PipelineRecoveryState {
@@ -5418,6 +5510,17 @@ impl LaminarDB {
                 prom_registry.as_ref(),
             )
             .await?;
+        let recovery = self
+            .recover_pipeline_state(
+                graph,
+                &mut sources,
+                runtime_mode,
+                pipeline_checkpoint_timeout,
+            )
+            .await?;
+        #[cfg(feature = "cluster")]
+        let mut vnode_transition_launch = (runtime_mode == RuntimeMode::Cluster)
+            .then(|| PendingVnodeTransitionLaunchGuard::capture(self));
         let PipelineRecoveryState {
             graph,
             recovered_mv_store,
@@ -5428,14 +5531,7 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
                 reconciled_source_handoff_version: startup_reconciled_source_handoff_version,
             restored_reference_tables,
-        } = self
-            .recover_pipeline_state(
-                graph,
-                &mut sources,
-                runtime_mode,
-                pipeline_checkpoint_timeout,
-            )
-            .await?;
+        } = recovery;
         let previous_mv_store = {
             let mut live = self.mv_store.write();
             std::mem::replace(&mut *live, recovered_mv_store)
@@ -5556,6 +5652,10 @@ impl LaminarDB {
             }
         });
         launch?;
+        #[cfg(feature = "cluster")]
+        if let Some(guard) = vnode_transition_launch.as_mut() {
+            guard.complete();
+        }
 
         // Readiness has transferred the exact captured assignment and its staged state to the
         // live graph. A watcher may now prepare a successor generation.

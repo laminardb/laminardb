@@ -220,9 +220,16 @@ const GRAPH_EXECUTION_POISON_REASON: &str =
 fn publish_cluster_execution_poison(
     poisoned: &AtomicBool,
     installed_vnode_state: Option<&crate::vnode_transition_staging::InstalledVnodeStateHandle>,
+    pending_vnode_transition: Option<(
+        &crate::vnode_transition_staging::PendingVnodeTransitionHandle,
+        &Arc<crate::vnode_transition_staging::PendingVnodeTransition>,
+    )>,
 ) {
     if let Some(installed_vnode_state) = installed_vnode_state {
         installed_vnode_state.lock().take();
+    }
+    if let Some((handle, expected)) = pending_vnode_transition {
+        crate::vnode_transition_staging::retire_exact_pending_vnode_transition(handle, expected);
     }
     poisoned.store(true, Ordering::Release);
 }
@@ -256,7 +263,11 @@ impl Drop for GraphExecutionAttemptGuard {
     fn drop(&mut self) {
         if self.armed {
             #[cfg(feature = "cluster")]
-            publish_cluster_execution_poison(&self.poisoned, self.installed_vnode_state.as_ref());
+            publish_cluster_execution_poison(
+                &self.poisoned,
+                self.installed_vnode_state.as_ref(),
+                None,
+            );
             #[cfg(not(feature = "cluster"))]
             self.poisoned.store(true, Ordering::Release);
         }
@@ -2735,12 +2746,19 @@ impl OperatorGraph {
 
     #[cfg(feature = "cluster")]
     fn poison_cluster_execution(&self) {
-        if self.installed_vnode_state.is_none() {
+        let pending = self.pending_vnode_transition.as_ref().and_then(|handle| {
+            handle
+                .lock()
+                .clone()
+                .map(|pending| (Arc::clone(handle), pending))
+        });
+        if self.installed_vnode_state.is_none() && pending.is_none() {
             return;
         }
         publish_cluster_execution_poison(
             &self.execution_poisoned,
             self.installed_vnode_state.as_ref(),
+            pending.as_ref().map(|(handle, pending)| (handle, pending)),
         );
     }
 

@@ -203,6 +203,70 @@ async fn boot_report_marks_and_stages_the_exact_owned_roster() {
 }
 
 #[tokio::test]
+async fn failed_graph_launch_retires_staged_input_but_leaves_vnodes_restoring() {
+    let registry = Arc::new(VnodeRegistry::single_owner(2, NodeId(1)));
+    let db = boot_test_db(Arc::clone(&registry)).await;
+    let attempt = CheckpointAttempt::canonical(7);
+    let target_assignment = registry.versioned_snapshot();
+    let (target_fence, participant, restore_cut) =
+        boot_restore_authority(&target_assignment, attempt);
+    let chains = HashMap::from([
+        (0, vec![Bytes::from_static(b"vnode-0")]),
+        (1, vec![Bytes::from_static(b"vnode-1")]),
+    ]);
+    let payload_bytes = chains
+        .values()
+        .flatten()
+        .map(Bytes::len)
+        .map(|bytes| u64::try_from(bytes).unwrap())
+        .sum();
+    let artifacts = u64::try_from(chains.values().flatten().count()).unwrap();
+    let usage = crate::vnode_restore_input::VnodeRestoreInputUsage::from_counts_for_test(
+        payload_bytes,
+        artifacts,
+        payload_bytes,
+        artifacts,
+    );
+    let restore_budget = Arc::new(
+        crate::vnode_restore_input::VnodeRestoreInputBudget::new(
+            crate::vnode_restore_input::VnodeRestoreInputLimits {
+                max_lineage_bytes: payload_bytes,
+                max_lineage_artifacts: artifacts,
+            },
+        )
+        .unwrap(),
+    );
+    let loaded = LoadedVnodeChains::from_parts_with_budget_for_test(
+        Some(attempt),
+        chains,
+        usage,
+        &restore_budget,
+    )
+    .unwrap();
+    db.publish_boot_vnode_restore_transition(
+        &registry,
+        &target_assignment,
+        target_fence,
+        participant,
+        restore_cut,
+        loaded,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        restore_budget.reserved_for_test(),
+        (payload_bytes, artifacts)
+    );
+
+    let launch = super::PendingVnodeTransitionLaunchGuard::capture(&db);
+    drop(launch);
+
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert_eq!(registry.restoring_vnodes(), vec![0, 1]);
+    assert_eq!(restore_budget.reserved_for_test(), (0, 0));
+}
+
+#[tokio::test]
 async fn invalid_boot_report_changes_neither_staging_nor_lifecycle() {
     let registry = Arc::new(VnodeRegistry::single_owner(2, NodeId(1)));
     let db = boot_test_db(Arc::clone(&registry)).await;
