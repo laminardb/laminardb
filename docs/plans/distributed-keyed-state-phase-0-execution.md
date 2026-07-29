@@ -5,7 +5,7 @@
   backend is selected; no runtime dependency, qualification result, independent production-soak
   result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-29 after the RocksDB adapter-entry source closure
+- **Last reconciled:** 2026-07-29 after Core Cycle 12 and the Fjall lifecycle reproduction
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -54,7 +54,7 @@ stopped on resource/lifecycle evidence. None is a runtime fallback. The exact Ro
 enter only the one now-completed bounded adapter cycle; its inadequate cleanup/failure and teardown
 surface stopped and removed it. `[LDB-4007]` and `[LDB-0013]` remain unchanged throughout.
 
-Core Cycles 2–11 add a fail-closed runtime containment path for staged local vnode transitions and a
+Core Cycles 2–12 add a fail-closed runtime containment path for staged local vnode transitions and a
 narrow audited, committed final-owner revoke path. Cycles 4–6 pin restore to the capsule-validated
 seal, enforce immutable attempt identity and bounded chain traversal, and replace split staging with
 one transition bound to exact checkpoint, assignment, process, pipeline, acquired, and revoked
@@ -74,9 +74,11 @@ reservation. Cycle 10 binds participant-agreed current-profile limits and exact 
 cluster totals into capsule v6 before Commit and reproduces them before restore body reads. Cycle
 11 reserves each acquired subset's declared raw lineage bytes/artifacts before its first body GET,
 holds that charge with the pending transition, shares a bounded body-read pool, and applies one
-absolute deadline/cancellation scope. Complete wrapper/allocator/decode/RSS/pause limits remain
-open; these cycles do not consume the proposed managed V2 format, add a hot-state backend,
-authorize a stateful query, or change delivery.
+absolute deadline/cancellation scope. Cycle 12 validates the legacy outer archive as a borrowed
+checked view and enforces the committed one-entry compatibility roster before owned outer
+deserialization at both loader and graph boundaries. Complete wrapper/allocator/inner-decode/RSS/
+pause limits remain open; these cycles do not consume the proposed managed V2 format, add a hot-
+state backend, authorize a stateful query, or change delivery.
 
 The phase is complete only when maintainers can answer, with versioned evidence:
 
@@ -887,9 +889,10 @@ Cycle 37 freezes the aggregate-v1 journal/checkpoint-transition contract and a p
 coalescing, immutable capture/re-emission, Commit-admitted ancestry, aborted-attempt retention,
 outcome-less allocated-ID gaps, pre/post-seal DecisionInDoubt, exact generation release,
 deterministic ordering, and the existing aggregate/V2 codec seam. It is a reference model, not a
-runtime implementation or performance result. Core Cycles 6–11 additionally land exact transition
+runtime implementation or performance result. Core Cycles 6–12 additionally land exact transition
 authority, all-mode aggregate initialization, aggregate prepare/publication, current-profile pre-
-Commit raw-lineage authority, and held acquired-subset raw-input ownership. The managed artifact-v1
+Commit raw-lineage authority, held acquired-subset raw-input ownership, and preallocation legacy
+outer-archive roster validation. The managed artifact-v1
 and `VnodePartialV2` readers remain unwired; `[LDB-4007]` remains unchanged.
 
 Remaining work is kept reviewable in this dependency order:
@@ -908,17 +911,20 @@ Remaining work is kept reviewable in this dependency order:
    limits and verified totals in capsule v6, and makes restore reproduce that contract before body
    reads. Core Cycle 11 now holds the acquired-subset raw lineage reservation through transition
    ownership, bounds body-read concurrency, shares one absolute acquisition deadline/cancellation,
-   and releases exact abandoned work without erasing a successor. Next, separately close
-   wrapper/seal/allocator/decode/RSS/pause reservations, vnode sharding, minimum truthful
+   and releases exact abandoned work without erasing a successor. Core Cycle 12 checks the legacy
+   outer archive and current one-entry profile before owned outer deserialization at both loader
+   and graph boundaries. Next, separately close wrapper/seal/allocator/inner-decode/RSS/pause
+   reservations, vnode sharding, minimum truthful
    health signals, and a second state-family consumer. The outcome, publication,
    checkpoint/rebalance fencing, fresh-root, capability, and current raw-lineage authority already
-   landed in Core Cycles 6–11 and must remain regression coverage rather than be reimplemented.
+   landed in Core Cycles 6–12 and must remain regression coverage rather than be reimplemented.
    The completed containment increments and their tests are summarized in the
-   [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md). Core Cycles 6–11
+   [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md). Core Cycles 6–12
    complete the immutable transition, aggregate prepare/publication, and current raw-lineage
-   authority/resource-ownership subsets. Wrapper/seal/allocator/decode/RSS/pause limits, vnode
-   sharding, and a second state family remain open. The latest exact boundary is recorded in the
-   [Cycle 11 review](../reviews/distributed-keyed-state-core-cycle-11.md);
+   authority/resource-ownership subsets plus the legacy outer-container allocation bound. Wrapper/
+   seal/allocator/inner-decode/RSS/pause limits, vnode sharding, and a second state family remain
+   open. The latest exact boundary is recorded in the
+   [Cycle 12 review](../reviews/distributed-keyed-state-core-cycle-12.md);
 4. `test: complete the historical TidesDB empirical re-entry` — complete. Released 0.11.1 passes the
    ordinary baseline and clean-reopen smoke. Under tmpfs capacity exhaustion, commit returned an
    error and Rust `Drop` returned within its deadline while native close logged a flush failure.
@@ -964,7 +970,7 @@ manifest-selected or production streaming writer.
 
 Each commit runs its affected feature matrix. Backend candidates do not touch runtime crates before
 the separately reviewed adapter step. The
-[Cycle 11 review](../reviews/distributed-keyed-state-core-cycle-11.md) records the cumulative current
+[Cycle 12 review](../reviews/distributed-keyed-state-core-cycle-12.md) records the cumulative current
 Phase 1 containment boundary; it neither completes Phase 1 nor bypasses the Phase 0 gates. The
 first guard-removal commit is reserved for the later grouped-aggregate vertical after Phase 1
 passes.

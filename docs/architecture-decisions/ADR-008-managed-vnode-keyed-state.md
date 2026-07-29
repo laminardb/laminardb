@@ -4,7 +4,7 @@
   local-spill backend is selected, production qualification is paused, and cluster admission is
   unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-29 after Core Cycle 11 and the Fjall lifecycle reproduction
+- **Last reconciled:** 2026-07-29 after Core Cycle 12 and the Fjall lifecycle reproduction
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** released `rocksdb` 0.24.0 is stopped at the cleanup/lifecycle
   source gate; no backend is selected or production-qualified, and admission is **NO-GO**
@@ -18,7 +18,7 @@
   [Fjall 3.1.8 source closure](../reports/fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md),
   [Fjall lifecycle reproduction](../reports/fjall-3.1.8-worker-lifecycle-empirical-closure-2026-07-29.md),
   [TidesDB empirical re-entry](../reports/tidesdb-current-package-reentry-2026-07-28.md), and
-  [latest core review](../reviews/distributed-keyed-state-core-cycle-11.md)
+  [latest core review](../reviews/distributed-keyed-state-core-cycle-12.md)
 
 ## Decision
 
@@ -290,11 +290,19 @@ vnodes remain `Restoring`. Revoke-only final-owner staging is deliberately retai
 indeterminate failure. No new record-path lock, allocation, I/O, or transition retention is
 introduced.
 
+Core Cycle 12 bounds owned decoding of the legacy outer vnode partial. Each production restore
+decode first obtains a safe checked borrowed rkyv view, then enforces the committed
+`global_singleton_compatibility` ceiling of one operator/delta entry before deserializing owned
+names and payload vectors. Sealed-chain head and parent traversal plus graph preflight use the same
+profile authority. An over-roster child fails before parent-body I/O, and an over-roster parent
+fails before a chain can reach operator preparation. The wire format remains unchanged.
+
 This is still current-profile containment, not the complete production keyed-state budget. The
 charge covers declared raw lineage payload/artifact ownership, not encoded wrapper/seal metadata,
-allocator and response overhead, decoder scratch and expansion, decoded state/RSS, simultaneous
-live/prepared/retired residency, or apply/retirement pause. Capsule v5 and readiness v5 are an
-explicit reset/new-namespace boundary. So is changing `max_staged_bytes` or the retained-chain-
+allocator and response overhead, archive-validation CPU, unaligned-copy memory, inner decoder
+scratch and expansion, decoded state/RSS, simultaneous live/prepared/retired residency, or apply/
+retirement pause. Capsule v5 and readiness v5 are an explicit reset/new-namespace boundary. So is
+changing `max_staged_bytes` or the retained-chain-
 derived depth across a live cut until a versioned capability-superset rule is designed. Nothing
 here authorizes relaxing `[LDB-4007]`.
 
@@ -366,12 +374,14 @@ and staging-receipt path described above. Core Cycle 10 adds participant-agreed 
 pre-Commit parent-seal traversal and checked cluster totals, capsule binding, target reproduction,
 and Commit-only successor-parent promotion. Core Cycle 11 holds the acquired-subset raw-input
 charge through publication/failure, bounds body-read concurrency, and applies one absolute restore
-deadline/cancellation scope. The profile remains global-singleton compatibility; none of these
-cycles admits keyed state.
+deadline/cancellation scope. Core Cycle 12 caps the legacy outer operator/delta entry count before
+owned deserialization at every production restore decode site. The profile remains global-
+singleton compatibility; none of these cycles admits keyed state.
 
 This remains an aggregate reference lifecycle, not complete Phase 1. Transition-wide encoded
-wrapper/seal and allocator overhead, decode scratch, decoded RSS, transient live-plus-prepared-plus-
-retired residency, publication/retirement pause, vnode-scalable publication, bounded hot working
+wrapper/seal and allocator overhead, archive-validation/alignment work, inner decode scratch,
+decoded RSS, transient live-plus-prepared-plus-retired residency, publication/retirement pause,
+vnode-scalable publication, bounded hot working
 state, source/state/sink delivery composition, tail-latency evidence, backend qualification, and
 independent soak remain open. Every implemented local keyed/windowed/join candidate that reaches
 cluster admission stays
@@ -1013,7 +1023,7 @@ Restore follows this protocol:
    source/shuffle/output intake only after complete publication. Off-thread retirement remains a
    future measured design choice rather than a current guarantee.
 
-Cycles 6–11 implement the immutable authority envelope, complete structural preflight, exact
+Cycles 6–12 implement the immutable authority envelope, complete structural preflight, exact
 transition retention, and the prepare/publish protocol for `SqlAggregateV1`. Each aggregate fully
 decodes and validates its complete restore/revoke batch into a mutation plan with private
 replacement collections. Any prepare or authority error aborts and finishes every attempted
@@ -1030,13 +1040,15 @@ That proves logical atomicity for the current aggregate participant because grap
 assignment publication are excluded across the cut. It is not a bounded-pause result. Aggregate
 publication still moves/updates collections in proportion to transitioned state, preparation can
 temporarily retain live state and prepared replacement collections, can grow live capacity even if
-later aborted, and retirement can run destructors proportional to displaced state. Cycles 9–11
+later aborted, and retirement can run destructors proportional to displaced state. Cycles 9–12
 account sealed raw restore input, bind a metadata-verified cluster-global compatibility contract
 before Commit, and hold each acquired subset's declared raw payload/artifact charge through the
-pending transition. They do not prove a bounded publication pause or complete transition-wide
-resource envelope. Wrapper/seal metadata, allocator/response overhead, retained spool, decoded RSS
-and scratch, live-plus-prepared-plus-retired residency, and measured apply/retirement pause remain
-admission blockers. Vnode-level indirection remains required if measurement cannot prove the pause.
+pending transition; Cycle 12 additionally caps legacy outer entries before owned deserialization.
+They do not prove a bounded publication pause or complete transition-wide resource envelope.
+Wrapper/seal metadata, allocator/response overhead, retained spool, archive validation/alignment,
+inner decoded RSS and scratch, live-plus-prepared-plus-retired residency, and measured apply/
+retirement pause remain admission blockers. Vnode-level indirection remains required if measurement
+cannot prove the pause.
 A process crash during publication still discards the process image and reconstructs from the
 unchanged durable cut.
 

@@ -356,11 +356,14 @@ preflight, bounded sealed body reads, exact parent checks, and a staged verified
 Cycle 10 adds participant-agreed current-profile limits, complete metadata-only ancestry traversal,
 and a checked cluster-global contract before Commit and again at restore. Cycle 11 adds a held
 acquired-subset reservation for the current legacy raw bodies/artifacts plus bounded body-read
-concurrency and an absolute deadline/cancellation scope. That containment still neither
+concurrency and an absolute deadline/cancellation scope. Cycle 12 makes every production legacy
+restore decode validate a checked borrowed outer archive and enforce the committed one-entry
+operator/delta ceiling before owned deserialization. That containment still neither
 authenticates nor decodes `VnodePartialV2`; it does not charge this format's wrapper/directory,
-decoder, decoded-state, or allocator overhead. Managed whole-transition preflight must still
-validate every roster entry, aggregate every object and decoder counter, and finish every chain
-before callbacks.
+decoder, decoded-state, or allocator overhead. Legacy alignment copies, archive-validation work,
+inner decode, and simultaneous RSS also remain uncharged. Managed whole-transition preflight must
+still validate every roster entry, aggregate every object and decoder counter, and finish every
+chain before callbacks.
 
 ## Rolling compatibility
 

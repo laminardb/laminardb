@@ -43,7 +43,7 @@ through every phase; they are not a final cleanup sprint.
 
 The owner reset is recorded normatively in
 [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset).
-Cycle 69 and later certification work are paused. Core Cycles 1–11 add a private reference shard and
+Cycle 69 and later certification work are paused. Core Cycles 1–12 add a private reference shard and
 a fail-closed graph containment path: exact owned/restoring vnode-roster and chain preflight,
 deterministic callbacks, delayed activation, sticky poison after indeterminate mutation, boot-cut
 validation, predecessor-authority repair, control-only completion while source intake is closed,
@@ -133,10 +133,18 @@ terminal poison, failed launch, and graph replacement without removing newer wor
 final-owner staging has no charge and remains retryable after an indeterminate failure. Steady-state
 record cycles take no new lock or retain a transition Arc.
 
+Core Cycle 12, recorded in the
+[cycle review](../reviews/distributed-keyed-state-core-cycle-12.md), bounds owned decoding of the
+legacy outer vnode-partial archive. Safe checked archive access validates and borrows the rkyv
+shape, then the committed `global_singleton_compatibility` profile rejects more than its one state
+entry before owned names/payload vectors are deserialized. Both sealed-chain traversal decode sites
+and graph preflight use that boundary. Invalid heads/parents fail before callbacks or activation;
+the persisted bytes and record hot path are unchanged.
+
 This is current-profile raw-input containment, not the complete production keyed-state budget.
-Encoded wrapper/seal metadata, allocator and response overhead, decoder scratch and expansion,
-decoded/live/prepared/retired RSS, apply/retirement pause, and vnode-scalable publication remain
-separate limits.
+Encoded wrapper/seal metadata, allocator and response overhead, archive-validation CPU, unaligned-
+copy memory, inner decoder scratch and expansion, decoded/live/prepared/retired RSS, apply/
+retirement pause, and vnode-scalable publication remain separate limits.
 Bounded working-state storage remains later.
 Backend work does not block these slices. The selected RocksDB entry path failed its first released-
 API veto before code, as recorded in the
@@ -737,11 +745,12 @@ Work packages:
 
 ### 1E. Ownership lifecycle
 
-Cycles 6–11 land the transition identity, structural preflight, authoritative roster, explicit
+Cycles 6–12 land the transition identity, structural preflight, authoritative roster, explicit
 empty-state, aggregate prepare/publish, current-profile pre-Commit raw-lineage authority, and held
-acquired-subset raw-input ownership below. Phase 1E remains open until the complete production
-transition resource/RSS/pause bounds, vnode-sharded bounded-cost publication, a second real state-
-family consumer, and full lifecycle/fault/performance evidence are complete.
+acquired-subset raw-input ownership plus the legacy outer-container allocation bound below. Phase
+1E remains open until the complete production transition resource/RSS/pause bounds, vnode-sharded
+bounded-cost publication, a second real state-family consumer, and full lifecycle/fault/performance
+evidence are complete.
 
 - Implement `Unowned -> Acquiring -> Restoring -> Validated -> Active` and
   `Active -> Frozen/Draining -> Revoked` in the graph/runtime.
@@ -783,6 +792,11 @@ family consumer, and full lifecycle/fault/performance evidence are complete.
   transition, share bounded body-read permits and one absolute deadline/cancellation scope, and
   release only exact abandoned restore-input work on publication, terminal failure, launch failure,
   or replacement. Revoke-only final-owner staging remains durable retry authority.
+- **Landed in Cycle 12 for the current raw-rkyv path:** validate a checked borrowed outer archive,
+  enforce the committed one-entry compatibility roster before owned deserialization, and use the
+  same bounded entry point during chain traversal and graph preflight. This closes outer-container
+  allocation amplification only; archive-validation CPU, alignment copies, and inner state decode
+  remain outside the claim.
 - **Remaining:** keep stateful capability fail-closed unless initialize, capture, prepare, publish,
   abort, revoke, and finish are complete. Generalize this boundary only when a window or join
   consumer proves its timer/cursor/output needs; stateless operators remain legitimate
@@ -800,7 +814,8 @@ family consumer, and full lifecycle/fault/performance evidence are complete.
 - Bound acquired-vnode input buffering, bulk install, post-acquire full rebase, and revoked-range
   cleanup. Prove stale owners cannot read/write/publish after rotation.
 - Complete the transition-wide production reservation beyond Cycle 11's declared raw-lineage
-  ownership: charge wrapper/seal metadata, allocator/response overhead, retained spool, decode
+  ownership and Cycle 12's outer-container allocation bound: charge wrapper/seal metadata,
+  allocator/response overhead, retained spool, archive-validation/alignment work, inner decode
   scratch, decoded RSS, simultaneous live/prepared/retired residency, and publication/retirement-
   pause work. The current compatibility profile does not substitute for this complete keyed budget.
 - Introduce vnode-owned state shards before the aggregate migration so acquire/revoke publication

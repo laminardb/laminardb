@@ -79,6 +79,13 @@
   adds no steady-state record-path lock or I/O and does not cover wrapper/seal metadata, allocator/
   response overhead, decoder or decoded-state RSS, publication pause, a hot-state backend, keyed/
   window/join admission, or exactly-once. `[LDB-4007]` and `[LDB-0013]` remain unchanged.
+- Legacy vnode restore now validates the raw-rkyv outer archive through a checked borrowed view and
+  enforces the committed `global_singleton_compatibility` one-entry ceiling before allocating owned
+  operator names or payload vectors. Sealed-chain traversal and graph preflight both use this
+  bounded decoder; corrupt or over-profile heads and parents fail before callbacks, live-state
+  mutation, or activation. The persisted bytes are unchanged and record processing has no new work.
+  Checked archive traversal, unaligned-copy memory, inner aggregate/Arrow decoding, complete RSS,
+  and publication pause remain open; no backend or stateful admission is added.
 - Replacement cluster processes now start fenced and use the audited recovery-successor path to
   recertify durable vnode owners. Pristine vnode-zero bootstrap remains distinct from stale owner
   or drain state, and a stale-process drain terminal is settled before successor recovery.
