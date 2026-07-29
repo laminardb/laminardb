@@ -8,7 +8,7 @@ QUALIFICATION EVIDENCE**. It is outside the LaminarDB workspace and runtime depe
   and verifies a canonical export record by record. The caller, not the gate, is responsible for
   launching `scan` as a fresh process and keeping the report/export in one private run directory.
 
-The only executable lane currently implemented is `construction-only-no-decision`. It creates a
+The primary construction lane is `construction-only-no-decision`. It creates a
 disposable 64 MiB logical four-table fixture, executes one returned transaction in each frozen
 `I1`, `I2`, and `QR` mode, exercises the database-wide writer with a 250 ms `HOLD`, and exports the
 complete state from a fresh candidate process. The gate accepts no backend disposition and repeats
@@ -32,3 +32,13 @@ state-backend-redb-prescreen-gate verify-construction <report> <export>
 ```
 
 All output paths must have an existing parent and must not already exist.
+
+`candidate/src/bin/resource_review.rs` is the smaller, Linux-aware reproducer retained for the
+2026-07-29 bounded no-select decision. It reports physical allocation using `st_blocks`, and remains
+elimination evidence rather than a benchmark or qualification runner. From this workspace, run its
+buffered and baseline-barrier scenarios with separate existing empty directories:
+
+```text
+cargo run --locked --release -p state-backend-redb-prescreen-candidate --bin resource_review -- <empty-directory>
+cargo run --locked --release -p state-backend-redb-prescreen-candidate --bin resource_review -- <empty-directory> baseline-barrier
+```

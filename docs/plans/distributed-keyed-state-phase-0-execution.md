@@ -706,15 +706,11 @@ independent-operation, and candidate-comparison blockers remain.
 
 redb 4.1.0 remains outside C2. Cycle 16 added a separately authorized, isolated
 `construction-only-no-decision` workspace and CI lane; it cannot consume approval, classify a
-prescreen, or contribute selection evidence. The optional
-[bounded redb prescreen](../testing/state-backend-redb-prescreen-v1.md) is **PARKED after Cycle 34**;
-this is an administrative stop, not a formal `DEFER` result. Its design timebox is exhausted, and
-its descriptor-root schemas remain synthetic-only
-regression shapes. No further protocol, provider, Docker, IPC, schema, collector, mechanism, or
-adapter work is scheduled. It may reopen only through the protocol's one-page, two-engineering-day/
-four-machine-hour, separately versioned micro-prescreen charter and separate candidate-execution
-authority. A favorable observation merely funds mechanism/persistence mapping, an additive profile/
-schema proposal, and adapter review; no prescreen artifact may satisfy or be pooled into C1/C2/C3.
+prescreen, or contribute selection evidence. The later
+[bounded review](../reports/redb-4.1.0-bounded-review-2026-07-29.md) passed narrow construction but
+exposed unresolved physical-allocation, durability-barrier, offline-compaction, and shutdown risks.
+Do not add a redb adapter or runtime dependency. Only a newer official release may re-enter through
+the same narrow resource/maintenance control; no redb artifact may satisfy or be pooled into C1/C2/C3.
 
 **Historical candidate record:** The following Cycle 17–41 RocksDB/TidesDB sequence and its
 TidesDB-specific facade/campaign details are retained as exact decision provenance. The Fjall
@@ -928,10 +924,9 @@ Remaining work is kept reviewable in this dependency order:
 10. `docs: review distributed keyed state phase zero and authorize only the operator families whose
     full distribution/state/delivery evidence passes`.
 
-The parked redb prescreen is not a prerequisite or active side branch in this numbered candidate
-sequence. If a future bounded charter yields a favorable administrative recommendation, a later
-explicit scope decision and additive profile/schema revision are still required before any redb
-adapter commit.
+The stopped 4.1.0 redb review is not a prerequisite or active side branch in this numbered candidate
+sequence. If a newer official release passes the bounded re-entry control, a later explicit scope
+decision and additive profile/schema revision are still required before any redb adapter commit.
 
 Phase 1 tracks three temporary release dead-code allowances as **DKS-P1-001**. Owner:
 distributed-state lifecycle implementation. Deadline: 2026-08-31 or the first applicable runtime

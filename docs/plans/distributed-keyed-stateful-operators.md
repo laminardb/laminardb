@@ -136,8 +136,9 @@ core lifecycle and backend implementation are functionally complete and before a
 admission. The independent soak must exercise the cleaned release candidate, so the final sweep
 also precedes that soak and any production-readiness claim. Its ordered inventory is:
 
-1. remove the parked redb prescreen/qualification lane, required-CI dependency, and oversized
-   parked protocol document, retaining only a short alternatives-considered decision;
+1. remove the obsolete redb construction/qualification code, required-CI dependency, and oversized
+   protocol document; retain only the bounded alternatives decision and its minimal locked resource
+   reproducer until a successor repeat or final backend selection closes it;
 2. remove or explicitly product-own the excluded `distributed-state-ab` fake observer and the
    certification-only collectors mixed into `cluster_soak.rs`; preserve the independent soak as a
    later release gate, not production helper code;

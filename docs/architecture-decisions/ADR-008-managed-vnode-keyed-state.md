@@ -315,7 +315,7 @@ seal, coordinator decision, or restore-before-activate authority.
 | Qualification contract | Cycle 38 maintenance-health v2 and exact v4 remain immutable validation/reference lineage; no GitHub approval workflow exists or is required for that scope; v1 remains immutable regression lineage | Do not relabel frozen evidence. Any later candidate run needs exact source/build/profile/plan/target/limits authority and may use only truthful candidate or Laminar-owned bounded signals; unsupported is never zero |
 | RocksDB 10.4.2 via `rocksdb` 0.24.0 | Mature operational LSM reference and immutable v1-v4 regression/comparison subject; not the product backend | No new adapter, source-closure, or qualification work is scheduled absent a new project-owner direction |
 | Fjall 3.1.8, official tag `6debe706` | **SOURCE_BLOCKED_PENDING_TARGETED_REPRO.** Source shows a worker-error/drop hazard and incomplete frozen-v2 failure coverage; neither has an empirical candidate result | Not active while TidesDB is preferred. Before an outright rejection, inject the existing worker-error branch and bound database destruction externally |
-| redb 4.1.0 | **PARKED after Cycle 34**; administrative status, not a formal `DEFER` result; design timebox exhausted; no candidate profile, adapter, mechanism result, or execution authority | No scheduled work. Reopen only through an explicit two-day/four-machine-hour micro-prescreen charter; otherwise retain as history. A favorable observation could only fund a later mapping/profile proposal |
+| redb 4.1.0 | **Stop 4.1.0; reconsider only an official successor.** The 2026-07-29 bounded review found unresolved physical-allocation, durability-barrier, offline-compaction, and non-fallible-drop risks; it is not a formal qualification result | No adapter or runtime dependency. A newer official release may begin with the same two-profile resource/maintenance control; no upstream change is pre-credited |
 | Official `tidesdb/tidesdb-rs` binding | **PREFERRED; BLOCKED PENDING UPSTREAM RELEASE.** Released 0.11.1 ordinary-path tests pass; unmodified 9.3.14 unified mode and a separate short-return contract test expose false-success paths | Land focused native regressions/fix, publish a fixed successor tag and matching official Rust package, then repeat entry before adapter work |
 | SurrealKV 0.21.2 | Rejected unmodified; no active candidate track | Correctness/liveness fork and new bounded prescreen authority before reconsideration |
 
@@ -326,7 +326,7 @@ The current source detail and rationale live in the
 [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
 [candidate mapping designs](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md),
 [RocksDB closure](../reports/rocksdb-mechanism-source-closure-2026-07-24.md),
-[redb prescreen](../testing/state-backend-redb-prescreen-v1.md),
+[redb 4.1.0 bounded review](../reports/redb-4.1.0-bounded-review-2026-07-29.md),
 [TidesDB prescreen](../reports/tidesdb-static-prescreen-2026-07-25.md),
 [historical TidesDB package design](tidesdb-local-state-successor-design.md), and
 [historical TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
