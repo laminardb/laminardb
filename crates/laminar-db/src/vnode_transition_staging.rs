@@ -127,7 +127,7 @@ pub(crate) struct PendingVnodeTransition {
     revoked_vnodes: Box<[u32]>,
     restores: Box<[PendingVnodeRestore]>,
     /// Held for exactly as long as the raw checkpoint bodies in `restores`.
-    _restore_input_reservation: Option<VnodeRestoreInputReservation>,
+    restore_input_reservation: Option<VnodeRestoreInputReservation>,
 }
 
 struct ValidatedVnodeRestores {
@@ -136,6 +136,13 @@ struct ValidatedVnodeRestores {
 }
 
 impl PendingVnodeTransition {
+    /// Whether this transition owns raw checkpoint bodies that must be retired with a terminally
+    /// failed restore attempt. Revoke-only final-owner exits deliberately retain their durable
+    /// staging authority for retry and therefore return `false`.
+    pub(crate) fn has_restore_input_reservation(&self) -> bool {
+        self.restore_input_reservation.is_some()
+    }
+
     pub(crate) fn boot_recovery(
         target: CheckpointAssignmentFence,
         target_owners: &[NodeId],
@@ -163,7 +170,7 @@ impl PendingVnodeTransition {
             acquired_vnodes: acquired_vnodes.into_boxed_slice(),
             revoked_vnodes: Box::default(),
             restores: validated.restores.into_boxed_slice(),
-            _restore_input_reservation: Some(validated.reservation),
+            restore_input_reservation: Some(validated.reservation),
         })
     }
 
@@ -292,7 +299,7 @@ impl PendingVnodeTransition {
             acquired_vnodes: acquired_vnodes.into_boxed_slice(),
             revoked_vnodes: revoked_vnodes.into_boxed_slice(),
             restores: restores.into_boxed_slice(),
-            _restore_input_reservation: restore_input_reservation,
+            restore_input_reservation,
         })
     }
 

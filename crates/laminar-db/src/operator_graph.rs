@@ -229,7 +229,11 @@ fn publish_cluster_execution_poison(
         installed_vnode_state.lock().take();
     }
     if let Some((handle, expected)) = pending_vnode_transition {
-        crate::vnode_transition_staging::retire_exact_pending_vnode_transition(handle, expected);
+        if expected.has_restore_input_reservation() {
+            crate::vnode_transition_staging::retire_exact_pending_vnode_transition(
+                handle, expected,
+            );
+        }
     }
     poisoned.store(true, Ordering::Release);
 }
