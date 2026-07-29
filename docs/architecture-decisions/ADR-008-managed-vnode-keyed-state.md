@@ -4,7 +4,7 @@
   local-spill backend is selected, production qualification is paused, and cluster admission is
   unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-29 after Core Cycle 12 and the Fjall lifecycle reproduction
+- **Last reconciled:** 2026-07-29 after Core Cycle 13 and the Fjall lifecycle reproduction
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** released `rocksdb` 0.24.0 is stopped at the cleanup/lifecycle
   source gate; no backend is selected or production-qualified, and admission is **NO-GO**
@@ -18,7 +18,7 @@
   [Fjall 3.1.8 source closure](../reports/fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md),
   [Fjall lifecycle reproduction](../reports/fjall-3.1.8-worker-lifecycle-empirical-closure-2026-07-29.md),
   [TidesDB empirical re-entry](../reports/tidesdb-current-package-reentry-2026-07-28.md), and
-  [latest core review](../reviews/distributed-keyed-state-core-cycle-12.md)
+  [latest core review](../reviews/distributed-keyed-state-core-cycle-13.md)
 
 ## Decision
 
@@ -297,6 +297,16 @@ names and payload vectors. Sealed-chain head and parent traversal plus graph pre
 profile authority. An over-roster child fails before parent-body I/O, and an over-roster parent
 fails before a chain can reach operator preparation. The wire format remains unchanged.
 
+Core Cycle 13 makes aggregate key-group cardinality construction identity rather than a value
+selected by the first vnode capture. Embedded and single-node aggregate state binds
+`LOCAL_KEY_GROUP_COUNT`; cluster lazy initialization and the DDL/startup construction probe bind
+the exact registry/checkpoint count. A global aggregate in an N-key-group cluster retains N while
+mapping its sole state key to vnode zero. Full/delta capture checks the identity before acquired-
+vnode bookkeeping, and transition preparation checks it before payload decode or private staging.
+The former optional delta count is reduced to a baseline-activation flag, so inactive record
+processing retains one guard and performs no tracking hash, insertion, allocation, lock, or I/O.
+No artifact, fingerprint, backend, delivery contract, or admission rule changes.
+
 This is still current-profile containment, not the complete production keyed-state budget. The
 charge covers declared raw lineage payload/artifact ownership, not encoded wrapper/seal metadata,
 allocator and response overhead, archive-validation CPU, unaligned-copy memory, inner decoder
@@ -375,8 +385,9 @@ pre-Commit parent-seal traversal and checked cluster totals, capsule binding, ta
 and Commit-only successor-parent promotion. Core Cycle 11 holds the acquired-subset raw-input
 charge through publication/failure, bounds body-read concurrency, and applies one absolute restore
 deadline/cancellation scope. Core Cycle 12 caps the legacy outer operator/delta entry count before
-owned deserialization at every production restore decode site. The profile remains global-
-singleton compatibility; none of these cycles admits keyed state.
+owned deserialization at every production restore decode site. Core Cycle 13 freezes the aggregate
+key-group count across construction, capture, restore, and rebalance before physical sharding. The
+profile remains global-singleton compatibility; none of these cycles admits keyed state.
 
 This remains an aggregate reference lifecycle, not complete Phase 1. Transition-wide encoded
 wrapper/seal and allocator overhead, archive-validation/alignment work, inner decode scratch,
@@ -1023,7 +1034,7 @@ Restore follows this protocol:
    source/shuffle/output intake only after complete publication. Off-thread retirement remains a
    future measured design choice rather than a current guarantee.
 
-Cycles 6–12 implement the immutable authority envelope, complete structural preflight, exact
+Cycles 6–13 implement the immutable authority envelope, complete structural preflight, exact
 transition retention, and the prepare/publish protocol for `SqlAggregateV1`. Each aggregate fully
 decodes and validates its complete restore/revoke batch into a mutation plan with private
 replacement collections. Any prepare or authority error aborts and finishes every attempted
@@ -1040,10 +1051,11 @@ That proves logical atomicity for the current aggregate participant because grap
 assignment publication are excluded across the cut. It is not a bounded-pause result. Aggregate
 publication still moves/updates collections in proportion to transitioned state, preparation can
 temporarily retain live state and prepared replacement collections, can grow live capacity even if
-later aborted, and retirement can run destructors proportional to displaced state. Cycles 9–12
+later aborted, and retirement can run destructors proportional to displaced state. Cycles 9–13
 account sealed raw restore input, bind a metadata-verified cluster-global compatibility contract
 before Commit, and hold each acquired subset's declared raw payload/artifact charge through the
-pending transition; Cycle 12 additionally caps legacy outer entries before owned deserialization.
+pending transition; Cycle 12 additionally caps legacy outer entries before owned deserialization,
+and Cycle 13 rejects aggregate routing-count drift before capture or transition work.
 They do not prove a bounded publication pause or complete transition-wide resource envelope.
 Wrapper/seal metadata, allocator/response overhead, retained spool, archive validation/alignment,
 inner decoded RSS and scratch, live-plus-prepared-plus-retired residency, and measured apply/

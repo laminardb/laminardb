@@ -4,7 +4,7 @@
   adapter-entry cleanup/lifecycle gate, no local-spill backend is selected, production
   qualification/certification is paused, and no new cluster operator is admitted
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-29 after the RocksDB adapter-entry source closure
+- **Last reconciled:** 2026-07-29 after Core Cycle 13 and the Fjall lifecycle reproduction
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Backend selection:** [official-release decision](../reports/official-release-state-backend-selection-2026-07-29.md)
 - **Backend result:** [RocksDB source closure](../reports/rocksdb-0.24.0-adapter-entry-source-closure-2026-07-29.md)
@@ -43,7 +43,7 @@ through every phase; they are not a final cleanup sprint.
 
 The owner reset is recorded normatively in
 [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset).
-Cycle 69 and later certification work are paused. Core Cycles 1–12 add a private reference shard and
+Cycle 69 and later certification work are paused. Core Cycles 1–13 add a private reference shard and
 a fail-closed graph containment path: exact owned/restoring vnode-roster and chain preflight,
 deterministic callbacks, delayed activation, sticky poison after indeterminate mutation, boot-cut
 validation, predecessor-authority repair, control-only completion while source intake is closed,
@@ -140,6 +140,15 @@ shape, then the committed `global_singleton_compatibility` profile rejects more 
 entry before owned names/payload vectors are deserialized. Both sealed-chain traversal decode sites
 and graph preflight use that boundary. Invalid heads/parents fail before callbacks or activation;
 the persisted bytes and record hot path are unchanged.
+
+Core Cycle 13, recorded in the
+[cycle review](../reviews/distributed-keyed-state-core-cycle-13.md), binds a typed immutable key-
+group count when aggregate state is constructed. Local runtimes bind one; cluster lazy init and
+DDL/startup preflight bind the exact registry/checkpoint topology. Full/delta capture rejects a
+different caller count before acquired-vnode bookkeeping, and transition preparation rejects it
+before payload decode. Global aggregate state retains the cluster-wide count while remaining on
+vnode zero. Delta tracking now has a boolean baseline-activation flag rather than a second routing
+authority; inactive record processing gains no hash, insertion, allocation, lock, or I/O.
 
 This is current-profile raw-input containment, not the complete production keyed-state budget.
 Encoded wrapper/seal metadata, allocator and response overhead, archive-validation CPU, unaligned-
@@ -745,7 +754,7 @@ Work packages:
 
 ### 1E. Ownership lifecycle
 
-Cycles 6–12 land the transition identity, structural preflight, authoritative roster, explicit
+Cycles 6–13 land the transition identity, structural preflight, authoritative roster, explicit
 empty-state, aggregate prepare/publish, current-profile pre-Commit raw-lineage authority, and held
 acquired-subset raw-input ownership plus the legacy outer-container allocation bound below. Phase
 1E remains open until the complete production transition resource/RSS/pause bounds, vnode-sharded
@@ -797,6 +806,11 @@ evidence are complete.
   same bounded entry point during chain traversal and graph preflight. This closes outer-container
   allocation amplification only; archive-validation CPU, alignment copies, and inner state decode
   remain outside the claim.
+- **Landed in Cycle 13 before aggregate sharding:** make `KeyGroupCount` immutable construction
+  identity in embedded, single-node, and cluster modes; require exact equality from capture callers
+  and the production managed restore/revoke/rebalance transition before mutation or decode; retain
+  global state on vnode zero without collapsing an N-key-group cluster to one. Key-group-count
+  rescaling remains a new-identity/repartition problem, not an in-place mutation.
 - **Remaining:** keep stateful capability fail-closed unless initialize, capture, prepare, publish,
   abort, revoke, and finish are complete. Generalize this boundary only when a window or join
   consumer proves its timer/cursor/output needs; stateless operators remain legitimate

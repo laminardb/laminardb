@@ -86,6 +86,15 @@
   mutation, or activation. The persisted bytes are unchanged and record processing has no new work.
   Checked archive traversal, unaligned-copy memory, inner aggregate/Arrow decoding, complete RSS,
   and publication pause remain open; no backend or stateful admission is added.
+- Incremental aggregate state now binds one typed, immutable key-group count at construction in
+  embedded, single-node, and cluster modes. Local runtimes bind one key group; cluster lazy
+  initialization and DDL preflight use the exact registry/checkpoint topology, including global
+  aggregates that retain the complete count while mapping their sole key to vnode zero. Full/delta
+  capture and the production managed vnode transition reject a different count before ownership
+  bookkeeping, payload decode, or live-state mutation. The former optional delta count is now only
+  a baseline-activation flag, removing duplicate routing authority without adding a record-path
+  hash, allocation, lock, or I/O. No wire/fingerprint, backend, delivery, or admission rule changes;
+  `[LDB-4007]` and `[LDB-0013]` remain unchanged.
 - Replacement cluster processes now start fenced and use the audited recovery-successor path to
   recertify durable vnode owners. Pristine vnode-zero bootstrap remains distinct from stale owner
   or drain state, and a stale-process drain terminal is settled before successor recovery.

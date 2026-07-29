@@ -6,7 +6,7 @@
 
 **Scope:** admission and lifecycle validation only; no cluster capability is enabled by this work.
 
-**2026-07-29 core update (through Core Cycle 12):** The
+**2026-07-29 core update (through Core Cycle 13):** The
 [ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset)
 pauses later certification tooling. Core Cycle 1 adds a private reference managed vnode shard and
 caller-supplied lifecycle publication. Core Cycles 2–4 contain the existing runtime staging path
@@ -75,6 +75,14 @@ payload-vector deserialization. Both sealed-chain traversal decode sites and gra
 that boundary. Over-roster heads fail before parent body I/O, over-roster parents fail before a
 chain reaches operator preparation, and callbacks/activation remain untouched. The persisted wire
 and record hot path are unchanged.
+
+Cycle 13 makes the aggregate key-group count immutable construction identity. Embedded and single-
+node state binds `LOCAL_KEY_GROUP_COUNT`; cluster lazy initialization and DDL/startup preflight use
+the exact registry/checkpoint count. A global aggregate retains that full count while routing its
+sole key to vnode zero. Full and delta capture reject a mismatch before `prev_owned` or delta-chain
+bookkeeping changes, and transition preparation rejects it before payload decode or private state
+staging. The former optional delta count is now a baseline-activation boolean, leaving inactive
+record processing with one guard and no tracking hash, insertion, allocation, lock, or I/O.
 
 These cycles do not add a bounded working-state backend or runtime selector, validate the complete
 production keyed budget, bound wrapper/seal/allocator/archive-alignment/inner-decode/RSS/
@@ -577,7 +585,7 @@ must not be patched as an isolated assertion:
   can leave an in-memory partial batch. Cluster execution must recover from the sealed cut rather
   than retry that batch locally until the managed state write is one atomic transaction.
 
-Cycles 6–12 close staged-material loss, activation before complete validation, mixed live
+Cycles 6–13 close staged-material loss, activation before complete validation, mixed live
 aggregate publication. The graph snapshots one exact pending-transition `Arc`, structurally
 resolves the complete raw-chain inventory against its cached participant roster, and asks every
 applicable SQL aggregate to prepare a mutation plan with private replacement collections. A
@@ -598,12 +606,13 @@ simultaneously, and can leave successfully reserved capacity after abort. Public
 retirement remain proportional to transitioned state. Cycle 10 supplies the current-profile
 pre-Commit raw-lineage authority, and Cycle 11 owns each acquired subset's declared bodies/
 artifacts under bounded body-read concurrency and one restore deadline. Cycle 12 caps legacy outer
-entries before owned deserialization. There is still no complete
-production keyed or transition-wide reservation for wrapper/seal metadata, allocator/response
-overhead, retained spool, archive validation/alignment, inner decoder scratch/expansion, decoded
-RSS, live/prepared/retired residency, or apply pause. The remaining boundary is therefore resource-
-governed, vnode-sharded bounded-cost publication plus a second real state-family consumer—not
-another validator around the raw keyed payload.
+entries before owned deserialization. Cycle 13 closes first-capture selection of aggregate routing
+cardinality and checks the immutable count before capture/transition work. There is still no
+complete production keyed or transition-wide reservation for wrapper/seal metadata, allocator/
+response overhead, retained spool, archive validation/alignment, inner decoder scratch/expansion,
+decoded RSS, live/prepared/retired residency, or apply pause. The remaining boundary is therefore
+resource-governed, vnode-sharded bounded-cost publication plus a second real state-family
+consumer—not another validator around the raw keyed payload.
 
 This code is useful implementation substrate, but it does not make the operator production safe.
 The current one-million-group guard counts entries, not bytes. The live `groups`, changelog
@@ -926,6 +935,7 @@ The current branch's admission-neutral hardening was then checked separately:
 | Core Cycle 10 commit-domain lineage authority | PASS for focused current-profile scope | Participant-agreed limits and exact cluster totals, complete pre-Commit and pre-body parent-seal traversal, Abort/non-promotion on invalid ancestry, Commit-only parent promotion, affected coordinator/committer/rehydration/staging suites, feature checks, and warnings-denied Clippy passed. Broad suites and current-binary soaks were not run |
 | Core Cycle 11 raw restore-input ownership | PASS, 40 focused lifecycle/resource tests plus build/lint gates | Exact acquired-subset byte/artifact reservation before body GET, 32 shared body-read permits, in-flight cancellation/drop, publication/poison/failed-launch/replacement release, pointer-exact successor preservation, cluster and no-cluster checks, and warnings-denied Clippy passed. No backend, admission, latency/RSS result, or soak follows |
 | Core Cycle 12 legacy outer-decode bound | PASS, 11 codec, 27 rehydration, 24 vnode-transition, and focused graph regressions plus build/lint gates | Checked borrowed rkyv validation and the committed one-entry ceiling precede owned outer deserialization at loader and graph boundaries. Real head/parent ancestry, zero-roster, duplicate-name, multi-participant test protocol, unaligned/truncated input, no-default/cluster checks, and warnings-denied Clippy passed. Inner decode/RSS/pause, backend, admission, delivery and soak remain open |
+| Core Cycle 13 immutable aggregate key-group identity | PASS, 15 vnode-lifecycle, 19 SQL operator, 72 active cluster aggregate, 62 active local aggregate, and focused admission regressions plus build/lint gates | Typed construction identity is exact in local and cluster modes; global state keeps N while routing to vnode zero; first/full/delta/transition mismatch paths fail before bookkeeping, decode, or logical mutation. No wire, backend, delivery, or admission change. One broader operator-graph filter timed out during Windows linking and has no pass claim; soaks remain paused |
 | Independent immutable release-candidate soak | **NOT RUN** | Production certification remains unavailable |
 | Core Cycle 3 `operator_graph::tests` with cluster | PASS, 111/111 | Full graph unit module after opaque final-exit authority, rotation-fence, endpoint, restore-drift, assignment-drift, callback-failure, and sticky-poison checks |
 | Current `final_owner_exit` focused filter | PASS, 11/11 | Audited committed last-vnode cleanup succeeds only for exact predecessor/target authority. Revoke-only exits own no raw restore-input charge; callback failure and post-callback restore, transport, or assignment drift poison the graph while retaining durable staging for retry |
@@ -1138,7 +1148,7 @@ a managed keyed working-state capability connected to the distributed execution 
    tests, process-death/rebalance output oracles, recovery compatibility, and published latency and
    resource profiles.
 
-Core Cycles 6–12 implement the transition identity, authoritative participant roster, named FULL
+Core Cycles 6–13 implement the transition identity, authoritative participant roster, named FULL
 payloads whose decoded aggregate image is empty, placement scoping, structural preflight, aggregate
 semantic prepare-all/abort-all/infallible publication, net live-growth reserve, and current-path
 sealed raw-lineage receipt and Commit-domain authority subsets of item 5. Cycle 10 validates the
@@ -1150,6 +1160,8 @@ body reads and transfers the charge through loaded and pending-transition owners
 publication or terminal retirement. One worker request pool and absolute deadline/cancellation
 scope bound the read phase. Cycle 12 then enforces the current one-entry legacy outer roster through
 a checked borrowed archive before owned deserialization at every production restore decode site.
+Cycle 13 makes aggregate routing cardinality immutable across construction, capture, restore, and
+rebalance, while preserving global vnode-zero semantics under a multi-key-group topology.
 
 They do not complete the capability. The current resource-owning slice is deliberately limited to
 the admitted global-singleton compatibility profile and its declared raw lineage. Wrapper/seal

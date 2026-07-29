@@ -358,7 +358,10 @@ and a checked cluster-global contract before Commit and again at restore. Cycle 
 acquired-subset reservation for the current legacy raw bodies/artifacts plus bounded body-read
 concurrency and an absolute deadline/cancellation scope. Cycle 12 makes every production legacy
 restore decode validate a checked borrowed outer archive and enforce the committed one-entry
-operator/delta ceiling before owned deserialization. That containment still neither
+operator/delta ceiling before owned deserialization. Cycle 13 freezes each aggregate's typed key-
+group count at construction and requires lifecycle caller counts to match before legacy payload
+decode; it does not add the count to an aggregate body or fingerprint because the validated
+manifest/assignment contract already owns that authority. That containment still neither
 authenticates nor decodes `VnodePartialV2`; it does not charge this format's wrapper/directory,
 decoder, decoded-state, or allocator overhead. Legacy alignment copies, archive-validation work,
 inner decode, and simultaneous RSS also remain uncharged. Managed whole-transition preflight must
