@@ -4,7 +4,7 @@
   adapter-entry cleanup/lifecycle gate, no local-spill backend is selected, production
   qualification/certification is paused, and no new cluster operator is admitted
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-29 after Core Cycle 13 and the Fjall lifecycle reproduction
+- **Last reconciled:** 2026-07-29 after Core Cycle 14 and the Fjall lifecycle reproduction
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Backend selection:** [official-release decision](../reports/official-release-state-backend-selection-2026-07-29.md)
 - **Backend result:** [RocksDB source closure](../reports/rocksdb-0.24.0-adapter-entry-source-closure-2026-07-29.md)
@@ -43,7 +43,7 @@ through every phase; they are not a final cleanup sprint.
 
 The owner reset is recorded normatively in
 [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset).
-Cycle 69 and later certification work are paused. Core Cycles 1–13 add a private reference shard and
+Cycle 69 and later certification work are paused. Core Cycles 1–14 add a private reference shard and
 a fail-closed graph containment path: exact owned/restoring vnode-roster and chain preflight,
 deterministic callbacks, delayed activation, sticky poison after indeterminate mutation, boot-cut
 validation, predecessor-authority repair, control-only completion while source intake is closed,
@@ -150,11 +150,29 @@ before payload decode. Global aggregate state retains the cluster-wide count whi
 vnode zero. Delta tracking now has a boolean baseline-activation flag rather than a second routing
 authority; inactive record processing gains no hash, insertion, allocation, lock, or I/O.
 
+Core Cycle 14 replaces the aggregate's flat working maps with one private coherent vnode working
+set in embedded, single-node, and cluster modes. Lazy boxed slots hold rows, output baseline, dirty
+tracking, delta-chain length, and forced-rebase state together. An active-vnode roster keeps emit,
+capture, and whole-checkpoint traversal proportional to resident vnodes; per-vnode capture is a
+direct slot lookup. Whole restore constructs and swaps a complete set, while a managed transition
+constructs replacement slots off-side and publishes only transitioned slot pointers plus the
+roster, retaining displaced allocations until post-fence retirement. The checkpoint structs,
+schema, codec, envelope, and fingerprint were not changed; serialized ordering and byte-for-byte
+compatibility are not claimed. Exact local routes carry an internal uniform-vnode hint into normal
+aggregate processing. Singleton remote route sets retain it through normal processing and live
+in-memory aligned replay. Checkpoint-restored replay deliberately loses the hint and rehashes each
+unique group, as do mixed owner-coalesced routes. The hint is a trusted routing invariant, not
+independently derived authority; those fallback paths remain explicit latency-measurement gates.
+
 This is current-profile raw-input containment, not the complete production keyed-state budget.
 Encoded wrapper/seal metadata, allocator and response overhead, archive-validation CPU, unaligned-
 copy memory, inner decoder scratch and expansion, decoded/live/prepared/retired RSS, apply/
-retirement pause, and vnode-scalable publication remain separate limits.
-Bounded working-state storage remains later.
+retirement pause, and fixed slot-table/active-roster startup and RSS costs remain separate limits.
+The next smallest core cycle is backend-neutral live-state accounting and a bounded working-state
+resource envelope. It does not select or integrate a backend, relax admission, or resume soak.
+Cluster failover and source/state/sink ALO/EO evidence, complete window and join-family support,
+and the independent soak remain paused and unrun for this subject. `[LDB-4007]` and `[LDB-0013]`
+remain unchanged.
 Backend work does not block these slices. The selected RocksDB entry path failed its first released-
 API veto before code, as recorded in the
 [source closure](../reports/rocksdb-0.24.0-adapter-entry-source-closure-2026-07-29.md). There is no
@@ -754,11 +772,11 @@ Work packages:
 
 ### 1E. Ownership lifecycle
 
-Cycles 6–13 land the transition identity, structural preflight, authoritative roster, explicit
+Cycles 6–14 land the transition identity, structural preflight, authoritative roster, explicit
 empty-state, aggregate prepare/publish, current-profile pre-Commit raw-lineage authority, and held
-acquired-subset raw-input ownership plus the legacy outer-container allocation bound below. Phase
-1E remains open until the complete production transition resource/RSS/pause bounds, vnode-sharded
-bounded-cost publication, a second real state-family consumer, and full lifecycle/fault/performance
+acquired-subset raw-input ownership plus the legacy outer-container allocation bound and aggregate
+vnode-sharded publication below. Phase 1E remains open until the complete production transition
+resource/RSS/pause bounds, a second real state-family consumer, and full lifecycle/fault/performance
 evidence are complete.
 
 - Implement `Unowned -> Acquiring -> Restoring -> Validated -> Active` and
@@ -811,6 +829,13 @@ evidence are complete.
   and the production managed restore/revoke/rebalance transition before mutation or decode; retain
   global state on vnode zero without collapsing an N-key-group cluster to one. Key-group-count
   rescaling remains a new-identity/repartition problem, not an in-place mutation.
+- **Landed in Cycle 14 for the aggregate working set:** co-locate rows, output baseline, dirty and
+  delta metadata in lazy boxed vnode slots; traverse an exact active-vnode roster; capture a vnode
+  by direct lookup; construct whole-restore and managed-transition replacements off-side; and
+  publish transitioned slot pointers plus the roster without allocation. Exact local/singleton
+  route hints avoid redundant hashing, but their trusted invariant and mixed-route/restart rehash
+  cost still require measurement. The checkpoint structs, schema, codec, envelope, and fingerprint
+  were unchanged; serialized ordering and byte-identical compatibility remain unproven.
 - **Remaining:** keep stateful capability fail-closed unless initialize, capture, prepare, publish,
   abort, revoke, and finish are complete. Generalize this boundary only when a window or join
   consumer proves its timer/cursor/output needs; stateless operators remain legitimate
@@ -832,8 +857,10 @@ evidence are complete.
   allocator/response overhead, retained spool, archive-validation/alignment work, inner decode
   scratch, decoded RSS, simultaneous live/prepared/retired residency, and publication/retirement-
   pause work. The current compatibility profile does not substitute for this complete keyed budget.
-- Introduce vnode-owned state shards before the aggregate migration so acquire/revoke publication
-  is a bounded pointer swap rather than a full-map scan.
+- **Next core cycle:** account live aggregate state without per-record hot-path scans and enforce a
+  bounded working-state envelope, including fixed slot-table/active-roster startup and RSS plus
+  simultaneous live/prepared/retired residency. Do not add a backend, relax admission, or resume
+  qualification/soak in that cycle.
 
 Tests:
 

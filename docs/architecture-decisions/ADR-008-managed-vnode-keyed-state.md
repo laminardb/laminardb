@@ -4,7 +4,7 @@
   local-spill backend is selected, production qualification is paused, and cluster admission is
   unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-29 after Core Cycle 13 and the Fjall lifecycle reproduction
+- **Last reconciled:** 2026-07-29 after Core Cycle 14 and the Fjall lifecycle reproduction
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** released `rocksdb` 0.24.0 is stopped at the cleanup/lifecycle
   source gate; no backend is selected or production-qualified, and admission is **NO-GO**
@@ -18,7 +18,7 @@
   [Fjall 3.1.8 source closure](../reports/fjall-3.1.8-adapter-entry-source-closure-2026-07-28.md),
   [Fjall lifecycle reproduction](../reports/fjall-3.1.8-worker-lifecycle-empirical-closure-2026-07-29.md),
   [TidesDB empirical re-entry](../reports/tidesdb-current-package-reentry-2026-07-28.md), and
-  [latest core review](../reviews/distributed-keyed-state-core-cycle-13.md)
+  [latest core review](../reviews/distributed-keyed-state-core-cycle-14.md)
 
 ## Decision
 
@@ -306,6 +306,28 @@ vnode bookkeeping, and transition preparation checks it before payload decode or
 The former optional delta count is reduced to a baseline-activation flag, so inactive record
 processing retains one guard and performs no tracking hash, insertion, allocation, lock, or I/O.
 No artifact, fingerprint, backend, delivery contract, or admission rule changes.
+
+Core Cycle 14 replaces the aggregate's private flat mutable maps with one coherent resident state
+box per vnode. The immutable `KeyGroupCount` sizes a fixed direct-address slot table; only resident
+vnodes own boxes, and a separately maintained sorted active roster keeps emit and checkpoint walks
+proportional to active vnodes rather than the configured key-group count. Each box co-locates group
+accumulators, changelog state, dirty-key journals, and delta-chain/rebase bookkeeping. Whole-state
+restore builds a complete replacement table off-side, while per-vnode capture reads its slot
+directly. Rebalance preparation decodes and validates the complete restore roster into private
+replacement boxes. Publication performs allocation-free slot-pointer swaps plus one prepared-roster
+swap under the graph fence; displaced boxes remain owned by the retired transition until post-fence
+cleanup. A canonical EMPTY restore clears the vnode's physical slot instead of retaining an inert
+box. The checkpoint structs, artifact schema, and fingerprint are unchanged; this is not a claim
+that serialization preserves byte-for-byte map iteration order.
+
+Pre-aggregate routing may carry an ephemeral internal vnode hint without a protobuf, checkpoint,
+or other wire-format change. Only an exact singleton routed-vnode declaration is trusted, and the
+aggregate still validates its range and the global-aggregate vnode-zero rule before mutation. A
+live retained aligned-replay batch keeps that hint. Owner-coalesced mixed-vnode batches, configless
+routes, and replay reconstructed from a checkpoint have no singleton hint and therefore derive the
+vnode once per unique encoded group. This is an internal non-Byzantine routing contract, not durable
+artifact identity or a new admission capability. No runtime backend dependency is added;
+`[LDB-4007]`, `[LDB-0013]`, and the production **NO-GO** remain unchanged.
 
 This is still current-profile containment, not the complete production keyed-state budget. The
 charge covers declared raw lineage payload/artifact ownership, not encoded wrapper/seal metadata,

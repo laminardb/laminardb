@@ -6,7 +6,7 @@
 
 **Scope:** admission and lifecycle validation only; no cluster capability is enabled by this work.
 
-**2026-07-29 core update (through Core Cycle 13):** The
+**2026-07-29 core update (through Core Cycle 14):** The
 [ADR reset](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#2026-07-27-workstream-reset)
 pauses later certification tooling. Core Cycle 1 adds a private reference managed vnode shard and
 caller-supplied lifecycle publication. Core Cycles 2–4 contain the existing runtime staging path
@@ -83,6 +83,25 @@ sole key to vnode zero. Full and delta capture reject a mismatch before `prev_ow
 bookkeeping changes, and transition preparation rejects it before payload decode or private state
 staging. The former optional delta count is now a baseline-activation boolean, leaving inactive
 record processing with one guard and no tracking hash, insertion, allocation, lock, or I/O.
+
+Cycle 14 replaces the aggregate's flat working collections with one coherent state object per
+vnode. A fixed topology-sized table contains lazy boxed slots, while a sorted active-vnode roster
+makes whole-state traversal proportional to resident shards rather than configured key groups.
+Each shard owns its groups, changelog deduplication state, emit/checkpoint dirty keys, delta-chain
+depth, and forced-full-rebase marker. Whole restore constructs a complete off-side slot set before
+replacement. Managed restore/revoke prepares complete replacement shards, then publication swaps
+only transitioned slot pointers and the active roster under the existing graph fence; displaced
+state remains retired until after the fence. Per-vnode capture is a direct slot operation rather
+than a flat-map scan.
+
+The existing local route and remote routed-vnode metadata now provide an exact uniform vnode hint
+to aggregate processing. This removes the redundant partition hash for local and singleton-remote
+batches without adding a row sidecar or changing the transport wire. Live in-memory aligned replay
+retains a singleton remote hint; checkpoint-restored replay, owner-coalesced mixed routes, and
+configless batches still hash once per unique encoded group. Independent review caught and fixed
+an idle delta that interpreted an empty emitted-dirty set as the complete `last_emitted` map. The
+checkpoint structs, body schema, codec, envelope, fingerprint, and routing ABI remain unchanged,
+but serialized ordering and byte-identical compatibility have not been independently demonstrated.
 
 These cycles do not add a bounded working-state backend or runtime selector, validate the complete
 production keyed budget, bound wrapper/seal/allocator/archive-alignment/inner-decode/RSS/
@@ -936,6 +955,7 @@ The current branch's admission-neutral hardening was then checked separately:
 | Core Cycle 11 raw restore-input ownership | PASS, 40 focused lifecycle/resource tests plus build/lint gates | Exact acquired-subset byte/artifact reservation before body GET, 32 shared body-read permits, in-flight cancellation/drop, publication/poison/failed-launch/replacement release, pointer-exact successor preservation, cluster and no-cluster checks, and warnings-denied Clippy passed. No backend, admission, latency/RSS result, or soak follows |
 | Core Cycle 12 legacy outer-decode bound | PASS, 11 codec, 27 rehydration, 24 vnode-transition, and focused graph regressions plus build/lint gates | Checked borrowed rkyv validation and the committed one-entry ceiling precede owned outer deserialization at loader and graph boundaries. Real head/parent ancestry, zero-roster, duplicate-name, multi-participant test protocol, unaligned/truncated input, no-default/cluster checks, and warnings-denied Clippy passed. Inner decode/RSS/pause, backend, admission, delivery and soak remain open |
 | Core Cycle 13 immutable aggregate key-group identity | PASS, 15 vnode-lifecycle, 19 SQL operator, 72 active cluster aggregate, 62 active local aggregate, and focused admission regressions plus build/lint gates | Typed construction identity is exact in local and cluster modes; global state keeps N while routing to vnode zero; first/full/delta/transition mismatch paths fail before bookkeeping, decode, or logical mutation. No wire, backend, delivery, or admission change. One broader operator-graph filter timed out during Windows linking and has no pass claim; soaks remain paused |
+| Core Cycle 14 vnode-sharded aggregate working state (`32dcec29`) | PASS for the focused slice: 63 active no-default aggregate tests (1 ignored), 74 active cluster aggregate tests (1 ignored), 16 vnode lifecycle, 21 SQL delta/replay, exact `[LDB-4007]` and `[LDB-0013]` sentinels, two exact core transport tests, and one aligned-graph regression | Lazy coherent vnode slots, O(active) traversal, direct vnode capture, off-side restore, transitioned-slot pointer-swap publication, and uniform route-hint reuse pass. DB no-default/cluster and core cluster Clippy pass with `-D warnings`; formatting and diff hygiene are clean. No broad workspace/integration/soak run, backend, wire, delivery, or admission change. The no-default library-test target emitted only pre-existing warnings |
 | Independent immutable release-candidate soak | **NOT RUN** | Production certification remains unavailable |
 | Core Cycle 3 `operator_graph::tests` with cluster | PASS, 111/111 | Full graph unit module after opaque final-exit authority, rotation-fence, endpoint, restore-drift, assignment-drift, callback-failure, and sticky-poison checks |
 | Current `final_owner_exit` focused filter | PASS, 11/11 | Audited committed last-vnode cleanup succeeds only for exact predecessor/target authority. Revoke-only exits own no raw restore-input charge; callback failure and post-callback restore, transport, or assignment drift poison the graph while retaining durable staging for retry |
@@ -1148,7 +1168,7 @@ a managed keyed working-state capability connected to the distributed execution 
    tests, process-death/rebalance output oracles, recovery compatibility, and published latency and
    resource profiles.
 
-Core Cycles 6–13 implement the transition identity, authoritative participant roster, named FULL
+Core Cycles 6–14 implement the transition identity, authoritative participant roster, named FULL
 payloads whose decoded aggregate image is empty, placement scoping, structural preflight, aggregate
 semantic prepare-all/abort-all/infallible publication, net live-growth reserve, and current-path
 sealed raw-lineage receipt and Commit-domain authority subsets of item 5. Cycle 10 validates the
@@ -1161,16 +1181,23 @@ publication or terminal retirement. One worker request pool and absolute deadlin
 scope bound the read phase. Cycle 12 then enforces the current one-entry legacy outer roster through
 a checked borrowed archive before owned deserialization at every production restore decode site.
 Cycle 13 makes aggregate routing cardinality immutable across construction, capture, restore, and
-rebalance, while preserving global vnode-zero semantics under a multi-key-group topology.
+rebalance, while preserving global vnode-zero semantics under a multi-key-group topology. Cycle 14
+then gives the aggregate a coherent physical vnode layout, direct shard capture, off-side shard
+construction, and fenced pointer-swap publication. Existing exact route metadata skips the
+redundant aggregate partition hash for uniform batches; mixed/configless input retains a per-unique-
+group hash fallback.
 
 They do not complete the capability. The current resource-owning slice is deliberately limited to
 the admitted global-singleton compatibility profile and its declared raw lineage. Wrapper/seal
 metadata, allocator/response overhead, archive validation and alignment-copy memory, inner decode
 scratch/expansion, decoded RSS, simultaneous live/prepared/retired residency, and publication/
-retirement pause remain unreserved. The aggregate maps
-are not vnode-sharded for bounded-cost swaps, and no window/timer or join state family consumes the
-lifecycle. The hot-state service/backend, delivery composition, operator-specific contracts, and
-independent production proof in items 2–9 also remain open.
+retirement pause remain unreserved. The aggregate is vnode-sharded, but its fixed slot table and
+active/replacement/retired working sets do not yet have a measured or enforced live-byte/RSS
+envelope. Uniform route hints rely on trusted internal routing metadata; mixed/configless and
+restart/replay paths still require explicit hash/latency characterization. No window/timer or join
+state family consumes the lifecycle. The hot-state service/backend, delivery composition,
+operator-specific contracts, byte-identical checkpoint compatibility proof, current-binary
+failover EO/ALO recertification, and independent production proof in items 2–9 also remain open.
 
 The existing `StateBackend` must not be mistaken for item 2. Its contract explicitly persists
 immutable per-checkpoint-attempt vnode artifacts and an exact-attempt durability seal. It has no

@@ -361,12 +361,22 @@ restore decode validate a checked borrowed outer archive and enforce the committ
 operator/delta ceiling before owned deserialization. Cycle 13 freezes each aggregate's typed key-
 group count at construction and requires lifecycle caller counts to match before legacy payload
 decode; it does not add the count to an aggregate body or fingerprint because the validated
-manifest/assignment contract already owns that authority. That containment still neither
+manifest/assignment contract already owns that authority. Cycle 14 changes only the private
+working representation: sparse resident vnode boxes sit behind the immutable count's fixed address
+table and active roster; whole restore builds an off-side table, direct per-vnode capture reads one
+slot, and rebalance publishes prepared slot pointers while retiring displaced boxes after the graph
+fence. A canonical EMPTY restore leaves no resident physical slot. Existing whole/per-vnode
+checkpoint structures, the legacy raw-rkyv envelope, this managed artifact schema, and fingerprint
+derivation are unchanged. That continuity does not assert byte-identical serialization ordering.
+The ephemeral singleton route hint is neither encoded here nor added to the transport or checkpoint
+wire; mixed-vnode input and checkpoint-restored aligned replay derive a vnode once per unique
+encoded group. That containment still neither
 authenticates nor decodes `VnodePartialV2`; it does not charge this format's wrapper/directory,
 decoder, decoded-state, or allocator overhead. Legacy alignment copies, archive-validation work,
 inner decode, and simultaneous RSS also remain uncharged. Managed whole-transition preflight must
 still validate every roster entry, aggregate every object and decoder counter, and finish every
-chain before callbacks.
+chain before callbacks. No runtime backend is selected; `[LDB-4007]`, `[LDB-0013]`, and the
+production **NO-GO** remain unchanged.
 
 ## Rolling compatibility
 

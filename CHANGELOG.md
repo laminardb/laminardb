@@ -95,6 +95,20 @@
   a baseline-activation flag, removing duplicate routing authority without adding a record-path
   hash, allocation, lock, or I/O. No wire/fingerprint, backend, delivery, or admission rule changes;
   `[LDB-4007]` and `[LDB-0013]` remain unchanged.
+- Aggregate working state is now physically partitioned into lazy, boxed vnode slots that keep
+  groups, changelog deduplication state, emit/checkpoint dirty sets, delta depth, and forced-rebase
+  state together. A sorted active-vnode roster keeps whole-state traversal proportional to resident
+  shards, while per-vnode capture and managed rebalance address exact slots. Restore constructs
+  replacement shards off-side; publication pointer-swaps only transitioned slots under the graph
+  fence and retires displaced state afterwards. Existing shuffle route metadata supplies an exact
+  vnode hint for local and singleton-remote batches; mixed/configless batches retain the hash-once-
+  per-unique-group fallback. Review caught and fixed an idle delta that could serialize the complete
+  unchanged changelog dedup map. The whole/vnode checkpoint structs, schema, codec, fingerprint,
+  transport wire,
+  backend set, delivery and admission rules are unchanged; `[LDB-4007]` and `[LDB-0013]` remain
+  closed. Trusted-hint validation, mixed/restart hashing, fixed-table and live-state RSS, backend
+  qualification, compatibility proof, failover delivery recertification, and independent soak
+  remain production gates.
 - Replacement cluster processes now start fenced and use the audited recovery-successor path to
   recertify durable vnode owners. Pristine vnode-zero bootstrap remains distinct from stale owner
   or drain state, and a stale-process drain terminal is settled before successor recovery.
