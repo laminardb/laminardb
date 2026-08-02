@@ -22,7 +22,6 @@ CREATE SOURCE bluesky_posts (
     created_at  VARCHAR
 ) FROM WEBSOCKET (
     url    = 'wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post',
-    format = 'json',
     'json.column.did'        = 'did',
     'json.column.operation'  = 'commit.operation',
     'json.column.collection' = 'commit.collection',
@@ -45,7 +44,6 @@ CREATE SOURCE bluesky_posts_wm (
     WATERMARK FOR evt_us AS evt_us - INTERVAL '15' SECOND
 ) FROM WEBSOCKET (
     url    = 'wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post',
-    format = 'json',
     'json.column.operation'         = 'commit.operation',
     'json.column.evt_us'            = 'time_us',
     'json.column.evt_us.epoch_unit' = 'micros'

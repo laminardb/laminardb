@@ -1,4 +1,4 @@
-//! Delta Lake sink config. Parsed from SQL `WITH (...)` via
+//! Delta Lake sink config. Parsed from the resolved connector config via
 //! [`DeltaLakeSinkConfig::from_config`].
 #![allow(clippy::disallowed_types)] // cold path: lakehouse configuration
 
@@ -18,7 +18,7 @@ use crate::storage::{
 
 /// Configuration for the Delta Lake sink connector.
 ///
-/// Parsed from SQL `WITH (...)` clause options or constructed programmatically.
+/// Parsed from resolved sink connector options or constructed programmatically.
 #[derive(Debug, Clone)]
 pub struct DeltaLakeSinkConfig {
     /// Path to the Delta Lake table (local, `s3://`, `az://`, `gs://`).
@@ -110,7 +110,7 @@ impl DeltaLakeSinkConfig {
         }
     }
 
-    /// Parses a sink config from a [`ConnectorConfig`] (SQL WITH clause).
+    /// Parses a sink config from a resolved [`ConnectorConfig`].
     ///
     /// # Required keys
     ///

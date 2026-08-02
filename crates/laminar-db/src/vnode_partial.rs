@@ -5,12 +5,7 @@
 
 use crate::error::DbError;
 #[cfg(any(feature = "cluster", test))]
-use laminar_core::checkpoint::VnodeRestoreLimitProfile;
-
-#[cfg(not(test))]
-mod v2;
-#[cfg(test)]
-pub(crate) mod v2;
+use laminar_core::checkpoint::{VnodeRestoreLimitProfile, MAX_VNODE_OPERATOR_ENTRIES};
 
 /// Operator-state slices for one vnode at one epoch, in one of three shapes:
 ///
@@ -21,9 +16,6 @@ pub(crate) mod v2;
 ///
 /// `base` is an exact parent-attempt link; the reader walks it back to a FULL and replays deltas
 /// forward. The writer re-bases before the base leaves the prune window.
-///
-/// This raw rkyv layout is also used by the currently admitted cluster global aggregate. Do not
-/// change its persisted shape until a version-fenced rolling-upgrade and rollback policy exists.
 #[derive(Debug, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct VnodePartial {
     /// `(operator_name, vnode-slice bytes)`: FULL slices; also operators that re-based this epoch.
@@ -32,6 +24,46 @@ pub(crate) struct VnodePartial {
     pub base: Option<laminar_core::state::CheckpointAttempt>,
     /// `(operator_name, changed-state bytes)`. Non-empty only for delta partials.
     pub deltas: Vec<(String, Vec<u8>)>,
+}
+
+/// Checked, borrowed access to one retained outer vnode-partial archive.
+///
+/// The body owner must keep the archive alive and aligned for the lifetime of this view. Restore
+/// loading establishes that invariant once, so graph preflight need not duplicate every operator
+/// name and nested state body before it knows the complete batch is usable.
+#[cfg(any(feature = "cluster", test))]
+#[derive(Clone, Copy)]
+pub(crate) struct ValidatedVnodePartial<'a> {
+    archived: &'a ArchivedVnodePartial,
+}
+
+#[cfg(any(feature = "cluster", test))]
+impl<'a> ValidatedVnodePartial<'a> {
+    pub(crate) fn operators(
+        self,
+    ) -> impl ExactSizeIterator<Item = (&'a str, &'a [u8])> + DoubleEndedIterator + 'a {
+        self.archived
+            .operators
+            .iter()
+            .map(|entry| (entry.0.as_str(), entry.1.as_slice()))
+    }
+
+    pub(crate) fn deltas(
+        self,
+    ) -> impl ExactSizeIterator<Item = (&'a str, &'a [u8])> + DoubleEndedIterator + 'a {
+        self.archived
+            .deltas
+            .iter()
+            .map(|entry| (entry.0.as_str(), entry.1.as_slice()))
+    }
+
+    pub(crate) fn entry_count(self) -> usize {
+        self.archived
+            .operators
+            .len()
+            .checked_add(self.archived.deltas.len())
+            .expect("validated outer entry count")
+    }
 }
 
 impl VnodePartial {
@@ -60,31 +92,33 @@ impl VnodePartial {
 
     /// Validate the current durable restore profile before allocating owned outer containers.
     ///
-    /// The legacy raw-rkyv format predates an explicit directory-entry bound. A checked archived
-    /// view keeps corrupt offsets and self-declared vector lengths borrowed while the committed
-    /// profile's roster ceiling is enforced. Only then may deserialization allocate the owned
-    /// `String`/`Vec` values consumed by recovery.
+    /// A checked archived view keeps corrupt offsets and self-declared vector lengths borrowed
+    /// while the committed roster ceiling is enforced.
     #[cfg(any(feature = "cluster", test))]
     pub(crate) fn decode_for_restore(
         bytes: &[u8],
         profile: VnodeRestoreLimitProfile,
     ) -> Result<Self, DbError> {
         let max_entries = match profile {
-            VnodeRestoreLimitProfile::GlobalSingletonCompatibility => 1,
+            VnodeRestoreLimitProfile::ManagedVnode => {
+                usize::try_from(MAX_VNODE_OPERATOR_ENTRIES).unwrap_or(usize::MAX)
+            }
         };
         Self::decode_for_restore_with_entry_limit(bytes, profile, max_entries)
     }
 
-    /// Test-only extension for multi-participant transition-protocol fixtures. Production remains
-    /// bound to the committed profile above; these fixtures deliberately exercise prepare-all /
-    /// abort-all behavior that the currently admitted single-global-operator profile cannot emit.
-    #[cfg(all(test, feature = "cluster"))]
-    pub(crate) fn decode_for_restore_test_roster(
+    /// Validate an aligned retained restore body and borrow its outer directory and payloads.
+    #[cfg(any(feature = "cluster", test))]
+    pub(crate) fn validate_for_restore(
         bytes: &[u8],
         profile: VnodeRestoreLimitProfile,
-        max_entries: usize,
-    ) -> Result<Self, DbError> {
-        Self::decode_for_restore_with_entry_limit(bytes, profile, max_entries)
+    ) -> Result<ValidatedVnodePartial<'_>, DbError> {
+        let max_entries = match profile {
+            VnodeRestoreLimitProfile::ManagedVnode => {
+                usize::try_from(MAX_VNODE_OPERATOR_ENTRIES).unwrap_or(usize::MAX)
+            }
+        };
+        Self::validate_aligned_for_restore(bytes, profile, max_entries)
     }
 
     #[cfg(any(feature = "cluster", test))]
@@ -116,6 +150,29 @@ impl VnodePartial {
         profile: VnodeRestoreLimitProfile,
         max_entries: usize,
     ) -> Result<Self, DbError> {
+        let validated = Self::validate_aligned_for_restore(bytes, profile, max_entries)?;
+
+        // Reuse the checked view so the accepted archive is not validated a second time inside
+        // this call. With the roster ceiling established, owned outer allocation is bounded by
+        // the admitted name/body pairs and the already-bounded serialized payload. Production's
+        // current profile bounds the complete named operator roster.
+        rkyv::deserialize::<Self, rkyv::rancor::Error>(validated.archived)
+            .map_err(|error| DbError::Checkpoint(format!("vnode partial deserialization: {error}")))
+    }
+
+    #[cfg(any(feature = "cluster", test))]
+    fn validate_aligned_for_restore(
+        bytes: &[u8],
+        profile: VnodeRestoreLimitProfile,
+        max_entries: usize,
+    ) -> Result<ValidatedVnodePartial<'_>, DbError> {
+        const ARCHIVE_ALIGNMENT: usize = rkyv::util::AlignedVec::<16>::ALIGNMENT;
+
+        if bytes.as_ptr().align_offset(ARCHIVE_ALIGNMENT) != 0 {
+            return Err(DbError::Checkpoint(
+                "vnode partial restore archive is not aligned".into(),
+            ));
+        }
         let archived = rkyv::access::<<Self as rkyv::Archive>::Archived, rkyv::rancor::Error>(
             bytes,
         )
@@ -138,12 +195,7 @@ impl VnodePartial {
             ));
         }
 
-        // Reuse the checked view so the accepted archive is not validated a second time inside
-        // this call. With the roster ceiling established, owned outer allocation is bounded by
-        // the admitted name/body pairs and the already-bounded serialized payload. Production's
-        // current compatibility profile admits one pair.
-        rkyv::deserialize::<Self, rkyv::rancor::Error>(archived)
-            .map_err(|error| DbError::Checkpoint(format!("vnode partial deserialization: {error}")))
+        Ok(ValidatedVnodePartial { archived })
     }
 }
 
@@ -151,8 +203,7 @@ impl VnodePartial {
 mod tests {
     use super::*;
 
-    const RESTORE_PROFILE: VnodeRestoreLimitProfile =
-        VnodeRestoreLimitProfile::GlobalSingletonCompatibility;
+    const RESTORE_PROFILE: VnodeRestoreLimitProfile = VnodeRestoreLimitProfile::ManagedVnode;
 
     #[test]
     fn full_round_trips() {
@@ -199,29 +250,6 @@ mod tests {
             deltas: vec![("agg".to_string(), vec![4, 5, 6])],
         };
         let restored = VnodePartial::decode(&partial.encode().unwrap()).unwrap();
-        assert_eq!(restored.base, Some(parent));
-        assert_eq!(restored.deltas, vec![("agg".to_string(), vec![4, 5, 6])]);
-    }
-
-    #[test]
-    fn admitted_global_aggregate_delta_wire_is_stable() {
-        // Frozen from the raw rkyv layout emitted before the managed-keyed-state work. The
-        // admitted cluster global aggregate can persist DELTA artifacts, so an accidental layout
-        // change here would strand an otherwise valid rolling-upgrade checkpoint.
-        const ESTABLISHED_DELTA: &[u8] = &[
-            4, 5, 6, 0, 97, 103, 103, 255, 255, 255, 255, 255, 244, 255, 255, 255, 3, 0, 0, 0, 0,
-            0, 0, 0, 232, 255, 255, 255, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0,
-            0, 9, 0, 0, 0, 0, 0, 0, 0, 204, 255, 255, 255, 1, 0, 0, 0,
-        ];
-        let parent = laminar_core::state::CheckpointAttempt::canonical(9);
-        let partial = VnodePartial {
-            operators: Vec::new(),
-            base: Some(parent),
-            deltas: vec![("agg".to_string(), vec![4, 5, 6])],
-        };
-
-        assert_eq!(partial.encode().unwrap(), ESTABLISHED_DELTA);
-        let restored = VnodePartial::decode(ESTABLISHED_DELTA).unwrap();
         assert_eq!(restored.base, Some(parent));
         assert_eq!(restored.deltas, vec![("agg".to_string(), vec![4, 5, 6])]);
     }
@@ -292,12 +320,12 @@ mod tests {
     }
 
     #[test]
-    fn restore_decode_rejects_outer_entry_amplification() {
+    fn restore_decode_rejects_global_outer_entry_limit() {
+        let max_entries = usize::try_from(MAX_VNODE_OPERATOR_ENTRIES).unwrap();
         let encoded = VnodePartial {
-            operators: vec![
-                ("agg".to_string(), Vec::new()),
-                ("unexpected".to_string(), Vec::new()),
-            ],
+            operators: (0..=max_entries)
+                .map(|index| (format!("operator-{index}"), Vec::new()))
+                .collect(),
             base: None,
             deltas: Vec::new(),
         }
@@ -305,7 +333,12 @@ mod tests {
         .unwrap();
 
         let error = VnodePartial::decode_for_restore(&encoded, RESTORE_PROFILE).unwrap_err();
-        assert!(error.to_string().contains("allows at most 1"));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("allows at most {max_entries}")),
+            "{error}"
+        );
     }
 
     #[test]

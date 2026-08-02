@@ -22,9 +22,9 @@ use crate::operator::capability::{OperatorCapability, OperatorImplementation};
 #[cfg(feature = "cluster")]
 use crate::operator::RetainedBatch;
 use crate::sql_analysis::{
-    apply_topk_filter, detect_asof_query, detect_stream_join_query, detect_temporal_probe_query,
-    detect_temporal_query, detect_unbounded_join_steps, extract_table_references, has_join_clause,
-    join_clause_count, StreamJoinDetection,
+    apply_topk_filter, detect_stream_join_query, detect_temporal_query,
+    detect_unbounded_join_steps, extract_table_references, has_join_clause, join_clause_count,
+    StreamJoinDetection,
 };
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{
@@ -46,6 +46,12 @@ pub(crate) struct ManagedStateAccountingSnapshot {
 }
 
 impl ManagedStateAccountingSnapshot {
+    fn total_bytes(self) -> usize {
+        self.live
+            .saturating_add(self.prepared)
+            .saturating_add(self.retired)
+    }
+
     #[cfg(any(feature = "cluster", test))]
     fn observe_transient(&mut self, observation: Self) {
         self.prepared = self.prepared.max(observation.prepared);
@@ -69,6 +75,13 @@ pub(crate) trait GraphOperator: Send {
     fn managed_state_accounting(&self) -> Option<ManagedStateAccountingSnapshot> {
         None
     }
+
+    /// Install the pipeline-wide retained-state limit for bounded restore preflight.
+    fn set_managed_state_budget(&mut self, _bytes: usize) {}
+
+    /// Install the backend-neutral pre-encoding work budget used by retractable MIN/MAX aggregate
+    /// checkpoints. Non-SQL operators do not consume this query-execution setting.
+    fn set_retractable_extremum_checkpoint_budget(&mut self, _bytes: usize) {}
 
     /// Build and install the operator's declared managed working state before recovery.
     ///
@@ -190,7 +203,7 @@ pub(crate) trait GraphOperator: Send {
         )))
     }
 
-    /// Test-only adapter for legacy live-mutation fault probes.
+    /// Test-only revocation adapter for fault-containment probes that mutate live state.
     #[cfg(all(feature = "cluster", test))]
     fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) -> Result<(), DbError> {
         Err(DbError::Checkpoint(
@@ -209,7 +222,7 @@ pub(crate) trait GraphOperator: Send {
 pub(crate) struct ManagedVnodeRestore<'a> {
     pub(crate) vnode: u32,
     pub(crate) base: &'a [u8],
-    pub(crate) deltas: &'a [&'a [u8]],
+    pub(crate) deltas: &'a [crate::vnode_restore_input::VnodeRestoreArchive<'a>],
 }
 
 /// Exact operator-local projection of one graph vnode transition.
@@ -350,7 +363,13 @@ impl GraphNode {
         }
     }
 
-    fn replace_operator(&mut self, operator: Box<dyn GraphOperator>) {
+    fn replace_operator(
+        &mut self,
+        mut operator: Box<dyn GraphOperator>,
+        max_retractable_extremum_checkpoint_bytes: usize,
+    ) {
+        operator
+            .set_retractable_extremum_checkpoint_budget(max_retractable_extremum_checkpoint_bytes);
         let capability = operator.cluster_capability();
         tracing::debug!(
             operator = %self.name,
@@ -594,6 +613,12 @@ pub(crate) struct OperatorGraph {
     query_budget_ns: u64,
     deferred_scan_offset: usize,
     stats_tick: u64,
+    // Pipeline-wide backend-neutral charged-byte envelope for all managed operators and lifecycle
+    // phases. Runtime construction always replaces the unbounded test/default sentinel.
+    max_managed_state_bytes: usize,
+    // Per aggregate-operator capture charge allowed before retractable MIN/MAX multisets are
+    // materialized. Runtime construction replaces the public default with the resolved setting.
+    max_retractable_extremum_checkpoint_bytes: usize,
     // Since-last-sample high watermarks make synchronous prepare/publish/finish ownership visible
     // without invoking Prometheus inside the vnode publication section. Indices mirror `nodes`.
     managed_state_accounting_peaks: Vec<ManagedStateAccountingSnapshot>,
@@ -632,10 +657,6 @@ pub(crate) struct OperatorGraph {
     // chain then becomes the PRIMARY agg checkpoint (skip the whole-node manifest, recover from the chain).
     #[cfg(feature = "cluster")]
     delta_chain_bound: Option<u32>,
-    // Per-vnode partials are the authoritative agg checkpoint (cluster + durable backend);
-    // whole-node capture into the per-node-incomplete manifest is skipped.
-    #[cfg(feature = "cluster")]
-    vnode_partials_authoritative: bool,
     // Set from the shuffle registry in cluster mode.
     #[cfg(feature = "cluster")]
     vnode_count: Option<u32>,
@@ -685,6 +706,9 @@ impl OperatorGraph {
             query_budget_ns: 8_000_000,
             deferred_scan_offset: 0,
             stats_tick: 0,
+            max_managed_state_bytes: usize::MAX,
+            max_retractable_extremum_checkpoint_bytes:
+                crate::config::DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES,
             managed_state_accounting_peaks: Vec::new(),
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
@@ -692,8 +716,6 @@ impl OperatorGraph {
             last_execution_assignment_version: None,
             #[cfg(feature = "cluster")]
             delta_chain_bound: None,
-            #[cfg(feature = "cluster")]
-            vnode_partials_authoritative: false,
             #[cfg(feature = "cluster")]
             vnode_count: None,
             #[cfg(feature = "cluster")]
@@ -789,6 +811,26 @@ impl OperatorGraph {
 
     pub fn set_query_budget_ns(&mut self, ns: u64) {
         self.query_budget_ns = ns;
+    }
+
+    pub(crate) fn set_max_managed_state_bytes(&mut self, bytes: usize) {
+        assert!(bytes > 0, "managed-state budget must be nonzero");
+        self.max_managed_state_bytes = bytes;
+        for node in &mut self.nodes {
+            node.operator.set_managed_state_budget(bytes);
+        }
+    }
+
+    pub(crate) fn set_max_retractable_extremum_checkpoint_bytes(&mut self, bytes: usize) {
+        assert!(
+            bytes > 0,
+            "retractable-extremum checkpoint budget must be nonzero"
+        );
+        self.max_retractable_extremum_checkpoint_bytes = bytes;
+        for node in &mut self.nodes {
+            node.operator
+                .set_retractable_extremum_checkpoint_budget(bytes);
+        }
     }
 
     pub fn set_metrics(&mut self, m: Arc<EngineMetrics>) {
@@ -930,12 +972,6 @@ impl OperatorGraph {
     #[cfg(feature = "cluster")]
     pub fn set_delta_chain_bound(&mut self, chain_bound: u32) {
         self.delta_chain_bound = Some(chain_bound);
-    }
-
-    /// Per-vnode partials are the authoritative agg checkpoint; skip the whole-node manifest copy.
-    #[cfg(feature = "cluster")]
-    pub fn set_vnode_partials_authoritative(&mut self) {
-        self.vnode_partials_authoritative = true;
     }
 
     /// Cluster shuffle config, if installed; reused by the pipeline callback for subscriptions.
@@ -1284,7 +1320,30 @@ impl OperatorGraph {
             }
             node.capability = resolved;
         }
+        self.validate_managed_state_budget("managed-state initialization")?;
         Ok(self)
+    }
+
+    fn managed_state_accounted_bytes(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|node| !node.removed)
+            .filter_map(|node| node.operator.managed_state_accounting())
+            .fold(0_usize, |total, accounting| {
+                total.saturating_add(accounting.total_bytes())
+            })
+    }
+
+    fn validate_managed_state_budget(&self, context: impl Into<String>) -> Result<(), DbError> {
+        let accounted_bytes = self.managed_state_accounted_bytes();
+        if accounted_bytes > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: context.into(),
+                accounted_bytes,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+        Ok(())
     }
 
     fn ensure_live_provider(&mut self, name: &str, schema: &SchemaRef) {
@@ -1322,7 +1381,12 @@ impl OperatorGraph {
             .position(|n| &*n.name == name && !n.removed)
     }
 
-    fn allocate_node(&mut self, node: GraphNode) -> usize {
+    fn allocate_node(&mut self, mut node: GraphNode) -> usize {
+        node.operator
+            .set_managed_state_budget(self.max_managed_state_bytes);
+        node.operator.set_retractable_extremum_checkpoint_budget(
+            self.max_retractable_extremum_checkpoint_bytes,
+        );
         let input_port_count = node.input_port_count;
         if let Some(id) = self.free_node_ids.pop() {
             debug_assert!(self.nodes[id].removed);
@@ -1390,23 +1454,11 @@ impl OperatorGraph {
 
     fn ensure_query_source_nodes(
         &mut self,
-        temporal_probe_config: Option<&laminar_sql::translator::TemporalProbeConfig>,
-        asof_config: Option<&laminar_sql::translator::AsofJoinTranslatorConfig>,
         stream_join_config: Option<&laminar_sql::translator::StreamJoinConfig>,
         temporal_config: Option<&TemporalJoinTranslatorConfig>,
         table_refs: &FxHashSet<String>,
     ) {
-        if let Some(tpc) = temporal_probe_config {
-            self.find_node(&tpc.left_table)
-                .unwrap_or_else(|| self.ensure_source_node(&tpc.left_table));
-            self.find_node(&tpc.right_table)
-                .unwrap_or_else(|| self.ensure_source_node(&tpc.right_table));
-        } else if let Some(asof_cfg) = asof_config {
-            self.find_node(&asof_cfg.left_table)
-                .unwrap_or_else(|| self.ensure_source_node(&asof_cfg.left_table));
-            self.find_node(&asof_cfg.right_table)
-                .unwrap_or_else(|| self.ensure_source_node(&asof_cfg.right_table));
-        } else if let Some(sjc) = stream_join_config {
+        if let Some(sjc) = stream_join_config {
             self.find_node(&sjc.left_table)
                 .unwrap_or_else(|| self.ensure_source_node(&sjc.left_table));
             self.find_node(&sjc.right_table)
@@ -1425,42 +1477,15 @@ impl OperatorGraph {
     }
 
     // Returns true when the node depends on another query output (not just raw sources).
-    #[allow(clippy::too_many_arguments)]
     fn wire_query_edges(
         &mut self,
         node_id: usize,
-        temporal_probe_config: Option<&laminar_sql::translator::TemporalProbeConfig>,
-        asof_config: Option<&laminar_sql::translator::AsofJoinTranslatorConfig>,
         stream_join_config: Option<&laminar_sql::translator::StreamJoinConfig>,
         stream_join_detection: Option<&StreamJoinDetection>,
         temporal_config: Option<&TemporalJoinTranslatorConfig>,
-        incremental_join_config: Option<&crate::sql_analysis::IncrementalJoinConfig>,
         table_refs: &FxHashSet<String>,
     ) -> bool {
-        if let Some(ijc) = incremental_join_config {
-            // Both sides are incremental MV producers — wire left → port 0, right → 1.
-            let left_id = self.find_node(&ijc.left_table).expect("source ensured");
-            let right_id = self.find_node(&ijc.right_table).expect("source ensured");
-            self.add_edge(left_id, node_id, 0);
-            self.add_edge(right_id, node_id, 1);
-            true
-        } else if let Some(tpc) = temporal_probe_config {
-            let left_id = self.find_node(&tpc.left_table).expect("source ensured");
-            let right_id = self.find_node(&tpc.right_table).expect("source ensured");
-            self.add_edge(left_id, node_id, 0);
-            self.add_edge(right_id, node_id, 1);
-            false
-        } else if let Some(asof_cfg) = asof_config {
-            let left_id = self
-                .find_node(&asof_cfg.left_table)
-                .expect("source ensured");
-            let right_id = self
-                .find_node(&asof_cfg.right_table)
-                .expect("source ensured");
-            self.add_edge(left_id, node_id, 0);
-            self.add_edge(right_id, node_id, 1);
-            false
-        } else if let Some(sjc) = stream_join_config {
+        if let Some(sjc) = stream_join_config {
             let source_id = self.find_node(&sjc.left_table).expect("source ensured");
 
             let has_pre_filters = stream_join_detection
@@ -1572,6 +1597,8 @@ impl OperatorGraph {
             return;
         }
 
+        let mut table_refs = extract_table_references(&sql);
+
         // `changelog ⋈ static dim`: detected first so it wins over the generic processing-time
         // equi-join — a changelog left makes this a retraction-aware enrich, not a stream join.
         let changelog_enrich_config = if self.incremental_tables.is_empty() {
@@ -1585,40 +1612,28 @@ impl OperatorGraph {
         };
         let enrich = changelog_enrich_config.is_some();
 
-        // `changelog ⋈ changelog` two-sided IVM join — both sides incremental MVs. Like enrich, it
-        // wins over the generic stream join (a changelog left/right makes it retraction-aware).
-        let incremental_join_config = if enrich || self.incremental_tables.len() < 2 {
-            None
-        } else {
-            crate::sql_analysis::detect_changelog_incremental_join(&sql, &self.incremental_tables)
-        };
-        let inc_join = incremental_join_config.is_some();
+        if has_join_clause(&sql)
+            && !enrich
+            && table_refs
+                .iter()
+                .any(|table| self.incremental_tables.contains(table))
+        {
+            self.build_errors.push(DbError::InvalidOperation(format!(
+                "join '{name}' reads an incremental changelog; only changelog-to-static-table enrichment is supported"
+            )));
+            return;
+        }
 
-        // TemporalProbe is parsed off the token stream (not the sqlparser AST), so it
-        // never appears in join_config and always needs its own detector pass.
         let needs_specialized_detection = join_config.as_ref().is_none_or(|jcs| {
             jcs.iter().any(|c| {
                 matches!(
                     c,
-                    JoinOperatorConfig::StreamStream(_)
-                        | JoinOperatorConfig::Asof(_)
-                        | JoinOperatorConfig::Temporal(_)
+                    JoinOperatorConfig::StreamStream(_) | JoinOperatorConfig::Temporal(_)
                 )
             })
         });
 
-        let (temporal_probe_config, temporal_probe_projection_sql) = if enrich || inc_join {
-            (None, None)
-        } else {
-            detect_temporal_probe_query(&sql)
-        };
-        let specialized =
-            !enrich && !inc_join && temporal_probe_config.is_none() && needs_specialized_detection;
-        let (asof_config, projection_sql) = if specialized {
-            detect_asof_query(&sql)
-        } else {
-            (None, None)
-        };
+        let specialized = !enrich && needs_specialized_detection;
         let (temporal_config, temporal_projection_sql) = if specialized {
             detect_temporal_query(&sql)
         } else {
@@ -1631,12 +1646,10 @@ impl OperatorGraph {
         };
         let stream_join_config = stream_join_detection.as_ref().map(|d| d.config.clone());
         if let Some(config) = &stream_join_config {
-            if config.join_type != laminar_sql::translator::StreamJoinType::Inner
-                || config.time_bound.is_zero()
-                || i64::try_from(config.time_bound.as_millis()).is_err()
+            if config.time_bound.is_zero() || i64::try_from(config.time_bound.as_millis()).is_err()
             {
                 self.build_errors.push(DbError::InvalidOperation(format!(
-                    "streaming interval join '{name}' requires an INNER join with a positive finite time bound"
+                    "streaming interval join '{name}' requires a positive finite time bound"
                 )));
                 return;
             }
@@ -1647,9 +1660,6 @@ impl OperatorGraph {
 
         // Lookup-enrich: only when no other specialized join (incl. changelog-enrich) matched.
         let (lookup_enrich_config, lookup_projection_sql) = if !enrich
-            && !inc_join
-            && temporal_probe_config.is_none()
-            && asof_config.is_none()
             && temporal_config.is_none()
             && stream_join_config.is_none()
             && !self.partial_lookup_tables.is_empty()
@@ -1663,7 +1673,7 @@ impl OperatorGraph {
             (None, None)
         };
 
-        let unbounded_lookup_join = if !enrich && !inc_join {
+        let unbounded_lookup_join = if !enrich {
             if let Some(steps) = detect_unbounded_join_steps(&sql) {
                 let lookup_only = steps.iter().all(|(_, right)| {
                     self.reference_tables.contains(right)
@@ -1688,17 +1698,12 @@ impl OperatorGraph {
             false
         };
 
-        let projection_sql = projection_sql
-            .or(temporal_probe_projection_sql)
-            .or(temporal_projection_sql)
+        let projection_sql = temporal_projection_sql
             .or(stream_join_projection_sql)
             .or(lookup_projection_sql);
 
         let unrecognized_join = has_join_clause(&sql)
             && !enrich
-            && !inc_join
-            && temporal_probe_config.is_none()
-            && asof_config.is_none()
             && temporal_config.is_none()
             && stream_join_config.is_none()
             && lookup_enrich_config.is_none()
@@ -1710,7 +1715,6 @@ impl OperatorGraph {
             return;
         }
 
-        let mut table_refs = extract_table_references(&sql);
         // Lookup-enrich reads its table from the registry, not as a graph input.
         if let Some(cfg) = &lookup_enrich_config {
             table_refs.remove(&cfg.table_name);
@@ -1726,29 +1730,16 @@ impl OperatorGraph {
             &sql,
             emit_clause.as_ref(),
             window_config.as_ref(),
-            asof_config.as_ref(),
             temporal_config.as_ref(),
             stream_join_config.as_ref(),
-            temporal_probe_config.as_ref(),
             lookup_enrich_config,
             projection_sql.as_deref(),
             incremental,
             changelog_enrich_config,
-            incremental_join_config.clone(),
         );
-        let input_port_count = if asof_config.is_some()
-            || stream_join_config.is_some()
-            || temporal_probe_config.is_some()
-            || inc_join
-        {
-            2
-        } else {
-            1
-        };
+        let input_port_count = if stream_join_config.is_some() { 2 } else { 1 };
 
         self.ensure_query_source_nodes(
-            temporal_probe_config.as_ref(),
-            asof_config.as_ref(),
             stream_join_config.as_ref(),
             temporal_config.as_ref(),
             &table_refs,
@@ -1756,12 +1747,9 @@ impl OperatorGraph {
         let node_id = self.place_prepared_operator_node(name.as_str(), operator, input_port_count);
         let depends = self.wire_query_edges(
             node_id,
-            temporal_probe_config.as_ref(),
-            asof_config.as_ref(),
             stream_join_config.as_ref(),
             stream_join_detection.as_ref(),
             temporal_config.as_ref(),
-            incremental_join_config.as_ref(),
             &table_refs,
         );
         if depends {
@@ -1800,7 +1788,8 @@ impl OperatorGraph {
         input_port_count: usize,
     ) -> usize {
         if let Some(&id) = self.source_map.get(name) {
-            self.nodes[id].replace_operator(operator);
+            self.nodes[id]
+                .replace_operator(operator, self.max_retractable_extremum_checkpoint_bytes);
             self.nodes[id].input_port_count = input_port_count;
             self.input_bufs[id] = vec![Vec::new(); input_port_count];
             self.input_buf_bytes[id] = vec![0; input_port_count];
@@ -1889,10 +1878,9 @@ impl OperatorGraph {
             (operator, table_refs)
         };
 
-        self.ensure_query_source_nodes(None, None, None, None, &table_refs);
+        self.ensure_query_source_nodes(None, None, &table_refs);
         let node_id = self.place_prepared_operator_node(name, operator, 1);
-        let depends =
-            self.wire_query_edges(node_id, None, None, None, None, None, None, &table_refs);
+        let depends = self.wire_query_edges(node_id, None, None, None, &table_refs);
         if depends {
             self.depends_on_stream.insert(node_id);
         }
@@ -1921,10 +1909,9 @@ impl OperatorGraph {
             ));
         let mut table_refs = FxHashSet::default();
         table_refs.insert(plan.source_table.clone());
-        self.ensure_query_source_nodes(None, None, None, None, &table_refs);
+        self.ensure_query_source_nodes(None, None, &table_refs);
         let node_id = self.place_prepared_operator_node(name, operator, 1);
-        let depends =
-            self.wire_query_edges(node_id, None, None, None, None, None, None, &table_refs);
+        let depends = self.wire_query_edges(node_id, None, None, None, &table_refs);
         if depends {
             self.depends_on_stream.insert(node_id);
         }
@@ -1939,25 +1926,14 @@ impl OperatorGraph {
         sql: &str,
         emit_clause: Option<&EmitClause>,
         window_config: Option<&WindowOperatorConfig>,
-        asof_config: Option<&laminar_sql::translator::AsofJoinTranslatorConfig>,
         temporal_config: Option<&TemporalJoinTranslatorConfig>,
         stream_join_config: Option<&laminar_sql::translator::StreamJoinConfig>,
-        temporal_probe_config: Option<&laminar_sql::translator::TemporalProbeConfig>,
         lookup_enrich_config: Option<crate::operator::lookup_enrich::LookupEnrichConfig>,
         projection_sql: Option<&str>,
         incremental: bool,
         changelog_enrich_config: Option<crate::sql_analysis::ChangelogEnrichConfig>,
-        incremental_join_config: Option<crate::sql_analysis::IncrementalJoinConfig>,
     ) -> Box<dyn GraphOperator> {
         use crate::operator;
-
-        // `changelog ⋈ changelog` two-sided IVM join — a hand-rolled Z-set join emitting a joined
-        // changelog into the join MV's `Multiset` store.
-        if let Some(cfg) = incremental_join_config {
-            return Box::new(operator::incremental_join::IncrementalJoinOperator::new(
-                cfg,
-            ));
-        }
 
         // `changelog ⋈ static dim` — consume the changelog, join against the dimension (in the
         // graph context), preserve `__weight` → joined changelog.
@@ -1984,26 +1960,6 @@ impl OperatorGraph {
             }
         }
 
-        if let Some(cfg) = temporal_probe_config {
-            return Box::new(
-                operator::temporal_probe_join::TemporalProbeJoinOperator::new(
-                    name,
-                    cfg.clone(),
-                    projection_sql.map(Arc::from),
-                    self.ctx.clone(),
-                ),
-            );
-        }
-
-        if let Some(cfg) = asof_config {
-            return Box::new(operator::asof_join::AsofJoinOperator::new(
-                name,
-                cfg.clone(),
-                projection_sql.map(Arc::from),
-                self.ctx.clone(),
-            ));
-        }
-
         if let Some(cfg) = temporal_config {
             return Box::new(operator::temporal_join::TemporalJoinOperator::new(
                 name,
@@ -2015,12 +1971,22 @@ impl OperatorGraph {
         }
 
         if let Some(cfg) = stream_join_config {
-            let op = operator::interval_join::IntervalJoinOperator::new(
+            let mut op = operator::interval_join::IntervalJoinOperator::new(
                 name,
                 cfg.clone(),
                 projection_sql.map(Arc::from),
                 self.ctx.clone(),
             );
+            if let (Some(left_schema), Some(right_schema)) = (
+                self.source_schemas.get(&cfg.left_table),
+                self.source_schemas.get(&cfg.right_table),
+            ) {
+                op.set_input_schemas(left_schema.clone(), right_schema.clone());
+            }
+            #[cfg(feature = "cluster")]
+            if let Some(ref scope) = self.cluster_shuffle {
+                op.attach_cluster_shuffle(scope.clone());
+            }
             return Box::new(op);
         }
 
@@ -2063,14 +2029,21 @@ impl OperatorGraph {
             .is_some_and(|ec| matches!(ec, EmitClause::OnWindowClose | EmitClause::Final));
 
         if is_eowc {
-            return Box::new(operator::eowc_query::EowcQueryOperator::new(
+            let op = operator::eowc_query::EowcQueryOperator::new(
                 name,
                 sql,
                 emit_clause.cloned(),
                 window_config.cloned(),
                 self.ctx.clone(),
                 self.prom.clone(),
-            ));
+            );
+            #[cfg(feature = "cluster")]
+            let mut op = op;
+            #[cfg(feature = "cluster")]
+            if let Some(ref scope) = self.cluster_shuffle {
+                op.attach_cluster_scope(scope.clone());
+            }
+            return Box::new(op);
         }
 
         // `EMIT CHANGES` is an explicit changelog; `incremental` drives the same dirty-only emit
@@ -2094,9 +2067,6 @@ impl OperatorGraph {
             // Enabling delta also makes the chain the primary agg checkpoint.
             if let Some(chain_bound) = self.delta_chain_bound {
                 op.enable_delta_checkpoints(chain_bound);
-            }
-            if self.vnode_partials_authoritative {
-                op.set_vnode_partials_authoritative();
             }
         }
         Box::new(op)
@@ -2128,7 +2098,10 @@ impl OperatorGraph {
             }
             self.managed_state_accounting_peaks[id] = ManagedStateAccountingSnapshot::default();
             self.nodes[id].removed = true;
-            self.nodes[id].replace_operator(Box::new(TombstonedOperator));
+            self.nodes[id].replace_operator(
+                Box::new(TombstonedOperator),
+                self.max_retractable_extremum_checkpoint_bytes,
+            );
             self.nodes[id].output_routes.clear();
             for port_buf in &mut self.input_bufs[id] {
                 port_buf.clear();
@@ -2366,6 +2339,16 @@ impl OperatorGraph {
                 &watermarks,
             )
             .await;
+        let output_result = match output_result {
+            Ok(batches) if self.nodes[node_id].capability.managed_state.is_some() => self
+                .validate_managed_state_budget(format!(
+                    "operator '{}' record processing",
+                    self.nodes[node_id].name
+                ))
+                .map(|()| batches),
+            Ok(batches) => Ok(batches),
+            Err(error) => Err(error),
+        };
 
         let batches = match output_result {
             Ok(b) => {
@@ -3827,6 +3810,16 @@ impl OperatorGraph {
                 Self::required_vnodes_for_capability(node.capability, &owned_vnodes)?,
             ));
         }
+        if participants.len()
+            > usize::try_from(laminar_core::checkpoint::MAX_VNODE_OPERATOR_ENTRIES)
+                .unwrap_or(usize::MAX)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "managed-state graph has {} operator entries; maximum is {}",
+                participants.len(),
+                laminar_core::checkpoint::MAX_VNODE_OPERATOR_ENTRIES
+            )));
+        }
         let mut out: crate::checkpoint_coordinator::StagedVnodeStates =
             std::collections::HashMap::new();
         for (node_idx, name, required_vnodes) in participants {
@@ -3925,6 +3918,7 @@ impl OperatorGraph {
                 restored += 1;
             }
         }
+        self.validate_managed_state_budget("whole-graph restore")?;
         self.whole_restore_open = false;
         Ok((self, restored))
     }

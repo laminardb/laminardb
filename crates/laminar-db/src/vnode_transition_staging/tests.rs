@@ -6,7 +6,7 @@ use laminar_core::checkpoint::{
     AssignmentDrainTransition, CheckpointAssignmentFence, CheckpointParticipant, LeaderProof,
     LeaderProofOwner, PipelineIdentity,
 };
-use laminar_core::state::{CheckpointAttempt, NodeId};
+use laminar_core::state::{CheckpointAttempt, NodeId, SealedPartialReadEnvelope};
 
 use super::{
     retire_exact_pending_vnode_transition, PendingVnodeTransition, PendingVnodeTransitionHandle,
@@ -67,7 +67,7 @@ fn adjacent_assignment_derives_exact_local_rosters() {
         &target_owners,
         local,
         identity,
-        Some(cut),
+        Some(cut.into_transition_binding().unwrap()),
         loaded(attempt, &[2]),
         false,
         None,
@@ -114,7 +114,7 @@ fn replacement_incarnation_restores_target_without_revoking_old_process_state() 
         &target_owners,
         current_local,
         identity,
-        Some(cut),
+        Some(cut.into_transition_binding().unwrap()),
         loaded(attempt, &[0]),
         false,
         None,
@@ -222,7 +222,7 @@ fn full_local_restore_is_explicit_and_cut_bound() {
         &owners,
         local,
         identity,
-        Some(cut),
+        Some(cut.into_transition_binding().unwrap()),
         loaded(attempt, &[0, 2]),
         true,
         None,
@@ -258,7 +258,7 @@ fn live_assignment_change_rejects_a_cut_older_than_the_predecessor() {
         &target_owners,
         local,
         identity,
-        Some(cut),
+        Some(cut.into_transition_binding().unwrap()),
         loaded(attempt, &[1]),
         false,
         None,
@@ -271,7 +271,7 @@ fn live_assignment_change_rejects_a_cut_older_than_the_predecessor() {
 }
 
 #[test]
-fn boot_recovery_accepts_an_older_cut_for_every_target_owned_vnode() {
+fn boot_recovery_requires_target_vnodes_within_the_older_sealed_domain() {
     let local = participant(1, 1);
     let owners = [NodeId(1), NodeId(1)];
     let older_cut_fence = fence(3, &[1, 1], vec![local]);
@@ -285,13 +285,27 @@ fn boot_recovery_accepts_an_older_cut_for_every_target_owned_vnode() {
         &[1, 1],
     )
     .unwrap();
+    let binding = cut.into_transition_binding().unwrap();
+
+    let expanded_owners = [NodeId(1), NodeId(1), NodeId(1)];
+    let expanded_target = fence(5, &[1, 1, 1], vec![local]);
+    let error = PendingVnodeTransition::boot_recovery(
+        expanded_target,
+        &expanded_owners,
+        local,
+        identity.clone(),
+        binding.clone(),
+        loaded(attempt, &[0, 1, 2]),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("sealed domain"), "{error}");
 
     let transition = PendingVnodeTransition::boot_recovery(
         target,
         &owners,
         local,
         identity,
-        cut,
+        binding,
         loaded(attempt, &[0, 1]),
     )
     .unwrap();
@@ -326,9 +340,15 @@ fn nonempty_restore_requires_a_complete_input_usage_receipt() {
         VnodeRestoreInputUsage::default(),
     );
 
-    let error =
-        PendingVnodeTransition::boot_recovery(target, &owners, local, identity, cut, loaded)
-            .unwrap_err();
+    let error = PendingVnodeTransition::boot_recovery(
+        target,
+        &owners,
+        local,
+        identity,
+        cut.into_transition_binding().unwrap(),
+        loaded,
+    )
+    .unwrap_err();
     assert!(
         error.to_string().contains("incomplete input usage"),
         "{error}"
@@ -355,9 +375,15 @@ fn verified_usage_must_cover_every_retained_apply_body_before_decode() {
         VnodeRestoreInputUsage::from_counts_for_test(32, 1, 1, 1),
     );
 
-    let error =
-        PendingVnodeTransition::boot_recovery(target, &owners, local, identity, cut, loaded)
-            .unwrap_err();
+    let error = PendingVnodeTransition::boot_recovery(
+        target,
+        &owners,
+        local,
+        identity,
+        cut.into_transition_binding().unwrap(),
+        loaded,
+    )
+    .unwrap_err();
     assert!(
         error.to_string().contains("retained apply chains require"),
         "{error}"
@@ -422,10 +448,13 @@ fn retiring_exact_pending_transition_releases_its_charge_for_replacement() {
     .unwrap();
     let usage = VnodeRestoreInputUsage::from_counts_for_test(4, 1, 4, 1);
     let budget = Arc::new(
-        VnodeRestoreInputBudget::new(VnodeRestoreInputLimits {
-            max_lineage_bytes: 4,
-            max_lineage_artifacts: 1,
-        })
+        VnodeRestoreInputBudget::new(
+            VnodeRestoreInputLimits {
+                max_lineage_bytes: 4,
+                max_lineage_artifacts: 1,
+            },
+            SealedPartialReadEnvelope::new(2, 0),
+        )
         .unwrap(),
     );
     let loaded = LoadedVnodeChains::from_parts_with_budget_for_test(
@@ -437,8 +466,15 @@ fn retiring_exact_pending_transition_releases_its_charge_for_replacement() {
     .unwrap();
 
     let transition = Arc::new(
-        PendingVnodeTransition::boot_recovery(target, &owners, local, identity, cut, loaded)
-            .unwrap(),
+        PendingVnodeTransition::boot_recovery(
+            target,
+            &owners,
+            local,
+            identity,
+            cut.into_transition_binding().unwrap(),
+            loaded,
+        )
+        .unwrap(),
     );
     let handle: PendingVnodeTransitionHandle =
         Arc::new(parking_lot::Mutex::new(Some(Arc::clone(&transition))));

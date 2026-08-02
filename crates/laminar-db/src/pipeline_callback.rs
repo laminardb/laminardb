@@ -1318,6 +1318,26 @@ impl ConnectorPipelineCallback {
                     reason = %msg,
                     "permanent shuffle routing failure; halting pipeline"
                 ),
+                crate::error::DbError::ManagedStateBudgetExceeded {
+                    context,
+                    accounted_bytes,
+                    limit_bytes,
+                } => tracing::error!(
+                    context,
+                    accounted_bytes,
+                    limit_bytes,
+                    "managed working-state budget exceeded; halting pipeline"
+                ),
+                crate::error::DbError::RetractableExtremumCheckpointBudgetExceeded {
+                    context,
+                    charged_bytes,
+                    limit_bytes,
+                } => tracing::error!(
+                    context,
+                    charged_bytes,
+                    limit_bytes,
+                    "retractable MIN/MAX checkpoint budget exceeded; halting pipeline"
+                ),
                 _ => unreachable!("requires_pipeline_halt returned true for a non-terminal error"),
             }
             shutdown.notify_one();

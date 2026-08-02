@@ -7214,7 +7214,7 @@ async fn renewals_copy_only_the_bounded_catalog_reference() {
         canonical_name: "events".into(),
         kind: crate::catalog::CatalogObjectKind::Source,
         ddl: format!(
-            "CREATE SOURCE events WITH ('description' = '{}')",
+            "CREATE SOURCE events FROM GENERATOR ('description' = '{}')",
             "x".repeat(100_000)
         ),
     }])

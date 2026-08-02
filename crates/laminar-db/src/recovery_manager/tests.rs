@@ -14,8 +14,16 @@ fn make_store(dir: &std::path::Path) -> FileSystemCheckpointStore {
     FileSystemCheckpointStore::new(dir)
 }
 
-fn finalized_manifest(checkpoint_id: u64) -> CheckpointManifest {
+const TEST_DEPLOYMENT_ID: &str = "00000000-0000-0000-0000-000000000001";
+
+fn test_manifest(checkpoint_id: u64, deployment_id: &str) -> CheckpointManifest {
     let mut manifest = CheckpointManifest::new(checkpoint_id, checkpoint_id);
+    deployment_id.clone_into(&mut manifest.deployment_id);
+    manifest
+}
+
+fn finalized_manifest(checkpoint_id: u64) -> CheckpointManifest {
+    let mut manifest = test_manifest(checkpoint_id, TEST_DEPLOYMENT_ID);
     manifest.durable_phase = DurableCheckpointPhase::Finalized;
     manifest
 }
@@ -392,7 +400,7 @@ async fn test_recover_empty_checkpoint() {
     let manifest = finalized_manifest(5);
     store.save_with_state(&manifest, None).await.unwrap();
 
-    let mgr = RecoveryManager::new(&store);
+    let mgr = RecoveryManager::new(&store).with_deployment_id(TEST_DEPLOYMENT_ID);
     let result = mgr.recover(None).await.unwrap().unwrap();
 
     assert_eq!(result.epoch(), 5);
@@ -408,7 +416,7 @@ async fn recover_to_epoch_picks_newest_at_or_below_target() {
             .await
             .unwrap();
     }
-    let mgr = RecoveryManager::new(&store);
+    let mgr = RecoveryManager::new(&store).with_deployment_id(TEST_DEPLOYMENT_ID);
 
     assert_eq!(
         mgr.recover_to_epoch(7, None)
@@ -490,17 +498,19 @@ async fn recover_to_genesis_rejects_finalized_inventory_without_latest_pointer()
 async fn recover_to_genesis_rejects_dangling_latest_pointer() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(dir.path());
-    store.save(&CheckpointManifest::new(1, 1)).await.unwrap();
+    let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+        std::sync::Arc::new(object_store::memory::InMemory::new()),
+    );
+    let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+    store.save(&test_manifest(1, &deployment_id)).await.unwrap();
     std::fs::write(
         dir.path().join("checkpoints/latest.txt"),
         "checkpoint_000099",
     )
     .unwrap();
-    let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
-        std::sync::Arc::new(object_store::memory::InMemory::new()),
-    );
 
     let error = RecoveryManager::new(&store)
+        .with_deployment_id(&deployment_id)
         .recover_to_epoch(0, Some(&decisions))
         .await
         .expect_err("a dangling recovery pointer cannot be treated as genesis");
@@ -517,12 +527,14 @@ async fn recover_to_genesis_rejects_dangling_latest_pointer() {
 async fn recover_to_genesis_allows_prepared_only_inventory() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(dir.path());
-    store.save(&CheckpointManifest::new(1, 1)).await.unwrap();
     let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
         std::sync::Arc::new(object_store::memory::InMemory::new()),
     );
+    let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+    store.save(&test_manifest(1, &deployment_id)).await.unwrap();
 
     let recovered = RecoveryManager::new(&store)
+        .with_deployment_id(&deployment_id)
         .recover_to_epoch(0, Some(&decisions))
         .await
         .unwrap();
@@ -543,7 +555,7 @@ async fn test_recover_with_watermark() {
     manifest.watermark = Some(42_000);
     store.save(&manifest).await.unwrap();
 
-    let mgr = RecoveryManager::new(&store);
+    let mgr = RecoveryManager::new(&store).with_deployment_id(TEST_DEPLOYMENT_ID);
     let result = mgr.recover(None).await.unwrap().unwrap();
 
     assert_eq!(result.manifest.watermark, Some(42_000));
@@ -563,12 +575,12 @@ async fn test_recover_with_operator_states() {
         .insert("3".to_string(), OperatorCheckpoint::inline(b"filter-state"));
     store.save_with_state(&manifest, None).await.unwrap();
 
-    let mgr = RecoveryManager::new(&store);
+    let mgr = RecoveryManager::new(&store).with_deployment_id(TEST_DEPLOYMENT_ID);
     let result = mgr.recover(None).await.unwrap().unwrap();
 
     assert_eq!(result.manifest.operator_states.len(), 2);
     let op0 = result.manifest.operator_states.get("0").unwrap();
-    assert_eq!(op0.decode_inline().unwrap(), b"window-state");
+    assert_eq!(op0.try_decode_inline().unwrap().unwrap(), b"window-state");
 }
 
 #[tokio::test]
@@ -580,7 +592,7 @@ async fn test_recover_table_store_path() {
     manifest.table_store_checkpoint_path = Some("/data/table_store_cp_001".into());
     store.save(&manifest).await.unwrap();
 
-    let mgr = RecoveryManager::new(&store);
+    let mgr = RecoveryManager::new(&store).with_deployment_id(TEST_DEPLOYMENT_ID);
     let result = mgr.recover(None).await.unwrap().unwrap();
 
     assert_eq!(
@@ -611,7 +623,7 @@ async fn test_recover_fallback_to_previous_checkpoint() {
         .join("manifest.json");
     std::fs::write(&latest_manifest_path, "not valid json!!!").unwrap();
 
-    let mgr = RecoveryManager::new(&store);
+    let mgr = RecoveryManager::new(&store).with_deployment_id(TEST_DEPLOYMENT_ID);
     let result = mgr.recover(None).await.unwrap();
 
     // Should fall back to checkpoint 10.
@@ -671,7 +683,7 @@ async fn test_recover_all_checkpoints_corrupt_fails_closed() {
         .join("manifest.json");
     std::fs::write(&manifest_path, "corrupt").unwrap();
 
-    let mgr = RecoveryManager::new(&store);
+    let mgr = RecoveryManager::new(&store).with_deployment_id(TEST_DEPLOYMENT_ID);
     let error = mgr.recover(None).await.unwrap_err();
     assert!(error.to_string().contains("checkpoint history exists"));
 }
@@ -684,7 +696,7 @@ async fn test_recover_latest_ok_no_fallback_needed() {
     store.save(&finalized_manifest(10)).await.unwrap();
     store.save(&finalized_manifest(20)).await.unwrap();
 
-    let mgr = RecoveryManager::new(&store);
+    let mgr = RecoveryManager::new(&store).with_deployment_id(TEST_DEPLOYMENT_ID);
     let result = mgr.recover(None).await.unwrap().unwrap();
 
     // Should use the latest (no fallback needed)
@@ -711,13 +723,13 @@ async fn test_recover_with_sidecar_state() {
         .await
         .unwrap();
 
-    let mgr = RecoveryManager::new(&store);
+    let mgr = RecoveryManager::new(&store).with_deployment_id(TEST_DEPLOYMENT_ID);
     let result = mgr.recover(None).await.unwrap().unwrap();
 
     // External state should have been resolved to inline
     let op = result.manifest.operator_states.get("big-op").unwrap();
     assert!(!op.external, "external state should be resolved to inline");
-    assert_eq!(op.decode_inline().unwrap(), large_data);
+    assert_eq!(op.try_decode_inline().unwrap().unwrap(), large_data);
 }
 
 #[tokio::test]
@@ -744,14 +756,14 @@ async fn test_recover_mixed_inline_and_external() {
         .await
         .unwrap();
 
-    let mgr = RecoveryManager::new(&store);
+    let mgr = RecoveryManager::new(&store).with_deployment_id(TEST_DEPLOYMENT_ID);
     let result = mgr.recover(None).await.unwrap().unwrap();
 
     let small = result.manifest.operator_states.get("small-op").unwrap();
-    assert_eq!(small.decode_inline().unwrap(), b"tiny");
+    assert_eq!(small.try_decode_inline().unwrap().unwrap(), b"tiny");
 
     let big = result.manifest.operator_states.get("big-op").unwrap();
-    assert_eq!(big.decode_inline().unwrap(), large_data);
+    assert_eq!(big.try_decode_inline().unwrap().unwrap(), large_data);
 }
 
 #[tokio::test]
@@ -770,7 +782,7 @@ async fn test_recover_missing_sidecar_fails_closed() {
         .unwrap();
     std::fs::remove_file(dir.path().join("checkpoints/checkpoint_000001/state.bin")).unwrap();
 
-    let mgr = RecoveryManager::new(&store);
+    let mgr = RecoveryManager::new(&store).with_deployment_id(TEST_DEPLOYMENT_ID);
     let error = mgr.recover(None).await.unwrap_err();
     assert!(error.to_string().contains("checkpoint history exists"));
 }
@@ -779,9 +791,12 @@ async fn test_recover_missing_sidecar_fails_closed() {
 async fn prepared_manifest_without_decision_is_not_recoverable() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(dir.path());
-    store.save(&CheckpointManifest::new(1, 1)).await.unwrap();
+    store
+        .save(&test_manifest(1, TEST_DEPLOYMENT_ID))
+        .await
+        .unwrap();
 
-    let mgr = RecoveryManager::new(&store);
+    let mgr = RecoveryManager::new(&store).with_deployment_id(TEST_DEPLOYMENT_ID);
     let error = mgr.recover(None).await.unwrap_err();
     assert!(error.to_string().contains("checkpoint history exists"));
 }
@@ -790,12 +805,14 @@ async fn prepared_manifest_without_decision_is_not_recoverable() {
 async fn prepared_manifest_without_outcomes_recovers_genesis() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(dir.path());
-    store.save(&CheckpointManifest::new(1, 1)).await.unwrap();
     let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
         std::sync::Arc::new(object_store::memory::InMemory::new()),
     );
+    let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+    store.save(&test_manifest(1, &deployment_id)).await.unwrap();
 
     let recovered = RecoveryManager::new(&store)
+        .with_deployment_id(&deployment_id)
         .recover(Some(&decisions))
         .await
         .unwrap();
@@ -1360,17 +1377,19 @@ async fn finalized_manifest_without_latest_pointer_fails_without_commit_outcome(
 async fn dangling_latest_pointer_fails_without_commit_outcome() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(dir.path());
-    store.save(&CheckpointManifest::new(1, 1)).await.unwrap();
+    let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+        std::sync::Arc::new(object_store::memory::InMemory::new()),
+    );
+    let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+    store.save(&test_manifest(1, &deployment_id)).await.unwrap();
     std::fs::write(
         dir.path().join("checkpoints/latest.txt"),
         "checkpoint_000099",
     )
     .unwrap();
-    let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
-        std::sync::Arc::new(object_store::memory::InMemory::new()),
-    );
 
     let error = RecoveryManager::new(&store)
+        .with_deployment_id(&deployment_id)
         .recover(Some(&decisions))
         .await
         .unwrap_err();
@@ -1387,18 +1406,20 @@ async fn dangling_latest_pointer_fails_without_commit_outcome() {
 async fn unreadable_manifest_fails_without_commit_outcome() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(dir.path());
-    store.save(&CheckpointManifest::new(1, 1)).await.unwrap();
+    let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+        std::sync::Arc::new(object_store::memory::InMemory::new()),
+    );
+    let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+    store.save(&test_manifest(1, &deployment_id)).await.unwrap();
     std::fs::write(
         dir.path()
             .join("checkpoints/checkpoint_000001/manifest.json"),
         b"not-json",
     )
     .unwrap();
-    let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
-        std::sync::Arc::new(object_store::memory::InMemory::new()),
-    );
 
     let error = RecoveryManager::new(&store)
+        .with_deployment_id(&deployment_id)
         .recover(Some(&decisions))
         .await
         .unwrap_err();
@@ -1513,6 +1534,7 @@ async fn pipeline_identity_mismatch_is_fatal_without_older_fallback() {
     store.save(&latest).await.unwrap();
 
     let error = RecoveryManager::new(&store)
+        .with_deployment_id(TEST_DEPLOYMENT_ID)
         .with_pipeline_identity(&expected)
         .recover(None)
         .await
@@ -1551,15 +1573,15 @@ async fn identity_mismatch_does_not_finalize_committed_prepared_checkpoint() {
 async fn outcome_scope_mismatch_does_not_finalize_prepared_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(dir.path());
-    let prepared = CheckpointManifest::new(7, 7);
-    store.save(&prepared).await.unwrap();
-
     let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
         std::sync::Arc::new(object_store::memory::InMemory::new()),
     );
+    let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+    store.save(&test_manifest(7, &deployment_id)).await.unwrap();
     record_local_commit(&decisions, 7).await;
 
     let error = RecoveryManager::new(&store)
+        .with_deployment_id(&deployment_id)
         .with_outcome_scope(CheckpointScope::Cluster)
         .recover(Some(&decisions))
         .await
@@ -1651,7 +1673,8 @@ async fn excluded_participant_recovers_exact_portable_peer_manifest() {
     assert_eq!(recovered.manifest.watermark, Some(40_000));
     assert_eq!(
         recovered.manifest.operator_states["global"]
-            .decode_inline()
+            .try_decode_inline()
+            .unwrap()
             .unwrap(),
         b"state"
     );
@@ -1775,7 +1798,8 @@ async fn cluster_recovery_uses_a_peer_when_the_local_sidecar_is_corrupt() {
     assert_eq!(recovered.manifest.participant_id, 1);
     assert_eq!(
         recovered.manifest.operator_states["global"]
-            .decode_inline()
+            .try_decode_inline()
+            .unwrap()
             .unwrap(),
         b"state"
     );

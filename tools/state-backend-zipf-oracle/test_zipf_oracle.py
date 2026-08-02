@@ -220,7 +220,7 @@ class OracleTests(unittest.TestCase):
                 ).encode("ascii"),
             )
 
-    def test_oracle_source_has_no_file_or_candidate_import_path(self) -> None:
+    def test_oracle_source_has_no_file_import_path(self) -> None:
         source_path = pathlib.Path(oracle.__file__)
         source = source_path.read_text(encoding="utf-8")
         tree = ast.parse(source)
@@ -236,7 +236,6 @@ class OracleTests(unittest.TestCase):
             for alias in node.names
         )
         self.assertTrue(imported_modules.isdisjoint({"subprocess", "pathlib", "os"}))
-        self.assertNotIn("state-backend-qual", source)
         called_names = {
             node.func.id
             for node in ast.walk(tree)

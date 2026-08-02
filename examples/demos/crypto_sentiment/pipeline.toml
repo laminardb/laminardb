@@ -26,7 +26,6 @@ CREATE SOURCE binance_trades (
     WATERMARK FOR ts AS PROCTIME()
 ) FROM WEBSOCKET (
     url = 'wss://stream.binance.com:9443/ws/btcusdt@trade',
-    format = 'json',
     'json.column.sym' = 's',
     'json.column.price' = 'p',
     'json.column.qty' = 'q',
@@ -44,7 +43,6 @@ CREATE SOURCE bluesky_posts (
     WATERMARK FOR ts AS PROCTIME()
 ) FROM WEBSOCKET (
     url = 'wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post',
-    format = 'json',
     'json.column.did' = 'did',
     'json.column.operation' = 'commit.operation',
     'json.column.text' = 'commit.record.text',

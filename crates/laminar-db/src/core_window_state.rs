@@ -26,8 +26,100 @@ use crate::aggregate_state::{
     query_fingerprint_with_config, AggFuncSpec, CompiledProjection, GroupCheckpoint, PreAggBuilder,
     WindowCheckpoint,
 };
-use crate::eowc_state::{extract_i64_timestamps, NULL_TIMESTAMP};
 use crate::error::DbError;
+
+/// Sentinel for null timestamps; callers must skip these rows rather than
+/// assigning them to the epoch-zero window.
+const NULL_TIMESTAMP: i64 = i64::MIN;
+
+fn extract_i64_timestamps(batch: &RecordBatch, col_index: usize) -> Result<Vec<i64>, DbError> {
+    use arrow::array::{Array, Int64Array};
+    use arrow::datatypes::TimeUnit;
+
+    let col = batch.column(col_index);
+    let mut result = Vec::with_capacity(batch.num_rows());
+
+    match col.data_type() {
+        DataType::Int64 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| DbError::Pipeline("expected Int64Array".to_string()))?;
+            for i in 0..arr.len() {
+                result.push(if arr.is_null(i) {
+                    NULL_TIMESTAMP
+                } else {
+                    arr.value(i)
+                });
+            }
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+                .ok_or_else(|| {
+                    DbError::Pipeline("expected TimestampMillisecondArray".to_string())
+                })?;
+            for i in 0..arr.len() {
+                result.push(if arr.is_null(i) {
+                    NULL_TIMESTAMP
+                } else {
+                    arr.value(i)
+                });
+            }
+        }
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampSecondArray>()
+                .ok_or_else(|| DbError::Pipeline("expected TimestampSecondArray".to_string()))?;
+            for i in 0..arr.len() {
+                result.push(if arr.is_null(i) {
+                    NULL_TIMESTAMP
+                } else {
+                    arr.value(i).saturating_mul(1000)
+                });
+            }
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+                .ok_or_else(|| {
+                    DbError::Pipeline("expected TimestampMicrosecondArray".to_string())
+                })?;
+            for i in 0..arr.len() {
+                result.push(if arr.is_null(i) {
+                    NULL_TIMESTAMP
+                } else {
+                    arr.value(i) / 1000
+                });
+            }
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+                .ok_or_else(|| {
+                    DbError::Pipeline("expected TimestampNanosecondArray".to_string())
+                })?;
+            for i in 0..arr.len() {
+                result.push(if arr.is_null(i) {
+                    NULL_TIMESTAMP
+                } else {
+                    arr.value(i) / 1_000_000
+                });
+            }
+        }
+        other => {
+            return Err(DbError::Pipeline(format!(
+                "unsupported timestamp type for EOWC: {other}"
+            )));
+        }
+    }
+
+    Ok(result)
+}
 
 enum CoreWindowAssigner {
     Tumbling(TumblingWindowAssigner),
@@ -97,42 +189,53 @@ struct SessionGroupState {
     sessions: BTreeMap<i64, SessionAccState>,
 }
 
-#[derive(
-    Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+type FixedWindowGroups = AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>;
+type FixedWindows = BTreeMap<i64, FixedWindowGroups>;
+
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct SessionCheckpoint {
     pub start: i64,
     pub end: i64,
     pub acc_states: Vec<Vec<u8>>,
 }
 
-#[derive(
-    Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct SessionGroupCheckpoint {
     pub key: Vec<u8>,
     pub sessions: Vec<SessionCheckpoint>,
 }
 
-#[derive(
-    Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct CoreWindowCheckpoint {
     pub fingerprint: u64,
     pub windows: Vec<WindowCheckpoint>,
-    #[serde(default)]
     pub session_state: Vec<SessionGroupCheckpoint>,
-    /// No serde default — missing tag must error rather than silently route wrong.
     pub window_type: String,
     pub high_watermark_ms: i64,
+}
+
+/// Off-side mutable image for the lifecycle-only vnode-zero tumbling-window profile.
+#[cfg(feature = "cluster")]
+pub(crate) struct PreparedCoreWindowTransition {
+    windows: FixedWindows,
+    session_groups: AHashMap<arrow::row::OwnedRow, SessionGroupState>,
+    high_watermark_ms: i64,
+    scratch_nogroup: AHashMap<i64, Vec<u32>>,
+    scratch_grouped: AHashMap<(i64, u32), Vec<u32>>,
+    scratch_group_keys: indexmap::IndexSet<arrow::row::OwnedRow, ahash::RandomState>,
+    accounted_state_bytes: usize,
+}
+
+/// Checked borrowed checkpoint retained until all archive structure has passed preflight.
+#[cfg(feature = "cluster")]
+pub(crate) struct PreflightedCoreWindowArchive<'a> {
+    checkpoint: &'a ArchivedCoreWindowCheckpoint,
 }
 
 /// Core window state for tumbling/hopping/session aggregate queries.
 pub(crate) struct CoreWindowState {
     assigner: CoreWindowAssigner,
-    #[allow(clippy::type_complexity)]
-    windows:
-        BTreeMap<i64, AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>>,
+    windows: FixedWindows,
     // Only populated for session windows.
     session_groups: AHashMap<arrow::row::OwnedRow, SessionGroupState>,
     row_converter: arrow::row::RowConverter,
@@ -165,6 +268,8 @@ pub(crate) struct CoreWindowState {
     // Group ids are dense within a batch and index into scratch_group_keys.
     scratch_grouped: AHashMap<(i64, u32), Vec<u32>>,
     scratch_group_keys: indexmap::IndexSet<arrow::row::OwnedRow, ahash::RandomState>,
+    managed_global_tumbling: bool,
+    accounted_state_bytes: usize,
 }
 
 impl CoreWindowState {
@@ -505,6 +610,17 @@ impl CoreWindowState {
         let row_converter = arrow::row::RowConverter::new(sort_fields)
             .map_err(|e| DbError::Pipeline(format!("row converter init: {e}")))?;
 
+        let managed_global_tumbling = matches!(assigner, CoreWindowAssigner::Tumbling(_))
+            && window_config.offset_ms == 0
+            && num_group_cols == 0
+            && agg_specs.iter().all(|spec| {
+                !spec.distinct
+                    && matches!(
+                        spec.udf.name().to_ascii_lowercase().as_str(),
+                        "count" | "sum" | "avg" | "min" | "max"
+                    )
+            });
+
         Ok(Some(Self {
             assigner,
             windows: BTreeMap::new(),
@@ -538,7 +654,76 @@ impl CoreWindowState {
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
             scratch_group_keys: indexmap::IndexSet::default(),
+            managed_global_tumbling,
+            accounted_state_bytes: 0,
         }))
+    }
+
+    #[must_use]
+    pub(crate) const fn supports_managed_global_tumbling(&self) -> bool {
+        self.managed_global_tumbling
+    }
+
+    fn accumulator_vector_bytes(
+        accumulators: &Vec<Box<dyn datafusion_expr::Accumulator>>,
+    ) -> usize {
+        accumulators
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Box<dyn datafusion_expr::Accumulator>>())
+            .saturating_add(accumulators.iter().fold(0_usize, |bytes, accumulator| {
+                bytes.saturating_add(accumulator.size())
+            }))
+    }
+
+    fn fixed_window_bytes(groups: &FixedWindowGroups) -> usize {
+        groups
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(
+                arrow::row::OwnedRow,
+                Vec<Box<dyn datafusion_expr::Accumulator>>,
+            )>())
+            .saturating_add(groups.iter().fold(0_usize, |bytes, (key, accumulators)| {
+                bytes
+                    .saturating_add(key.as_ref().len())
+                    .saturating_add(Self::accumulator_vector_bytes(accumulators))
+            }))
+            .saturating_add(std::mem::size_of::<(i64, FixedWindowGroups)>())
+    }
+
+    fn scratch_nogroup_bytes(scratch: &AHashMap<i64, Vec<u32>>) -> usize {
+        scratch
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(i64, Vec<u32>)>())
+            .saturating_add(scratch.values().fold(0_usize, |bytes, rows| {
+                bytes.saturating_add(rows.capacity().saturating_mul(std::mem::size_of::<u32>()))
+            }))
+    }
+
+    fn fixed_windows_bytes(windows: &FixedWindows) -> usize {
+        windows.values().fold(0_usize, |bytes, groups| {
+            bytes.saturating_add(Self::fixed_window_bytes(groups))
+        })
+    }
+
+    fn replace_accounted_component(&mut self, previous: usize, current: usize) {
+        if self.managed_global_tumbling {
+            self.accounted_state_bytes = self
+                .accounted_state_bytes
+                .saturating_sub(previous)
+                .saturating_add(current);
+        }
+    }
+
+    fn refresh_managed_accounting(&mut self) {
+        if self.managed_global_tumbling {
+            self.accounted_state_bytes = Self::fixed_windows_bytes(&self.windows)
+                .saturating_add(Self::scratch_nogroup_bytes(&self.scratch_nogroup));
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn accounted_state_bytes(&self) -> usize {
+        self.accounted_state_bytes
     }
 
     /// Update per-window accumulators with a new pre-aggregation batch.
@@ -569,6 +754,8 @@ impl CoreWindowState {
     ) -> Result<(), DbError> {
         let empty_key = crate::aggregate_state::global_aggregate_key();
         let mut grouped = std::mem::take(&mut self.scratch_nogroup);
+        let previous_scratch_bytes = Self::scratch_nogroup_bytes(&grouped);
+        self.replace_accounted_component(previous_scratch_bytes, 0);
         grouped.clear();
         for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
             if ts_ms == NULL_TIMESTAMP {
@@ -598,10 +785,14 @@ impl CoreWindowState {
             }
         }
         for (window_start, indices) in &grouped {
-            let needs_insert = {
-                let wg = self.windows.entry(*window_start).or_default();
-                !wg.contains_key(&empty_key)
-            };
+            let previous_window_bytes = self
+                .windows
+                .get(window_start)
+                .map_or(0, Self::fixed_window_bytes);
+            let needs_insert = self
+                .windows
+                .get(window_start)
+                .is_none_or(|groups| !groups.contains_key(&empty_key));
             if needs_insert {
                 let accs = self.create_fresh_accumulators()?;
                 self.windows
@@ -616,15 +807,23 @@ impl CoreWindowState {
             else {
                 continue;
             };
-            crate::aggregate_state::IncrementalAggState::update_group_accumulators(
+            let update = crate::aggregate_state::IncrementalAggState::update_group_accumulators(
                 accs,
                 batch,
                 indices,
                 &self.agg_specs,
                 None,
-            )?;
+            );
+            let current_window_bytes = self
+                .windows
+                .get(window_start)
+                .map_or(0, Self::fixed_window_bytes);
+            self.replace_accounted_component(previous_window_bytes, current_window_bytes);
+            update?;
         }
+        let scratch_bytes = Self::scratch_nogroup_bytes(&grouped);
         self.scratch_nogroup = grouped;
+        self.replace_accounted_component(0, scratch_bytes);
         Ok(())
     }
 
@@ -1037,6 +1236,8 @@ impl CoreWindowState {
             let Some(groups) = self.windows.remove(&window_start) else {
                 continue;
             };
+            let retired_bytes = Self::fixed_window_bytes(&groups);
+            self.replace_accounted_component(retired_bytes, 0);
             if groups.is_empty() {
                 continue;
             }
@@ -1365,42 +1566,49 @@ impl CoreWindowState {
 
         match &self.assigner {
             CoreWindowAssigner::Tumbling(_) | CoreWindowAssigner::Hopping(_) => {
-                let mut windows = Vec::with_capacity(self.windows.len());
-                for (&window_start, groups) in &mut self.windows {
-                    let mut group_checkpoints = Vec::with_capacity(groups.len());
-                    for (key, accs) in groups {
-                        let sv_key = crate::aggregate_state::row_to_scalar_key_with_types(
-                            &self.row_converter,
-                            key,
-                            &self.group_types,
-                        )?;
-                        let key_ipc = scalars_to_ipc(&sv_key)?;
-                        let mut acc_states = Vec::with_capacity(accs.len());
-                        for (i, acc) in accs.iter_mut().enumerate() {
-                            acc_states.push(crate::aggregate_state::snapshot_and_rebuild(
-                                acc,
-                                &self.agg_specs[i],
-                                false,
-                            )?);
+                let checkpoint = (|| {
+                    let mut windows = Vec::with_capacity(self.windows.len());
+                    for (&window_start, groups) in &mut self.windows {
+                        let mut group_checkpoints = Vec::with_capacity(groups.len());
+                        for (key, accs) in groups {
+                            let sv_key = crate::aggregate_state::row_to_scalar_key_with_types(
+                                &self.row_converter,
+                                key,
+                                &self.group_types,
+                            )?;
+                            let key_ipc = scalars_to_ipc(&sv_key)?;
+                            let mut acc_states = Vec::with_capacity(accs.len());
+                            for (i, acc) in accs.iter_mut().enumerate() {
+                                acc_states.push(crate::aggregate_state::snapshot_and_rebuild(
+                                    acc,
+                                    &self.agg_specs[i],
+                                    false,
+                                )?);
+                            }
+                            group_checkpoints.push(GroupCheckpoint {
+                                key: key_ipc,
+                                acc_states,
+                                last_updated_ms: i64::MIN,
+                            });
                         }
-                        group_checkpoints.push(GroupCheckpoint {
-                            key: key_ipc,
-                            acc_states,
-                            last_updated_ms: i64::MIN,
+                        windows.push(WindowCheckpoint {
+                            window_start,
+                            groups: group_checkpoints,
                         });
                     }
-                    windows.push(WindowCheckpoint {
-                        window_start,
-                        groups: group_checkpoints,
-                    });
-                }
-                Ok(CoreWindowCheckpoint {
-                    fingerprint,
-                    windows,
-                    session_state: Vec::new(),
-                    window_type,
-                    high_watermark_ms: self.high_watermark_ms,
-                })
+                    Ok(CoreWindowCheckpoint {
+                        fingerprint,
+                        windows,
+                        session_state: Vec::new(),
+                        window_type,
+                        high_watermark_ms: self.high_watermark_ms,
+                    })
+                })();
+                // Snapshotting may rebuild accumulator implementations with different retained
+                // capacities. Capture already visits the complete image, so reconcile once here
+                // without adding another steady-state scan, including on an encode failure.
+                self.refresh_managed_accounting();
+                checkpoint
             }
             CoreWindowAssigner::Session { .. } => {
                 let mut session_state = Vec::with_capacity(self.session_groups.len());
@@ -1456,14 +1664,18 @@ impl CoreWindowState {
         }
 
         self.high_watermark_ms = checkpoint.high_watermark_ms;
-        match checkpoint.window_type.as_str() {
+        let restored = match checkpoint.window_type.as_str() {
             "session" => self.restore_session_windows(checkpoint),
             "tumbling" | "hopping" => self.restore_fixed_windows(checkpoint),
             other => Err(DbError::Pipeline(format!(
                 "core window checkpoint has unknown window_type `{other}` — \
                  refusing to silently route to the wrong restore path"
             ))),
-        }
+        };
+        // Restore can fail after replacing part of the image. The whole-image caller rolls that
+        // back, but accounting must describe whichever live image exists between those calls.
+        self.refresh_managed_accounting();
+        restored
     }
 
     fn restore_fixed_windows(
@@ -1557,6 +1769,247 @@ impl CoreWindowState {
                 .insert(row_key, SessionGroupState { sessions });
         }
         Ok(total_sessions)
+    }
+
+    /// Validate the complete managed archive without allocating its owned checkpoint containers.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn preflight_managed_tumbling_bytes<'a>(
+        &self,
+        bytes: &'a [u8],
+    ) -> Result<PreflightedCoreWindowArchive<'a>, DbError> {
+        let checkpoint = rkyv::access::<ArchivedCoreWindowCheckpoint, rkyv::rancor::Error>(bytes)
+            .map_err(|error| {
+            DbError::Checkpoint(format!(
+                "managed CoreWindow checkpoint validation failed: {error}"
+            ))
+        })?;
+        self.preflight_managed_tumbling_archive(checkpoint, bytes.len())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn preflight_managed_tumbling_archive<'a>(
+        &self,
+        checkpoint: &'a ArchivedCoreWindowCheckpoint,
+        encoded_bytes: usize,
+    ) -> Result<PreflightedCoreWindowArchive<'a>, DbError> {
+        if !self.managed_global_tumbling {
+            return Err(DbError::Checkpoint(
+                "managed CoreWindow restore targeted an unsupported query shape".into(),
+            ));
+        }
+        if checkpoint.fingerprint != self.query_fingerprint() {
+            return Err(DbError::Checkpoint(format!(
+                "Core window checkpoint fingerprint mismatch: saved={}, current={}",
+                checkpoint.fingerprint,
+                self.query_fingerprint()
+            )));
+        }
+        if checkpoint.window_type.as_str() != "tumbling" || !checkpoint.session_state.is_empty() {
+            return Err(DbError::Checkpoint(
+                "managed CoreWindow archive is not a canonical tumbling-window image".into(),
+            ));
+        }
+        if checkpoint.windows.len() > encoded_bytes {
+            return Err(DbError::Checkpoint(
+                "managed CoreWindow archive declares more windows than its encoded body can contain"
+                    .into(),
+            ));
+        }
+
+        let CoreWindowAssigner::Tumbling(assigner) = &self.assigner else {
+            unreachable!("managed CoreWindow profile is tumbling-only");
+        };
+        let mut previous_start = None;
+        let mut nested_payload_bytes = 0_usize;
+        for window in checkpoint.windows.iter() {
+            let window_start = window.window_start.to_native();
+            if previous_start.is_some_and(|previous| previous >= window_start) {
+                return Err(DbError::Checkpoint(
+                    "managed CoreWindow archive window starts are not strictly increasing".into(),
+                ));
+            }
+            previous_start = Some(window_start);
+            let aligned = (i128::from(window_start) - i128::from(assigner.offset_ms()))
+                .rem_euclid(i128::from(assigner.size_ms()))
+                == 0;
+            if !aligned {
+                return Err(DbError::Checkpoint(format!(
+                    "managed CoreWindow archive window {window_start} is not aligned to the configured tumbling assigner"
+                )));
+            }
+            if window_start
+                .saturating_add(assigner.size_ms())
+                .saturating_add(self.allowed_lateness_ms)
+                <= checkpoint.high_watermark_ms.to_native()
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "managed CoreWindow archive retains already-closed window {window_start}"
+                )));
+            }
+            if window.groups.len() != 1 {
+                return Err(DbError::Checkpoint(format!(
+                    "managed global CoreWindow archive window {} contains {} groups",
+                    window_start,
+                    window.groups.len()
+                )));
+            }
+            let group = &window.groups[0];
+            if !group.key.is_empty() || group.last_updated_ms != i64::MIN {
+                return Err(DbError::Checkpoint(format!(
+                    "managed global CoreWindow archive window {window_start} has non-canonical group metadata"
+                )));
+            }
+            if group.acc_states.len() != self.agg_specs.len() {
+                return Err(DbError::Checkpoint(format!(
+                    "managed CoreWindow archive window {} contains {} accumulator states; expected {}",
+                    window_start,
+                    group.acc_states.len(),
+                    self.agg_specs.len()
+                )));
+            }
+            for state in group.acc_states.iter() {
+                nested_payload_bytes =
+                    nested_payload_bytes
+                        .checked_add(state.len())
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(
+                                "managed CoreWindow archive nested byte accounting overflow".into(),
+                            )
+                        })?;
+            }
+        }
+        if nested_payload_bytes > encoded_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow archive aliases {nested_payload_bytes} nested payload bytes inside a {encoded_bytes}-byte body"
+            )));
+        }
+        Ok(PreflightedCoreWindowArchive { checkpoint })
+    }
+
+    /// Decode a checked global tumbling image directly into off-side live structures.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn prepare_managed_tumbling_restore(
+        &self,
+        archive: &PreflightedCoreWindowArchive<'_>,
+    ) -> Result<PreparedCoreWindowTransition, DbError> {
+        use crate::aggregate_state::ipc_to_scalars;
+
+        let mut windows = BTreeMap::new();
+        for window in archive.checkpoint.windows.iter() {
+            let window_start = window.window_start.to_native();
+            let group = &window.groups[0];
+            let key_scalars = ipc_to_scalars(group.key.as_slice()).map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "managed CoreWindow key decode for window {window_start} failed: {error}"
+                ))
+            })?;
+            let row_key = crate::aggregate_state::scalar_key_to_owned_row(
+                &self.row_converter,
+                &key_scalars,
+                &self.group_types,
+            )?;
+            let mut accumulators = Vec::new();
+            accumulators
+                .try_reserve_exact(self.agg_specs.len())
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "managed CoreWindow accumulator reserve failed: {error}"
+                    ))
+                })?;
+            for (spec, state) in self.agg_specs.iter().zip(group.acc_states.iter()) {
+                let state_scalars = ipc_to_scalars(state.as_slice()).map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "managed CoreWindow accumulator decode for window {window_start} failed: {error}"
+                    ))
+                })?;
+                let mut arrays = Vec::new();
+                arrays
+                    .try_reserve_exact(state_scalars.len())
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "managed CoreWindow scalar-array reserve failed: {error}"
+                        ))
+                    })?;
+                for value in &state_scalars {
+                    arrays.push(value.to_array().map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "managed CoreWindow scalar materialization failed: {error}"
+                        ))
+                    })?);
+                }
+                let mut accumulator = spec.create_accumulator()?;
+                accumulator.merge_batch(&arrays).map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "managed CoreWindow accumulator merge for window {window_start} failed: {error}"
+                    ))
+                })?;
+                accumulators.push(accumulator);
+            }
+            let mut groups = AHashMap::new();
+            groups.try_reserve(1).map_err(|error| {
+                DbError::Checkpoint(format!("managed CoreWindow group reserve failed: {error}"))
+            })?;
+            groups.insert(row_key, accumulators);
+            windows.insert(window_start, groups);
+        }
+        let accounted_state_bytes = Self::fixed_windows_bytes(&windows);
+        Ok(PreparedCoreWindowTransition {
+            windows,
+            session_groups: AHashMap::new(),
+            high_watermark_ms: archive.checkpoint.high_watermark_ms.to_native(),
+            scratch_nogroup: AHashMap::new(),
+            scratch_grouped: AHashMap::new(),
+            scratch_group_keys: indexmap::IndexSet::default(),
+            accounted_state_bytes,
+        })
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn prepare_managed_tumbling_empty(&self) -> PreparedCoreWindowTransition {
+        debug_assert!(self.managed_global_tumbling);
+        PreparedCoreWindowTransition {
+            windows: BTreeMap::new(),
+            session_groups: AHashMap::new(),
+            high_watermark_ms: i64::MIN,
+            scratch_nogroup: AHashMap::new(),
+            scratch_grouped: AHashMap::new(),
+            scratch_group_keys: indexmap::IndexSet::default(),
+            accounted_state_bytes: 0,
+        }
+    }
+
+    /// Publish with fixed-count ownership swaps; every allocation and decode happened in prepare.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn publish_managed_tumbling_transition(
+        &mut self,
+        mut prepared: PreparedCoreWindowTransition,
+    ) -> PreparedCoreWindowTransition {
+        assert!(
+            self.managed_global_tumbling,
+            "managed CoreWindow publication targeted an unsupported shape"
+        );
+        std::mem::swap(&mut self.windows, &mut prepared.windows);
+        std::mem::swap(&mut self.session_groups, &mut prepared.session_groups);
+        std::mem::swap(&mut self.high_watermark_ms, &mut prepared.high_watermark_ms);
+        std::mem::swap(&mut self.scratch_nogroup, &mut prepared.scratch_nogroup);
+        std::mem::swap(&mut self.scratch_grouped, &mut prepared.scratch_grouped);
+        std::mem::swap(
+            &mut self.scratch_group_keys,
+            &mut prepared.scratch_group_keys,
+        );
+        std::mem::swap(
+            &mut self.accounted_state_bytes,
+            &mut prepared.accounted_state_bytes,
+        );
+        prepared
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl PreparedCoreWindowTransition {
+    #[must_use]
+    pub(crate) const fn accounted_state_bytes(&self) -> usize {
+        self.accounted_state_bytes
     }
 }
 
@@ -1657,6 +2110,8 @@ mod tests {
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
             scratch_group_keys: indexmap::IndexSet::default(),
+            managed_global_tumbling: false,
+            accounted_state_bytes: 0,
         }
     }
 
@@ -1726,6 +2181,8 @@ mod tests {
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
             scratch_group_keys: indexmap::IndexSet::default(),
+            managed_global_tumbling: false,
+            accounted_state_bytes: 0,
         }
     }
 
@@ -1783,6 +2240,8 @@ mod tests {
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
             scratch_group_keys: indexmap::IndexSet::default(),
+            managed_global_tumbling: false,
+            accounted_state_bytes: 0,
         }
     }
 
@@ -1838,6 +2297,8 @@ mod tests {
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
             scratch_group_keys: indexmap::IndexSet::default(),
+            managed_global_tumbling: false,
+            accounted_state_bytes: 0,
         }
     }
 

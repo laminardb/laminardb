@@ -159,7 +159,7 @@ async fn boot_report_marks_and_stages_the_exact_owned_roster() {
         &target_assignment,
         target_fence.clone(),
         participant,
-        restore_cut,
+        restore_cut.into_transition_binding().unwrap(),
         report,
     )
     .await
@@ -184,8 +184,8 @@ async fn boot_report_marks_and_stages_the_exact_owned_roster() {
     assert!(transition.revoked_vnodes().is_empty());
     assert_eq!(
         transition
-            .restore_cut()
-            .expect("boot transition must retain its cut")
+            .restore_binding()
+            .expect("boot transition must retain its binding")
             .attempt(),
         attempt
     );
@@ -200,6 +200,9 @@ async fn boot_report_marks_and_stages_the_exact_owned_roster() {
         transition.restores()[1].chain(),
         [Bytes::from_static(b"vnode-1")]
     );
+    let mut launch = super::PendingVnodeTransitionLaunchGuard::capture(&db);
+    launch.complete();
+    assert!(launch.expected.is_none());
 }
 
 #[tokio::test]
@@ -233,6 +236,7 @@ async fn failed_graph_launch_retires_staged_input_but_leaves_vnodes_restoring() 
                 max_lineage_bytes: payload_bytes,
                 max_lineage_artifacts: artifacts,
             },
+            laminar_core::state::SealedPartialReadEnvelope::new(2, 0),
         )
         .unwrap(),
     );
@@ -248,7 +252,7 @@ async fn failed_graph_launch_retires_staged_input_but_leaves_vnodes_restoring() 
         &target_assignment,
         target_fence,
         participant,
-        restore_cut,
+        restore_cut.into_transition_binding().unwrap(),
         loaded,
     )
     .await
@@ -285,7 +289,7 @@ async fn invalid_boot_report_changes_neither_staging_nor_lifecycle() {
             &target_assignment,
             target_fence,
             participant,
-            restore_cut,
+            restore_cut.into_transition_binding().unwrap(),
             report,
         )
         .await
@@ -319,7 +323,7 @@ async fn changed_boot_assignment_rejects_report_without_mutation() {
             &target_assignment,
             target_fence,
             participant,
-            restore_cut,
+            restore_cut.into_transition_binding().unwrap(),
             report,
         )
         .await
@@ -352,7 +356,7 @@ async fn wrong_boot_attempt_rejects_report_without_mutation() {
             &target_assignment,
             target_fence,
             participant,
-            restore_cut,
+            restore_cut.into_transition_binding().unwrap(),
             report,
         )
         .await
@@ -375,7 +379,7 @@ async fn failed_boot_preparation_retains_prior_exact_transition_and_lifecycle() 
         &target,
         prior_fence,
         participant,
-        prior_cut,
+        prior_cut.into_transition_binding().unwrap(),
         loaded_vnode_chains(
             prior_attempt,
             HashMap::from([
@@ -396,7 +400,7 @@ async fn failed_boot_preparation_retains_prior_exact_transition_and_lifecycle() 
     let (_replacement_fence, _participant, replacement_cut) =
         boot_restore_authority(&target, replacement_attempt);
     let error = db
-        .prepare_boot_vnode_restore_transition(&replacement_cut)
+        .prepare_boot_vnode_restore_transition(replacement_cut)
         .await
         .unwrap_err();
 
@@ -408,7 +412,7 @@ async fn failed_boot_preparation_retains_prior_exact_transition_and_lifecycle() 
         .expect("failed replacement must retain prior transition");
     assert!(Arc::ptr_eq(&prior, &retained));
     assert_eq!(registry.restoring_vnodes(), vec![0, 1]);
-    assert_eq!(retained.restore_cut().unwrap().attempt(), prior_attempt);
+    assert_eq!(retained.restore_binding().unwrap().attempt(), prior_attempt);
     assert_eq!(
         retained.restores()[0].chain(),
         [Bytes::from_static(b"prior-0")]
@@ -428,7 +432,7 @@ async fn successful_boot_replacement_publishes_exact_arc_and_target_lifecycle() 
         &target,
         prior_fence,
         participant,
-        prior_cut,
+        prior_cut.into_transition_binding().unwrap(),
         loaded_vnode_chains(
             prior_attempt,
             HashMap::from([(0, vec![Bytes::from_static(b"prior")])]),
@@ -452,7 +456,7 @@ async fn successful_boot_replacement_publishes_exact_arc_and_target_lifecycle() 
         &target,
         replacement_fence.clone(),
         participant,
-        replacement_cut,
+        replacement_cut.into_transition_binding().unwrap(),
         loaded_vnode_chains(
             replacement_attempt,
             HashMap::from([(0, vec![Bytes::from_static(b"replacement")])]),
@@ -471,7 +475,7 @@ async fn successful_boot_replacement_publishes_exact_arc_and_target_lifecycle() 
     assert_eq!(replacement.target(), &replacement_fence);
     assert_eq!(replacement.acquired_vnodes(), [0]);
     assert_eq!(
-        replacement.restore_cut().unwrap().attempt(),
+        replacement.restore_binding().unwrap().attempt(),
         replacement_attempt
     );
     assert_eq!(replacement.restores().len(), 1);
@@ -557,7 +561,7 @@ async fn zero_owned_boot_target_retires_prior_transition_only_after_authority_au
             &[self_id, self_id],
             prior_participant,
             identity.clone(),
-            prior_cut,
+            prior_cut.into_transition_binding().unwrap(),
             loaded_vnode_chains(
                 attempt,
                 HashMap::from([
@@ -579,7 +583,7 @@ async fn zero_owned_boot_target_retires_prior_transition_only_after_authority_au
         &[peer_id.0, peer_id.0],
     )
     .unwrap();
-    db.prepare_boot_vnode_restore_transition(&target_cut)
+    db.prepare_boot_vnode_restore_transition(target_cut)
         .await
         .unwrap();
 
@@ -595,7 +599,7 @@ async fn unassigned_replacement_boot_defers_restore_without_publishing_state() {
     let donor = VnodeRegistry::single_owner(2, NodeId(1)).versioned_snapshot();
     let (_, _, restore_cut) = boot_restore_authority(&donor, CheckpointAttempt::canonical(7));
 
-    db.prepare_boot_vnode_restore_transition(&restore_cut)
+    db.prepare_boot_vnode_restore_transition(restore_cut)
         .await
         .expect("an unassigned replacement process must restore through later adoption");
 
@@ -614,7 +618,7 @@ async fn unassigned_replacement_boot_rejects_retained_lifecycle_state() {
     let (_, _, restore_cut) = boot_restore_authority(&donor, CheckpointAttempt::canonical(7));
 
     let error = db
-        .prepare_boot_vnode_restore_transition(&restore_cut)
+        .prepare_boot_vnode_restore_transition(restore_cut)
         .await
         .expect_err("assignment zero with retained lifecycle state must fail closed");
 
@@ -639,9 +643,16 @@ async fn fresh_cluster_start_rejects_staged_vnode_state_without_clearing_it() {
             (1, vec![Bytes::from_static(b"must-not-be-discarded-1")]),
         ]),
     );
-    db.publish_boot_vnode_restore_transition(&registry, &target, fence, participant, cut, loaded)
-        .await
-        .unwrap();
+    db.publish_boot_vnode_restore_transition(
+        &registry,
+        &target,
+        fence,
+        participant,
+        cut.into_transition_binding().unwrap(),
+        loaded,
+    )
+    .await
+    .unwrap();
     let pending = db
         .pending_vnode_transition
         .lock()
@@ -685,7 +696,7 @@ async fn assert_boot_recovery_target_mismatch_is_non_mutating(
         &target,
         fence,
         participant,
-        cut,
+        cut.into_transition_binding().unwrap(),
         loaded_vnode_chains(
             committed_attempt,
             HashMap::from([

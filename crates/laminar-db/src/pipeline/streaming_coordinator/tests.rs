@@ -5,6 +5,14 @@ use arrow::datatypes::{DataType, Field, Schema};
 use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
 
+fn replayable_append_only_source_contract() -> laminar_connectors::connector::SourceContract {
+    laminar_connectors::connector::SourceContract::new(
+        laminar_connectors::connector::SourceConsistency::Replayable,
+        laminar_connectors::connector::SourceTopology::Singleton,
+        laminar_connectors::connector::SourceInputMode::AppendOnly,
+    )
+}
+
 #[test]
 fn barrier_release_high_watermark_cannot_be_overwritten_by_stale_attempt() {
     let injector = CheckpointBarrierInjector::new();
@@ -3135,6 +3143,20 @@ struct StartupSource {
     fail_open: bool,
     fail_restore: bool,
     cancellation_policy: ConnectorCancellationPolicy,
+    contract: laminar_connectors::connector::SourceContract,
+}
+
+struct LateBoundMutationSource {
+    starts: Arc<AtomicU64>,
+    started: bool,
+}
+
+fn test_source_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]))
 }
 
 struct TrackedStartupSource {
@@ -3211,10 +3233,6 @@ fn barrier_hold_probe_source(name: &str, state: Arc<BarrierHoldProbeState>) -> S
         name: name.into(),
         connector: Box::new(BarrierHoldProbeSource { state }),
         config: laminar_connectors::config::ConnectorConfig::new(name),
-        contract: laminar_connectors::connector::SourceContract::new(
-            laminar_connectors::connector::SourceConsistency::Replayable,
-            laminar_connectors::connector::SourceTopology::Singleton,
-        ),
         assignment_scoped: false,
         position: SourcePosition::Initial,
     }
@@ -3222,6 +3240,13 @@ fn barrier_hold_probe_source(name: &str, state: Arc<BarrierHoldProbeState>) -> S
 
 #[async_trait::async_trait]
 impl SourceConnector for BarrierHoldProbeSource {
+    fn contract(
+        &self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<laminar_connectors::connector::SourceContract, ConnectorError> {
+        Ok(replayable_append_only_source_contract())
+    }
+
     async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
         self.state.starts.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -3236,7 +3261,7 @@ impl SourceConnector for BarrierHoldProbeSource {
     }
 
     fn schema(&self) -> Arc<Schema> {
-        Arc::new(Schema::empty())
+        test_source_schema()
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
@@ -4313,10 +4338,6 @@ async fn local_runtime_rejects_assignment_scoped_sources() {
             state: Arc::clone(&state),
         }),
         config: laminar_connectors::config::ConnectorConfig::new("local-drain-probe"),
-        contract: laminar_connectors::connector::SourceContract::new(
-            laminar_connectors::connector::SourceConsistency::Replayable,
-            laminar_connectors::connector::SourceTopology::Splittable,
-        ),
         assignment_scoped: true,
         position: SourcePosition::Initial,
     };
@@ -4588,6 +4609,13 @@ async fn active_source_drain_abort_waits_for_the_fifo_cut() {
 
 #[async_trait::async_trait]
 impl laminar_connectors::connector::SourceConnector for BarrierRetrySource {
+    fn contract(
+        &self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<laminar_connectors::connector::SourceContract, ConnectorError> {
+        Ok(replayable_append_only_source_contract())
+    }
+
     async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
         Ok(())
     }
@@ -4655,6 +4683,13 @@ impl laminar_connectors::connector::SourceConnector for StartupSource {
         self.cancellation_policy
     }
 
+    fn contract(
+        &self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<laminar_connectors::connector::SourceContract, ConnectorError> {
+        Ok(self.contract)
+    }
+
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         self.state.open_calls.fetch_add(1, Ordering::SeqCst);
         // Model a connector that acquired resources inside the atomic startup operation
@@ -4710,10 +4745,60 @@ impl laminar_connectors::connector::SourceConnector for StartupSource {
 }
 
 #[async_trait::async_trait]
+impl SourceConnector for LateBoundMutationSource {
+    fn contract(
+        &self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<laminar_connectors::connector::SourceContract, ConnectorError> {
+        Ok(replayable_append_only_source_contract())
+    }
+
+    async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        self.started = true;
+        Ok(())
+    }
+
+    async fn poll_batch(
+        &mut self,
+        _max_records: usize,
+    ) -> Result<Option<SourceBatch>, ConnectorError> {
+        unreachable!("late-bound mutation source must fail admission before polling")
+    }
+
+    fn schema(&self) -> Arc<Schema> {
+        if self.started {
+            Arc::new(Schema::new(vec![Field::new(
+                "__weight",
+                DataType::Int64,
+                false,
+            )]))
+        } else {
+            Arc::new(Schema::empty())
+        }
+    }
+
+    fn checkpoint(&self) -> SourceCheckpoint {
+        SourceCheckpoint::new()
+    }
+
+    async fn close(&mut self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
 impl SourceConnector for TrackedStartupSource {
     fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
         self.tracker_calls.fetch_add(1, Ordering::SeqCst);
         Some(self.task_tracker.clone())
+    }
+
+    fn contract(
+        &self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<laminar_connectors::connector::SourceContract, ConnectorError> {
+        Ok(replayable_append_only_source_contract())
     }
 
     async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
@@ -4728,7 +4813,7 @@ impl SourceConnector for TrackedStartupSource {
     }
 
     fn schema(&self) -> Arc<Schema> {
-        Arc::new(Schema::empty())
+        test_source_schema()
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
@@ -4744,6 +4829,7 @@ impl SourceConnector for TrackedStartupSource {
 #[derive(Clone, Copy)]
 enum RuntimeSourceFailure {
     TerminalPoll,
+    SchemaMismatch,
     CommitNotification,
     Panic,
 }
@@ -4774,6 +4860,13 @@ struct PendingCheckpointFailureSource {
 
 #[async_trait::async_trait]
 impl laminar_connectors::connector::SourceConnector for PendingCheckpointFailureSource {
+    fn contract(
+        &self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<laminar_connectors::connector::SourceContract, ConnectorError> {
+        Ok(replayable_append_only_source_contract())
+    }
+
     async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
         Ok(())
     }
@@ -4872,6 +4965,13 @@ impl laminar_connectors::connector::SourceConnector for CancellationSafePollSour
         ConnectorCancellationPolicy::CancelSafe
     }
 
+    fn contract(
+        &self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<laminar_connectors::connector::SourceContract, ConnectorError> {
+        Ok(replayable_append_only_source_contract())
+    }
+
     async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
         Ok(())
     }
@@ -4894,7 +4994,7 @@ impl laminar_connectors::connector::SourceConnector for CancellationSafePollSour
     }
 
     fn schema(&self) -> Arc<Schema> {
-        Arc::new(Schema::empty())
+        test_source_schema()
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
@@ -4920,6 +5020,15 @@ impl laminar_connectors::connector::SourceConnector for CancellationSafePollSour
 
 #[async_trait::async_trait]
 impl laminar_connectors::connector::SourceConnector for RuntimeFailureSource {
+    fn contract(
+        &self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<laminar_connectors::connector::SourceContract, ConnectorError> {
+        laminar_connectors::generator::GeneratorSource::default().contract(
+            &laminar_connectors::config::ConnectorConfig::new("generator"),
+        )
+    }
+
     async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
         Ok(())
     }
@@ -4933,13 +5042,33 @@ impl laminar_connectors::connector::SourceConnector for RuntimeFailureSource {
             RuntimeSourceFailure::TerminalPoll => Err(ConnectorError::Internal(
                 "injected terminal poll failure".into(),
             )),
+            RuntimeSourceFailure::SchemaMismatch => {
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    "actual",
+                    DataType::Int64,
+                    false,
+                )]));
+                let batch =
+                    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))])
+                        .unwrap();
+                Ok(Some(SourceBatch::new(batch)))
+            }
             RuntimeSourceFailure::CommitNotification => Ok(None),
             RuntimeSourceFailure::Panic => panic!("injected source-task panic"),
         }
     }
 
     fn schema(&self) -> Arc<Schema> {
-        Arc::new(Schema::empty())
+        match self.failure {
+            RuntimeSourceFailure::SchemaMismatch => Arc::new(Schema::new(vec![Field::new(
+                "expected",
+                DataType::Int64,
+                false,
+            )])),
+            RuntimeSourceFailure::TerminalPoll
+            | RuntimeSourceFailure::CommitNotification
+            | RuntimeSourceFailure::Panic => test_source_schema(),
+        }
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
@@ -4958,7 +5087,9 @@ impl laminar_connectors::connector::SourceConnector for RuntimeFailureSource {
             RuntimeSourceFailure::CommitNotification => Err(ConnectorError::Internal(
                 "injected commit notification failure".into(),
             )),
-            RuntimeSourceFailure::TerminalPoll | RuntimeSourceFailure::Panic => Ok(()),
+            RuntimeSourceFailure::TerminalPoll
+            | RuntimeSourceFailure::SchemaMismatch
+            | RuntimeSourceFailure::Panic => Ok(()),
         }
     }
 
@@ -4978,11 +5109,6 @@ async fn runtime_failure_coordinator(
         name: "runtime-failure-source".into(),
         connector: Box::new(RuntimeFailureSource { state, failure }),
         config: laminar_connectors::config::ConnectorConfig::new("runtime-failure-test"),
-        contract: laminar_connectors::generator::GeneratorSource::default()
-            .contract(&laminar_connectors::config::ConnectorConfig::new(
-                "generator",
-            ))
-            .expect("static generator contract"),
         assignment_scoped: false,
         position: SourcePosition::Initial,
     };
@@ -5084,22 +5210,44 @@ fn startup_source_with_close_delay(
     position: SourcePosition,
     cancellation_policy: ConnectorCancellationPolicy,
 ) -> SourceRegistration {
+    startup_source_with_close_delay_and_contract(
+        name,
+        state,
+        fail_open,
+        fail_restore,
+        start_delay,
+        close_delay,
+        position,
+        cancellation_policy,
+        replayable_append_only_source_contract(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn startup_source_with_close_delay_and_contract(
+    name: &str,
+    state: Arc<StartupSourceState>,
+    fail_open: bool,
+    fail_restore: bool,
+    start_delay: Duration,
+    close_delay: Duration,
+    position: SourcePosition,
+    cancellation_policy: ConnectorCancellationPolicy,
+    contract: laminar_connectors::connector::SourceContract,
+) -> SourceRegistration {
     SourceRegistration {
         name: name.into(),
         connector: Box::new(StartupSource {
             state,
-            schema: Arc::new(Schema::empty()),
+            schema: test_source_schema(),
             start_delay,
             close_delay,
             fail_open,
             fail_restore,
             cancellation_policy,
+            contract,
         }),
         config: laminar_connectors::config::ConnectorConfig::new("startup-test"),
-        contract: laminar_connectors::connector::SourceContract::new(
-            laminar_connectors::connector::SourceConsistency::Replayable,
-            laminar_connectors::connector::SourceTopology::Singleton,
-        ),
         assignment_scoped: false,
         position,
     }
@@ -5161,18 +5309,121 @@ async fn uncertified_exact_source_is_rejected_before_start() {
 }
 
 #[tokio::test]
+async fn public_coordinator_uses_connector_contract_for_mutation_admission() {
+    let state = Arc::new(StartupSourceState::default());
+    let source = startup_source_with_close_delay_and_contract(
+        "mutation-source",
+        Arc::clone(&state),
+        false,
+        false,
+        Duration::ZERO,
+        Duration::ZERO,
+        SourcePosition::Initial,
+        ConnectorCancellationPolicy::CancelSafe,
+        laminar_connectors::connector::SourceContract::new(
+            laminar_connectors::connector::SourceConsistency::Replayable,
+            laminar_connectors::connector::SourceTopology::Singleton,
+            laminar_connectors::connector::SourceInputMode::FullChangelog,
+        ),
+    );
+
+    let error = match startup_result(vec![source]).await {
+        Err(error) => error,
+        Ok(_) => panic!("the public coordinator must reject the connector's mutation contract"),
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains(laminar_core::error_codes::SOURCE_MUTATION_NOT_ADMITTED),
+        "unexpected error: {error}"
+    );
+    assert_eq!(state.open_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.start_completions.load(Ordering::SeqCst), 0);
+    assert_eq!(state.poll_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn public_coordinator_rejects_late_bound_schema_before_start() {
+    let starts = Arc::new(AtomicU64::new(0));
+    let source = SourceRegistration {
+        name: "late-bound-mutation-source".into(),
+        connector: Box::new(LateBoundMutationSource {
+            starts: Arc::clone(&starts),
+            started: false,
+        }),
+        config: laminar_connectors::config::ConnectorConfig::new("late-bound-mutation-test"),
+        assignment_scoped: false,
+        position: SourcePosition::Initial,
+    };
+
+    let error = match startup_result(vec![source]).await {
+        Err(error) => error,
+        Ok(_) => panic!("the public coordinator must reject a late-bound source schema"),
+    };
+
+    assert!(
+        error.to_string().contains("non-empty schema before"),
+        "{error}"
+    );
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn public_coordinator_rejects_commit_coupled_best_effort_before_start() {
+    let state = Arc::new(StartupSourceState::default());
+    let source = startup_source_with_close_delay_and_contract(
+        "commit-coupled-best-effort",
+        Arc::clone(&state),
+        false,
+        false,
+        Duration::ZERO,
+        Duration::ZERO,
+        SourcePosition::Initial,
+        ConnectorCancellationPolicy::CancelSafe,
+        laminar_connectors::connector::SourceContract::new(
+            laminar_connectors::connector::SourceConsistency::CommitCoupled,
+            laminar_connectors::connector::SourceTopology::Singleton,
+            laminar_connectors::connector::SourceInputMode::AppendOnly,
+        ),
+    );
+    let result = startup_result_with_config(
+        vec![source],
+        PipelineConfig {
+            delivery_guarantee: DeliveryGuarantee::BestEffort,
+            checkpoint_schedule: CheckpointSchedule::Manual,
+            ..PipelineConfig::default()
+        },
+    )
+    .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("best-effort must reject a commit-coupled source"),
+    };
+
+    assert!(error.to_string().contains("only at-least-once"), "{error}");
+    assert_eq!(state.open_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.start_completions.load(Ordering::SeqCst), 0);
+    assert_eq!(state.poll_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn at_least_once_manual_only_checkpointing_is_admitted() {
     let state = Arc::new(StartupSourceState::default());
-    let mut source = startup_source(
+    let source = startup_source_with_close_delay_and_contract(
         "manual-only-at-least-once",
         Arc::clone(&state),
         false,
         false,
+        Duration::ZERO,
+        Duration::ZERO,
         SourcePosition::Initial,
-    );
-    source.contract = laminar_connectors::connector::SourceContract::new(
-        laminar_connectors::connector::SourceConsistency::CommitCoupled,
-        laminar_connectors::connector::SourceTopology::Singleton,
+        ConnectorCancellationPolicy::CancelSafe,
+        laminar_connectors::connector::SourceContract::new(
+            laminar_connectors::connector::SourceConsistency::CommitCoupled,
+            laminar_connectors::connector::SourceTopology::Singleton,
+            laminar_connectors::connector::SourceInputMode::AppendOnly,
+        ),
     );
     let coordinator = startup_result_with_config(
         vec![source],
@@ -5353,10 +5604,6 @@ async fn claimed_barrier_is_retained_while_source_cursor_is_unreconciled() {
             state: Arc::clone(&state),
         }),
         config: laminar_connectors::config::ConnectorConfig::new("barrier-retry"),
-        contract: laminar_connectors::connector::SourceContract::new(
-            laminar_connectors::connector::SourceConsistency::Replayable,
-            laminar_connectors::connector::SourceTopology::Singleton,
-        ),
         assignment_scoped: false,
         position: SourcePosition::Initial,
     };
@@ -5448,10 +5695,6 @@ async fn emitted_barrier_holds_polling_until_an_applicable_release() {
             state: Arc::clone(&state),
         }),
         config: laminar_connectors::config::ConnectorConfig::new("barrier-hold-probe"),
-        contract: laminar_connectors::connector::SourceContract::new(
-            laminar_connectors::connector::SourceConsistency::Replayable,
-            laminar_connectors::connector::SourceTopology::Singleton,
-        ),
         assignment_scoped: false,
         position: SourcePosition::Initial,
     };
@@ -5539,10 +5782,6 @@ async fn returned_batch_is_retained_while_source_cursor_is_unreconciled() {
             state: Arc::clone(&state),
         }),
         config: laminar_connectors::config::ConnectorConfig::new("batch-retry"),
-        contract: laminar_connectors::connector::SourceContract::new(
-            laminar_connectors::connector::SourceConsistency::Replayable,
-            laminar_connectors::connector::SourceTopology::Singleton,
-        ),
         assignment_scoped: false,
         position: SourcePosition::Initial,
     };
@@ -5744,10 +5983,6 @@ async fn public_runtime_rejects_overlapping_source_generations() {
             close_calls: Arc::clone(&close_calls),
         }),
         config: laminar_connectors::config::ConnectorConfig::new("runtime-owned-source"),
-        contract: laminar_connectors::connector::SourceContract::new(
-            laminar_connectors::connector::SourceConsistency::Replayable,
-            laminar_connectors::connector::SourceTopology::Singleton,
-        ),
         assignment_scoped: false,
         position: SourcePosition::Initial,
     };
@@ -5887,10 +6122,6 @@ fn public_runtime_terminal_proof_survives_executor_shutdown() {
             close_calls: Arc::new(AtomicU64::new(0)),
         }),
         config: laminar_connectors::config::ConnectorConfig::new("executor-shutdown-source"),
-        contract: laminar_connectors::connector::SourceContract::new(
-            laminar_connectors::connector::SourceConsistency::Replayable,
-            laminar_connectors::connector::SourceTopology::Singleton,
-        ),
         assignment_scoped: false,
         position: SourcePosition::Initial,
     };
@@ -6164,6 +6395,7 @@ async fn source_start_completion_tied_with_deadline_is_rejected() {
         fail_open: false,
         fail_restore: false,
         cancellation_policy: ConnectorCancellationPolicy::RetireConnector,
+        contract: replayable_append_only_source_contract(),
     };
     let request = SourceStart::new(
         laminar_connectors::config::ConnectorConfig::new("deadline-tie"),
@@ -6293,10 +6525,6 @@ async fn failed_source_start_retains_connector_child_fence() {
             close_calls: Arc::clone(&close_calls),
         }),
         config: laminar_connectors::config::ConnectorConfig::new("tracked-start-failure"),
-        contract: laminar_connectors::connector::SourceContract::new(
-            laminar_connectors::connector::SourceConsistency::Replayable,
-            laminar_connectors::connector::SourceTopology::Singleton,
-        ),
         assignment_scoped: false,
         position: SourcePosition::Initial,
     };
@@ -6360,10 +6588,6 @@ async fn outcome_unknown_source_start_retires_without_close() {
             close_calls: Arc::clone(&close_calls),
         }),
         config: laminar_connectors::config::ConnectorConfig::new("ambiguous-start"),
-        contract: laminar_connectors::connector::SourceContract::new(
-            laminar_connectors::connector::SourceConsistency::Replayable,
-            laminar_connectors::connector::SourceTopology::Singleton,
-        ),
         assignment_scoped: false,
         position: SourcePosition::Initial,
     };
@@ -6439,6 +6663,22 @@ async fn immediate_source_fault_is_ordered_after_runtime_ready() {
 }
 
 #[tokio::test]
+async fn connector_batch_schema_mismatch_faults_before_enqueue() {
+    let coordinator = runtime_failure_coordinator(
+        DeliveryGuarantee::BestEffort,
+        RuntimeSourceFailure::SchemaMismatch,
+        Arc::new(RuntimeSourceState::default()),
+        Arc::new(tokio::sync::Notify::new()),
+    )
+    .await;
+
+    let exit = tokio::time::timeout(Duration::from_secs(5), coordinator.run(MockCallback::new()))
+        .await
+        .expect("connector schema mismatch was not observed");
+    assert!(matches!(exit, ExitReason::Fault(ref reason) if reason.contains("schema mismatch")));
+}
+
+#[tokio::test]
 async fn terminal_source_poll_failure_faults_all_delivery_modes() {
     for guarantee in [
         DeliveryGuarantee::BestEffort,
@@ -6480,7 +6720,6 @@ async fn terminal_checkpoint_failure_does_not_tail_poll_or_ack() {
         config: laminar_connectors::config::ConnectorConfig::new(
             "pending-checkpoint-failure-source",
         ),
-        contract: laminar_connectors::connector::SourceContract::default(),
         assignment_scoped: false,
         position: SourcePosition::Initial,
     };
@@ -6555,10 +6794,6 @@ async fn process_lease_loss_cancels_an_in_flight_cancel_safe_poll() {
             state: Arc::clone(&state),
         }),
         config: laminar_connectors::config::ConnectorConfig::new("lease-fenced-cancel-safe-source"),
-        contract: laminar_connectors::connector::SourceContract::new(
-            laminar_connectors::connector::SourceConsistency::Replayable,
-            laminar_connectors::connector::SourceTopology::Singleton,
-        ),
         assignment_scoped: false,
         position: SourcePosition::Initial,
     };
@@ -6620,10 +6855,6 @@ async fn epoch_commit_waits_for_in_flight_poll_without_cancelling_it() {
             state: Arc::clone(&state),
         }),
         config: laminar_connectors::config::ConnectorConfig::new("cancellation-safe-test"),
-        contract: laminar_connectors::connector::SourceContract::new(
-            laminar_connectors::connector::SourceConsistency::Replayable,
-            laminar_connectors::connector::SourceTopology::Singleton,
-        ),
         assignment_scoped: false,
         position: SourcePosition::Initial,
     };
@@ -7377,10 +7608,6 @@ async fn one_source_task_panic_faults_while_its_peer_remains_connected() {
             failure: RuntimeSourceFailure::Panic,
         }),
         config: laminar_connectors::config::ConnectorConfig::new("panic-source-test"),
-        contract: laminar_connectors::connector::SourceContract::new(
-            laminar_connectors::connector::SourceConsistency::Replayable,
-            laminar_connectors::connector::SourceTopology::Singleton,
-        ),
         assignment_scoped: false,
         position: SourcePosition::Initial,
     };

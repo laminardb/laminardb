@@ -43,7 +43,7 @@ The demo creates a streaming pipeline with three sources and seven continuous qu
 4. **Anomaly Alerts** -- High-volume detection
 5. **Book Imbalance** -- Bid/ask depth ratio
 6. **Depth Metrics** -- Total quantities per side
-7. **ASOF JOIN** -- Enriched orders with latest market data (application-level)
+7. **Latest-tick enrichment** -- Orders paired with the latest available market data
 
 ## TUI Dashboard
 

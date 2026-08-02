@@ -17,6 +17,8 @@ use crate::error::ConnectorError;
 /// Reserved source-offset key prefix for a partition's durable numeric next-to-read baseline.
 /// `@` and `:` are invalid in Kafka topic names, so a real topic-partition key cannot collide.
 pub(super) const KAFKA_PARTITION_BASELINE_PREFIX: &str = "@laminar.kafka.next.v1:";
+pub(super) const KAFKA_CHECKPOINT_VERSION_KEY: &str = "checkpoint.version";
+pub(super) const KAFKA_CHECKPOINT_VERSION: &str = "1";
 
 /// Tracks consumed offsets per topic-partition.
 ///
@@ -109,12 +111,24 @@ impl OffsetTracker {
     /// Returns a configuration error when the connector identity, partition
     /// key, or offset value is malformed.
     pub fn try_from_checkpoint(cp: &SourceCheckpoint) -> Result<Self, ConnectorError> {
-        if let Some(connector) = cp.get_metadata("connector") {
-            if connector != "kafka" {
+        match cp.get_metadata("connector") {
+            Some("kafka") => {}
+            Some(connector) => {
                 return Err(ConnectorError::ConfigurationError(format!(
                     "Kafka checkpoint belongs to connector '{connector}'"
                 )));
             }
+            None => {
+                return Err(ConnectorError::ConfigurationError(
+                    "Kafka checkpoint is missing connector identity".into(),
+                ));
+            }
+        }
+        if cp.get_metadata(KAFKA_CHECKPOINT_VERSION_KEY) != Some(KAFKA_CHECKPOINT_VERSION) {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "Kafka checkpoint requires {}={}",
+                KAFKA_CHECKPOINT_VERSION_KEY, KAFKA_CHECKPOINT_VERSION
+            )));
         }
         Self::try_from_offset_map(cp.offsets())
     }
@@ -129,7 +143,19 @@ impl OffsetTracker {
         checkpoint: &ConnectorCheckpoint,
     ) -> Result<Self, ConnectorError> {
         match checkpoint.metadata.get("connector").map(String::as_str) {
-            Some("kafka") => Self::try_from_offset_map(&checkpoint.offsets),
+            Some("kafka")
+                if checkpoint
+                    .metadata
+                    .get(KAFKA_CHECKPOINT_VERSION_KEY)
+                    .map(String::as_str)
+                    == Some(KAFKA_CHECKPOINT_VERSION) =>
+            {
+                Self::try_from_offset_map(&checkpoint.offsets)
+            }
+            Some("kafka") => Err(ConnectorError::ConfigurationError(format!(
+                "Kafka checkpoint requires {}={}",
+                KAFKA_CHECKPOINT_VERSION_KEY, KAFKA_CHECKPOINT_VERSION
+            ))),
             Some(connector) => Err(ConnectorError::ConfigurationError(format!(
                 "Kafka checkpoint belongs to connector '{connector}'"
             ))),
@@ -249,6 +275,7 @@ impl OffsetTracker {
         }
         let mut cp = SourceCheckpoint::with_offsets(offsets);
         cp.set_metadata("connector", "kafka");
+        cp.set_metadata(KAFKA_CHECKPOINT_VERSION_KEY, KAFKA_CHECKPOINT_VERSION);
         cp
     }
 }
@@ -379,6 +406,10 @@ mod tests {
 
         let mut kafka = ConnectorCheckpoint::with_offsets(offsets);
         kafka.metadata.insert("connector".into(), "kafka".into());
+        kafka.metadata.insert(
+            KAFKA_CHECKPOINT_VERSION_KEY.into(),
+            KAFKA_CHECKPOINT_VERSION.into(),
+        );
         let restored = OffsetTracker::try_from_connector_checkpoint(&kafka).unwrap();
         assert_eq!(restored.get("events", 0), Some(41));
     }
@@ -456,6 +487,10 @@ mod tests {
         let tracker = OffsetTracker::new();
         let cp = tracker.to_checkpoint_for_partitions(std::iter::empty());
         assert_eq!(cp.get_metadata("connector"), Some("kafka"));
+        assert_eq!(
+            cp.get_metadata(KAFKA_CHECKPOINT_VERSION_KEY),
+            Some(KAFKA_CHECKPOINT_VERSION)
+        );
     }
 
     #[test]

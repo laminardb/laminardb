@@ -9,12 +9,15 @@ use std::time::{Duration, Instant};
 
 use futures::{stream::FuturesUnordered, StreamExt};
 use laminar_connectors::checkpoint::SourceCheckpoint;
-use laminar_connectors::connector::CoordinatedCommitNamespace;
+use laminar_connectors::connector::{
+    CoordinatedCommitNamespace, MAX_COORDINATED_COMMIT_BATCH_BYTES,
+    MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
+};
 #[cfg(feature = "cluster")]
 use laminar_core::checkpoint::{
     canonical_json_sha256, ClusterRecoveryCapsule, CommittedSourceHandoff,
-    PreparedCheckpointWitness, RecoveryCapsuleRef, VnodeRestoreContract, VnodeRestoreLimits,
-    MAX_PREPARED_CHECKPOINT_WITNESSES,
+    PreparedCheckpointWitness, RecoveryCapsuleRef, VnodeRestoreContract, VnodeRestoreLimitProfile,
+    VnodeRestoreLimits, MAX_PREPARED_CHECKPOINT_WITNESSES,
 };
 use laminar_core::checkpoint::{CheckpointWatermark, LeaderProof};
 #[cfg(feature = "cluster")]
@@ -81,6 +84,71 @@ where
     match first_error {
         Some(error) => Err(error),
         None => Ok(values),
+    }
+}
+
+async fn collect_sink_phase_one_bounded_draining<F>(
+    futures: Vec<F>,
+    limit: usize,
+    mut descriptors: HashMap<String, Option<Vec<u8>>>,
+) -> Result<HashMap<String, Option<Vec<u8>>>, DbError>
+where
+    F: std::future::Future<Output = Result<Option<(String, Option<Vec<u8>>)>, DbError>>,
+{
+    assert!(limit > 0, "bounded concurrency must be nonzero");
+    let mut pending = futures.into_iter();
+    let mut active = FuturesUnordered::new();
+    for future in pending.by_ref().take(limit) {
+        active.push(future);
+    }
+
+    let mut retained_payload_bytes = 0usize;
+    let mut first_error = None;
+    while let Some(result) = active.next().await {
+        match result {
+            Ok(Some((name, payload))) if first_error.is_none() => {
+                let payload_bytes = payload.as_ref().map_or(0, Vec::len);
+                let accepted = retained_payload_bytes
+                    .checked_add(payload_bytes)
+                    .filter(|total| *total <= MAX_COORDINATED_COMMIT_BATCH_BYTES)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "phase-one descriptors exceed the fixed \
+                             {MAX_COORDINATED_COMMIT_BATCH_BYTES}-byte aggregate limit"
+                        ))
+                    });
+                match accepted {
+                    Ok(total) => {
+                        retained_payload_bytes = total;
+                        descriptors.insert(name, payload);
+                        if let Some(future) = pending.next() {
+                            active.push(future);
+                        }
+                    }
+                    Err(error) => {
+                        descriptors.clear();
+                        first_error = Some(error);
+                    }
+                }
+            }
+            Ok(None) if first_error.is_none() => {
+                if let Some(future) = pending.next() {
+                    active.push(future);
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                if first_error.is_none() {
+                    descriptors.clear();
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(descriptors),
     }
 }
 
@@ -755,7 +823,7 @@ impl<'a> PrepareQuorum<'a> {
 pub(crate) struct ValidatedVnodeRestoreHead {
     inventory: Arc<CheckpointSealInventory>,
     contract: VnodeRestoreContract,
-    lineage_inventories: HashMap<CheckpointAttempt, Arc<CheckpointSealInventory>>,
+    ancestor_attestations: Arc<crate::vnode_restore_lineage::ValidatedVnodeAncestorAttestations>,
 }
 
 #[cfg(feature = "cluster")]
@@ -763,13 +831,14 @@ impl ValidatedVnodeRestoreHead {
     fn new(
         inventory: Arc<CheckpointSealInventory>,
         contract: VnodeRestoreContract,
-        mut lineage_inventories: HashMap<CheckpointAttempt, Arc<CheckpointSealInventory>>,
+        ancestor_attestations: Arc<
+            crate::vnode_restore_lineage::ValidatedVnodeAncestorAttestations,
+        >,
     ) -> Self {
-        lineage_inventories.insert(inventory.attempt, Arc::clone(&inventory));
         Self {
             inventory,
             contract,
-            lineage_inventories,
+            ancestor_attestations,
         }
     }
 
@@ -799,7 +868,7 @@ impl ValidatedVnodeRestoreHead {
                 },
             );
         let max_partial_payload_bytes = exact_payload_bytes.max(1);
-        let limits = VnodeRestoreLimits::global_singleton_compatibility(
+        let limits = VnodeRestoreLimits::managed_vnode(
             max_partial_payload_bytes,
             max_chain_artifacts,
             vnode_count,
@@ -808,7 +877,19 @@ impl ValidatedVnodeRestoreHead {
         let contract =
             VnodeRestoreContract::new(limits, exact_payload_bytes, exact_artifacts, vnode_count)
                 .expect("test restore contract");
-        Self::new(Arc::new(inventory), contract, HashMap::new())
+        let ancestor_attestations =
+            crate::vnode_restore_lineage::ValidatedVnodeAncestorAttestations::empty_for_test();
+        Self::new(Arc::new(inventory), contract, ancestor_attestations)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_validated_lineage_for_test(
+        inventory: Arc<CheckpointSealInventory>,
+        lineage: crate::vnode_restore_lineage::ValidatedVnodeRestoreLineage,
+    ) -> Self {
+        let contract = lineage.contract().clone();
+        let ancestor_attestations = lineage.into_ancestor_attestations();
+        Self::new(inventory, contract, ancestor_attestations)
     }
 
     #[must_use]
@@ -826,12 +907,11 @@ impl ValidatedVnodeRestoreHead {
         &self.contract
     }
 
-    pub(crate) fn lineage_inventories(
+    #[must_use]
+    pub(crate) fn ancestor_attestations(
         &self,
-    ) -> impl Iterator<Item = (CheckpointAttempt, Arc<CheckpointSealInventory>)> + '_ {
-        self.lineage_inventories
-            .iter()
-            .map(|(attempt, inventory)| (*attempt, Arc::clone(inventory)))
+    ) -> Arc<crate::vnode_restore_lineage::ValidatedVnodeAncestorAttestations> {
+        Arc::clone(&self.ancestor_attestations)
     }
 }
 
@@ -944,7 +1024,7 @@ impl ValidatedClusterVnodeRestoreCut {
         let max_partial_payload_bytes = u64::try_from(inventory.required_vnodes.len())
             .unwrap_or(u64::MAX)
             .max(1);
-        let limits = VnodeRestoreLimits::global_singleton_compatibility(
+        let limits = VnodeRestoreLimits::managed_vnode(
             max_partial_payload_bytes,
             6,
             inventory
@@ -962,9 +1042,9 @@ impl ValidatedClusterVnodeRestoreCut {
             pipeline_identity,
             seal_inventory_sha256,
             restore_head: ValidatedVnodeRestoreHead::new(
-                Arc::new(inventory),
+                Arc::new(inventory.clone()),
                 contract,
-                HashMap::new(),
+                crate::vnode_restore_lineage::ValidatedVnodeAncestorAttestations::empty_for_test(),
             ),
         };
         cut.validate_transition_binding().map_err(|error| {
@@ -984,16 +1064,12 @@ impl ValidatedClusterVnodeRestoreCut {
     }
 
     #[must_use]
-    pub(crate) fn pipeline_identity(&self) -> &PipelineIdentity {
-        &self.pipeline_identity
-    }
-
-    #[must_use]
     pub(crate) fn restore_head(&self) -> &ValidatedVnodeRestoreHead {
         &self.restore_head
     }
 
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn inventory(&self) -> Arc<CheckpointSealInventory> {
         self.restore_head.inventory()
     }
@@ -1032,6 +1108,73 @@ impl ValidatedClusterVnodeRestoreCut {
             return Err("committed restore cut has a non-canonical seal digest".into());
         }
         Ok(())
+    }
+
+    pub(crate) fn into_transition_binding(
+        self,
+    ) -> Result<ValidatedClusterVnodeTransitionBinding, DbError> {
+        self.validate_transition_binding().map_err(|error| {
+            DbError::Checkpoint(format!("[LDB-6051] invalid committed restore cut: {error}"))
+        })?;
+        let assignment_fence = self
+            .restore_head
+            .inventory
+            .assignment_fence
+            .as_ref()
+            .expect("validated cluster restore cut has an assignment fence");
+        let attempt = self.restore_head.attempt();
+        let source_assignment_digest = assignment_fence.digest();
+        let sealed_vnode_count = assignment_fence.vnode_count;
+        let restore_profile = self.restore_head.contract.limits.profile;
+        Ok(ValidatedClusterVnodeTransitionBinding {
+            attempt,
+            pipeline_identity: self.pipeline_identity,
+            source_assignment_digest,
+            sealed_vnode_count,
+            restore_profile,
+        })
+    }
+}
+
+/// Minimal committed-cut identity retained after vnode bodies have been loaded.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValidatedClusterVnodeTransitionBinding {
+    attempt: CheckpointAttempt,
+    pipeline_identity: PipelineIdentity,
+    source_assignment_digest: [u8; 32],
+    sealed_vnode_count: u32,
+    restore_profile: VnodeRestoreLimitProfile,
+}
+
+#[cfg(feature = "cluster")]
+impl ValidatedClusterVnodeTransitionBinding {
+    #[must_use]
+    pub(crate) const fn attempt(&self) -> CheckpointAttempt {
+        self.attempt
+    }
+
+    #[must_use]
+    pub(crate) const fn pipeline_identity(&self) -> &PipelineIdentity {
+        &self.pipeline_identity
+    }
+
+    #[must_use]
+    pub(crate) const fn restore_profile(&self) -> VnodeRestoreLimitProfile {
+        self.restore_profile
+    }
+
+    #[must_use]
+    pub(crate) fn matches_source_assignment(
+        &self,
+        assignment: &laminar_core::checkpoint::CheckpointAssignmentFence,
+    ) -> bool {
+        self.source_assignment_digest == assignment.digest()
+    }
+
+    #[must_use]
+    pub(crate) const fn covers_vnode_index(&self, vnode: u32) -> bool {
+        vnode < self.sealed_vnode_count
     }
 }
 
@@ -2582,6 +2725,13 @@ impl CheckpointCoordinator {
                 "checkpoint-committable sink names must be unique".into(),
             ));
         }
+        // Certified cluster sinks stage immutable, log-invisible phase-one files and publish
+        // through the namespaced external checkpoint cursor. The singleton local witness is not
+        // an ownership primitive for that protocol.
+        #[cfg(feature = "cluster")]
+        if self.cluster_controller.is_some() {
+            return Ok(());
+        }
         let store = self.decision_store.as_ref().ok_or_else(|| {
             DbError::Checkpoint(
                 "[LDB-6050] sink-open audit requires a durable decision store".into(),
@@ -2603,13 +2753,6 @@ impl CheckpointCoordinator {
             return Ok(());
         };
         self.validate_sink_open_witness_for_sinks(&witness, &expected_sinks)?;
-        #[cfg(feature = "cluster")]
-        if self.cluster_controller.is_some() {
-            return Err(DbError::Checkpoint(
-                "[LDB-0013] cluster exactly-once sink recovery is unavailable until connector epoch operations are leader-term fenced"
-                    .into(),
-            ));
-        }
         Ok(())
     }
 
@@ -2800,6 +2943,22 @@ impl CheckpointCoordinator {
             .burn_sink_epoch_reservation(witness.attempt)?;
         self.allocator.advance_epoch_to(successor);
         active.take();
+        Ok(())
+    }
+
+    fn finalize_unwitnessed_sink_epoch(&self, attempt: CheckpointAttempt) -> Result<(), DbError> {
+        if self.active_sink_witness.lock().is_some() {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6050] checkpoint {} cannot finalize without a witness while local sink ownership is active",
+                attempt.checkpoint_id
+            )));
+        }
+        let successor = checked_successor_epoch(
+            attempt.epoch,
+            "advancing after certified cluster sink-epoch cleanup",
+        )?;
+        self.allocator.burn_sink_epoch_reservation(attempt)?;
+        self.allocator.advance_epoch_to(successor);
         Ok(())
     }
 
@@ -3286,7 +3445,7 @@ impl CheckpointCoordinator {
         .map_err(|_| {
             DbError::Config("checkpoint vnode-chain limit does not fit the durable contract".into())
         })?;
-        VnodeRestoreLimits::global_singleton_compatibility(
+        VnodeRestoreLimits::managed_vnode(
             self.config.max_staged_bytes,
             max_artifacts_per_vnode_chain,
             vnode_count,
@@ -3433,23 +3592,21 @@ impl CheckpointCoordinator {
                 ready.participant_id, manifest.participant_id
             )));
         }
+        let participant_id = ready.participant_id;
         let bytes = laminar_core::checkpoint::canonical_json_bytes(&ready)
             .map(bytes::Bytes::from)
             .map_err(|error| {
                 DbError::Checkpoint(format!("participant readiness encode: {error}"))
             })?;
         checked_participant_ready_total(0, bytes.len())?;
+        drop(ready);
+        let key = participant_ready_key(participant_id);
         if follower_prepare {
             self.participant_ready_write = Some(attempt);
         }
         tokio::time::timeout_at(
             deadline,
-            self.write_commit_descriptor(
-                backend.as_ref(),
-                attempt,
-                &participant_ready_key(ready.participant_id),
-                bytes,
-            ),
+            self.write_commit_descriptor(backend.as_ref(), attempt, &key, bytes),
         )
         .await
         .map_err(|_| {
@@ -3674,7 +3831,7 @@ impl CheckpointCoordinator {
         })?;
         let inventory = tokio::time::timeout_at(
             deadline,
-            backend.checkpoint_seal_inventory(attempt),
+            backend.checkpoint_seal_inventory_bounded(attempt),
         )
         .await
         .map_err(|_| {
@@ -3818,6 +3975,25 @@ impl CheckpointCoordinator {
             .any(|sink| sink.handle.checkpoint_committable())
     }
 
+    fn requires_durable_sink_open_witness(&self) -> Result<bool, DbError> {
+        #[cfg(feature = "cluster")]
+        let cluster_runtime = self.cluster_controller.is_some();
+        #[cfg(not(feature = "cluster"))]
+        let cluster_runtime = false;
+        if !cluster_runtime {
+            return Ok(true);
+        }
+        if let Some(sink) = self.sinks.iter().find(|sink| {
+            sink.handle.checkpoint_committable() && !sink.handle.cluster_exact_delivery_certified()
+        }) {
+            return Err(DbError::Config(format!(
+                "[LDB-5035] cluster checkpoint-committable sink '{}' is not certified for immutable phase one and fenced external publication",
+                sink.name
+            )));
+        }
+        Ok(false)
+    }
+
     async fn open_next_sink_epoch_until(
         &self,
         deadline: tokio::time::Instant,
@@ -3826,13 +4002,18 @@ impl CheckpointCoordinator {
             return Ok(None);
         }
 
+        let witness_required = self.requires_durable_sink_open_witness()?;
         let attempt = self.allocator.reserve_sink_epoch_until(deadline).await?;
-        let witness = match self.create_sink_open_witness_until(attempt, deadline).await {
-            Ok(witness) => witness,
-            Err(error) => {
-                self.allocator.mark_sink_epoch_in_doubt(attempt)?;
-                return Err(error);
+        let witness = if witness_required {
+            match self.create_sink_open_witness_until(attempt, deadline).await {
+                Ok(witness) => Some(witness),
+                Err(error) => {
+                    self.allocator.mark_sink_epoch_in_doubt(attempt)?;
+                    return Err(error);
+                }
             }
+        } else {
+            None
         };
         if let Err(failure) = self
             .begin_epoch_for_sinks_until(attempt.epoch, deadline, deadline)
@@ -3841,12 +4022,15 @@ impl CheckpointCoordinator {
             // A failed or timed-out rollback leaves the external transaction in-doubt. Keep the
             // reservation as a poison fence so this process cannot open a higher epoch over it.
             if failure.rollback_complete {
-                if let Err(clear_error) =
-                    self.clear_sink_open_witness_until(&witness, deadline).await
-                {
+                let cleanup = if let Some(witness) = witness.as_ref() {
+                    self.clear_sink_open_witness_until(witness, deadline).await
+                } else {
+                    self.finalize_unwitnessed_sink_epoch(attempt)
+                };
+                if let Err(clear_error) = cleanup {
                     self.allocator.mark_sink_epoch_in_doubt(attempt)?;
                     return Err(DbError::Checkpoint(format!(
-                        "{}; connector rollback completed but durable sink-open cleanup failed: {clear_error}",
+                        "{}; connector rollback completed but sink-epoch cleanup failed: {clear_error}",
                         failure.error
                     )));
                 }
@@ -3861,9 +4045,13 @@ impl CheckpointCoordinator {
                 .await
                 .err();
             let cleanup_error = if rollback_error.is_none() {
-                self.clear_sink_open_witness_until(&witness, deadline)
-                    .await
-                    .err()
+                if let Some(witness) = witness.as_ref() {
+                    self.clear_sink_open_witness_until(witness, deadline)
+                        .await
+                        .err()
+                } else {
+                    self.finalize_unwitnessed_sink_epoch(attempt).err()
+                }
             } else {
                 None
             };
@@ -3876,7 +4064,7 @@ impl CheckpointCoordinator {
                     format!("failed, leaving epoch state in-doubt: {rollback}")
                 }
                 (None, Some(cleanup)) => format!(
-                    "completed, but durable witness cleanup failed and left epoch state in-doubt: {cleanup}"
+                    "completed, but sink-epoch cleanup failed and left epoch state in-doubt: {cleanup}"
                 ),
             };
             return Err(DbError::Checkpoint(format!(
@@ -4305,47 +4493,73 @@ impl CheckpointCoordinator {
         epoch: u64,
         deadline: tokio::time::Instant,
     ) -> Result<std::collections::HashMap<String, Option<Vec<u8>>>, DbError> {
-        let futures: Vec<_> = self
+        let coordinated_sink_count = self
             .sinks
             .iter()
-            .map(|sink| {
-                let handle = sink.handle.clone();
-                let name = sink.name.clone();
-                let checkpoint_committable = sink.handle.checkpoint_committable();
-                async move {
-                    if checkpoint_committable {
-                        // 2PC phase 1: flush + prepare; coordinated sinks return a descriptor.
-                        match handle.pre_commit_until(epoch, deadline).await {
-                            Ok(descriptor) => {
-                                debug!(sink = %name, epoch, "sink pre-committed");
-                                // Every coordinated sink emits a prepared marker, even when it has
-                                // no files for this cut. Empty markers are required to prove each
-                                // quorum participant reached phase 1 and to advance external cursors.
-                                Ok(Some((name, descriptor)))
+            .filter(|sink| sink.handle.checkpoint_committable())
+            .count();
+        let mut descriptors = HashMap::new();
+        descriptors
+            .try_reserve(coordinated_sink_count)
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "phase-one descriptor inventory allocation failed: {error}"
+                ))
+            })?;
+        let mut futures = Vec::new();
+        futures
+            .try_reserve_exact(self.sinks.len())
+            .map_err(|error| {
+                DbError::Checkpoint(format!("phase-one work allocation failed: {error}"))
+            })?;
+        for sink in &self.sinks {
+            let handle = sink.handle.clone();
+            let name = sink.name.clone();
+            let checkpoint_committable = sink.handle.checkpoint_committable();
+            futures.push(async move {
+                if checkpoint_committable {
+                    // 2PC phase 1: flush + prepare; coordinated sinks return a descriptor.
+                    match handle.pre_commit_until(epoch, deadline).await {
+                        Ok(descriptor) => {
+                            if descriptor.as_ref().is_some_and(|payload| {
+                                payload.len() > MAX_COORDINATED_COMMIT_PAYLOAD_BYTES
+                            }) {
+                                return Err(DbError::Checkpoint(format!(
+                                    "sink '{name}' phase-one descriptor exceeds the fixed \
+                                     {MAX_COORDINATED_COMMIT_PAYLOAD_BYTES}-byte payload limit"
+                                )));
                             }
-                            Err(e) => Err(DbError::Checkpoint(format!(
-                                "sink '{name}' pre-commit failed: {e}"
-                            ))),
+                            debug!(sink = %name, epoch, "sink pre-committed");
+                            // Every coordinated sink emits a prepared marker, even when it has
+                            // no files for this cut. Empty markers are required to prove each
+                            // quorum participant reached phase 1 and to advance external cursors.
+                            Ok(Some((name, descriptor)))
                         }
-                    } else {
-                        // At-least-once sinks flush buffered rows before the manifest seals offsets;
-                        // they do not enter the transactional pre-commit path.
-                        match handle.flush_until(deadline).await {
-                            Ok(()) => {
-                                debug!(sink = %name, epoch, "at-least-once sink flushed");
-                                Ok(None)
-                            }
-                            Err(e) => Err(DbError::Checkpoint(format!(
-                                "sink '{name}' flush failed: {e}"
-                            ))),
+                        Err(e) => Err(DbError::Checkpoint(format!(
+                            "sink '{name}' pre-commit failed: {e}"
+                        ))),
+                    }
+                } else {
+                    // At-least-once sinks flush buffered rows before the manifest seals offsets;
+                    // they do not enter the transactional pre-commit path.
+                    match handle.flush_until(deadline).await {
+                        Ok(()) => {
+                            debug!(sink = %name, epoch, "at-least-once sink flushed");
+                            Ok(None)
                         }
+                        Err(e) => Err(DbError::Checkpoint(format!(
+                            "sink '{name}' flush failed: {e}"
+                        ))),
                     }
                 }
-            })
-            .collect();
-        let collected =
-            try_collect_bounded_draining(futures, MAX_SINK_PHASE_ONE_CONCURRENCY).await?;
-        Ok(collected.into_iter().flatten().collect())
+            });
+        }
+        collect_sink_phase_one_bounded_draining(
+            futures,
+            MAX_SINK_PHASE_ONE_CONCURRENCY,
+            descriptors,
+        )
+        .await
     }
 
     /// Save a manifest (and optional sidecar) to the store, bounded by the attempt timeout.
@@ -4415,19 +4629,31 @@ impl CheckpointCoordinator {
     fn coordinated_namespaces(&self) -> Result<Vec<CoordinatedCommitNamespace>, DbError> {
         let identity = self.expected_pipeline_identity();
         let deployment_id = self.expected_deployment_id()?;
-        let mut namespaces: Vec<_> = self
+        let namespace_count = self
             .sinks
             .iter()
             .filter(|sink| sink.handle.checkpoint_committable())
-            .map(|sink| {
+            .count();
+        let mut namespaces = Vec::new();
+        namespaces
+            .try_reserve_exact(namespace_count)
+            .map_err(|error| {
+                DbError::Checkpoint(format!("coordinated namespace allocation failed: {error}"))
+            })?;
+        for sink in self
+            .sinks
+            .iter()
+            .filter(|sink| sink.handle.checkpoint_committable())
+        {
+            namespaces.push(
                 CoordinatedCommitNamespace::try_new(
                     identity.clone(),
                     deployment_id,
                     sink.name.clone(),
                 )
-                .map_err(|error| DbError::Checkpoint(error.to_string()))
-            })
-            .collect::<Result<_, _>>()?;
+                .map_err(|error| DbError::Checkpoint(error.to_string()))?,
+            );
+        }
         namespaces.sort_unstable_by(|left, right| left.sink_id.cmp(&right.sink_id));
         Ok(namespaces)
     }
@@ -4439,10 +4665,31 @@ impl CheckpointCoordinator {
         &self,
         participants: &[QuorumPeer],
     ) -> Result<Vec<String>, DbError> {
-        let participant_ids = self.checkpoint_participant_ids(participants);
+        let participant_ids = self.checkpoint_participant_ids(participants)?;
 
         let namespaces = self.coordinated_namespaces()?;
-        let mut keys = Vec::with_capacity(namespaces.len() * participant_ids.len());
+        let descriptor_count = namespaces
+            .len()
+            .checked_mul(participant_ids.len())
+            .ok_or_else(|| DbError::Checkpoint("required descriptor key count overflow".into()))?;
+        #[cfg(feature = "cluster")]
+        let readiness_count = if self.cluster_controller.is_some() {
+            participant_ids.len()
+        } else {
+            0
+        };
+        #[cfg(not(feature = "cluster"))]
+        let readiness_count = 0;
+        let required_key_count = descriptor_count
+            .checked_add(readiness_count)
+            .ok_or_else(|| DbError::Checkpoint("required descriptor key count overflow".into()))?;
+        let mut keys = Vec::new();
+        keys.try_reserve_exact(required_key_count)
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "required descriptor key allocation failed: {error}"
+                ))
+            })?;
         for namespace in &namespaces {
             for &participant_id in &participant_ids {
                 keys.push(crate::coordinated_committer::descriptor_key(
@@ -4459,15 +4706,25 @@ impl CheckpointCoordinator {
         Ok(keys)
     }
 
-    fn checkpoint_participant_ids(&self, participants: &[QuorumPeer]) -> Vec<u64> {
-        let mut participant_ids = vec![self.self_node_id()];
+    fn checkpoint_participant_ids(&self, participants: &[QuorumPeer]) -> Result<Vec<u64>, DbError> {
+        let capacity = participants
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| DbError::Checkpoint("checkpoint participant count overflow".into()))?;
+        let mut participant_ids = Vec::new();
+        participant_ids
+            .try_reserve_exact(capacity)
+            .map_err(|error| {
+                DbError::Checkpoint(format!("checkpoint participant allocation failed: {error}"))
+            })?;
+        participant_ids.push(self.self_node_id());
         #[cfg(feature = "cluster")]
         participant_ids.extend(participants.iter().map(|participant| participant.0));
         #[cfg(not(feature = "cluster"))]
         participant_ids.extend(participants.iter().copied());
         participant_ids.sort_unstable();
         participant_ids.dedup();
-        participant_ids
+        Ok(participant_ids)
     }
 
     /// Persist this participant's prepared marker for every coordinated sink.
@@ -4499,7 +4756,7 @@ impl CheckpointCoordinator {
                 "coordinated-commit sinks require a state backend for prepared markers".into(),
             ));
         };
-        self.persist_sink_descriptors(backend, attempt, &namespaces, &descriptors)
+        self.persist_sink_descriptors(backend, attempt, &namespaces, descriptors)
             .await
     }
 
@@ -4508,11 +4765,11 @@ impl CheckpointCoordinator {
         backend: &Arc<dyn StateBackend>,
         attempt: CheckpointAttempt,
         namespaces: &[CoordinatedCommitNamespace],
-        descriptors: &std::collections::HashMap<String, Option<Vec<u8>>>,
+        mut descriptors: std::collections::HashMap<String, Option<Vec<u8>>>,
     ) -> Result<(), DbError> {
         let participant_id = self.self_node_id();
         for namespace in namespaces {
-            let payload = descriptors.get(&namespace.sink_id).ok_or_else(|| {
+            let payload = descriptors.remove(&namespace.sink_id).ok_or_else(|| {
                 DbError::Checkpoint(format!(
                     "missing prepared marker for sink '{}'",
                     namespace.sink_id
@@ -4524,6 +4781,7 @@ impl CheckpointCoordinator {
                 participant_id,
                 payload.as_deref(),
             )?;
+            drop(payload);
             self.write_commit_descriptor(
                 backend.as_ref(),
                 attempt,
@@ -4764,11 +5022,11 @@ impl CheckpointCoordinator {
         }
 
         let writes: Vec<_> = prepared
-            .iter()
+            .iter_mut()
             .map(|partial| {
                 let backend = Arc::clone(backend);
                 let v = partial.vnode;
-                let payload = partial.payload.clone();
+                let payload = std::mem::take(&mut partial.payload);
                 let lineage = partial.lineage;
                 let certified_writer = certified_writer.clone();
                 async move {
@@ -5395,6 +5653,9 @@ impl CheckpointCoordinator {
         if !self.has_checkpoint_committable_sinks() {
             return Ok(());
         }
+        if !self.requires_durable_sink_open_witness()? {
+            return self.finalize_unwitnessed_sink_epoch(attempt);
+        }
         let witness = self.active_sink_witness.lock().clone().ok_or_else(|| {
             DbError::Checkpoint(format!(
                 "[LDB-6050] checkpoint {} has no owned durable sink-open witness",
@@ -5619,7 +5880,7 @@ impl CheckpointCoordinator {
                     let attempt = CheckpointAttempt::new(epoch, checkpoint_id);
                     let inventory = tokio::time::timeout(
                         self.config.checkpoint_timeout,
-                        backend.checkpoint_seal_inventory(attempt),
+                        backend.checkpoint_seal_inventory_bounded(attempt),
                     )
                     .await
                     .map_err(|_| {
@@ -5748,6 +6009,22 @@ impl CheckpointCoordinator {
         if !self.has_checkpoint_committable_sinks() {
             return Ok(());
         }
+        if !self.requires_durable_sink_open_witness()? {
+            self.quiesce_pending_sink_witness_create_until(deadline)
+                .await?;
+            self.quiesce_pending_sink_witness_clear_until(deadline)
+                .await?;
+            if self.active_sink_witness.lock().is_some() {
+                return Err(DbError::Checkpoint(
+                    "[LDB-6050] certified cluster sink recovery found legacy local sink-open ownership"
+                        .into(),
+                ));
+            }
+            if let Some(reservation) = self.allocator.sink_epoch_reservation() {
+                self.finalize_unwitnessed_sink_epoch(reservation.attempt())?;
+            }
+            return Ok(());
+        }
         self.quiesce_pending_sink_witness_create_until(deadline)
             .await?;
         self.quiesce_pending_sink_witness_clear_until(deadline)
@@ -5795,13 +6072,6 @@ impl CheckpointCoordinator {
             return Ok(());
         };
         self.validate_sink_open_witness(&witness)?;
-        #[cfg(feature = "cluster")]
-        if self.cluster_controller.is_some() {
-            return Err(DbError::Checkpoint(
-                "[LDB-0013] cluster exactly-once sink recovery is unavailable until connector epoch operations are leader-term fenced"
-                    .into(),
-            ));
-        }
         *self.active_sink_witness.lock() = Some(witness.clone());
         let attempt = witness.attempt;
         let outcome = tokio::time::timeout_at(deadline, store.outcome(attempt.epoch))
@@ -7977,7 +8247,7 @@ impl CheckpointCoordinator {
     ) -> Result<ValidatedClusterVnodeRestoreCut, DbError> {
         let attempt = CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id);
         let inventory = backend
-            .checkpoint_seal_inventory(attempt)
+            .checkpoint_seal_inventory_bounded(attempt)
             .await
             .map_err(|error| {
                 DbError::Checkpoint(format!("checkpoint seal inventory read failed: {error}"))
@@ -7999,7 +8269,7 @@ impl CheckpointCoordinator {
         if let Some((max_partial_payload_bytes, max_artifacts_per_vnode_chain)) =
             expected_runtime_limits
         {
-            let expected_limits = VnodeRestoreLimits::global_singleton_compatibility(
+            let expected_limits = VnodeRestoreLimits::managed_vnode(
                 max_partial_payload_bytes,
                 max_artifacts_per_vnode_chain,
                 capsule.assignment_fence.vnode_count,
@@ -8051,7 +8321,7 @@ impl CheckpointCoordinator {
                 outcome.epoch, outcome.checkpoint_id
             )));
         }
-        let lineage_inventories = validated_lineage.into_inventories();
+        let ancestor_attestations = validated_lineage.into_ancestor_attestations();
         let recovery_capsule_ref = outcome.recovery_capsule.clone().ok_or_else(|| {
             DbError::Checkpoint(format!(
                 "[LDB-6041] cluster Commit for epoch {} checkpoint {} has no recovery capsule",
@@ -8066,7 +8336,7 @@ impl CheckpointCoordinator {
             restore_head: ValidatedVnodeRestoreHead::new(
                 inventory,
                 capsule.vnode_restore_contract.clone(),
-                lineage_inventories,
+                ancestor_attestations,
             ),
         })
     }

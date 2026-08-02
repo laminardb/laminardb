@@ -60,7 +60,6 @@ mod aggregate_state;
 pub mod ai;
 mod ai_catalog;
 mod ai_worker;
-mod asof_batch;
 mod builder;
 mod catalog;
 mod catalog_connector;
@@ -83,7 +82,6 @@ mod core_window_state;
 mod db;
 /// Prometheus metrics for the streaming engine.
 pub mod engine_metrics;
-mod eowc_state;
 // Reopened `impl LaminarDB` modules — split from db.rs
 /// FFI-friendly API for language bindings.
 ///
@@ -130,11 +128,10 @@ pub mod subscription;
 mod table_backend;
 mod table_provider;
 mod table_store;
-mod temporal_probe;
 mod vnode_partial;
 #[cfg(any(feature = "cluster", test))]
 mod vnode_restore_input;
-#[cfg(feature = "cluster")]
+#[cfg(any(feature = "cluster", test))]
 mod vnode_restore_lineage;
 #[cfg(feature = "cluster")]
 mod vnode_transition_staging;
@@ -161,7 +158,10 @@ pub use catalog::{ArrowRecord, SourceCatalog, SourceEntry};
 pub use checkpoint_coordinator::{
     CheckpointFailureDisposition, CheckpointPhase, CheckpointResult, CheckpointStats,
 };
-pub use config::{BackpressurePolicy, LaminarConfig, RestartPolicy};
+pub use config::{
+    BackpressurePolicy, LaminarConfig, RestartPolicy, DEFAULT_MAX_MANAGED_STATE_BYTES,
+    DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES,
+};
 pub use db::LaminarDB;
 pub use engine_metrics::EngineMetrics;
 pub use error::DbError;

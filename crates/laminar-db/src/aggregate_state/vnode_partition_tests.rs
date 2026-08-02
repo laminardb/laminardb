@@ -79,6 +79,55 @@ fn pre_agg_batch(rows: &[(&str, i64)]) -> RecordBatch {
     .unwrap()
 }
 
+async fn retractable_min_state() -> IncrementalAggState {
+    let ctx = laminar_sql::create_session_context();
+    let source_schema = Arc::new(Schema::new(vec![
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+        Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+    ]));
+    let seed = RecordBatch::try_new(
+        Arc::clone(&source_schema),
+        vec![
+            Arc::new(arrow::array::StringArray::from(vec!["seed"])),
+            Arc::new(arrow::array::Int64Array::from(vec![0])),
+            Arc::new(arrow::array::Int64Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    let mem = datafusion::datasource::MemTable::try_new(source_schema, vec![vec![seed]]).unwrap();
+    ctx.register_table("upstream", Arc::new(mem)).unwrap();
+    IncrementalAggState::try_from_sql(
+        &ctx,
+        "SELECT symbol, MIN(value) AS minimum FROM upstream GROUP BY symbol",
+        false,
+        KeyGroupCount::try_from(VNODES).unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+fn group_accumulator_charge(state: &IncrementalAggState, symbol: &str) -> usize {
+    let batch = pre_agg_batch(&[(symbol, 0)]);
+    let rows = state
+        .row_converter
+        .convert_columns(&[Arc::clone(batch.column(0))])
+        .unwrap();
+    let key = rows.row(0).owned();
+    let vnode = IncrementalAggState::vnode_for_group_key(
+        state.num_group_cols,
+        &key,
+        NonZeroU32::new(VNODES).unwrap(),
+    );
+    state
+        .vnode_states
+        .get(vnode)
+        .and_then(|vnode_state| vnode_state.groups.get(&key))
+        .expect("test group must exist")
+        .accumulator_reported_bytes
+}
+
 fn totals(state: &mut IncrementalAggState) -> std::collections::BTreeMap<String, i64> {
     let mut out = std::collections::BTreeMap::new();
     for b in state.emit().unwrap() {
@@ -232,6 +281,149 @@ async fn delta_accounting_does_not_inspect_clean_groups() {
         0,
         "an incremental checkpoint must not inspect a clean accumulator"
     );
+}
+
+/// Dynamic accumulator bytes must be current at the same record boundary where the graph enforces
+/// its pipeline-wide working-state budget.
+#[tokio::test]
+async fn retractable_minimum_growth_updates_accounting_on_the_record_path() {
+    let ctx = laminar_sql::create_session_context();
+    let source_schema = Arc::new(Schema::new(vec![
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+        Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+    ]));
+    let seed = RecordBatch::try_new(
+        Arc::clone(&source_schema),
+        vec![
+            Arc::new(arrow::array::StringArray::from(vec!["seed"])),
+            Arc::new(arrow::array::Int64Array::from(vec![0])),
+            Arc::new(arrow::array::Int64Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    let mem = datafusion::datasource::MemTable::try_new(source_schema, vec![vec![seed]]).unwrap();
+    ctx.register_table("upstream", Arc::new(mem)).unwrap();
+    let mut state = IncrementalAggState::try_from_sql(
+        &ctx,
+        "SELECT symbol, MIN(value) AS minimum FROM upstream GROUP BY symbol",
+        false,
+        KeyGroupCount::try_from(VNODES).unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let pre_agg_schema = Arc::new(Schema::new(vec![
+        Field::new("symbol", DataType::Utf8, true),
+        Field::new("__agg_input_1", DataType::Int64, true),
+        Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+    ]));
+    let initial = RecordBatch::try_new(
+        Arc::clone(&pre_agg_schema),
+        vec![
+            Arc::new(arrow::array::StringArray::from(vec!["hot"])),
+            Arc::new(arrow::array::Int64Array::from(vec![0])),
+            Arc::new(arrow::array::Int64Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    state.process_batch(&initial, 1).unwrap();
+    let before = state.accounted_state_bytes();
+
+    let values = (1_i64..=256).collect::<Vec<_>>();
+    let update = RecordBatch::try_new(
+        pre_agg_schema,
+        vec![
+            Arc::new(arrow::array::StringArray::from(vec!["hot"; values.len()])),
+            Arc::new(arrow::array::Int64Array::from(values)),
+            Arc::new(arrow::array::Int64Array::from(vec![1; 256])),
+        ],
+    )
+    .unwrap();
+    state.process_batch(&update, 2).unwrap();
+
+    assert!(
+        state.accounted_state_bytes() > before,
+        "dynamic retractable accumulator growth was not charged before checkpointing"
+    );
+    assert!(state.cached_usage_matches_structural_recompute());
+}
+
+#[tokio::test]
+async fn retractable_extremum_delta_budget_is_selective_exact_and_retry_safe() {
+    let mut state = retractable_min_state().await;
+    let dirty_symbol = symbol_for_vnode(&state, 0, 0);
+    let clean_symbol = symbol_for_vnode(&state, 1, 10_000);
+    feed(
+        &mut state,
+        &[
+            (dirty_symbol.as_str(), 1),
+            (dirty_symbol.as_str(), 2),
+            (clean_symbol.as_str(), 10),
+            (clean_symbol.as_str(), 20),
+        ],
+    );
+    state.set_delta_enabled(true);
+    let full_charge = group_accumulator_charge(&state, &dirty_symbol)
+        + group_accumulator_charge(&state, &clean_symbol);
+    state.set_max_retractable_extremum_checkpoint_bytes(full_charge);
+    state
+        .checkpoint_delta_by_vnode(VNODES, 8)
+        .expect("the first forced-FULL capture must accept its exact combined charge");
+
+    feed(&mut state, &[(dirty_symbol.as_str(), 3)]);
+    let dirty_charge = group_accumulator_charge(&state, &dirty_symbol);
+    let clean_charge = group_accumulator_charge(&state, &clean_symbol);
+    state.set_max_retractable_extremum_checkpoint_bytes(dirty_charge);
+    let selective = state
+        .checkpoint_delta_by_vnode(VNODES, 8)
+        .expect("a DELTA must charge only its dirty extremum group");
+    assert!(selective.values().any(|capture| {
+        matches!(capture, VnodeCapture::Delta(delta) if delta.changed.last_updated_ms.len() == 1)
+    }));
+
+    feed(&mut state, &[(dirty_symbol.as_str(), 4)]);
+    let grown_dirty_charge = group_accumulator_charge(&state, &dirty_symbol);
+    let values_before = state.evaluated_groups_for_test().unwrap();
+    let bookkeeping_before = state.working_set_snapshot_for_test();
+    state.set_max_retractable_extremum_checkpoint_bytes(grown_dirty_charge - 1);
+    for _ in 0..2 {
+        let error = match state.checkpoint_delta_by_vnode(VNODES, 8) {
+            Ok(_) => panic!("an over-budget delta capture must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            DbError::RetractableExtremumCheckpointBudgetExceeded {
+                charged_bytes,
+                limit_bytes,
+                ..
+            } if charged_bytes == grown_dirty_charge && limit_bytes == grown_dirty_charge - 1
+        ));
+        assert_eq!(state.working_set_snapshot_for_test(), bookkeeping_before);
+        assert_eq!(state.evaluated_groups_for_test().unwrap(), values_before);
+    }
+
+    state.set_max_retractable_extremum_checkpoint_bytes(grown_dirty_charge);
+    state
+        .checkpoint_delta_by_vnode(VNODES, 8)
+        .expect("the unchanged dirty delta must retry at its exact charge");
+
+    let total_charge = grown_dirty_charge + clean_charge;
+    let before_full_failure = state.working_set_snapshot_for_test();
+    let full_error = match state.checkpoint_groups_by_vnode(VNODES) {
+        Ok(_) => panic!("a FULL capture must include the otherwise-clean group"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        full_error,
+        DbError::RetractableExtremumCheckpointBudgetExceeded { .. }
+    ));
+    assert_eq!(state.working_set_snapshot_for_test(), before_full_failure);
+    state.set_max_retractable_extremum_checkpoint_bytes(total_charge);
+    state
+        .checkpoint_groups_by_vnode(VNODES)
+        .expect("the per-vnode FULL capture must accept its exact aggregate charge");
 }
 
 #[tokio::test]
@@ -809,6 +1001,20 @@ async fn prepared_vnode_transition_group_limit_failure_preserves_live_image() {
         deltas: &[],
     }];
 
+    let preflight_error = live
+        .preflight_vnode_transition_cardinality(
+            VNODES,
+            &[(restored_vnode, restored_base.last_updated_ms.len())],
+            &Default::default(),
+        )
+        .expect_err("the retained plus restored lower bound must exceed the limit");
+    assert!(
+        preflight_error
+            .to_string()
+            .contains("replacement_lower_bound=2"),
+        "{preflight_error}"
+    );
+
     let error = live
         .prepare_vnode_transition(VNODES, &restores, &Default::default())
         .err()
@@ -843,6 +1049,13 @@ async fn prepared_vnode_transition_accepts_exact_final_group_limit() {
         base: &restored_base,
         deltas: &[],
     }];
+
+    live.preflight_vnode_transition_cardinality(
+        VNODES,
+        &[(restored_vnode, restored_base.last_updated_ms.len())],
+        &Default::default(),
+    )
+    .expect("the retained plus restored lower bound is exactly at the limit");
 
     let prepared = live
         .prepare_vnode_transition(VNODES, &restores, &Default::default())

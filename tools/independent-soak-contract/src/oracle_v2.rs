@@ -10,7 +10,7 @@ const SCHEMA_VERSION: &str = "independent-oracle-fixture/v2";
 const ABI: &str = "fixture-utf8-byte-sum-mod-v1";
 const PARTITIONING_ABI: &str = "fixture-sink-shard-partition-map-v1";
 const ENVELOPE_VERSION: u16 = 1;
-const PIPELINE_IDENTITY_VERSION: u16 = 3;
+const PIPELINE_IDENTITY_VERSION: u16 = 5;
 const WIRE_ABI_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]

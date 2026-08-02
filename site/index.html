@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>LaminarDB — Streaming SQL Engine</title>
   <meta name="description" content="LaminarDB is an open-source streaming SQL engine written in Rust. It runs continuous SQL queries over event streams using Apache Arrow and DataFusion. Embed it in Rust or Python, or run as a standalone server. Sub-microsecond state lookups. Apache 2.0.">
-  <meta name="keywords" content="streaming database, embedded database, stream processing, Rust, SQL, Apache Arrow, DataFusion, Kafka, CDC, Delta Lake, Apache Iceberg, OpenTelemetry, sub-microsecond, ASOF join, temporal probe join, tumbling window, session window, exactly-once, barrier checkpoint">
+  <meta name="keywords" content="streaming database, embedded database, stream processing, Rust, SQL, Apache Arrow, DataFusion, Kafka, CDC, Delta Lake, Apache Iceberg, OpenTelemetry, sub-microsecond, bounded join, tumbling window, session window, exactly-once, barrier checkpoint">
   <meta name="author" content="LaminarDB Contributors">
   <meta name="robots" content="index, follow, max-image-preview:large">
   <meta name="theme-color" content="#f8fafc">
@@ -74,7 +74,7 @@
         "featureList": [
           "Continuous SQL queries over event streams",
           "Tumbling, sliding, hopping, and session windows",
-          "ASOF, temporal, temporal probe, interval, and lookup joins",
+          "Bounded interval, temporal, and lookup joins",
           "Exactly-once sinks via two-phase commit barrier checkpoints",
           "Kafka, PostgreSQL/MongoDB CDC, Delta Lake, Iceberg, and OpenTelemetry connectors",
           "Embed in Rust or Python, or run as a standalone server",
@@ -135,7 +135,7 @@
             "name": "Is LaminarDB production-ready?",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "LaminarDB is pre-1.0. Single-node embedded and standalone server deployments are stable, including exactly-once sinks via barrier checkpoints."
+              "text": "LaminarDB is pre-1.0. Distributed-state production certification is pending the full single-node and cluster ALO/EO soak matrix."
             }
           },
           {
@@ -151,7 +151,7 @@
             "name": "What SQL features does LaminarDB support?",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "LaminarDB supports standard SQL through DataFusion plus streaming extensions: tumbling, sliding, hopping, and session windows; ASOF, temporal, temporal probe, interval, and lookup joins; EMIT clauses (ON WATERMARK, ON WINDOW CLOSE, PERIODICALLY, CHANGES, FINAL); watermarks with ALLOW LATENESS; and late data routing via LATE DATA TO."
+              "text": "LaminarDB supports standard SQL through DataFusion plus streaming extensions: tumbling, sliding, hopping, and session windows; bounded interval, temporal, and lookup joins; EMIT clauses (ON WATERMARK, ON WINDOW CLOSE, PERIODICALLY, CHANGES, FINAL); watermarks with ALLOW LATENESS; and late data routing via LATE DATA TO."
             }
           },
           {
@@ -159,23 +159,7 @@
             "name": "How does LaminarDB handle exactly-once delivery?",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "LaminarDB uses Chandy-Lamport style barrier checkpoints with two-phase commit. Source offsets and sink commit status are stored in a checkpoint manifest. On recovery, the engine restores operator state and rewinds sources to the last committed checkpoint."
-            }
-          },
-          {
-            "@type": "Question",
-            "name": "What is an ASOF join in LaminarDB?",
-            "acceptedAnswer": {
-              "@type": "Answer",
-              "text": "An ASOF join matches each row in the left stream to the single closest row in the right stream by timestamp within the same key partition. LaminarDB supports three directions: Backward (most recent prior event), Forward (next event), and Nearest (minimum absolute time difference)."
-            }
-          },
-          {
-            "@type": "Question",
-            "name": "What is a temporal probe join?",
-            "acceptedAnswer": {
-              "@type": "Answer",
-              "text": "A temporal probe join produces multiple output rows for each left event by probing the right stream at a list of fixed time offsets. Offsets are specified with RANGE FROM x TO y STEP z or LIST of explicit millisecond values. It is designed for impact-curve analysis and lagged feature lookups."
+              "text": "Exactly-once is connector-gated. Barrier checkpoints align source offsets, operator state, and coordinated sink publication; the current cluster candidate is Kafka input to direct S3/S3A append-mode Delta Lake."
             }
           },
           {
@@ -184,15 +168,16 @@
             "acceptedAnswer": {
               "@type": "Answer",
               "text": "No. LaminarDB is written in Rust and ships as a native binary. It has no JVM or other runtime dependencies beyond the operating system."
-            },
-            {
-              "@type": "Question",
-              "name": "Is LaminarDB open source?",
-              "acceptedAnswer": {
-                "@type": "Answer",
-                "text": "Yes. LaminarDB is licensed under Apache 2.0 and the source is hosted at github.com/laminardb/laminardb."
-              }
             }
+          },
+          {
+            "@type": "Question",
+            "name": "Is LaminarDB open source?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Yes. LaminarDB is licensed under Apache 2.0 and the source is hosted at github.com/laminardb/laminardb."
+            }
+          }
           ]
         }
       ]
@@ -318,8 +303,8 @@
             <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/window_bench.rs" target="_blank" rel="noopener">core/window_bench.rs</a></div>
           </div>
           <div class="hero-metric">
-            <div class="hero-metric-value">0</div>
-            <div class="hero-metric-label">Hot-Path Allocations</div>
+            <div class="hero-metric-value">Low</div>
+            <div class="hero-metric-label">Hot-Path Overhead</div>
             <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/Cargo.toml" target="_blank" rel="noopener">core/Cargo.toml</a></div>
           </div>
         </div>
@@ -338,7 +323,7 @@
             <div class="card-content">
               <h3>MILLISECOND STATEFUL PROCESSING</h3>
               <p>
-                Execute window functions and session aggregations on a zero-allocation compute path, ensuring sub-microsecond state update speeds.
+                Execute window functions and session aggregations on a latency-focused, memory-accounted compute path.
               </p>
             </div>
             <div class="card-illustration">
@@ -372,7 +357,7 @@
             <div class="card-content">
               <h3>DISTRIBUTED MPP SCALING</h3>
               <p>
-                Scale execution across clusters using key-sharded data partitioners, distributed join rules, and lease-fenced coordination.
+                Scale bounded interval joins across clusters with canonical vnode partitioning and lease-fenced coordination.
               </p>
             </div>
             <div class="card-illustration">
@@ -448,7 +433,7 @@
             <div class="card-content">
               <h3>STATEFUL STREAM JOINS</h3>
               <p>
-                Correlate independent event pipelines in real time using high-performance ASOF, interval, and temporal probe joins.
+                Correlate independent event pipelines using bounded interval joins.
               </p>
             </div>
             <div class="card-illustration">
@@ -555,15 +540,15 @@
       <div class="container">
         <div class="split-layout">
           <div class="split-text">
-            <h2>Engineered for Zero-Overhead Stream Processing</h2>
+            <h2>Engineered for Low-Overhead Stream Processing</h2>
             <p>
               LaminarDB runs SQL queries over event streams. Aggregations, joins, and windows are evaluated continuously in a dedicated thread topology.
             </p>
             <p>
-              <strong>Zero-allocation compute.</strong> Our execution design isolates latency-sensitive compute threads from system overhead. By routing in-flight events through lock-free channels, we guarantee predictable latency.
+              <strong>Latency-focused compute.</strong> Bounded batches, managed state accounting, and lock-free channels reduce hot-path overhead.
             </p>
             <p>
-              <strong>Exactly-once delivery.</strong> Chandy-Lamport style barrier checkpoints with two-phase commit track source offsets and commit statuses. In case of disruption, offset offsets are automatically re-aligned.
+              <strong>Connector-gated exactly-once delivery.</strong> Barrier checkpoints align source offsets, state, and coordinated sink publication. The current cluster candidate is Kafka input to direct S3/S3A append-mode Delta Lake.
             </p>
           </div>
 
@@ -800,20 +785,12 @@ FROM clickstream
 GROUP BY user_id, session(ts, INTERVAL '30' SECOND)
 EMIT ON WINDOW CLOSE;
 
--- ASOF join: enrich trades with closest preceding quote
-SELECT t.symbol, t.price, q.bid, q.ask,
-       t.price - q.bid AS spread
-FROM trades t
-ASOF JOIN quotes q
-    MATCH_CONDITION(t.ts >= q.ts)
-    ON t.symbol = q.symbol;
-
 -- Interval join: match orders to payments within 1 hour
 CREATE STREAM matched AS
 SELECT o.order_id, o.amount, p.status
 FROM orders o
 INNER JOIN payments p ON o.order_id = p.order_id
-    AND p.ts BETWEEN o.ts AND o.ts + 3600000;</code></pre>
+    AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR;</code></pre>
               </div>
             </div>
             <div class="expand-overlay">
@@ -978,8 +955,8 @@ INNER JOIN payments p ON o.order_id = p.order_id
                 <div class="console-mockup-code" style="border-radius: 6px; padding: 10px;">
                   <span style="color: #64748b;">-- Authoring continuous stream join</span><br/>
                   <span style="color: #0ea5e9; font-weight: bold;">SELECT</span> symbol, price, volume<br/>
-                  <span style="color: #0ea5e9; font-weight: bold;">FROM</span> trades <span style="color: #0ea5e9; font-weight: bold;">ASOF JOIN</span> quotes<br/>
-                  <span style="color: #0ea5e9; font-weight: bold;">ON</span> trades.symbol = quotes.symbol
+                  <span style="color: #0ea5e9; font-weight: bold;">FROM</span> trades <span style="color: #0ea5e9; font-weight: bold;">INNER JOIN</span> quotes<br/>
+                  <span style="color: #0ea5e9; font-weight: bold;">ON</span> trades.symbol = quotes.symbol <span style="color: #0ea5e9; font-weight: bold;">AND</span> quotes.ts <span style="color: #0ea5e9; font-weight: bold;">BETWEEN</span> trades.ts <span style="color: #0ea5e9; font-weight: bold;">AND</span> trades.ts + <span style="color: #0ea5e9; font-weight: bold;">INTERVAL</span> '5' SECOND
                 </div>
                 <!-- Nodes/DAG visual mockup -->
                 <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 0;">
@@ -1118,7 +1095,7 @@ FROM tickets;</code></pre>
             <h3>Engine &amp; SQL</h3>
             <ul class="status-list">
               <li>Streaming operator graph evaluation (tumble, sliding, hopping, session windows).</li>
-              <li>Support for interval, ASOF, lookup, and temporal probe joins.</li>
+              <li>Bounded interval joins; lookup and temporal joins in local mode.</li>
               <li>Dynamic partitioning and state store lookup indexing.</li>
               <li>Chandy-Lamport barrier checkpointing (2-phase commit).</li>
               <li>Multi-node coordination, gossip discovery, durable leader leases, and CAS-published assignments.</li>
@@ -1159,7 +1136,7 @@ FROM tickets;</code></pre>
           </details>
           <details>
             <summary>Is LaminarDB production-ready?</summary>
-            <p>LaminarDB is pre-1.0. Single-node embedded and standalone server deployments are stable, including exactly-once sinks via barrier checkpoints.</p>
+            <p>LaminarDB is pre-1.0. Distributed-state production certification is pending the full single-node and cluster ALO/EO soak matrix.</p>
           </details>
           <details>
             <summary>Can I use LaminarDB from Python?</summary>
@@ -1167,19 +1144,11 @@ FROM tickets;</code></pre>
           </details>
           <details>
             <summary>What SQL features does LaminarDB support?</summary>
-            <p>LaminarDB supports standard SQL through DataFusion plus streaming extensions: tumbling, sliding, hopping, and session windows; ASOF, temporal, temporal probe, interval, and lookup joins; EMIT clauses (<code>ON WATERMARK</code>, <code>ON WINDOW CLOSE</code>, <code>PERIODICALLY</code>, <code>CHANGES</code>, <code>FINAL</code>); watermarks with <code>ALLOW LATENESS</code>; and late data routing via <code>LATE DATA TO</code>.</p>
+            <p>LaminarDB supports standard SQL through DataFusion plus streaming extensions: tumbling, sliding, hopping, and session windows; bounded interval, temporal, and lookup joins; EMIT clauses (<code>ON WATERMARK</code>, <code>ON WINDOW CLOSE</code>, <code>PERIODICALLY</code>, <code>CHANGES</code>, <code>FINAL</code>); watermarks with <code>ALLOW LATENESS</code>; and late data routing via <code>LATE DATA TO</code>.</p>
           </details>
           <details>
             <summary>How does LaminarDB handle exactly-once delivery?</summary>
-            <p>LaminarDB uses Chandy-Lamport style barrier checkpoints with two-phase commit. Source offsets and sink commit status are stored in a checkpoint manifest. On recovery, the engine restores operator state and rewinds sources to the last committed checkpoint.</p>
-          </details>
-          <details>
-            <summary>What is an ASOF join in LaminarDB?</summary>
-            <p>An ASOF join matches each row in the left stream to the single closest row in the right stream by timestamp within the same key partition. LaminarDB supports three directions: <strong>Backward</strong> (most recent prior event), <strong>Forward</strong> (next event), and <strong>Nearest</strong> (minimum absolute time difference).</p>
-          </details>
-          <details>
-            <summary>What is a temporal probe join?</summary>
-            <p>A temporal probe join produces multiple output rows for each left event by probing the right stream at a list of fixed time offsets. Offsets are specified with <code>RANGE FROM x TO y STEP z</code> or <code>LIST</code> of explicit millisecond values. It is designed for impact-curve analysis and lagged feature lookups.</p>
+            <p>Exactly-once is connector-gated. Barrier checkpoints align source offsets, operator state, and coordinated sink publication; the current cluster candidate is Kafka input to direct S3/S3A append-mode Delta Lake.</p>
           </details>
           <details>
             <summary>Does LaminarDB require a JVM?</summary>
@@ -1465,7 +1434,7 @@ FROM tickets;</code></pre>
         </div>
         <div id="ldb-examples">
           <button class="ldb-ex">How do I define a TUMBLE window?</button>
-          <button class="ldb-ex">What's the difference between ASOF and interval joins?</button>
+          <button class="ldb-ex">How do bounded interval joins use watermarks?</button>
           <button class="ldb-ex">How does Ring 0 enforce zero-alloc?</button>
           <button class="ldb-ex">How do I connect a Kafka source?</button>
         </div>

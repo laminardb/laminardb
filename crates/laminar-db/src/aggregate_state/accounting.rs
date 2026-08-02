@@ -4,12 +4,10 @@
 //! deliberately separates inline logical storage from owned payloads so callers can account for
 //! every retained key clone without counting the inline value twice.
 //!
-//! The estimate excludes `AHashMap`/`AHashSet` bucket and control-byte allocations, allocator
-//! metadata and fragmentation, unique attribution of shared `Arc` allocations, and process RSS.
-//! It also excludes transient batch/output scratch and serialized checkpoint/capture bytes. Those
-//! require separate budgets rather than being hidden inside the live-state number. Nested payloads
-//! retained by changelog `ScalarValue`s are also excluded: inspecting every value would put an
-//! allocation-dependent traversal on the record-processing hot path.
+//! Hash collection capacity is charged using the inline key/value size exposed by the collection;
+//! private control-byte layout, allocator metadata and fragmentation, unique attribution of shared
+//! `Arc` allocations, and process RSS remain excluded. Transient batch/output scratch and serialized
+//! checkpoint/capture bytes require separate budgets rather than being hidden in live state.
 
 use std::mem::size_of;
 
@@ -19,9 +17,9 @@ use datafusion_expr::Accumulator;
 
 /// Categorized charged bytes retained by aggregate state.
 ///
-/// Collection element storage describes the inline key/value or vector-element bytes for logical
-/// entries. Hash-table bucket/control allocation is intentionally excluded because `AHashMap`
-/// does not expose its physical allocation layout as a stable contract.
+/// Collection element storage describes reserved inline key/value or vector-element bytes.
+/// Hash-table private control bytes remain excluded because `AHashMap` does not expose that layout
+/// as a stable contract.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct AggregateStateUsage {
     topology_element_storage_bytes: usize,
@@ -218,6 +216,27 @@ pub(super) fn logical_collection_element_usage<T>(element_capacity: usize) -> Ag
     AggregateStateUsage::from_parts_with_saturation(0, 0, bytes, 0, 0, saturated)
 }
 
+/// Reserved hash-collection slots that are not already charged by initialized entries.
+///
+/// Callers charge each initialized entry separately because its owned payload has a distinct
+/// lifetime, then add this capacity slack so initialized plus spare inline bytes equal the
+/// collection's exposed capacity.
+pub(super) fn logical_collection_spare_capacity_usage<T>(
+    capacity: usize,
+    len: usize,
+) -> AggregateStateUsage {
+    let (spare, subtraction_saturated) = saturating_sub_with_flag(capacity, len);
+    let (bytes, multiplication_saturated) = saturating_element_storage::<T>(spare);
+    AggregateStateUsage::from_parts_with_saturation(
+        0,
+        0,
+        bytes,
+        0,
+        0,
+        subtraction_saturated || multiplication_saturated,
+    )
+}
+
 /// Payload bytes owned by `retained_copies` physical `OwnedRow` clones.
 ///
 /// The inline `OwnedRow` value is accounted as collection element storage. Its boxed byte slice has
@@ -256,16 +275,38 @@ pub(super) fn accumulator_usage(accumulators: &Vec<Box<dyn Accumulator>>) -> Agg
     )
 }
 
-/// Reserved inline elements for a retained changelog `Vec<ScalarValue>`.
+/// Reserved inline elements and initialized nested payloads for a retained changelog value vector.
 ///
-/// This is constant-time with respect to initialized values: nested `ScalarValue` allocations and
-/// shared `Arc` payload/control blocks are deliberately excluded rather than calling
-/// `ScalarValue::size()` on the record-processing hot path.
+/// `ScalarValue::size()` includes its inline value and owned/shared nested allocation estimate.
+/// Only changed aggregate groups call this on the record path; vector spare capacity is charged
+/// separately so initialized and uninitialized elements are not double counted.
 #[allow(clippy::ptr_arg)] // Capacity, not only the initialized slice, is part of the allocation.
 pub(super) fn retained_changelog_vector_element_usage(
     values: &Vec<ScalarValue>,
 ) -> AggregateStateUsage {
-    logical_collection_element_usage::<ScalarValue>(values.capacity())
+    let (initialized, initialized_saturated) =
+        values
+            .iter()
+            .fold((0_usize, false), |(total, saturated), value| {
+                let (total, addition_saturated) = saturating_add_with_flag(total, value.size());
+                (total, saturated || addition_saturated)
+            });
+    let (spare, spare_subtraction_saturated) =
+        saturating_sub_with_flag(values.capacity(), values.len());
+    let (spare_bytes, spare_multiplication_saturated) =
+        saturating_element_storage::<ScalarValue>(spare);
+    let (bytes, addition_saturated) = saturating_add_with_flag(initialized, spare_bytes);
+    AggregateStateUsage::from_parts_with_saturation(
+        0,
+        0,
+        bytes,
+        0,
+        0,
+        initialized_saturated
+            || spare_subtraction_saturated
+            || spare_multiplication_saturated
+            || addition_saturated,
+    )
 }
 
 fn saturating_element_storage<T>(count: usize) -> (usize, bool) {
@@ -352,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn changelog_vector_usage_excludes_nested_scalar_allocations() {
+    fn changelog_vector_usage_includes_nested_scalar_allocations_and_spare_capacity() {
         let mut compact_values = Vec::with_capacity(4);
         compact_values.push(ScalarValue::Int64(Some(7)));
         let mut allocated_values = Vec::with_capacity(4);
@@ -360,15 +401,32 @@ mod tests {
 
         let compact_usage = retained_changelog_vector_element_usage(&compact_values);
         let allocated_usage = retained_changelog_vector_element_usage(&allocated_values);
-        let expected_inline = compact_values.capacity() * size_of::<ScalarValue>();
+        let expected_compact = compact_values[0].size()
+            + (compact_values.capacity() - compact_values.len()) * size_of::<ScalarValue>();
+        let expected_allocated = allocated_values[0].size()
+            + (allocated_values.capacity() - allocated_values.len()) * size_of::<ScalarValue>();
 
         assert_eq!(
             compact_usage.logical_collection_element_storage_bytes(),
-            expected_inline
+            expected_compact
         );
-        assert_eq!(compact_usage, allocated_usage);
-        assert_eq!(compact_usage.total_bytes(), expected_inline);
+        assert_eq!(compact_usage.total_bytes(), expected_compact);
+        assert_eq!(allocated_usage.total_bytes(), expected_allocated);
+        assert!(allocated_usage.total_bytes() > compact_usage.total_bytes());
         assert!(!compact_usage.is_saturated());
+        assert!(!allocated_usage.is_saturated());
+    }
+
+    #[test]
+    fn collection_spare_capacity_completes_initialized_element_charge() {
+        let capacity = 11;
+        let len = 7;
+        let initialized = logical_collection_element_usage::<u64>(len);
+        let spare = logical_collection_spare_capacity_usage::<u64>(capacity, len);
+        assert_eq!(
+            initialized.saturating_add(spare).total_bytes(),
+            capacity * size_of::<u64>()
+        );
     }
 
     #[derive(Debug)]

@@ -13,8 +13,8 @@ pub mod vnode;
 
 pub use backend::{
     CheckpointAttempt, CheckpointAttemptRelation, CheckpointSealInventory, SealedCommitDescriptor,
-    SealedCommitDescriptorWriter, SealedVnodePartial, SealedVnodeWriter, StateBackend,
-    StateBackendDurability, StateBackendError, VnodePartialLineage,
+    SealedCommitDescriptorWriter, SealedPartialReadEnvelope, SealedVnodePartial, SealedVnodeWriter,
+    StateBackend, StateBackendDurability, StateBackendError, VnodePartialLineage,
 };
 pub use config::{StateBackendBuildError, StateBackendConfig};
 pub use in_process::InProcessBackend;

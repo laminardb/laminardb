@@ -28,6 +28,7 @@ const STORE_NAME: &str = "DurableLocalObjectStore";
 const TEMP_PREFIX: &str = ".laminardb-object#";
 const MAX_CACHED_DIRECTORIES: usize = 4096;
 const MAX_RETAINED_POISONED_ROOTS: usize = 4096;
+const MAX_EMPTY_PREFIX_CLEANUP_DEPTH: usize = 128;
 
 #[cfg(test)]
 #[derive(Debug, Default)]
@@ -129,6 +130,13 @@ pub(crate) struct DurableLocalObjectStore {
 #[async_trait]
 pub(crate) trait EmptyPrefixCleanup: Send + Sync {
     async fn cleanup_empty_prefix(&self, prefix: &Path) -> object_store::Result<()>;
+
+    async fn cleanup_retired_empty_epoch_prefixes(
+        &self,
+        state_root: &Path,
+        before_epoch: u64,
+        limit: usize,
+    ) -> object_store::Result<usize>;
 }
 
 impl DurableLocalObjectStore {
@@ -417,7 +425,35 @@ impl EmptyPrefixCleanup for DurableLocalObjectStore {
         tokio::task::spawn_blocking(move || {
             let _ownership_lock = ownership_lock;
             cleanup_empty_directory_tree(root.as_ref(), domain.as_ref(), &prefix)
+                .map(|_| ())
                 .map_err(generic_io_error)
+        })
+        .await?
+    }
+
+    async fn cleanup_retired_empty_epoch_prefixes(
+        &self,
+        state_root: &Path,
+        before_epoch: u64,
+        limit: usize,
+    ) -> object_store::Result<usize> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let state_root = self.filesystem_path(state_root)?;
+        let root = Arc::clone(&self.root);
+        let domain = Arc::clone(&self.domain);
+        let ownership_lock = self.ownership_lock.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ownership_lock = ownership_lock;
+            cleanup_retired_empty_epoch_directories(
+                root.as_ref(),
+                domain.as_ref(),
+                &state_root,
+                before_epoch,
+                limit,
+            )
+            .map_err(generic_io_error)
         })
         .await?
     }
@@ -537,10 +573,10 @@ fn cleanup_empty_directory_tree(
     root: &FsPath,
     domain: &RootDomain,
     prefix: &FsPath,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let prefix = match std::fs::canonicalize(prefix) {
         Ok(prefix) => prefix,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(error),
     };
     if prefix == root || !prefix.starts_with(root) {
@@ -550,42 +586,158 @@ fn cleanup_empty_directory_tree(
         ));
     }
 
-    let mut pending = vec![prefix];
-    let mut directories = Vec::new();
-    while let Some(directory) = pending.pop() {
-        directories.push(directory.clone());
-        let entries = match std::fs::read_dir(&directory) {
-            Ok(entries) => entries,
+    cleanup_empty_directory(root, domain, &prefix, 0)?;
+    match std::fs::metadata(&prefix) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+fn cleanup_empty_directory(
+    root: &FsPath,
+    domain: &RootDomain,
+    directory: &FsPath,
+    depth: usize,
+) -> io::Result<()> {
+    if depth >= MAX_EMPTY_PREFIX_CLEANUP_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty-prefix cleanup directory nesting exceeds its fixed bound",
+        ));
+    }
+
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if file_type.is_dir() && !file_type.is_symlink() {
+            let child = match std::fs::canonicalize(entry.path()) {
+                Ok(child) => child,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            if child.parent() != Some(directory) || !child.starts_with(root) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "empty-prefix cleanup child resolves outside its parent",
+                ));
+            }
+            cleanup_empty_directory(root, domain, &child, depth + 1)?;
+        } else if file_type.is_file() && is_internal_artifact_name(&entry.file_name()) {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
-            };
-            if file_type.is_dir() {
-                pending.push(entry.path());
-            } else if file_type.is_file() && is_internal_artifact_name(&entry.file_name()) {
-                match std::fs::remove_file(entry.path()) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
             }
         }
     }
-
-    for directory in directories.into_iter().rev() {
-        try_remove_empty_directory(root, domain, &directory);
-    }
+    try_remove_empty_directory(root, domain, directory);
     Ok(())
+}
+
+fn cleanup_retired_empty_epoch_directories(
+    root: &FsPath,
+    domain: &RootDomain,
+    state_root: &FsPath,
+    before_epoch: u64,
+    limit: usize,
+) -> io::Result<usize> {
+    let metadata = match std::fs::symlink_metadata(state_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "state root for empty-prefix cleanup is not a physical directory",
+        ));
+    }
+    let state_root = std::fs::canonicalize(state_root)?;
+    if state_root.parent() != Some(root) || !state_root.starts_with(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "state root for empty-prefix cleanup resolves outside its store root",
+        ));
+    }
+
+    let mut candidates = Vec::new();
+    candidates.try_reserve_exact(limit).map_err(|error| {
+        io::Error::other(format!(
+            "cannot reserve retired empty-prefix cleanup batch: {error}"
+        ))
+    })?;
+    let entries = std::fs::read_dir(&state_root)?;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(encoded) = file_name
+            .to_str()
+            .and_then(|name| name.strip_prefix("epoch="))
+        else {
+            continue;
+        };
+        if encoded.is_empty()
+            || encoded.starts_with('0')
+            || !encoded.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            continue;
+        }
+        if !encoded
+            .parse::<u64>()
+            .is_ok_and(|epoch| epoch < before_epoch)
+        {
+            continue;
+        }
+        let directory = match std::fs::canonicalize(entry.path()) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if directory.parent() != Some(state_root.as_path()) || !directory.starts_with(root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "retired epoch directory resolves outside the state root",
+            ));
+        }
+        candidates.push(directory);
+        if candidates.len() == limit {
+            break;
+        }
+    }
+
+    let mut cleaned = 0_usize;
+    for directory in candidates {
+        if cleanup_empty_directory_tree(root, domain, &directory)? {
+            cleaned += 1;
+        }
+    }
+    Ok(cleaned)
 }
 
 fn is_internal_artifact_name(name: &std::ffi::OsStr) -> bool {

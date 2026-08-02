@@ -164,7 +164,7 @@ prometheusRule:
 | `laminardb.consoleToken.existingSecret` | Secret holding the console API bearer token (key from `secretKey`, default `token`); empty = unauthenticated | `""` |
 | `laminardb.consoleCorsAllowedOrigins` | CORS allow-list of console origins; empty = permissive legacy policy | `[]` |
 | `laminardb.state.backend` | Storage type: `in_process`, `local`, or `object_store` | `local` |
-| `laminardb.delivery` | Pipeline-wide delivery: `best_effort`, `at_least_once`, or single-node `exactly_once` (cluster currently requires `at_least_once`) | `at_least_once` |
+| `laminardb.delivery` | Pipeline-wide delivery: `best_effort`, `at_least_once`, or capability-gated `exactly_once` | `at_least_once` |
 | `laminardb.state.path` | Path for persistent state (required if backend=local) | `/var/lib/laminardb/state` |
 | `laminardb.state.url` | URL for object storage (required if backend=object_store) | `""` |
 | `laminardb.checkpoint.interval` | Checkpoint frequency | `30s` |

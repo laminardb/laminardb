@@ -15,8 +15,8 @@ use tokio::sync::Notify;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{
-    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourcePosition, SourceStart,
-    SourceTopology,
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
+    SourcePosition, SourceStart, SourceTopology,
 };
 use laminar_connectors::error::ConnectorError;
 use laminar_core::streaming;
@@ -117,6 +117,7 @@ impl SourceConnector for CatalogSourceConnector {
         Ok(SourceContract::new(
             SourceConsistency::Ephemeral,
             SourceTopology::NodeLocalIngress,
+            SourceInputMode::AppendOnly,
         ))
     }
 }

@@ -66,6 +66,51 @@ impl GraphOperator for RestoreProbe {
     }
 }
 
+struct CheckpointBudgetProbe(Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait]
+impl GraphOperator for CheckpointBudgetProbe {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
+    fn set_retractable_extremum_checkpoint_budget(&mut self, bytes: usize) {
+        self.0.store(bytes, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+}
+
+#[test]
+fn retractable_extremum_checkpoint_budget_reaches_existing_and_late_nodes() {
+    let first = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let second = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+    graph.push_test_node("first", Box::new(CheckpointBudgetProbe(Arc::clone(&first))));
+    assert_eq!(
+        first.load(std::sync::atomic::Ordering::SeqCst),
+        crate::config::DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES
+    );
+
+    graph.set_max_retractable_extremum_checkpoint_bytes(123_456);
+    assert_eq!(first.load(std::sync::atomic::Ordering::SeqCst), 123_456);
+    graph.push_test_node(
+        "second",
+        Box::new(CheckpointBudgetProbe(Arc::clone(&second))),
+    );
+    assert_eq!(second.load(std::sync::atomic::Ordering::SeqCst), 123_456);
+}
+
 struct ManagedStateAccountingProbe {
     accounting: ManagedStateAccountingSnapshot,
     samples: Arc<std::sync::atomic::AtomicUsize>,
@@ -93,6 +138,10 @@ impl GraphOperator for ManagedStateAccountingProbe {
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
         Ok(None)
+    }
+
+    fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+        Ok(())
     }
 }
 
@@ -236,6 +285,48 @@ fn whole_graph_checkpoint_serialization_enforces_its_byte_budget() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("byte budget"), "{error}");
+}
+
+#[test]
+fn whole_graph_restore_rejects_managed_state_above_the_execution_budget() {
+    let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut graph = test_graph();
+    graph.set_max_managed_state_bytes(65);
+    graph.allocate_node(GraphNode::new(
+        Arc::from("accounted"),
+        Box::new(ManagedStateAccountingProbe {
+            accounting: ManagedStateAccountingSnapshot {
+                live: 11,
+                prepared: 22,
+                retired: 33,
+            },
+            samples,
+        }),
+        0,
+    ));
+    let checkpoint = GraphCheckpoint {
+        version: GRAPH_CHECKPOINT_VERSION,
+        operators: [("accounted".to_string(), vec![1])].into_iter().collect(),
+    };
+
+    let error = graph
+        .restore_state(&checkpoint)
+        .err()
+        .expect("restore must reject the live + prepared + retired peak");
+
+    assert!(matches!(
+        &error,
+        DbError::ManagedStateBudgetExceeded {
+            accounted_bytes: 66,
+            limit_bytes: 65,
+            ..
+        }
+    ));
+    assert!(error.requires_pipeline_halt());
+    assert_eq!(
+        error.code(),
+        laminar_core::error_codes::MANAGED_STATE_BUDGET_EXCEEDED
+    );
 }
 
 #[cfg(feature = "cluster")]
@@ -780,7 +871,7 @@ fn build_boot_transition_from_loaded(
             boot_incarnation: uuid::Uuid::from_u128(1),
         },
         PipelineIdentity::empty(),
-        restore_cut,
+        restore_cut.into_transition_binding()?,
         loaded,
     )
 }
@@ -835,7 +926,11 @@ fn build_assignment_transition(
             boot_incarnation: uuid::Uuid::from_u128(1),
         },
         PipelineIdentity::empty(),
-        restore_cut,
+        restore_cut
+            .map(
+                crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut::into_transition_binding,
+            )
+            .transpose()?,
         loaded,
         false,
         None,
@@ -2331,6 +2426,31 @@ fn test_remove_query() {
 }
 
 #[test]
+fn changelog_join_fails_closed_before_graph_mutation() {
+    let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+    let mut incremental = FxHashSet::default();
+    incremental.insert("agg_a".to_string());
+    incremental.insert("agg_b".to_string());
+    graph.set_incremental_tables(incremental);
+
+    graph.add_query(
+        "joined".to_string(),
+        "SELECT a.k FROM agg_a a JOIN agg_b b ON a.k = b.k".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+
+    assert!(!graph.output_map.contains_key("joined"));
+    assert!(graph
+        .build_errors
+        .iter()
+        .any(|error| error.to_string().contains("reads an incremental changelog")));
+}
+
+#[test]
 fn rejected_control_add_removes_all_query_artifacts() {
     let ctx = laminar_sql::create_session_context();
     let mut graph = OperatorGraph::new(ctx);
@@ -2895,7 +3015,7 @@ struct SignalThenPendingOperator {
     entered: Option<tokio::sync::oneshot::Sender<(usize, Option<f64>)>>,
 }
 
-fn asof_probe_observation(inputs: &[Vec<RecordBatch>]) -> (usize, Option<f64>) {
+fn stateful_probe_observation(inputs: &[Vec<RecordBatch>]) -> (usize, Option<f64>) {
     let batches = inputs.iter().flat_map(|port| port.iter());
     let rows = batches.clone().map(RecordBatch::num_rows).sum();
     let bid = batches
@@ -2917,7 +3037,7 @@ impl GraphOperator for SignalThenPendingOperator {
         _watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
         if let Some(entered) = self.entered.take() {
-            let _ = entered.send(asof_probe_observation(inputs));
+            let _ = entered.send(stateful_probe_observation(inputs));
         }
         std::future::pending().await
     }
@@ -2940,7 +3060,7 @@ impl GraphOperator for PanicAfterInputOperator {
         inputs: &[Vec<RecordBatch>],
         _watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
-        *self.0.lock() = Some(asof_probe_observation(inputs));
+        *self.0.lock() = Some(stateful_probe_observation(inputs));
         panic!("injected panic after stateful upstream output");
     }
 
@@ -2965,82 +3085,91 @@ fn test_graph() -> OperatorGraph {
     graph.set_query_budget_ns(5_000_000_000); // 5 seconds
     graph
 }
+struct CheckpointedBidOperator {
+    latest_bid: Option<f64>,
+}
 
-fn asof_execution_test_graph() -> OperatorGraph {
+#[async_trait]
+impl GraphOperator for CheckpointedBidOperator {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let output: Vec<_> = inputs.iter().flatten().cloned().collect();
+        if let Some(bid) = output
+            .iter()
+            .filter_map(|batch| batch.column_by_name("bid"))
+            .filter_map(|column| column.as_any().downcast_ref::<Float64Array>())
+            .find_map(|column| (!column.is_empty()).then(|| column.value(column.len() - 1)))
+        {
+            self.latest_bid = Some(bid);
+        }
+        Ok(output)
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(self.latest_bid.map(|bid| OperatorCheckpoint {
+            data: bid.to_le_bytes().to_vec(),
+        }))
+    }
+
+    fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+        let bytes: [u8; 8] = checkpoint
+            .data
+            .try_into()
+            .map_err(|_| DbError::Pipeline("invalid checkpointed bid state".into()))?;
+        self.latest_bid = Some(f64::from_le_bytes(bytes));
+        Ok(())
+    }
+}
+
+fn checkpointed_bid_test_graph() -> OperatorGraph {
     let mut graph = test_graph();
-    let config = laminar_sql::translator::AsofJoinTranslatorConfig {
-        left_table: "trades".to_string(),
-        right_table: "quotes".to_string(),
-        key_column: "symbol".to_string(),
-        left_time_column: "trade_ts".to_string(),
-        right_time_column: "quote_ts".to_string(),
-        direction: laminar_sql::parser::join_parser::AsofSqlDirection::Backward,
-        tolerance: None,
-        join_type: laminar_sql::translator::AsofSqlJoinType::Left,
-    };
-    let operator =
-        crate::operator::asof_join::AsofJoinOperator::new("asof", config, None, graph.ctx.clone());
-    let asof = graph
-        .place_operator_node("asof", Box::new(operator), 2)
+    let stateful = graph
+        .place_operator_node(
+            "checkpointed_bid",
+            Box::new(CheckpointedBidOperator { latest_bid: None }),
+            1,
+        )
         .unwrap();
-    let trades = graph.ensure_source_node("trades");
-    let quotes = graph.ensure_source_node("quotes");
-    graph.add_edge(trades, asof, 0);
-    graph.add_edge(quotes, asof, 1);
-    graph.output_map.insert(Arc::from("asof"), asof);
+    let source = graph.ensure_source_node("quotes");
+    graph.add_edge(source, stateful, 0);
+    graph
+        .output_map
+        .insert(Arc::from("checkpointed_bid"), stateful);
     graph.topo_dirty = true;
     graph
 }
 
-fn append_asof_downstream_probe(graph: &mut OperatorGraph, operator: Box<dyn GraphOperator>) {
-    let asof = *graph.output_map.get("asof").expect("ASOF output node");
+fn append_stateful_downstream_probe(graph: &mut OperatorGraph, operator: Box<dyn GraphOperator>) {
+    let stateful = *graph
+        .output_map
+        .get("checkpointed_bid")
+        .expect("stateful output node");
     let probe = graph
-        .place_operator_node("asof_probe", operator, 1)
+        .place_operator_node("stateful_probe", operator, 1)
         .unwrap();
-    graph.add_edge(asof, probe, 0);
+    graph.add_edge(stateful, probe, 0);
     graph.topo_dirty = true;
 }
 
-fn asof_trade_batch() -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("symbol", DataType::Utf8, false),
-        Field::new("trade_ts", DataType::Int64, false),
-    ]));
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(vec!["AAPL"])),
-            Arc::new(Int64Array::from(vec![25])),
-        ],
-    )
-    .unwrap()
+fn bid_batch(bid: f64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "bid",
+        DataType::Float64,
+        false,
+    )]));
+    RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![bid]))]).unwrap()
 }
 
-fn asof_quote_batch(quote_ts: i64, bid: f64) -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("symbol", DataType::Utf8, false),
-        Field::new("quote_ts", DataType::Int64, false),
-        Field::new("bid", DataType::Float64, false),
-    ]));
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(vec!["AAPL"])),
-            Arc::new(Int64Array::from(vec![quote_ts])),
-            Arc::new(Float64Array::from(vec![bid])),
-        ],
-    )
-    .unwrap()
-}
-
-fn asof_sources(trades: bool, quote: Option<(i64, f64)>) -> FxHashMap<Arc<str>, Vec<RecordBatch>> {
+fn bid_sources(bid: f64) -> FxHashMap<Arc<str>, Vec<RecordBatch>> {
     let mut sources = FxHashMap::default();
-    if trades {
-        sources.insert(Arc::from("trades"), vec![asof_trade_batch()]);
-    }
-    if let Some((quote_ts, bid)) = quote {
-        sources.insert(Arc::from("quotes"), vec![asof_quote_batch(quote_ts, bid)]);
-    }
+    sources.insert(Arc::from("quotes"), vec![bid_batch(bid)]);
     sources
 }
 
@@ -3617,7 +3746,10 @@ async fn final_owner_exit_assignment_drift_after_callback_poisons_and_retains_au
 #[tokio::test]
 async fn successful_revoke_batch_consumes_handle() {
     let VnodeTransitionHarness {
-        mut graph, pending, ..
+        mut graph,
+        pending,
+        published,
+        ..
     } = vnode_transition_harness_for_assignment(
         vec![
             laminar_core::state::NodeId(2),
@@ -3627,6 +3759,7 @@ async fn successful_revoke_batch_consumes_handle() {
         Vec::new(),
     )
     .await;
+    assert!(!published.has_restore_input_reservation());
     graph.apply_pending_vnode_transition().unwrap();
     assert!(
         pending.lock().is_none(),
@@ -4118,7 +4251,7 @@ async fn cluster_graph_startup_rejects_rejected_capability_inventory() {
     impl GraphOperator for RejectedStatefulProbe {
         fn cluster_capability(&self) -> OperatorCapability {
             OperatorCapability::fixed(
-                crate::operator::capability::OperatorImplementation::IncrementalJoin,
+                crate::operator::capability::OperatorImplementation::TemporalFilter,
             )
         }
 
@@ -4153,7 +4286,10 @@ async fn cluster_graph_startup_rejects_rejected_capability_inventory() {
 
     assert!(error.to_string().contains("LDB-4007"), "{error}");
     assert!(error.to_string().contains("rejected-stateful"), "{error}");
-    assert!(error.to_string().contains("join state"), "{error}");
+    assert!(
+        error.to_string().contains("retracting buffered rows"),
+        "{error}"
+    );
 }
 
 #[cfg(feature = "cluster")]
@@ -4443,41 +4579,6 @@ async fn rehydration_delta_without_full_base_is_rejected_before_callbacks() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn outer_entry_amplification_is_rejected_before_callbacks() {
-    let partial = crate::vnode_partial::VnodePartial {
-        operators: vec![("agg".to_string(), vec![1]), ("agg".to_string(), vec![2])],
-        base: None,
-        deltas: Vec::new(),
-    };
-    let VnodeTransitionHarness {
-        mut graph,
-        registry,
-        pending,
-        published,
-    } = vnode_transition_harness(1, &[0], vec![(0, vec![encoded_vnode_partial(&partial)])]).await;
-    let applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    graph.push_test_node(
-        "agg",
-        Box::new(RecordingVnodeRestoreOperator {
-            applied: Arc::clone(&applied),
-            failure_on_vnode: None,
-        }),
-    );
-
-    let error = graph
-        .execute_cycle(&FxHashMap::default(), i64::MAX, None)
-        .await
-        .expect_err("an over-roster legacy outer archive must fail closed");
-
-    assert!(error.to_string().contains("allows at most 1"), "{error}");
-    assert!(applied.lock().is_empty());
-    assert!(registry.is_restoring(0));
-    assert!(pending_is_exact(&pending, &published));
-    assert!(graph.execution_poison_reason().is_none());
-}
-
-#[cfg(feature = "cluster")]
-#[tokio::test]
 async fn duplicate_operator_name_is_rejected_after_bounded_preflight() {
     let partial = crate::vnode_partial::VnodePartial {
         operators: vec![("agg".to_string(), vec![1]), ("agg".to_string(), vec![2])],
@@ -4588,7 +4689,7 @@ async fn missing_rehydration_operator_is_rejected_before_callbacks() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn later_vnode_structural_failure_runs_no_callbacks_and_retains_batch() {
+async fn later_outer_corruption_precedes_inner_decode_and_callbacks() {
     struct TransitionCallbackProbe(Arc<parking_lot::Mutex<Vec<&'static str>>>);
 
     #[async_trait]
@@ -4625,8 +4726,8 @@ async fn later_vnode_structural_failure_runs_no_callbacks_and_retains_batch() {
         }
     }
 
-    let partial = crate::vnode_partial::VnodePartial {
-        operators: vec![("agg".to_string(), vec![1])],
+    let placeholder = crate::vnode_partial::VnodePartial {
+        operators: Vec::new(),
         base: None,
         deltas: Vec::new(),
     };
@@ -4634,7 +4735,7 @@ async fn later_vnode_structural_failure_runs_no_callbacks_and_retains_batch() {
         mut graph,
         registry,
         pending,
-        published,
+        ..
     } = vnode_transition_harness_for_assignment(
         vec![
             laminar_core::state::NodeId(1),
@@ -4644,15 +4745,66 @@ async fn later_vnode_structural_failure_runs_no_callbacks_and_retains_batch() {
         &[0, 1],
         vec![
             (1, vec![bytes::Bytes::from_static(b"not-rkyv")]),
-            (0, vec![encoded_vnode_partial(&partial)]),
+            (0, vec![encoded_vnode_partial(&placeholder)]),
         ],
     )
     .await;
+
+    graph.register_source_schema("trades".to_string(), test_schema());
+    graph.add_query(
+        "agg".to_string(),
+        "SELECT SUM(price) AS total FROM trades".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    let aggregate_node = graph.output_map["agg"];
+    let mut graph = graph
+        .initialize_managed_state()
+        .await
+        .expect("aggregate must initialize before restore preflight");
+    let mut aggregate_capture = graph.nodes[aggregate_node]
+        .operator
+        .checkpoint_by_vnode(&[0], 3)
+        .expect("empty aggregate capture must succeed")
+        .expect("managed aggregate must emit an explicit FULL");
+    let crate::checkpoint_coordinator::StagedSlice::Bytes(aggregate_full) = aggregate_capture
+        .remove(&0)
+        .expect("global aggregate must capture vnode zero")
+    else {
+        panic!("first aggregate capture must be a FULL image");
+    };
     let callbacks = Arc::new(parking_lot::Mutex::new(Vec::new()));
     graph.push_test_node(
-        "agg",
+        "probe",
         Box::new(TransitionCallbackProbe(Arc::clone(&callbacks))),
     );
+    let valid_first = crate::vnode_partial::VnodePartial {
+        operators: vec![
+            ("agg".to_string(), aggregate_full.to_vec()),
+            ("probe".to_string(), vec![1]),
+        ],
+        base: None,
+        deltas: Vec::new(),
+    };
+    let replacement = Arc::new(
+        build_boot_transition(
+            &[
+                laminar_core::state::NodeId(1),
+                laminar_core::state::NodeId(1),
+                laminar_core::state::NodeId(2),
+            ],
+            vec![
+                (0, vec![encoded_vnode_partial(&valid_first)]),
+                (1, vec![bytes::Bytes::from_static(b"not-rkyv")]),
+            ],
+        )
+        .expect("late-corruption transition fixture must stage"),
+    );
+    *pending.lock() = Some(Arc::clone(&replacement));
+    crate::aggregate_state::reset_owned_restore_decode_count_for_test();
     let error = graph
         .execute_cycle(&FxHashMap::default(), i64::MAX, None)
         .await
@@ -4660,9 +4812,14 @@ async fn later_vnode_structural_failure_runs_no_callbacks_and_retains_batch() {
     let message = error.to_string();
     assert!(message.contains("vnode 1"), "{message}");
     assert!(message.contains("corrupt"), "{message}");
+    assert_eq!(
+        crate::aggregate_state::owned_restore_decode_count_for_test(),
+        0,
+        "late outer corruption must prevent the earlier aggregate's owned inner decode"
+    );
     assert!(callbacks.lock().is_empty(), "preflight ran a callback");
     assert_eq!(registry.restoring_vnodes(), vec![0, 1]);
-    assert!(pending_is_exact(&pending, &published));
+    assert!(pending_is_exact(&pending, &replacement));
     assert!(graph.execution_poison_reason().is_none());
     assert_eq!(graph.last_execution_assignment_version(), None);
 }
@@ -4887,6 +5044,7 @@ async fn prepared_managed_state_publishes_with_exact_graph_authority() {
                 max_lineage_bytes: payload_bytes,
                 max_lineage_artifacts: 1,
             },
+            laminar_core::state::SealedPartialReadEnvelope::new(2, 0),
         )
         .unwrap(),
     );
@@ -4948,6 +5106,11 @@ async fn prepared_managed_state_publishes_with_exact_graph_authority() {
         restore_budget.reserved_for_test(),
         (usage.declared_lineage_bytes(), 1),
         "the test observer still owns the published transition"
+    );
+    assert_eq!(
+        restore_budget.reserved_inner_alignment_copy_bytes_for_test(),
+        0,
+        "inner alignment copies must retire after synchronous preparation"
     );
     drop(published);
     assert_eq!(restore_budget.reserved_for_test(), (0, 0));
@@ -5456,7 +5619,7 @@ async fn transition_authority_rejects_shuffle_endpoints_for_another_node_before_
             boot_incarnation: incarnation,
         },
         PipelineIdentity::empty(),
-        cut,
+        cut.into_transition_binding().unwrap(),
         test_loaded_vnode_chains(attempt, vec![(0, vec![encoded_vnode_partial(&partial)])]),
     )
     .unwrap();
@@ -6335,6 +6498,140 @@ async fn test_og_aggregate_incremental() {
 }
 
 #[tokio::test]
+async fn named_bounded_join_feeds_keyed_aggregate_at_safe_frontier() {
+    use arrow::array::TimestampMillisecondArray;
+    use arrow::datatypes::TimeUnit;
+    use laminar_sql::parser::join_parser::JoinType;
+    use laminar_sql::translator::{JoinOperatorConfig, StreamJoinConfig};
+    use std::time::Duration;
+
+    let mut graph = test_graph();
+    let orders_schema = Arc::new(Schema::new(vec![
+        Field::new("account", DataType::Utf8, false),
+        Field::new("amount", DataType::Int64, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+    ]));
+    let receipts_schema = Arc::new(Schema::new(vec![
+        Field::new("account", DataType::Utf8, false),
+        Field::new("receipt_id", DataType::Int64, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+    ]));
+    graph.register_source_schema("orders".to_string(), Arc::clone(&orders_schema));
+    graph.register_source_schema("receipts".to_string(), Arc::clone(&receipts_schema));
+
+    let mut join_config = StreamJoinConfig::new(
+        JoinType::Inner,
+        vec!["account".to_string()],
+        vec!["account".to_string()],
+        Duration::from_secs(1),
+    );
+    join_config.left_table = "orders".to_string();
+    join_config.right_table = "receipts".to_string();
+    join_config.left_time_column = "ts".to_string();
+    join_config.right_time_column = "ts".to_string();
+    graph.add_query(
+        "matched".to_string(),
+        "SELECT o.account AS account, o.amount AS amount FROM orders o JOIN receipts r \
+         ON o.account = r.account \
+         AND r.ts BETWEEN o.ts AND o.ts + INTERVAL '1' SECOND"
+            .to_string(),
+        None,
+        None,
+        None,
+        Some(vec![JoinOperatorConfig::StreamStream(join_config)]),
+        false,
+    );
+    graph.add_query(
+        "totals".to_string(),
+        "SELECT account, SUM(amount) AS total, COUNT(*) AS match_count \
+         FROM matched GROUP BY account"
+            .to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    graph.register_intermediate_schema(
+        "matched",
+        &Arc::new(Schema::new(vec![
+            Field::new("account", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+        ])),
+    );
+    graph.take_build_errors().unwrap();
+
+    let orders = RecordBatch::try_new(
+        orders_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["acct-a", "acct-b"])),
+            Arc::new(Int64Array::from(vec![10, 999])),
+            Arc::new(TimestampMillisecondArray::from(vec![5_000, 6_000])),
+        ],
+    )
+    .unwrap();
+    let receipts = RecordBatch::try_new(
+        receipts_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["acct-a"])),
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(TimestampMillisecondArray::from(vec![5_500])),
+        ],
+    )
+    .unwrap();
+    let mut sources = FxHashMap::default();
+    sources.insert(Arc::from("orders"), vec![orders]);
+    sources.insert(Arc::from("receipts"), vec![receipts]);
+    let mut source_watermarks = FxHashMap::default();
+    source_watermarks.insert(Arc::from("orders"), 4_000);
+    source_watermarks.insert(Arc::from("receipts"), 4_500);
+
+    let results = graph
+        .execute_cycle(&sources, 4_500, Some(&source_watermarks))
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&results, "matched"), 1);
+    assert_eq!(total_rows(&results, "totals"), 1);
+
+    let totals = &results.get("totals").unwrap()[0];
+    let accounts = totals
+        .column_by_name("account")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let sums = totals
+        .column_by_name("total")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = totals
+        .column_by_name("match_count")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(accounts.value(0), "acct-a");
+    assert_eq!(sums.value(0), 10);
+    assert_eq!(counts.value(0), 1);
+
+    let joined = *graph.output_map.get("matched").unwrap();
+    let aggregate = *graph.output_map.get("totals").unwrap();
+    let safe_frontier = 4_000_i64.min(4_500 - 1_000);
+    assert_eq!(graph.output_watermarks[joined], safe_frontier);
+    assert_eq!(graph.output_watermarks[aggregate], safe_frontier);
+}
+
+#[tokio::test]
 async fn test_og_cascading() {
     // Query A feeds Query B through intermediate LiveSourceProvider
     let mut graph = test_graph();
@@ -6807,7 +7104,7 @@ async fn cancellation_while_waiting_for_rotation_does_not_poison_graph() {
 
 #[tokio::test]
 async fn cancelled_stateful_cycle_poison_requires_fresh_graph_restore() {
-    let mut graph = asof_execution_test_graph();
+    let mut graph = checkpointed_bid_test_graph();
     #[cfg(feature = "cluster")]
     let installed = set_test_installed_vnode_state(
         &mut graph,
@@ -6815,23 +7112,23 @@ async fn cancelled_stateful_cycle_poison_requires_fresh_graph_restore() {
         laminar_core::checkpoint::PipelineIdentity::empty(),
     );
     graph
-        .execute_cycle(&asof_sources(false, Some((10, 10.0))), i64::MIN, None)
+        .execute_cycle(&bid_sources(10.0), i64::MIN, None)
         .await
         .unwrap();
     let checkpoint = graph
         .snapshot_state()
         .unwrap()
-        .expect("ASOF right state should be checkpointed");
+        .expect("stateful bid should be checkpointed");
     let checkpoint = OperatorGraph::serialize_checkpoint_bounded(&checkpoint, u64::MAX).unwrap();
 
     let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
-    append_asof_downstream_probe(
+    append_stateful_downstream_probe(
         &mut graph,
         Box::new(SignalThenPendingOperator {
             entered: Some(entered_tx),
         }),
     );
-    let replay = asof_sources(true, Some((20, 20.0)));
+    let replay = bid_sources(20.0);
     let mut cycle = Box::pin(graph.execute_cycle(&replay, i64::MIN, None));
     let observation = tokio::select! {
         entered = &mut entered_rx => entered.expect("pending probe dropped its signal"),
@@ -6843,7 +7140,7 @@ async fn cancelled_stateful_cycle_poison_requires_fresh_graph_restore() {
     assert_eq!(
         observation,
         (1, Some(20.0)),
-        "the cancelled pass must route the newly admitted ASOF quote"
+        "the cancelled pass must route the newly admitted stateful output"
     );
     drop(cycle);
 
@@ -6877,7 +7174,7 @@ async fn cancelled_stateful_cycle_poison_requires_fresh_graph_restore() {
         .expect_err("cancelled graph generation entered checkpoint drain");
     assert_graph_execution_poison(&drain_error);
 
-    let (mut restored, restored_operators) = asof_execution_test_graph()
+    let (mut restored, restored_operators) = checkpointed_bid_test_graph()
         .restore_from_bytes(&checkpoint)
         .unwrap();
     assert_eq!(restored_operators, 1);
@@ -6885,11 +7182,13 @@ async fn cancelled_stateful_cycle_poison_requires_fresh_graph_restore() {
         .execute_cycle(&replay, i64::MIN, None)
         .await
         .unwrap();
-    let batches = output.get("asof").expect("replayed ASOF output");
+    let batches = output
+        .get("checkpointed_bid")
+        .expect("replayed stateful output");
     assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
     let bid = batches[0]
         .column_by_name("bid")
-        .expect("ASOF bid")
+        .expect("bid column")
         .as_any()
         .downcast_ref::<Float64Array>()
         .expect("Float64 bid");
@@ -6904,7 +7203,7 @@ async fn cancelled_stateful_cycle_poison_requires_fresh_graph_restore() {
 async fn caught_stateful_cycle_panic_poison_prevents_graph_reuse() {
     use futures::FutureExt as _;
 
-    let mut graph = asof_execution_test_graph();
+    let mut graph = checkpointed_bid_test_graph();
     #[cfg(feature = "cluster")]
     let installed = set_test_installed_vnode_state(
         &mut graph,
@@ -6912,15 +7211,15 @@ async fn caught_stateful_cycle_panic_poison_prevents_graph_reuse() {
         laminar_core::checkpoint::PipelineIdentity::empty(),
     );
     graph
-        .execute_cycle(&asof_sources(false, Some((10, 10.0))), i64::MIN, None)
+        .execute_cycle(&bid_sources(10.0), i64::MIN, None)
         .await
         .unwrap();
     let observation = Arc::new(parking_lot::Mutex::new(None));
-    append_asof_downstream_probe(
+    append_stateful_downstream_probe(
         &mut graph,
         Box::new(PanicAfterInputOperator(Arc::clone(&observation))),
     );
-    let replay = asof_sources(true, Some((20, 20.0)));
+    let replay = bid_sources(20.0);
 
     let panic = std::panic::AssertUnwindSafe(graph.execute_cycle(&replay, i64::MIN, None))
         .catch_unwind()
@@ -7064,79 +7363,6 @@ async fn test_og_reverse_order_cascading() {
     let r = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
     assert_eq!(total_rows(&r, "q1"), 2); // AAPL + GOOG
     assert_eq!(total_rows(&r, "q2"), 1); // Only GOOG (price=2800 > 200)
-}
-
-#[tokio::test]
-async fn test_temporal_probe_through_graph() {
-    let ctx = laminar_sql::create_session_context();
-    laminar_sql::register_streaming_functions(&ctx);
-    let mut graph = OperatorGraph::new(ctx);
-
-    let trades_schema = Arc::new(Schema::new(vec![
-        Field::new("symbol", DataType::Utf8, false),
-        Field::new("ts", DataType::Int64, false),
-        Field::new("price", DataType::Float64, false),
-    ]));
-    let market_schema = Arc::new(Schema::new(vec![
-        Field::new("symbol", DataType::Utf8, false),
-        Field::new("mts", DataType::Int64, false),
-        Field::new("mprice", DataType::Float64, false),
-    ]));
-
-    graph.register_source_schema("trades".to_string(), trades_schema.clone());
-    graph.register_source_schema("market_data".to_string(), market_schema);
-
-    graph.add_query(
-        "probed".to_string(),
-        "SELECT t.symbol, p.offset_ms, mprice \
-         FROM trades t \
-         TEMPORAL PROBE JOIN market_data m ON (symbol) \
-         TIMESTAMPS (ts, mts) LIST (0s, 5s) AS p"
-            .to_string(),
-        None,
-        None,
-        None,
-        None,
-        false,
-    );
-
-    // Cycle 1: inject both sides, watermark=102k (only offset=0 resolves)
-    let trades = RecordBatch::try_new(
-        trades_schema.clone(),
-        vec![
-            Arc::new(StringArray::from(vec!["AAPL"])),
-            Arc::new(Int64Array::from(vec![100_000])),
-            Arc::new(Float64Array::from(vec![152.5])),
-        ],
-    )
-    .unwrap();
-    let market = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("symbol", DataType::Utf8, false),
-            Field::new("mts", DataType::Int64, false),
-            Field::new("mprice", DataType::Float64, false),
-        ])),
-        vec![
-            Arc::new(StringArray::from(vec!["AAPL", "AAPL"])),
-            Arc::new(Int64Array::from(vec![100_000, 105_000])),
-            Arc::new(Float64Array::from(vec![150.0, 155.0])),
-        ],
-    )
-    .unwrap();
-
-    let mut sources = FxHashMap::default();
-    sources.insert(Arc::from("trades"), vec![trades]);
-    sources.insert(Arc::from("market_data"), vec![market]);
-
-    let r1 = graph.execute_cycle(&sources, 102_000, None).await.unwrap();
-    let rows1 = total_rows(&r1, "probed");
-    assert_eq!(rows1, 1, "only offset=0 should resolve at watermark=102k");
-
-    // Cycle 2: no new data, advance watermark past offset=5000 (probe_ts=105000)
-    let empty = FxHashMap::default();
-    let r2 = graph.execute_cycle(&empty, 110_000, None).await.unwrap();
-    let rows2 = total_rows(&r2, "probed");
-    assert_eq!(rows2, 1, "offset=5000 should resolve at watermark=110k");
 }
 
 #[test]
@@ -7717,6 +7943,204 @@ fn managed_state_accounting_is_sampled_at_cold_cadence_and_skips_removed_nodes()
                 .get(),
             expected,
             "transient peak must reset after one sample interval"
+        );
+    }
+}
+
+#[tokio::test]
+async fn managed_state_initialization_rejects_a_budget_below_the_empty_topology() {
+    let mut graph = test_graph();
+    graph.register_source_schema("trades".to_string(), test_schema());
+    graph.add_query(
+        "agg".to_string(),
+        "SELECT SUM(price) AS total FROM trades".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    graph.set_max_managed_state_bytes(1);
+
+    let error = graph
+        .initialize_managed_state()
+        .await
+        .err()
+        .expect("the empty managed topology must still fit its execution budget");
+
+    assert!(matches!(
+        &error,
+        DbError::ManagedStateBudgetExceeded {
+            context,
+            accounted_bytes,
+            limit_bytes: 1,
+        } if context == "managed-state initialization" && *accounted_bytes > 1
+    ));
+}
+
+#[tokio::test]
+async fn aggregate_record_growth_is_rejected_before_output_routing() {
+    let mut graph = test_graph();
+    graph.register_source_schema("trades".to_string(), test_schema());
+    graph.add_query(
+        "agg".to_string(),
+        "SELECT SUM(price) AS total FROM trades".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    let aggregate = graph.output_map["agg"];
+    let downstream = graph
+        .place_operator_node("after_budget", Box::new(SourcePassthrough), 1)
+        .unwrap();
+    graph.add_edge(aggregate, downstream, 0);
+    graph.topo_dirty = true;
+    let mut graph = graph
+        .initialize_managed_state()
+        .await
+        .expect("aggregate must initialize within the unconstrained test budget");
+    let baseline = graph.managed_state_accounted_bytes();
+    assert!(baseline > 0);
+    graph.set_max_managed_state_bytes(baseline);
+
+    let mut source = FxHashMap::default();
+    source.insert(Arc::from("trades"), vec![test_batch()]);
+    let error = graph
+        .execute_cycle(&source, i64::MAX, None)
+        .await
+        .expect_err("record growth above the baseline must halt the pipeline");
+
+    assert!(matches!(
+        &error,
+        DbError::ManagedStateBudgetExceeded {
+            context,
+            accounted_bytes,
+            limit_bytes,
+        } if context == "operator 'agg' record processing"
+            && *accounted_bytes > baseline
+            && *limit_bytes == baseline
+    ));
+    assert!(error.requires_pipeline_halt());
+    assert!(
+        graph.input_bufs[downstream][0].is_empty(),
+        "the rejected aggregate output crossed the downstream routing boundary"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn managed_aggregate_lifecycle_metrics_capture_transition_peaks_and_clear_on_removal() {
+    use laminar_core::state::NodeId;
+
+    let placeholder = crate::vnode_partial::VnodePartial {
+        operators: Vec::new(),
+        base: None,
+        deltas: Vec::new(),
+    };
+    let VnodeTransitionHarness {
+        mut graph, pending, ..
+    } = vnode_transition_harness(
+        1,
+        &[0],
+        vec![(0, vec![encoded_vnode_partial(&placeholder)])],
+    )
+    .await;
+    let registry = prometheus::Registry::new();
+    let prom = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+    graph.set_metrics(Arc::clone(&prom));
+    graph.register_source_schema("trades".to_string(), test_schema());
+    graph.add_query(
+        "agg".to_string(),
+        "SELECT SUM(price) AS total FROM trades".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    let mut graph = graph
+        .initialize_managed_state()
+        .await
+        .expect("real aggregate must initialize before boot restore");
+
+    let aggregate_node = graph.output_map["agg"];
+    let mut captured = graph.nodes[aggregate_node]
+        .operator
+        .checkpoint_by_vnode(&[0], 1)
+        .expect("empty aggregate capture must succeed")
+        .expect("managed aggregate must emit an explicit empty FULL");
+    let crate::checkpoint_coordinator::StagedSlice::Bytes(aggregate_full) =
+        captured.remove(&0).expect("vnode zero must be captured")
+    else {
+        panic!("the first aggregate capture must be a FULL image");
+    };
+    let partial = crate::vnode_partial::VnodePartial {
+        operators: vec![("agg".to_string(), aggregate_full.to_vec())],
+        base: None,
+        deltas: Vec::new(),
+    };
+    let replacement = Arc::new(
+        build_boot_transition(
+            &[NodeId(1)],
+            vec![(0, vec![encoded_vnode_partial(&partial)])],
+        )
+        .expect("captured aggregate FULL must form a valid boot transition"),
+    );
+    let published = Arc::clone(&replacement);
+    *pending.lock() = Some(replacement);
+
+    let live_before = graph.managed_state_accounted_bytes();
+    graph.set_max_managed_state_bytes(live_before);
+    let error = graph
+        .apply_pending_vnode_transition()
+        .expect_err("the live plus prepared transition peak must exceed the live-only budget");
+    assert!(matches!(
+        &error,
+        DbError::ManagedStateBudgetExceeded {
+            context,
+            accounted_bytes,
+            limit_bytes,
+        } if context == "vnode transition preparation"
+            && *accounted_bytes > live_before
+            && *limit_bytes == live_before
+    ));
+    assert!(pending_is_exact(&pending, &published));
+    assert_eq!(graph.managed_state_accounted_bytes(), live_before);
+    let aborted = graph.nodes[aggregate_node]
+        .operator
+        .managed_state_accounting()
+        .expect("managed aggregate must retain live accounting after abort");
+    assert_eq!(aborted.prepared, 0);
+    assert_eq!(aborted.retired, 0);
+    assert!(graph.execution_poison_reason().is_none());
+
+    graph.set_max_managed_state_bytes(usize::MAX);
+    graph
+        .apply_pending_vnode_transition()
+        .expect("real aggregate boot transition must publish");
+    for _ in 0..STATS_SAMPLE_INTERVAL {
+        graph.sample_buffer_stats();
+    }
+
+    for phase in ["live", "prepared", "retired"] {
+        assert!(
+            prom.managed_state_accounted_bytes
+                .with_label_values(&["agg", phase])
+                .get()
+                > 0,
+            "real aggregate transition did not publish its {phase} ownership"
+        );
+    }
+
+    graph.remove_query("agg");
+    for phase in ["live", "prepared", "retired"] {
+        assert!(
+            prom.managed_state_accounted_bytes
+                .remove_label_values(&["agg", phase])
+                .is_err(),
+            "removed aggregate retained its {phase} metric series"
         );
     }
 }

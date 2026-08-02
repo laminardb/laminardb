@@ -3,9 +3,9 @@ use datafusion_common::ScalarValue;
 use laminar_core::state::KeyGroupCount;
 
 use super::accounting::{
-    logical_collection_element_usage, owned_row_payload_usage,
-    retained_changelog_vector_element_usage, topology_element_usage, vnode_inline_usage,
-    AggregateStateUsage,
+    logical_collection_element_usage, logical_collection_spare_capacity_usage,
+    owned_row_payload_usage, retained_changelog_vector_element_usage, topology_element_usage,
+    vnode_inline_usage, AggregateStateUsage,
 };
 use super::GroupEntry;
 use crate::error::DbError;
@@ -54,6 +54,36 @@ impl Default for AggregateVnodeState {
 }
 
 impl AggregateVnodeState {
+    fn hash_set_spare_usage(values: &AHashSet<arrow::row::OwnedRow>) -> AggregateStateUsage {
+        logical_collection_spare_capacity_usage::<arrow::row::OwnedRow>(
+            values.capacity(),
+            values.len(),
+        )
+    }
+
+    pub(super) fn collection_spare_usage(&self) -> AggregateStateUsage {
+        logical_collection_spare_capacity_usage::<(arrow::row::OwnedRow, GroupEntry)>(
+            self.groups.capacity(),
+            self.groups.len(),
+        )
+        .saturating_add(logical_collection_spare_capacity_usage::<(
+            arrow::row::OwnedRow,
+            Vec<ScalarValue>,
+        )>(
+            self.last_emitted.capacity(), self.last_emitted.len()
+        ))
+        .saturating_add(Self::hash_set_spare_usage(&self.emit_dirty_keys))
+        .saturating_add(Self::hash_set_spare_usage(&self.checkpoint_dirty_keys))
+        .saturating_add(Self::hash_set_spare_usage(&self.last_emitted_dirty_keys))
+    }
+
+    pub(super) fn reconcile_collection_spare_usage(&mut self, previous: AggregateStateUsage) {
+        self.usage = self
+            .usage
+            .saturating_sub(previous)
+            .saturating_add(self.collection_spare_usage());
+    }
+
     #[cfg(feature = "cluster")]
     pub(super) fn try_from_recovered(
         groups: AHashMap<arrow::row::OwnedRow, GroupEntry>,
@@ -111,7 +141,6 @@ impl AggregateVnodeState {
         self.usage = self.usage.saturating_add(usage);
     }
 
-    #[cfg(feature = "cluster")]
     pub(super) fn reconcile_accumulator_usage(
         &mut self,
         previous: AggregateStateUsage,
@@ -121,28 +150,35 @@ impl AggregateVnodeState {
     }
 
     pub(super) fn insert_emit_dirty_key(&mut self, key: arrow::row::OwnedRow) {
+        let previous_spare = self.collection_spare_usage();
         let usage = Self::dirty_key_usage(&key);
         if self.emit_dirty_keys.insert(key) {
             self.usage = self.usage.saturating_add(usage);
         }
+        self.reconcile_collection_spare_usage(previous_spare);
     }
 
     pub(super) fn insert_checkpoint_dirty_key(&mut self, key: arrow::row::OwnedRow) {
+        let previous_spare = self.collection_spare_usage();
         let usage = Self::dirty_key_usage(&key);
         if self.checkpoint_dirty_keys.insert(key) {
             self.usage = self.usage.saturating_add(usage);
         }
+        self.reconcile_collection_spare_usage(previous_spare);
     }
 
     pub(super) fn insert_last_emitted_dirty_key(&mut self, key: arrow::row::OwnedRow) {
+        let previous_spare = self.collection_spare_usage();
         let usage = Self::dirty_key_usage(&key);
         if self.last_emitted_dirty_keys.insert(key) {
             self.usage = self.usage.saturating_add(usage);
         }
+        self.reconcile_collection_spare_usage(previous_spare);
     }
 
     #[cfg(feature = "cluster")]
     pub(super) fn clear_checkpoint_dirty_keys(&mut self) {
+        let previous_spare = self.collection_spare_usage();
         let released = self
             .checkpoint_dirty_keys
             .iter()
@@ -151,10 +187,12 @@ impl AggregateVnodeState {
             });
         self.checkpoint_dirty_keys.clear();
         self.usage = self.usage.saturating_sub(released);
+        self.reconcile_collection_spare_usage(previous_spare);
     }
 
     #[cfg(feature = "cluster")]
     pub(super) fn clear_last_emitted_dirty_keys(&mut self) {
+        let previous_spare = self.collection_spare_usage();
         let released = self
             .last_emitted_dirty_keys
             .iter()
@@ -163,6 +201,7 @@ impl AggregateVnodeState {
             });
         self.last_emitted_dirty_keys.clear();
         self.usage = self.usage.saturating_sub(released);
+        self.reconcile_collection_spare_usage(previous_spare);
     }
 
     pub(super) fn replace_emit_dirty_keys_after_attempt(
@@ -170,6 +209,7 @@ impl AggregateVnodeState {
         mut dirty: AHashSet<arrow::row::OwnedRow>,
         emission_succeeded: bool,
     ) {
+        let previous_spare = Self::hash_set_spare_usage(&dirty);
         if emission_succeeded {
             let released = dirty
                 .iter()
@@ -179,6 +219,11 @@ impl AggregateVnodeState {
             dirty.clear();
             self.usage = self.usage.saturating_sub(released);
         }
+        let current_spare = Self::hash_set_spare_usage(&dirty);
+        self.usage = self
+            .usage
+            .saturating_sub(previous_spare)
+            .saturating_add(current_spare);
         self.emit_dirty_keys = dirty;
     }
 
@@ -187,6 +232,7 @@ impl AggregateVnodeState {
         key: arrow::row::OwnedRow,
         values: Vec<ScalarValue>,
     ) {
+        let previous_spare = self.collection_spare_usage();
         let new_usage = Self::emitted_usage(&key, &values);
         if let Some((resident_key, previous_values)) = self.last_emitted.get_key_value(&key) {
             let previous_usage = Self::emitted_usage(resident_key, previous_values);
@@ -198,10 +244,12 @@ impl AggregateVnodeState {
             self.usage = self.usage.saturating_add(new_usage);
         }
         self.last_emitted.insert(key, values);
+        self.reconcile_collection_spare_usage(previous_spare);
     }
 
     fn recompute_usage(&self) -> AggregateStateUsage {
-        let mut usage = vnode_inline_usage::<AggregateVnodeState>(1);
+        let mut usage = vnode_inline_usage::<AggregateVnodeState>(1)
+            .saturating_add(self.collection_spare_usage());
         for (key, entry) in &self.groups {
             usage = usage.saturating_add(Self::group_usage(key, entry));
         }

@@ -33,7 +33,7 @@ testConnection:
 laminardb:
   # -- Server mode: "single" (standalone) or "cluster" (multi-node clustering)
   mode: single
-  # -- Pipeline-wide delivery contract. Cluster mode currently requires at_least_once.
+  # -- Pipeline-wide delivery contract. Cluster exactly-once is connector-capability gated.
   delivery: at_least_once
   # -- Log level: trace, debug, info, warn, error
   logLevel: info

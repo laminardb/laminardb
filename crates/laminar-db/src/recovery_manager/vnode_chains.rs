@@ -8,18 +8,21 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use laminar_core::checkpoint::VnodeRestoreLimitProfile;
 use laminar_core::state::{
-    CheckpointAttempt, CheckpointSealInventory, SealedVnodePartial, StateBackend,
-    VnodePartialLineage,
+    CheckpointAttempt, CheckpointSealInventory, SealedPartialReadEnvelope, SealedVnodePartial,
+    StateBackend, VnodePartialLineage,
 };
 use tracing::{debug, info};
 
 use crate::error::DbError;
 use crate::vnode_restore_input::{
-    restore_cancelled, restore_timed_out, VnodeRestoreInputBudget, VnodeRestoreInputReservation,
-    VnodeRestoreInputUsage, MAX_CONCURRENT_VNODE_BODY_READS,
+    normalize_restore_archive_alignment, restore_cancelled, restore_timed_out,
+    VnodeRestoreInputBudget, VnodeRestoreInputReservation, VnodeRestoreInputUsage,
+    MAX_CONCURRENT_VNODE_BODY_READS,
 };
 
+#[cfg(test)]
 type SealInventoryLoad = Result<Arc<CheckpointSealInventory>, String>;
+#[cfg(test)]
 type SealInventoryCell = tokio::sync::OnceCell<Arc<CheckpointSealInventory>>;
 
 /// Vnode recovery chains loaded from one exact sealed attempt.
@@ -54,8 +57,9 @@ impl LoadedVnodeChains {
     #[cfg(test)]
     pub(crate) fn from_chains_for_test(
         attempt: Option<CheckpointAttempt>,
-        chains: HashMap<u32, Vec<Bytes>>,
+        mut chains: HashMap<u32, Vec<Bytes>>,
     ) -> Self {
+        normalize_test_chain_alignment(&mut chains);
         let (bytes, artifacts) = chains.values().flat_map(|chain| chain.iter()).fold(
             (0_u64, 0_u64),
             |(bytes, artifacts), body| {
@@ -80,9 +84,10 @@ impl LoadedVnodeChains {
     #[cfg(test)]
     pub(crate) fn from_parts_with_usage_for_test(
         attempt: Option<CheckpointAttempt>,
-        chains: HashMap<u32, Vec<Bytes>>,
+        mut chains: HashMap<u32, Vec<Bytes>>,
         usage: VnodeRestoreInputUsage,
     ) -> Self {
+        normalize_test_chain_alignment(&mut chains);
         let reservation = VnodeRestoreInputReservation::for_test(usage);
         Self {
             attempt,
@@ -95,10 +100,11 @@ impl LoadedVnodeChains {
     #[cfg(test)]
     pub(crate) fn from_parts_with_budget_for_test(
         attempt: Option<CheckpointAttempt>,
-        chains: HashMap<u32, Vec<Bytes>>,
+        mut chains: HashMap<u32, Vec<Bytes>>,
         usage: VnodeRestoreInputUsage,
         budget: &Arc<VnodeRestoreInputBudget>,
     ) -> Result<Self, DbError> {
+        normalize_test_chain_alignment(&mut chains);
         let reservation = budget.try_reserve(usage)?;
         Ok(Self {
             attempt,
@@ -106,6 +112,13 @@ impl LoadedVnodeChains {
             usage,
             reservation: Some(reservation),
         })
+    }
+}
+
+#[cfg(test)]
+fn normalize_test_chain_alignment(chains: &mut HashMap<u32, Vec<Bytes>>) {
+    for body in chains.values_mut().flat_map(|chain| chain.iter_mut()) {
+        *body = normalize_restore_archive_alignment(std::mem::take(body));
     }
 }
 
@@ -138,7 +151,13 @@ struct ChainInputUsage {
 /// Applying the bytes is the caller's responsibility.
 pub(crate) struct SealedVnodeChainReader<'a> {
     backend: &'a dyn StateBackend,
+    head_inventory: Option<Arc<CheckpointSealInventory>>,
+    ancestor_attestations:
+        Option<Arc<crate::vnode_restore_lineage::ValidatedVnodeAncestorAttestations>>,
+    #[cfg(test)]
     seal_cache: tokio::sync::Mutex<HashMap<CheckpointAttempt, Arc<SealInventoryCell>>>,
+    #[cfg(test)]
+    allow_unvalidated_inventory_fetch: bool,
     validated_head_attempt: Option<CheckpointAttempt>,
     max_partial_bytes: u64,
     max_artifacts_per_vnode_chain: usize,
@@ -154,14 +173,40 @@ impl<'a> SealedVnodeChainReader<'a> {
     pub(crate) fn new(backend: &'a dyn StateBackend) -> Self {
         Self {
             backend,
+            head_inventory: None,
+            ancestor_attestations: None,
+            #[cfg(test)]
             seal_cache: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            allow_unvalidated_inventory_fetch: true,
             validated_head_attempt: None,
             max_partial_bytes: u64::MAX,
             max_artifacts_per_vnode_chain: usize::MAX,
-            restore_profile: VnodeRestoreLimitProfile::GlobalSingletonCompatibility,
-            committed_full_cut_lineage_payload_bytes: u64::MAX,
-            committed_full_cut_lineage_artifacts: u64::MAX,
+            restore_profile: VnodeRestoreLimitProfile::ManagedVnode,
+            // Large enough to be unrestricted for fixtures while still admitting every built-in
+            // read-envelope quote without overflowing its checked aggregate arithmetic.
+            committed_full_cut_lineage_payload_bytes: 1_u64 << 50,
+            committed_full_cut_lineage_artifacts: u64::from(u32::MAX),
         }
+    }
+
+    fn backend_read_envelope(&self) -> Result<SealedPartialReadEnvelope, DbError> {
+        let envelope = self
+            .backend
+            .sealed_partial_read_envelope()
+            .ok_or_else(|| {
+                DbError::Checkpoint(
+                    "[LDB-6050] checkpoint backend cannot read checkpoint-sealed vnode partials without a declared logical resource envelope"
+                        .into(),
+                )
+            })?;
+        if envelope.payload_multiplier() < 2 {
+            return Err(DbError::Checkpoint(
+                "[LDB-6050] checkpoint backend declared an invalid sealed-partial read envelope"
+                    .into(),
+            ));
+        }
+        Ok(envelope)
     }
 
     /// Create a reader pinned to the exact seal already validated with the committed source cut.
@@ -186,6 +231,7 @@ impl<'a> SealedVnodeChainReader<'a> {
             contract.limits.profile,
             contract.exact_cluster_lineage_payload_bytes,
             contract.exact_cluster_lineage_artifacts,
+            false,
         )
     }
 
@@ -224,6 +270,7 @@ impl<'a> SealedVnodeChainReader<'a> {
             head.contract().limits.profile,
             test_full_cut_lineage_payload_bytes,
             test_full_cut_lineage_artifacts,
+            true,
         )
     }
 
@@ -236,6 +283,7 @@ impl<'a> SealedVnodeChainReader<'a> {
         restore_profile: VnodeRestoreLimitProfile,
         committed_full_cut_lineage_payload_bytes: u64,
         committed_full_cut_lineage_artifacts: u64,
+        allow_incomplete_proof_for_test: bool,
     ) -> Result<Self, DbError> {
         if max_partial_bytes == 0 {
             return Err(DbError::Checkpoint(
@@ -255,29 +303,45 @@ impl<'a> SealedVnodeChainReader<'a> {
                 "[LDB-6050] validated vnode restore head has an invalid seal inventory: {error}"
             ))
         })?;
-        let mut seal_cache = HashMap::new();
-        for (cached_attempt, cached_inventory) in head.lineage_inventories() {
-            let inventory_cell = SealInventoryCell::new();
-            inventory_cell.set(cached_inventory).map_err(|_| {
-                DbError::Checkpoint("[LDB-6050] validated seal cache collision".into())
+        let ancestor_attestations = head.ancestor_attestations();
+        let head_artifacts = u64::try_from(inventory.sealed_partials.len()).map_err(|_| {
+            DbError::Checkpoint(
+                "[LDB-6050] validated head artifact count does not fit accounting".into(),
+            )
+        })?;
+        let proven_artifacts = head_artifacts
+            .checked_add(ancestor_attestations.artifact_count())
+            .ok_or_else(|| {
+                DbError::Checkpoint(
+                    "[LDB-6050] validated seal proof artifact count overflows accounting".into(),
+                )
             })?;
-            if seal_cache
-                .insert(cached_attempt, Arc::new(inventory_cell))
-                .is_some()
-            {
-                return Err(DbError::Checkpoint(
-                    "[LDB-6050] duplicate validated seal-cache attempt".into(),
-                ));
-            }
-        }
-        if !seal_cache.contains_key(&attempt) {
+        let proof_is_complete = proven_artifacts == committed_full_cut_lineage_artifacts;
+        if !proof_is_complete && !allow_incomplete_proof_for_test {
             return Err(DbError::Checkpoint(
-                "[LDB-6050] validated seal cache is missing its committed head".into(),
+                "[LDB-6050] validated seal proof does not exactly cover the committed lineage"
+                    .into(),
             ));
         }
+        #[cfg(test)]
+        let allow_unvalidated_inventory_fetch =
+            allow_incomplete_proof_for_test && !proof_is_complete;
+        #[cfg(test)]
+        let seal_cache = {
+            let inventory_cell = SealInventoryCell::new();
+            inventory_cell.set(Arc::clone(&inventory)).map_err(|_| {
+                DbError::Checkpoint("[LDB-6050] validated head seal-cache collision".into())
+            })?;
+            HashMap::from([(attempt, Arc::new(inventory_cell))])
+        };
         Ok(Self {
             backend,
+            head_inventory: Some(inventory),
+            ancestor_attestations: Some(ancestor_attestations),
+            #[cfg(test)]
             seal_cache: tokio::sync::Mutex::new(seal_cache),
+            #[cfg(test)]
+            allow_unvalidated_inventory_fetch,
             validated_head_attempt: Some(attempt),
             max_partial_bytes,
             max_artifacts_per_vnode_chain,
@@ -297,6 +361,7 @@ impl<'a> SealedVnodeChainReader<'a> {
         )))
     }
 
+    #[cfg(test)]
     pub(super) async fn sealed_inventory(
         &self,
         attempt: CheckpointAttempt,
@@ -319,10 +384,11 @@ impl<'a> SealedVnodeChainReader<'a> {
         }
     }
 
+    #[cfg(test)]
     async fn fetch_sealed_inventory(&self, attempt: CheckpointAttempt) -> SealInventoryLoad {
         let inventory = self
             .backend
-            .checkpoint_seal_inventory(attempt)
+            .checkpoint_seal_inventory_bounded(attempt)
             .await
             .map_err(|error| {
                 format!(
@@ -351,6 +417,7 @@ impl<'a> SealedVnodeChainReader<'a> {
         Ok(Arc::new(inventory))
     }
 
+    #[cfg(test)]
     fn sealed_attestation(
         inventory: &CheckpointSealInventory,
         attempt: CheckpointAttempt,
@@ -368,13 +435,59 @@ impl<'a> SealedVnodeChainReader<'a> {
         Ok(inventory.sealed_partials[index].clone())
     }
 
+    fn retained_attestation(
+        &self,
+        attempt: CheckpointAttempt,
+        vnode: u32,
+    ) -> Option<SealedVnodePartial> {
+        if self.validated_head_attempt == Some(attempt) {
+            return self.head_inventory.as_ref().and_then(|inventory| {
+                inventory
+                    .sealed_partials
+                    .binary_search_by_key(&vnode, |partial| partial.vnode)
+                    .ok()
+                    .map(|index| inventory.sealed_partials[index].clone())
+            });
+        }
+        self.ancestor_attestations
+            .as_ref()
+            .and_then(|attestations| attestations.attestation(attempt, vnode))
+            .cloned()
+    }
+
+    fn missing_attestation(attempt: CheckpointAttempt, vnode: u32) -> DbError {
+        DbError::Checkpoint(format!(
+            "[LDB-6050] vnode {vnode} is absent from the validated seal proof for checkpoint {} epoch {}",
+            attempt.checkpoint_id, attempt.epoch
+        ))
+    }
+
+    #[cfg(not(test))]
+    fn attestation_at(
+        &self,
+        attempt: CheckpointAttempt,
+        vnode: u32,
+    ) -> std::future::Ready<Result<SealedVnodePartial, DbError>> {
+        std::future::ready(
+            self.retained_attestation(attempt, vnode)
+                .ok_or_else(|| Self::missing_attestation(attempt, vnode)),
+        )
+    }
+
+    #[cfg(test)]
     async fn attestation_at(
         &self,
         attempt: CheckpointAttempt,
         vnode: u32,
     ) -> Result<SealedVnodePartial, DbError> {
-        let inventory = self.sealed_inventory(attempt).await?;
-        Self::sealed_attestation(&inventory, attempt, vnode)
+        if let Some(attestation) = self.retained_attestation(attempt, vnode) {
+            return Ok(attestation);
+        }
+        if self.allow_unvalidated_inventory_fetch {
+            let inventory = self.sealed_inventory(attempt).await?;
+            return Self::sealed_attestation(&inventory, attempt, vnode);
+        }
+        Err(Self::missing_attestation(attempt, vnode))
     }
 
     async fn read_verified_partial(
@@ -430,6 +543,7 @@ impl<'a> SealedVnodeChainReader<'a> {
                 bytes.len(), attestation.payload_len
             )));
         }
+        let bytes = normalize_restore_archive_alignment(bytes);
         usage.bytes = next_bytes;
         usage.artifacts = next_artifacts;
         Ok(bytes)
@@ -462,9 +576,8 @@ impl<'a> SealedVnodeChainReader<'a> {
         Ok(parent)
     }
 
-    fn preflight_restore_inputs(
+    async fn preflight_restore_inputs(
         &self,
-        inventory: &CheckpointSealInventory,
         attempt: CheckpointAttempt,
         requested_vnodes: &[u32],
     ) -> Result<RestoreInputPreflight, DbError> {
@@ -479,7 +592,7 @@ impl<'a> SealedVnodeChainReader<'a> {
         let mut declared_lineage_bytes = 0_u64;
         let mut declared_lineage_artifacts = 0_u64;
         for &vnode in requested_vnodes {
-            let attestation = Self::sealed_attestation(inventory, attempt, vnode)?;
+            let attestation = self.attestation_at(attempt, vnode).await?;
             let lineage_artifacts =
                 usize::try_from(attestation.lineage.artifact_count()).map_err(|_| {
                     DbError::Checkpoint(format!(
@@ -553,6 +666,7 @@ impl<'a> SealedVnodeChainReader<'a> {
                 max_lineage_bytes: self.committed_full_cut_lineage_payload_bytes,
                 max_lineage_artifacts: self.committed_full_cut_lineage_artifacts,
             },
+            self.backend_read_envelope()?,
         )?);
         let cancel = tokio_util::sync::CancellationToken::new();
         self.load_at_reserved(
@@ -610,6 +724,13 @@ impl<'a> SealedVnodeChainReader<'a> {
         if vnodes.is_empty() {
             return Ok(loaded);
         }
+        let backend_read_envelope = self.backend_read_envelope()?;
+        if budget.read_envelope() != backend_read_envelope {
+            return Err(DbError::Checkpoint(
+                "[LDB-6050] vnode restore budget does not match the checkpoint backend's sealed-partial read envelope"
+                    .into(),
+            ));
+        }
         let mut requested_vnodes = vnodes.to_vec();
         requested_vnodes.sort_unstable();
         if requested_vnodes.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -617,8 +738,9 @@ impl<'a> SealedVnodeChainReader<'a> {
                 "[LDB-6050] vnode restore request contains duplicate vnodes".into(),
             ));
         }
-        let inventory = self.sealed_inventory(attempt).await?;
-        let preflight = self.preflight_restore_inputs(&inventory, attempt, &requested_vnodes)?;
+        let preflight = self
+            .preflight_restore_inputs(attempt, &requested_vnodes)
+            .await?;
         let reservation = budget.try_reserve(preflight.usage)?;
         loaded.attempt = Some(attempt);
         loaded.usage = preflight.usage;
@@ -877,11 +999,11 @@ impl<'a> SealedVnodeChainReader<'a> {
 }
 
 /// One operator's resolved recovery chain: FULL base bytes + ordered changed-state deltas.
-#[cfg(feature = "cluster")]
+#[cfg(test)]
 pub(crate) type ResolvedOpChain<'a> = (&'a [u8], Vec<&'a [u8]>);
 
 /// Resolve one operator's FULL base and ordered delta payloads from a vnode recovery chain.
-#[cfg(feature = "cluster")]
+#[cfg(test)]
 #[must_use]
 pub(crate) fn resolve_op_chain<'a>(
     chain: &'a [crate::vnode_partial::VnodePartial],

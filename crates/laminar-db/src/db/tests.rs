@@ -6,6 +6,60 @@
 use super::*;
 
 #[test]
+fn managed_state_budget_default_is_resolved_at_database_construction() {
+    let db = LaminarDB::open().unwrap();
+
+    assert_eq!(
+        db.config.pipeline_max_managed_state_bytes,
+        Some(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES)
+    );
+}
+
+#[test]
+fn zero_managed_state_budget_is_rejected_as_configuration() {
+    let result = LaminarDB::open_with_config(LaminarConfig {
+        pipeline_max_managed_state_bytes: Some(0),
+        ..Default::default()
+    });
+    let error = match result {
+        Ok(_) => panic!("a zero managed-state budget must be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(&error, DbError::Config(_)));
+    assert!(error
+        .to_string()
+        .contains("pipeline_max_managed_state_bytes must be greater than zero"));
+}
+
+#[test]
+fn retractable_extremum_checkpoint_budget_default_is_resolved_at_database_construction() {
+    let db = LaminarDB::open().unwrap();
+
+    assert_eq!(
+        db.config.pipeline_max_retractable_extremum_checkpoint_bytes,
+        Some(crate::config::DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES)
+    );
+}
+
+#[test]
+fn zero_retractable_extremum_checkpoint_budget_is_rejected_as_configuration() {
+    let result = LaminarDB::open_with_config(LaminarConfig {
+        pipeline_max_retractable_extremum_checkpoint_bytes: Some(0),
+        ..Default::default()
+    });
+    let error = match result {
+        Ok(_) => panic!("a zero retractable-extremum checkpoint budget must be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(&error, DbError::Config(_)));
+    assert!(error
+        .to_string()
+        .contains("pipeline_max_retractable_extremum_checkpoint_bytes must be greater than zero"));
+}
+
+#[test]
 fn control_runtime_stack_override_is_cluster_only() {
     assert_eq!(
         DbControlRuntime::new(RuntimeMode::Local).worker_stack_bytes,
@@ -419,7 +473,6 @@ fn pending_final_owner_exit_binds_exact_transition_and_process() {
     )
     .is_err());
 }
-use crate::ddl::extract_connector_from_with_options;
 use laminar_core::catalog::CatalogObjectKind;
 #[cfg(feature = "cluster")]
 use object_store::ObjectStoreExt;
@@ -498,7 +551,7 @@ fn synthetic_boot_transition(
             owners,
             participant,
             identity,
-            cut,
+            cut.into_transition_binding().unwrap(),
             LoadedVnodeChains::from_chains_for_test(Some(attempt), chains),
         )
         .unwrap(),
@@ -3148,6 +3201,109 @@ async fn test_create_source() {
 }
 
 #[tokio::test]
+async fn create_source_routes_composite_primary_key_to_catalog() {
+    let db = LaminarDB::open().unwrap();
+    db.execute(
+        "CREATE SOURCE keyed_events (
+            tenant VARCHAR,
+            event_id BIGINT,
+            payload VARCHAR,
+            PRIMARY KEY (tenant, event_id)
+        )",
+    )
+    .await
+    .unwrap();
+
+    let entry = db.catalog.get_source("keyed_events").unwrap();
+    assert_eq!(entry.primary_key, ["tenant", "event_id"]);
+    assert!(!entry
+        .schema
+        .field_with_name("tenant")
+        .unwrap()
+        .is_nullable());
+    assert!(!entry
+        .schema
+        .field_with_name("event_id")
+        .unwrap()
+        .is_nullable());
+    assert!(entry
+        .schema
+        .field_with_name("payload")
+        .unwrap()
+        .is_nullable());
+
+    let handle = db.source_untyped("keyed_events").unwrap();
+    let reserved_batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("tenant", DataType::Utf8, false),
+            Field::new("event_id", DataType::Int64, false),
+            Field::new("__weight", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["acme"])),
+            Arc::new(arrow_array::Int64Array::from(vec![1_i64])),
+            Arc::new(StringArray::from(vec!["payload"])),
+        ],
+    )
+    .unwrap();
+    let error = handle.push_arrow(reserved_batch).unwrap_err();
+    assert!(error.to_string().contains("schema mismatch"));
+}
+
+#[tokio::test]
+async fn create_source_rejects_invalid_primary_key_declarations() {
+    let cases = [
+        (
+            "CREATE SOURCE invalid (id BIGINT PRIMARY KEY, PRIMARY KEY (id))",
+            "at most one PRIMARY KEY declaration",
+        ),
+        (
+            "CREATE SOURCE invalid (id BIGINT, PRIMARY KEY (missing))",
+            "does not exist",
+        ),
+        (
+            "CREATE SOURCE invalid (id BIGINT, PRIMARY KEY (id, id))",
+            "repeats column",
+        ),
+        (
+            "CREATE SOURCE invalid (id BIGINT NULL, PRIMARY KEY (id))",
+            "cannot be declared NULL",
+        ),
+        (
+            "CREATE SOURCE invalid (id BIGINT, ID BIGINT, PRIMARY KEY (id))",
+            "is ambiguous",
+        ),
+        (
+            "CREATE SOURCE invalid (id BIGINT CONSTRAINT pk PRIMARY KEY)",
+            "does not support named PRIMARY KEY constraints",
+        ),
+        (
+            "CREATE SOURCE invalid (id BIGINT PRIMARY KEY DEFERRABLE)",
+            "does not support PRIMARY KEY constraint characteristics",
+        ),
+        (
+            "CREATE SOURCE invalid (_op VARCHAR)",
+            "reserved mutation metadata",
+        ),
+        (
+            "CREATE SOURCE invalid (__op VARCHAR)",
+            "reserved mutation metadata",
+        ),
+        (
+            "CREATE SOURCE invalid (__weight BIGINT)",
+            "reserved mutation metadata",
+        ),
+    ];
+
+    for (sql, expected) in cases {
+        let db = LaminarDB::open().unwrap();
+        let error = db.execute(sql).await.unwrap_err();
+        assert!(error.to_string().contains(expected), "{sql}: {error}");
+        assert!(db.catalog.get_source("invalid").is_none());
+    }
+}
+
+#[tokio::test]
 async fn test_create_source_with_watermark() {
     let db = LaminarDB::open().unwrap();
     db.execute(
@@ -4284,6 +4440,126 @@ async fn create_stream_planner_rejection_does_not_enter_registries() {
 }
 
 #[tokio::test]
+async fn interval_join_ddl_enforces_runtime_key_and_time_types() {
+    let db = LaminarDB::open().unwrap();
+    db.execute(
+        "CREATE SOURCE int_left (id INT, ts TIMESTAMP NOT NULL, \
+         WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE SOURCE int_right (id INT, ts TIMESTAMP NOT NULL, \
+         WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
+    )
+    .await
+    .unwrap();
+
+    let error = db
+        .execute(
+            "CREATE STREAM invalid_interval AS \
+             SELECT l.id FROM int_left l JOIN int_right r ON l.id = r.id \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("same Utf8 or Int64 type"),
+        "unexpected rejection: {error}"
+    );
+    assert!(db.catalog.get_stream_entry("invalid_interval").is_none());
+
+    db.execute(
+        "CREATE SOURCE bigint_left (id BIGINT, partition_id BIGINT, ts TIMESTAMP NOT NULL, \
+         WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE SOURCE bigint_right (id BIGINT, partition_id BIGINT, ts TIMESTAMP NOT NULL, \
+         WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE STREAM valid_interval AS \
+         SELECT l.id AS id FROM bigint_left l JOIN bigint_right r ON l.id = r.id \
+         AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+    )
+    .await
+    .unwrap();
+    assert!(db.catalog.get_stream_entry("valid_interval").is_some());
+
+    let error = db
+        .execute(
+            "CREATE STREAM unaliased_interval AS \
+             SELECT l.id FROM bigint_left l JOIN bigint_right r ON l.id = r.id \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("explicit alias"));
+    assert!(db.catalog.get_stream_entry("unaliased_interval").is_none());
+
+    db.execute(
+        "CREATE STREAM composite_interval AS \
+         SELECT l.id AS id FROM bigint_left l JOIN bigint_right r \
+         ON l.id = r.id AND l.partition_id = r.partition_id \
+         AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+    )
+    .await
+    .unwrap();
+    assert!(db.catalog.get_stream_entry("composite_interval").is_some());
+
+    db.execute("CREATE SOURCE no_watermark (id BIGINT, ts TIMESTAMP NOT NULL)")
+        .await
+        .unwrap();
+    let error = db
+        .execute(
+            "CREATE STREAM unwatermarked_interval AS \
+             SELECT l.id FROM no_watermark l JOIN bigint_right r ON l.id = r.id \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("event-time watermark"));
+    assert!(db
+        .catalog
+        .get_stream_entry("unwatermarked_interval")
+        .is_none());
+
+    let error = db
+        .execute(
+            "CREATE STREAM aggregate_interval AS \
+             SELECT l.id AS id, COUNT(*) AS n FROM bigint_left l JOIN bigint_right r ON l.id = r.id \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND GROUP BY l.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("cannot contain an aggregate stage"));
+    assert!(db.catalog.get_stream_entry("aggregate_interval").is_none());
+
+    db.execute(
+        "CREATE SOURCE nullable_time (id BIGINT, ts TIMESTAMP, \
+         WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
+    )
+    .await
+    .unwrap();
+    let error = db
+        .execute(
+            "CREATE STREAM nullable_interval AS \
+             SELECT l.id FROM nullable_time l JOIN bigint_right r ON l.id = r.id \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("must be declared NOT NULL"));
+    assert!(db.catalog.get_stream_entry("nullable_interval").is_none());
+}
+
+#[tokio::test]
 async fn test_show_streams() {
     let db = LaminarDB::open().unwrap();
     db.execute("CREATE STREAM a AS SELECT 1 FROM events")
@@ -4492,20 +4768,8 @@ async fn test_create_source_with_connector_rejected_when_running() {
     db.execute("CREATE SOURCE seed (id INT)").await.unwrap();
     db.start().await.unwrap();
 
-    // WITH syntax
     let result = db
-        .execute("CREATE SOURCE events (id INT) WITH ('connector' = 'kafka', 'topic' = 'x')")
-        .await;
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("LDB-6043"),
-        "expected pipeline-running error, got: {err}"
-    );
-
-    // FROM syntax (what server mode generates via source_to_ddl)
-    let result = db
-        .execute("CREATE SOURCE events2 (id INT) FROM KAFKA (topic = 'x')")
+        .execute("CREATE SOURCE events (id INT) FROM KAFKA (topic = 'x')")
         .await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -4525,9 +4789,9 @@ async fn create_source_surfaces_kafka_config_error_in_ddl_message() {
                  'bootstrap.servers' = 'localhost:9092', \
                  'group.id' = 'g', \
                  'topic' = 't', \
-                 'format' = 'avro', \
-                 'schema.registry.url' = 'http://localhost:8081', \
                  'broker.commit.interval.ms' = '5000' \
+             ) FORMAT AVRO WITH ( \
+                 'schema.registry.url' = 'http://localhost:8081' \
              )",
         )
         .await;
@@ -4565,7 +4829,7 @@ async fn test_create_sink_with_connector_rejected_when_running() {
     let result = db
         .execute(
             "CREATE SINK output FROM events \
-             WITH ('connector' = 'kafka', 'topic' = 'out')",
+             INTO KAFKA ('topic' = 'out')",
         )
         .await;
     assert!(result.is_err());
@@ -4755,7 +5019,7 @@ async fn test_sql_create_source_auto_discovers_map_column() {
 
     let (db, _) = fake_source_db("fake-avro", Some(Arc::clone(&map_schema))).await;
     db.execute(
-        "CREATE SOURCE events WITH ('connector' = 'fake-avro', \
+        "CREATE SOURCE events FROM \"fake-avro\" (\
          'schema.registry.url' = 'http://irrelevant', 'topic' = 'events')",
     )
     .await
@@ -4784,12 +5048,12 @@ async fn test_sql_create_source_if_not_exists_skips_discovery() {
     )]));
     let (db, counter) = fake_source_db("counting-fake", Some(discovered)).await;
 
-    db.execute("CREATE SOURCE events WITH ('connector' = 'counting-fake')")
+    db.execute("CREATE SOURCE events FROM \"counting-fake\"")
         .await
         .unwrap();
     assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-    db.execute("CREATE SOURCE IF NOT EXISTS events WITH ('connector' = 'counting-fake')")
+    db.execute("CREATE SOURCE IF NOT EXISTS events FROM \"counting-fake\"")
         .await
         .unwrap();
     assert_eq!(
@@ -4805,7 +5069,7 @@ async fn test_sql_create_source_if_not_exists_skips_discovery() {
 async fn test_sql_create_source_errors_when_discovery_yields_empty() {
     let (db, _) = fake_source_db("empty-fake", None).await;
     let err = db
-        .execute("CREATE SOURCE events WITH ('connector' = 'empty-fake')")
+        .execute("CREATE SOURCE events FROM \"empty-fake\"")
         .await
         .unwrap_err();
     assert!(
@@ -4825,8 +5089,8 @@ async fn fake_source_db(
     use laminar_connectors::checkpoint::SourceCheckpoint;
     use laminar_connectors::config::ConnectorInfo;
     use laminar_connectors::connector::{
-        SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceStart,
-        SourceTopology,
+        SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
+        SourceStart, SourceTopology,
     };
     use laminar_connectors::error::ConnectorError;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4869,6 +5133,7 @@ async fn fake_source_db(
             Ok(SourceContract::new(
                 SourceConsistency::Replayable,
                 SourceTopology::Splittable,
+                SourceInputMode::AppendOnly,
             ))
         }
         async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -4914,7 +5179,10 @@ async fn paused_schema_discovery_serializes_pipeline_start() {
     use async_trait::async_trait;
     use laminar_connectors::checkpoint::SourceCheckpoint;
     use laminar_connectors::config::ConnectorInfo;
-    use laminar_connectors::connector::{SourceBatch, SourceConnector, SourceStart};
+    use laminar_connectors::connector::{
+        SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
+        SourceStart, SourceTopology,
+    };
     use laminar_connectors::error::ConnectorError;
 
     struct GatedSource {
@@ -4926,6 +5194,17 @@ async fn paused_schema_discovery_serializes_pipeline_start() {
 
     #[async_trait]
     impl SourceConnector for GatedSource {
+        fn contract(
+            &self,
+            _config: &laminar_connectors::config::ConnectorConfig,
+        ) -> Result<SourceContract, ConnectorError> {
+            Ok(SourceContract::new(
+                SourceConsistency::Replayable,
+                SourceTopology::Splittable,
+                SourceInputMode::AppendOnly,
+            ))
+        }
+
         async fn start(&mut self, _: SourceStart) -> Result<(), ConnectorError> {
             Ok(())
         }
@@ -4999,7 +5278,7 @@ async fn paused_schema_discovery_serializes_pipeline_start() {
     let create = {
         let db = Arc::clone(&db);
         tokio::spawn(async move {
-            db.execute("CREATE SOURCE discovered WITH ('connector' = 'gated-source')")
+            db.execute("CREATE SOURCE discovered FROM \"gated-source\"")
                 .await
         })
     };
@@ -5349,7 +5628,7 @@ async fn multiway_incremental_mv_is_rejected_without_partial_registration() {
         .unwrap_err();
     assert!(error
         .to_string()
-        .contains("atomic batch topology admission"));
+        .contains("multi-way streaming joins require explicitly named two-way stages"));
     assert!(db.mv_registry.lock().get("abc").is_none());
     assert!(!db.ctx.table_exist("abc").unwrap());
     assert!(db.connector_manager.lock().get_ddl("abc").is_none());
@@ -8296,13 +8575,13 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
     super::CATALOG_MANIFEST_REPLAY
         .scope((), async {
             db.execute(
-                "CREATE SOURCE left_events (id BIGINT, value DOUBLE, ts TIMESTAMP, \
+                "CREATE SOURCE left_events (id BIGINT, shard BIGINT, value DOUBLE, ts TIMESTAMP NOT NULL, \
                  WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
             )
             .await
             .unwrap();
             db.execute(
-                "CREATE SOURCE right_events (id BIGINT, value DOUBLE, ts TIMESTAMP, \
+                "CREATE SOURCE right_events (id BIGINT, shard BIGINT, value DOUBLE, ts TIMESTAMP NOT NULL, \
                  WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
             )
             .await
@@ -8317,15 +8596,55 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
                  EMIT ON WINDOW CLOSE",
             )
             .await;
-            assert_cluster_rejection(
-                &db,
-                "rejected_interval",
-                "CREATE STREAM rejected_interval AS \
-                 SELECT l.id, l.value AS left_value, r.value AS right_value \
+            db.execute(
+                "CREATE STREAM interval_ok AS \
+                 SELECT l.id AS id, l.value AS left_value, r.value AS right_value \
                  FROM left_events l JOIN right_events r ON l.id = r.id \
                  AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '10' SECOND",
             )
-            .await;
+            .await
+            .expect("bounded watermarked interval join is cluster-safe");
+            assert!(db.catalog.get_stream_entry("interval_ok").is_some());
+
+            let mut persisted_invalid =
+                db.connector_manager.lock().streams()["interval_ok"].clone();
+            persisted_invalid.name = "persisted_invalid_interval".into();
+            let Some(laminar_sql::translator::JoinOperatorConfig::StreamStream(join)) =
+                persisted_invalid
+                    .join_config
+                    .as_mut()
+                    .and_then(|joins| joins.first_mut())
+            else {
+                panic!("interval stream registration lost its join plan");
+            };
+            join.left_keys = vec!["value".into()];
+            join.right_keys = vec!["value".into()];
+            let error = db
+                .revalidate_persisted_cluster_query_shapes(&std::collections::HashMap::from([(
+                    persisted_invalid.name.clone(),
+                    persisted_invalid,
+                )]))
+                .await
+                .expect_err("persisted interval joins must repeat DDL schema admission");
+            assert!(
+                error
+                    .to_string()
+                    .contains("key pairs must have the same Utf8 or Int64 type"),
+                "{error}"
+            );
+
+            db.execute(
+                "CREATE STREAM composite_interval_ok AS \
+                 SELECT l.id AS id, l.value AS left_value, r.value AS right_value \
+                 FROM left_events l JOIN right_events r ON l.id = r.id AND l.shard = r.shard \
+                 AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '10' SECOND",
+            )
+            .await
+            .expect("ordered composite interval keys are cluster-safe");
+            assert!(db
+                .catalog
+                .get_stream_entry("composite_interval_ok")
+                .is_some());
             assert_cluster_rejection(
                 &db,
                 "rejected_temporal_filter",
@@ -8333,19 +8652,13 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
                  FROM left_events WHERE ts > now() - INTERVAL '10' SECOND EMIT CHANGES",
             )
             .await;
-            let keyed_error = assert_cluster_rejection(
-                &db,
-                "rejected_keyed_aggregate",
-                "CREATE STREAM rejected_keyed_aggregate AS \
+            db.execute(
+                "CREATE STREAM keyed_aggregate_ok AS \
                  SELECT id, SUM(value) AS total FROM left_events GROUP BY id",
             )
-            .await;
-            assert!(
-                keyed_error.contains(
-                    "keyed aggregates retain operator-owned map state without a live-state byte budget"
-                ),
-                "unexpected keyed aggregate rejection: {keyed_error}"
-            );
+            .await
+            .expect("bounded vnode-keyed aggregate state is cluster-safe");
+            assert!(db.catalog.get_stream_entry("keyed_aggregate_ok").is_some());
             let global_window_error = assert_cluster_rejection(
                 &db,
                 "rejected_global_window",
@@ -8355,9 +8668,7 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
             )
             .await;
             assert!(
-                global_window_error.contains(
-                    "keyed aggregates retain operator-owned map state without a live-state byte budget"
-                ),
+                global_window_error.contains("window"),
                 "unexpected global window rejection: {global_window_error}"
             );
             assert_cluster_rejection(
@@ -8514,10 +8825,8 @@ async fn live_topology_ddl_is_fenced_in_a_configured_one_owner_cluster() {
     super::CATALOG_MANIFEST_REPLAY
         .scope(
             (),
-            cluster.execute(
-                "CREATE SOURCE replayed (id INT) WITH \
-                 ('connector' = 'generator', 'topic' = 'manifest')",
-            ),
+            cluster
+                .execute("CREATE SOURCE replayed (id INT) FROM GENERATOR ('topic' = 'manifest')"),
         )
         .await
         .expect("internal manifest replay must rebuild connector catalog entries during startup");
@@ -9106,7 +9415,7 @@ async fn cluster_manifest_never_persists_literal_connector_secrets() {
 
     let error = db
         .execute(&format!(
-            "CREATE SOURCE rejected (id INT) WITH ('password' = '{PASSWORD}')"
+            "CREATE SOURCE rejected (id INT) FROM GENERATOR ('password' = '{PASSWORD}')"
         ))
         .await
         .unwrap_err();
@@ -9114,7 +9423,7 @@ async fn cluster_manifest_never_persists_literal_connector_secrets() {
     assert!(db.catalog.get_source("rejected").is_none());
     let token_error = db
         .execute(&format!(
-            "CREATE SOURCE rejected_token (id INT) WITH ('token' = '{TOKEN}')"
+            "CREATE SOURCE rejected_token (id INT) FROM GENERATOR ('token' = '{TOKEN}')"
         ))
         .await
         .unwrap_err();
@@ -9124,7 +9433,7 @@ async fn cluster_manifest_never_persists_literal_connector_secrets() {
     assert!(db.catalog.get_source("rejected_token").is_none());
     let signed_url_error = db
         .execute(
-            "CREATE SOURCE rejected_url (id INT) WITH \
+            "CREATE SOURCE rejected_url (id INT) FROM GENERATOR \
              ('connection' = 'https://example.test/data?X-Amz%2DSignature=signed-secret')",
         )
         .await
@@ -9133,11 +9442,11 @@ async fn cluster_manifest_never_persists_literal_connector_secrets() {
         .to_string()
         .contains("cannot persist secret property"));
     for ddl in [
-        "CREATE SOURCE rejected_exact_url (id INT) WITH \
+        "CREATE SOURCE rejected_exact_url (id INT) FROM GENERATOR \
          ('url' = 'wss://user:socket-secret@example.test/events')",
-        "CREATE SOURCE rejected_sas_uri (id INT) WITH \
+        "CREATE SOURCE rejected_sas_uri (id INT) FROM GENERATOR \
          ('uri' = 'https://blob.test/data?sv=1&sig=sas-secret')",
-        "CREATE SOURCE rejected_uri_list (id INT) WITH \
+        "CREATE SOURCE rejected_uri_list (id INT) FROM GENERATOR \
          ('endpoints' = 'wss://public.test, wss://user:list-secret@private.test')",
     ] {
         let error = db.execute(ddl).await.unwrap_err();
@@ -9155,7 +9464,7 @@ async fn cluster_manifest_never_persists_literal_connector_secrets() {
         .contains("cannot persist SQL comments"));
     let default_error = db
         .execute(
-            "CREATE SOURCE rejected_default (id INT) WITH \
+            "CREATE SOURCE rejected_default (id INT) FROM GENERATOR \
              ('password' = '${LDB_PASSWORD:-unsafe-default}')",
         )
         .await
@@ -9193,8 +9502,8 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
     use laminar_connectors::checkpoint::SourceCheckpoint;
     use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
     use laminar_connectors::connector::{
-        SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceStart,
-        SourceTopology,
+        SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
+        SourceStart, SourceTopology,
     };
     use laminar_connectors::error::ConnectorError;
     use laminar_core::checkpoint::CheckpointParticipant;
@@ -9206,7 +9515,7 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
 
     const VARIABLE: &str = "LDB_TEST_CLUSTER_CONNECTOR_PASSWORD";
     const PASSWORD: &str = "resolved-only-on-this-node";
-    const DDL: &str = "CREATE SOURCE secured (id INT) WITH ('connector' = 'capture-secret', \
+    const DDL: &str = "CREATE SOURCE secured (id INT) FROM \"capture-secret\" (\
         'password' = '${LDB_TEST_CLUSTER_CONNECTOR_PASSWORD}')";
 
     struct CapturingSource {
@@ -9247,6 +9556,7 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
             Ok(SourceContract::new(
                 SourceConsistency::Replayable,
                 SourceTopology::Splittable,
+                SourceInputMode::AppendOnly,
             ))
         }
 
@@ -9351,7 +9661,7 @@ async fn manifest_replay_rejects_connector_schema_rediscovery_before_factory_use
     use laminar_core::cluster::control::{CatalogManifest, CatalogManifestEntry};
     use object_store::ObjectStore;
 
-    const DDL: &str = "CREATE SOURCE unstable WITH ('connector' = 'changing-discovery')";
+    const DDL: &str = "CREATE SOURCE unstable FROM \"changing-discovery\"";
     let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let authority = test_catalog_authority(object_store).await;
     let manifest_store = Arc::clone(&authority.manifest_store);
@@ -9828,96 +10138,25 @@ async fn alter_source_properties_are_rejected_without_mutation() {
     assert_eq!(db.get_session_property("events.batch.size"), None);
 }
 
-#[test]
-fn test_extract_connector_from_with_options_basic() {
-    let mut opts = HashMap::new();
-    opts.insert("connector".to_string(), "kafka".to_string());
-    opts.insert("topic".to_string(), "events".to_string());
-    opts.insert(
-        "bootstrap.servers".to_string(),
-        "localhost:9092".to_string(),
-    );
-    opts.insert("format".to_string(), "json".to_string());
-
-    let (conn_opts, format, fmt_opts) = extract_connector_from_with_options(&opts);
-
-    // 'connector' and 'format' are extracted, not in connector_options
-    assert!(!conn_opts.contains_key("connector"));
-    assert!(!conn_opts.contains_key("format"));
-    assert_eq!(conn_opts.get("topic"), Some(&"events".to_string()));
-    assert_eq!(
-        conn_opts.get("bootstrap.servers"),
-        Some(&"localhost:9092".to_string())
-    );
-    assert_eq!(format, Some("json".to_string()));
-    assert!(fmt_opts.is_empty());
-}
-
-#[test]
-fn test_extract_connector_filters_streaming_keys() {
-    let mut opts = HashMap::new();
-    opts.insert("connector".to_string(), "websocket".to_string());
-    opts.insert("url".to_string(), "wss://feed.example.com".to_string());
-    opts.insert("buffer_size".to_string(), "4096".to_string());
-    opts.insert("backpressure".to_string(), "block".to_string());
-    opts.insert("watermark_delay".to_string(), "5s".to_string());
-
-    let (conn_opts, _, _) = extract_connector_from_with_options(&opts);
-
-    // Streaming keys should NOT be in connector_options
-    assert!(!conn_opts.contains_key("buffer_size"));
-    assert!(!conn_opts.contains_key("backpressure"));
-    assert!(!conn_opts.contains_key("watermark_delay"));
-    // Connector-specific key should be present
-    assert_eq!(
-        conn_opts.get("url"),
-        Some(&"wss://feed.example.com".to_string())
-    );
-}
-
-#[test]
-fn test_extract_connector_format_options() {
-    let mut opts = HashMap::new();
-    opts.insert("connector".to_string(), "kafka".to_string());
-    opts.insert("format".to_string(), "avro".to_string());
-    opts.insert(
-        "format.schema.registry.url".to_string(),
-        "http://localhost:8081".to_string(),
-    );
-    opts.insert("topic".to_string(), "events".to_string());
-
-    let (conn_opts, format, fmt_opts) = extract_connector_from_with_options(&opts);
-
-    assert_eq!(format, Some("avro".to_string()));
-    assert_eq!(
-        fmt_opts.get("schema.registry.url"),
-        Some(&"http://localhost:8081".to_string())
-    );
-    assert_eq!(conn_opts.get("topic"), Some(&"events".to_string()));
-    assert!(!conn_opts.contains_key("format.schema.registry.url"));
-}
-
 #[tokio::test]
-async fn test_create_source_with_connector_option() {
-    // Verify that WITH ('connector' = '...') is accepted at the DDL level.
+async fn test_create_source_with_explicit_connector() {
+    // Verify that FROM routes the source to the connector registry.
     // The actual connector won't be instantiated because the type isn't
     // registered in the default embedded registry, so we just check
     // that the error is "Unknown source connector type" (meaning the
-    // WITH clause was correctly routed) rather than silently ignored.
+    // FROM clause was correctly routed) rather than silently ignored.
     let db = LaminarDB::open().unwrap();
     let result = db
         .execute(
-            "CREATE SOURCE ws_feed (id BIGINT, data TEXT) WITH (
-                'connector' = 'websocket',
-                'url' = 'wss://feed.example.com',
-                'format' = 'json'
-            )",
+            "CREATE SOURCE ws_feed (id BIGINT, data TEXT) FROM WEBSOCKET (
+                'url' = 'wss://feed.example.com'
+            ) FORMAT JSON",
         )
         .await;
 
     // Without the websocket feature, the connector type won't be registered,
     // so we expect an "Unknown source connector type" error — which proves
-    // the WITH clause WAS routed to the connector registry.
+    // the FROM clause was routed to the connector registry.
     if let Err(e) = result {
         let msg = e.to_string();
         assert!(
@@ -10219,6 +10458,57 @@ async fn test_connectorless_source_does_not_break_pipeline() {
 }
 
 #[tokio::test]
+async fn explicit_connector_and_format_options_reach_registrations() {
+    let db = LaminarDB::builder()
+        .register_connector(|registry| {
+            laminar_connectors::testing::register_mock_source(registry)?;
+            laminar_connectors::testing::register_mock_sink(registry)
+        })
+        .build()
+        .await
+        .unwrap();
+
+    db.execute(
+        "CREATE SOURCE input (id BIGINT) \
+         FROM MOCK ('source.option' = 'source-value') \
+         FORMAT JSON WITH ('compression' = 'gzip')",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE SINK output FROM input \
+         INTO MOCK ('sink.option' = 'sink-value') \
+         FORMAT JSON WITH ('compression' = 'zstd')",
+    )
+    .await
+    .unwrap();
+
+    let manager = db.connector_manager.lock();
+    let source = manager.sources().get("input").unwrap();
+    assert_eq!(
+        source.connector_options,
+        std::collections::HashMap::from([(
+            "source.option".to_string(),
+            "source-value".to_string(),
+        )])
+    );
+    assert_eq!(
+        source.format_options,
+        std::collections::HashMap::from([("compression".to_string(), "gzip".to_string(),)])
+    );
+
+    let sink = manager.sinks().get("output").unwrap();
+    assert_eq!(
+        sink.connector_options,
+        std::collections::HashMap::from([("sink.option".to_string(), "sink-value".to_string(),)])
+    );
+    assert_eq!(
+        sink.format_options,
+        std::collections::HashMap::from([("compression".to_string(), "zstd".to_string(),)])
+    );
+}
+
+#[tokio::test]
 async fn connector_options_resolve_vars() {
     // `${VAR}` resolves in connector option values (config vars, then env) for
     // both sources and sinks — and only there, not elsewhere in the statement.
@@ -10227,11 +10517,9 @@ async fn connector_options_resolve_vars() {
         .build()
         .await
         .unwrap();
-    db.execute(
-        "CREATE SOURCE s (id BIGINT) WITH ('connector' = 'generator', 'topic' = '${TOPIC}')",
-    )
-    .await
-    .unwrap();
+    db.execute("CREATE SOURCE s (id BIGINT) FROM GENERATOR ('topic' = '${TOPIC}')")
+        .await
+        .unwrap();
     {
         let mgr = db.connector_manager.lock();
         let opts = &mgr.sources().get("s").unwrap().connector_options;
@@ -10240,7 +10528,7 @@ async fn connector_options_resolve_vars() {
     // Sinks go through the same resolver — an unresolved option errors (raised
     // before the unknown-connector check), proving the sink path is wired.
     let err = db
-        .execute("CREATE SINK snk FROM s WITH ('connector' = 'noop', 'topic' = '${MISSING_X9Q}')")
+        .execute("CREATE SINK snk FROM s INTO NOOP ('topic' = '${MISSING_X9Q}')")
         .await
         .unwrap_err();
     assert!(
@@ -10604,99 +10892,6 @@ async fn windowed_aggregate_over_lateral_unnest_emits() {
         "windowed aggregate over lateral UNNEST should emit"
     );
 }
-
-/// An `ASOF JOIN` feeding a materialized view must plan and emit, matching
-/// each left row to the latest right row at-or-before its timestamp (per key).
-/// `DataFusion` can't lower `AsOf`, so schema resolution rewrites it to a plain
-/// join; execution uses the ASOF operator.
-#[tokio::test]
-async fn asof_join_in_materialized_view_emits_backward_match() {
-    let db = LaminarDB::open().unwrap();
-    db.execute(
-        "CREATE SOURCE quotes (sym VARCHAR, price DOUBLE, qts TIMESTAMP, \
-         WATERMARK FOR qts AS qts - INTERVAL '0' SECOND)",
-    )
-    .await
-    .unwrap();
-    db.execute(
-        "CREATE SOURCE trades (sym VARCHAR, tts TIMESTAMP, \
-         WATERMARK FOR tts AS tts - INTERVAL '0' SECOND)",
-    )
-    .await
-    .unwrap();
-    db.execute(
-        "CREATE MATERIALIZED VIEW enriched AS \
-         SELECT t.sym, q.price \
-         FROM trades t ASOF JOIN quotes q \
-         MATCH_CONDITION(t.tts >= q.qts) \
-         ON t.sym = q.sym",
-    )
-    .await
-    .unwrap();
-    db.start().await.unwrap();
-
-    let q = db.source_untyped("quotes").unwrap();
-    q.push_arrow(
-        RecordBatch::try_new(
-            q.schema().clone(),
-            vec![
-                Arc::new(arrow::array::StringArray::from(vec!["x", "x", "x"])),
-                Arc::new(arrow::array::Float64Array::from(vec![10.0, 20.0, 30.0])),
-                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
-                    1_000_000, 5_000_000, 8_000_000,
-                ])),
-            ],
-        )
-        .unwrap(),
-    )
-    .unwrap();
-
-    let t = db.source_untyped("trades").unwrap();
-    t.push_arrow(
-        RecordBatch::try_new(
-            t.schema().clone(),
-            vec![
-                // trade@3s -> latest quote qts<=3s = 10.0; trade@7s -> 20.0.
-                Arc::new(arrow::array::StringArray::from(vec!["x", "x"])),
-                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
-                    3_000_000, 7_000_000,
-                ])),
-            ],
-        )
-        .unwrap(),
-    )
-    .unwrap();
-
-    assert!(
-        poll_mv(&db, "enriched", 2).await >= 2,
-        "ASOF join in an MV should emit matches"
-    );
-    let batches = db
-        .ctx
-        .sql("SELECT price FROM enriched ORDER BY price")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-    let prices: Vec<f64> = batches
-        .iter()
-        .flat_map(|b| {
-            let col = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .unwrap();
-            (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
-        })
-        .collect();
-    assert_eq!(
-        prices,
-        vec![10.0, 20.0],
-        "backward ASOF should pick the latest quote at-or-before each trade"
-    );
-}
-
 /// Regression: `COUNT(DISTINCT)` must survive a checkpoint that lands while a
 /// window is still open. `Accumulator::state()` drains the DISTINCT set, and
 /// the window-checkpoint path calls it on the *live* accumulator — so before

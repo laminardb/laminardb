@@ -63,14 +63,11 @@ fn test_new_source() {
 }
 
 #[test]
-fn test_source_contract_is_commit_coupled_singleton() {
-    // The replication slot's WAL only advances on durable commit, so the pipeline must reject a
-    // CDC source without checkpointing or its WAL grows without bound.
-    let contract = default_source()
+fn source_contract_fails_closed_for_raw_json_envelope() {
+    let error = default_source()
         .contract(&ConnectorConfig::new("postgres-cdc"))
-        .unwrap();
-    assert_eq!(contract.consistency, SourceConsistency::CommitCoupled);
-    assert_eq!(contract.topology, SourceTopology::Singleton);
+        .unwrap_err();
+    assert!(error.to_string().contains("raw JSON change envelope"));
 }
 
 #[test]

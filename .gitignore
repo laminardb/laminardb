@@ -50,12 +50,8 @@ checkpoints/
 wal/
 /tools/*
 !/tools/independent-soak-contract/
-!/tools/distributed-state-ab/
 !/tools/kafka-transaction-probe/
-!/tools/state-backend-qual/
-!/tools/state-backend-redb-prescreen/
 !/tools/state-backend-zipf-oracle/
-/tools/state-backend-redb-prescreen/target/
 
 # Private configs (symlinked from private repo)
 CLAUDE.md
@@ -67,9 +63,6 @@ docs/adr/
 .desloppify/
 /examples/microstructure/target
 /examples/microstructure/Cargo.lock
-/examples/binance-markout/target
-/examples/binance-markout/Cargo.lock
-/examples/binance-markout/smoke-report.txt
 
 # Private internal docs (formerly a git submodule; kept local-only, untracked)
 /private/

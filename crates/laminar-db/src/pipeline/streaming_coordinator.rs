@@ -16,7 +16,7 @@ use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::SourceBatch;
 use laminar_connectors::connector::{
     ConnectorCancellationPolicy, ConnectorTaskTracker, DeliveryGuarantee, SourceConnector,
-    SourcePosition, SourceStart,
+    SourceConsistency, SourceContract, SourceInputMode, SourcePosition, SourceStart,
 };
 #[cfg(feature = "cluster")]
 use laminar_connectors::connector::{
@@ -41,6 +41,7 @@ use super::callback::{
 #[cfg(test)]
 use super::config::CheckpointSchedule;
 use super::config::PipelineConfig;
+use crate::catalog::{schema_has_reserved_mutation_columns, validate_source_batch};
 use crate::connector_task_fence::{ConnectorTaskFenceRegistration, OwnedConnectorTaskFences};
 use crate::error::DbError;
 
@@ -963,24 +964,109 @@ struct SourceHandle {
 
 pub(crate) struct TrackedSourceRegistration {
     source: SourceRegistration,
+    contract: SourceContract,
+    expected_schema: arrow_schema::SchemaRef,
+    primary_key: Vec<String>,
+    primary_key_indices: Vec<usize>,
+    schema_admitted: bool,
     task_fence: ConnectorTaskFenceRegistration,
 }
 
+pub(crate) const MUTATION_SOURCE_NOT_ADMITTED: &str =
+    "[LDB-5039] mutation sources are not admitted until canonical changelog normalization and \
+     schema propagation are installed";
+
+pub(crate) fn admit_append_only_source(
+    contract: SourceContract,
+    has_reserved_mutation_columns: bool,
+) -> Result<(), &'static str> {
+    if contract.input_mode == SourceInputMode::AppendOnly && !has_reserved_mutation_columns {
+        Ok(())
+    } else {
+        Err(MUTATION_SOURCE_NOT_ADMITTED)
+    }
+}
+
 impl TrackedSourceRegistration {
-    pub(crate) fn capture(source: SourceRegistration, owned: &OwnedConnectorTaskFences) -> Self {
+    fn resolve_contract(source: &SourceRegistration) -> Result<SourceContract, DbError> {
+        let contract = source.connector.contract(&source.config).map_err(|error| {
+            DbError::Config(format!(
+                "source '{}' (type '{}') has an invalid contract: {error}",
+                source.name,
+                source.config.connector_type()
+            ))
+        })?;
+        Ok(contract)
+    }
+
+    pub(crate) fn capture(
+        source: SourceRegistration,
+        owned: &OwnedConnectorTaskFences,
+    ) -> Result<Self, DbError> {
+        let contract = Self::resolve_contract(&source)?;
+        let expected_schema = source.connector.schema();
         let task_fence = ConnectorTaskFenceRegistration::capture_registered(
             Arc::<str>::from(format!("source:{}", source.name)),
             source.connector.terminal_task_tracker(),
             owned,
         );
-        Self { source, task_fence }
+        Ok(Self {
+            source,
+            contract,
+            expected_schema,
+            primary_key: Vec::new(),
+            primary_key_indices: Vec::new(),
+            schema_admitted: false,
+            task_fence,
+        })
     }
 
     pub(crate) fn from_captured(
         source: SourceRegistration,
         task_fence: ConnectorTaskFenceRegistration,
-    ) -> Self {
-        Self { source, task_fence }
+    ) -> Result<Self, DbError> {
+        let contract = Self::resolve_contract(&source)?;
+        let expected_schema = source.connector.schema();
+        Ok(Self {
+            source,
+            contract,
+            expected_schema,
+            primary_key: Vec::new(),
+            primary_key_indices: Vec::new(),
+            schema_admitted: false,
+            task_fence,
+        })
+    }
+
+    pub(crate) fn with_admitted_schema(
+        mut self,
+        expected_schema: arrow_schema::SchemaRef,
+        primary_key: Vec<String>,
+    ) -> Result<Self, DbError> {
+        let primary_key_indices = primary_key
+            .iter()
+            .map(|column| {
+                expected_schema.index_of(column).map_err(|_| {
+                    DbError::Config(format!(
+                        "source '{}' primary-key column '{column}' is absent from its admitted schema",
+                        self.name
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.expected_schema = expected_schema;
+        self.primary_key = primary_key;
+        self.primary_key_indices = primary_key_indices;
+        self.schema_admitted = true;
+        Ok(self)
+    }
+
+    pub(crate) const fn contract(&self) -> SourceContract {
+        self.contract
+    }
+
+    fn has_reserved_mutation_columns(&self) -> bool {
+        schema_has_reserved_mutation_columns(self.expected_schema.as_ref())
     }
 }
 
@@ -2459,6 +2545,29 @@ async fn wait_source_barrier_release(
 }
 
 impl StreamingCoordinator {
+    fn admit_public_source_shapes(sources: &[TrackedSourceRegistration]) -> Result<(), DbError> {
+        for source in sources {
+            if source.expected_schema.fields().is_empty() {
+                return Err(DbError::Config(format!(
+                    "source '{}' must expose a non-empty schema before public coordinator startup; late-bound schemas require database-owned catalog admission",
+                    source.name
+                )));
+            }
+            admit_append_only_source(
+                source.contract(),
+                source.has_reserved_mutation_columns(),
+            )
+            .map_err(|reason| {
+                DbError::Config(format!(
+                    "source '{}' is not admissible through the public coordinator: {reason} (contract: {:?})",
+                    source.name,
+                    source.contract()
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "cluster")]
     #[inline]
     fn require_process_authority(&self, boundary: &str) -> Result<(), CycleError> {
@@ -2604,7 +2713,8 @@ impl StreamingCoordinator {
             .map(|source| {
                 TrackedSourceRegistration::capture(source, &runtime.owned_connector_task_fences)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::admit_public_source_shapes(&sources)?;
         if let Some(source) = sources.iter().find(|source| source.assignment_scoped) {
             return Err(DbError::Config(format!(
                 "assignment-scoped source '{}' requires the database-owned cluster runtime",
@@ -2642,7 +2752,8 @@ impl StreamingCoordinator {
         let sources = sources
             .into_iter()
             .map(|source| TrackedSourceRegistration::capture(source, &owned_connector_task_fences))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::admit_public_source_shapes(&sources)?;
         Self::new_with_tracked_source_registry(
             sources,
             config,
@@ -2678,9 +2789,19 @@ impl StreamingCoordinator {
                     .into(),
             ));
         }
+        if config.delivery_guarantee == DeliveryGuarantee::BestEffort {
+            for src in &sources {
+                if src.contract().consistency == SourceConsistency::CommitCoupled {
+                    return Err(DbError::Config(format!(
+                        "source '{}' is commit-coupled; commit-coupled sources currently support only at-least-once delivery",
+                        src.name
+                    )));
+                }
+            }
+        }
         if config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             for src in &sources {
-                if !src.contract.is_exact_delivery_certified() {
+                if !src.contract().is_exact_delivery_certified() {
                     return Err(DbError::Config(format!(
                         "[{}] exactly-once source '{}' is not production-certified",
                         laminar_core::error_codes::EXACTLY_ONCE_SOURCE_UNCERTIFIED,
@@ -2694,7 +2815,7 @@ impl StreamingCoordinator {
             DeliveryGuarantee::AtLeastOnce | DeliveryGuarantee::ExactlyOnce
         ) {
             for src in &sources {
-                if !src.contract.supports_replay() {
+                if !src.contract().supports_replay() {
                     return Err(DbError::Config(format!(
                         "[LDB-5031] {} requires source '{}' to support replay",
                         config.delivery_guarantee, src.name
@@ -2714,7 +2835,7 @@ impl StreamingCoordinator {
         // front.
         if !config.checkpoint_schedule.is_enabled() {
             for src in &sources {
-                if src.contract.requires_checkpointing() {
+                if src.contract().requires_checkpointing() {
                     return Err(DbError::Config(format!(
                         "[LDB-5034] source '{}' requires checkpointing to be enabled: externally \
                          retained data is only released at a durable checkpoint",
@@ -2832,7 +2953,7 @@ impl StreamingCoordinator {
                     true
                 }
             };
-            let start_error = if source_start_authorized {
+            let mut start_error = if source_start_authorized {
                 match start_source_once(
                     src.connector.as_mut(),
                     start,
@@ -2891,6 +3012,26 @@ impl StreamingCoordinator {
                     unreachable!("local source startup is always authorized")
                 }
             };
+            if start_error.is_none() {
+                let started_schema = src.connector.schema();
+                if src.schema_admitted {
+                    if started_schema.as_ref() != src.expected_schema.as_ref() {
+                        start_error = Some(SourceStartFailure::Connector(format!(
+                            "schema after start does not match the admitted schema for source '{src_name}'"
+                        )));
+                    }
+                } else {
+                    src.expected_schema = started_schema;
+                    if let Err(reason) = admit_append_only_source(
+                        src.contract,
+                        schema_has_reserved_mutation_columns(src.expected_schema.as_ref()),
+                    ) {
+                        start_error = Some(SourceStartFailure::Connector(format!(
+                            "source '{src_name}' schema after start is not admissible: {reason}"
+                        )));
+                    }
+                }
+            }
             if let Some(failure) = start_error {
                 let error = match failure {
                     SourceStartFailure::Connector(error) => {
@@ -2951,6 +3092,11 @@ impl StreamingCoordinator {
             let PreparedSourceGeneration { registration } = prepared;
             let TrackedSourceRegistration {
                 source: src,
+                contract,
+                expected_schema,
+                primary_key,
+                primary_key_indices,
+                schema_admitted: _,
                 task_fence,
             } = registration;
             let terminal_tasks = task_fence.tracker();
@@ -2966,7 +3112,7 @@ impl StreamingCoordinator {
             let source_operation_timeout = config.checkpoint_timeout;
             let delivery_guarantee = config.delivery_guarantee;
             let src_name = src.name.clone();
-            let recovery_cursor = src.contract.supports_replay();
+            let recovery_cursor = contract.supports_replay();
             let assignment_scoped = src.assignment_scoped;
             let cancellation_policy = src.connector.cancellation_policy();
             let mut connector = src.connector;
@@ -3610,6 +3756,20 @@ impl StreamingCoordinator {
 
                     match poll_result {
                         Ok(Some(batch)) => {
+                            if let Err(error) = validate_source_batch(
+                                &src_name,
+                                &expected_schema,
+                                &primary_key,
+                                &primary_key_indices,
+                                &batch.records,
+                            ) {
+                                lifecycle.fault_data_plane();
+                                let _ = task_fault_tx.send(SourceFault {
+                                    source: Arc::from(src_name.as_str()),
+                                    error: error.to_string(),
+                                });
+                                break;
+                            }
                             let checkpoint = match lifecycle.run_sync_hook(
                                 &src_name,
                                 "polled batch checkpoint capture",
@@ -3894,6 +4054,20 @@ impl StreamingCoordinator {
                         }
                         match poll_result {
                             Some(Ok(Some(batch))) => {
+                                if let Err(error) = validate_source_batch(
+                                    &src_name,
+                                    &expected_schema,
+                                    &primary_key,
+                                    &primary_key_indices,
+                                    &batch.records,
+                                ) {
+                                    lifecycle.fault_data_plane();
+                                    let _ = task_fault_tx.send(SourceFault {
+                                        source: Arc::from(src_name.as_str()),
+                                        error: error.to_string(),
+                                    });
+                                    break;
+                                }
                                 let checkpoint = match lifecycle.run_sync_hook(
                                     &src_name,
                                     "shutdown tail checkpoint capture",

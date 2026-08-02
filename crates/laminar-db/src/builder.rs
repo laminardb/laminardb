@@ -392,6 +392,28 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Pipeline-wide charged-byte limit for managed operator working state.
+    ///
+    /// This is an execution-memory envelope and is independent of checkpoint or local-state
+    /// backend configuration.
+    #[must_use]
+    pub fn pipeline_max_managed_state_bytes(mut self, bytes: usize) -> Self {
+        self.config.pipeline_max_managed_state_bytes = Some(bytes);
+        self
+    }
+
+    /// Pre-encoding work limit for one retractable MIN/MAX checkpoint capture.
+    ///
+    /// This is independent of checkpoint storage and local-state backend configuration. The charge
+    /// is a cached accumulator work proxy, not an encoded-payload or process-RSS limit. Database
+    /// construction rejects zero.
+    #[must_use]
+    pub fn pipeline_max_retractable_extremum_checkpoint_bytes(mut self, bytes: usize) -> Self {
+        self.config
+            .pipeline_max_retractable_extremum_checkpoint_bytes = Some(bytes);
+        self
+    }
+
     /// Backpressure policy (default `Backpressure`).
     #[must_use]
     pub fn pipeline_backpressure_policy(
@@ -827,9 +849,8 @@ impl LaminarDbBuilder {
 
     /// Validate delivery semantics whose correctness depends on the runtime mode.
     ///
-    /// Checkpoint decisions are term-fenced. Cluster exactly-once remains closed until supported
-    /// connectors also provide certified term-fenced source handoff and external sink cursor
-    /// commit across reassignment.
+    /// Connector-specific exact-delivery certification is checked before connector I/O, when the
+    /// concrete source and sink contracts are available.
     fn validate_cluster_delivery(
         runtime_mode: RuntimeMode,
         guarantee: laminar_connectors::connector::DeliveryGuarantee,
@@ -845,14 +866,7 @@ impl LaminarDbBuilder {
                  rebalance/state-loss contract"
                     .into(),
             )),
-            DeliveryGuarantee::AtLeastOnce => Ok(()),
-            DeliveryGuarantee::ExactlyOnce => Err(DbError::Config(
-                "[LDB-0013] cluster exactly-once is not admitted: checkpoint decisions are \
-                 term-fenced, but supported connectors do not yet provide a certified \
-                 term-fenced source handoff and external sink cursor commit. Use cluster \
-                 at_least_once, or exactly_once in embedded/single-node mode"
-                    .into(),
-            )),
+            DeliveryGuarantee::AtLeastOnce | DeliveryGuarantee::ExactlyOnce => Ok(()),
         }
     }
 }
@@ -886,6 +900,29 @@ impl std::fmt::Debug for LaminarDbBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_state_budget_builder_option_is_preserved() {
+        let builder = LaminarDbBuilder::new().pipeline_max_managed_state_bytes(123_456);
+
+        assert_eq!(
+            builder.config.pipeline_max_managed_state_bytes,
+            Some(123_456)
+        );
+    }
+
+    #[test]
+    fn retractable_extremum_checkpoint_budget_builder_option_is_preserved() {
+        let builder =
+            LaminarDbBuilder::new().pipeline_max_retractable_extremum_checkpoint_bytes(654_321);
+
+        assert_eq!(
+            builder
+                .config
+                .pipeline_max_retractable_extremum_checkpoint_bytes,
+            Some(654_321)
+        );
+    }
 
     #[cfg(feature = "cluster")]
     fn test_cluster_controller_without_deadline(
@@ -1118,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_delivery_admission_fails_closed_without_durable_term_binding() {
+    fn cluster_delivery_defers_exact_connector_certification() {
         use laminar_connectors::connector::DeliveryGuarantee;
 
         assert!(LaminarDbBuilder::validate_cluster_delivery(
@@ -1126,17 +1163,16 @@ mod tests {
             DeliveryGuarantee::AtLeastOnce,
         )
         .is_ok());
-
-        let error = LaminarDbBuilder::validate_cluster_delivery(
+        assert!(LaminarDbBuilder::validate_cluster_delivery(
             RuntimeMode::Cluster,
             DeliveryGuarantee::ExactlyOnce,
         )
-        .expect_err("cluster EO must remain closed until connectors consume the fence end to end");
-        assert!(error.to_string().contains("[LDB-0013]"), "{error}");
-        assert!(
-            error.to_string().contains("external sink cursor commit"),
-            "{error}"
-        );
+        .is_ok());
+        assert!(LaminarDbBuilder::validate_cluster_delivery(
+            RuntimeMode::Cluster,
+            DeliveryGuarantee::BestEffort,
+        )
+        .is_err());
 
         assert!(LaminarDbBuilder::validate_cluster_delivery(
             RuntimeMode::Local,
@@ -1247,6 +1283,7 @@ mod tests {
             db.checkpoint_key_groups(),
         );
         manifest.participant_id = participant_id;
+        manifest.deployment_id = uuid::Uuid::from_u128(1).to_string();
         manifest.durable_phase = DurableCheckpointPhase::Finalized;
         participant_store.save(&manifest).await.unwrap();
 
@@ -1613,18 +1650,18 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn cluster_exactly_once_build_is_rejected_before_runtime_start() {
+    async fn cluster_exactly_once_build_reaches_connector_admission() {
         use laminar_connectors::connector::DeliveryGuarantee;
 
-        let error = LaminarDbBuilder::new()
+        let db = LaminarDbBuilder::new()
             .profile(Profile::Cluster)
-            .object_store_url("memory://checkpoint-test")
             .cluster_controller(test_cluster_controller())
+            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
             .delivery_guarantee(DeliveryGuarantee::ExactlyOnce)
             .build()
             .await
-            .expect_err("cluster EO must fail at database admission");
-        assert!(error.to_string().contains("[LDB-0013]"), "{error}");
+            .expect("runtime-level admission must defer to concrete connector contracts");
+        assert_eq!(db.config.delivery_guarantee, DeliveryGuarantee::ExactlyOnce);
     }
 
     #[tokio::test]

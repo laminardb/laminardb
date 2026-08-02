@@ -49,5 +49,6 @@ pub use recovery_capsule::{
     canonical_json_bytes, canonical_json_sha256, CheckpointWatermark, ClusterRecoveryCapsule,
     CommittedSourceHandoff, ParticipantRecoveryRef, RecoveryCapsuleRef, SourceHandoffState,
     VnodeRestoreContract, VnodeRestoreLimitProfile, VnodeRestoreLimits,
-    CLUSTER_RECOVERY_CAPSULE_VERSION, MAX_RECOVERY_CAPSULE_BYTES, VNODE_RESTORE_LIMITS_VERSION,
+    CLUSTER_RECOVERY_CAPSULE_VERSION, MAX_RECOVERY_CAPSULE_BYTES, MAX_VNODE_OPERATOR_ENTRIES,
+    VNODE_RESTORE_LIMITS_VERSION,
 };

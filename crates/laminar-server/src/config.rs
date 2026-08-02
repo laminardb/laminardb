@@ -189,6 +189,17 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
                 sink.name, sink.pipeline
             ));
         }
+        if sink
+            .properties
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("format"))
+        {
+            errors.push(format!(
+                "sink '{}': format must be configured as a top-level sink field, not under sink.properties",
+                sink.name
+            ));
+        }
+        collect_connector_property_errors("sink", &sink.name, &sink.properties, &mut errors);
     }
 
     let mut seen_sources = HashSet::new();
@@ -196,6 +207,17 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         if !seen_sources.insert(&source.name) {
             errors.push(format!("duplicate source name: '{}'", source.name));
         }
+        if source
+            .properties
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("format"))
+        {
+            errors.push(format!(
+                "source '{}': format must be configured as a top-level source field, not under source.properties",
+                source.name
+            ));
+        }
+        collect_connector_property_errors("source", &source.name, &source.properties, &mut errors);
     }
 
     let mut seen_pipelines = HashSet::new();
@@ -322,14 +344,7 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
                  rebalance/state-loss contract"
                     .to_string(),
             ),
-            DeliveryGuarantee::AtLeastOnce => {}
-            DeliveryGuarantee::ExactlyOnce => errors.push(
-                "[LDB-0013] cluster exactly-once is not admitted: checkpoint decisions are \
-                 term-fenced, but supported connectors do not yet provide a certified \
-                 term-fenced source handoff and external sink cursor commit. Use cluster \
-                 at_least_once, or exactly_once in embedded/single-node mode"
-                    .to_string(),
-            ),
+            DeliveryGuarantee::AtLeastOnce | DeliveryGuarantee::ExactlyOnce => {}
         }
         if config.discovery.is_none() {
             errors.push("mode = \"cluster\" requires a [discovery] section".to_string());
@@ -418,6 +433,29 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     }
 
     Ok(())
+}
+
+fn collect_connector_property_errors(
+    kind: &str,
+    name: &str,
+    properties: &toml::Table,
+    errors: &mut Vec<String>,
+) {
+    for (key, value) in properties {
+        if !connector_property_is_flat(value) {
+            errors.push(format!(
+                "{kind} '{name}': property '{key}' is nested; connector properties must be flat (quote dotted keys such as \"bootstrap.servers\")"
+            ));
+        }
+    }
+}
+
+fn connector_property_is_flat(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Table(_) => false,
+        toml::Value::Array(values) => values.iter().all(connector_property_is_flat),
+        _ => true,
+    }
 }
 
 /// Top-level server configuration deserialized from `laminardb.toml`.
@@ -872,6 +910,7 @@ fn validate_ai(config: &ServerConfig, errors: &mut Vec<String>) {
 
 /// `[[source]]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceConfig {
     pub name: String,
     /// Connector type: "kafka", "postgres-cdc", "mongodb-cdc", "generator".
@@ -954,6 +993,9 @@ pub struct SinkConfig {
     pub pipeline: String,
     /// Connector type: "kafka", "postgres", "delta-lake", "iceberg", "stdout".
     pub connector: String,
+    /// Optional serialization format, emitted as a `FORMAT` clause.
+    #[serde(default)]
+    pub format: Option<String>,
     #[serde(default)]
     pub properties: toml::Table,
 }
@@ -1321,6 +1363,7 @@ sql = "SELECT symbol, SUM(price) FROM trades GROUP BY symbol"
 name = "output"
 pipeline = "vwap"
 connector = "kafka"
+format = "json"
 [sink.properties]
 "bootstrap.servers" = "localhost:9092"
 topic = "vwap_output"
@@ -1350,6 +1393,7 @@ topic = "vwap_output"
         assert_eq!(config.pipelines.len(), 1);
         assert_eq!(config.sinks.len(), 1);
         assert_eq!(config.sinks[0].pipeline, "vwap");
+        assert_eq!(config.sinks[0].format.as_deref(), Some("json"));
         assert_eq!(
             config.sinks[0]
                 .properties
@@ -1359,6 +1403,59 @@ topic = "vwap_output"
         );
 
         validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn test_format_is_not_a_connector_property() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+[[source]]
+name = "input"
+connector = "kafka"
+[source.properties]
+FoRmAt = "json"
+
+[[pipeline]]
+name = "events"
+sql = "SELECT 1"
+
+[[sink]]
+name = "output"
+pipeline = "events"
+connector = "kafka"
+[sink.properties]
+format = "json"
+"#,
+        )
+        .unwrap();
+
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("top-level source field"), "{error}");
+        assert!(error.contains("top-level sink field"), "{error}");
+
+        let error = toml::from_str::<ServerConfig>(
+            r#"
+[[source]]
+name = "input"
+connector = "kafka"
+formt = "json"
+"#,
+        )
+        .expect_err("misspelled source runtime fields must fail closed");
+        assert!(error.to_string().contains("formt"), "{error}");
+
+        let config: ServerConfig = toml::from_str(
+            r#"
+[[source]]
+name = "input"
+connector = "kafka"
+[source.properties]
+bootstrap.servers = "localhost:9092"
+"#,
+        )
+        .unwrap();
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("quote dotted keys"), "{error}");
     }
 
     #[test]
@@ -1493,10 +1590,34 @@ seeds = ["node-1:7946"]
         else {
             panic!("expected validation errors");
         };
-        assert!(errors.iter().any(|error| error.contains("[LDB-0013]")));
         assert!(errors
             .iter()
             .any(|error| { error.contains("ClusterShared [checkpoint]") }));
+
+        let cluster_exact_complete: ServerConfig = toml::from_str(
+            r#"
+node_id = "node-1"
+
+[server]
+mode = "cluster"
+delivery = "exactly_once"
+
+[state]
+backend = "object_store"
+url = "s3://bucket/state"
+
+[checkpoint]
+url = "s3://bucket/checkpoints"
+
+[discovery]
+strategy = "static"
+seeds = ["node-1:7946"]
+
+"#,
+        )
+        .unwrap();
+        validate_config(&cluster_exact_complete)
+            .expect("connector contracts, not the server mode, gate cluster exact delivery");
 
         let cluster_best_effort: ServerConfig = toml::from_str(
             r#"

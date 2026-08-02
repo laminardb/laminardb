@@ -739,24 +739,33 @@ async fn repeated_start_is_rejected_before_network_io() {
 
 #[cfg(feature = "mongodb-cdc")]
 #[test]
-fn enabled_contract_is_replayable_singleton() {
-    let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
-    let source = MongoDbCdcSource::new(config, None);
-    let contract = source
+fn contract_fails_closed_for_raw_json_envelope() {
+    let source = MongoDbCdcSource::new(
+        MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll"),
+        None,
+    );
+    let error = source
         .contract(&ConnectorConfig::new("mongodb-cdc"))
-        .unwrap();
-    assert_eq!(contract.consistency, SourceConsistency::Replayable);
-    assert_eq!(contract.topology, SourceTopology::Singleton);
-    assert!(!contract.is_exact_delivery_certified());
+        .unwrap_err();
+    assert!(error.to_string().contains("raw JSON change envelope"));
+
+    let mut config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
+    config.full_document_mode = super::super::config::FullDocumentMode::RequirePostImage;
+    let source = MongoDbCdcSource::new(config, None);
+    let error = source
+        .contract(&ConnectorConfig::new("mongodb-cdc"))
+        .unwrap_err();
+    assert!(error.to_string().contains("raw JSON change envelope"));
 }
 
 #[cfg(feature = "mongodb-cdc")]
 #[test]
 fn contract_validates_request_configuration() {
     let source = MongoDbCdcSource::new(MongoDbSourceConfig::default(), None);
-    let config = valid_connector_config();
-    let contract = source.contract(&config).unwrap();
-    assert_eq!(contract.consistency, SourceConsistency::Replayable);
+    let mut config = valid_connector_config();
+    config.set("full.document.mode", "required");
+    let error = source.contract(&config).unwrap_err();
+    assert!(error.to_string().contains("raw JSON change envelope"));
 
     let mut removed = config;
     removed.set("max.poll.records", "10");

@@ -5078,6 +5078,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossfire",
+ "deltalake",
  "futures",
  "gethostname",
  "humantime-serde",

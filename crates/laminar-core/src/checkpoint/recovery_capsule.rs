@@ -11,20 +11,21 @@ use crate::checkpoint::{
 use crate::state::CheckpointAttempt;
 
 /// Current canonical cluster recovery-capsule format.
-pub const CLUSTER_RECOVERY_CAPSULE_VERSION: u32 = 6;
+pub const CLUSTER_RECOVERY_CAPSULE_VERSION: u32 = 7;
 
 /// Current durable vnode-restore limit format.
-pub const VNODE_RESTORE_LIMITS_VERSION: u16 = 1;
+pub const VNODE_RESTORE_LIMITS_VERSION: u16 = 2;
+
+/// Maximum managed operator entries in one vnode artifact.
+pub const MAX_VNODE_OPERATOR_ENTRIES: u32 = 1_024;
 
 /// Capability profile that supplied a committed vnode-restore limit.
 ///
-/// The current profile preserves the bounded compatibility path used by the admitted global
-/// aggregate. It is deliberately not authority to admit distributed keyed operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VnodeRestoreLimitProfile {
-    /// Existing bounded global-state compatibility profile.
-    GlobalSingletonCompatibility,
+    /// Current managed vnode state shared by every stateful operator.
+    ManagedVnode,
 }
 
 /// Versioned raw-input limits agreed by every participant in a cluster checkpoint.
@@ -39,6 +40,8 @@ pub struct VnodeRestoreLimits {
     pub max_partial_payload_bytes: u64,
     /// Maximum physical artifacts in one vnode ancestry.
     pub max_artifacts_per_vnode_chain: u32,
+    /// Maximum named operator payloads in one vnode artifact.
+    pub max_operator_entries_per_vnode: u32,
     /// Maximum summed raw lineage payload for the complete cluster cut.
     pub max_cluster_lineage_payload_bytes: u64,
     /// Maximum summed lineage artifacts for the complete vnode domain.
@@ -46,11 +49,11 @@ pub struct VnodeRestoreLimits {
 }
 
 impl VnodeRestoreLimits {
-    /// Construct the current compatibility profile with checked derived cluster limits.
+    /// Construct the current managed-vnode profile with checked derived cluster limits.
     ///
     /// # Errors
     /// Returns an error for zero limits or arithmetic overflow.
-    pub fn global_singleton_compatibility(
+    pub fn managed_vnode(
         max_partial_payload_bytes: u64,
         max_artifacts_per_vnode_chain: u32,
         vnode_count: u32,
@@ -73,9 +76,10 @@ impl VnodeRestoreLimits {
             .ok_or_else(|| "vnode restore cluster artifact limit overflowed".to_owned())?;
         Ok(Self {
             version: VNODE_RESTORE_LIMITS_VERSION,
-            profile: VnodeRestoreLimitProfile::GlobalSingletonCompatibility,
+            profile: VnodeRestoreLimitProfile::ManagedVnode,
             max_partial_payload_bytes,
             max_artifacts_per_vnode_chain,
+            max_operator_entries_per_vnode: MAX_VNODE_OPERATOR_ENTRIES,
             max_cluster_lineage_payload_bytes,
             max_cluster_lineage_artifacts,
         })
@@ -86,7 +90,7 @@ impl VnodeRestoreLimits {
     /// # Errors
     /// Returns an error when the record is non-canonical or its arithmetic is inconsistent.
     pub fn validate(&self, vnode_count: u32) -> Result<(), String> {
-        let expected = Self::global_singleton_compatibility(
+        let expected = Self::managed_vnode(
             self.max_partial_payload_bytes,
             self.max_artifacts_per_vnode_chain,
             vnode_count,
@@ -168,9 +172,8 @@ impl VnodeRestoreContract {
 #[cfg(test)]
 pub(crate) fn vnode_restore_contract_for_test(vnode_count: u32) -> VnodeRestoreContract {
     let exact_payload_bytes = u64::from(vnode_count).max(1);
-    let limits =
-        VnodeRestoreLimits::global_singleton_compatibility(exact_payload_bytes, 1, vnode_count)
-            .expect("test vnode restore limits");
+    let limits = VnodeRestoreLimits::managed_vnode(exact_payload_bytes, 1, vnode_count)
+        .expect("test vnode restore limits");
     VnodeRestoreContract::new(
         limits,
         exact_payload_bytes,
@@ -1067,7 +1070,7 @@ mod tests {
 
     #[test]
     fn vnode_restore_contract_accepts_exact_limits_and_rejects_max_plus_one() {
-        let limits = VnodeRestoreLimits::global_singleton_compatibility(10, 2, 3).unwrap();
+        let limits = VnodeRestoreLimits::managed_vnode(10, 2, 3).unwrap();
         assert_eq!(limits.max_cluster_lineage_payload_bytes, 20);
         assert_eq!(limits.max_cluster_lineage_artifacts, 6);
 
@@ -1082,21 +1085,18 @@ mod tests {
 
     #[test]
     fn vnode_restore_limits_recompute_profile_derived_bounds() {
-        assert!(
-            VnodeRestoreLimits::global_singleton_compatibility(u64::MAX, 2, 1)
-                .unwrap_err()
-                .contains("payload limit overflowed")
-        );
+        assert!(VnodeRestoreLimits::managed_vnode(u64::MAX, 2, 1)
+            .unwrap_err()
+            .contains("payload limit overflowed"));
 
-        let mut limits = VnodeRestoreLimits::global_singleton_compatibility(10, 2, 3).unwrap();
+        let mut limits = VnodeRestoreLimits::managed_vnode(10, 2, 3).unwrap();
         limits.max_cluster_lineage_payload_bytes += 1;
         assert!(limits
             .validate(3)
             .unwrap_err()
             .contains("profile-derived bounds"));
 
-        let mut wrong_version =
-            VnodeRestoreLimits::global_singleton_compatibility(10, 2, 3).unwrap();
+        let mut wrong_version = VnodeRestoreLimits::managed_vnode(10, 2, 3).unwrap();
         wrong_version.version -= 1;
         assert!(wrong_version
             .validate(3)

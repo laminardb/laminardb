@@ -64,6 +64,58 @@ pub(crate) fn normalize_connector_type(raw: &str) -> String {
     raw.to_ascii_lowercase()
 }
 
+pub(crate) fn validate_connector_format_options(
+    kind: &str,
+    connector_options: &HashMap<String, String>,
+    format: Option<&str>,
+    format_options: &HashMap<String, String>,
+) -> Result<(), DbError> {
+    if format.is_none() && !format_options.is_empty() {
+        return Err(DbError::Connector(format!(
+            "{kind} format options require an explicit FORMAT clause"
+        )));
+    }
+    if connector_options
+        .keys()
+        .chain(format_options.keys())
+        .any(|key| key.eq_ignore_ascii_case("format"))
+    {
+        return Err(DbError::Connector(format!(
+            "{kind} option 'format' is unsupported; declare the format with the FORMAT clause"
+        )));
+    }
+    if let Some(key) = format_options.keys().find(|format_key| {
+        connector_options
+            .keys()
+            .any(|connector_key| connector_key.eq_ignore_ascii_case(format_key))
+    }) {
+        return Err(DbError::Connector(format!(
+            "{kind} option '{key}' is declared in both connector options and FORMAT WITH"
+        )));
+    }
+    let reserved: &[&str] = if kind.eq_ignore_ascii_case("source") {
+        &["laminar.source.name", "_arrow_schema"]
+    } else if kind.eq_ignore_ascii_case("sink") {
+        &["delivery.guarantee", "_arrow_schema"]
+    } else {
+        &[]
+    };
+    if let Some(key) = connector_options
+        .keys()
+        .chain(format_options.keys())
+        .find(|key| {
+            reserved
+                .iter()
+                .any(|reserved| key.eq_ignore_ascii_case(reserved))
+        })
+    {
+        return Err(DbError::Connector(format!(
+            "{kind} option '{key}' is owned by the runtime and cannot be configured"
+        )));
+    }
+    Ok(())
+}
+
 /// Build a `ConnectorConfig` from any registration that has connector fields.
 fn build_connector_config(
     kind: &str,
@@ -75,6 +127,7 @@ fn build_connector_config(
 ) -> Result<ConnectorConfig, DbError> {
     let ct = connector_type
         .ok_or_else(|| DbError::Connector(format!("{kind} '{name}' has no connector type")))?;
+    validate_connector_format_options(kind, connector_options, format, format_options)?;
     let mut config = ConnectorConfig::new(normalize_connector_type(ct));
     for (k, v) in connector_options {
         config.set(k.clone(), v.clone());
@@ -89,7 +142,7 @@ fn build_connector_config(
         config.set("format".to_string(), lower);
     }
     for (k, v) in format_options {
-        config.set(format!("format.{k}"), v.clone());
+        config.set(k.clone(), v.clone());
     }
     Ok(config)
 }
@@ -111,16 +164,6 @@ pub(crate) fn build_sink_config(
     reg: &SinkRegistration,
     delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
 ) -> Result<ConnectorConfig, DbError> {
-    if reg
-        .connector_options
-        .keys()
-        .any(|key| key.eq_ignore_ascii_case("delivery.guarantee"))
-    {
-        return Err(DbError::Connector(format!(
-            "Sink '{}' cannot set 'delivery.guarantee'; delivery is configured once for the pipeline",
-            reg.name
-        )));
-    }
     let mut config = build_connector_config(
         "Sink",
         &reg.name,
@@ -609,14 +652,21 @@ mod tests {
                 ),
             ]),
             format: Some("JSON".to_string()),
-            format_options: HashMap::from([("include_schema".to_string(), "true".to_string())]),
+            format_options: HashMap::from([(
+                "schema.registry.url".to_string(),
+                "http://registry:8081".to_string(),
+            )]),
         };
         let config = build_source_config(&reg).unwrap();
         assert_eq!(config.connector_type(), "kafka"); // normalized lowercase
         assert_eq!(config.get("topic"), Some("clicks"));
         assert_eq!(config.get("bootstrap.servers"), Some("localhost:9092"));
         assert_eq!(config.get("format"), Some("json"));
-        assert_eq!(config.get("format.include_schema"), Some("true"));
+        assert_eq!(
+            config.get("schema.registry.url"),
+            Some("http://registry:8081")
+        );
+        assert_eq!(config.get("format.schema.registry.url"), None);
     }
 
     #[test]
@@ -686,7 +736,7 @@ mod tests {
             connector_type: Some("KAFKA".to_string()),
             connector_options: HashMap::from([("topic".to_string(), "output".to_string())]),
             format: Some("JSON".to_string()),
-            format_options: HashMap::new(),
+            format_options: HashMap::from([("json.path".to_string(), "payload".to_string())]),
             filter_expr: Some("id > 10".to_string()),
         };
         let config = build_sink_config(
@@ -697,6 +747,8 @@ mod tests {
         assert_eq!(config.connector_type(), "kafka");
         assert_eq!(config.get("topic"), Some("output"));
         assert_eq!(config.get("format"), Some("json"));
+        assert_eq!(config.get("json.path"), Some("payload"));
+        assert_eq!(config.get("format.json.path"), None);
         assert_eq!(
             config.get("delivery.guarantee"),
             Some("at-least-once"),
@@ -725,8 +777,35 @@ mod tests {
         )
         .expect_err("per-sink delivery must not be silently overwritten");
         let message = error.to_string();
-        assert!(message.contains("delivery.guarantee"), "{message}");
-        assert!(message.contains("pipeline"), "{message}");
+        assert!(
+            message.to_ascii_lowercase().contains("delivery.guarantee"),
+            "{message}"
+        );
+        assert!(message.contains("owned by the runtime"), "{message}");
+    }
+
+    #[test]
+    fn connector_and_format_option_namespaces_must_not_collide() {
+        let connector_options = HashMap::from([("format".to_string(), "json".to_string())]);
+        let error =
+            validate_connector_format_options("Source", &connector_options, None, &HashMap::new())
+                .unwrap_err();
+        assert!(error.to_string().contains("FORMAT clause"));
+
+        let connector_options =
+            HashMap::from([("SCHEMA.REGISTRY.URL".to_string(), "first".to_string())]);
+        let format_options =
+            HashMap::from([("schema.registry.url".to_string(), "second".to_string())]);
+        let error = validate_connector_format_options(
+            "Sink",
+            &connector_options,
+            Some("avro"),
+            &format_options,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("both connector options and FORMAT WITH"));
     }
 
     #[test]

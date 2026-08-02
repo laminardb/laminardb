@@ -219,6 +219,51 @@ fn test_with_schema() {
     assert_eq!(sink.schema(), schema);
 }
 
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn open_rejects_injected_weight_schema_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("weighted");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let path = table_dir.to_string_lossy().to_string();
+
+    let legacy_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            DataType::Int64,
+            true,
+        ),
+    ]));
+    super::super::delta_io::open_or_create_table(
+        &path,
+        std::collections::HashMap::new(),
+        Some(&legacy_schema),
+    )
+    .await
+    .unwrap();
+
+    let pipeline_schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            DataType::Int64,
+            false,
+        ),
+    ]);
+    let mut connector_config = ConnectorConfig::new("delta-lake");
+    connector_config.set("table.path", &path);
+    connector_config.set(
+        "_arrow_schema",
+        crate::config::encode_arrow_schema_ipc(&pipeline_schema),
+    );
+
+    let mut sink = DeltaLakeSink::new(DeltaLakeSinkConfig::new(&path), None);
+    let error = sink.open(&connector_config).await.unwrap_err();
+    assert!(matches!(&error, ConnectorError::SchemaMismatch(_)));
+    assert!(error.to_string().contains("non-null Int64"));
+}
+
 #[test]
 fn test_schema_empty_when_none() {
     let sink = DeltaLakeSink::new(test_config(), None);
@@ -556,14 +601,37 @@ async fn test_close() {
 // ── Contract tests ──
 
 #[test]
-fn test_contract_append_exactly_once() {
-    let mut config = test_config();
-    config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-    let sink = DeltaLakeSink::new(config, None);
-    let contract = sink.contract(&ConnectorConfig::new("delta-lake")).unwrap();
-    assert_eq!(contract.consistency, SinkConsistency::CheckpointCommittable);
-    assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
-    assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(30));
+fn test_contract_append_exactly_once_certifies_only_direct_s3() {
+    for (path, topology, cluster_exact) in [
+        ("s3://bucket/table", SinkTopology::MultiWriter, true),
+        ("s3a://bucket/table", SinkTopology::MultiWriter, true),
+        ("gs://bucket/table", SinkTopology::MultiWriter, false),
+        ("az://container/table", SinkTopology::MultiWriter, false),
+        ("abfs://container/table", SinkTopology::MultiWriter, false),
+        ("abfss://container/table", SinkTopology::MultiWriter, false),
+        ("wasb://container/table", SinkTopology::MultiWriter, false),
+        ("wasbs://container/table", SinkTopology::MultiWriter, false),
+        (
+            "uc://catalog/schema/table",
+            SinkTopology::MultiWriter,
+            false,
+        ),
+        ("C:/delta/table", SinkTopology::Singleton, false),
+    ] {
+        let mut config = DeltaLakeSinkConfig::new(path);
+        config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+        let sink = DeltaLakeSink::new(config, None);
+        let contract = sink.contract(&ConnectorConfig::new("delta-lake")).unwrap();
+        assert_eq!(contract.consistency, SinkConsistency::CheckpointCommittable);
+        assert_eq!(contract.topology, topology, "path={path}");
+        assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
+        assert_eq!(
+            contract.is_cluster_exact_delivery_certified(),
+            cluster_exact,
+            "path={path}"
+        );
+        assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(30));
+    }
 }
 
 #[cfg(feature = "delta-lake")]
@@ -582,6 +650,7 @@ fn test_contract_upsert() {
     let contract = sink.contract(&ConnectorConfig::new("delta-lake")).unwrap();
     assert_eq!(contract.consistency, SinkConsistency::DurableAtLeastOnce);
     assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
+    assert!(!contract.is_cluster_exact_delivery_certified());
 }
 
 #[test]
@@ -591,6 +660,8 @@ fn test_contract_at_least_once() {
     let sink = DeltaLakeSink::new(config, None);
     let contract = sink.contract(&ConnectorConfig::new("delta-lake")).unwrap();
     assert_eq!(contract.consistency, SinkConsistency::DurableAtLeastOnce);
+    assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
+    assert!(!contract.is_cluster_exact_delivery_certified());
 }
 
 // ── Changelog splitting tests ──

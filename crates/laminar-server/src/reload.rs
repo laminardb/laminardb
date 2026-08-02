@@ -465,6 +465,7 @@ mod tests {
             name: name.to_string(),
             pipeline: pipeline.to_string(),
             connector: "kafka".to_string(),
+            format: None,
             properties: toml::Table::new(),
         }
     }

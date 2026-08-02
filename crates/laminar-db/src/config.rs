@@ -7,6 +7,17 @@ use std::path::PathBuf;
 use laminar_connectors::connector::DeliveryGuarantee;
 use laminar_core::streaming::{BackpressureStrategy, StreamCheckpointConfig};
 
+/// Default pipeline-wide lower-bound charge allowed for managed operator working state.
+///
+/// This execution budget is independent of checkpoint storage and any future local-state backend.
+pub const DEFAULT_MAX_MANAGED_STATE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Default pre-encoding work charge allowed for one retractable MIN/MAX checkpoint capture.
+///
+/// This limit is independent of checkpoint storage and any present or future local-state backend.
+/// It is a cached accumulator work proxy, not an encoded-payload or process-RSS limit.
+pub const DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES: usize = 1024 * 1024;
+
 /// What to do when an operator's input buffer exceeds its cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackpressurePolicy {
@@ -101,6 +112,14 @@ pub struct LaminarConfig {
     pub pipeline_max_input_buf_batches: Option<usize>,
     /// Per-port operator input-buffer cap (bytes). `None` = disabled.
     pub pipeline_max_input_buf_bytes: Option<usize>,
+    /// Pipeline-wide managed working-state budget in charged bytes. `None` resolves to
+    /// [`DEFAULT_MAX_MANAGED_STATE_BYTES`] when the database is constructed.
+    pub pipeline_max_managed_state_bytes: Option<usize>,
+    /// Pre-encoding work budget for one retractable MIN/MAX checkpoint capture. `None` resolves to
+    /// [`DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES`] when the database is constructed.
+    /// This charge is not an encoded-payload or process-RSS limit. Database construction rejects
+    /// zero.
+    pub pipeline_max_retractable_extremum_checkpoint_bytes: Option<usize>,
     /// Backpressure policy. See [`BackpressurePolicy`].
     pub pipeline_backpressure_policy: BackpressurePolicy,
     /// Auto-restart policy applied when supervision is enabled.
@@ -128,6 +147,8 @@ impl Default for LaminarConfig {
             pipeline_query_budget_ns: None,
             pipeline_max_input_buf_batches: None,
             pipeline_max_input_buf_bytes: None,
+            pipeline_max_managed_state_bytes: None,
+            pipeline_max_retractable_extremum_checkpoint_bytes: None,
             pipeline_backpressure_policy: BackpressurePolicy::default(),
             restart_policy: RestartPolicy::default(),
             shared_source_isolation: false,

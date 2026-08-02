@@ -9,7 +9,7 @@ LaminarDB is an embedded streaming database designed for sub-microsecond latency
 1. **Embedded First** -- Single binary, no external dependencies
 2. **Sub-Microsecond Latency** -- Minimal allocations on hot path
 3. **SQL Native** -- Full SQL support via Apache DataFusion
-4. **Explicit Delivery Contracts** -- Best-effort, at-least-once, or a certification-gated single-node exact candidate, validated before connector I/O
+4. **Explicit Delivery Contracts** -- Best-effort, at-least-once, or connector-gated exactly-once, validated before connector I/O
 5. **Arrow-Native** -- Apache Arrow RecordBatch at every boundary
 
 ## Architecture Overview
@@ -64,8 +64,8 @@ and injects/aligns in-band checkpoint barriers.
 
 **Components:**
 - **StreamExecutor** -- Drives DataFusion SQL execution per cycle. Optimization tiers: `CompiledProjection` (single-source non-aggregate queries compiled to `PhysicalExpr`), `IncrementalAggState` (incremental GROUP BY with per-group accumulators), and `CoreWindowState` (tumbling/hopping/session windows via optimized `CoreWindowAssigner`). Queries that don't match these tiers fall back to full DataFusion execution.
-- **Operators** -- Stateless transforms (map, filter, project) and stateful operators (tumbling/sliding/hopping/session windows, stream-stream joins, ASOF joins, temporal joins, lookup joins, lag/lead, ranking).
-- **State** -- Operators hold state in internal `FxHashMap`s (per-group accumulators, window buffers, join buffers). A checkpoint serializes and seals state under an immutable attempt; the manifest inventories the exact state keys, lengths, and digests.
+- **Operators** -- Stateless transforms (map, filter, project) and stateful operators (tumbling/sliding/hopping/session windows, the bounded interval join, lag/lead, ranking).
+- **State** -- Stateful operators use one managed capture/restore/ownership lifecycle with operator-specific in-memory layouts. A checkpoint serializes and seals state under an immutable attempt; the manifest inventories the exact state keys, lengths, and digests.
 - **Emit** -- Pushes output RecordBatches to downstream streams and sinks via tokio mpsc channels.
 
 **Compiled query execution**: Non-aggregate single-source queries are compiled to `PhysicalExpr` projections on first execution, eliminating per-cycle SQL overhead. Complex queries cache their optimized logical plans.
@@ -123,7 +123,7 @@ How an event moves through the system:
 3. **Operator processing**: The coordinator runs batches through SQL execution cycles (windows, joins, aggregations, filters). State is held in per-group accumulators and window buffers.
 4. **Emit**: Results are published to named streams. Subscribers receive RecordBatches via typed `TypedSubscription<T>` or callback subscriptions.
 5. **Durability**: Operator state and connector positions are captured under an exact attempt, sealed with a participant-complete inventory, then referenced by a prepared/finalized manifest and durable decision.
-6. **Sink output**: Each sink advertises durability, topology, and input-mode contracts. Kafka, PostgreSQL, MongoDB, file, and Iceberg sinks provide at-least-once writes; only append-mode Delta Lake implements coordinated external publication for an admitted single-node exactly-once pipeline.
+6. **Sink output**: Each sink advertises durability, topology, and input-mode contracts. Kafka, PostgreSQL, MongoDB, file, and Iceberg sinks provide at-least-once writes; coordinated append-mode Delta Lake implements external publication for admitted local exactly-once pipelines and direct S3/S3A cluster exactly-once pipelines.
 
 ## Crate Map
 
@@ -138,7 +138,7 @@ laminar-sql           SQL parser (streaming extensions), query planner,
                       DataFusion integration, operator config translators,
                       custom UDFs (tumble, hop, session, slide, first_value, last_value),
                       streaming physical optimizer, cooperative scheduling,
-                      PROCTIME() UDF, temporal probe join translator
+                      PROCTIME() UDF, bounded interval-join translator
                       |
 laminar-connectors    Kafka source/sink, PostgreSQL CDC/sink,
                       MongoDB CDC source/sink, WebSocket source/sink,
@@ -152,8 +152,7 @@ laminar-db            Unified facade: LaminarDB struct, LaminarDbBuilder,
                       StreamingCoordinator, checkpoint coordinator, recovery manager,
                       connector manager, pipeline observability, deployment profiles,
                       FFI API (C bindings, Arrow C Data Interface),
-                      SQL operator routing (core_window_state),
-                      EOWC incremental window accumulators (eowc_state)
+                      SQL operator routing and managed vnode state
                       |
 laminar-derive        Proc macros: #[derive(Record, FromRecordBatch, FromRow, ConnectorConfig)]
 laminar-server        Standalone binary: TOML config, Axum HTTP REST + WebSocket,
@@ -217,20 +216,17 @@ let db = LaminarDB::builder()
 
 ### Operator State
 
-The production SQL path currently retains hot state in operator-specific maps and buffers.
-Checkpoint formats are likewise operator-specific: aggregate state uses versioned rkyv metadata and
-Arrow IPC columnar payloads, while other operators have their own local snapshot formats. This is
-not one managed hot-state engine.
-
-Unbounded keyed aggregates can outgrow RAM. They remain memory-resident until a production-ready
-spill path is implemented and validated; deployments must size or bound those queries accordingly.
+Hot state stays in operator-specific in-memory maps and buffers under one managed vnode lifecycle.
+The bounded interval join uses per-vnode state, aligned checkpoint capture, bounded restore, and
+fenced ownership swaps in both local and cluster execution. Non-windowed keyed aggregates use the
+same lifecycle in both modes; event-time windowed aggregation is not yet admitted in cluster mode.
+Join output is hard-capped at 262,144 rows and 64 MiB per cycle, so excessive hot-key fanout causes
+a terminal controlled failure instead of spilling or exhausting the process.
 
 `laminar_core::state::StateBackend` persists immutable checkpoint-attempt vnode artifacts and the
-exact-attempt durability seal. It is shared recovery authority, not a point/range state store used
-while processing rows. Cluster aggregate code already has key shuffle and per-vnode
-capture/restore/revoke substrate, but grouped state remains inadmissible because its live map lacks
-a byte-governed spill path. Window-close and join operators also lack complete per-vnode
-state/timer/input lifecycles. The proposed managed-state design is
+exact-attempt durability seal. It is recovery authority, not a point/range store on the row path.
+Unbounded working sets can still outgrow RAM, so deployments must size or bound them until the
+selected worker-local TidesDB path is integrated and qualified against the production gates. See
 [ADR-008](architecture-decisions/ADR-008-managed-vnode-keyed-state.md).
 
 ### Streaming Channels
@@ -317,7 +313,7 @@ SQL parsing goes through sqlparser-rs with these streaming extensions:
 | Watermarks | `WATERMARK FOR col AS expr` | Event time tracking |
 | Late data | `ALLOW LATENESS INTERVAL` / `LATE DATA TO <sink>` | Grace periods, side outputs |
 | EMIT clause | `EMIT ON WINDOW CLOSE` | Output control |
-| ASOF JOIN | `ASOF JOIN ... ON ... AND ts >= ts` | Point-in-time lookups |
+| Bounded joins | `INNER`, `LEFT`, `RIGHT`, `FULL`, `LEFT/RIGHT SEMI`, `LEFT/RIGHT ANTI` | Direct watermarked append-only sources |
 | Lookup tables | `CREATE LOOKUP TABLE ... (...) WITH ('connector' = 'postgres', ...)` | Reference data |
 | LAG/LEAD | `LAG(col, offset) OVER (...)` | Sliding analytics |
 | Ranking | `ROW_NUMBER() OVER (...)` | Ranking functions |
@@ -368,7 +364,7 @@ node. Local paths and `file://` storage are node-durable only.
 
 ## Exactly-Once Semantics
 
-Exactly-once admission is currently limited to embedded/single-node mode and works through:
+Exactly-once delivery works through:
 
 1. **Source offsets** -- Tracked per-source, persisted in checkpoint manifests
 2. **Barrier-based snapshots** -- `StreamingCoordinator` injects checkpoint barriers at sources; all sources align on the barrier before operator state is captured
@@ -383,7 +379,7 @@ Exactly-once admission is currently limited to embedded/single-node mode and wor
 7. **Shutdown ownership** -- An issued decision write remains owned until its task settles.
    Teardown never cancels or detaches it before releasing deployment or recovery fences.
 
-Startup additionally requires node-durable state, the built-in local
+Embedded and single-node startup additionally require node-durable state, the built-in local
 checkpoint/decision store held by an exclusive OS deployment lock, an exact-delivery-certified
 source, and a `CheckpointCommittable` sink. In the standalone server, a
 `file://` checkpoint URL selects that built-in store. Shared object-store URLs
@@ -392,18 +388,19 @@ because their provenance cannot yet prove that the local lock fences every
 writer. Incompatible connectors fail before external I/O;
 there is no per-connector delivery override or public writer ID.
 
-The only admitted local exact candidate is the certified deterministic generator with append-mode
-Delta Lake, and it is not yet production-certified end to end. Iceberg is
-`DurableAtLeastOnce` and never `CheckpointCommittable`. Local Kafka sources use engine-owned assignment in supported guaranteed modes;
-dynamic consumer-group ownership is `BestEffort` and its revoke callback does not claim a later
-asynchronous checkpoint can retain the partition. The Kafka sink forces `acks=all` and is
-`DurableAtLeastOnce`, never `CheckpointCommittable`; weaker acknowledgement modes are rejected.
-This Kafka sink does not implement transactional checkpoint commit.
+Exactly-once admission requires an exact-certified source and a `CheckpointCommittable` sink. Kafka
+source is replayable, splittable, and exact-certified. Delta coordinated append is the local exact
+path; only direct S3/S3A Delta is cluster-exact certified. Standard Azure and GCS Delta targets are
+shared at-least-once targets but await native-provider fault soaks for cluster EO. Iceberg append is
+`DurableAtLeastOnce` and has no checkpoint-bound catalog cursor, so EO admission rejects it. The
+Kafka sink forces `acks=all` but remains `DurableAtLeastOnce`; it does not implement transactional
+checkpoint commit. Unsupported connector combinations fail before I/O, and the end-to-end
+production soak remains pending.
 
-PostgreSQL CDC is resume-only: fresh `Initial` startup is rejected before I/O. Kafka and MongoDB
-CDC remain at-least-once-only pending exact-delivery certification; MongoDB has event-level resume
-but no initial snapshot or transaction-group guarantee. Delta Lake and Iceberg sources are ephemeral singletons, so they are local
-`BestEffort`-only sources and are unavailable in cluster mode.
+PostgreSQL CDC is resume-only: fresh `Initial` startup is rejected before I/O. MongoDB CDC has
+event-level resume but no initial snapshot or transaction-group guarantee. Delta Lake and Iceberg
+sources are ephemeral singletons, so they are local `BestEffort`-only sources and are unavailable in
+cluster mode.
 
 ## Cluster Architecture (Distributed Mode)
 
@@ -412,19 +409,20 @@ With the `cluster` feature enabled, multi-node operation provides:
 - **Discovery** -- Static seed configuration or Chitchat gossip membership.
 - **Coordination** -- Shared-store assignment CAS and a renewable leader lease; no embedded Raft service
 - **Partition Ownership** -- Epoch-fenced partition guards with consistent assignment
-- **Distributed Checkpoints** -- Cross-node capture and shared durable state for at-least-once recovery
+- **Distributed Checkpoints** -- Cross-node capture and shared durable state for admitted at-least-once and exactly-once recovery
 - **Cross-Node Streaming** -- Vnode-keyed row shuffle with assignment and process-generation fencing
 - **Inter-Node Control** -- Process-bound gRPC barrier delivery with durable authority validation
 
-**Delivery boundary**: cluster mode currently admits only `at_least_once` and
-requires cluster-shared S3/GCS/Azure state. Cluster `exactly_once` fails closed
-with `[LDB-0013]`: checkpoint decisions are term-fenced, but supported connectors
-do not yet provide certified term-fenced source handoff and external sink cursor
-commits, so end-to-end term fencing cannot yet be proven.
+**Delivery boundary**: cluster mode requires cluster-shared S3/GCS/Azure state. At-least-once uses
+replayable sources and durable sinks. Exactly-once is admitted only for certified Kafka input and
+direct S3/S3A append-mode Delta; incompatible sources or sinks fail with `[LDB-5035]`
+before connector I/O.
 
-**SQL boundary**: cluster `CREATE STREAM` admits stateless projection/filter pipelines and one
-direct ungrouped aggregate stage on the exact incremental path. Every keyed aggregate, windowed
-aggregate, and stateful join fails closed with `[LDB-4007]`. Every cluster materialized view is
-also rejected because retained output and distributed reads need their own assignment-fenced
-lifecycle. This admission is derived from configured runtime mode, even when one node currently
-owns every vnode. See the [validated matrix](reports/cluster-keyed-state-validation-2026-07-22.md).
+**SQL boundary**: cluster `CREATE STREAM` admits stateless pipelines, supported non-windowed keyed
+aggregates, and one bounded append-only event-time equi-join stage over direct watermarked sources.
+That stage supports `INNER`, `LEFT`, `RIGHT`, `FULL`, `LEFT/RIGHT SEMI`, and `LEFT/RIGHT ANTI` with
+ordered `Utf8`/`Int64` composite keys and explicit aliases for every projected expression. A named
+join stream from any of the eight kinds may feed a separate keyed aggregate stream. Fused
+`JOIN ... GROUP BY`, cluster windowed aggregation, intermediate-input or multi-way joins,
+temporal/lookup joins, and cluster
+materialized views fail closed. See [distributed state](DISTRIBUTED_STATE.md).

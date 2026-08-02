@@ -31,6 +31,8 @@ required-features = ["cluster"]
 laminar-core = { path = "../laminar-core", version = "0.28.0" }
 laminar-db = { path = "../laminar-db", version = "0.28.0", default-features = false, features = ["api", "remote", "local"] }
 laminar-sql = { path = "../laminar-sql", version = "0.28.0" }
+# Read-only Delta snapshot oracle for the ignored end-to-end EO soak.
+deltalake = { version = "0.31", optional = true, default-features = false, features = ["rustls"] }
 
 # For pgwire dispatch on parsed AST
 sqlparser = { workspace = true }
@@ -172,8 +174,8 @@ postgres-cdc = ["laminar-db/postgres-cdc"]
 postgres-sink = ["laminar-db/postgres-sink"]
 mongodb-cdc = ["laminar-db/mongodb-cdc"]
 nats = ["laminar-db/nats"]
-delta-lake = ["laminar-db/delta-lake"]
-delta-lake-s3 = ["delta-lake", "laminar-db/delta-lake-s3"]
+delta-lake = ["laminar-db/delta-lake", "dep:deltalake", "deltalake/datafusion"]
+delta-lake-s3 = ["delta-lake", "laminar-db/delta-lake-s3", "deltalake/s3"]
 delta-lake-azure = ["delta-lake", "laminar-db/delta-lake-azure"]
 delta-lake-gcs = ["delta-lake", "laminar-db/delta-lake-gcs"]
 delta-lake-unity = ["delta-lake", "laminar-db/delta-lake-unity"]

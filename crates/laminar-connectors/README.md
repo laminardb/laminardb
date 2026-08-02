@@ -8,7 +8,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 
 | Connector | Feature Flag | Protocol | Status |
 |-----------|-------------|----------|--------|
-| Kafka | `kafka` | Replayable at-least-once; exact delivery pending certification | Implemented |
+| Kafka | `kafka` | Replayable ALO; exact-certified input for coordinated EO pipelines | Implemented |
 | PostgreSQL CDC | `postgres-cdc` | Resume-only pgoutput replication; fresh startup is rejected | Implemented |
 | MongoDB CDC | `mongodb-cdc` | UUID-bound fixed-collection resume; replayable at-least-once only | Implemented |
 | NATS | `nats` | Core or JetStream ingestion; ephemeral because acknowledgements are not checkpoint-owned | Implemented |
@@ -45,7 +45,7 @@ backpressures rather than dropping rows.
 | NATS | `nats` | JetStream durable at-least-once after stream validation; Core is ephemeral | Implemented |
 | PostgreSQL | `postgres-sink` | COPY BINARY, upsert, durable at-least-once | Implemented |
 | MongoDB | `mongodb-cdc` | Majority-journaled ordered writes, upsert/CDC replay, durable at-least-once | Implemented |
-| Delta Lake | `delta-lake` | Coordinated append; local exactly-once remains release-gated by integration and fault/soak validation | Implemented |
+| Delta Lake | `delta-lake` | Coordinated append; cluster EO is certified only for direct S3/S3A | Implemented |
 | Iceberg | `iceberg` | REST catalog append, durable at-least-once; never checkpoint-committable | Implemented |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | Implemented |
 | WebSocket Client | `websocket` | Push to external server | Implemented |

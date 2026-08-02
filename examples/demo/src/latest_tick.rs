@@ -1,4 +1,4 @@
-//! Application-level backward ASOF merge for enriching orders with market ticks.
+//! Application-level latest-tick enrichment for enriching orders with market ticks.
 //!
 //! For each order, finds the most recent tick with the same symbol where
 //! `tick.ts <= order.ts`. Uses a BTreeMap index for O(log n) lookups.
@@ -14,7 +14,7 @@ pub type TickData = (f64, f64, f64);
 /// Index of recent ticks per symbol, keyed by timestamp.
 pub type TickIndex = HashMap<String, BTreeMap<i64, TickData>>;
 
-/// Merge orders with the most recent tick for each symbol (backward ASOF).
+/// Merge orders with the most recent tick for each symbol.
 ///
 /// For each order tuple `(order_id, symbol, side, quantity, price, ts)`,
 /// finds the latest tick in `tick_index[symbol]` where `tick.ts <= order.ts`.
@@ -26,7 +26,7 @@ pub fn merge_orders_with_ticks(
 
     for (order_id, symbol, side, quantity, price, ts) in orders {
         if let Some(ticks) = tick_index.get(symbol.as_str()) {
-            // Backward ASOF: find most recent tick where tick.ts <= order.ts
+            // Find the most recent tick at or before the order timestamp.
             if let Some((_, &(mkt_price, bid, ask))) = ticks.range(..=*ts).next_back() {
                 enriched.push(EnrichedOrder {
                     order_id: order_id.clone(),
@@ -51,7 +51,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_backward_asof_merge() {
+    fn test_latest_tick_merge() {
         let mut tick_index = TickIndex::new();
         let mut aapl_ticks = BTreeMap::new();
         aapl_ticks.insert(1000, (150.0, 149.95, 150.05));

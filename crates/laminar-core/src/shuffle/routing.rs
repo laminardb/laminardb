@@ -20,7 +20,7 @@ pub const ROUTE_MAX_BATCH_ROWS: usize = 65_536;
 /// Logical Arrow bytes referenced by this slice, independent of backing-buffer capacity or owner.
 /// This is the stable bound for IPC content; transport reservations account the retained backing
 /// allocation separately.
-pub(crate) fn logical_batch_bytes(batch: &RecordBatch) -> Result<usize, arrow_schema::ArrowError> {
+pub fn logical_batch_bytes(batch: &RecordBatch) -> Result<usize, arrow_schema::ArrowError> {
     batch.columns().iter().try_fold(0usize, |total, column| {
         let data = column.to_data();
         let bytes = data

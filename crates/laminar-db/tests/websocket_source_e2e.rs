@@ -109,10 +109,10 @@ async fn websocket_source_decodes_nested_json_into_materialized_view() {
         "CREATE SOURCE feed (\
             id BIGINT, kind TEXT, region TEXT, status TEXT, tags ARRAY<TEXT>\
          ) FROM WEBSOCKET (\
-            url = 'ws://127.0.0.1:{port}', format = 'json', \
+            url = 'ws://127.0.0.1:{port}', \
             'json.column.region' = 'meta.region', \
             'json.column.status' = 'meta.status', \
-            'json.column.tags'   = 'tags')"
+            'json.column.tags'   = 'tags') FORMAT JSON"
     ))
     .await
     .unwrap();
@@ -178,9 +178,9 @@ async fn websocket_event_time_uses_typed_json_and_sql_watermark() {
             id BIGINT, ts TIMESTAMP,
             WATERMARK FOR ts AS ts - INTERVAL '1' SECOND
          ) FROM WEBSOCKET (
-            url = 'ws://127.0.0.1:{port}', format = 'json',
+            url = 'ws://127.0.0.1:{port}',
             'json.column.ts' = 'meta.time_us',
-            'json.column.ts.epoch_unit' = 'micros')"
+            'json.column.ts.epoch_unit' = 'micros') FORMAT JSON"
     ))
     .await
     .unwrap();

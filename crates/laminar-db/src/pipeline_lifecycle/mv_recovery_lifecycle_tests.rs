@@ -10,8 +10,9 @@ use crate::db::LaminarDB;
 
 async fn install_generator_mvs(db: &Arc<LaminarDB>, max_rows: u64) {
     db.execute(&format!(
-        "CREATE SOURCE generated (seq BIGINT, ts_ms BIGINT, value VARCHAR) WITH \
-         ('connector' = 'generator', 'rows.per.second' = '1000', 'max.rows' = '{max_rows}')"
+        "CREATE SOURCE generated (seq BIGINT NOT NULL, ts_ms BIGINT NOT NULL, \
+         value VARCHAR NOT NULL) FROM GENERATOR \
+         ('rows.per.second' = '1000', 'max.rows' = '{max_rows}')"
     ))
     .await
     .unwrap();

@@ -25,7 +25,7 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
     ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector, SourceConsistency,
-    SourceContract, SourcePosition, SourceStart, SourceTopology,
+    SourceContract, SourceInputMode, SourcePosition, SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 
@@ -456,6 +456,7 @@ impl SourceConnector for OtelSource {
         Ok(SourceContract::new(
             SourceConsistency::Ephemeral,
             SourceTopology::NodeLocalIngress,
+            SourceInputMode::AppendOnly,
         ))
     }
 }

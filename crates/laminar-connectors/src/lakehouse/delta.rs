@@ -26,6 +26,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow_array::{Array, RecordBatch};
+#[cfg(feature = "delta-lake")]
+use arrow_schema::DataType;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
@@ -44,6 +46,7 @@ use crate::connector::{
     SinkInputMode, SinkTopology, WriteResult,
 };
 use crate::error::ConnectorError;
+use crate::storage::StorageProvider;
 
 use super::delta_config::{DeltaLakeSinkConfig, DeltaWriteMode};
 use super::delta_metrics::DeltaLakeSinkMetrics;
@@ -364,6 +367,10 @@ impl DeltaLakeSink {
     ) -> Result<(), ConnectorError> {
         use super::delta_io;
 
+        if let Some(schema) = self.schema.as_ref() {
+            Self::validate_weight_column(schema, "pipeline")?;
+        }
+
         // For uc:// tables, pre-create in Unity Catalog if needed.
         // Must run before resolve_catalog_options which calls GET on the table.
         #[cfg(feature = "delta-lake-unity")]
@@ -435,10 +442,18 @@ impl DeltaLakeSink {
             ))
         })??;
 
-        // Read schema from existing table if we don't have one.
-        if self.schema.is_none() {
-            if let Ok(schema) = delta_io::get_table_schema(&table) {
-                self.schema = Some(schema);
+        if table.version().is_some() {
+            let table_schema = delta_io::get_table_schema(&table)?;
+            if let Some(pipeline_schema) = self.schema.as_ref() {
+                Self::validate_existing_table_schema(
+                    pipeline_schema,
+                    &table_schema,
+                    self.config.schema_evolution,
+                    self.is_coordinated(),
+                )?;
+            } else {
+                Self::validate_weight_column(&table_schema, "Delta table")?;
+                self.schema = Some(table_schema);
             }
         }
 
@@ -541,6 +556,86 @@ impl DeltaLakeSink {
         } else {
             batch_schema.clone()
         }
+    }
+
+    #[cfg(feature = "delta-lake")]
+    fn validate_weight_column(schema: &SchemaRef, owner: &str) -> Result<(), ConnectorError> {
+        let Ok(field) = schema.field_with_name(laminar_core::changelog::WEIGHT_COLUMN) else {
+            return Ok(());
+        };
+        if field.data_type() != &DataType::Int64 || field.is_nullable() {
+            return Err(ConnectorError::SchemaMismatch(format!(
+                "{owner} '{}' column must be non-null Int64",
+                laminar_core::changelog::WEIGHT_COLUMN
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "delta-lake")]
+    fn validate_existing_table_schema(
+        pipeline: &SchemaRef,
+        table: &SchemaRef,
+        schema_evolution: bool,
+        exact_schema_required: bool,
+    ) -> Result<(), ConnectorError> {
+        Self::validate_weight_column(pipeline, "pipeline")?;
+        Self::validate_weight_column(table, "Delta table")?;
+
+        let weight = laminar_core::changelog::WEIGHT_COLUMN;
+        if pipeline.field_with_name(weight).is_ok() != table.field_with_name(weight).is_ok() {
+            return Err(ConnectorError::SchemaMismatch(format!(
+                "pipeline and existing Delta table must both contain '{weight}' for a weighted changelog"
+            )));
+        }
+
+        if exact_schema_required {
+            if pipeline.as_ref() != table.as_ref() {
+                return Err(ConnectorError::SchemaMismatch(
+                    "pipeline schema must exactly match the existing Delta table for coordinated append"
+                        .into(),
+                ));
+            }
+            return Ok(());
+        }
+
+        let allow_evolution = schema_evolution;
+        for input_field in pipeline.fields() {
+            let Ok(table_field) = table.field_with_name(input_field.name()) else {
+                if allow_evolution {
+                    continue;
+                }
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "pipeline column '{}' is missing from the existing Delta table",
+                    input_field.name()
+                )));
+            };
+            if !arrow_cast::can_cast_types(input_field.data_type(), table_field.data_type()) {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "pipeline column '{}' cannot be written as Delta type {}",
+                    input_field.name(),
+                    table_field.data_type()
+                )));
+            }
+            if input_field.is_nullable() && !table_field.is_nullable() {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "nullable pipeline column '{}' cannot target a non-null Delta column",
+                    input_field.name()
+                )));
+            }
+        }
+
+        for table_field in table.fields() {
+            if pipeline.field_with_name(table_field.name()).is_err()
+                && (!allow_evolution || !table_field.is_nullable())
+            {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "existing Delta column '{}' is missing from the pipeline schema",
+                    table_field.name()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Estimates the byte size of a `RecordBatch`.
@@ -1184,24 +1279,30 @@ impl SinkConnector for DeltaLakeSink {
         } else {
             SinkConsistency::DurableAtLeastOnce
         };
-        let target = cfg.table_path.to_ascii_lowercase();
-        let shared_target = [
-            "s3://", "s3a://", "gs://", "gcs://", "az://", "abfs://", "uc://",
-        ]
-        .iter()
-        .any(|scheme| target.starts_with(scheme));
+        let unity_target = cfg
+            .table_path
+            .split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("uc"));
+        let shared_target = StorageProvider::is_shared_uri(&cfg.table_path) || unity_target;
         let topology = if cfg.write_mode == DeltaWriteMode::Append && shared_target {
             SinkTopology::MultiWriter
         } else {
             // Node-local files plus overwrite/MERGE lack fenced distributed ownership.
             SinkTopology::Singleton
         };
-        let input_mode = if cfg.write_mode == DeltaWriteMode::Upsert {
-            SinkInputMode::FullChangelog
-        } else {
-            SinkInputMode::AppendOnly
+        let input_mode = match cfg.write_mode {
+            DeltaWriteMode::Append | DeltaWriteMode::Upsert => SinkInputMode::FullChangelog,
+            DeltaWriteMode::Overwrite => SinkInputMode::AppendOnly,
         };
-        Ok(SinkContract::new(consistency, topology, input_mode))
+        let contract = SinkContract::new(consistency, topology, input_mode);
+        let cluster_exact_target = StorageProvider::is_direct_s3_uri(&cfg.table_path);
+        Ok(
+            if consistency == SinkConsistency::CheckpointCommittable && cluster_exact_target {
+                contract.with_cluster_exact_delivery_certification()
+            } else {
+                contract
+            },
+        )
     }
 
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
@@ -1210,6 +1311,14 @@ impl SinkConnector for DeltaLakeSink {
         // Re-parse config if properties provided.
         if !config.properties().is_empty() {
             self.config = DeltaLakeSinkConfig::from_config(config)?;
+        }
+        if config.get("_arrow_schema").is_some() {
+            let schema = config.arrow_schema().ok_or_else(|| {
+                ConnectorError::ConfigurationError(
+                    "invalid Delta sink '_arrow_schema' encoding".into(),
+                )
+            })?;
+            self.schema = Some(Self::target_schema(&schema, self.config.write_mode));
         }
         #[cfg(feature = "delta-lake")]
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {

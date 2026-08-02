@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use laminar_db::{PipelineMetrics, PipelineTopology};
 
-use crate::asof_merge::TickIndex;
 use crate::generator::SYMBOLS;
+use crate::latest_tick::TickIndex;
 use crate::types::{
     AnomalyAlert, BookImbalanceMetrics, DepthMetrics, EnrichedOrder, MarketTick, OhlcBar,
     OrderBookLevel, OrderBookUpdate, SpreadMetrics, SymbolBookState, SystemStats, ViewMode,
@@ -22,7 +22,7 @@ const MAX_ALERTS: usize = 20;
 /// Maximum number of enriched orders to display.
 const MAX_ENRICHED_ORDERS: usize = 8;
 
-/// How long to keep ticks in the ASOF buffer (30 seconds in ms).
+/// How long to keep ticks for latest-value enrichment (30 seconds in ms).
 const TICK_BUFFER_WINDOW_MS: i64 = 30_000;
 
 /// Volume threshold multiplier for anomaly detection.
@@ -61,7 +61,7 @@ pub struct App {
     pub view_mode: ViewMode,
     pub topology: Option<PipelineTopology>,
 
-    // -- ASOF join state --
+    // -- Latest-tick enrichment state --
     pub tick_buffer: TickIndex,
     pub enriched_orders: VecDeque<EnrichedOrder>,
 
@@ -228,8 +228,8 @@ impl App {
         }
     }
 
-    /// Buffer raw ticks for ASOF join matching.
-    pub fn ingest_ticks_for_asof(&mut self, ticks: &[MarketTick]) {
+    /// Buffer raw ticks for latest-value enrichment.
+    pub fn ingest_ticks(&mut self, ticks: &[MarketTick]) {
         for tick in ticks {
             self.tick_buffer
                 .entry(tick.symbol.clone())
@@ -238,7 +238,7 @@ impl App {
         }
     }
 
-    /// Clean up old ticks from the ASOF buffer.
+    /// Clean up old ticks from the enrichment buffer.
     pub fn cleanup_tick_buffer(&mut self, current_ts: i64) {
         let cutoff = current_ts - TICK_BUFFER_WINDOW_MS;
         for ticks in self.tick_buffer.values_mut() {
@@ -247,7 +247,7 @@ impl App {
         }
     }
 
-    /// Store enriched orders from ASOF merge.
+    /// Store enriched orders.
     pub fn ingest_enriched_orders(&mut self, orders: Vec<EnrichedOrder>) {
         for order in orders {
             if self.enriched_orders.len() >= MAX_ENRICHED_ORDERS {

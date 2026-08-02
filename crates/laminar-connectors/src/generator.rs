@@ -18,11 +18,37 @@ use async_trait::async_trait;
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConfigKeySpec, ConnectorConfig, ConnectorInfo};
 use crate::connector::{
-    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourcePosition, SourceStart,
-    SourceTopology,
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
+    SourcePosition, SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 use crate::registry::ConnectorRegistry;
+
+const GENERATOR_CHECKPOINT_CONNECTOR: &str = "generator";
+const CHECKPOINT_VERSION_METADATA: &str = "checkpoint.version";
+const GENERATOR_CHECKPOINT_VERSION: &str = "1";
+
+fn validate_generator_checkpoint(checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
+    match checkpoint.get_metadata("connector") {
+        Some(GENERATOR_CHECKPOINT_CONNECTOR) => {}
+        Some(connector) => {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "generator checkpoint belongs to connector '{connector}'"
+            )));
+        }
+        None => {
+            return Err(ConnectorError::ConfigurationError(
+                "generator checkpoint is missing connector identity".into(),
+            ));
+        }
+    }
+    if checkpoint.get_metadata(CHECKPOINT_VERSION_METADATA) != Some(GENERATOR_CHECKPOINT_VERSION) {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "generator checkpoint requires {CHECKPOINT_VERSION_METADATA}={GENERATOR_CHECKPOINT_VERSION}"
+        )));
+    }
+    Ok(())
+}
 
 /// Deterministic rate-limited source. See module docs.
 pub struct GeneratorSource {
@@ -98,10 +124,12 @@ impl Default for GeneratorSource {
 #[async_trait]
 impl SourceConnector for GeneratorSource {
     fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        Ok(
-            SourceContract::new(SourceConsistency::Replayable, SourceTopology::Singleton)
-                .with_exact_delivery_certification(),
+        Ok(SourceContract::new(
+            SourceConsistency::Replayable,
+            SourceTopology::Singleton,
+            SourceInputMode::AppendOnly,
         )
+        .with_exact_delivery_certification())
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
@@ -125,6 +153,7 @@ impl SourceConnector for GeneratorSource {
                 attempt,
                 checkpoint,
             } => {
+                validate_generator_checkpoint(&checkpoint)?;
                 let seq = checkpoint.get_offset("seq").ok_or_else(|| {
                     ConnectorError::ConfigurationError(format!(
                         "generator checkpoint {attempt:?} is missing required 'seq' offset"
@@ -179,6 +208,8 @@ impl SourceConnector for GeneratorSource {
     fn checkpoint(&self) -> SourceCheckpoint {
         let mut cp = SourceCheckpoint::new();
         cp.set_offset("seq", self.next_seq.to_string());
+        cp.set_metadata("connector", GENERATOR_CHECKPOINT_CONNECTOR);
+        cp.set_metadata(CHECKPOINT_VERSION_METADATA, GENERATOR_CHECKPOINT_VERSION);
         cp
     }
 
@@ -187,8 +218,7 @@ impl SourceConnector for GeneratorSource {
     }
 }
 
-/// Registers the generator source so
-/// `CREATE SOURCE ... WITH (connector = 'generator')` resolves.
+/// Registers the generator source so `CREATE SOURCE ... FROM GENERATOR (...)` resolves.
 ///
 /// # Errors
 ///
@@ -258,6 +288,14 @@ mod tests {
         // Restore a fresh instance from a's checkpoint at seq=8 and
         // verify the next rows equal what `a` produces next.
         let cp = a.checkpoint();
+        assert_eq!(
+            cp.get_metadata("connector"),
+            Some(GENERATOR_CHECKPOINT_CONNECTOR)
+        );
+        assert_eq!(
+            cp.get_metadata(CHECKPOINT_VERSION_METADATA),
+            Some(GENERATOR_CHECKPOINT_VERSION)
+        );
         let mut b = GeneratorSource::default();
         b.start(start_request(
             config,
@@ -293,7 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_resume_fails_before_rate_anchor() {
-        let mut checkpoint = SourceCheckpoint::new();
+        let mut checkpoint = GeneratorSource::default().checkpoint();
         checkpoint.set_offset("seq", "not-a-sequence");
         let mut source = GeneratorSource::default();
         let error = source
@@ -311,11 +349,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_rejects_wrong_checkpoint_identity_or_version() {
+        for (connector, version, expected) in [
+            (
+                "files",
+                GENERATOR_CHECKPOINT_VERSION,
+                "belongs to connector 'files'",
+            ),
+            (
+                GENERATOR_CHECKPOINT_CONNECTOR,
+                "0",
+                "requires checkpoint.version=1",
+            ),
+        ] {
+            let mut checkpoint = SourceCheckpoint::new();
+            checkpoint.set_offset("seq", "8");
+            checkpoint.set_metadata("connector", connector);
+            checkpoint.set_metadata(CHECKPOINT_VERSION_METADATA, version);
+
+            let mut source = GeneratorSource::default();
+            let error = source
+                .start(start_request(
+                    ConnectorConfig::new("generator"),
+                    SourcePosition::Resume {
+                        attempt: CheckpointAttempt::canonical(7),
+                        checkpoint,
+                    },
+                ))
+                .await
+                .expect_err("non-current generator checkpoint must be rejected");
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(source.anchor.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn resume_at_finite_end_remains_exhausted() {
         let mut config = ConnectorConfig::new("generator");
         config.set("rows.per.second", "1000000");
         config.set("max.rows", "8");
-        let mut checkpoint = SourceCheckpoint::new();
+        let mut checkpoint = GeneratorSource::default().checkpoint();
         checkpoint.set_offset("seq", "8");
         let mut source = GeneratorSource::default();
         source

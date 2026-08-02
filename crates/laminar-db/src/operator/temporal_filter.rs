@@ -19,9 +19,7 @@ use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
 use crate::sql_analysis::TemporalFilterConfig;
 
 /// Live buffer encoded as one Arrow IPC batch.
-#[derive(
-    serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct TemporalFilterCheckpoint {
     fingerprint: u64,
     last_frontier: i64,

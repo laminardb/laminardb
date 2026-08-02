@@ -54,9 +54,9 @@ See the [Configuration Reference](https://laminardb.io/docs/) for every field, o
 
 ```toml
 [server]
-mode = "single"             # "single" (standalone) or "cluster" (multi-node at-least-once)
+mode = "single"             # "single" (standalone) or "cluster" (multi-node)
 bind = "0.0.0.0:8080"       # HTTP API bind address
-delivery = "at_least_once"  # pipeline-wide; exactly_once is single-node only
+delivery = "at_least_once"  # pipeline-wide; cluster EO is connector-capability gated
 pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SUBSCRIBE
 log_level = "info"
 # Optional MD5 password auth for the pgwire listener. When this map is set,
@@ -78,8 +78,8 @@ path = "./data/state"       # required when backend = "local"
 # library-injected object or decision stores fail with LDB-0014 because their
 # writer-fencing provenance cannot be proved. Cluster mode requires cloud
 # object storage shared by every node.
-# Cluster exactly-once currently fails closed with LDB-0013 because supported
-# connectors lack certified term-fenced source handoff and external sink cursors.
+# Cluster exactly-once is currently admitted only for Kafka input and coordinated
+# append-mode Delta output on direct S3/S3A. Other combinations fail closed.
 
 [checkpoint]
 # Local file://, or an object store: s3://, gs://, az://, abfs(s):// (the
@@ -94,9 +94,9 @@ name = "trades"
 connector = "kafka"
 format = "json"
 [source.properties]
-bootstrap.servers = "localhost:9092"
+"bootstrap.servers" = "localhost:9092"
 topic = "market-trades"
-group.id = "laminar"
+"group.id" = "laminar"
 [[source.schema]]
 name = "symbol"
 type = "VARCHAR"
@@ -124,10 +124,10 @@ EMIT ON WINDOW CLOSE
 name = "output"
 pipeline = "avg_price"
 connector = "kafka"
-[sink.properties]
-bootstrap.servers = "localhost:9092"
-topic = "avg-prices"
 format = "json"
+[sink.properties]
+"bootstrap.servers" = "localhost:9092"
+topic = "avg-prices"
 ```
 
 ## AI Functions

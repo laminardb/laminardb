@@ -61,8 +61,10 @@ async fn windowed_stream_schema_matches_user_select() {
         ),
     );
 
-    let out = resolve_stream_output_schemas(&ctx, &regs).await.unwrap();
-    let names: Vec<&str> = out["agg"]
+    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
+        .await
+        .unwrap();
+    let names: Vec<&str> = out.schemas["agg"]
         .fields()
         .iter()
         .map(|f| f.name().as_str())
@@ -95,19 +97,21 @@ async fn windowed_stream_with_explicit_window_columns() {
         ),
     );
 
-    let out = resolve_stream_output_schemas(&ctx, &regs).await.unwrap();
-    let names: Vec<&str> = out["agg"]
+    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
+        .await
+        .unwrap();
+    let names: Vec<&str> = out.schemas["agg"]
         .fields()
         .iter()
         .map(|f| f.name().as_str())
         .collect();
     assert_eq!(names, vec!["window_start", "window_end", "region", "n"]);
     assert_eq!(
-        out["agg"].field(0).data_type(),
+        out.schemas["agg"].field(0).data_type(),
         &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
     );
     assert_eq!(
-        out["agg"].field(1).data_type(),
+        out.schemas["agg"].field(1).data_type(),
         &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
     );
 }
@@ -125,8 +129,10 @@ async fn non_windowed_stream_has_no_prefix() {
         ),
     );
 
-    let out = resolve_stream_output_schemas(&ctx, &regs).await.unwrap();
-    let names: Vec<&str> = out["passthrough"]
+    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
+        .await
+        .unwrap();
+    let names: Vec<&str> = out.schemas["passthrough"]
         .fields()
         .iter()
         .map(|f| f.name().as_str())
@@ -153,8 +159,10 @@ async fn chained_streams_resolve_via_iterative_planning() {
         ),
     );
 
-    let out = resolve_stream_output_schemas(&ctx, &regs).await.unwrap();
-    let b_names: Vec<&str> = out["b"]
+    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
+        .await
+        .unwrap();
+    let b_names: Vec<&str> = out.schemas["b"]
         .fields()
         .iter()
         .map(|f| f.name().as_str())
@@ -185,9 +193,92 @@ async fn case_distinct_chained_streams_resolve_exactly() {
         ),
     );
 
-    let out = resolve_stream_output_schemas(&ctx, &regs).await.unwrap();
-    assert!(out.contains_key("Foo"));
-    assert!(out.contains_key("foo"));
+    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
+        .await
+        .unwrap();
+    assert!(out.schemas.contains_key("Foo"));
+    assert!(out.schemas.contains_key("foo"));
+}
+
+#[tokio::test]
+async fn changelog_schema_tracks_real_emitters_and_safe_projection() {
+    use laminar_core::changelog::WEIGHT_COLUMN;
+    use laminar_sql::parser::EmitClause;
+
+    let ctx = ctx_with_payments();
+    let mut changes = reg(
+        "changes",
+        "SELECT region, SUM(amount_usd) AS total FROM payments GROUP BY region",
+        false,
+    );
+    changes.emit_clause = Some(EmitClause::Changes);
+    let mut stateless = reg(
+        "stateless",
+        "SELECT region, amount_usd FROM payments",
+        false,
+    );
+    stateless.emit_clause = Some(EmitClause::Changes);
+
+    let mut regs = std::collections::HashMap::new();
+    regs.insert(changes.name.clone(), changes);
+    regs.insert(
+        "projected".to_string(),
+        reg(
+            "projected",
+            "SELECT region, total FROM changes WHERE total > 0.0",
+            false,
+        ),
+    );
+    regs.insert(stateless.name.clone(), stateless);
+
+    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
+        .await
+        .unwrap();
+
+    for name in ["changes", "projected"] {
+        assert!(out.changelog_carrying.contains(name));
+        let field = out.schemas[name].field_with_name(WEIGHT_COLUMN).unwrap();
+        assert_eq!(field.data_type(), &DataType::Int64);
+        assert!(!field.is_nullable());
+    }
+    assert!(!out.changelog_carrying.contains("stateless"));
+    assert!(out.schemas["stateless"]
+        .field_with_name(WEIGHT_COLUMN)
+        .is_err());
+}
+
+#[tokio::test]
+async fn ambiguous_changelog_consumer_fails_closed() {
+    use laminar_sql::parser::EmitClause;
+
+    let ctx = ctx_with_payments();
+    let mut changes = reg(
+        "changes",
+        "SELECT region, SUM(amount_usd) AS total FROM payments GROUP BY region",
+        false,
+    );
+    changes.emit_clause = Some(EmitClause::Changes);
+
+    let mut regs = std::collections::HashMap::new();
+    regs.insert(changes.name.clone(), changes);
+    regs.insert(
+        "joined".to_string(),
+        reg(
+            "joined",
+            "SELECT c.region, c.total, p.method FROM changes c \
+             JOIN payments p ON c.region = p.region",
+            false,
+        ),
+    );
+
+    let error = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("cannot safely consume a changelog"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -198,7 +289,7 @@ async fn unresolvable_streams_surface_planner_error() {
     regs.insert("a".to_string(), reg("a", "SELECT * FROM b", false));
     regs.insert("b".to_string(), reg("b", "SELECT * FROM a", false));
 
-    let err = resolve_stream_output_schemas(&ctx, &regs)
+    let err = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
         .await
         .unwrap_err()
         .to_string();

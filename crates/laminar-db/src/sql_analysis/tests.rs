@@ -120,76 +120,6 @@ fn extract_table_refs_plain() {
 }
 
 #[test]
-fn test_temporal_probe_strips_quoted_timestamp_columns() {
-    let sql = "SELECT t.s FROM trades t \
-               TEMPORAL PROBE JOIN book r \
-               ON (s) TIMESTAMPS (\"T\", \"E\") \
-               LIST (0s, 1s) AS p";
-    let (config, _) = detect_temporal_probe_query(sql);
-    let config = config.expect("temporal probe detected");
-    assert_eq!(config.left_time_column, "T");
-    assert_eq!(config.right_time_column, "E");
-}
-
-#[test]
-fn test_temporal_probe_ignores_literal_in_where() {
-    let sql = "SELECT * FROM trades WHERE msg = 'TEMPORAL PROBE JOIN'";
-    let (config, _) = detect_temporal_probe_query(sql);
-    assert!(
-        config.is_none(),
-        "must not detect a probe join inside a string literal"
-    );
-}
-
-#[test]
-fn test_temporal_probe_ignores_block_comment_literal() {
-    let sql = "SELECT * FROM trades WHERE comment = '/* TEMPORAL PROBE JOIN */'";
-    let (config, _) = detect_temporal_probe_query(sql);
-    assert!(config.is_none());
-}
-
-#[test]
-fn test_temporal_probe_through_block_comments() {
-    let sql = "SELECT t.s FROM trades t \
-               /* outer */ TEMPORAL PROBE JOIN /* inner */ book r \
-               ON (s) TIMESTAMPS (ts, ts) \
-               LIST (0s, 1s) AS p";
-    let (config, _) = detect_temporal_probe_query(sql);
-    let config = config.expect("block comments must not block detection");
-    assert_eq!(config.left_table, "trades");
-    assert_eq!(config.right_table, "book");
-}
-
-#[test]
-fn test_temporal_probe_qualified_quoted_timestamps() {
-    let sql = "SELECT t.s FROM trades t \
-               TEMPORAL PROBE JOIN book r \
-               ON (s) TIMESTAMPS (t.\"T\", r.\"E\") \
-               LIST (0s, 1s) AS p";
-    let (config, _) = detect_temporal_probe_query(sql);
-    let config = config.expect("qualified quoted idents must resolve");
-    assert_eq!(config.left_time_column, "T");
-    assert_eq!(config.right_time_column, "E");
-}
-
-#[test]
-fn test_temporal_probe_range_spec() {
-    let sql = "SELECT t.s FROM trades t \
-               TEMPORAL PROBE JOIN book r \
-               ON (s) TIMESTAMPS (ts, ts) \
-               RANGE FROM 0s TO 30s STEP 5s AS p";
-    let (config, _) = detect_temporal_probe_query(sql);
-    let config = config.expect("range spec must parse");
-    // 0,5,10,15,20,25,30 = 7 offsets
-    assert_eq!(
-        config.expanded_offsets_ms.len(),
-        7,
-        "got {:?}",
-        config.expanded_offsets_ms
-    );
-}
-
-#[test]
 fn extract_table_refs_tumble_in_from() {
     let refs = extract_table_references(
         "SELECT COUNT(*) FROM TUMBLE(events, ts, INTERVAL '10' SECOND) \
@@ -217,17 +147,6 @@ fn inline_unnest_is_not_a_second_stream_or_join() {
     assert_eq!(refs, FxHashSet::from_iter(["events".to_string()]));
     assert_eq!(join_clause_count(sql), 0);
     assert_eq!(single_source_table(sql), None);
-}
-
-#[test]
-fn extract_table_refs_temporal_probe_join() {
-    let refs = extract_table_references(
-        "SELECT t.s FROM trades t \
-         TEMPORAL PROBE JOIN prices r ON (s) TIMESTAMPS (ts, ts) \
-         LIST (0s, 5s) AS p",
-    );
-    assert!(refs.contains("trades"), "got {refs:?}");
-    assert!(refs.contains("prices"), "got {refs:?}");
 }
 
 #[test]

@@ -1482,6 +1482,7 @@ mod tests {
         assert_eq!(contract.consistency, SinkConsistency::DurableAtLeastOnce);
         assert_eq!(contract.topology, SinkTopology::MultiWriter);
         assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
+        assert!(!contract.is_cluster_exact_delivery_certified());
         assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(126));
     }
 

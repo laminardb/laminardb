@@ -463,6 +463,7 @@ enum Extremum {
 #[derive(Debug)]
 struct RetractableExtremumAccum {
     counts: BTreeMap<arrow::row::OwnedRow, i64>,
+    key_bytes: usize,
     row_converter: arrow::row::RowConverter,
     return_type: DataType,
     direction: Extremum,
@@ -479,6 +480,7 @@ impl RetractableExtremumAccum {
                 })?;
         Ok(Self {
             counts: BTreeMap::new(),
+            key_bytes: 0,
             row_converter,
             return_type,
             direction,
@@ -510,10 +512,12 @@ impl Accumulator for RetractableExtremumAccum {
                 Entry::Occupied(mut o) => {
                     *o.get_mut() += w;
                     if *o.get() == 0 {
+                        self.key_bytes -= o.key().as_ref().len();
                         o.remove();
                     }
                 }
                 Entry::Vacant(v) => {
+                    self.key_bytes += v.key().as_ref().len();
                     v.insert(w);
                 }
             }
@@ -539,8 +543,7 @@ impl Accumulator for RetractableExtremumAccum {
     }
 
     fn size(&self) -> usize {
-        let key_bytes: usize = self.counts.keys().map(|k| k.as_ref().len()).sum();
-        std::mem::size_of::<Self>() + key_bytes + self.counts.len() * 72
+        std::mem::size_of::<Self>() + self.key_bytes + self.counts.len() * 72
     }
 
     fn state(&mut self) -> datafusion_common::Result<Vec<ScalarValue>> {
@@ -591,10 +594,12 @@ impl Accumulator for RetractableExtremumAccum {
                     Entry::Occupied(mut o) => {
                         *o.get_mut() += cnt;
                         if *o.get() == 0 {
+                            self.key_bytes -= o.key().as_ref().len();
                             o.remove();
                         }
                     }
                     Entry::Vacant(v) => {
+                        self.key_bytes += v.key().as_ref().len();
                         v.insert(cnt);
                     }
                 }
@@ -617,6 +622,15 @@ mod tests {
 
     fn f64_arr(vals: &[f64]) -> ArrayRef {
         Arc::new(Float64Array::from(vals.to_vec()))
+    }
+
+    fn assert_extremum_key_bytes(acc: &RetractableExtremumAccum) {
+        let actual: usize = acc.counts.keys().map(|key| key.as_ref().len()).sum();
+        assert_eq!(acc.key_bytes, actual);
+        assert_eq!(
+            acc.size(),
+            std::mem::size_of::<RetractableExtremumAccum>() + actual + acc.counts.len() * 72
+        );
     }
 
     fn bool_arr(vals: &[bool]) -> ArrayRef {
@@ -755,11 +769,48 @@ mod tests {
         let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min).unwrap();
         acc.update_batch(&[i64_arr(&[10, 10, 20]), i64_arr(&[1, 1, 1])])
             .unwrap();
+        assert_extremum_key_bytes(&acc);
         acc.update_batch(&[i64_arr(&[10]), i64_arr(&[-1])]).unwrap();
+        assert_extremum_key_bytes(&acc);
         assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int64(Some(10)));
 
         acc.update_batch(&[i64_arr(&[10]), i64_arr(&[-1])]).unwrap();
+        assert_extremum_key_bytes(&acc);
         assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int64(Some(20)));
+    }
+
+    #[test]
+    fn min_cached_key_bytes_survive_merge_and_cancellation() {
+        use arrow::array::StringArray;
+
+        let mut source = RetractableExtremumAccum::new(DataType::Utf8, Extremum::Min).unwrap();
+        let values: ArrayRef = Arc::new(StringArray::from(vec!["a", "alphabet", "a"]));
+        source.update_batch(&[values, i64_arr(&[1, 1, 1])]).unwrap();
+        assert_extremum_key_bytes(&source);
+
+        let state = source.state().unwrap();
+        let arrays: Vec<ArrayRef> = state
+            .iter()
+            .map(|value| value.to_array().unwrap())
+            .collect();
+        let mut restored = RetractableExtremumAccum::new(DataType::Utf8, Extremum::Min).unwrap();
+        restored.merge_batch(&arrays).unwrap();
+        assert_extremum_key_bytes(&restored);
+
+        let mut cancellation =
+            RetractableExtremumAccum::new(DataType::Utf8, Extremum::Min).unwrap();
+        let values: ArrayRef = Arc::new(StringArray::from(vec!["a", "alphabet"]));
+        cancellation
+            .update_batch(&[values, i64_arr(&[-2, -1])])
+            .unwrap();
+        let state = cancellation.state().unwrap();
+        let arrays: Vec<ArrayRef> = state
+            .iter()
+            .map(|value| value.to_array().unwrap())
+            .collect();
+        restored.merge_batch(&arrays).unwrap();
+        assert_extremum_key_bytes(&restored);
+        assert!(restored.counts.is_empty());
     }
 
     #[test]

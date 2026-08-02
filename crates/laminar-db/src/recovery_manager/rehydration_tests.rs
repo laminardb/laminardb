@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use laminar_core::state::{
     CheckpointAttempt, CheckpointSealInventory, InProcessBackend, ObjectStoreBackend,
-    SealedVnodePartial, StateBackend, StateBackendDurability, StateBackendError,
-    VnodePartialLineage,
+    SealedPartialReadEnvelope, SealedVnodePartial, StateBackend, StateBackendDurability,
+    StateBackendError, VnodePartialLineage,
 };
 
 #[cfg(feature = "cluster")]
@@ -24,8 +24,8 @@ pub(super) struct ReadCountingBackend {
     seal_inventory_reads: std::sync::atomic::AtomicUsize,
     sealed_partial_body_reads: std::sync::atomic::AtomicUsize,
     inventory_failures_remaining: std::sync::atomic::AtomicUsize,
-    yield_inventory_reads: bool,
     block_body_reads: bool,
+    unalign_body_reads: bool,
     body_read_entries: tokio::sync::Semaphore,
     body_read_releases: tokio::sync::Semaphore,
     active_body_reads: std::sync::atomic::AtomicUsize,
@@ -46,8 +46,8 @@ impl ReadCountingBackend {
             seal_inventory_reads: std::sync::atomic::AtomicUsize::new(0),
             sealed_partial_body_reads: std::sync::atomic::AtomicUsize::new(0),
             inventory_failures_remaining: std::sync::atomic::AtomicUsize::new(0),
-            yield_inventory_reads: false,
             block_body_reads: false,
+            unalign_body_reads: false,
             body_read_entries: tokio::sync::Semaphore::new(0),
             body_read_releases: tokio::sync::Semaphore::new(0),
             active_body_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -61,9 +61,9 @@ impl ReadCountingBackend {
         }
     }
 
-    fn with_yielding_inventory_reads(key_group_capacity: u32) -> Self {
+    pub(super) fn with_unaligned_body_reads(key_group_capacity: u32) -> Self {
         Self {
-            yield_inventory_reads: true,
+            unalign_body_reads: true,
             ..Self::new(key_group_capacity)
         }
     }
@@ -75,7 +75,7 @@ impl ReadCountingBackend {
         }
     }
 
-    fn seal_inventory_reads(&self) -> usize {
+    pub(super) fn seal_inventory_reads(&self) -> usize {
         self.seal_inventory_reads
             .load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -97,12 +97,35 @@ impl ReadCountingBackend {
         self.active_body_reads
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    fn record_seal_inventory_read(&self) -> Result<(), StateBackendError> {
+        self.seal_inventory_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self
+            .inventory_failures_remaining
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(StateBackendError::Io(
+                "injected transient seal inventory failure".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl StateBackend for ReadCountingBackend {
     fn key_group_capacity(&self) -> u32 {
         self.inner.key_group_capacity()
+    }
+
+    fn sealed_partial_read_envelope(&self) -> Option<SealedPartialReadEnvelope> {
+        self.inner.sealed_partial_read_envelope()
     }
 
     async fn write_partial(
@@ -166,9 +189,23 @@ impl StateBackend for ReadCountingBackend {
                 .expect("body-read release semaphore remains open")
                 .forget();
         }
-        self.inner
+        let body = self
+            .inner
             .read_sealed_partial_bounded(attempt, sealed, max_bytes)
-            .await
+            .await?;
+        if !self.unalign_body_reads {
+            return Ok(body);
+        }
+        Ok(body.map(|body| {
+            let mut storage = Vec::with_capacity(body.len() + 16);
+            let base = storage.as_ptr() as usize;
+            let offset = (0..16)
+                .find(|offset| !(base + offset).is_multiple_of(16))
+                .expect("one of sixteen byte offsets must be unaligned");
+            storage.resize(offset, 0);
+            storage.extend_from_slice(&body);
+            Bytes::from(storage).slice(offset..)
+        }))
     }
 
     async fn write_commit_descriptor(
@@ -217,25 +254,16 @@ impl StateBackend for ReadCountingBackend {
         &self,
         attempt: CheckpointAttempt,
     ) -> Result<Option<CheckpointSealInventory>, StateBackendError> {
-        self.seal_inventory_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self
-            .inventory_failures_remaining
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |remaining| remaining.checked_sub(1),
-            )
-            .is_ok()
-        {
-            return Err(StateBackendError::Io(
-                "injected transient seal inventory failure".into(),
-            ));
-        }
-        if self.yield_inventory_reads {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        self.record_seal_inventory_read()?;
         self.inner.checkpoint_seal_inventory(attempt).await
+    }
+
+    async fn checkpoint_seal_inventory_bounded(
+        &self,
+        attempt: CheckpointAttempt,
+    ) -> Result<Option<CheckpointSealInventory>, StateBackendError> {
+        self.record_seal_inventory_read()?;
+        self.inner.checkpoint_seal_inventory_bounded(attempt).await
     }
 
     async fn verify_checkpoint_artifact_metadata(
@@ -330,6 +358,13 @@ impl StateBackend for LegacyPartialReadBackend {
         attempt: CheckpointAttempt,
     ) -> Result<Option<CheckpointSealInventory>, StateBackendError> {
         self.inner.checkpoint_seal_inventory(attempt).await
+    }
+
+    async fn checkpoint_seal_inventory_bounded(
+        &self,
+        attempt: CheckpointAttempt,
+    ) -> Result<Option<CheckpointSealInventory>, StateBackendError> {
+        self.inner.checkpoint_seal_inventory_bounded(attempt).await
     }
 
     async fn verify_checkpoint_artifact_metadata(
@@ -471,7 +506,7 @@ async fn rehydrate_reads_committed_partials_and_rejects_missing_vnodes() {
 }
 
 #[tokio::test]
-async fn rehydrate_rejects_outer_entry_amplification_without_parent_io() {
+async fn rehydrate_rejects_global_outer_entry_limit_without_parent_io() {
     let backend = ReadCountingBackend::new(1);
     let parent = CheckpointAttempt::canonical(6);
     write_and_seal_partial(
@@ -489,10 +524,9 @@ async fn rehydrate_rejects_outer_entry_amplification_without_parent_io() {
         &backend,
         child,
         crate::vnode_partial::VnodePartial {
-            operators: vec![
-                ("agg".to_string(), Vec::new()),
-                ("unexpected".to_string(), Vec::new()),
-            ],
+            operators: (0..=laminar_core::checkpoint::MAX_VNODE_OPERATOR_ENTRIES)
+                .map(|index| (format!("operator-{index}"), Vec::new()))
+                .collect(),
             base: Some(parent),
             deltas: Vec::new(),
         },
@@ -502,55 +536,19 @@ async fn rehydrate_rejects_outer_entry_amplification_without_parent_io() {
     let error = SealedVnodeChainReader::new(&backend)
         .load_at(&[0], child)
         .await
-        .expect_err("an over-roster legacy outer archive must fail closed");
+        .expect_err("an artifact over the global operator-entry limit must fail closed");
 
-    assert!(error.to_string().contains("allows at most 1"), "{error}");
+    assert!(
+        error.to_string().contains(&format!(
+            "allows at most {}",
+            laminar_core::checkpoint::MAX_VNODE_OPERATOR_ENTRIES
+        )),
+        "{error}"
+    );
     assert_eq!(
         backend.sealed_partial_body_reads(),
         1,
         "the invalid head must fail before any parent body can be requested"
-    );
-}
-
-#[tokio::test]
-async fn rehydrate_rejects_outer_entry_amplification_in_delta_parent() {
-    let backend = ReadCountingBackend::new(1);
-    let parent = CheckpointAttempt::canonical(6);
-    write_and_seal_partial(
-        &backend,
-        parent,
-        crate::vnode_partial::VnodePartial {
-            operators: vec![
-                ("agg".to_string(), Vec::new()),
-                ("unexpected".to_string(), Vec::new()),
-            ],
-            base: None,
-            deltas: Vec::new(),
-        },
-    )
-    .await;
-    let child = CheckpointAttempt::canonical(7);
-    write_and_seal_partial(
-        &backend,
-        child,
-        crate::vnode_partial::VnodePartial {
-            operators: Vec::new(),
-            base: Some(parent),
-            deltas: vec![("agg".to_string(), b"delta".to_vec())],
-        },
-    )
-    .await;
-
-    let error = SealedVnodeChainReader::new(&backend)
-        .load_at(&[0], child)
-        .await
-        .expect_err("an over-roster delta parent must fail closed");
-
-    assert!(error.to_string().contains("allows at most 1"), "{error}");
-    assert_eq!(
-        backend.sealed_partial_body_reads(),
-        2,
-        "the accepted head and invalid parent are the only bodies read"
     );
 }
 
@@ -738,7 +736,7 @@ async fn metadata_lineage_rejection_performs_zero_partial_body_reads() {
             .unwrap()
             .unwrap(),
     );
-    let limits = VnodeRestoreLimits::global_singleton_compatibility(12, 2, 1).unwrap();
+    let limits = VnodeRestoreLimits::managed_vnode(12, 2, 1).unwrap();
 
     let error =
         crate::vnode_restore_lineage::validate_vnode_restore_lineage(&backend, head, limits)
@@ -1070,11 +1068,25 @@ async fn decoded_base_mismatch_fails_before_parent_body_io() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn parent_seal_inventory_load_is_single_flight_across_vnodes() {
-    let backend = ReadCountingBackend::with_yielding_inventory_reads(8);
-    let parent = CheckpointAttempt::canonical(1);
-    let child = CheckpointAttempt::canonical(2);
-    let vnodes: Vec<u32> = (0..8).collect();
+async fn validated_lineage_reads_each_parent_once_before_multi_vnode_body_loading() {
+    use laminar_core::checkpoint::{
+        CheckpointAssignmentFence, CheckpointParticipant, VnodeRestoreLimits,
+    };
+
+    let backend = ReadCountingBackend::new(2);
+    let oldest = CheckpointAttempt::canonical(1);
+    let intermediate = CheckpointAttempt::canonical(2);
+    let head_attempt = CheckpointAttempt::canonical(3);
+    let vnodes = [0, 1];
+    let fence = CheckpointAssignmentFence::from_owner_map(
+        7,
+        &vec![1; vnodes.len()],
+        vec![CheckpointParticipant {
+            node_id: 1,
+            boot_incarnation: uuid::Uuid::from_u128(1),
+        }],
+    )
+    .unwrap();
     let full_partial = crate::vnode_partial::VnodePartial {
         operators: vec![("agg".into(), b"full".to_vec())],
         base: None,
@@ -1083,10 +1095,11 @@ async fn parent_seal_inventory_load_is_single_flight_across_vnodes() {
     let full_bytes = Bytes::from(full_partial.encode().unwrap());
     for &vnode in &vnodes {
         backend
-            .write_partial(
-                parent,
+            .write_certified_partial(
+                oldest,
                 vnode,
-                0,
+                &fence,
+                1,
                 VnodePartialLineage::root(full_bytes.len() as u64),
                 full_bytes.clone(),
             )
@@ -1094,69 +1107,147 @@ async fn parent_seal_inventory_load_is_single_flight_across_vnodes() {
             .unwrap();
     }
     assert!(backend
-        .seal_checkpoint(parent, None, &vnodes, &[])
+        .seal_checkpoint(oldest, Some(&fence), &vnodes, &[])
         .await
         .unwrap());
-    let parent_inventory = backend
+    let oldest_inventory = backend
         .inner
-        .checkpoint_seal_inventory(parent)
+        .checkpoint_seal_inventory(oldest)
         .await
         .unwrap()
         .unwrap();
-    let reference_partial = crate::vnode_partial::VnodePartial {
+    let oldest_reference = crate::vnode_partial::VnodePartial {
         operators: Vec::new(),
-        base: Some(parent),
+        base: Some(oldest),
         deltas: Vec::new(),
     };
-    let reference_bytes = Bytes::from(reference_partial.encode().unwrap());
-    for &vnode in &vnodes {
-        let parent_lineage = parent_inventory
-            .sealed_partials
-            .iter()
-            .find(|partial| partial.vnode == vnode)
-            .unwrap()
-            .lineage;
-        let lineage = VnodePartialLineage::extend(
-            child,
-            reference_bytes.len() as u64,
-            parent,
-            parent_lineage,
+    let oldest_reference_bytes = Bytes::from(oldest_reference.encode().unwrap());
+    backend
+        .write_certified_partial(
+            intermediate,
+            0,
+            &fence,
+            1,
+            VnodePartialLineage::root(full_bytes.len() as u64),
+            full_bytes.clone(),
         )
+        .await
         .unwrap();
-        backend
-            .write_partial(child, vnode, 0, lineage, reference_bytes.clone())
-            .await
-            .unwrap();
-    }
+    let oldest_vnode_one = oldest_inventory
+        .sealed_partials
+        .iter()
+        .find(|partial| partial.vnode == 1)
+        .unwrap();
+    let intermediate_vnode_one_lineage = VnodePartialLineage::extend(
+        intermediate,
+        oldest_reference_bytes.len() as u64,
+        oldest,
+        oldest_vnode_one.lineage,
+    )
+    .unwrap();
+    backend
+        .write_certified_partial(
+            intermediate,
+            1,
+            &fence,
+            1,
+            intermediate_vnode_one_lineage,
+            oldest_reference_bytes.clone(),
+        )
+        .await
+        .unwrap();
     assert!(backend
-        .seal_checkpoint(child, None, &vnodes, &[])
+        .seal_checkpoint(intermediate, Some(&fence), &vnodes, &[])
         .await
         .unwrap());
-    let head_inventory = backend
+    let intermediate_inventory = backend
         .inner
-        .checkpoint_seal_inventory(child)
+        .checkpoint_seal_inventory(intermediate)
         .await
         .unwrap()
         .unwrap();
+    let intermediate_reference = crate::vnode_partial::VnodePartial {
+        operators: Vec::new(),
+        base: Some(intermediate),
+        deltas: Vec::new(),
+    };
+    let intermediate_reference_bytes = Bytes::from(intermediate_reference.encode().unwrap());
+    let head_vnode_zero_lineage = VnodePartialLineage::extend(
+        head_attempt,
+        oldest_reference_bytes.len() as u64,
+        oldest,
+        oldest_inventory.sealed_partials[0].lineage,
+    )
+    .unwrap();
+    backend
+        .write_certified_partial(
+            head_attempt,
+            0,
+            &fence,
+            1,
+            head_vnode_zero_lineage,
+            oldest_reference_bytes,
+        )
+        .await
+        .unwrap();
+    let head_vnode_one_lineage = VnodePartialLineage::extend(
+        head_attempt,
+        intermediate_reference_bytes.len() as u64,
+        intermediate,
+        intermediate_inventory.sealed_partials[1].lineage,
+    )
+    .unwrap();
+    backend
+        .write_certified_partial(
+            head_attempt,
+            1,
+            &fence,
+            1,
+            head_vnode_one_lineage,
+            intermediate_reference_bytes,
+        )
+        .await
+        .unwrap();
+    assert!(backend
+        .seal_checkpoint(head_attempt, Some(&fence), &vnodes, &[])
+        .await
+        .unwrap());
+    let head_inventory = Arc::new(
+        backend
+            .inner
+            .checkpoint_seal_inventory(head_attempt)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    let limits =
+        VnodeRestoreLimits::managed_vnode(TEST_PARTIAL_LIMIT_BYTES, 3, fence.vnode_count).unwrap();
+    let lineage = crate::vnode_restore_lineage::validate_vnode_restore_lineage(
+        &backend,
+        Arc::clone(&head_inventory),
+        limits,
+    )
+    .await
+    .unwrap();
     let head =
-        crate::checkpoint_coordinator::ValidatedVnodeRestoreHead::from_unchecked_inventory_for_test(
+        crate::checkpoint_coordinator::ValidatedVnodeRestoreHead::from_validated_lineage_for_test(
             head_inventory,
+            lineage,
         );
 
-    let loaded =
-        SealedVnodeChainReader::from_validated_head(&backend, &head, TEST_PARTIAL_LIMIT_BYTES, 2)
-            .unwrap()
-            .load_at(&vnodes, child)
-            .await
-            .unwrap();
+    let loaded = SealedVnodeChainReader::from_committed_head(&backend, &head)
+        .unwrap()
+        .load_at(&vnodes, head_attempt)
+        .await
+        .unwrap();
     assert_eq!(loaded.chain_count(), vnodes.len());
-    assert_eq!(loaded.input_usage().verified_body_artifacts(), 16);
+    assert_eq!(loaded.input_usage().verified_body_artifacts(), 5);
     assert_eq!(
         backend.seal_inventory_reads(),
-        1,
-        "concurrent parent lookups must share one per-attempt seal load"
+        2,
+        "the shared oldest seal must not be reread after discovery through the newer intermediate"
     );
-    assert_eq!(backend.sealed_partial_body_reads(), 16);
+    assert_eq!(backend.sealed_partial_body_reads(), 5);
 }
 
 #[cfg(feature = "cluster")]

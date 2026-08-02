@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 
 use arrow_schema::{Field, Schema};
 use laminar_connectors::config::ConnectorConfig;
+use laminar_connectors::connector::SourceInputMode;
 use laminar_connectors::registry::ConnectorRegistry;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
@@ -41,7 +42,9 @@ struct CanonicalSource {
     name: String,
     connector_type: String,
     options: BTreeMap<String, String>,
+    input_mode: &'static str,
     schema: Option<CanonicalSchema>,
+    primary_key: Vec<String>,
     watermark_column: Option<String>,
     max_out_of_orderness_ms: Option<u64>,
     processing_time: bool,
@@ -195,16 +198,21 @@ fn canonical_sources(
 ) -> Result<Vec<CanonicalSource>, DbError> {
     let mut sources = Vec::with_capacity(registrations.sources.len());
     for reg in registrations.sources.values() {
-        let (connector_type, options) = if reg.connector_type.is_some() {
+        let (connector_type, options, input_mode) = if reg.connector_type.is_some() {
             canonical_source_connector(&build_source_config(reg)?, connector_registry)?
         } else {
-            ("catalog-bridge".into(), BTreeMap::new())
+            (
+                "catalog-bridge".into(),
+                BTreeMap::new(),
+                SourceInputMode::AppendOnly,
+            )
         };
         let entry = catalog.get_source(&reg.name);
         sources.push(canonical_source(
             reg.name.clone(),
             connector_type,
             options,
+            input_mode,
             entry.as_deref(),
         ));
     }
@@ -220,6 +228,7 @@ fn canonical_sources(
             name,
             "catalog-bridge".into(),
             BTreeMap::new(),
+            SourceInputMode::AppendOnly,
             entry.as_deref(),
         ));
     }
@@ -231,13 +240,16 @@ fn canonical_source(
     name: String,
     connector_type: String,
     options: BTreeMap<String, String>,
+    input_mode: SourceInputMode,
     entry: Option<&SourceEntry>,
 ) -> CanonicalSource {
     CanonicalSource {
         name,
         connector_type,
         options,
+        input_mode: canonical_source_input_mode(input_mode),
         schema: entry.map(|entry| canonical_schema(&entry.schema)),
+        primary_key: entry.map_or_else(Vec::new, |entry| entry.primary_key.clone()),
         watermark_column: entry.and_then(|entry| entry.watermark_column.clone()),
         max_out_of_orderness_ms: entry
             .and_then(|entry| entry.max_out_of_orderness)
@@ -333,14 +345,30 @@ fn canonical_connector(config: &ConnectorConfig) -> (String, BTreeMap<String, St
 fn canonical_source_connector(
     config: &ConnectorConfig,
     connector_registry: &ConnectorRegistry,
-) -> Result<(String, BTreeMap<String, String>), DbError> {
-    let options = connector_registry
-        .source_recovery_identity_options(config)
+) -> Result<(String, BTreeMap<String, String>, SourceInputMode), DbError> {
+    let source = connector_registry
+        .create_source(config, None)
         .map_err(|error| DbError::Checkpoint(format!("source recovery identity: {error}")))?;
-    Ok(options.map_or_else(
+    let input_mode = source
+        .contract(config)
+        .map_err(|error| DbError::Checkpoint(format!("source contract identity: {error}")))?
+        .input_mode;
+    let options = source
+        .recovery_identity_options(config)
+        .map_err(|error| DbError::Checkpoint(format!("source recovery identity: {error}")))?;
+    let (connector_type, options) = options.map_or_else(
         || canonical_connector(config),
         |options| (config.connector_type().to_string(), options),
-    ))
+    );
+    Ok((connector_type, options, input_mode))
+}
+
+const fn canonical_source_input_mode(input_mode: SourceInputMode) -> &'static str {
+    match input_mode {
+        SourceInputMode::AppendOnly => "append_only",
+        SourceInputMode::KeyedUpsert => "keyed_upsert",
+        SourceInputMode::FullChangelog => "full_changelog",
+    }
 }
 
 fn canonical_schema(schema: &Schema) -> CanonicalSchema {
@@ -413,6 +441,42 @@ mod tests {
     }
 
     #[test]
+    fn source_input_mode_changes_canonical_identity() {
+        let digest = |input_mode| {
+            let payload = CanonicalPipeline {
+                canonical_version: PIPELINE_IDENTITY_VERSION,
+                state_abi_version: STATE_ABI_VERSION,
+                partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
+                state_layout: "local",
+                vnode_count: 1,
+                delivery_guarantee: "at-least-once".into(),
+                sources: vec![CanonicalSource {
+                    name: "events".into(),
+                    connector_type: "test".into(),
+                    options: BTreeMap::new(),
+                    input_mode: canonical_source_input_mode(input_mode),
+                    schema: None,
+                    primary_key: Vec::new(),
+                    watermark_column: None,
+                    max_out_of_orderness_ms: None,
+                    processing_time: false,
+                }],
+                streams: Vec::new(),
+                tables: Vec::new(),
+                sinks: Vec::new(),
+            };
+            Sha256::digest(serde_json::to_vec(&payload).unwrap())
+        };
+
+        let append = digest(SourceInputMode::AppendOnly);
+        let upsert = digest(SourceInputMode::KeyedUpsert);
+        let changelog = digest(SourceInputMode::FullChangelog);
+        assert_ne!(append, upsert);
+        assert_ne!(append, changelog);
+        assert_ne!(upsert, changelog);
+    }
+
+    #[test]
     fn connector_property_order_is_canonical_and_credentials_are_ignored() {
         let mut left = ConnectorConfig::new("kafka");
         left.set("topic", "trades");
@@ -466,6 +530,51 @@ mod tests {
         assert_eq!(
             serde_json::to_vec(&canonical_schema(&left)).unwrap(),
             serde_json::to_vec(&canonical_schema(&right)).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn source_primary_key_order_changes_pipeline_identity() {
+        let identity_for = |primary_key: &[&str]| {
+            let catalog =
+                SourceCatalog::new(8, laminar_core::streaming::BackpressureStrategy::Block);
+            catalog
+                .register_source(
+                    "events",
+                    std::sync::Arc::new(Schema::new(vec![
+                        Field::new("tenant", arrow_schema::DataType::Utf8, false),
+                        Field::new("event_id", arrow_schema::DataType::Int64, false),
+                    ])),
+                    primary_key.iter().map(|column| (*column).into()).collect(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+
+            let config = LaminarConfig::default();
+            let connector_registry = ConnectorRegistry::new();
+            let registrations = PipelineRegistrations::new(
+                std::iter::empty::<&SourceRegistration>(),
+                std::iter::empty::<&SinkRegistration>(),
+                std::iter::empty::<&StreamRegistration>(),
+                std::iter::empty::<&TableRegistration>(),
+            );
+            compute(&PipelineIdentityContext::new(
+                &config,
+                &catalog,
+                &connector_registry,
+                registrations,
+                1,
+                false,
+            ))
+            .unwrap()
+        };
+
+        assert_ne!(
+            identity_for(&["tenant", "event_id"]),
+            identity_for(&["event_id", "tenant"])
         );
     }
 }

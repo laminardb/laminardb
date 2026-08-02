@@ -21,7 +21,7 @@ use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
     ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, DeliveryGuarantee, SourceBatch,
     SourceConnector, SourceConsistency, SourceContract, SourceDrainOutcome, SourceDrainRequest,
-    SourceDrainResolution, SourcePosition, SourceStart, SourceTopology,
+    SourceDrainResolution, SourceInputMode, SourcePosition, SourceStart, SourceTopology,
 };
 use crate::error::{ConnectorError, SerdeError};
 use crate::serde::{self, Format, RecordDeserializer};
@@ -3999,11 +3999,24 @@ impl SourceConnector for KafkaSource {
         Some(self.task_tracker.clone())
     }
 
-    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+    fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        let format = if config.properties().is_empty() {
+            self.config.validate()?;
+            self.config.format
+        } else {
+            KafkaSourceConfig::from_config(config)?.format
+        };
+        let input_mode = if format == Format::Debezium {
+            SourceInputMode::KeyedUpsert
+        } else {
+            SourceInputMode::AppendOnly
+        };
         Ok(SourceContract::new(
             SourceConsistency::Replayable,
             SourceTopology::Splittable,
-        ))
+            input_mode,
+        )
+        .with_exact_delivery_certification())
     }
 
     fn set_vnode_assignment(

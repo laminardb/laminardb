@@ -789,10 +789,9 @@ async fn state_backend_capacity_must_match_checkpoint_store_before_installation(
 async fn coordinator_construction_rejects_exhausted_manifest_epoch() {
     let dir = tempfile::tempdir().unwrap();
     let store = FileSystemCheckpointStore::new(dir.path());
-    store
-        .save(&CheckpointManifest::new(u64::MAX, u64::MAX))
-        .await
-        .unwrap();
+    let mut manifest = CheckpointManifest::new(u64::MAX, u64::MAX);
+    manifest.deployment_id = "00000000-0000-0000-0000-000000000001".into();
+    store.save(&manifest).await.unwrap();
 
     let error = CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store))
         .await
@@ -981,6 +980,7 @@ async fn retention_counts_committed_cuts_instead_of_checkpoint_id_distance() {
     let writer = FileSystemCheckpointStore::new(dir.path());
     for checkpoint_id in [1, 2, 3, 65_537] {
         let mut manifest = CheckpointManifest::new(checkpoint_id, checkpoint_id);
+        manifest.deployment_id = "00000000-0000-0000-0000-000000000001".into();
         manifest.durable_phase =
             laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase::Finalized;
         writer.save(&manifest).await.unwrap();
@@ -1376,7 +1376,8 @@ async fn test_coordinator_resumes_from_stored_checkpoint() {
 
     // Save a checkpoint manually
     let store = FileSystemCheckpointStore::new(dir.path());
-    let m = CheckpointManifest::new(10, 10);
+    let mut m = CheckpointManifest::new(10, 10);
+    m.deployment_id = "00000000-0000-0000-0000-000000000001".into();
     store.save(&m).await.unwrap();
 
     // Manifest history seeds the local floor; the durable allocator advances the same canonical
@@ -1580,7 +1581,10 @@ async fn test_checkpoint_with_operator_states() {
     assert_eq!(loaded.operator_states.len(), 2);
 
     let window_op = loaded.operator_states.get("window-agg").unwrap();
-    assert_eq!(window_op.decode_inline().unwrap(), b"state-data");
+    assert_eq!(
+        window_op.try_decode_inline().unwrap().unwrap(),
+        b"state-data"
+    );
 }
 
 #[tokio::test]
@@ -1764,7 +1768,10 @@ async fn test_sidecar_round_trip() {
     let loaded = coord.store().load_latest().await.unwrap().unwrap();
     let small_op = loaded.operator_states.get("small").unwrap();
     assert!(!small_op.external, "small state should be inline");
-    assert_eq!(small_op.decode_inline().unwrap(), vec![0xAAu8; 50]);
+    assert_eq!(
+        small_op.try_decode_inline().unwrap().unwrap(),
+        vec![0xAAu8; 50]
+    );
 
     let large_op = loaded.operator_states.get("large").unwrap();
     assert!(large_op.external, "large state should be external");
@@ -6192,6 +6199,52 @@ struct FaultBackend {
     retention_read_probe: Option<Arc<RetentionReadProbe>>,
 }
 
+impl FaultBackend {
+    fn seal_is_hidden(&self) -> bool {
+        #[cfg(feature = "cluster")]
+        {
+            self.retention_read_probe
+                .as_ref()
+                .is_some_and(|probe| probe.hide_seal.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            false
+        }
+    }
+
+    fn apply_seal_inventory_fault(
+        &self,
+        attempt: CheckpointAttempt,
+        inventory: &mut Option<laminar_core::state::CheckpointSealInventory>,
+    ) {
+        #[cfg(not(feature = "cluster"))]
+        let _ = (attempt, inventory);
+        #[cfg(feature = "cluster")]
+        {
+            if !self
+                .retention_read_probe
+                .as_ref()
+                .is_some_and(|probe| *probe.forge_parent_lineage_at.lock() == Some(attempt))
+            {
+                return;
+            }
+            let inventory = inventory
+                .as_mut()
+                .expect("a forged parent-lineage fixture must name an existing seal");
+            let partial = inventory
+                .sealed_partials
+                .first_mut()
+                .expect("a forged parent-lineage fixture must contain a vnode");
+            partial.payload_len = partial
+                .payload_len
+                .checked_add(1)
+                .expect("test payload length must fit u64");
+            partial.lineage = VnodePartialLineage::root(partial.payload_len);
+        }
+    }
+}
+
 #[cfg(feature = "cluster")]
 #[derive(Default)]
 struct RetentionReadProbe {
@@ -6244,6 +6297,12 @@ impl Drop for WriteProbeGuard {
 impl StateBackend for FaultBackend {
     fn key_group_capacity(&self) -> u32 {
         self.inner.key_group_capacity()
+    }
+
+    fn sealed_partial_read_envelope(
+        &self,
+    ) -> Option<laminar_core::state::SealedPartialReadEnvelope> {
+        self.inner.sealed_partial_read_envelope()
     }
 
     async fn write_partial(
@@ -6417,34 +6476,29 @@ impl StateBackend for FaultBackend {
         Option<laminar_core::state::CheckpointSealInventory>,
         laminar_core::state::StateBackendError,
     > {
-        #[cfg(feature = "cluster")]
-        if self
-            .retention_read_probe
-            .as_ref()
-            .is_some_and(|probe| probe.hide_seal.load(std::sync::atomic::Ordering::SeqCst))
-        {
+        if self.seal_is_hidden() {
             return Ok(None);
         }
         let mut inventory = self.inner.checkpoint_seal_inventory(attempt).await?;
-        #[cfg(feature = "cluster")]
-        if self
-            .retention_read_probe
-            .as_ref()
-            .is_some_and(|probe| *probe.forge_parent_lineage_at.lock() == Some(attempt))
-        {
-            let inventory = inventory
-                .as_mut()
-                .expect("a forged parent-lineage fixture must name an existing seal");
-            let partial = inventory
-                .sealed_partials
-                .first_mut()
-                .expect("a forged parent-lineage fixture must contain a vnode");
-            partial.payload_len = partial
-                .payload_len
-                .checked_add(1)
-                .expect("test payload length must fit u64");
-            partial.lineage = VnodePartialLineage::root(partial.payload_len);
+        self.apply_seal_inventory_fault(attempt, &mut inventory);
+        Ok(inventory)
+    }
+
+    async fn checkpoint_seal_inventory_bounded(
+        &self,
+        attempt: CheckpointAttempt,
+    ) -> Result<
+        Option<laminar_core::state::CheckpointSealInventory>,
+        laminar_core::state::StateBackendError,
+    > {
+        if self.seal_is_hidden() {
+            return Ok(None);
         }
+        let mut inventory = self
+            .inner
+            .checkpoint_seal_inventory_bounded(attempt)
+            .await?;
+        self.apply_seal_inventory_fault(attempt, &mut inventory);
         Ok(inventory)
     }
 
@@ -7349,6 +7403,71 @@ async fn coordinator_with_decision_backing(
     (coordinator, decisions)
 }
 
+#[cfg(all(feature = "cluster", feature = "delta-lake"))]
+#[tokio::test]
+async fn certified_cluster_sink_does_not_create_a_local_open_witness() {
+    use arrow::datatypes::{DataType, Field, Schema};
+    use laminar_connectors::connector::{DeliveryGuarantee, SinkConnector};
+    use laminar_connectors::lakehouse::{DeltaLakeSink, DeltaLakeSinkConfig};
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::NodeId;
+
+    let dir = tempfile::tempdir().unwrap();
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let (mut coord, decisions) =
+        coordinator_with_decision_backing(dir.path(), Arc::clone(&backing)).await;
+    let node_id = NodeId(1);
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+    coord.set_cluster_controller(Arc::new(ClusterController::new(
+        node_id, kv, None, members_rx,
+    )));
+
+    let mut delta_config = DeltaLakeSinkConfig::new("s3://bucket/table");
+    delta_config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+    let delta = DeltaLakeSink::new(delta_config, None);
+    let contract = delta
+        .contract(&laminar_connectors::config::ConnectorConfig::new(
+            "delta-lake",
+        ))
+        .unwrap();
+    assert!(contract.is_cluster_exact_delivery_certified());
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+        name: "delta".into(),
+        sink_id: Arc::from("delta"),
+        connector: Box::new(SinkWitnessRestartProbe {
+            events: Arc::clone(&events),
+            fail_rollback: false,
+            schema,
+        }),
+        contract,
+        requires_recovery_on_error: true,
+        channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_secs(1),
+        event_tx,
+        terminal_tasks: None,
+        process_authority: None,
+    });
+    coord.register_sink("delta", handle);
+
+    coord.begin_initial_epoch().await.unwrap();
+    assert_eq!(events.lock().as_slice(), &[("begin", 1)]);
+    assert!(decisions.sink_open_witness().await.unwrap().is_none());
+
+    coord.reconcile_sink_open_witness().await.unwrap();
+    assert_eq!(events.lock().as_slice(), &[("begin", 1)]);
+    assert!(coord.allocator.sink_epoch_reservation().is_none());
+    coord.clear_sinks().unwrap();
+}
+
 const BLOCK_OUTCOME_READ: u8 = 1;
 const BLOCK_SINK_WITNESS_CLEAR: u8 = 2;
 
@@ -8239,13 +8358,6 @@ async fn follower_prepare_rollback_failure_retains_in_doubt_phase() {
 
     let dir = tempfile::tempdir().unwrap();
     let mut coord = make_cluster_coordinator(dir.path(), 1).await;
-    let _leader_lease = attach_cluster_controller(&mut coord, 1, &[]).await;
-    let leader_proof = coord
-        .cluster_controller
-        .as_ref()
-        .unwrap()
-        .capture_leader_proof()
-        .unwrap();
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
     let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
         crate::sink_task::SinkEvent,
@@ -8269,6 +8381,13 @@ async fn follower_prepare_rollback_failure_retains_in_doubt_phase() {
         ),
     );
     coord.begin_initial_epoch().await.unwrap();
+    let _leader_lease = attach_cluster_controller(&mut coord, 1, &[]).await;
+    let leader_proof = coord
+        .cluster_controller
+        .as_ref()
+        .unwrap()
+        .capture_leader_proof()
+        .unwrap();
 
     let request = certified_cluster_request(&coord);
     let attempt = CheckpointAttempt::canonical(8);
@@ -8301,7 +8420,6 @@ async fn landed_follower_readiness_with_lost_ack_never_rolls_back() {
 
     let dir = tempfile::tempdir().unwrap();
     let mut coord = make_cluster_coordinator(dir.path(), 1).await;
-    let _leader_lease = attach_cluster_controller(&mut coord, 1, &[]).await;
     let backend = Arc::new(FaultBackend {
         inner: laminar_core::state::InProcessBackend::new(1),
         fail: parking_lot::Mutex::new(std::collections::HashSet::new()),
@@ -8341,6 +8459,7 @@ async fn landed_follower_readiness_with_lost_ack_never_rolls_back() {
         ),
     );
     coord.begin_initial_epoch().await.unwrap();
+    let _leader_lease = attach_cluster_controller(&mut coord, 1, &[]).await;
 
     let attempt = CheckpointAttempt::canonical(8);
     let request = certified_cluster_request(&coord);
@@ -8538,7 +8657,7 @@ impl laminar_connectors::connector::SinkConnector for FailingPreCommitSink {
 
 #[derive(Clone, Copy)]
 enum PhaseOneProbeRole {
-    Fail,
+    Oversized,
     Slow,
 }
 
@@ -8573,10 +8692,8 @@ impl laminar_connectors::connector::SinkConnector for PhaseOneProbeSink {
     ) -> Result<Option<Vec<u8>>, laminar_connectors::error::ConnectorError> {
         self.barrier.wait().await;
         match self.role {
-            PhaseOneProbeRole::Fail => {
-                Err(laminar_connectors::error::ConnectorError::TransactionError(
-                    "synthetic phase-one failure".into(),
-                ))
+            PhaseOneProbeRole::Oversized => {
+                Ok(Some(vec![0; MAX_COORDINATED_COMMIT_PAYLOAD_BYTES + 1]))
             }
             PhaseOneProbeRole::Slow => {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -8707,7 +8824,7 @@ async fn pre_commit_failure_rolls_back_coordinated_prepare() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn phase_one_drains_started_sink_before_cleanup_budget() {
+async fn phase_one_payload_bound_drains_started_sink_before_cleanup_budget() {
     use arrow::datatypes::{DataType, Field, Schema};
 
     let dir = tempfile::tempdir().unwrap();
@@ -8723,19 +8840,19 @@ async fn phase_one_drains_started_sink_before_cleanup_budget() {
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let slow_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let fail_rollbacks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let oversized_rollbacks = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let slow_rollbacks = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
         crate::sink_task::SinkEvent,
     >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
 
-    let failing = spawn_phase_one_probe(
-        "phase-one-fail",
+    let oversized = spawn_phase_one_probe(
+        "phase-one-oversized",
         PhaseOneProbeSink {
-            role: PhaseOneProbeRole::Fail,
+            role: PhaseOneProbeRole::Oversized,
             barrier: Arc::clone(&barrier),
             precommit_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            rollback_count: Arc::clone(&fail_rollbacks),
+            rollback_count: Arc::clone(&oversized_rollbacks),
             schema: Arc::clone(&schema),
         },
         event_tx.clone(),
@@ -8751,7 +8868,7 @@ async fn phase_one_drains_started_sink_before_cleanup_budget() {
         },
         event_tx,
     );
-    coord.register_sink("phase-one-fail", failing);
+    coord.register_sink("phase-one-oversized", oversized);
     coord.register_sink("phase-one-slow", slow);
     coord.begin_initial_epoch().await.unwrap();
 
@@ -8768,12 +8885,16 @@ async fn phase_one_drains_started_sink_before_cleanup_budget() {
     );
     let error = result.error.expect("checkpoint failure has an error");
     assert!(error.contains("pre-commit failed"), "{error}");
+    assert!(error.contains("payload limit"), "{error}");
     assert!(!error.contains("cleanup incomplete"), "{error}");
     assert!(
         slow_complete.load(std::sync::atomic::Ordering::SeqCst),
         "cleanup began before the admitted slow prepare completed"
     );
-    assert_eq!(fail_rollbacks.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        oversized_rollbacks.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
     assert_eq!(slow_rollbacks.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 

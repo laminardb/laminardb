@@ -7,11 +7,61 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Schema, SchemaRef};
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 
-use laminar_core::streaming::{self, BackpressureStrategy, SourceConfig, WaitStrategy};
+use laminar_core::streaming::{
+    self, BackpressureStrategy, SourceConfig, StreamingError, WaitStrategy,
+};
+
+pub(crate) fn schema_has_reserved_mutation_columns(schema: &Schema) -> bool {
+    schema.fields().iter().any(|field| {
+        ["_op", "__op", laminar_core::changelog::WEIGHT_COLUMN]
+            .iter()
+            .any(|reserved| field.name().eq_ignore_ascii_case(reserved))
+    })
+}
+
+pub(crate) fn validate_source_batch(
+    source_name: &str,
+    expected_schema: &SchemaRef,
+    primary_key: &[String],
+    primary_key_indices: &[usize],
+    batch: &RecordBatch,
+) -> Result<(), StreamingError> {
+    let actual_schema = batch.schema();
+    if !Arc::ptr_eq(&actual_schema, expected_schema)
+        && actual_schema.as_ref() != expected_schema.as_ref()
+    {
+        return Err(StreamingError::SchemaMismatch {
+            expected: expected_schema
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect(),
+            actual: actual_schema
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect(),
+        });
+    }
+    if primary_key.len() != primary_key_indices.len() {
+        return Err(StreamingError::InvalidConfig(format!(
+            "source '{source_name}' primary-key metadata is inconsistent"
+        )));
+    }
+    for (column, &index) in primary_key.iter().zip(primary_key_indices) {
+        let null_count = batch.column(index).null_count();
+        if null_count != 0 {
+            return Err(StreamingError::InvalidConfig(format!(
+                "source '{source_name}' primary-key column '{column}' contains {null_count} null value(s)"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Record type for Arrow-based streaming subscriptions.
 #[derive(Clone, Debug)]
@@ -84,6 +134,9 @@ pub struct SourceEntry {
     pub name: String,
     /// Arrow schema.
     pub schema: SchemaRef,
+    /// Primary-key columns in declaration order.
+    pub primary_key: Vec<String>,
+    primary_key_indices: Vec<usize>,
     /// Watermark column name, if configured.
     pub watermark_column: Option<String>,
     /// Maximum out-of-orderness for watermark generation.
@@ -103,6 +156,13 @@ impl SourceEntry {
         &self,
         batch: RecordBatch,
     ) -> Result<(), laminar_core::streaming::StreamingError> {
+        validate_source_batch(
+            &self.name,
+            &self.schema,
+            &self.primary_key,
+            &self.primary_key_indices,
+            &batch,
+        )?;
         self.source.push_arrow(batch.clone())?;
         self.buffer.push(batch);
         self.data_notify.notify_one();
@@ -174,6 +234,7 @@ impl SourceCatalog {
         &self,
         name: &str,
         schema: SchemaRef,
+        primary_key: Vec<String>,
         watermark_column: Option<String>,
         max_out_of_orderness: Option<Duration>,
         buffer_size: Option<usize>,
@@ -182,6 +243,26 @@ impl SourceCatalog {
         let mut sources = self.sources.write();
         if sources.contains_key(name) {
             return Err(crate::DbError::SourceAlreadyExists(name.to_string()));
+        }
+
+        let mut primary_key_indices = Vec::with_capacity(primary_key.len());
+        for column in &primary_key {
+            let index = schema.index_of(column).map_err(|_| {
+                crate::DbError::InvalidOperation(format!(
+                    "source '{name}' primary-key column '{column}' is absent from its schema"
+                ))
+            })?;
+            if primary_key_indices.contains(&index) {
+                return Err(crate::DbError::InvalidOperation(format!(
+                    "source '{name}' primary key repeats column '{column}'"
+                )));
+            }
+            if schema.field(index).is_nullable() {
+                return Err(crate::DbError::InvalidOperation(format!(
+                    "source '{name}' primary-key column '{column}' must be non-nullable"
+                )));
+            }
+            primary_key_indices.push(index);
         }
 
         let buf_size = buffer_size.unwrap_or(self.default_buffer_size);
@@ -204,6 +285,8 @@ impl SourceCatalog {
         let entry = Arc::new(SourceEntry {
             name: name.to_string(),
             schema,
+            primary_key,
+            primary_key_indices,
             watermark_column,
             max_out_of_orderness,
             is_processing_time: std::sync::atomic::AtomicBool::new(false),
@@ -222,6 +305,7 @@ impl SourceCatalog {
         &self,
         name: &str,
         schema: SchemaRef,
+        primary_key: Vec<String>,
         watermark_column: Option<String>,
         max_out_of_orderness: Option<Duration>,
         buffer_size: Option<usize>,
@@ -233,6 +317,7 @@ impl SourceCatalog {
         self.register_source(
             name,
             schema,
+            primary_key,
             watermark_column,
             max_out_of_orderness,
             buffer_size,
@@ -382,18 +467,67 @@ mod tests {
     #[tokio::test]
     async fn test_register_source() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
-        let result = catalog.register_source("test", test_schema(), None, None, None, None);
+        let result = catalog.register_source("test", test_schema(), vec![], None, None, None, None);
         assert!(result.is_ok());
         assert!(catalog.get_source("test").is_some());
+    }
+
+    #[test]
+    fn source_ingress_rejects_null_primary_key() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![None::<i64>]))],
+        )
+        .unwrap();
+
+        let error =
+            validate_source_batch("keyed", &schema, &["id".into()], &[0], &batch).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("primary-key column 'id' contains 1 null"));
+    }
+
+    #[test]
+    fn register_source_rejects_nullable_primary_key() {
+        let catalog = SourceCatalog::new(8, BackpressureStrategy::Block);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let error = catalog
+            .register_source("keyed", schema, vec!["id".into()], None, None, None, None)
+            .err()
+            .expect("nullable primary key must be rejected");
+        assert!(error
+            .to_string()
+            .contains("primary-key column 'id' must be non-nullable"));
+    }
+
+    #[test]
+    fn register_source_rejects_repeated_primary_key_column() {
+        let catalog = SourceCatalog::new(8, BackpressureStrategy::Block);
+        let error = catalog
+            .register_source(
+                "keyed",
+                test_schema(),
+                vec!["id".into(), "id".into()],
+                None,
+                None,
+                None,
+                None,
+            )
+            .err()
+            .expect("repeated primary key must be rejected");
+        assert!(error
+            .to_string()
+            .contains("primary key repeats column 'id'"));
     }
 
     #[tokio::test]
     async fn test_register_duplicate_source() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         catalog
-            .register_source("test", test_schema(), None, None, None, None)
+            .register_source("test", test_schema(), vec![], None, None, None, None)
             .unwrap();
-        let result = catalog.register_source("test", test_schema(), None, None, None, None);
+        let result = catalog.register_source("test", test_schema(), vec![], None, None, None, None);
         assert!(matches!(
             result,
             Err(crate::DbError::SourceAlreadyExists(_))
@@ -404,7 +538,7 @@ mod tests {
     async fn test_drop_source() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         catalog
-            .register_source("test", test_schema(), None, None, None, None)
+            .register_source("test", test_schema(), vec![], None, None, None, None)
             .unwrap();
         assert!(catalog.drop_source("test"));
         assert!(catalog.get_source("test").is_none());
@@ -414,10 +548,10 @@ mod tests {
     async fn test_list_sources() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         catalog
-            .register_source("a", test_schema(), None, None, None, None)
+            .register_source("a", test_schema(), vec![], None, None, None, None)
             .unwrap();
         catalog
-            .register_source("b", test_schema(), None, None, None, None)
+            .register_source("b", test_schema(), vec![], None, None, None, None)
             .unwrap();
         let mut names = catalog.list_sources();
         names.sort();
@@ -483,7 +617,7 @@ mod tests {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         let schema = test_schema();
         catalog
-            .register_source("test", schema.clone(), None, None, None, None)
+            .register_source("test", schema.clone(), vec![], None, None, None, None)
             .unwrap();
         let result = catalog.describe_source("test");
         assert!(result.is_some());
@@ -494,11 +628,12 @@ mod tests {
     async fn test_or_replace() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         catalog
-            .register_source("test", test_schema(), None, None, None, None)
+            .register_source("test", test_schema(), vec![], None, None, None, None)
             .unwrap();
         let entry = catalog.register_source_or_replace(
             "test",
             test_schema(),
+            vec![],
             Some("ts".into()),
             None,
             None,
@@ -512,7 +647,7 @@ mod tests {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         let schema = test_schema();
         let entry = catalog
-            .register_source("test", schema.clone(), None, None, None, None)
+            .register_source("test", schema.clone(), vec![], None, None, None, None)
             .unwrap();
 
         let batch = RecordBatch::try_new(
@@ -536,7 +671,7 @@ mod tests {
         let catalog = SourceCatalog::new(2, BackpressureStrategy::DropOldest);
         let schema = test_schema();
         let entry = catalog
-            .register_source("test", schema.clone(), None, None, None, None)
+            .register_source("test", schema.clone(), vec![], None, None, None, None)
             .unwrap();
 
         let values: [(i64, f64); 3] = [(0, 1.0), (1, 2.0), (2, 3.0)];

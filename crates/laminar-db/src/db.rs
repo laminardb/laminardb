@@ -12,7 +12,6 @@ use laminar_core::streaming;
 use laminar_sql::parser::{parse_streaming_sql, ShowCommand, StreamingStatement};
 use laminar_sql::planner::StreamingPlanner;
 use laminar_sql::register_streaming_functions;
-use laminar_sql::translator::{AsofJoinTranslatorConfig, JoinOperatorConfig};
 
 use crate::builder::LaminarDbBuilder;
 use crate::catalog::SourceCatalog;
@@ -289,6 +288,11 @@ pub struct LaminarDB {
     /// Persistent terminal cancellation for the currently installed compute runtime. Unlike a
     /// notification permit, cancellation cannot be lost while the coordinator is between awaits.
     pub(crate) runtime_shutdown: parking_lot::RwLock<tokio_util::sync::CancellationToken>,
+    /// Process-lifetime cancellation for assignment restore I/O. A coordinated recovery stops the
+    /// current compute runtime before a successor assignment can acquire vnodes, so restartable
+    /// runtime cancellation must not make that restore permanently fail.
+    #[cfg(feature = "cluster")]
+    pub(crate) assignment_restore_shutdown: tokio_util::sync::CancellationToken,
     pub(crate) engine_metrics:
         parking_lot::Mutex<Option<Arc<crate::engine_metrics::EngineMetrics>>>,
     /// Process-lifetime, fixed-capacity barrier timing evidence. Pipeline recovery generations share
@@ -742,9 +746,7 @@ fn sensitive_catalog_property(statement: &StreamingStatement) -> Option<String> 
                     .as_ref()
                     .and_then(|format| find(format.options.iter(), true))
             }),
-        StreamingStatement::CreateSink(create) => find(create.with_options.iter(), true)
-            .or_else(|| find(create.connector_options.iter(), true))
-            .or_else(|| find(create.output_options.iter(), true))
+        StreamingStatement::CreateSink(create) => find(create.connector_options.iter(), true)
             .or_else(|| {
                 create
                     .format
@@ -778,12 +780,7 @@ fn connector_source_requires_schema_discovery(statement: &StreamingStatement) ->
     let StreamingStatement::CreateSource(create) = statement else {
         return false;
     };
-    let has_connector = create.connector_type.is_some()
-        || create
-            .with_options
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case("connector"));
-    has_connector && (create.columns.is_empty() || create.has_wildcard)
+    create.connector_type.is_some() && create.columns.is_empty()
 }
 
 #[cfg(not(feature = "cluster"))]
@@ -949,6 +946,17 @@ impl LaminarDB {
         &self,
         head: &crate::checkpoint_coordinator::ValidatedVnodeRestoreHead,
     ) -> Result<Arc<crate::vnode_restore_input::VnodeRestoreInputBudget>, DbError> {
+        let read_envelope = self
+            .state_backend
+            .lock()
+            .as_ref()
+            .and_then(|backend| backend.sealed_partial_read_envelope())
+            .ok_or_else(|| {
+                DbError::Checkpoint(
+                    "[LDB-6050] installed checkpoint backend does not declare a sealed-partial read resource envelope"
+                        .into(),
+                )
+            })?;
         let limits = &head.contract().limits;
         let expected = crate::vnode_restore_input::VnodeRestoreInputLimits {
             max_lineage_bytes: limits.max_cluster_lineage_payload_bytes,
@@ -956,9 +964,9 @@ impl LaminarDB {
         };
         let mut installed = self.vnode_restore_input_budget.lock();
         if let Some(current) = installed.as_ref() {
-            if current.limits() != expected {
+            if current.limits() != expected || current.read_envelope() != read_envelope {
                 return Err(DbError::Checkpoint(
-                    "[LDB-6050] committed vnode restore raw-input limits changed within one graph generation; reset or a new checkpoint namespace is required"
+                    "[LDB-6050] committed vnode restore limits or checkpoint-backend read envelope changed within one graph generation; reset or a new checkpoint namespace is required"
                         .into(),
                 ));
             }
@@ -966,6 +974,7 @@ impl LaminarDB {
         }
         let budget = Arc::new(crate::vnode_restore_input::VnodeRestoreInputBudget::new(
             expected,
+            read_envelope,
         )?);
         *installed = Some(Arc::clone(&budget));
         Ok(budget)
@@ -1124,6 +1133,28 @@ impl LaminarDB {
         target_partitions: Option<usize>,
         runtime_mode: RuntimeMode,
     ) -> Result<Self, DbError> {
+        let max_managed_state_bytes = config
+            .pipeline_max_managed_state_bytes
+            .unwrap_or(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES);
+        if max_managed_state_bytes == 0 {
+            return Err(DbError::Config(
+                "pipeline_max_managed_state_bytes must be greater than zero".into(),
+            ));
+        }
+        config.pipeline_max_managed_state_bytes = Some(max_managed_state_bytes);
+
+        let max_retractable_extremum_checkpoint_bytes = config
+            .pipeline_max_retractable_extremum_checkpoint_bytes
+            .unwrap_or(crate::config::DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES);
+        if max_retractable_extremum_checkpoint_bytes == 0 {
+            return Err(DbError::Config(
+                "pipeline_max_retractable_extremum_checkpoint_bytes must be greater than zero"
+                    .into(),
+            ));
+        }
+        config.pipeline_max_retractable_extremum_checkpoint_bytes =
+            Some(max_retractable_extremum_checkpoint_bytes);
+
         if let Some(checkpoint) = config.checkpoint.as_mut() {
             let max_state_data_bytes = checkpoint.max_staged_bytes.unwrap_or(
                 laminar_core::storage::checkpoint_store::DEFAULT_MAX_CHECKPOINT_STATE_BYTES,
@@ -1216,6 +1247,8 @@ impl LaminarDB {
             owned_connector_task_fences: Arc::new(parking_lot::Mutex::new(Vec::new())),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             runtime_shutdown: parking_lot::RwLock::new(tokio_util::sync::CancellationToken::new()),
+            #[cfg(feature = "cluster")]
+            assignment_restore_shutdown: tokio_util::sync::CancellationToken::new(),
             engine_metrics: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
             checkpoint_barrier_timings: Arc::new(
@@ -2627,7 +2660,7 @@ impl LaminarDB {
             let attempt = handoff.vnode_restore_cut.attempt();
             let restore_head = handoff.vnode_restore_cut.restore_head();
             let budget = self.vnode_restore_input_budget(restore_head)?;
-            let cancel = self.runtime_shutdown.read().clone();
+            let cancel = self.assignment_restore_shutdown.clone();
             let reader =
                 crate::recovery_manager::vnode_chains::SealedVnodeChainReader::from_committed_head(
                     backend.as_ref(),
@@ -2644,6 +2677,13 @@ impl LaminarDB {
                 .await?
         } else {
             crate::recovery_manager::vnode_chains::LoadedVnodeChains::default()
+        };
+        let (source_handoff, restore_binding) = match source_handoff {
+            Some(handoff) => (
+                Some(handoff.sources),
+                Some(handoff.vnode_restore_cut.into_transition_binding()?),
+            ),
+            None => (None, None),
         };
 
         let observed_outcome = if let Some(reader) = handoff_reader.as_ref() {
@@ -2724,14 +2764,17 @@ impl LaminarDB {
             }
         }
         if let Some(handoff) = source_handoff.as_ref() {
-            let expected_attempt = handoff.vnode_restore_cut.attempt();
-            if handoff.sources.attempt() != expected_attempt {
+            let expected_attempt = restore_binding
+                .as_ref()
+                .expect("source handoff retains its vnode transition binding")
+                .attempt();
+            if handoff.attempt() != expected_attempt {
                 return Err(DbError::Checkpoint(format!(
                     "[LDB-6054] committed source handoff {:?} does not match durable outcome {expected_attempt:?}",
-                    handoff.sources.attempt()
+                    handoff.attempt()
                 )));
             }
-            for (source_name, _) in handoff.sources.sources() {
+            for (source_name, _) in handoff.sources() {
                 if self.catalog.get_source(source_name).is_none() {
                     return Err(DbError::Checkpoint(format!(
                         "[LDB-6054] committed source handoff names unknown catalog source '{source_name}'"
@@ -2740,7 +2783,7 @@ impl LaminarDB {
             }
             match (
                 controller.cluster_min_watermark(),
-                handoff.sources.recovery_watermark_frontier(),
+                handoff.recovery_watermark_frontier(),
             ) {
                 (Some(current), Some(recovered)) if current > recovered => {
                     return Err(DbError::Checkpoint(format!(
@@ -2750,7 +2793,7 @@ impl LaminarDB {
                 (Some(current), None) => {
                     return Err(DbError::Checkpoint(format!(
                         "[LDB-6054] {:?} source handoff without a numeric frontier cannot replace committed cluster watermark {current}",
-                        handoff.sources.cluster_watermark()
+                        handoff.cluster_watermark()
                     )));
                 }
                 _ => {}
@@ -2784,9 +2827,7 @@ impl LaminarDB {
                     snapshot.version
                 ))
             })?;
-            let restore_cut = source_handoff
-                .as_ref()
-                .map(|handoff| handoff.vnode_restore_cut.clone());
+            let restore_binding = restore_binding.clone();
             let transition = if predecessor_snapshot.is_some() {
                 crate::vnode_transition_staging::PendingVnodeTransition::assignment_change(
                     predecessor_fence.clone().ok_or_else(|| {
@@ -2800,13 +2841,13 @@ impl LaminarDB {
                     &new_assignment,
                     local_participant,
                     pipeline_identity,
-                    restore_cut,
+                    restore_binding,
                     loaded_chains,
                     force_local_restore,
                     final_owner_exit,
                 )?
             } else {
-                let restore_cut = restore_cut.ok_or_else(|| {
+                let restore_binding = restore_binding.ok_or_else(|| {
                     DbError::Checkpoint(format!(
                         "[LDB-6053] initial assignment {} has vnode state to install but no committed restore cut",
                         snapshot.version
@@ -2817,7 +2858,7 @@ impl LaminarDB {
                     &new_assignment,
                     local_participant,
                     pipeline_identity,
-                    restore_cut,
+                    restore_binding,
                     loaded_chains,
                 )?
             };
@@ -2898,7 +2939,7 @@ impl LaminarDB {
 
         if let Some(watermark) = source_handoff
             .as_ref()
-            .and_then(|handoff| handoff.sources.recovery_watermark_frontier())
+            .and_then(|handoff| handoff.recovery_watermark_frontier())
         {
             controller.publish_cluster_min_watermark(watermark);
         }
@@ -2906,7 +2947,7 @@ impl LaminarDB {
             registry.set_assignment_and_version_with_source_handoff(
                 new_assignment,
                 snapshot.version,
-                handoff.sources,
+                handoff,
             );
         } else if source_handoff_required {
             // Genesis has no committed cut. Keep that distinct from a committed
@@ -4319,10 +4360,6 @@ impl LaminarDB {
                 }))
             }
             laminar_sql::planner::StreamingPlan::Query(query_plan) => {
-                if let Some(asof_config) = Self::extract_asof_config(&query_plan) {
-                    return self.execute_asof_query(&asof_config, sql).await;
-                }
-
                 let plan_sql = query_plan.statement.to_string();
                 let logical_plan = self.ctx.state().create_logical_plan(&plan_sql).await?;
                 let df = self.ctx.execute_logical_plan(logical_plan).await?;
@@ -4399,90 +4436,6 @@ impl LaminarDB {
             cancel_token,
         })
     }
-
-    fn extract_asof_config(
-        plan: &laminar_sql::planner::QueryPlan,
-    ) -> Option<AsofJoinTranslatorConfig> {
-        plan.join_config.as_ref()?.iter().find_map(|jc| {
-            if let JoinOperatorConfig::Asof(cfg) = jc {
-                Some(cfg.clone())
-            } else {
-                None
-            }
-        })
-    }
-
-    async fn execute_asof_query(
-        &self,
-        asof_config: &AsofJoinTranslatorConfig,
-        original_sql: &str,
-    ) -> Result<ExecuteResult, DbError> {
-        let left_sql = format!("SELECT * FROM {}", asof_config.left_table);
-        let right_sql = format!("SELECT * FROM {}", asof_config.right_table);
-
-        let left_batches = self
-            .ctx
-            .sql(&left_sql)
-            .await
-            .map_err(|e| DbError::query_pipeline(&asof_config.left_table, &e))?
-            .collect()
-            .await
-            .map_err(|e| DbError::query_pipeline(&asof_config.left_table, &e))?;
-
-        let right_batches = self
-            .ctx
-            .sql(&right_sql)
-            .await
-            .map_err(|e| DbError::query_pipeline(&asof_config.right_table, &e))?
-            .collect()
-            .await
-            .map_err(|e| DbError::query_pipeline(&asof_config.right_table, &e))?;
-
-        let result_batch =
-            crate::asof_batch::execute_asof_join_batch(&left_batches, &right_batches, asof_config)?;
-
-        if result_batch.num_rows() == 0 {
-            let query_id = self.catalog.register_query(original_sql);
-            self.catalog.deactivate_query(query_id);
-            return Ok(ExecuteResult::Query(QueryHandle {
-                id: query_id,
-                schema: result_batch.schema(),
-                sql: original_sql.to_string(),
-                subscription: None,
-                active: false,
-                cancel_token: tokio_util::sync::CancellationToken::new(),
-            }));
-        }
-
-        let schema = result_batch.schema();
-        let mem_table =
-            datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![result_batch]])
-                .map_err(|e| DbError::query_pipeline("ASOF join", &e))?;
-
-        let _ = self
-            .ctx
-            .deregister_table(exact_table_reference("__asof_result"));
-        self.ctx
-            .register_table(exact_table_reference("__asof_result"), Arc::new(mem_table))
-            .map_err(|e| DbError::query_pipeline("ASOF join", &e))?;
-
-        let df = self
-            .ctx
-            .sql("SELECT * FROM __asof_result")
-            .await
-            .map_err(|e| DbError::query_pipeline("ASOF join", &e))?;
-        let stream = df
-            .execute_stream()
-            .await
-            .map_err(|e| DbError::query_pipeline("ASOF join", &e))?;
-
-        let _ = self
-            .ctx
-            .deregister_table(exact_table_reference("__asof_result"));
-
-        Ok(self.bridge_query_stream(original_sql, stream))
-    }
-
     /// Get a typed handle for pushing data to a registered source.
     ///
     /// # Errors

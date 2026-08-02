@@ -1,9 +1,10 @@
 use super::*;
+use crate::kafka::offsets::{KAFKA_CHECKPOINT_VERSION, KAFKA_CHECKPOINT_VERSION_KEY};
 use arrow_schema::{DataType, Field, Schema};
 use laminar_core::checkpoint::{
     CheckpointAssignmentFence, CheckpointParticipant, CheckpointWatermark, ClusterRecoveryCapsule,
-    ParticipantRecoveryRef, PipelineIdentity, CLUSTER_RECOVERY_CAPSULE_VERSION,
-    PIPELINE_IDENTITY_VERSION,
+    ParticipantRecoveryRef, PipelineIdentity, VnodeRestoreContract, VnodeRestoreLimits,
+    CLUSTER_RECOVERY_CAPSULE_VERSION, PIPELINE_IDENTITY_VERSION,
 };
 use laminar_core::state::CheckpointAttempt;
 use rdkafka::mocking::MockCluster;
@@ -63,7 +64,13 @@ fn committed_kafka_handoff_at(
             BTreeMap::from([(source_name.to_string(), version)])
         });
     let metadata = connector.map_or_else(BTreeMap::new, |connector| {
-        BTreeMap::from([("connector".into(), connector.into())])
+        BTreeMap::from([
+            ("connector".into(), connector.into()),
+            (
+                KAFKA_CHECKPOINT_VERSION_KEY.into(),
+                KAFKA_CHECKPOINT_VERSION.into(),
+            ),
+        ])
     });
     let capsule = ClusterRecoveryCapsule {
         version: CLUSTER_RECOVERY_CAPSULE_VERSION,
@@ -80,6 +87,13 @@ fn committed_kafka_handoff_at(
         )
         .unwrap(),
         seal_inventory_sha256: digest(2),
+        vnode_restore_contract: VnodeRestoreContract::new(
+            VnodeRestoreLimits::managed_vnode(1, 1, 1).unwrap(),
+            1,
+            1,
+            1,
+        )
+        .unwrap(),
         participants: vec![ParticipantRecoveryRef {
             participant_id: 1,
             readiness_sha256: digest(3),
@@ -655,7 +669,21 @@ fn source_contract_is_replayable_and_splittable() {
         .expect("static Kafka contract");
     assert_eq!(contract.consistency, SourceConsistency::Replayable);
     assert_eq!(contract.topology, SourceTopology::Splittable);
-    assert!(!contract.is_exact_delivery_certified());
+    assert_eq!(contract.input_mode, SourceInputMode::AppendOnly);
+    assert!(contract.is_exact_delivery_certified());
+}
+
+#[test]
+fn debezium_contract_is_keyed_upsert_from_request_config() {
+    let source = KafkaSource::new(test_schema(), test_config(), None);
+    let mut config = ConnectorConfig::new("kafka");
+    config.set("bootstrap.servers", "localhost:9092");
+    config.set("group.id", "contract-test");
+    config.set("topic", "events");
+    config.set("format", "debezium");
+
+    let contract = source.contract(&config).unwrap();
+    assert_eq!(contract.input_mode, SourceInputMode::KeyedUpsert);
 }
 
 #[tokio::test]
@@ -769,10 +797,12 @@ async fn guaranteed_dynamic_broker_ownership_fails_before_activation() {
     request_config.set("topic.pattern", "replacement-.*");
     request_config.set("laminar.source.name", "replacement-source");
 
-    let checkpoint = SourceCheckpoint::with_offsets(std::collections::HashMap::from([(
+    let mut checkpoint = SourceCheckpoint::with_offsets(std::collections::HashMap::from([(
         "replacement-topic:0".to_string(),
         "42".to_string(),
     )]));
+    checkpoint.set_metadata("connector", "kafka");
+    checkpoint.set_metadata(KAFKA_CHECKPOINT_VERSION_KEY, KAFKA_CHECKPOINT_VERSION);
     let error = source
         .start(
             SourceStart::new(
@@ -788,11 +818,14 @@ async fn guaranteed_dynamic_broker_ownership_fails_before_activation() {
         .await
         .expect_err("dynamic broker-managed ownership must fail closed");
 
-    assert!(matches!(
-        error,
+    assert!(
+        matches!(
+        &error,
         ConnectorError::ConfigurationError(message)
             if message.contains("topic patterns") && message.contains("engine-owned")
-    ));
+        ),
+        "unexpected admission error: {error:?}"
+    );
     assert_eq!(source.state(), ConnectorState::Created);
     assert!(source.consumer.is_none());
     assert!(source.msg_rx.is_none());
@@ -1238,6 +1271,8 @@ async fn vnode_resume_cut_wins_over_older_acquisition_handoff_on_first_reader_tu
         (partition_baseline_key("events", 0), "17".to_string()),
     ]));
     recovered_cut.bind_assignment_version(NonZeroU64::new(2).unwrap());
+    recovered_cut.set_metadata("connector", "kafka");
+    recovered_cut.set_metadata(KAFKA_CHECKPOINT_VERSION_KEY, KAFKA_CHECKPOINT_VERSION);
     recovered_cut.set_metadata(
         KAFKA_PARTITION_INVENTORY_METADATA,
         encode_partition_inventory(&inventory),
@@ -2137,6 +2172,7 @@ fn deterministic_initial_never_uses_stored_offsets() {
 fn empty_resume_checkpoint_is_valid() {
     let mut checkpoint = SourceCheckpoint::new();
     checkpoint.set_metadata("connector", "kafka");
+    checkpoint.set_metadata(KAFKA_CHECKPOINT_VERSION_KEY, KAFKA_CHECKPOINT_VERSION);
     let offsets =
         OffsetTracker::try_from_checkpoint(&checkpoint).expect("empty resume is a valid cut");
     assert_eq!(offsets.partition_count(), 0);
@@ -2155,10 +2191,12 @@ fn resume_checkpoint_decode_is_strict() {
         ("events:0", "9223372036854775807"),
         ("invalid:topic:0", "1"),
     ] {
-        let checkpoint = SourceCheckpoint::with_offsets(std::collections::HashMap::from([(
+        let mut checkpoint = SourceCheckpoint::with_offsets(std::collections::HashMap::from([(
             key.to_string(),
             value.to_string(),
         )]));
+        checkpoint.set_metadata("connector", "kafka");
+        checkpoint.set_metadata(KAFKA_CHECKPOINT_VERSION_KEY, KAFKA_CHECKPOINT_VERSION);
         assert!(
             OffsetTracker::try_from_checkpoint(&checkpoint).is_err(),
             "malformed checkpoint entry {key}={value} must fail closed"
@@ -2747,7 +2785,9 @@ fn test_checkpoint_to_tpl_uses_next_offset() {
     let mut offsets = std::collections::HashMap::new();
     offsets.insert("events:0".to_string(), "100".to_string());
     offsets.insert("events:1".to_string(), "200".to_string());
-    let cp = SourceCheckpoint::with_offsets(offsets);
+    let mut cp = SourceCheckpoint::with_offsets(offsets);
+    cp.set_metadata("connector", "kafka");
+    cp.set_metadata(KAFKA_CHECKPOINT_VERSION_KEY, KAFKA_CHECKPOINT_VERSION);
     let tpl = OffsetTracker::try_from_checkpoint(&cp)
         .unwrap()
         .to_topic_partition_list();
@@ -2775,6 +2815,8 @@ async fn test_notify_epoch_committed_empty_cp_is_noop() {
 fn durable_kafka_checkpoint() -> SourceCheckpoint {
     let mut checkpoint = SourceCheckpoint::new();
     checkpoint.set_offset("events:0", "100");
+    checkpoint.set_metadata("connector", "kafka");
+    checkpoint.set_metadata(KAFKA_CHECKPOINT_VERSION_KEY, KAFKA_CHECKPOINT_VERSION);
     checkpoint
 }
 

@@ -657,10 +657,6 @@ pub(crate) fn spawn_config_watcher(
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // DDL generation
 // ---------------------------------------------------------------------------
 
@@ -675,6 +671,10 @@ fn connector_sql_identifier(connector: &str) -> String {
     } else {
         format!("\"{}\"", connector.replace('"', "\"\""))
     }
+}
+
+fn connector_option_key_sql(key: &str) -> String {
+    format!("\"{}\"", key.replace('"', "\"\""))
 }
 
 pub fn source_to_ddl(source: &SourceConfig) -> String {
@@ -706,18 +706,26 @@ pub fn source_to_ddl(source: &SourceConfig) -> String {
 
     // FROM CONNECTOR (...) clause
     let connector_keyword = connector_sql_identifier(&source.connector);
-    let mut opts = Vec::new();
-    opts.push(format!("format = '{}'", source.format));
-    for (key, value) in &source.properties {
-        // Quote keys that contain dots (e.g. kafka.session.timeout.ms)
-        // to prevent SQL parser errors with dotted identifiers.
-        if key.contains('.') {
-            opts.push(format!("\"{}\" = '{}'", key, toml_value_to_sql(value)));
-        } else {
-            opts.push(format!("{} = '{}'", key, toml_value_to_sql(value)));
-        }
+    let opts: Vec<String> = source
+        .properties
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{} = '{}'",
+                connector_option_key_sql(key),
+                toml_value_to_sql(value)
+            )
+        })
+        .collect();
+    if opts.is_empty() {
+        parts.push(format!("FROM {connector_keyword}"));
+    } else {
+        parts.push(format!("FROM {} ({})", connector_keyword, opts.join(", ")));
     }
-    parts.push(format!("FROM {} ({})", connector_keyword, opts.join(", ")));
+    parts.push(format!(
+        "FORMAT {}",
+        connector_sql_identifier(&source.format)
+    ));
 
     parts.join(" ")
 }
@@ -732,15 +740,15 @@ pub fn sink_to_ddl(sink: &SinkConfig) -> String {
         .properties
         .iter()
         .map(|(key, value)| {
-            if key.contains('.') {
-                format!("\"{}\" = '{}'", key, toml_value_to_sql(value))
-            } else {
-                format!("{} = '{}'", key, toml_value_to_sql(value))
-            }
+            format!(
+                "{} = '{}'",
+                connector_option_key_sql(key),
+                toml_value_to_sql(value)
+            )
         })
         .collect();
 
-    if opts.is_empty() {
+    let mut ddl = if opts.is_empty() {
         format!(
             "CREATE SINK {} FROM {} INTO {}",
             sink.name, sink.pipeline, connector_keyword
@@ -753,7 +761,12 @@ pub fn sink_to_ddl(sink: &SinkConfig) -> String {
             connector_keyword,
             opts.join(", ")
         )
+    };
+    if let Some(format) = &sink.format {
+        ddl.push_str(" FORMAT ");
+        ddl.push_str(&connector_sql_identifier(format));
     }
+    ddl
 }
 
 #[allow(clippy::result_large_err)]
@@ -1160,8 +1173,8 @@ mod tests {
         assert!(ddl.starts_with("CREATE SOURCE events"));
         assert!(ddl.contains("id BIGINT NOT NULL"));
         assert!(ddl.contains("name VARCHAR"));
-        assert!(ddl.contains("FROM KAFKA"));
-        assert!(ddl.contains("format = 'json'"));
+        assert!(ddl.contains("FROM KAFKA FORMAT JSON"));
+        assert!(!ddl.contains("format ="));
     }
 
     /// Columnless OTel source + WATERMARK FOR must compose: the OTel
@@ -1347,9 +1360,39 @@ mod tests {
             "topic".to_string(),
             toml::Value::String("events".to_string()),
         );
+        source.properties.insert(
+            "client-id".to_string(),
+            toml::Value::String("source-client".to_string()),
+        );
+        source.properties.insert(
+            "vendor\"option".to_string(),
+            toml::Value::String("quoted-key".to_string()),
+        );
         let ddl = source_to_ddl(&source);
         assert!(ddl.contains("\"bootstrap.servers\" = 'localhost:9092'"));
-        assert!(ddl.contains("topic = 'events'"));
+        assert!(ddl.contains("\"topic\" = 'events'"));
+        assert!(ddl.contains("\"client-id\" = 'source-client'"));
+        assert!(ddl.contains("\"vendor\"\"option\" = 'quoted-key'"));
+        assert!(ddl.ends_with(") FORMAT JSON"));
+
+        let statements = laminar_sql::parser::parse_streaming_sql(&ddl).unwrap();
+        let laminar_sql::parser::StreamingStatement::CreateSource(parsed) = &statements[0] else {
+            panic!("expected CREATE SOURCE")
+        };
+        assert_eq!(
+            parsed
+                .connector_options
+                .get("client-id")
+                .map(String::as_str),
+            Some("source-client")
+        );
+        assert_eq!(
+            parsed
+                .connector_options
+                .get("vendor\"option")
+                .map(String::as_str),
+            Some("quoted-key")
+        );
     }
 
     #[test]
@@ -1376,18 +1419,38 @@ mod tests {
             "bootstrap.servers".to_string(),
             toml::Value::String("localhost:9092".to_string()),
         );
+        props.insert(
+            "oauthbearer-token".to_string(),
+            toml::Value::String("token".to_string()),
+        );
         let sink = SinkConfig {
             name: "output_sink".to_string(),
             pipeline: "vwap".to_string(),
             connector: "kafka".to_string(),
+            format: Some("json".to_string()),
             properties: props,
         };
         let ddl = sink_to_ddl(&sink);
         assert!(ddl.starts_with("CREATE SINK output_sink FROM vwap INTO KAFKA"));
-        assert!(ddl.contains("topic = 'output'"));
+        assert!(ddl.contains("\"topic\" = 'output'"));
         assert!(ddl.contains("\"bootstrap.servers\" = 'localhost:9092'"));
+        assert!(ddl.contains("\"oauthbearer-token\" = 'token'"));
+        assert!(ddl.ends_with(") FORMAT JSON"));
+        assert!(!ddl.contains("format ="));
         // Delivery is injected from the pipeline-wide engine contract at connector build time.
         assert!(!ddl.contains("delivery"));
+
+        let statements = laminar_sql::parser::parse_streaming_sql(&ddl).unwrap();
+        let laminar_sql::parser::StreamingStatement::CreateSink(parsed) = &statements[0] else {
+            panic!("expected CREATE SINK")
+        };
+        assert_eq!(
+            parsed
+                .connector_options
+                .get("oauthbearer-token")
+                .map(String::as_str),
+            Some("token")
+        );
     }
 
     #[test]
@@ -1396,6 +1459,7 @@ mod tests {
             name: "out".to_string(),
             pipeline: "p".to_string(),
             connector: "kafka".to_string(),
+            format: None,
             properties: toml::Table::new(),
         };
         let ddl = sink_to_ddl(&sink);

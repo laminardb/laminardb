@@ -17,7 +17,9 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use laminar_core::state::{CheckpointAttempt, CheckpointSealInventory, StateBackend};
+use laminar_core::state::{
+    CheckpointAttempt, CheckpointSealInventory, SealedCommitDescriptor, StateBackend,
+};
 use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
 
 #[cfg(feature = "cluster")]
@@ -55,7 +57,15 @@ struct CommitInventory {
 
 struct CommitBindings {
     outcomes: FxHashMap<CheckpointAttempt, CheckpointOutcome>,
-    seals: FxHashMap<CheckpointAttempt, CheckpointSealInventory>,
+    seals: FxHashMap<CheckpointAttempt, ValidatedCommitSeal>,
+}
+
+/// Descriptor evidence retained after the complete seal and cluster capsule have been validated.
+/// Vnode inventories are recovery authority, but external publication does not consume them.
+struct ValidatedCommitSeal {
+    attempt: CheckpointAttempt,
+    scope: CheckpointScope,
+    descriptors: Vec<SealedCommitDescriptor>,
 }
 
 struct RetainedOutcomeContinuity {
@@ -68,6 +78,7 @@ struct RetainedOutcomeContinuity {
 /// as raw bytes; serializing it as a JSON integer array would amplify a valid marker into
 /// hundreds of MiB and make the encoder/decoder limits disagree.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PreparedSinkMarkerHeader {
     version: u32,
     attempt: CheckpointAttempt,
@@ -435,11 +446,24 @@ impl CoordinatedCommitter {
                         checkpoint_id: 0,
                         fencing_token: 0,
                     });
-            let sealed: Vec<CheckpointAttempt> = committed_attempts
+            // Publish only the contiguous seal window validated on this pass. A lagging sink must
+            // never skip an unloaded predecessor merely because a later outcome is durable.
+            let sealed_count = committed_attempts
                 .iter()
-                .copied()
-                .filter(|attempt| attempt.checkpoint_id > cursor.checkpoint_id)
-                .collect();
+                .filter(|attempt| {
+                    attempt.checkpoint_id > cursor.checkpoint_id
+                        && bindings.seals.contains_key(attempt)
+                })
+                .count();
+            let mut sealed = Vec::new();
+            sealed.try_reserve_exact(sealed_count).map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "committer: pending checkpoint inventory for sink '{name}' is too large"
+                ))
+            })?;
+            sealed.extend(committed_attempts.iter().copied().filter(|attempt| {
+                attempt.checkpoint_id > cursor.checkpoint_id && bindings.seals.contains_key(attempt)
+            }));
             let Some(&target) = sealed.last() else {
                 continue;
             };
@@ -585,19 +609,30 @@ impl CoordinatedCommitter {
                 ));
             }
         }
-        let committed: Vec<CheckpointOutcome> = outcomes
-            .into_iter()
-            // A floor may advance after outcomes() selected its stable view. Apply the separately
-            // audited scalar boundary before any seal read or connector call.
-            .filter(|outcome| {
-                outcome.epoch >= retention.artifact_before_epoch && outcome.is_commit()
-            })
-            .collect();
-        let committed_attempts: Vec<CheckpointAttempt> = committed
-            .iter()
-            .map(|outcome| CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id))
-            .collect();
+        let mut committed = Vec::new();
+        committed.try_reserve_exact(outcomes.len()).map_err(|_| {
+            DbError::Checkpoint("committer: checkpoint outcome inventory is too large".into())
+        })?;
+        // A floor may advance after outcomes() selected its stable view. Apply the separately
+        // audited scalar boundary before any seal read or connector call.
+        committed.extend(outcomes.into_iter().filter(|outcome| {
+            outcome.epoch >= retention.artifact_before_epoch && outcome.is_commit()
+        }));
+        let mut committed_attempts = Vec::new();
+        committed_attempts
+            .try_reserve_exact(committed.len())
+            .map_err(|_| {
+                DbError::Checkpoint("committer: checkpoint attempt inventory is too large".into())
+            })?;
+        committed_attempts.extend(
+            committed
+                .iter()
+                .map(|outcome| CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id)),
+        );
         let mut outcome_bindings = FxHashMap::default();
+        outcome_bindings.try_reserve(committed.len()).map_err(|_| {
+            DbError::Checkpoint("committer: checkpoint outcome bindings are too large".into())
+        })?;
         for outcome in committed {
             let attempt = CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id);
             if outcome_bindings.insert(attempt, outcome).is_some() {
@@ -619,7 +654,7 @@ impl CoordinatedCommitter {
             .min()
             .unwrap_or(0);
         let seals = self
-            .load_pending_seals(&committed_attempts, min_observed)
+            .load_pending_seals(&committed_attempts, min_observed, &outcome_bindings)
             .await?;
         self.validate_commit_continuity(
             &committed_attempts,
@@ -629,9 +664,6 @@ impl CoordinatedCommitter {
             &outcome_bindings,
             &seals,
         )?;
-        #[cfg(feature = "cluster")]
-        self.validate_cluster_recovery_capsules(&committed_attempts, &outcome_bindings, &seals)
-            .await?;
         Ok(CommitInventory {
             attempts: committed_attempts,
             bindings: CommitBindings {
@@ -673,11 +705,23 @@ impl CoordinatedCommitter {
         &self,
         committed_attempts: &[CheckpointAttempt],
         min_observed: u64,
-    ) -> Result<FxHashMap<CheckpointAttempt, CheckpointSealInventory>, DbError> {
+        outcomes: &FxHashMap<CheckpointAttempt, CheckpointOutcome>,
+    ) -> Result<FxHashMap<CheckpointAttempt, ValidatedCommitSeal>, DbError> {
+        // Retain a fixed contiguous window; successful passes resume at the next pending attempt.
+        let pending_count = committed_attempts
+            .iter()
+            .filter(|attempt| attempt.checkpoint_id > min_observed)
+            .take(MAX_SEAL_READ_CONCURRENCY)
+            .count();
+        let mut seals = FxHashMap::default();
+        seals.try_reserve(pending_count).map_err(|_| {
+            DbError::Checkpoint("committer: pending checkpoint seal inventory is too large".into())
+        })?;
         let pending = committed_attempts
             .iter()
             .copied()
-            .filter(|attempt| attempt.checkpoint_id > min_observed);
+            .filter(|attempt| attempt.checkpoint_id > min_observed)
+            .take(MAX_SEAL_READ_CONCURRENCY);
         let reads = futures::stream::iter(pending.map(|attempt| async move {
             let inventory = self
                 .storage_io(
@@ -685,17 +729,36 @@ impl CoordinatedCommitter {
                         "read seal inventory for checkpoint {}",
                         attempt.checkpoint_id
                     ),
-                    self.backend.checkpoint_seal_inventory(attempt),
+                    self.backend.checkpoint_seal_inventory_bounded(attempt),
                 )
                 .await?;
             Ok::<_, DbError>((attempt, inventory))
         }))
         .buffer_unordered(MAX_SEAL_READ_CONCURRENCY);
         tokio::pin!(reads);
-        let mut seals = FxHashMap::default();
         while let Some((attempt, inventory)) = reads.try_next().await? {
             if let Some(inventory) = inventory {
-                if seals.insert(attempt, inventory).is_some() {
+                let outcome = outcomes.get(&attempt).ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "committer: checkpoint {} has no durable commit outcome binding",
+                        attempt.checkpoint_id
+                    ))
+                })?;
+                self.validate_pending_seal_inventory(attempt, outcome, &inventory)?;
+                #[cfg(feature = "cluster")]
+                self.validate_cluster_recovery_capsule(attempt, outcome, &inventory)
+                    .await?;
+                let CheckpointSealInventory {
+                    attempt: inventory_attempt,
+                    sealed_descriptors: descriptors,
+                    ..
+                } = inventory;
+                let seal = ValidatedCommitSeal {
+                    attempt: inventory_attempt,
+                    scope: outcome.scope,
+                    descriptors,
+                };
+                if seals.insert(attempt, seal).is_some() {
                     return Err(DbError::Checkpoint(format!(
                         "committer: duplicate seal inventory for checkpoint {}",
                         attempt.checkpoint_id
@@ -706,12 +769,102 @@ impl CoordinatedCommitter {
         Ok(seals)
     }
 
+    fn validate_pending_seal_inventory(
+        &self,
+        attempt: CheckpointAttempt,
+        outcome: &CheckpointOutcome,
+        inventory: &CheckpointSealInventory,
+    ) -> Result<(), DbError> {
+        inventory.validate_control_limits().map_err(|error| {
+            DbError::Checkpoint(format!(
+                "committer: checkpoint {} seal inventory exceeds control limits: {error}",
+                attempt.checkpoint_id
+            ))
+        })?;
+        inventory.validate_vnode_partials().map_err(|error| {
+            DbError::Checkpoint(format!(
+                "committer: checkpoint {} has invalid vnode seal inventory: {error}",
+                attempt.checkpoint_id
+            ))
+        })?;
+        if inventory.attempt != attempt {
+            return Err(DbError::Checkpoint(format!(
+                "committer: seal inventory identity mismatch for checkpoint {}",
+                attempt.checkpoint_id
+            )));
+        }
+        if outcome.epoch != attempt.epoch || outcome.checkpoint_id != attempt.checkpoint_id {
+            return Err(DbError::Checkpoint(format!(
+                "committer: outcome identity mismatch for checkpoint {}",
+                attempt.checkpoint_id
+            )));
+        }
+        if outcome.deployment_id != self.deployment_id {
+            return Err(DbError::Checkpoint(format!(
+                "committer: checkpoint {} outcome deployment '{}' does not match committer deployment '{}'",
+                attempt.checkpoint_id, outcome.deployment_id, self.deployment_id
+            )));
+        }
+        if outcome.scope != self.outcome_scope {
+            return Err(DbError::Checkpoint(format!(
+                "committer: checkpoint {} outcome scope {:?} does not match active runtime scope {:?}",
+                attempt.checkpoint_id, outcome.scope, self.outcome_scope
+            )));
+        }
+        if !matches!(&outcome.verdict, CheckpointVerdict::Commit) {
+            return Err(DbError::Checkpoint(format!(
+                "committer: checkpoint {} is bound to an abort outcome",
+                attempt.checkpoint_id
+            )));
+        }
+        match outcome.scope {
+            CheckpointScope::Local if inventory.assignment_fence.is_some() => {
+                return Err(DbError::Checkpoint(format!(
+                    "committer: local checkpoint {} has a cluster assignment certificate",
+                    attempt.checkpoint_id
+                )));
+            }
+            CheckpointScope::Cluster if inventory.assignment_fence != outcome.assignment_fence => {
+                return Err(DbError::Checkpoint(format!(
+                    "committer: checkpoint {} outcome assignment certificate does not match the sealed certificate",
+                    attempt.checkpoint_id
+                )));
+            }
+            _ => {}
+        }
+        let descriptor_leader = inventory.descriptor_leader_proof().map_err(|error| {
+            DbError::Checkpoint(format!(
+                "committer: checkpoint {} has invalid descriptor provenance: {error}",
+                attempt.checkpoint_id
+            ))
+        })?;
+        match outcome.scope {
+            CheckpointScope::Local if descriptor_leader.is_some() => {
+                return Err(DbError::Checkpoint(format!(
+                    "committer: local checkpoint {} has certified cluster descriptors",
+                    attempt.checkpoint_id
+                )));
+            }
+            CheckpointScope::Cluster if descriptor_leader != outcome.leader_proof.as_ref() => {
+                return Err(DbError::Checkpoint(format!(
+                    "committer: checkpoint {} descriptor authority does not match its durable outcome",
+                    attempt.checkpoint_id
+                )));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Re-read every external cursor on every pass. Besides recovering an ambiguous prior commit,
     /// this detects a live target-catalog rollback instead of trusting stale memory.
     async fn read_external_cursors(
         &self,
     ) -> Result<FxHashMap<String, CoordinatedCommitCursor>, DbError> {
         let mut observed_cursors = FxHashMap::default();
+        observed_cursors
+            .try_reserve(self.sinks.len())
+            .map_err(|_| DbError::Checkpoint("committer: sink inventory is too large".into()))?;
         for (name, handle) in &self.sinks {
             let namespace = CoordinatedCommitNamespace::try_new(
                 self.pipeline_identity.clone(),
@@ -781,7 +934,7 @@ impl CoordinatedCommitter {
         continuity_outcome: Option<&CheckpointOutcome>,
         observed_cursors: &FxHashMap<String, CoordinatedCommitCursor>,
         outcomes: &FxHashMap<CheckpointAttempt, CheckpointOutcome>,
-        seals: &FxHashMap<CheckpointAttempt, CheckpointSealInventory>,
+        seals: &FxHashMap<CheckpointAttempt, ValidatedCommitSeal>,
     ) -> Result<(), DbError> {
         let min_observed = self
             .sinks
@@ -793,11 +946,11 @@ impl CoordinatedCommitter {
             })
             .min()
             .unwrap_or(0);
-        // Every commit outcome still ahead of at least one sink must retain its exact seal and
-        // participant inventory.
+        // Every outcome selected for this bounded pass must retain its exact seal evidence.
         for attempt in committed_attempts
             .iter()
             .filter(|attempt| attempt.checkpoint_id > min_observed)
+            .take(MAX_SEAL_READ_CONCURRENCY)
         {
             if !seals.contains_key(attempt) {
                 return Err(DbError::Checkpoint(format!(
@@ -890,115 +1043,89 @@ impl CoordinatedCommitter {
     }
 
     #[cfg(feature = "cluster")]
-    async fn validate_cluster_recovery_capsules(
+    async fn validate_cluster_recovery_capsule(
         &self,
-        committed_attempts: &[CheckpointAttempt],
-        outcomes: &FxHashMap<CheckpointAttempt, CheckpointOutcome>,
-        seals: &FxHashMap<CheckpointAttempt, CheckpointSealInventory>,
+        attempt: CheckpointAttempt,
+        outcome: &CheckpointOutcome,
+        inventory: &CheckpointSealInventory,
     ) -> Result<(), DbError> {
+        if outcome.scope != CheckpointScope::Cluster {
+            return Ok(());
+        }
         let decision_store = self.decision_store.as_ref().ok_or_else(|| {
             DbError::Checkpoint(
                 "committer: cluster recovery-capsule validation requires a checkpoint decision store"
                     .into(),
             )
         })?;
+        let reference = outcome.recovery_capsule.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "committer: cluster checkpoint {} commit outcome has no recovery capsule",
+                attempt.checkpoint_id
+            ))
+        })?;
+        let capsule = self
+            .storage_io(
+                &format!(
+                    "load recovery capsule for checkpoint {}",
+                    attempt.checkpoint_id
+                ),
+                decision_store.load_recovery_capsule(reference),
+            )
+            .await?;
 
-        for attempt in committed_attempts {
-            let Some(inventory) = seals.get(attempt) else {
-                continue;
-            };
-            let outcome = outcomes.get(attempt).ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "committer: checkpoint {} has no durable commit outcome binding",
-                    attempt.checkpoint_id
-                ))
-            })?;
-            if outcome.scope != CheckpointScope::Cluster {
-                continue;
-            }
+        if capsule.attempt != attempt {
+            return Err(DbError::Checkpoint(format!(
+                "committer: checkpoint {} recovery capsule attempt {:?} does not match {:?}",
+                attempt.checkpoint_id, capsule.attempt, attempt
+            )));
+        }
+        if capsule.deployment_id != self.deployment_id
+            || capsule.deployment_id != outcome.deployment_id
+        {
+            return Err(DbError::Checkpoint(format!(
+                "committer: checkpoint {} recovery capsule deployment '{}' does not match outcome deployment '{}'",
+                attempt.checkpoint_id, capsule.deployment_id, outcome.deployment_id
+            )));
+        }
+        if Some(&capsule.assignment_fence) != outcome.assignment_fence.as_ref()
+            || inventory.assignment_fence.as_ref() != Some(&capsule.assignment_fence)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "committer: checkpoint {} recovery capsule assignment certificate does not match the outcome and sealed certificate",
+                attempt.checkpoint_id
+            )));
+        }
+        let seal_inventory_sha256 = canonical_json_sha256(inventory).map_err(|error| {
+            DbError::Checkpoint(format!(
+                "committer: canonicalize seal inventory for checkpoint {}: {error}",
+                attempt.checkpoint_id
+            ))
+        })?;
+        if capsule.seal_inventory_sha256 != seal_inventory_sha256 {
+            return Err(DbError::Checkpoint(format!(
+                "committer: checkpoint {} recovery capsule seal inventory digest does not match the durable seal",
+                attempt.checkpoint_id
+            )));
+        }
 
-            let reference = outcome.recovery_capsule.as_ref().ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "committer: cluster checkpoint {} commit outcome has no recovery capsule",
-                    attempt.checkpoint_id
-                ))
-            })?;
-            let capsule = self
-                .storage_io(
-                    &format!(
-                        "load recovery capsule for checkpoint {}",
-                        attempt.checkpoint_id
-                    ),
-                    decision_store.load_recovery_capsule(reference),
-                )
-                .await?;
-
-            if capsule.attempt != *attempt {
-                return Err(DbError::Checkpoint(format!(
-                    "committer: checkpoint {} recovery capsule attempt {:?} does not match {:?}",
-                    attempt.checkpoint_id, capsule.attempt, attempt
-                )));
-            }
-            if capsule.deployment_id != self.deployment_id
-                || capsule.deployment_id != outcome.deployment_id
-            {
-                return Err(DbError::Checkpoint(format!(
-                    "committer: checkpoint {} recovery capsule deployment '{}' does not match outcome deployment '{}'",
-                    attempt.checkpoint_id, capsule.deployment_id, outcome.deployment_id
-                )));
-            }
-            if Some(&capsule.assignment_fence) != outcome.assignment_fence.as_ref()
-                || inventory.assignment_fence.as_ref() != Some(&capsule.assignment_fence)
-            {
-                return Err(DbError::Checkpoint(format!(
-                    "committer: checkpoint {} recovery capsule assignment certificate does not match the outcome and sealed certificate",
-                    attempt.checkpoint_id
-                )));
-            }
-            if inventory.descriptor_leader_proof().map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "committer: checkpoint {} has invalid descriptor provenance: {error}",
-                    attempt.checkpoint_id
-                ))
-            })? != outcome.leader_proof.as_ref()
-            {
-                return Err(DbError::Checkpoint(format!(
-                    "committer: checkpoint {} descriptor authority does not match its durable outcome",
-                    attempt.checkpoint_id
-                )));
-            }
-
-            let seal_inventory_sha256 = canonical_json_sha256(inventory).map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "committer: canonicalize seal inventory for checkpoint {}: {error}",
-                    attempt.checkpoint_id
-                ))
-            })?;
-            if capsule.seal_inventory_sha256 != seal_inventory_sha256 {
-                return Err(DbError::Checkpoint(format!(
-                    "committer: checkpoint {} recovery capsule seal inventory digest does not match the durable seal",
-                    attempt.checkpoint_id
-                )));
-            }
-
-            let readiness = self
-                .read_cluster_readiness_inventory(inventory, *attempt)
-                .await?;
-            let reproduced = assemble_capsule(
-                inventory,
-                readiness,
-                capsule.vnode_restore_contract.clone(),
-                &self.deployment_id,
-                &self.pipeline_identity,
-                capsule.cluster_watermark,
-                capsule.recovery_watermark_frontier,
-            )?;
-            if reproduced != capsule {
-                return Err(DbError::Checkpoint(format!(
-                    "committer: checkpoint {} sealed participant readiness inventory does not reproduce the committed recovery capsule",
-                    attempt.checkpoint_id
-                )));
-            }
+        let readiness = self
+            .read_cluster_readiness_inventory(inventory, attempt)
+            .await?;
+        let reproduced = assemble_capsule(
+            inventory,
+            readiness,
+            capsule.vnode_restore_contract.clone(),
+            &self.deployment_id,
+            &self.pipeline_identity,
+            capsule.cluster_watermark,
+            capsule.recovery_watermark_frontier,
+        )?;
+        if reproduced != capsule {
+            return Err(DbError::Checkpoint(format!(
+                "committer: checkpoint {} sealed participant readiness inventory does not reproduce the committed recovery capsule",
+                attempt.checkpoint_id
+            )));
         }
         Ok(())
     }
@@ -1078,7 +1205,7 @@ impl CoordinatedCommitter {
             let attempt_cursor = outcome_cursor(outcome)?;
             let inventory = bindings.seals.get(&attempt).ok_or_else(|| {
                 DbError::Checkpoint(format!(
-                    "committer: checkpoint {} has no cached exact seal inventory",
+                    "committer: checkpoint {} has no cached validated descriptor seal",
                     attempt.checkpoint_id
                 ))
             })?;
@@ -1137,6 +1264,11 @@ impl CoordinatedCommitter {
                         "committer: coordinated commit batch byte count overflow".into(),
                     )
                 })?;
+            entries.try_reserve(attempt_entries.len()).map_err(|_| {
+                DbError::Checkpoint(
+                    "committer: coordinated commit batch entry inventory is too large".into(),
+                )
+            })?;
             entries.append(&mut attempt_entries);
             batch_target = Some(attempt);
             batch_fencing_token = Some(attempt_cursor.fencing_token);
@@ -1169,8 +1301,8 @@ impl CoordinatedCommitter {
         prefix: &str,
         attempt: CheckpointAttempt,
         outcome: &CheckpointOutcome,
-        inventory: &CheckpointSealInventory,
-    ) -> Result<Vec<String>, DbError> {
+        inventory: &ValidatedCommitSeal,
+    ) -> Result<usize, DbError> {
         if inventory.attempt != attempt {
             return Err(DbError::Checkpoint(format!(
                 "committer: seal inventory identity mismatch for checkpoint {}",
@@ -1201,63 +1333,31 @@ impl CoordinatedCommitter {
                 attempt.checkpoint_id
             )));
         }
-        match outcome.scope {
-            CheckpointScope::Local if inventory.assignment_fence.is_some() => {
-                return Err(DbError::Checkpoint(format!(
-                    "committer: local checkpoint {} has a cluster assignment certificate",
-                    attempt.checkpoint_id
-                )));
-            }
-            CheckpointScope::Cluster if inventory.assignment_fence != outcome.assignment_fence => {
-                return Err(DbError::Checkpoint(format!(
-                "committer: checkpoint {} outcome assignment certificate does not match the sealed certificate",
-                    attempt.checkpoint_id
-                )));
-            }
-            _ => {}
-        }
-        let descriptor_leader = inventory.descriptor_leader_proof().map_err(|error| {
-            DbError::Checkpoint(format!(
-                "committer: checkpoint {} has invalid descriptor provenance: {error}",
+        if inventory.scope != outcome.scope {
+            return Err(DbError::Checkpoint(format!(
+                "committer: checkpoint {} validated descriptor scope does not match its durable outcome",
                 attempt.checkpoint_id
-            ))
-        })?;
-        match outcome.scope {
-            CheckpointScope::Local if descriptor_leader.is_some() => {
-                return Err(DbError::Checkpoint(format!(
-                    "committer: local checkpoint {} has certified cluster descriptors",
-                    attempt.checkpoint_id
-                )));
-            }
-            CheckpointScope::Cluster if descriptor_leader != outcome.leader_proof.as_ref() => {
-                return Err(DbError::Checkpoint(format!(
-                    "committer: checkpoint {} descriptor authority does not match its durable outcome",
-                    attempt.checkpoint_id
-                )));
-            }
-            _ => {}
+            )));
         }
-        let required: Vec<String> = inventory
-            .required_descriptors
+        let required_count = inventory
+            .descriptors
             .iter()
-            .filter(|key| key.starts_with(prefix))
-            .cloned()
-            .collect();
-        if required.is_empty() {
+            .filter(|descriptor| descriptor.key.starts_with(prefix))
+            .count();
+        if required_count == 0 {
             return Err(DbError::Checkpoint(format!(
                 "committer: sealed checkpoint {} has no participant marker for sink '{name}'",
                 attempt.checkpoint_id
             )));
         }
-        if required.len() > MAX_COORDINATED_COMMIT_BATCH_ENTRIES {
+        if required_count > MAX_COORDINATED_COMMIT_BATCH_ENTRIES {
             return Err(DbError::Checkpoint(format!(
                 "committer: checkpoint {} has {} markers for sink '{name}', exceeding the \
                  per-transaction limit of {MAX_COORDINATED_COMMIT_BATCH_ENTRIES}",
-                attempt.checkpoint_id,
-                required.len()
+                attempt.checkpoint_id, required_count
             )));
         }
-        Ok(required)
+        Ok(required_count)
     }
 
     #[cfg(feature = "cluster")]
@@ -1272,22 +1372,35 @@ impl CoordinatedCommitter {
                 attempt.checkpoint_id
             )));
         }
-        let keys = inventory
-            .required_descriptors
+        let key_count = inventory
+            .sealed_descriptors
             .iter()
-            .filter(|key| key.starts_with(PARTICIPANT_READY_PREFIX))
-            .cloned()
-            .collect::<Vec<_>>();
-        let reads = futures::stream::iter(keys.into_iter().map(|key| async move {
-            let participant_id = participant_from_ready_key(&key).ok_or_else(|| {
+            .filter(|descriptor| descriptor.key.starts_with(PARTICIPANT_READY_PREFIX))
+            .count();
+        let mut descriptor_indexes = Vec::new();
+        descriptor_indexes
+            .try_reserve_exact(key_count)
+            .map_err(|_| {
                 DbError::Checkpoint(format!(
-                    "committer: checkpoint {} has non-canonical participant readiness key '{key}'",
+                    "committer: checkpoint {} participant readiness inventory is too large",
                     attempt.checkpoint_id
                 ))
             })?;
-            let descriptor = inventory.sealed_descriptor(&key).ok_or_else(|| {
+        descriptor_indexes.extend(inventory.sealed_descriptors.iter().enumerate().filter_map(
+            |(index, descriptor)| {
+                descriptor
+                    .key
+                    .starts_with(PARTICIPANT_READY_PREFIX)
+                    .then_some(index)
+            },
+        ));
+        let reads = futures::stream::iter(descriptor_indexes.into_iter().map(|index| async move {
+            let descriptor = &inventory.sealed_descriptors[index];
+            let key = descriptor.key.as_str();
+            let participant_id = participant_from_ready_key(key).ok_or_else(|| {
                 DbError::Checkpoint(format!(
-                    "committer: participant readiness marker '{key}' has no sealed provenance"
+                    "committer: checkpoint {} has non-canonical participant readiness key '{key}'",
+                    attempt.checkpoint_id
                 ))
             })?;
             if descriptor
@@ -1319,12 +1432,18 @@ impl CoordinatedCommitter {
                         attempt.checkpoint_id
                     ))
             })?;
-            Ok::<_, DbError>((key, participant_id, bytes))
+            Ok::<_, DbError>((descriptor.key.clone(), participant_id, bytes))
         }))
         .buffer_unordered(MAX_PARTICIPANT_READY_READ_CONCURRENCY);
         tokio::pin!(reads);
         let mut retained_bytes = 0;
         let mut records = Vec::new();
+        records.try_reserve_exact(key_count).map_err(|_| {
+            DbError::Checkpoint(format!(
+                "committer: checkpoint {} participant readiness records are too large",
+                attempt.checkpoint_id
+            ))
+        })?;
         while let Some(record) = reads.try_next().await? {
             let (key, participant_id, bytes) = record;
             retained_bytes = checked_participant_ready_total(retained_bytes, bytes.len())?;
@@ -1358,37 +1477,60 @@ impl CoordinatedCommitter {
         prefix: &str,
         attempt: CheckpointAttempt,
         outcome: &CheckpointOutcome,
-        inventory: &CheckpointSealInventory,
+        inventory: &ValidatedCommitSeal,
     ) -> Result<(Vec<CoordinatedCommitPayload>, usize), DbError> {
-        let required =
+        let required_count =
             self.validate_attempt_inventory(name, prefix, attempt, outcome, inventory)?;
-
-        let descriptors = futures::stream::iter(required.into_iter().map(|key| async move {
-            let sealed = inventory.sealed_descriptor(&key).ok_or_else(|| {
+        let mut descriptor_indexes = Vec::new();
+        descriptor_indexes
+            .try_reserve_exact(required_count)
+            .map_err(|_| {
                 DbError::Checkpoint(format!(
-                    "committer: sealed marker '{key}' has no descriptor attestation"
+                    "committer: checkpoint {} descriptor inventory for sink '{name}' is too large",
+                    attempt.checkpoint_id
                 ))
             })?;
-            let bytes = self
-                .storage_io(
-                    &format!(
-                        "read descriptor '{key}' for epoch {} checkpoint {}",
-                        attempt.epoch, attempt.checkpoint_id
-                    ),
-                    self.backend.read_sealed_commit_descriptor_bounded(
-                        attempt,
-                        sealed,
-                        MAX_PREPARED_MARKER_BYTES,
-                    ),
-                )
-                .await?;
-            Ok::<_, DbError>((key, bytes))
-        }))
-        .buffer_unordered(MAX_DESCRIPTOR_READ_CONCURRENCY);
+        descriptor_indexes.extend(
+            inventory
+                .descriptors
+                .iter()
+                .enumerate()
+                .filter_map(|(index, descriptor)| {
+                    descriptor.key.starts_with(prefix).then_some(index)
+                }),
+        );
+        let descriptors =
+            futures::stream::iter(descriptor_indexes.into_iter().map(|index| async move {
+                let sealed = &inventory.descriptors[index];
+                let key = sealed.key.as_str();
+                let bytes = self
+                    .storage_io(
+                        &format!(
+                            "read descriptor '{key}' for epoch {} checkpoint {}",
+                            attempt.epoch, attempt.checkpoint_id
+                        ),
+                        self.backend.read_sealed_commit_descriptor_bounded(
+                            attempt,
+                            sealed,
+                            MAX_PREPARED_MARKER_BYTES,
+                        ),
+                    )
+                    .await?;
+                Ok::<_, DbError>((index, bytes))
+            }))
+            .buffer_unordered(MAX_DESCRIPTOR_READ_CONCURRENCY);
         tokio::pin!(descriptors);
         let mut entries = Vec::new();
+        entries.try_reserve_exact(required_count).map_err(|_| {
+            DbError::Checkpoint(format!(
+                "committer: checkpoint {} descriptor payload inventory for sink '{name}' is too large",
+                attempt.checkpoint_id
+            ))
+        })?;
         let mut descriptor_bytes = 0usize;
-        while let Some((key, bytes)) = descriptors.try_next().await? {
+        while let Some((index, bytes)) = descriptors.try_next().await? {
+            let sealed = &inventory.descriptors[index];
+            let key = sealed.key.as_str();
             let bytes = bytes.ok_or_else(|| {
                 DbError::Checkpoint(format!(
                     "committer: sealed marker '{key}' is missing for checkpoint {}",
@@ -1404,15 +1546,10 @@ impl CoordinatedCommitter {
                     attempt.checkpoint_id, MAX_COORDINATED_COMMIT_BATCH_BYTES
                 )));
             }
-            let entry = decode_prepared_marker(&key, &bytes, attempt, namespace)?;
-            match inventory.assignment_fence.as_ref() {
-                Some(_) => {
-                    let descriptor = inventory.sealed_descriptor(&key).ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "committer: sealed marker '{key}' has no descriptor provenance"
-                        ))
-                    })?;
-                    if descriptor
+            let entry = decode_prepared_marker(key, &bytes, attempt, namespace)?;
+            match inventory.scope {
+                CheckpointScope::Cluster => {
+                    if sealed
                         .writer
                         .as_ref()
                         .map(|writer| writer.participant.node_id)
@@ -1424,35 +1561,34 @@ impl CoordinatedCommitter {
                         )));
                     }
                 }
-                None if inventory
-                    .sealed_descriptor(&key)
-                    .is_some_and(|descriptor| descriptor.writer.is_some()) =>
-                {
+                CheckpointScope::Local if sealed.writer.is_some() => {
                     return Err(DbError::Checkpoint(format!(
                         "committer: local marker '{key}' has cluster writer provenance"
                     )));
                 }
-                None => {}
+                CheckpointScope::Local => {}
             }
             entries.push(entry);
         }
         entries.sort_unstable_by_key(|entry| entry.participant_id);
-        let actual_participants: Vec<u64> =
-            entries.iter().map(|entry| entry.participant_id).collect();
-        match &outcome.verdict {
-            CheckpointVerdict::Commit => {}
-            CheckpointVerdict::Abort => {
-                return Err(DbError::Checkpoint(format!(
-                    "committer: checkpoint {} is bound to an abort outcome",
-                    attempt.checkpoint_id
-                )));
-            }
-        }
-        let expected_participants = outcome.assignment_fence.as_ref().map_or_else(
-            || vec![0],
-            laminar_core::checkpoint::CheckpointAssignmentFence::participant_ids,
+        let participants_match = outcome.assignment_fence.as_ref().map_or_else(
+            || entries.len() == 1 && entries[0].participant_id == 0,
+            |fence| {
+                entries.iter().map(|entry| entry.participant_id).eq(fence
+                    .participants
+                    .iter()
+                    .map(|participant| participant.node_id))
+            },
         );
-        if actual_participants != expected_participants {
+        if !participants_match {
+            let actual_participants = entries
+                .iter()
+                .map(|entry| entry.participant_id)
+                .collect::<Vec<_>>();
+            let expected_participants = outcome.assignment_fence.as_ref().map_or_else(
+                || vec![0],
+                laminar_core::checkpoint::CheckpointAssignmentFence::participant_ids,
+            );
             return Err(DbError::Checkpoint(format!(
                 "committer: checkpoint {} sink '{name}' participants {actual_participants:?} do not match outcome participants {:?}",
                 attempt.checkpoint_id, expected_participants

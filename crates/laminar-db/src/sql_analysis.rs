@@ -16,19 +16,15 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
-use sqlparser::tokenizer::{Location, Token, TokenWithSpan};
 
 use crate::ai::{BackendKind, ModelRegistry, Task};
-use laminar_sql::parser::join_parser::{analyze_join, analyze_joins};
+use laminar_sql::parser::join_parser::{analyze_join, analyze_joins, JoinType};
 
 use crate::error::DbError;
 use crate::operator::window_frame::MomentFn;
 #[cfg(test)]
 use laminar_sql::parser::{EmitClause, EmitStrategy as SqlEmitStrategy};
-use laminar_sql::translator::{
-    AsofJoinTranslatorConfig, JoinOperatorConfig, StreamJoinConfig, StreamJoinType,
-    TemporalJoinTranslatorConfig, WindowOperatorConfig, WindowType,
-};
+use laminar_sql::translator::{JoinOperatorConfig, StreamJoinConfig, TemporalJoinTranslatorConfig};
 
 #[cfg(test)]
 pub(crate) fn sql_emit_to_core(
@@ -65,11 +61,6 @@ pub(crate) fn extract_table_references(sql: &str) -> FxHashSet<String> {
                 collect_tables_from_set_expr(query.body.as_ref(), &mut tables);
             }
         }
-    }
-    // sqlparser can't parse TEMPORAL PROBE JOIN; pull its tables separately.
-    if let (Some(config), _) = detect_temporal_probe_query(sql) {
-        tables.insert(config.left_table.clone());
-        tables.insert(config.right_table.clone());
     }
     tables
 }
@@ -285,47 +276,6 @@ fn collect_factor_counting(factor: &TableFactor, tables: &mut Vec<String>) {
         _ => tables.push("\u{0}non_table_factor".to_string()),
     }
 }
-
-/// Rewrite `ASOF JOIN … MATCH_CONDITION(..)` to `LEFT JOIN … ON ..` for schema planning.
-///
-/// `DataFusion` can't lower `AsOf`; left outer keeps the right side nullable. Returns `None`
-/// if the query has no ASOF join.
-pub(crate) fn rewrite_asof_joins_for_planning(sql: &str) -> Option<String> {
-    use sqlparser::ast::{JoinConstraint, JoinOperator};
-
-    let dialect = GenericDialect {};
-    let mut stmts = Parser::parse_sql(&dialect, sql).ok()?;
-    let mut changed = false;
-    for stmt in &mut stmts {
-        if let Statement::Query(query) = stmt {
-            if let SetExpr::Select(select) = query.body.as_mut() {
-                for twj in &mut select.from {
-                    for join in &mut twj.joins {
-                        if !matches!(join.join_operator, JoinOperator::AsOf { .. }) {
-                            continue;
-                        }
-                        let op = std::mem::replace(
-                            &mut join.join_operator,
-                            JoinOperator::Inner(JoinConstraint::None),
-                        );
-                        if let JoinOperator::AsOf { constraint, .. } = op {
-                            join.join_operator = JoinOperator::LeftOuter(constraint);
-                            changed = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    changed.then(|| {
-        stmts
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; ")
-    })
-}
-
 /// Resolve the real source table from a `TableFactor::Table`.
 ///
 /// sqlparser parses `FROM TUMBLE(events, ts, ...)` as a table named `TUMBLE` with args;
@@ -379,7 +329,7 @@ fn normalize_ident(ident: &Ident) -> String {
     ident.value.clone()
 }
 
-/// Compiled post-join projection for ASOF/temporal queries.
+/// Compiled post-join projection for stateful queries.
 pub(crate) struct CompiledPostProjection {
     pub(crate) exprs: Vec<Arc<dyn PhysicalExpr>>,
     pub(crate) output_schema: SchemaRef,
@@ -502,101 +452,6 @@ pub(crate) fn extract_projection_exprs(
     let output_schema = Arc::new(arrow::datatypes::Schema::new(fields));
     Some((exprs, output_schema))
 }
-
-/// Compute the closed-window boundary for a given watermark.
-///
-/// Tumbling: floor to the nearest boundary. Session: `watermark - gap`.
-/// Sliding: first slide-aligned boundary after `watermark - size`.
-pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> i64 {
-    match config.window_type {
-        WindowType::Tumbling => {
-            let size = i64::try_from(config.size.as_millis()).unwrap_or(i64::MAX);
-            if size <= 0 {
-                tracing::warn!("tumbling window size is zero or negative, EOWC filtering disabled");
-                return watermark_ms;
-            }
-            // Saturating so the i64::MIN initial-watermark sentinel doesn't panic.
-            let offset = config.offset_ms;
-            let adjusted = watermark_ms.saturating_sub(offset);
-            let floored = adjusted.div_euclid(size).saturating_mul(size);
-            floored.saturating_add(offset)
-        }
-        WindowType::Session => {
-            let gap = config
-                .gap
-                .map_or(0, |g| i64::try_from(g.as_millis()).unwrap_or(i64::MAX));
-            watermark_ms.saturating_sub(gap)
-        }
-        WindowType::Sliding => {
-            let size = i64::try_from(config.size.as_millis()).unwrap_or(i64::MAX);
-            let slide = config
-                .slide
-                .map_or(size, |s| i64::try_from(s.as_millis()).unwrap_or(i64::MAX));
-            if slide <= 0 || size <= 0 {
-                tracing::warn!(
-                    slide_ms = slide,
-                    size_ms = size,
-                    "sliding window size/slide is zero or negative, EOWC filtering disabled"
-                );
-                return watermark_ms;
-            }
-            // Earliest open window starts at first slide-aligned boundary after (watermark - size).
-            let offset = config.offset_ms;
-            let base = watermark_ms.saturating_sub(offset).saturating_sub(size);
-            let boundary = base
-                .div_euclid(slide)
-                .saturating_add(1)
-                .saturating_mul(slide);
-            boundary.saturating_add(offset)
-        }
-        WindowType::Cumulate => {
-            let size = i64::try_from(config.size.as_millis()).unwrap_or(i64::MAX);
-            if size <= 0 {
-                tracing::warn!("cumulate window size is zero or negative, EOWC filtering disabled");
-                return watermark_ms;
-            }
-            let offset = config.offset_ms;
-            let adjusted = watermark_ms.saturating_sub(offset);
-            let floored = adjusted.div_euclid(size).saturating_mul(size);
-            floored.saturating_add(offset)
-        }
-    }
-}
-
-pub(crate) fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>, Option<String>) {
-    let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
-        return (None, None);
-    };
-
-    let Some(laminar_sql::parser::StreamingStatement::Standard(stmt)) = statements.first() else {
-        return (None, None);
-    };
-
-    let Statement::Query(query) = stmt.as_ref() else {
-        return (None, None);
-    };
-
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return (None, None);
-    };
-
-    let Ok(Some(multi)) = analyze_joins(select) else {
-        return (None, None);
-    };
-
-    let Some(asof_analysis) = multi.joins.iter().find(|j| j.is_asof_join) else {
-        return (None, None);
-    };
-
-    let JoinOperatorConfig::Asof(config) = JoinOperatorConfig::from_analysis(asof_analysis) else {
-        return (None, None);
-    };
-
-    let projection_sql = build_projection_sql(select, asof_analysis, &config);
-
-    (Some(config), Some(projection_sql))
-}
-
 use crate::operator::lookup_enrich::{disambiguated_lookup_name, LookupEnrichConfig};
 
 /// Detect a partial lookup-enrich join and return its operator config plus residual projection.
@@ -650,11 +505,7 @@ pub(crate) fn detect_lookup_enrich_query(
         return (None, None);
     }
     let j = &multi.joins[0];
-    if j.is_asof_join
-        || j.is_temporal_join
-        || j.time_bound.is_some()
-        || !j.additional_key_columns.is_empty()
-    {
+    if j.is_temporal_join || j.time_bound.is_some() || !j.additional_key_columns.is_empty() {
         return (None, None);
     }
     let lookup_table = j.right_table.clone();
@@ -804,11 +655,11 @@ pub(crate) fn detect_changelog_enrich_query(
         return None;
     }
     let j = &multi.joins[0];
-    if j.is_asof_join || j.is_temporal_join || j.time_bound.is_some() {
+    if j.is_temporal_join || j.time_bound.is_some() {
         return None;
     }
-    // Left = changelog (incremental MV); right = a static reference/dimension table. The reverse,
-    // a streaming/source right, or both-sides-changelog is a full incremental join handled elsewhere.
+    // Only changelog-left to static-right enrichment is supported. Every other changelog join
+    // shape is rejected by DDL and graph admission.
     if !incremental_mvs.contains(&j.left_table) || !static_tables.contains(&j.right_table) {
         return None;
     }
@@ -890,210 +741,6 @@ pub(crate) fn detect_changelog_enrich_query(
         left_outer: j.join_type == JoinType::Left,
         projection_sql,
     })
-}
-
-/// Which side of the join an output column comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JoinSide {
-    Left,
-    Right,
-}
-
-/// One output projection item of an incremental join. Plain column references only (no wildcards or
-/// expressions); an `Unqualified` column is resolved against both side schemas at the operator.
-#[derive(Debug, Clone)]
-pub(crate) enum JoinProjItem {
-    /// `a.col [AS x]` — a column on a known side, plus its optional output alias.
-    Qualified {
-        side: JoinSide,
-        column: String,
-        alias: Option<String>,
-    },
-    /// `col [AS x]` — resolved against both side schemas at the operator (ambiguous ⇒ error).
-    Unqualified {
-        column: String,
-        alias: Option<String>,
-    },
-}
-
-/// A `<incremental MV> JOIN <incremental MV>` two-sided IVM join. The operator does the weighted
-/// Z-set join in Rust, so detection yields a structured config (not rewritten SQL).
-#[derive(Debug, Clone)]
-pub(crate) struct IncrementalJoinConfig {
-    pub left_table: String,
-    pub right_table: String,
-    pub left_keys: Vec<String>,
-    pub right_keys: Vec<String>,
-    pub projection: Vec<JoinProjItem>,
-    /// `true` for `LEFT JOIN` (NULL-pad unmatched left rows), `false` for inner.
-    pub left_outer: bool,
-}
-
-/// Detect a single INNER or LEFT equi-join whose BOTH sides are incremental MVs (changelogs).
-/// Returns the join keys, output projection, and LEFT-outer flag; `None` for any other shape.
-#[allow(clippy::too_many_lines)]
-pub(crate) fn detect_changelog_incremental_join(
-    sql: &str,
-    incremental_mvs: &FxHashSet<String>,
-) -> Option<IncrementalJoinConfig> {
-    use laminar_sql::parser::join_parser::JoinType;
-
-    if incremental_mvs.len() < 2 {
-        return None;
-    }
-    let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
-    let laminar_sql::parser::StreamingStatement::Standard(stmt) = statements.first()? else {
-        return None;
-    };
-    let Statement::Query(query) = stmt.as_ref() else {
-        return None;
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return None;
-    };
-    let has_group_by = match &select.group_by {
-        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
-        sqlparser::ast::GroupByExpr::All(_) => false,
-    };
-    if select.distinct.is_some()
-        || has_group_by
-        || select.having.is_some()
-        || select.selection.is_some() // WHERE unsupported here
-        || query.order_by.is_some()
-        || query.limit_clause.is_some()
-        || query.fetch.is_some()
-        || query.with.is_some()
-    {
-        return None;
-    }
-    let multi = analyze_joins(select).ok()??;
-    if multi.joins.len() != 1 {
-        return None;
-    }
-    let j = &multi.joins[0];
-    if j.is_asof_join || j.is_temporal_join || j.time_bound.is_some() {
-        return None;
-    }
-    // Both sides must be incremental MVs; a static or source right is a different operator.
-    if !incremental_mvs.contains(&j.left_table) || !incremental_mvs.contains(&j.right_table) {
-        return None;
-    }
-    // A self-join feeds one changelog into both ports — out of scope.
-    if j.left_table == j.right_table {
-        return None;
-    }
-    let left_outer = match j.join_type {
-        JoinType::Inner => false,
-        JoinType::Left => true,
-        _ => return None, // RIGHT/FULL unsupported.
-    };
-    // The ON clause must be a pure conjunction of column equalities — a non-equi residual (e.g.
-    // `AND a.x > b.y`) is silently dropped by the key extractor, which would emit unfiltered rows.
-    if !single_join_on_is_pure_equi(select) {
-        return None;
-    }
-
-    let mut left_keys = vec![j.left_key_column.clone()];
-    let mut right_keys = vec![j.right_key_column.clone()];
-    for (lk, rk) in &j.additional_key_columns {
-        left_keys.push(lk.clone());
-        right_keys.push(rk.clone());
-    }
-
-    let lalias = j.left_alias.as_deref().unwrap_or(&j.left_table);
-    let ralias = j.right_alias.as_deref().unwrap_or(&j.right_table);
-    let side_of = |qualifier: &str| -> Option<JoinSide> {
-        if qualifier == lalias || qualifier == j.left_table {
-            Some(JoinSide::Left)
-        } else if qualifier == ralias || qualifier == j.right_table {
-            Some(JoinSide::Right)
-        } else {
-            None
-        }
-    };
-
-    let mut projection = Vec::with_capacity(select.projection.len());
-    for item in &select.projection {
-        // Explicit column references only. Wildcards (which would yield a duplicate-named MV schema
-        // for the shared join key) and expressions are unsupported.
-        let (expr, alias) = match item {
-            SelectItem::UnnamedExpr(expr) => (expr, None),
-            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
-            _ => return None,
-        };
-        let proj = match expr {
-            Expr::Identifier(id) => JoinProjItem::Unqualified {
-                column: id.value.clone(),
-                alias,
-            },
-            Expr::CompoundIdentifier(parts) if parts.len() == 2 => JoinProjItem::Qualified {
-                side: side_of(&parts[0].value)?,
-                column: parts[1].value.clone(),
-                alias,
-            },
-            _ => return None,
-        };
-        projection.push(proj);
-    }
-
-    // Reject a duplicate OUTPUT column name (same-named column, or the join key, from both sides): it
-    // yields a duplicate-named MV schema, and the operator resolves the join key by first occurrence
-    // but a projected column by last, silently binding them to different physical columns.
-    let out_names: Vec<&str> = projection
-        .iter()
-        .map(|item| match item {
-            JoinProjItem::Qualified { column, alias, .. }
-            | JoinProjItem::Unqualified { column, alias } => alias.as_deref().unwrap_or(column),
-        })
-        .collect();
-    for (i, name) in out_names.iter().enumerate() {
-        if out_names[i + 1..].contains(name) {
-            return None;
-        }
-    }
-
-    Some(IncrementalJoinConfig {
-        left_table: j.left_table.clone(),
-        right_table: j.right_table.clone(),
-        left_keys,
-        right_keys,
-        projection,
-        left_outer,
-    })
-}
-
-/// Return whether a query is a single-statement join of three or more incremental MVs.
-///
-/// Such a query would need one atomic admission transaction for all internal pairwise operators.
-/// Until that transaction exists, callers reject it and require explicitly named two-way stages.
-pub(crate) fn is_multiway_incremental_join(sql: &str, incremental_mvs: &FxHashSet<String>) -> bool {
-    let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
-        return false;
-    };
-    let Some(laminar_sql::parser::StreamingStatement::Standard(statement)) = statements.first()
-    else {
-        return false;
-    };
-    let Statement::Query(query) = statement.as_ref() else {
-        return false;
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return false;
-    };
-    if select.from.len() != 1 || select.from[0].joins.len() < 2 {
-        return false;
-    }
-
-    let table_with_joins = &select.from[0];
-    std::iter::once(&table_with_joins.relation)
-        .chain(table_with_joins.joins.iter().map(|join| &join.relation))
-        .all(|factor| {
-            matches!(
-                factor,
-                TableFactor::Table { name, .. }
-                    if incremental_mvs.contains(&name.to_string())
-            )
-        })
 }
 
 /// `true` if the single join's ON clause is a pure conjunction of `col = col` equalities (or a
@@ -1637,7 +1284,8 @@ pub(crate) fn detect_temporal_query(
         return (None, None);
     };
 
-    let JoinOperatorConfig::Temporal(config) = JoinOperatorConfig::from_analysis(temporal_analysis)
+    let Ok(JoinOperatorConfig::Temporal(config)) =
+        JoinOperatorConfig::from_analysis(temporal_analysis)
     else {
         return (None, None);
     };
@@ -1733,17 +1381,6 @@ fn expr_mentions_alias(expr: &Expr, alias: &str) -> bool {
         // Unknown expr variant — conservatively assume it references the alias
         _ => true,
     }
-}
-
-// Returns false for the non-preserved side of an outer join; removing its predicate
-// would pass NULL-extended rows that the original WHERE would have rejected.
-fn can_remove_from_post_where(join_type: StreamJoinType, is_left_side: bool) -> bool {
-    !matches!(
-        (join_type, is_left_side),
-        (StreamJoinType::Left | StreamJoinType::LeftAnti, false)
-            | (StreamJoinType::Right, true)
-            | (StreamJoinType::Full, _)
-    )
 }
 
 // `p.col` → `col`; literals and other nodes pass through via `to_string()`.
@@ -1871,15 +1508,9 @@ fn extract_self_join_pre_filters(
         match (refs_left, refs_right) {
             (true, false) => {
                 left_strs.push(expr_to_sql_strip_alias(pred, left_alias));
-                if !can_remove_from_post_where(config.join_type, true) {
-                    post_join_preds.push(pred.clone());
-                }
             }
             (false, true) => {
                 right_strs.push(expr_to_sql_strip_alias(pred, right_alias));
-                if !can_remove_from_post_where(config.join_type, false) {
-                    post_join_preds.push(pred.clone());
-                }
             }
             _ => post_join_preds.push(pred.clone()),
         }
@@ -1906,7 +1537,6 @@ fn extract_self_join_pre_filters(
             analysis.left_alias.as_deref(),
             analysis.right_alias.as_deref(),
             config,
-            None,
         )
     });
 
@@ -2006,23 +1636,18 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
         return None;
     };
 
-    // The interval operator consumes the first two inputs; any later static joins run in the
-    // residual DataFusion projection. Analyzing the full chain both misattributes back-references
-    // to the original left input and could select a bounded later step that this operator cannot
-    // execute.
-    if select.from.len() != 1 {
+    if select.from.len() != 1 || select.from[0].joins.len() != 1 {
         return None;
     }
     let stream_analysis = analyze_join(select).ok()??;
     if stream_analysis.time_bound.is_none()
-        || stream_analysis.is_asof_join
         || stream_analysis.is_temporal_join
         || stream_analysis.is_lookup_join
     {
         return None;
     }
 
-    let JoinOperatorConfig::StreamStream(config) =
+    let Ok(JoinOperatorConfig::StreamStream(config)) =
         JoinOperatorConfig::from_analysis(&stream_analysis)
     else {
         return None;
@@ -2032,24 +1657,12 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
         return None;
     }
 
-    // RightSemi/RightAnti are mapped to Inner by the translator — wrong semantics.
-    if matches!(
-        stream_analysis.join_type,
-        laminar_sql::parser::join_parser::JoinType::RightSemi
-            | laminar_sql::parser::join_parser::JoinType::RightAnti
-    ) {
-        tracing::warn!(
-            join_type = ?stream_analysis.join_type,
-            "RightSemi/RightAnti are not implemented for streaming interval joins; rejecting"
-        );
-        return None;
-    }
-
-    let pre_filters = if config.left_table == config.right_table {
-        extract_self_join_pre_filters(select, &stream_analysis, &config)
-    } else {
-        None
-    };
+    let pre_filters =
+        if config.join_type == JoinType::Inner && config.left_table == config.right_table {
+            extract_self_join_pre_filters(select, &stream_analysis, &config)
+        } else {
+            None
+        };
 
     let where_clause = match &pre_filters {
         Some(f) => f
@@ -2066,7 +1679,6 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
                     stream_analysis.left_alias.as_deref(),
                     stream_analysis.right_alias.as_deref(),
                     &config,
-                    None,
                 );
                 format!(" WHERE {rewritten}")
             })
@@ -2083,275 +1695,24 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
     })
 }
 
-/// Detect a `TEMPORAL PROBE JOIN`, which is not in sqlparser's grammar.
-pub(crate) fn detect_temporal_probe_query(
-    sql: &str,
-) -> (
-    Option<laminar_sql::translator::TemporalProbeConfig>,
-    Option<String>,
-) {
-    match parse_probe(sql) {
-        Some((cfg, proj)) => (Some(cfg), proj),
-        None => (None, None),
-    }
-}
-
-fn parse_probe(
-    sql: &str,
-) -> Option<(laminar_sql::translator::TemporalProbeConfig, Option<String>)> {
-    let raw = sqlparser::tokenizer::Tokenizer::new(&GenericDialect {}, sql)
-        .tokenize_with_location()
-        .ok()?;
-    let toks: Vec<&TokenWithSpan> = raw
+pub(crate) fn has_unaliased_projection(sql: &str) -> bool {
+    let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
+        return false;
+    };
+    let Some(laminar_sql::parser::StreamingStatement::Standard(statement)) = statements.first()
+    else {
+        return false;
+    };
+    let Statement::Query(query) = statement.as_ref() else {
+        return false;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    select
+        .projection
         .iter()
-        .filter(|t| !matches!(t.token, Token::Whitespace(_)))
-        .collect();
-
-    let tpj = (0..toks.len().saturating_sub(2)).find(|&i| {
-        kw(toks[i], "TEMPORAL") && kw(toks[i + 1], "PROBE") && kw(toks[i + 2], "JOIN")
-    })?;
-    let from = (0..tpj).rev().find(|&i| kw(toks[i], "FROM"))?;
-    let left = parse_table_ref(&toks[from + 1..tpj])?;
-
-    let after_tpj = tpj + 3;
-    let on = (after_tpj..toks.len()).find(|&i| kw(toks[i], "ON"))?;
-    let right = parse_table_ref(&toks[after_tpj..on])?;
-
-    let mut i = on + 1;
-    let keys = parse_key_columns(&toks, &mut i)?;
-
-    let (left_time, right_time) = if kw_at(&toks, i, "TIMESTAMPS") {
-        i += 1;
-        parse_pair(&toks, &mut i)?
-    } else {
-        tracing::warn!(
-            left = %left.name, right = %right.name,
-            "TEMPORAL PROBE JOIN: no TIMESTAMPS clause; defaulting to 'ts'",
-        );
-        ("ts".into(), "ts".into())
-    };
-
-    let offsets = if kw_at(&toks, i, "LIST") {
-        i += 1;
-        parse_list(&toks, &mut i)?
-    } else if kw_at(&toks, i, "RANGE") {
-        i += 1;
-        parse_range(&toks, &mut i)?
-    } else {
-        return None;
-    };
-
-    if !kw_at(&toks, i, "AS") {
-        return None;
-    }
-    i += 1;
-    let alias_tok = *toks.get(i)?;
-    let probe_alias = ident(alias_tok)?;
-
-    let cfg = laminar_sql::translator::TemporalProbeConfig::new(
-        left.name,
-        right.name,
-        left.alias.clone(),
-        right.alias.clone(),
-        keys,
-        left_time,
-        right_time,
-        &offsets,
-        probe_alias,
-    );
-
-    let projection = build_probe_projection_via_ast(
-        sql,
-        location_to_byte(sql, toks[tpj].span.start),
-        location_to_byte(sql, alias_tok.span.end),
-        &cfg,
-        left.alias.as_deref(),
-        right.alias.as_deref(),
-    );
-
-    Some((cfg, projection))
-}
-
-struct TableRef {
-    name: String,
-    alias: Option<String>,
-}
-
-fn kw(t: &TokenWithSpan, s: &str) -> bool {
-    matches!(&t.token, Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(s))
-}
-
-fn kw_at(toks: &[&TokenWithSpan], i: usize, s: &str) -> bool {
-    toks.get(i).is_some_and(|t| kw(t, s))
-}
-
-fn ident(t: &TokenWithSpan) -> Option<String> {
-    match &t.token {
-        Token::Word(w) => Some(w.value.clone()),
-        _ => None,
-    }
-}
-
-fn expect(toks: &[&TokenWithSpan], i: &mut usize, want: &Token) -> Option<()> {
-    if toks.get(*i).map(|t| &t.token) == Some(want) {
-        *i += 1;
-        Some(())
-    } else {
-        None
-    }
-}
-
-// Returns the last segment of a dotted path (the column name).
-fn read_qualified(toks: &[&TokenWithSpan], i: &mut usize) -> Option<String> {
-    let mut last = ident(toks.get(*i)?)?;
-    *i += 1;
-    while toks.get(*i).map(|t| &t.token) == Some(&Token::Period) {
-        *i += 1;
-        last = ident(toks.get(*i)?)?;
-        *i += 1;
-    }
-    Some(last)
-}
-
-fn parse_table_ref(toks: &[&TokenWithSpan]) -> Option<TableRef> {
-    let mut i = 0;
-    let mut name = ident(toks.first()?)?;
-    i += 1;
-    while toks.get(i).map(|t| &t.token) == Some(&Token::Period) {
-        let next = ident(toks.get(i + 1)?)?;
-        name.push('.');
-        name.push_str(&next);
-        i += 2;
-    }
-    let alias = match toks.len() - i {
-        0 => None,
-        1 => ident(toks[i]),
-        _ if kw(toks[i], "AS") => ident(toks.get(i + 1)?),
-        _ => ident(toks[i]),
-    };
-    Some(TableRef { name, alias })
-}
-
-fn parse_key_columns(toks: &[&TokenWithSpan], i: &mut usize) -> Option<Vec<String>> {
-    if toks.get(*i).map(|t| &t.token) != Some(&Token::LParen) {
-        return Some(vec![read_qualified(toks, i)?]);
-    }
-    *i += 1;
-    let mut cols = Vec::new();
-    loop {
-        cols.push(read_qualified(toks, i)?);
-        match toks.get(*i).map(|t| &t.token) {
-            Some(Token::Comma) => *i += 1,
-            Some(Token::RParen) => {
-                *i += 1;
-                return (!cols.is_empty()).then_some(cols);
-            }
-            _ => return None,
-        }
-    }
-}
-
-fn parse_pair(toks: &[&TokenWithSpan], i: &mut usize) -> Option<(String, String)> {
-    expect(toks, i, &Token::LParen)?;
-    let l = read_qualified(toks, i)?;
-    expect(toks, i, &Token::Comma)?;
-    let r = read_qualified(toks, i)?;
-    expect(toks, i, &Token::RParen)?;
-    Some((l, r))
-}
-
-// `0s` tokenizes as Number + Word; concatenate to reassemble for parse_interval_to_ms.
-fn token_text(toks: &[&TokenWithSpan], start: usize, end: usize) -> String {
-    toks[start..end]
-        .iter()
-        .map(|t| t.token.to_string())
-        .collect()
-}
-
-fn parse_list(
-    toks: &[&TokenWithSpan],
-    i: &mut usize,
-) -> Option<laminar_sql::translator::ProbeOffsetSpec> {
-    expect(toks, i, &Token::LParen)?;
-    let mut items = Vec::new();
-    let mut item_start = *i;
-    loop {
-        match &toks.get(*i)?.token {
-            Token::Comma => {
-                items.push(laminar_sql::translator::parse_interval_to_ms(&token_text(
-                    toks, item_start, *i,
-                ))?);
-                *i += 1;
-                item_start = *i;
-            }
-            Token::RParen => {
-                if *i > item_start {
-                    items.push(laminar_sql::translator::parse_interval_to_ms(&token_text(
-                        toks, item_start, *i,
-                    ))?);
-                }
-                *i += 1;
-                break;
-            }
-            _ => *i += 1,
-        }
-    }
-    (!items.is_empty()).then_some(laminar_sql::translator::ProbeOffsetSpec::List(items))
-}
-
-fn parse_range(
-    toks: &[&TokenWithSpan],
-    i: &mut usize,
-) -> Option<laminar_sql::translator::ProbeOffsetSpec> {
-    if kw_at(toks, *i, "FROM") {
-        *i += 1;
-    }
-    let start_ms = laminar_sql::translator::parse_interval_to_ms(&take_until(toks, i, &["TO"]))?;
-    if !kw_at(toks, *i, "TO") {
-        return None;
-    }
-    *i += 1;
-    let end_ms =
-        laminar_sql::translator::parse_interval_to_ms(&take_until(toks, i, &["STEP", "AS"]))?;
-    let step_ms = if kw_at(toks, *i, "STEP") {
-        *i += 1;
-        laminar_sql::translator::parse_interval_to_ms(&take_until(toks, i, &["AS"]))?
-    } else {
-        1000
-    };
-    Some(laminar_sql::translator::ProbeOffsetSpec::Range {
-        start_ms,
-        end_ms,
-        step_ms,
-    })
-}
-
-fn take_until(toks: &[&TokenWithSpan], i: &mut usize, stops: &[&str]) -> String {
-    let start = *i;
-    while *i < toks.len() && !stops.iter().any(|s| kw(toks[*i], s)) {
-        *i += 1;
-    }
-    token_text(toks, start, *i)
-}
-
-fn location_to_byte(sql: &str, loc: Location) -> usize {
-    if loc.line == 0 {
-        return 0;
-    }
-    let mut line: u64 = 1;
-    let mut col: u64 = 1;
-    for (b, ch) in sql.char_indices() {
-        if line == loc.line && col == loc.column {
-            return b;
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-    }
-    sql.len()
+        .any(|item| !matches!(item, SelectItem::ExprWithAlias { .. }))
 }
 
 /// Apply a global Top-K limit across all batches.
@@ -2383,7 +1744,7 @@ pub(crate) fn apply_topk_filter(batches: &[RecordBatch], k: usize) -> Vec<Record
 /// Rewrite an expression to SQL over a flattened join temp table.
 ///
 /// `leaf` resolves qualified column references for the specific join type, returning `None`
-/// to fall through to the shared structural recursion. Shared by ASOF, temporal,
+/// to fall through to the shared structural recursion. Shared by temporal,
 /// stream-stream, and lookup rewriters.
 fn rewrite_join_expr<F: Fn(&Expr) -> Option<String>>(expr: &Expr, leaf: &F) -> String {
     if let Some(s) = leaf(expr) {
@@ -2483,93 +1844,6 @@ fn rewrite_join_expr<F: Fn(&Expr) -> Option<String>>(expr: &Expr, leaf: &F) -> S
     }
 }
 
-// Build `SELECT … FROM __asof_tmp` rewriting table-qualified refs to plain names.
-fn build_projection_sql(
-    select: &sqlparser::ast::Select,
-    analysis: &laminar_sql::parser::join_parser::JoinAnalysis,
-    config: &AsofJoinTranslatorConfig,
-) -> String {
-    let left_alias = analysis.left_alias.as_deref();
-    let right_alias = analysis.right_alias.as_deref();
-
-    let items: Vec<String> = select
-        .projection
-        .iter()
-        .map(|item| rewrite_select_item(item, left_alias, right_alias, config))
-        .collect();
-
-    let select_clause = items.join(", ");
-
-    let where_clause = select.selection.as_ref().map(|expr| {
-        let rewritten = rewrite_expr(expr, left_alias, right_alias, config);
-        format!(" WHERE {rewritten}")
-    });
-
-    format!(
-        "SELECT {select_clause} FROM __asof_tmp{}",
-        where_clause.unwrap_or_default()
-    )
-}
-
-fn rewrite_select_item(
-    item: &SelectItem,
-    left_alias: Option<&str>,
-    right_alias: Option<&str>,
-    config: &AsofJoinTranslatorConfig,
-) -> String {
-    match item {
-        SelectItem::UnnamedExpr(expr) => rewrite_expr(expr, left_alias, right_alias, config),
-        SelectItem::ExprWithAlias { expr, alias } => {
-            let rewritten = rewrite_expr(expr, left_alias, right_alias, config);
-            format!("{rewritten} AS {alias}")
-        }
-        SelectItem::Wildcard(WildcardAdditionalOptions { .. }) => "*".to_string(),
-        SelectItem::QualifiedWildcard(name, _) => {
-            let table = name.to_string();
-            if Some(table.as_str()) == left_alias || Some(table.as_str()) == right_alias {
-                "*".to_string()
-            } else {
-                format!("{table}.*")
-            }
-        }
-    }
-}
-
-fn rewrite_expr(
-    expr: &Expr,
-    left_alias: Option<&str>,
-    right_alias: Option<&str>,
-    config: &AsofJoinTranslatorConfig,
-) -> String {
-    rewrite_join_expr(expr, &|e: &Expr| {
-        let Expr::CompoundIdentifier(parts) = e else {
-            return None;
-        };
-        if parts.len() != 2 {
-            return None;
-        }
-        let table = parts[0].value.as_str();
-        let column = parts[1].value.as_str();
-        let is_left = Some(table) == left_alias || table == config.left_table;
-        let is_right = Some(table) == right_alias || table == config.right_table;
-        Some(if is_left {
-            column.to_string()
-        } else if is_right {
-            // Suffix right time column if it shares the left time column name.
-            if column == config.left_time_column
-                && column == config.right_time_column
-                && column != config.key_column
-            {
-                format!("{}_{}", column, config.right_table)
-            } else {
-                column.to_string()
-            }
-        } else {
-            e.to_string()
-        })
-    })
-}
-
 fn build_temporal_projection_sql(
     select: &sqlparser::ast::Select,
     analysis: &laminar_sql::parser::join_parser::JoinAnalysis,
@@ -2648,77 +1922,16 @@ fn build_stream_join_projection_sql(
     let left_alias = analysis.left_alias.as_deref();
     let right_alias = analysis.right_alias.as_deref();
 
-    // Extra joins beyond the step-0 stream-stream join run as residual joins in the
-    // post-projection over __interval_tmp. Step-0 refs are prefixed with __interval_tmp.
-    // to avoid collisions with downstream table names.
-    let has_residual = select.from.len() == 1 && select.from[0].joins.len() > 1;
-    let tmp_qual: Option<&str> = has_residual.then_some("__interval_tmp");
-
-    let natural_counts = if has_residual {
-        count_natural_projection_names(select)
-    } else {
-        FxHashMap::default()
-    };
-
     let items: Vec<String> = select
         .projection
         .iter()
-        .map(|item| {
-            render_join_projection_item(
-                item,
-                left_alias,
-                right_alias,
-                config,
-                tmp_qual,
-                has_residual,
-                &natural_counts,
-            )
-        })
+        .map(|item| render_join_projection_item(item, left_alias, right_alias, config))
         .collect();
 
-    let residual = if has_residual {
-        render_residual_joins(
-            &select.from[0].joins[1..],
-            config,
-            left_alias,
-            right_alias,
-            tmp_qual,
-        )
-    } else {
-        String::new()
-    };
-
-    let directional_filter = join_directional_filter(config, tmp_qual);
-
-    let combined_where = match (where_clause.is_empty(), directional_filter.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => where_clause.to_string(),
-        (true, false) => format!(" WHERE {directional_filter}"),
-        (false, false) => format!("{where_clause} AND ({directional_filter})"),
-    };
-
     format!(
-        "SELECT {} FROM __interval_tmp{residual}{combined_where}",
+        "SELECT {} FROM __interval_tmp{where_clause}",
         items.join(", ")
     )
-}
-
-// Count natural names so colliding projections (p.type, a.type) get {qual}_{col} aliases.
-fn count_natural_projection_names(select: &sqlparser::ast::Select) -> FxHashMap<String, usize> {
-    let mut counts: FxHashMap<String, usize> = FxHashMap::default();
-    for item in &select.projection {
-        if let SelectItem::UnnamedExpr(expr) = item {
-            let n = match expr {
-                Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
-                Expr::Identifier(ident) => Some(ident.value.clone()),
-                _ => None,
-            };
-            if let Some(n) = n {
-                *counts.entry(n).or_insert(0) += 1;
-            }
-        }
-    }
-    counts
 }
 
 fn render_join_projection_item(
@@ -2726,117 +1939,28 @@ fn render_join_projection_item(
     left_alias: Option<&str>,
     right_alias: Option<&str>,
     config: &StreamJoinConfig,
-    tmp_qual: Option<&str>,
-    has_residual: bool,
-    natural_counts: &FxHashMap<String, usize>,
 ) -> String {
     match item {
         SelectItem::UnnamedExpr(expr) => {
-            let rewritten =
-                rewrite_stream_join_expr(expr, left_alias, right_alias, config, tmp_qual);
-            if has_residual {
-                let (qual, natural) = match expr {
-                    Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-                        (Some(parts[0].value.clone()), Some(parts[1].value.clone()))
-                    }
-                    Expr::Identifier(ident) => (None, Some(ident.value.clone())),
-                    _ => (None, None),
-                };
-                if let Some(n) = natural {
-                    let collides = natural_counts.get(&n).copied().unwrap_or(0) > 1;
-                    if collides {
-                        if let Some(q) = qual {
-                            return format!("{rewritten} AS {q}_{n}");
-                        }
-                    }
-                    if rewritten != n {
-                        return format!("{rewritten} AS {n}");
-                    }
-                }
-            }
-            rewritten
+            rewrite_stream_join_expr(expr, left_alias, right_alias, config)
         }
         SelectItem::ExprWithAlias { expr, alias } => {
-            let rewritten =
-                rewrite_stream_join_expr(expr, left_alias, right_alias, config, tmp_qual);
+            let rewritten = rewrite_stream_join_expr(expr, left_alias, right_alias, config);
             format!("{rewritten} AS {alias}")
         }
         SelectItem::Wildcard(_) => "*".to_string(),
-        SelectItem::QualifiedWildcard(name, _) => {
-            let table = name.to_string();
-            if table == config.left_table
-                || left_alias.is_some_and(|a| a == table)
-                || table == config.right_table
-                || right_alias.is_some_and(|a| a == table)
-            {
-                "*".to_string()
-            } else {
-                format!("{table}.*")
-            }
-        }
+        // DDL rejects qualified wildcards for bounded joins because the internal pair schema
+        // renames right-side columns. Keeping the qualifier here makes any bypass fail closed.
+        SelectItem::QualifiedWildcard(name, _) => format!("{name}.*"),
     }
-}
-
-// IntervalJoin is symmetric but BETWEEN is directional; add right_ts >= left_ts
-// to enforce the lower bound (the upper is already covered by the tolerance).
-fn join_directional_filter(config: &StreamJoinConfig, tmp_qual: Option<&str>) -> String {
-    if config.left_time_column.is_empty() || config.right_time_column.is_empty() {
-        return String::new();
-    }
-    let left_ref = match tmp_qual {
-        Some(q) => format!("{q}.{}", config.left_time_column),
-        None => config.left_time_column.clone(),
-    };
-    let right_ref = match tmp_qual {
-        Some(q) => format!("{q}.{}_{}", config.right_time_column, config.right_table),
-        None => format!("{}_{}", config.right_time_column, config.right_table),
-    };
-    format!("{right_ref} >= {left_ref}")
-}
-
-// Unsupported shapes (CROSS, USING, etc.) pass through sqlparser's Display unchanged.
-fn render_residual_joins(
-    joins: &[sqlparser::ast::Join],
-    config: &StreamJoinConfig,
-    left_alias: Option<&str>,
-    right_alias: Option<&str>,
-    tmp_qual: Option<&str>,
-) -> String {
-    use sqlparser::ast::{JoinConstraint, JoinOperator};
-    let mut out = String::new();
-    for join in joins {
-        let (kw, on) = match &join.join_operator {
-            JoinOperator::Inner(JoinConstraint::On(e))
-            | JoinOperator::Join(JoinConstraint::On(e))
-            | JoinOperator::StraightJoin(JoinConstraint::On(e)) => ("JOIN", e),
-            JoinOperator::Left(JoinConstraint::On(e))
-            | JoinOperator::LeftOuter(JoinConstraint::On(e)) => ("LEFT JOIN", e),
-            JoinOperator::Right(JoinConstraint::On(e))
-            | JoinOperator::RightOuter(JoinConstraint::On(e)) => ("RIGHT JOIN", e),
-            JoinOperator::FullOuter(JoinConstraint::On(e)) => ("FULL JOIN", e),
-            _ => {
-                out.push(' ');
-                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{join}"));
-                continue;
-            }
-        };
-        let on_sql = rewrite_stream_join_expr(on, left_alias, right_alias, config, tmp_qual);
-        let _ = std::fmt::Write::write_fmt(
-            &mut out,
-            format_args!(" {kw} {} ON {on_sql}", join.relation),
-        );
-    }
-    out
 }
 
 // Left columns become bare names; right columns get the _<right_table> suffix from IntervalJoinState.
-// tmp_qual prefixes rewritten names to disambiguate from downstream tables in residual joins.
 fn rewrite_stream_join_expr(
     expr: &sqlparser::ast::Expr,
     left_alias: Option<&str>,
     right_alias: Option<&str>,
     config: &StreamJoinConfig,
-    tmp_qual: Option<&str>,
 ) -> String {
     rewrite_join_expr(expr, &|e: &Expr| {
         let Expr::CompoundIdentifier(parts) = e else {
@@ -2850,200 +1974,17 @@ fn rewrite_stream_join_expr(
         let is_left = table == &config.left_table || left_alias.is_some_and(|a| a == table);
         let is_right = table == &config.right_table || right_alias.is_some_and(|a| a == table);
         Some(if is_left || is_right {
-            let bare = if is_right {
+            let right_only = matches!(config.join_type, JoinType::RightSemi | JoinType::RightAnti);
+            let bare = if is_right && !right_only {
                 format!("{col}_{}", config.right_table)
             } else {
                 col.clone()
             };
-            match tmp_qual {
-                Some(q) => format!("{q}.{bare}"),
-                None => bare,
-            }
+            bare
         } else {
             e.to_string()
         })
     })
-}
-
-// Rewrites the probe clause to a standard JOIN so sqlparser can parse the rest of the query.
-fn build_probe_projection_via_ast(
-    original_sql: &str,
-    tpj_pos: usize,
-    probe_clause_end: usize,
-    config: &laminar_sql::translator::TemporalProbeConfig,
-    left_alias: Option<&str>,
-    right_alias: Option<&str>,
-) -> Option<String> {
-    let probe = &config.probe_alias;
-
-    let left_ref = left_alias.unwrap_or(&config.left_table);
-    let right_ref = right_alias.unwrap_or(&config.right_table);
-    let on_clause = config
-        .key_columns
-        .iter()
-        .map(|k| format!("{left_ref}.{k} = {right_ref}.{k}"))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    let right_part = right_alias.map_or_else(
-        || config.right_table.clone(),
-        |a| format!("{} {a}", config.right_table),
-    );
-    let join_clause = format!("JOIN {right_part} ON {on_clause}");
-
-    let before_probe = &original_sql[..tpj_pos];
-    let after_probe = &original_sql[probe_clause_end..];
-    let mut rewritten = format!("{before_probe}{join_clause}{after_probe}");
-
-    rewritten = rewritten.replace(&format!("{probe}.offset_ms"), &format!("{probe}_offset_ms"));
-    rewritten = rewritten.replace(&format!("{probe}.probe_ts"), &format!("{probe}_probe_ts"));
-    rewritten = rewritten.replace(&format!("{probe}.offset_us"), &format!("{probe}_offset_ms"));
-    rewritten = rewritten.replace(&format!("{probe}.timestamp"), &format!("{probe}_probe_ts"));
-
-    let stmts = laminar_sql::parse_streaming_sql(&rewritten).ok()?;
-    let laminar_sql::parser::StreamingStatement::Standard(stmt) = stmts.first()? else {
-        return None;
-    };
-    let Statement::Query(query) = stmt.as_ref() else {
-        return None;
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return None;
-    };
-
-    let items: Vec<String> = select
-        .projection
-        .iter()
-        .map(|item| rewrite_probe_select_item(item, left_alias, right_alias, config))
-        .collect();
-    let select_clause = items.join(", ");
-
-    let where_clause = select.selection.as_ref().map(|expr| {
-        let r = rewrite_probe_expr(expr, left_alias, right_alias, config);
-        format!(" WHERE {r}")
-    });
-
-    let group_by = match &select.group_by {
-        sqlparser::ast::GroupByExpr::Expressions(exprs, _) if !exprs.is_empty() => {
-            let cols: Vec<String> = exprs
-                .iter()
-                .map(|e| rewrite_probe_expr(e, left_alias, right_alias, config))
-                .collect();
-            format!(" GROUP BY {}", cols.join(", "))
-        }
-        _ => String::new(),
-    };
-
-    let having = select.having.as_ref().map_or(String::new(), |expr| {
-        let r = rewrite_probe_expr(expr, left_alias, right_alias, config);
-        format!(" HAVING {r}")
-    });
-
-    Some(format!(
-        "SELECT {select_clause} FROM __temporal_probe_tmp{}{group_by}{having}",
-        where_clause.unwrap_or_default()
-    ))
-}
-
-fn rewrite_probe_select_item(
-    item: &SelectItem,
-    left_alias: Option<&str>,
-    right_alias: Option<&str>,
-    config: &laminar_sql::translator::TemporalProbeConfig,
-) -> String {
-    match item {
-        SelectItem::UnnamedExpr(expr) => rewrite_probe_expr(expr, left_alias, right_alias, config),
-        SelectItem::ExprWithAlias { expr, alias } => {
-            let r = rewrite_probe_expr(expr, left_alias, right_alias, config);
-            format!("{r} AS {alias}")
-        }
-        SelectItem::Wildcard(_) => "*".to_string(),
-        SelectItem::QualifiedWildcard(name, _) => {
-            let table = name.to_string();
-            if Some(table.as_str()) == left_alias || Some(table.as_str()) == right_alias {
-                "*".to_string()
-            } else {
-                format!("{table}.*")
-            }
-        }
-    }
-}
-
-fn rewrite_probe_expr(
-    expr: &Expr,
-    left_alias: Option<&str>,
-    right_alias: Option<&str>,
-    config: &laminar_sql::translator::TemporalProbeConfig,
-) -> String {
-    match expr {
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            let table = parts[0].value.as_str();
-            let column = parts[1].value.as_str();
-
-            let is_left = Some(table) == left_alias || table == config.left_table;
-            let is_right = Some(table) == right_alias || table == config.right_table;
-
-            if is_left {
-                column.to_string()
-            } else if is_right {
-                if config.key_columns.iter().any(|k| k == column) {
-                    column.to_string()
-                } else if column == config.left_time_column && column == config.right_time_column {
-                    format!("{}_{}", column, config.right_table)
-                } else {
-                    column.to_string()
-                }
-            } else {
-                expr.to_string()
-            }
-        }
-        Expr::BinaryOp { left, op, right } => {
-            let l = rewrite_probe_expr(left, left_alias, right_alias, config);
-            let r = rewrite_probe_expr(right, left_alias, right_alias, config);
-            format!("{l} {op} {r}")
-        }
-        Expr::UnaryOp { op, expr: inner } => {
-            let e = rewrite_probe_expr(inner, left_alias, right_alias, config);
-            format!("{op} {e}")
-        }
-        Expr::Nested(inner) => {
-            let e = rewrite_probe_expr(inner, left_alias, right_alias, config);
-            format!("({e})")
-        }
-        Expr::Function(func) => {
-            let name = &func.name;
-            let args: Vec<String> = match &func.args {
-                sqlparser::ast::FunctionArguments::List(arg_list) => arg_list
-                    .args
-                    .iter()
-                    .map(|arg| match arg {
-                        sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(e),
-                        ) => rewrite_probe_expr(e, left_alias, right_alias, config),
-                        other => other.to_string(),
-                    })
-                    .collect(),
-                other => vec![other.to_string()],
-            };
-            format!("{name}({})", args.join(", "))
-        }
-        Expr::Cast {
-            expr: inner,
-            data_type,
-            ..
-        } => {
-            let e = rewrite_probe_expr(inner, left_alias, right_alias, config);
-            format!("CAST({e} AS {data_type})")
-        }
-        Expr::IsNull(inner) => {
-            let e = rewrite_probe_expr(inner, left_alias, right_alias, config);
-            format!("{e} IS NULL")
-        }
-        Expr::IsNotNull(inner) => {
-            let e = rewrite_probe_expr(inner, left_alias, right_alias, config);
-            format!("{e} IS NOT NULL")
-        }
-        _ => expr.to_string(),
-    }
 }
 
 /// One bound of a `time_col CMP now() ± offset` predicate. `strict` means `>`/`<`.

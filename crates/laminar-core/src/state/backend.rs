@@ -136,6 +136,9 @@ impl CheckpointAttempt {
 /// Current on-storage checkpoint-seal payload format.
 pub(crate) const CHECKPOINT_SEAL_VERSION: u32 = 8;
 
+/// Maximum encoded or logical control-plane size of one checkpoint seal.
+pub const MAX_CHECKPOINT_SEAL_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Immutable transitive payload-size and artifact-count metadata for one vnode partial.
 ///
 /// A root partial accounts only for its own raw payload. An incremental or reference partial
@@ -515,7 +518,98 @@ pub struct CheckpointSealInventory {
     pub sealed_descriptors: Vec<SealedCommitDescriptor>,
 }
 
+struct SealControlCharge {
+    bytes: u64,
+}
+
+impl SealControlCharge {
+    fn new() -> Result<Self, String> {
+        let bytes = u64::try_from(std::mem::size_of::<CheckpointSealInventory>())
+            .map_err(|_| Self::limit_error())?;
+        let charge = Self { bytes };
+        charge.check()?;
+        Ok(charge)
+    }
+
+    fn add_items<T>(&mut self, count: usize) -> Result<(), String> {
+        let bytes = count
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(Self::limit_error)?;
+        self.add_bytes(bytes)
+    }
+
+    fn add_repeated_bytes(&mut self, count: usize, bytes_per_item: usize) -> Result<(), String> {
+        let bytes = count
+            .checked_mul(bytes_per_item)
+            .ok_or_else(Self::limit_error)?;
+        self.add_bytes(bytes)
+    }
+
+    fn add_bytes(&mut self, bytes: usize) -> Result<(), String> {
+        let bytes = u64::try_from(bytes).map_err(|_| Self::limit_error())?;
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or_else(Self::limit_error)?;
+        self.check()
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.bytes > MAX_CHECKPOINT_SEAL_BYTES {
+            return Err(Self::limit_error());
+        }
+        Ok(())
+    }
+
+    fn limit_error() -> String {
+        format!(
+            "checkpoint seal inventory exceeds the {MAX_CHECKPOINT_SEAL_BYTES}-byte logical control limit"
+        )
+    }
+}
+
 impl CheckpointSealInventory {
+    /// Validate the logical allocation charge of this decoded control-plane inventory.
+    ///
+    /// Successful validation does not allocate and includes vector elements plus nested string
+    /// bytes. Storage backends must separately bound collection and decoding before returning it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the logical charge overflows or exceeds the seal protocol ceiling.
+    pub fn validate_control_limits(&self) -> Result<(), String> {
+        validate_checkpoint_seal_control_limits(
+            self.assignment_fence.as_ref(),
+            &self.required_vnodes,
+            &self.sealed_partials,
+            &self.required_descriptors,
+            &self.sealed_descriptors,
+        )
+    }
+
+    pub(crate) fn validate_request_control_limits(
+        assignment_fence: Option<&CheckpointAssignmentFence>,
+        vnodes: &[u32],
+        required_descriptors: &[String],
+    ) -> Result<(), String> {
+        validate_vnode_roster_bound(vnodes, vnodes.len())?;
+        let mut charge = SealControlCharge::new()?;
+        if let Some(fence) = assignment_fence {
+            charge.add_items::<CheckpointParticipant>(fence.participants.len())?;
+        }
+        charge.add_items::<u32>(vnodes.len())?;
+        charge.add_items::<SealedVnodePartial>(vnodes.len())?;
+        charge.add_repeated_bytes(vnodes.len(), 64)?;
+        charge.add_items::<String>(required_descriptors.len())?;
+        charge.add_items::<SealedCommitDescriptor>(required_descriptors.len())?;
+        for key in required_descriptors {
+            charge.add_bytes(key.len())?;
+            charge.add_bytes(key.len())?;
+        }
+        charge.add_repeated_bytes(required_descriptors.len(), 64)?;
+        Ok(())
+    }
+
     /// Validate the canonical vnode artifact inventory and every writer/content attestation.
     ///
     /// This is the recovery-side validation boundary for inventories returned by custom backend
@@ -555,68 +649,124 @@ impl CheckpointSealInventory {
     ///
     /// Returns an error when the inventory is noncanonical, incomplete, or mixes authorities.
     pub fn descriptor_leader_proof(&self) -> Result<Option<&LeaderProof>, String> {
-        if !self.attempt.is_canonical() {
-            return Err(
-                "checkpoint seal inventory must use one nonzero canonical checkpoint ID".into(),
-            );
-        }
-        if self.sealed_descriptors.len() != self.required_descriptors.len() {
-            return Err(
-                "checkpoint seal descriptor attestations do not exactly cover its keys".into(),
-            );
-        }
-        let descriptor_keys: Vec<&str> = self
-            .sealed_descriptors
-            .iter()
-            .map(|descriptor| descriptor.key.as_str())
-            .collect();
-        let required_keys: Vec<&str> = self
-            .required_descriptors
-            .iter()
-            .map(String::as_str)
-            .collect();
-        if descriptor_keys != required_keys {
-            return Err(
-                "checkpoint seal descriptor attestations do not exactly cover its keys".into(),
-            );
-        }
+        validate_descriptor_seal_inventory(
+            self.attempt,
+            self.assignment_fence.as_ref(),
+            &self.required_descriptors,
+            &self.sealed_descriptors,
+        )
+    }
+}
 
-        let mut authority = None;
-        for descriptor in &self.sealed_descriptors {
-            let valid_digest = descriptor.payload_sha256.len() == 64
-                && descriptor
-                    .payload_sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-            if !valid_digest {
+fn validate_checkpoint_seal_control_limits(
+    assignment_fence: Option<&CheckpointAssignmentFence>,
+    required_vnodes: &[u32],
+    sealed_partials: &[SealedVnodePartial],
+    required_descriptors: &[String],
+    sealed_descriptors: &[SealedCommitDescriptor],
+) -> Result<(), String> {
+    validate_vnode_roster_bound(required_vnodes, sealed_partials.len())?;
+    let mut charge = SealControlCharge::new()?;
+    if let Some(fence) = assignment_fence {
+        charge.add_items::<CheckpointParticipant>(fence.participants.len())?;
+    }
+    charge.add_items::<u32>(required_vnodes.len())?;
+    charge.add_items::<SealedVnodePartial>(sealed_partials.len())?;
+    for partial in sealed_partials {
+        charge.add_bytes(partial.payload_sha256.len())?;
+    }
+    charge.add_items::<String>(required_descriptors.len())?;
+    for key in required_descriptors {
+        charge.add_bytes(key.len())?;
+    }
+    charge.add_items::<SealedCommitDescriptor>(sealed_descriptors.len())?;
+    for descriptor in sealed_descriptors {
+        charge.add_bytes(descriptor.key.len())?;
+        charge.add_bytes(descriptor.payload_sha256.len())?;
+    }
+    Ok(())
+}
+
+fn validate_vnode_roster_bound(
+    required_vnodes: &[u32],
+    sealed_partial_count: usize,
+) -> Result<(), String> {
+    let max_count = usize::try_from(crate::state::MAX_KEY_GROUP_COUNT)
+        .map_err(|_| "checkpoint seal vnode limit is not representable".to_owned())?;
+    if required_vnodes.len() > max_count
+        || sealed_partial_count > max_count
+        || required_vnodes
+            .iter()
+            .any(|vnode| *vnode >= crate::state::MAX_KEY_GROUP_COUNT)
+    {
+        return Err(format!(
+            "checkpoint seal vnode roster exceeds the supported {} key groups",
+            crate::state::MAX_KEY_GROUP_COUNT
+        ));
+    }
+    Ok(())
+}
+
+fn validate_descriptor_seal_inventory<'a>(
+    attempt: CheckpointAttempt,
+    assignment_fence: Option<&CheckpointAssignmentFence>,
+    required_descriptors: &[String],
+    sealed_descriptors: &'a [SealedCommitDescriptor],
+) -> Result<Option<&'a LeaderProof>, String> {
+    if !attempt.is_canonical() {
+        return Err(
+            "checkpoint seal inventory must use one nonzero canonical checkpoint ID".into(),
+        );
+    }
+    if required_descriptors.iter().any(String::is_empty)
+        || required_descriptors
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err("checkpoint seal descriptor inventory is not canonical".into());
+    }
+    if sealed_descriptors.len() != required_descriptors.len()
+        || sealed_descriptors
+            .iter()
+            .zip(required_descriptors)
+            .any(|(descriptor, required)| descriptor.key != *required)
+    {
+        return Err("checkpoint seal descriptor attestations do not exactly cover its keys".into());
+    }
+
+    let mut authority = None;
+    for descriptor in sealed_descriptors {
+        let valid_digest = descriptor.payload_sha256.len() == 64
+            && descriptor
+                .payload_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !valid_digest {
+            return Err(format!(
+                "checkpoint seal has invalid descriptor digest for '{}'",
+                descriptor.key
+            ));
+        }
+        match (assignment_fence, &descriptor.writer) {
+            (Some(fence), Some(writer))
+                if descriptor.assignment_version == fence.assignment_version
+                    && writer.matches_fence(fence) =>
+            {
+                if authority.is_some_and(|proof| proof != &writer.leader_proof) {
+                    return Err("checkpoint seal descriptors name different leader terms".into());
+                }
+                authority = Some(&writer.leader_proof);
+            }
+            (None, None) if descriptor.assignment_version == 0 => {}
+            _ => {
                 return Err(format!(
-                    "checkpoint seal has invalid descriptor digest for '{}'",
+                    "checkpoint seal has invalid writer certificate for descriptor '{}'",
                     descriptor.key
                 ));
             }
-            match (&self.assignment_fence, &descriptor.writer) {
-                (Some(fence), Some(writer))
-                    if descriptor.assignment_version == fence.assignment_version
-                        && writer.matches_fence(fence) =>
-                {
-                    if authority.is_some_and(|proof| proof != &writer.leader_proof) {
-                        return Err(
-                            "checkpoint seal descriptors name different leader terms".into()
-                        );
-                    }
-                    authority = Some(&writer.leader_proof);
-                }
-                (None, None) if descriptor.assignment_version == 0 => {}
-                _ => {
-                    return Err(format!(
-                        "checkpoint seal has invalid writer certificate for descriptor '{}'",
-                        descriptor.key
-                    ));
-                }
-            }
         }
-        Ok(authority)
     }
+    Ok(authority)
 }
 
 fn validate_vnode_seal_inventory(
@@ -639,6 +789,8 @@ fn validate_vnode_seal_inventory(
             "checkpoint seal inventory assignment version does not match its certificate".into(),
         );
     }
+
+    validate_vnode_roster_bound(required_vnodes, sealed_partials.len())?;
 
     if required_vnodes.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err("checkpoint seal inventory vnode roster is not canonical".into());
@@ -753,6 +905,28 @@ impl CheckpointSeal {
         }
     }
 
+    pub(crate) fn into_inventory(self) -> CheckpointSealInventory {
+        CheckpointSealInventory {
+            attempt: self.attempt,
+            assignment_fence: self.assignment_fence,
+            assignment_version: self.assignment_version,
+            required_vnodes: self.required_vnodes,
+            sealed_partials: self.sealed_partials,
+            required_descriptors: self.required_descriptors,
+            sealed_descriptors: self.sealed_descriptors,
+        }
+    }
+
+    pub(crate) fn matches_inventory(&self, inventory: &CheckpointSealInventory) -> bool {
+        self.attempt == inventory.attempt
+            && self.assignment_fence == inventory.assignment_fence
+            && self.assignment_version == inventory.assignment_version
+            && self.required_vnodes == inventory.required_vnodes
+            && self.sealed_partials == inventory.sealed_partials
+            && self.required_descriptors == inventory.required_descriptors
+            && self.sealed_descriptors == inventory.sealed_descriptors
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.version != CHECKPOINT_SEAL_VERSION {
             return Err(format!(
@@ -763,6 +937,13 @@ impl CheckpointSeal {
         if self.instance_id.is_empty() || self.execution_id.is_nil() {
             return Err("checkpoint seal has an empty writer identity".into());
         }
+        validate_checkpoint_seal_control_limits(
+            self.assignment_fence.as_ref(),
+            &self.required_vnodes,
+            &self.sealed_partials,
+            &self.required_descriptors,
+            &self.sealed_descriptors,
+        )?;
         validate_vnode_seal_inventory(
             self.attempt,
             self.assignment_fence.as_ref(),
@@ -770,16 +951,12 @@ impl CheckpointSeal {
             &self.required_vnodes,
             &self.sealed_partials,
         )?;
-
-        let mut canonical_descriptors = self.required_descriptors.clone();
-        canonical_descriptors.sort_unstable();
-        canonical_descriptors.dedup();
-        if canonical_descriptors != self.required_descriptors
-            || canonical_descriptors.iter().any(String::is_empty)
-        {
-            return Err("checkpoint seal descriptor inventory is not canonical".into());
-        }
-        self.inventory().descriptor_leader_proof()?;
+        validate_descriptor_seal_inventory(
+            self.attempt,
+            self.assignment_fence.as_ref(),
+            &self.required_descriptors,
+            &self.sealed_descriptors,
+        )?;
         Ok(())
     }
 }
@@ -879,6 +1056,57 @@ pub enum StateBackendError {
     },
 }
 
+/// Backend-declared logical memory envelope for one sealed vnode-body read.
+///
+/// The envelope is affine so a restore worker can derive one exact aggregate reservation from
+/// sealed transitive payload bytes and artifact counts before it starts body I/O. The payload
+/// multiplier includes the returned payload and every complete payload-sized buffer that may
+/// coexist while the backend collects/verifies it or the caller normalizes its archive alignment.
+/// `fixed_bytes_per_artifact` covers fixed storage/response wrappers under the same peak.
+///
+/// This is a logical allocation bound, not process-RSS accounting: allocator metadata,
+/// fragmentation, and transport-owned buffers remain outside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealedPartialReadEnvelope {
+    payload_multiplier: u64,
+    fixed_bytes_per_artifact: u64,
+}
+
+impl SealedPartialReadEnvelope {
+    /// Construct an affine read envelope.
+    #[must_use]
+    pub const fn new(payload_multiplier: u64, fixed_bytes_per_artifact: u64) -> Self {
+        Self {
+            payload_multiplier,
+            fixed_bytes_per_artifact,
+        }
+    }
+
+    /// Complete payload-sized buffers charged at the read high-watermark.
+    #[must_use]
+    pub const fn payload_multiplier(self) -> u64 {
+        self.payload_multiplier
+    }
+
+    /// Fixed logical bytes charged for every artifact in the lineage.
+    #[must_use]
+    pub const fn fixed_bytes_per_artifact(self) -> u64 {
+        self.fixed_bytes_per_artifact
+    }
+
+    /// Compute the exact aggregate charge, returning `None` on arithmetic overflow.
+    #[must_use]
+    pub const fn checked_bytes(self, payload_bytes: u64, artifacts: u64) -> Option<u64> {
+        let Some(payload_charge) = payload_bytes.checked_mul(self.payload_multiplier) else {
+            return None;
+        };
+        let Some(fixed_charge) = artifacts.checked_mul(self.fixed_bytes_per_artifact) else {
+            return None;
+        };
+        payload_charge.checked_add(fixed_charge)
+    }
+}
+
 /// A pluggable state store used by streaming operators for partial
 /// aggregates and watermarks.
 ///
@@ -923,6 +1151,17 @@ pub trait StateBackend: Send + Sync + 'static {
     ///
     /// [`VnodeRegistry`]: crate::state::VnodeRegistry
     fn key_group_capacity(&self) -> u32;
+
+    /// Declare the logical allocation envelope for sealed vnode-body reads.
+    ///
+    /// Restore normalizes an arbitrary returned payload to rkyv's 16-byte alignment, so a valid
+    /// quote must use a payload multiplier of at least two. Implementations must also include all
+    /// fixed storage/response wrappers that can coexist at their read high-watermark. The default
+    /// is fail-closed: a custom backend remains writable but cannot participate in restore until
+    /// it declares a bound.
+    fn sealed_partial_read_envelope(&self) -> Option<SealedPartialReadEnvelope> {
+        None
+    }
 
     /// Bind this storage root to one deployment and logical pipeline before recovery or writes.
     ///
@@ -1002,11 +1241,14 @@ pub trait StateBackend: Send + Sync + 'static {
     /// Implementations must compare the currently stored vnode, assignment generation, writer
     /// certificate, lineage, payload length, and payload digest with `sealed` before returning
     /// the payload. Durable implementations must reject an impossible or oversized object from
-    /// metadata before loading its body. The default fails closed because [`Self::read_partial`]
-    /// cannot prove that a self-consistent replacement still belongs to the sealed recovery cut.
-    /// The caller must obtain `sealed` from an inventory already validated against recovery
-    /// authority; this storage operation proves a matching artifact, not the authority itself.
-    /// Dropping the returned future must not leave detached body reads or allocations running.
+    /// metadata before loading its body. Implementations that declare
+    /// [`Self::sealed_partial_read_envelope`] must keep the returned payload's complete backing
+    /// owner and Laminar-visible transient response buffers within that quote. The default fails
+    /// closed because [`Self::read_partial`] cannot prove that a self-consistent replacement still
+    /// belongs to the sealed recovery cut. The caller must obtain `sealed` from an inventory
+    /// already validated against recovery authority; this storage operation proves a matching
+    /// artifact, not the authority itself. Dropping the returned future must not leave detached
+    /// body reads or allocations running.
     async fn read_sealed_partial_bounded(
         &self,
         attempt: CheckpointAttempt,
@@ -1139,6 +1381,24 @@ pub trait StateBackend: Send + Sync + 'static {
         &self,
         attempt: CheckpointAttempt,
     ) -> Result<Option<CheckpointSealInventory>, StateBackendError>;
+
+    /// Read one seal inventory while bounding response collection, decoding, and logical control
+    /// data by [`MAX_CHECKPOINT_SEAL_BYTES`]. Recovery and external commit paths use this method.
+    /// The default fails before invoking an unbounded custom-backend read.
+    async fn checkpoint_seal_inventory_bounded(
+        &self,
+        attempt: CheckpointAttempt,
+    ) -> Result<Option<CheckpointSealInventory>, StateBackendError> {
+        Err(StateBackendError::Conflict {
+            resource: format!(
+                "state-v2/epoch={}/checkpoint={}/_SEAL",
+                attempt.epoch, attempt.checkpoint_id
+            ),
+            message: format!(
+                "backend cannot read checkpoint seals under the {MAX_CHECKPOINT_SEAL_BYTES}-byte control bound"
+            ),
+        })
+    }
 
     /// Prove from storage metadata that every artifact named by an exact seal still exists with
     /// its sealed length, without reading artifact payloads.

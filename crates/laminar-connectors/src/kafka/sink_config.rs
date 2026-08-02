@@ -1,7 +1,7 @@
 //! Kafka sink connector configuration.
 //!
 //! [`KafkaSinkConfig`] encapsulates all tuning knobs for the Kafka producer,
-//! parsed from a SQL `WITH (...)` clause via [`ConnectorConfig`].
+//! parsed from the resolved sink [`ConnectorConfig`].
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -17,7 +17,7 @@ const MAX_DELIVERY_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Configuration for the Kafka Sink Connector.
 ///
-/// Parsed from SQL `WITH (...)` clause options.
+/// Parsed from resolved sink connector and format options.
 ///
 /// Uses a custom `Debug` impl that redacts `sasl_password` and
 /// `ssl_key_password` to prevent credential leakage in logs.
@@ -142,7 +142,7 @@ impl Default for KafkaSinkConfig {
 }
 
 impl KafkaSinkConfig {
-    /// Parses a sink config from a [`ConnectorConfig`] (SQL WITH clause).
+    /// Parses a sink config from a resolved [`ConnectorConfig`].
     ///
     /// # Errors
     ///

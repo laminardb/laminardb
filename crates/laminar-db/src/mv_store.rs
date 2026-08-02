@@ -8,6 +8,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::ipc::reader::StreamReader;
+#[cfg(test)]
 use arrow::ipc::writer::StreamWriter;
 use arrow::row::{OwnedRow, RowConverter, SortField};
 use datafusion_common::ScalarValue;
@@ -1029,6 +1030,7 @@ impl MvStore {
 /// Prefix for MV entries in the `operator_states` checkpoint map.
 pub(crate) const CHECKPOINT_KEY_PREFIX: &str = "mv:";
 
+#[cfg(test)]
 pub(crate) fn batches_to_ipc<'a, I>(schema: &SchemaRef, batches: I) -> Result<Vec<u8>, DbError>
 where
     I: IntoIterator<Item = &'a RecordBatch>,
@@ -1062,10 +1064,6 @@ where
         max_bytes,
     )
     .map_err(|error| DbError::Storage(format!("IPC write: {error}")))
-}
-
-pub(crate) fn ipc_to_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>, arrow::error::ArrowError> {
-    ipc_to_schema_and_batches(bytes).map(|(_, batches)| batches)
 }
 
 fn ipc_to_schema_and_batches(

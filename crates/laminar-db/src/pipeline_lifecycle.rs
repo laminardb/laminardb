@@ -9,17 +9,18 @@ use futures::FutureExt;
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{
     ConnectorCancellationPolicy, DeliveryGuarantee, SinkConnector, SinkConsistency, SinkContract,
-    SinkTopology, SourceConsistency, SourceContract, SourceTopology,
+    SinkTopology, SourceConsistency, SourceContract, SourceInputMode, SourceTopology,
 };
 use laminar_core::state::StateBackendDurability;
 use rustc_hash::FxHashMap;
 
+use crate::catalog::schema_has_reserved_mutation_columns;
 use crate::connector_task_fence::ConnectorTaskFenceRegistration;
 #[cfg(feature = "cluster")]
 use crate::db::ClusterStartupDisposition;
 use crate::db::{exact_table_reference, DbState, LaminarDB, RuntimeMode, SourceWatermarkState};
 use crate::error::DbError;
-use crate::pipeline::streaming_coordinator::TrackedSourceRegistration;
+use crate::pipeline::streaming_coordinator::{admit_append_only_source, TrackedSourceRegistration};
 
 /// Bound recovery amplification while keeping every delta parent strictly inside the retained
 /// predecessor window. A single retained predecessor cannot support a delta chain, so it stays on
@@ -69,6 +70,8 @@ const EXACT_SINK_PROTOCOL: &str =
 const CLUSTER_BEST_EFFORT: &str =
     "cluster mode requires at_least_once delivery; best_effort has no defined \
      rebalance/state-loss contract";
+const KEYED_SOURCE_PRIMARY_KEY: &str =
+    "[LDB-5038] keyed-upsert sources require an explicit CREATE SOURCE PRIMARY KEY";
 #[cfg(feature = "cluster")]
 const CLUSTER_COMPUTE_THREAD_STACK_BYTES: usize = 4 * 1024 * 1024;
 
@@ -219,6 +222,8 @@ fn queue_owned_cluster_compute_fault(
 /// Validate source durability and placement before the connector performs I/O.
 fn admit_source_contract(
     contract: SourceContract,
+    has_primary_key: bool,
+    has_reserved_mutation_columns: bool,
     delivery: DeliveryGuarantee,
     checkpointing_enabled: bool,
     runtime: RuntimeMode,
@@ -226,12 +231,10 @@ fn admit_source_contract(
     if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::BestEffort {
         return Err(CLUSTER_BEST_EFFORT);
     }
-    if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::ExactlyOnce {
-        return Err(
-            "[LDB-0013] cluster exactly-once is not admitted until supported connectors have \
-             certified term-fenced source handoff and external sink cursor commits",
-        );
+    if contract.input_mode == SourceInputMode::KeyedUpsert && !has_primary_key {
+        return Err(KEYED_SOURCE_PRIMARY_KEY);
     }
+    admit_append_only_source(contract, has_reserved_mutation_columns)?;
     if delivery == DeliveryGuarantee::ExactlyOnce && !contract.is_exact_delivery_certified() {
         return Err(
             "[LDB-5037] exactly-once source delivery is not production-certified for this \
@@ -316,12 +319,6 @@ fn admit_sink_contract(
     if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::BestEffort {
         return Err(CLUSTER_BEST_EFFORT);
     }
-    if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::ExactlyOnce {
-        return Err(
-            "[LDB-0013] cluster exactly-once is not admitted until supported connectors have \
-             certified term-fenced source handoff and external sink cursor commits",
-        );
-    }
     match (delivery, contract.consistency) {
         (DeliveryGuarantee::ExactlyOnce, SinkConsistency::CheckpointCommittable) => {}
         (DeliveryGuarantee::ExactlyOnce, _) => return Err(EXACT_SINK_PROTOCOL),
@@ -332,6 +329,15 @@ fn admit_sink_contract(
             );
         }
         _ => {}
+    }
+    if runtime == RuntimeMode::Cluster
+        && delivery == DeliveryGuarantee::ExactlyOnce
+        && !contract.is_cluster_exact_delivery_certified()
+    {
+        return Err(
+            "cluster exactly-once requires a certified immutable phase-one sink with an atomic, \
+             namespaced external checkpoint cursor",
+        );
     }
 
     if delivery == DeliveryGuarantee::AtLeastOnce
@@ -912,19 +918,13 @@ async fn open_prepared_sinks(
     Ok(())
 }
 
-/// Resolve a query's output schema by planning it. On `ASOF JOIN` failure,
-/// retries with the schema-equivalent rewrite. Returns `None` if the query
-/// still can't be planned (e.g. a dependency isn't registered yet).
+/// Resolve a query's output schema by planning it. Returns `None` when a
+/// dependency is not registered yet or the query is invalid.
 pub(crate) async fn plan_output_schema(
     ctx: &datafusion::prelude::SessionContext,
     sql: &str,
 ) -> Option<arrow_schema::SchemaRef> {
-    let plan = if let Ok(plan) = ctx.state().create_logical_plan(sql).await {
-        plan
-    } else {
-        let rewritten = crate::sql_analysis::rewrite_asof_joins_for_planning(sql)?;
-        ctx.state().create_logical_plan(&rewritten).await.ok()?
-    };
+    let plan = ctx.state().create_logical_plan(sql).await.ok()?;
     let fields: Vec<_> = plan
         .schema()
         .fields()
@@ -937,24 +937,41 @@ pub(crate) async fn plan_output_schema(
 async fn resolve_stream_output_schemas(
     ctx: &datafusion::prelude::SessionContext,
     stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
-) -> Result<HashMap<String, arrow_schema::SchemaRef>, DbError> {
+    reference_tables: &rustc_hash::FxHashSet<String>,
+) -> Result<ResolvedStreamOutputs, DbError> {
     use datafusion::datasource::empty::EmptyTable;
 
-    let mut out: HashMap<String, arrow_schema::SchemaRef> =
+    let mut schemas: HashMap<String, arrow_schema::SchemaRef> =
         HashMap::with_capacity(stream_regs.len());
+    let mut shapes: HashMap<String, StreamOutputShape> = HashMap::with_capacity(stream_regs.len());
     let mut pending: Vec<&crate::connector_manager::StreamRegistration> =
         stream_regs.values().collect();
     let mut placeholders: Vec<String> = Vec::new();
 
-    let result: Result<(), DbError> = async {
+    let result: Result<ResolvedStreamOutputs, DbError> = async {
         while !pending.is_empty() {
             let mut next: Vec<&crate::connector_manager::StreamRegistration> = Vec::new();
             let mut progressed = false;
             for reg in pending {
-                let Some(schema) = plan_output_schema(ctx, &reg.query_sql).await else {
+                let Ok(plan) = ctx.state().create_logical_plan(&reg.query_sql).await else {
                     next.push(reg);
                     continue;
                 };
+                let fields: Vec<_> = plan
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| (**field).clone())
+                    .collect();
+                let schema = Arc::new(arrow_schema::Schema::new(fields));
+                shapes.insert(
+                    reg.name.clone(),
+                    StreamOutputShape {
+                        aggregate: crate::aggregate_state::find_aggregate(&plan).is_some(),
+                        projection_filter: crate::sql_analysis::extract_projection_filter(&plan)
+                            .is_some(),
+                    },
+                );
 
                 if !ctx
                     .table_exist(exact_table_reference(&reg.name))
@@ -972,21 +989,20 @@ async fn resolve_stream_output_schemas(
                     })?;
                     placeholders.push(reg.name.clone());
                 }
-                out.insert(reg.name.clone(), schema);
+                schemas.insert(reg.name.clone(), schema);
                 progressed = true;
             }
 
             if !progressed {
                 let mut unresolved: Vec<&str> = next.iter().map(|r| r.name.as_str()).collect();
                 unresolved.sort_unstable();
-                // For ASOF joins, report the rewritten-plan error (the raw planner
-                // just says "AsOf unsupported", which masks the real blocker).
                 let sql = &next[0].query_sql;
-                let err = match crate::sql_analysis::rewrite_asof_joins_for_planning(sql) {
-                    Some(rewritten) => ctx.state().create_logical_plan(&rewritten).await.err(),
-                    None => ctx.state().create_logical_plan(sql).await.err(),
-                }
-                .map_or_else(|| "unknown error".to_string(), |e| e.to_string());
+                let err = ctx
+                    .state()
+                    .create_logical_plan(sql)
+                    .await
+                    .err()
+                    .map_or_else(|| "unknown error".to_string(), |e| e.to_string());
                 return Err(DbError::Pipeline(format!(
                     "unresolvable stream dependency among [{}]: {err}",
                     unresolved.join(", ")
@@ -994,7 +1010,143 @@ async fn resolve_stream_output_schemas(
             }
             pending = next;
         }
-        Ok(())
+
+        let declared_incremental: rustc_hash::FxHashSet<String> = stream_regs
+            .values()
+            .filter(|reg| reg.incremental)
+            .map(|reg| reg.name.clone())
+            .collect();
+        let mut changelog_carrying = rustc_hash::FxHashSet::default();
+
+        for reg in stream_regs.values() {
+            let shape = shapes.get(&reg.name).ok_or_else(|| {
+                DbError::Pipeline(format!(
+                    "stream '{}' has no resolved output shape",
+                    reg.name
+                ))
+            })?;
+            let emit_changelog = reg.incremental
+                || reg
+                    .emit_clause
+                    .as_ref()
+                    .is_some_and(|emit| matches!(emit, laminar_sql::parser::EmitClause::Changes));
+            if shape.aggregate && emit_changelog {
+                match crate::aggregate_state::IncrementalAggState::try_from_sql(
+                    ctx,
+                    &reg.query_sql,
+                    true,
+                    laminar_core::state::LOCAL_KEY_GROUP_COUNT,
+                )
+                .await
+                {
+                    Ok(Some(_)) => {
+                        changelog_carrying.insert(reg.name.clone());
+                    }
+                    Ok(None) => {
+                        return Err(DbError::Pipeline(format!(
+                            "stream '{}' requests changelog aggregate output, but its aggregate \
+                             shape has no retraction-producing execution path",
+                            reg.name
+                        )));
+                    }
+                    Err(error) => {
+                        return Err(DbError::Pipeline(format!(
+                            "stream '{}' changelog aggregate could not be certified: {error}",
+                            reg.name
+                        )));
+                    }
+                }
+            }
+
+            if reg.window_config.is_none()
+                && !crate::sql_analysis::has_join_clause(&reg.query_sql)
+                && reg
+                    .emit_clause
+                    .as_ref()
+                    .is_some_and(|emit| matches!(emit, laminar_sql::parser::EmitClause::Changes))
+            {
+                use crate::sql_analysis::TemporalFilterAnalysis;
+                match crate::sql_analysis::analyze_temporal_filter(&reg.query_sql) {
+                    TemporalFilterAnalysis::Recognized(_) => {
+                        changelog_carrying.insert(reg.name.clone());
+                    }
+                    TemporalFilterAnalysis::PresentUnrecognized => {
+                        return Err(DbError::Pipeline(format!(
+                            "stream '{}' has an unrecognized retracting temporal-filter shape",
+                            reg.name
+                        )));
+                    }
+                    TemporalFilterAnalysis::NotPresent => {}
+                }
+            }
+        }
+
+        loop {
+            let mut added = false;
+            for reg in stream_regs.values() {
+                let references = crate::sql_analysis::extract_table_references(&reg.query_sql);
+                if !references
+                    .iter()
+                    .any(|name| changelog_carrying.contains(name))
+                {
+                    continue;
+                }
+                let shape = shapes.get(&reg.name).expect("resolved above");
+                let temporal_filter = !matches!(
+                    crate::sql_analysis::analyze_temporal_filter(&reg.query_sql),
+                    crate::sql_analysis::TemporalFilterAnalysis::NotPresent
+                );
+                let changelog_enrich = crate::sql_analysis::detect_changelog_enrich_query(
+                    &reg.query_sql,
+                    &declared_incremental,
+                    reference_tables,
+                )
+                .is_some();
+
+                if temporal_filter
+                    || (!shape.projection_filter && !shape.aggregate && !changelog_enrich)
+                {
+                    return Err(DbError::Pipeline(format!(
+                        "stream '{}' cannot safely consume a changelog; supported consumers are \
+                         a projection/filter, an aggregate, or a certified static-table enrich",
+                        reg.name
+                    )));
+                }
+
+                let emit_changelog = reg.incremental
+                    || reg.emit_clause.as_ref().is_some_and(|emit| {
+                        matches!(emit, laminar_sql::parser::EmitClause::Changes)
+                    });
+                let forwards_changelog = shape.projection_filter || changelog_enrich;
+                if (forwards_changelog || (shape.aggregate && emit_changelog))
+                    && changelog_carrying.insert(reg.name.clone())
+                {
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+
+        for reg in stream_regs.values().filter(|reg| reg.incremental) {
+            if !changelog_carrying.contains(&reg.name) {
+                return Err(DbError::Pipeline(format!(
+                    "stream '{}' is registered as incremental but has no certified changelog \
+                     output path",
+                    reg.name
+                )));
+            }
+        }
+        for name in &changelog_carrying {
+            let schema = schemas.get_mut(name).expect("resolved above");
+            *schema = advertise_changelog_schema(name, schema)?;
+        }
+
+        Ok(ResolvedStreamOutputs {
+            schemas,
+            changelog_carrying,
+        })
     }
     .await;
 
@@ -1002,7 +1154,45 @@ async fn resolve_stream_output_schemas(
         let _ = ctx.deregister_table(exact_table_reference(name));
     }
 
-    result.map(|()| out)
+    result
+}
+
+#[derive(Debug)]
+struct ResolvedStreamOutputs {
+    schemas: HashMap<String, arrow_schema::SchemaRef>,
+    changelog_carrying: rustc_hash::FxHashSet<String>,
+}
+
+struct StreamOutputShape {
+    aggregate: bool,
+    projection_filter: bool,
+}
+
+fn advertise_changelog_schema(
+    stream: &str,
+    schema: &arrow_schema::SchemaRef,
+) -> Result<arrow_schema::SchemaRef, DbError> {
+    use arrow_schema::{DataType, Field, Schema};
+
+    let weight = crate::aggregate_state::WEIGHT_COLUMN;
+    if let Some((_, field)) = schema.column_with_name(weight) {
+        if field.data_type() == &DataType::Int64 && !field.is_nullable() {
+            return Ok(Arc::clone(schema));
+        }
+        return Err(DbError::Pipeline(format!(
+            "stream '{stream}' exposes reserved changelog column '{weight}' with type {:?} and \
+             nullable={}; expected non-null Int64",
+            field.data_type(),
+            field.is_nullable()
+        )));
+    }
+
+    let mut fields = schema.fields().to_vec();
+    fields.push(Arc::new(Field::new(weight, DataType::Int64, false)));
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )))
 }
 
 /// Prune timestamps outside `window`; if under `max_restarts`, record `now` and return
@@ -1164,6 +1354,7 @@ impl PendingVnodeTransitionLaunchGuard {
     }
 
     fn complete(&mut self) {
+        self.expected.take();
         self.armed = false;
     }
 }
@@ -1397,7 +1588,7 @@ impl LaminarDB {
         target_assignment: &laminar_core::state::VnodeAssignmentSnapshot,
         target_fence: laminar_core::checkpoint::CheckpointAssignmentFence,
         participant: laminar_core::checkpoint::CheckpointParticipant,
-        restore_cut: crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut,
+        restore_binding: crate::checkpoint_coordinator::ValidatedClusterVnodeTransitionBinding,
         loaded: crate::recovery_manager::vnode_chains::LoadedVnodeChains,
     ) -> Result<(), DbError> {
         // Pin the registry publication through staging. The startup assignment lock prevents a
@@ -1420,8 +1611,8 @@ impl LaminarDB {
                 target_fence,
                 target_assignment.owners(),
                 participant,
-                restore_cut.pipeline_identity().clone(),
-                restore_cut,
+                restore_binding.pipeline_identity().clone(),
+                restore_binding,
                 loaded,
             )?,
         );
@@ -1458,6 +1649,8 @@ impl LaminarDB {
         let runtime_shutdown = self.runtime_shutdown.write();
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Release);
+        #[cfg(feature = "cluster")]
+        self.assignment_restore_shutdown.cancel();
         runtime_shutdown.cancel();
         self.shutdown_signal.notify_one();
     }
@@ -1466,7 +1659,7 @@ impl LaminarDB {
     #[cfg(feature = "cluster")]
     async fn prepare_boot_vnode_restore_transition(
         &self,
-        restore_cut: &crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut,
+        restore_cut: crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut,
     ) -> Result<(), DbError> {
         let timeout = self
             .config
@@ -1497,7 +1690,7 @@ impl LaminarDB {
     #[cfg(feature = "cluster")]
     async fn prepare_boot_vnode_restore_transition_until(
         &self,
-        restore_cut: &crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut,
+        restore_cut: crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut,
         deadline: tokio::time::Instant,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(), DbError> {
@@ -1657,6 +1850,8 @@ impl LaminarDB {
         let loaded = reader
             .load_at_reserved(&owned, attempt, &budget, deadline, cancel)
             .await?;
+        drop(reader);
+        let restore_binding = restore_cut.into_transition_binding()?;
         self.publish_boot_vnode_restore_transition(
             &registry,
             &target_assignment,
@@ -1665,7 +1860,7 @@ impl LaminarDB {
                 node_id: self_id.0,
                 boot_incarnation: controller.recovery_incarnation(),
             },
-            restore_cut.clone(),
+            restore_binding,
             loaded,
         )
         .await?;
@@ -2835,23 +3030,6 @@ impl LaminarDB {
             )));
         }
 
-        // A renewable lease can identify the current leader, but the object-store
-        // decision CAS and external sink transaction do not atomically consume its
-        // term/token. Until those writes are term-fenced end to end, admitting
-        // cluster EO would allow an expired leader to finalize a checkpoint.
-        // Keep this duplicate of the builder admission because tests and embedders
-        // can construct a database through lower-level paths.
-        if startup_runtime == RuntimeMode::Cluster
-            && self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-        {
-            return Err(DbError::Config(
-                "[LDB-0013] cluster exactly-once is not admitted: checkpoint decisions are \
-                 term-fenced, but supported connectors do not yet provide a certified \
-                 term-fenced source handoff and external sink cursor commit. Use cluster \
-                 at_least_once, or exactly_once in embedded/single-node mode"
-                    .into(),
-            ));
-        }
         #[cfg(feature = "cluster")]
         let has_injected_decision_store = self.decision_store.lock().is_some();
         #[cfg(not(feature = "cluster"))]
@@ -3376,6 +3554,8 @@ impl LaminarDB {
                 has_analytic: stream.has_analytic,
                 has_frame: stream.has_frame,
             };
+            self.validate_interval_join_schema(&stream.name, &stream.query_sql, &plan)
+                .await?;
             has_ownership_partitioned_state |= self
                 .validate_cluster_query_shape(
                     "persisted stream",
@@ -3489,30 +3669,17 @@ impl LaminarDB {
                 ));
                 graph.set_installed_vnode_state_handle(Arc::clone(&self.installed_vnode_state));
                 graph.set_rotation_execution_fence(Arc::clone(&self.rotation_execution_fence));
-                // With a durable backend, per-vnode partials are the authoritative agg checkpoint;
-                // the whole-node manifest copy is one node's slices and traps boot recovery.
-                let has_shared_state = self.state_backend.lock().as_ref().is_some_and(|backend| {
-                    backend
-                        .durability_scope()
-                        .satisfies(StateBackendDurability::ClusterShared)
-                });
-                if has_shared_state {
-                    graph.set_vnode_partials_authoritative();
+                if let Some(chain_bound) = self
+                    .config
+                    .checkpoint
+                    .as_ref()
+                    .and_then(|cp| cluster_delta_chain_bound(cp.max_retained.unwrap_or(3)))
+                {
+                    graph.set_delta_chain_bound(chain_bound);
                     tracing::info!(
-                        "cluster agg: per-vnode partials authoritative (no manifest copy)"
+                        delta_chain_bound = chain_bound,
+                        "bounded incremental vnode checkpoints enabled"
                     );
-                    if let Some(chain_bound) = self
-                        .config
-                        .checkpoint
-                        .as_ref()
-                        .and_then(|cp| cluster_delta_chain_bound(cp.max_retained.unwrap_or(3)))
-                    {
-                        graph.set_delta_chain_bound(chain_bound);
-                        tracing::info!(
-                            delta_chain_bound = chain_bound,
-                            "bounded incremental vnode checkpoints enabled"
-                        );
-                    }
                 }
             }
         }
@@ -3677,7 +3844,8 @@ impl LaminarDB {
             }
             let mut config = build_source_config(reg)?;
 
-            if let Some(entry) = self.catalog.get_source(name) {
+            let source_entry = self.catalog.get_source(name);
+            if let Some(entry) = source_entry.as_ref() {
                 let schema_str = crate::pipeline_callback::encode_arrow_schema(&entry.schema);
                 config.set("_arrow_schema".to_string(), schema_str);
             }
@@ -3692,21 +3860,34 @@ impl LaminarDB {
                         config.connector_type()
                     ))
                 })?;
-            #[cfg(feature = "cluster")]
-            let mut source = source;
             let task_fence = ConnectorTaskFenceRegistration::capture_registered(
                 Arc::<str>::from(format!("source:{name}")),
                 source.terminal_task_tracker(),
                 &self.owned_connector_task_fences,
             );
-            let contract = source.contract(&config).map_err(|e| {
-                DbError::Config(format!(
-                    "source '{name}' (type '{}') has an invalid contract: {e}",
-                    config.connector_type()
-                ))
-            })?;
+            let mut source = TrackedSourceRegistration::from_captured(
+                SourceRegistration {
+                    name: name.clone(),
+                    connector: source,
+                    config,
+                    assignment_scoped: false,
+                    position: laminar_connectors::connector::SourcePosition::Initial,
+                },
+                task_fence,
+            )?;
+            if let Some(entry) = source_entry.as_ref() {
+                source =
+                    source.with_admitted_schema(entry.schema.clone(), entry.primary_key.clone())?;
+            }
+            let contract = source.contract();
             admit_source_contract(
                 contract,
+                source_entry
+                    .as_ref()
+                    .is_some_and(|entry| !entry.primary_key.is_empty()),
+                source_entry.as_ref().is_some_and(|entry| {
+                    schema_has_reserved_mutation_columns(entry.schema.as_ref())
+                }),
                 self.config.delivery_guarantee,
                 checkpointing_enabled,
                 runtime_mode,
@@ -3721,6 +3902,7 @@ impl LaminarDB {
             let assignment_scoped = cfg!(feature = "cluster")
                 && runtime_mode == RuntimeMode::Cluster
                 && contract.topology == SourceTopology::Splittable;
+            source.assignment_scoped = assignment_scoped;
             #[cfg(feature = "cluster")]
             if assignment_scoped {
                 let registry = self.vnode_registry.lock().clone().ok_or_else(|| {
@@ -3737,6 +3919,7 @@ impl LaminarDB {
                         ))
                     })?;
                 source
+                    .connector
                     .set_vnode_assignment(name, registry, self_id)
                     .map_err(|error| {
                         DbError::Config(format!(
@@ -3744,17 +3927,7 @@ impl LaminarDB {
                         ))
                     })?;
             }
-            sources.push(TrackedSourceRegistration::from_captured(
-                SourceRegistration {
-                    name: name.clone(),
-                    connector: source,
-                    config,
-                    contract,
-                    assignment_scoped,
-                    position: laminar_connectors::connector::SourcePosition::Initial,
-                },
-                task_fence,
-            ));
+            sources.push(source);
         }
 
         let bridged_names: rustc_hash::FxHashSet<String> =
@@ -3776,11 +3949,22 @@ impl LaminarDB {
                     &self.owned_connector_task_fences,
                 );
                 let config = laminar_connectors::config::ConnectorConfig::new("catalog-bridge");
-                let contract = connector.contract(&config).map_err(|e| {
-                    DbError::Config(format!("source '{name}' has an invalid contract: {e}"))
-                })?;
+                let source = TrackedSourceRegistration::from_captured(
+                    SourceRegistration {
+                        name: name.clone(),
+                        connector: Box::new(connector),
+                        config,
+                        assignment_scoped: false,
+                        position: laminar_connectors::connector::SourcePosition::Initial,
+                    },
+                    task_fence,
+                )?
+                .with_admitted_schema(entry.schema.clone(), entry.primary_key.clone())?;
+                let contract = source.contract();
                 admit_source_contract(
                     contract,
+                    !entry.primary_key.is_empty(),
+                    schema_has_reserved_mutation_columns(entry.schema.as_ref()),
                     self.config.delivery_guarantee,
                     checkpointing_enabled,
                     runtime_mode,
@@ -3792,17 +3976,7 @@ impl LaminarDB {
                         self.config.delivery_guarantee
                     ))
                 })?;
-                sources.push(TrackedSourceRegistration::from_captured(
-                    SourceRegistration {
-                        name: name.clone(),
-                        connector: Box::new(connector),
-                        config,
-                        contract,
-                        assignment_scoped: false,
-                        position: laminar_connectors::connector::SourcePosition::Initial,
-                    },
-                    task_fence,
-                ));
+                sources.push(source);
             }
         }
         for name in self.catalog.list_sources() {
@@ -3822,11 +3996,22 @@ impl LaminarDB {
                     &self.owned_connector_task_fences,
                 );
                 let config = laminar_connectors::config::ConnectorConfig::new("catalog-bridge");
-                let contract = connector.contract(&config).map_err(|e| {
-                    DbError::Config(format!("source '{name}' has an invalid contract: {e}"))
-                })?;
+                let source = TrackedSourceRegistration::from_captured(
+                    SourceRegistration {
+                        name: name.clone(),
+                        connector: Box::new(connector),
+                        config,
+                        assignment_scoped: false,
+                        position: laminar_connectors::connector::SourcePosition::Initial,
+                    },
+                    task_fence,
+                )?
+                .with_admitted_schema(entry.schema.clone(), entry.primary_key.clone())?;
+                let contract = source.contract();
                 admit_source_contract(
                     contract,
+                    !entry.primary_key.is_empty(),
+                    schema_has_reserved_mutation_columns(entry.schema.as_ref()),
                     self.config.delivery_guarantee,
                     checkpointing_enabled,
                     runtime_mode,
@@ -3838,17 +4023,7 @@ impl LaminarDB {
                         self.config.delivery_guarantee
                     ))
                 })?;
-                sources.push(TrackedSourceRegistration::from_captured(
-                    SourceRegistration {
-                        name: name.clone(),
-                        connector: Box::new(connector),
-                        config,
-                        contract,
-                        assignment_scoped: false,
-                        position: laminar_connectors::connector::SourcePosition::Initial,
-                    },
-                    task_fence,
-                ));
+                sources.push(source);
             }
         }
         Ok(sources)
@@ -3857,8 +4032,8 @@ impl LaminarDB {
         &self,
         sources: &[TrackedSourceRegistration],
         sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
-        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
         stream_output_schemas: &HashMap<String, arrow_schema::SchemaRef>,
+        changelog_carrying: &rustc_hash::FxHashSet<String>,
         runtime_mode: RuntimeMode,
         checkpointing_enabled: bool,
         pipeline_checkpoint_timeout: std::time::Duration,
@@ -3869,33 +4044,6 @@ impl LaminarDB {
             laminar_core::streaming::channel::channel::<crate::sink_task::SinkEvent>(
                 crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY,
             );
-        // Names whose output carries a Z-set changelog: incremental MVs, plus any stream/view whose
-        // query reads a changelog-carrying name (a projection/filter forwards the changelog). A
-        // non-capable sink over one of these silently drops retractions, so it's rejected below.
-        let changelog_carrying: rustc_hash::FxHashSet<String> = {
-            let mut set: rustc_hash::FxHashSet<String> = stream_regs
-                .iter()
-                .filter(|(_, r)| r.incremental)
-                .map(|(n, _)| n.clone())
-                .collect();
-            loop {
-                let mut added = false;
-                for (name, reg) in stream_regs {
-                    if !set.contains(name)
-                        && crate::sql_analysis::extract_table_references(&reg.query_sql)
-                            .iter()
-                            .any(|t| set.contains(t.as_str()))
-                    {
-                        set.insert(name.clone());
-                        added = true;
-                    }
-                }
-                if !added {
-                    break;
-                }
-            }
-            set
-        };
 
         let mut prepared_sinks = Vec::new();
         for (name, reg) in sink_regs {
@@ -4135,11 +4283,19 @@ impl LaminarDB {
 
         match (has_reference_tables, checkpoint) {
             (true, Some(state)) => {
-                let bytes = state.decode_inline().ok_or_else(|| {
-                    DbError::Checkpoint(
-                        "reference-table checkpoint is not inline after sidecar resolution".into(),
-                    )
-                })?;
+                let bytes = state
+                    .try_decode_inline()
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "reference-table checkpoint is corrupt: {error}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "reference-table checkpoint is not inline after sidecar resolution"
+                                .into(),
+                        )
+                    })?;
                 let restored = self.table_store.write().restore_checkpoint(&bytes)?;
                 if !restored {
                     return Err(DbError::Checkpoint(
@@ -4268,6 +4424,8 @@ impl LaminarDB {
                 match recovery {
                     Ok(Some(recovered)) => {
                         #[cfg(feature = "cluster")]
+                        let mut recovered = recovered;
+                        #[cfg(feature = "cluster")]
                         let recovered_assignment = if runtime_mode == RuntimeMode::Cluster {
                             let capsule = recovered.cluster_capsule().ok_or_else(|| {
                                 DbError::Checkpoint(format!(
@@ -4322,7 +4480,7 @@ impl LaminarDB {
                             recovered.manifest.checkpoint_id,
                         );
                         for src in sources.iter_mut() {
-                            if !src.contract.supports_replay() {
+                            if !src.contract().supports_replay() {
                                 continue;
                             }
                             let manifest_cp = recovered.manifest.source_offsets.get(&src.name);
@@ -4369,45 +4527,47 @@ impl LaminarDB {
                         );
                         restored_reference_tables =
                             self.restore_reference_table_checkpoint(&recovered)?;
-                        if let Some(op) = recovered.manifest.operator_states.get("operator_graph") {
-                            if let Some(bytes) = op.decode_inline() {
-                                match graph.restore_from_bytes(&bytes) {
-                                    Ok((restored_graph, n)) => {
-                                        graph = restored_graph;
-                                        tracing::info!(
-                                            queries = n,
-                                            "Restored operator graph state from checkpoint"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        // Source offsets are already staged; resuming with
-                                        // empty operator state would silently lose in-flight
-                                        // windows. Fail loud so the intent to start fresh
-                                        // must be explicit.
-                                        return Err(DbError::Checkpoint(format!(
-                                            "[LDB-6029] operator graph restore failed: \
-                                             {e} — refusing to start with checkpointed \
-                                             source offsets and empty operator state"
-                                        )));
-                                    }
-                                }
-                            } else {
-                                return Err(DbError::Checkpoint(
-                                    "[LDB-6029] operator graph checkpoint is not inline after \
-                                     sidecar resolution"
-                                        .to_string(),
-                                ));
+                        for key in recovered.manifest.operator_states.keys() {
+                            if key != "operator_graph"
+                                && key != crate::table_store::REFERENCE_TABLE_CHECKPOINT_KEY
+                                && !key.starts_with(crate::mv_store::CHECKPOINT_KEY_PREFIX)
+                            {
+                                return Err(DbError::Checkpoint(format!(
+                                    "[LDB-6029] checkpoint contains unknown operator state '{key}'"
+                                )));
                             }
-                        } else if recovered
-                            .manifest
-                            .operator_states
-                            .contains_key("stream_executor")
-                        {
-                            return Err(DbError::Checkpoint(
-                                "[LDB-6029] legacy stream_executor checkpoint is unsupported; \
-                                 explicit checkpoint reset is required"
-                                    .to_string(),
-                            ));
+                        }
+                        if let Some(op) = recovered.manifest.operator_states.get("operator_graph") {
+                            let bytes = op
+                                .try_decode_inline()
+                                .map_err(|error| {
+                                    DbError::Checkpoint(format!(
+                                        "[LDB-6029] operator graph checkpoint is corrupt: {error}"
+                                    ))
+                                })?
+                                .ok_or_else(|| {
+                                    DbError::Checkpoint(
+                                        "[LDB-6029] operator graph checkpoint is not inline after \
+                                     sidecar resolution"
+                                            .to_string(),
+                                    )
+                                })?;
+                            match graph.restore_from_bytes(&bytes) {
+                                Ok((restored_graph, n)) => {
+                                    graph = restored_graph;
+                                    tracing::info!(
+                                        queries = n,
+                                        "Restored operator graph state from checkpoint"
+                                    );
+                                }
+                                Err(e) => {
+                                    return Err(DbError::Checkpoint(format!(
+                                        "[LDB-6029] operator graph restore failed: \
+                                         {e} — refusing to start with checkpointed \
+                                         source offsets and empty operator state"
+                                    )));
+                                }
+                            }
                         }
 
                         let mut mv_states = HashMap::new();
@@ -4451,7 +4611,7 @@ impl LaminarDB {
                                     recovered_attempt,
                                     recovered_assignment_version,
                                 )?;
-                            let restore_cut = recovered.vnode_restore_cut().ok_or_else(|| {
+                            let restore_cut = recovered.take_vnode_restore_cut().ok_or_else(|| {
                                 DbError::Checkpoint(format!(
                                     "[LDB-6041] recovered checkpoint {} has no validated vnode-state seal",
                                     recovered.manifest.checkpoint_id
@@ -5469,7 +5629,11 @@ impl LaminarDB {
                 std::time::Duration::from_millis,
             );
 
-        let stream_output_schemas = resolve_stream_output_schemas(&self.ctx, &stream_regs).await?;
+        let reference_tables: rustc_hash::FxHashSet<String> =
+            self.table_store.read().table_names().into_iter().collect();
+        let resolved_stream_outputs =
+            resolve_stream_output_schemas(&self.ctx, &stream_regs, &reference_tables).await?;
+        let stream_output_schemas = &resolved_stream_outputs.schemas;
         {
             let mut schemas = self.stream_schemas.write();
             schemas.clear();
@@ -5485,9 +5649,21 @@ impl LaminarDB {
             &table_regs,
             pipeline_identity.as_ref(),
         )?;
-        for (name, schema) in &stream_output_schemas {
+        for (name, schema) in stream_output_schemas {
             graph.register_intermediate_schema(name, schema);
         }
+        graph.set_max_managed_state_bytes(
+            self.config
+                .pipeline_max_managed_state_bytes
+                .expect("managed-state budget must be resolved at database construction"),
+        );
+        graph.set_max_retractable_extremum_checkpoint_bytes(
+            self.config
+                .pipeline_max_retractable_extremum_checkpoint_bytes
+                .expect(
+                    "retractable-extremum checkpoint budget must be resolved at database construction",
+                ),
+        );
         let graph = graph.initialize_managed_state().await?;
 
         let prom_registry = self.prometheus_registry.lock().clone();
@@ -5502,8 +5678,8 @@ impl LaminarDB {
             .prepare_pipeline_sinks(
                 &sources,
                 &sink_regs,
-                &stream_regs,
-                &stream_output_schemas,
+                stream_output_schemas,
+                &resolved_stream_outputs.changelog_carrying,
                 runtime_mode,
                 checkpointing_enabled,
                 pipeline_checkpoint_timeout,
@@ -5685,6 +5861,19 @@ impl LaminarDB {
         Ok(())
     }
 
+    #[cfg(feature = "cluster")]
+    fn retire_pending_restore_input_after_runtime_exit(&self) {
+        let expected = self.pending_vnode_transition.lock().clone();
+        let Some(expected) = expected.filter(|pending| pending.has_restore_input_reservation())
+        else {
+            return;
+        };
+        crate::vnode_transition_staging::retire_exact_pending_vnode_transition(
+            &self.pending_vnode_transition,
+            &expected,
+        );
+    }
+
     async fn reconcile_sink_open_witness_until(
         &self,
         deadline: tokio::time::Instant,
@@ -5730,7 +5919,12 @@ impl LaminarDB {
                     Arc::clone(in_flight)
                 } else {
                     match DbState::load(&self.state) {
-                        DbState::Stopped => return Ok(()),
+                        DbState::Stopped => {
+                            drop(owned);
+                            #[cfg(feature = "cluster")]
+                            self.retire_pending_restore_input_after_runtime_exit();
+                            return Ok(());
+                        }
                         DbState::Starting => {
                             return Err(DbError::Pipeline(
                                 "shutdown found Starting without an incomplete owned startup attempt"
@@ -5808,6 +6002,8 @@ impl LaminarDB {
             }
         }
         drop(runtime_handle);
+        #[cfg(feature = "cluster")]
+        self.retire_pending_restore_input_after_runtime_exit();
         if watcher_error.is_none() {
             if let Some(fault) = self.last_fault.lock().clone() {
                 watcher_error = Some(DbError::Pipeline(format!(
@@ -5865,10 +6061,13 @@ impl LaminarDB {
                 } else {
                     match DbState::load(&self.state) {
                         DbState::Created | DbState::Stopped => {
+                            drop(owned);
                             #[cfg(feature = "cluster")]
                             if self.is_cluster_runtime() {
                                 self.installed_vnode_state.lock().take();
                             }
+                            #[cfg(feature = "cluster")]
+                            self.retire_pending_restore_input_after_runtime_exit();
                             return Ok(());
                         }
                         DbState::Starting => {
@@ -5970,6 +6169,8 @@ impl LaminarDB {
             }
         }
         drop(runtime_handle);
+        #[cfg(feature = "cluster")]
+        self.retire_pending_restore_input_after_runtime_exit();
 
         // Do not announce Created or release the exclusive deployment lock while a timed-out
         // decision create can still mutate the recovery frontier. A later stop retry resumes here.

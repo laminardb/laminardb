@@ -13,9 +13,8 @@ CREATE SOURCE market_ticks (
     'bootstrap.servers' = '${KAFKA_BROKERS}',
     topic = 'market-ticks',
     'group.id' = '${GROUP_ID}',
-    format = 'json',
     'auto.offset.reset' = 'earliest'
-);
+) FORMAT JSON;
 
 CREATE SOURCE order_events (
     order_id        VARCHAR NOT NULL,
@@ -28,9 +27,8 @@ CREATE SOURCE order_events (
     'bootstrap.servers' = '${KAFKA_BROKERS}',
     topic = 'order-events',
     'group.id' = '${GROUP_ID}',
-    format = 'json',
     'auto.offset.reset' = 'earliest'
-);
+) FORMAT JSON;
 
 CREATE SOURCE book_updates (
     symbol          VARCHAR NOT NULL,
@@ -44,6 +42,5 @@ CREATE SOURCE book_updates (
     'bootstrap.servers' = '${KAFKA_BROKERS}',
     topic = 'book-updates',
     'group.id' = '${GROUP_ID}',
-    format = 'json',
     'auto.offset.reset' = 'earliest'
-);
+) FORMAT JSON;

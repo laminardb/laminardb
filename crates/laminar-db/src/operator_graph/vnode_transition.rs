@@ -1,6 +1,5 @@
 //! Managed vnode revoke/restore transition phases for [`OperatorGraph`].
 
-use std::collections::BTreeSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -12,7 +11,8 @@ use super::{
 use crate::error::DbError;
 use crate::operator::capability::{ManagedStateContract, OperatorStateClass};
 use crate::operator::sql_query::ClusterShuffleConfig;
-use crate::vnode_partial::VnodePartial;
+use crate::vnode_partial::{ValidatedVnodePartial, VnodePartial};
+use crate::vnode_restore_input::{VnodeRestoreAlignmentCopyReservation, VnodeRestoreArchive};
 use crate::vnode_transition_staging::{
     InstalledVnodeStateBinding, InstalledVnodeStateHandle, PendingVnodeRestore,
     PendingVnodeTransition, PendingVnodeTransitionHandle, VnodeTransitionKind,
@@ -259,25 +259,30 @@ struct PreparedFinalOwnerExit {
     installed_state: InstalledVnodeStateHandle,
 }
 
-struct DecodedVnode {
+struct DecodedVnode<'a> {
     vnode: u32,
-    attempt: laminar_core::state::CheckpointAttempt,
-    chain: Vec<VnodePartial>,
-    operators: Vec<(usize, String)>,
+    chain: Vec<ValidatedVnodePartial<'a>>,
+    operators: Vec<(usize, &'a str)>,
 }
 
 struct ResolvedOperator<'a> {
     node_idx: usize,
     #[cfg(test)]
     name: &'a str,
-    base: &'a [u8],
-    deltas: Vec<&'a [u8]>,
+    base: VnodeRestoreArchive<'a>,
+    deltas: Vec<VnodeRestoreArchive<'a>>,
+}
+
+type BorrowedOpChain<'a> = (&'a [u8], Vec<VnodeRestoreArchive<'a>>);
+
+struct NormalizedResolvedVnodes<'a> {
+    // Field order keeps the copy charge until every aligned owner has been dropped.
+    vnodes: Vec<ResolvedVnode<'a>>,
+    _alignment_copy_reservation: Option<VnodeRestoreAlignmentCopyReservation>,
 }
 
 struct ResolvedVnode<'a> {
     vnode: u32,
-    attempt: laminar_core::state::CheckpointAttempt,
-    links: usize,
     operators: Vec<ResolvedOperator<'a>>,
 }
 
@@ -432,10 +437,12 @@ impl OperatorGraph {
             Arc::clone(&transition.pending_handle),
             Arc::clone(&transition.pending),
         );
-        let restore_cut = transition.pending.restore_cut();
-        let attempt = restore_cut
-            .map(crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut::attempt);
-        let restore_profile = restore_cut.map(|cut| cut.restore_head().contract().limits.profile);
+        let restore_binding = transition.pending.restore_binding();
+        let attempt = restore_binding
+            .map(crate::checkpoint_coordinator::ValidatedClusterVnodeTransitionBinding::attempt);
+        let restore_profile = restore_binding.map(
+            crate::checkpoint_coordinator::ValidatedClusterVnodeTransitionBinding::restore_profile,
+        );
         let decoded = match self.preflight_decoded_vnodes(
             transition.pending.restores(),
             attempt,
@@ -454,10 +461,17 @@ impl OperatorGraph {
                 return Err(error);
             }
         };
+        let resolved = match Self::normalize_inner_archives(resolved, &transition.pending) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                transition_unwind.complete();
+                return Err(error);
+            }
+        };
         let prepared = match self.prepare_managed_operators(
             transition.pending.target(),
             &transition.revoked,
-            &resolved,
+            &resolved.vnodes,
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -471,7 +485,7 @@ impl OperatorGraph {
             &transition.pending_handle,
             &transition.pending,
             &transition.revoked,
-            &resolved,
+            &resolved.vnodes,
         ) {
             Ok(callbacks_run) => callbacks_run,
             Err(error) => {
@@ -482,13 +496,10 @@ impl OperatorGraph {
         };
         #[cfg(not(test))]
         let test_callbacks_mutated_state = false;
+        drop(resolved);
+        drop(decoded);
         transition_unwind.complete();
-        self.publish_vnode_transition(
-            transition,
-            &resolved,
-            &prepared,
-            test_callbacks_mutated_state,
-        )
+        self.publish_vnode_transition(transition, &prepared, test_callbacks_mutated_state)
     }
 
     pub(super) fn apply_committed_final_owner_exit(&mut self) -> Result<(), DbError> {
@@ -580,7 +591,7 @@ impl OperatorGraph {
         }
         if !pending.acquired_vnodes().is_empty()
             || !pending.restores().is_empty()
-            || pending.restore_cut().is_some()
+            || pending.restore_binding().is_some()
         {
             return Err(DbError::Checkpoint(
                 "[LDB-6051] final-owner-exit cleanup cannot include vnode restore state".into(),
@@ -645,7 +656,7 @@ impl OperatorGraph {
         self.validate_pending_pipeline_identity(&pending)?;
         match pending.origin() {
             VnodeTransitionOrigin::BootRecovery => {
-                if pending.restore_cut().is_none() || !pending.revoked_vnodes().is_empty() {
+                if pending.restore_binding().is_none() || !pending.revoked_vnodes().is_empty() {
                     return Err(DbError::Checkpoint(
                         "[LDB-6051] boot recovery transition has invalid restore/revoke authority"
                             .into(),
@@ -736,17 +747,25 @@ impl OperatorGraph {
         }))
     }
 
-    fn preflight_decoded_vnodes(
+    fn preflight_decoded_vnodes<'body>(
         &self,
-        staged: &[PendingVnodeRestore],
+        staged: &'body [PendingVnodeRestore],
         attempt: Option<laminar_core::state::CheckpointAttempt>,
         restore_profile: Option<laminar_core::checkpoint::VnodeRestoreLimitProfile>,
-    ) -> Result<Vec<DecodedVnode>, DbError> {
+    ) -> Result<Vec<DecodedVnode<'body>>, DbError> {
         // Decode and bind every participant before the first revoke or restore callback.
-        let mut decoded = Vec::with_capacity(staged.len());
+        let allocation_error = |context: &str, error: std::collections::TryReserveError| {
+            DbError::Checkpoint(format!(
+                "[LDB-6051] {context} allocation failed during vnode restore preflight: {error}"
+            ))
+        };
+        let mut decoded = Vec::new();
+        decoded
+            .try_reserve_exact(staged.len())
+            .map_err(|error| allocation_error("decoded vnode roster", error))?;
         for rehydrated in staged {
             let vnode = rehydrated.vnode();
-            let Some(attempt) = attempt else {
+            let Some(_attempt) = attempt else {
                 return Err(DbError::Checkpoint(
                     "[LDB-6051] pending vnode restore has no exact committed attempt".into(),
                 ));
@@ -762,79 +781,91 @@ impl OperatorGraph {
                 )));
             }
             let expected = self.managed_vnode_participants(vnode)?;
-            let chain: Vec<VnodePartial> = rehydrated
-                .chain()
-                .iter()
-                .enumerate()
-                .map(|(link, bytes)| {
-                    #[cfg(test)]
-                    let decoded = if expected.len() > 1 {
-                        VnodePartial::decode_for_restore_test_roster(
-                            bytes,
-                            restore_profile,
-                            expected.len(),
-                        )
-                    } else {
-                        VnodePartial::decode_for_restore(bytes, restore_profile)
-                    };
-                    #[cfg(not(test))]
-                    let decoded = VnodePartial::decode_for_restore(bytes, restore_profile);
-                    decoded.map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "[LDB-6051] vnode {vnode} rehydration chain link {link} is corrupt: \
-                             {error}"
-                        ))
-                    })
-                })
-                .collect::<Result<_, _>>()?;
-            let mut artifact_names = BTreeSet::new();
-            for (link, partial) in chain.iter().enumerate() {
-                let mut link_names = BTreeSet::new();
-                for name in partial
-                    .operators
-                    .iter()
-                    .map(|(name, _)| name)
-                    .chain(partial.deltas.iter().map(|(name, _)| name))
-                {
+            let mut chain = Vec::new();
+            chain
+                .try_reserve_exact(rehydrated.chain().len())
+                .map_err(|error| allocation_error("borrowed outer chain", error))?;
+            for (link, bytes) in rehydrated.chain().iter().enumerate() {
+                let validated = VnodePartial::validate_for_restore(bytes, restore_profile);
+                chain.push(validated.map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6051] vnode {vnode} rehydration chain link {link} is corrupt: \
+                         {error}"
+                    ))
+                })?);
+            }
+
+            let mut artifact_names = Vec::new();
+            artifact_names
+                .try_reserve_exact(expected.len())
+                .map_err(|error| allocation_error("artifact operator roster", error))?;
+            for (link, partial) in chain.iter().copied().enumerate() {
+                let mut link_names = Vec::new();
+                link_names
+                    .try_reserve_exact(partial.entry_count())
+                    .map_err(|error| allocation_error("outer-link operator roster", error))?;
+                for (name, _) in partial.operators().chain(partial.deltas()) {
                     if name.is_empty() {
                         return Err(DbError::Checkpoint(format!(
                             "[LDB-6051] vnode {vnode} rehydration chain link {link} has an empty \
                              operator name"
                         )));
                     }
-                    if !link_names.insert(name.as_str()) {
+                    if link_names.contains(&name) {
                         return Err(DbError::Checkpoint(format!(
                             "[LDB-6051] vnode {vnode} rehydration chain link {link} repeats \
                              operator '{name}'"
                         )));
                     }
-                    artifact_names.insert(name.clone());
+                    link_names.push(name);
+                    if !artifact_names.contains(&name) {
+                        artifact_names
+                            .try_reserve(1)
+                            .map_err(|error| allocation_error("artifact operator roster", error))?;
+                        artifact_names.push(name);
+                    }
                 }
             }
+            artifact_names.sort_unstable();
 
-            let expected_names: BTreeSet<&str> = expected.iter().map(|(_, name)| *name).collect();
-            let missing: Vec<&str> = expected_names
-                .iter()
-                .copied()
-                .filter(|name| !artifact_names.contains(*name))
-                .collect();
-            let unexpected: Vec<&str> = artifact_names
-                .iter()
-                .map(String::as_str)
-                .filter(|name| !expected_names.contains(name))
-                .collect();
+            let mut missing = Vec::new();
+            missing
+                .try_reserve_exact(expected.len())
+                .map_err(|error| allocation_error("missing operator roster", error))?;
+            for (_, name) in &expected {
+                if !artifact_names.contains(name) {
+                    missing.push(*name);
+                }
+            }
+            let mut unexpected = Vec::new();
+            unexpected
+                .try_reserve_exact(artifact_names.len())
+                .map_err(|error| allocation_error("unexpected operator roster", error))?;
+            for name in &artifact_names {
+                if !expected.iter().any(|(_, expected)| expected == name) {
+                    unexpected.push(*name);
+                }
+            }
             if !missing.is_empty() || !unexpected.is_empty() {
                 return Err(DbError::Checkpoint(format!(
                     "[LDB-6051] vnode {vnode} managed-state roster mismatch: missing={missing:?}, unexpected={unexpected:?}"
                 )));
             }
-            let operators = expected
-                .into_iter()
-                .map(|(node_idx, name)| (node_idx, name.to_string()))
-                .collect();
+
+            let mut operators = Vec::new();
+            operators
+                .try_reserve_exact(expected.len())
+                .map_err(|error| allocation_error("operator binding roster", error))?;
+            for (node_idx, expected_name) in expected {
+                let archived_name = artifact_names
+                    .iter()
+                    .copied()
+                    .find(|name| *name == expected_name)
+                    .expect("complete roster validation established every expected name");
+                operators.push((node_idx, archived_name));
+            }
             decoded.push(DecodedVnode {
                 vnode,
-                attempt,
                 chain,
                 operators,
             });
@@ -842,46 +873,127 @@ impl OperatorGraph {
         Ok(decoded)
     }
 
-    fn resolve_decoded_vnodes<'decoded>(
-        &self,
-        decoded: &'decoded [DecodedVnode],
-    ) -> Result<Vec<ResolvedVnode<'decoded>>, DbError> {
-        decoded
+    fn resolve_borrowed_op_chain<'body>(
+        chain: &[ValidatedVnodePartial<'body>],
+        op: &str,
+    ) -> Result<Option<BorrowedOpChain<'body>>, DbError> {
+        let Some(base_idx) = chain
             .iter()
-            .map(|vnode| {
-                let operators = vnode
-                    .operators
-                    .iter()
-                    .map(|(node_idx, name)| {
-                        let (base, deltas) =
-                            crate::recovery_manager::vnode_chains::resolve_op_chain(
-                                &vnode.chain,
-                                name,
-                            )
-                            .ok_or_else(|| {
-                                DbError::Checkpoint(format!(
-                                    "[LDB-6051] vnode {} rehydration chain has no FULL base \
-                                         for operator '{name}'",
-                                    vnode.vnode
-                                ))
+            .rposition(|partial| partial.operators().any(|(name, _)| name == op))
+        else {
+            return Ok(None);
+        };
+        let base = chain[base_idx]
+            .operators()
+            .find(|(name, _)| *name == op)
+            .map(|(_, bytes)| bytes)
+            .expect("base index was selected from the same checked operator directory");
+        let delta_count = chain[base_idx + 1..]
+            .iter()
+            .filter(|partial| partial.deltas().any(|(name, _)| name == op))
+            .count();
+        let mut deltas = Vec::new();
+        deltas.try_reserve_exact(delta_count).map_err(|error| {
+            DbError::Checkpoint(format!(
+                "[LDB-6051] resolved delta roster allocation failed: {error}"
+            ))
+        })?;
+        for partial in &chain[base_idx + 1..] {
+            if let Some((_, delta)) = partial.deltas().find(|(name, _)| *name == op) {
+                deltas.push(VnodeRestoreArchive::Borrowed(delta));
+            }
+        }
+        Ok(Some((base, deltas)))
+    }
+
+    fn resolve_decoded_vnodes<'body>(
+        &self,
+        decoded: &[DecodedVnode<'body>],
+    ) -> Result<Vec<ResolvedVnode<'body>>, DbError> {
+        let mut resolved = Vec::new();
+        resolved.try_reserve_exact(decoded.len()).map_err(|error| {
+            DbError::Checkpoint(format!(
+                "[LDB-6051] resolved vnode roster allocation failed: {error}"
+            ))
+        })?;
+        for vnode in decoded {
+            let mut operators = Vec::new();
+            operators
+                .try_reserve_exact(vnode.operators.len())
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6051] resolved operator roster allocation failed: {error}"
+                    ))
+                })?;
+            for (node_idx, name) in &vnode.operators {
+                let (base, deltas) = Self::resolve_borrowed_op_chain(&vnode.chain, name)?
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6051] vnode {} rehydration chain has no FULL base \
+                             for operator '{name}'",
+                            vnode.vnode
+                        ))
+                    })?;
+                operators.push(ResolvedOperator {
+                    node_idx: *node_idx,
+                    #[cfg(test)]
+                    name,
+                    base: VnodeRestoreArchive::Borrowed(base),
+                    deltas,
+                });
+            }
+            resolved.push(ResolvedVnode {
+                vnode: vnode.vnode,
+                operators,
+            });
+        }
+        Ok(resolved)
+    }
+
+    fn normalize_inner_archives<'decoded>(
+        mut resolved: Vec<ResolvedVnode<'decoded>>,
+        pending: &PendingVnodeTransition,
+    ) -> Result<NormalizedResolvedVnodes<'decoded>, DbError> {
+        let copy_bytes = resolved
+            .iter()
+            .flat_map(|vnode| vnode.operators.iter())
+            .try_fold(0_u64, |total, operator| {
+                std::iter::once(&operator.base)
+                    .chain(operator.deltas.iter())
+                    .try_fold(total, |total, archive| {
+                        let bytes =
+                            u64::try_from(archive.alignment_copy_bytes()).map_err(|_| {
+                                DbError::Checkpoint(
+                                    "[LDB-6050] inner archive alignment-copy size does not fit u64"
+                                        .into(),
+                                )
                             })?;
-                        Ok(ResolvedOperator {
-                            node_idx: *node_idx,
-                            #[cfg(test)]
-                            name,
-                            base,
-                            deltas,
+                        total.checked_add(bytes).ok_or_else(|| {
+                            DbError::Checkpoint(
+                                "[LDB-6050] inner archive alignment-copy accounting overflow"
+                                    .into(),
+                            )
                         })
                     })
-                    .collect::<Result<Vec<_>, DbError>>()?;
-                Ok(ResolvedVnode {
-                    vnode: vnode.vnode,
-                    attempt: vnode.attempt,
-                    links: vnode.chain.len(),
-                    operators,
-                })
-            })
-            .collect()
+            })?;
+        let alignment_copy_reservation = if copy_bytes == 0 {
+            None
+        } else {
+            Some(pending.reserve_inner_alignment_copy(copy_bytes)?)
+        };
+
+        for archive in resolved
+            .iter_mut()
+            .flat_map(|vnode| vnode.operators.iter_mut())
+            .flat_map(|operator| std::iter::once(&mut operator.base).chain(&mut operator.deltas))
+        {
+            archive.normalize_alignment()?;
+        }
+
+        Ok(NormalizedResolvedVnodes {
+            vnodes: resolved,
+            _alignment_copy_reservation: alignment_copy_reservation,
+        })
     }
 
     fn relevant_revoked_vnodes(
@@ -935,7 +1047,9 @@ impl OperatorGraph {
                 .managed_state
                 .expect("managed operator inventory was filtered above");
             match contract {
-                ManagedStateContract::SqlAggregateV1 => {}
+                ManagedStateContract::SqlAggregateV1
+                | ManagedStateContract::CoreWindowV1
+                | ManagedStateContract::BoundedIntervalJoinV1 => {}
                 #[cfg(test)]
                 ManagedStateContract::TestVnodeStateV1 => continue,
             }
@@ -959,7 +1073,7 @@ impl OperatorGraph {
                         .find(|operator| operator.node_idx == node_idx)
                         .map(|operator| ManagedVnodeRestore {
                             vnode: vnode.vnode,
-                            base: operator.base,
+                            base: operator.base.as_slice(),
                             deltas: &operator.deltas,
                         })
                 })
@@ -995,6 +1109,10 @@ impl OperatorGraph {
             node_indices: attempted,
         };
         self.observe_managed_state_accounting(&prepared.node_indices);
+        if let Err(error) = self.validate_managed_state_budget("vnode transition preparation") {
+            self.abort_and_finish_managed_operators(&prepared);
+            return Err(error);
+        }
         Ok(prepared)
     }
 
@@ -1079,10 +1197,15 @@ impl OperatorGraph {
                     continue;
                 }
                 callbacks_run = true;
+                let deltas: Vec<&[u8]> = operator
+                    .deltas
+                    .iter()
+                    .map(VnodeRestoreArchive::as_slice)
+                    .collect();
                 if let Err(error) = self.nodes[operator.node_idx].operator.apply_vnode_chain(
                     vnode.vnode,
-                    operator.base,
-                    &operator.deltas,
+                    operator.base.as_slice(),
+                    &deltas,
                 ) {
                     let phase = format!(
                         "restore callback for vnode {} operator '{}'",
@@ -1130,7 +1253,6 @@ impl OperatorGraph {
     fn publish_vnode_transition(
         &mut self,
         transition: PreparedVnodeTransition,
-        resolved: &[ResolvedVnode<'_>],
         prepared: &PreparedManagedOperators,
         test_callbacks_mutated_state: bool,
     ) -> Result<(), DbError> {
@@ -1192,20 +1314,10 @@ impl OperatorGraph {
         drop(retired_installed_binding);
         publication.complete();
 
-        for vnode in resolved {
-            tracing::debug!(
-                vnode = vnode.vnode,
-                epoch = vnode.attempt.epoch,
-                checkpoint_id = vnode.attempt.checkpoint_id,
-                operators = vnode.operators.len(),
-                links = vnode.links,
-                "completed vnode recovery-chain publication"
-            );
-        }
         tracing::info!(
             assignment_version = authority.assignment.version(),
             revoked_vnodes = revoked.len(),
-            restored_vnodes = resolved.len(),
+            restored_vnodes = pending.restores().len(),
             "completed staged vnode transition"
         );
         Ok(())

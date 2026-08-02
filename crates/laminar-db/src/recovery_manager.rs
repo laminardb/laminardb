@@ -65,10 +65,10 @@ impl RecoveredState {
     }
 
     #[cfg(feature = "cluster")]
-    pub(crate) fn vnode_restore_cut(
-        &self,
-    ) -> Option<&crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut> {
-        self.vnode_restore_cut.as_ref()
+    pub(crate) fn take_vnode_restore_cut(
+        &mut self,
+    ) -> Option<crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut> {
+        self.vnode_restore_cut.take()
     }
 }
 

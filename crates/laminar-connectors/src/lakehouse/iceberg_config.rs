@@ -1,8 +1,8 @@
 //! Apache Iceberg connector configuration.
 //!
 //! [`IcebergSinkConfig`] and [`IcebergSourceConfig`] encapsulate settings for
-//! writing to and reading from Iceberg tables, parsed from SQL `WITH (...)`
-//! clauses via their respective `from_config` methods.
+//! writing to and reading from Iceberg tables, parsed from resolved connector
+//! configs via their respective `from_config` methods.
 #![allow(clippy::disallowed_types)] // cold path: lakehouse configuration
 
 use std::collections::HashMap;
@@ -126,7 +126,7 @@ pub struct IcebergSinkConfig {
 }
 
 impl IcebergSinkConfig {
-    /// Parses a sink config from a [`ConnectorConfig`] (SQL WITH clause).
+    /// Parses a sink config from a resolved [`ConnectorConfig`].
     ///
     /// # Errors
     ///
@@ -164,7 +164,7 @@ pub struct IcebergSourceConfig {
 }
 
 impl IcebergSourceConfig {
-    /// Parses a source config from a [`ConnectorConfig`] (SQL WITH clause).
+    /// Parses a source config from a resolved [`ConnectorConfig`].
     ///
     /// # Errors
     ///

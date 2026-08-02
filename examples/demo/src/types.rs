@@ -73,7 +73,7 @@ pub struct AnomalyAlert {
     pub total_volume: i64,
 }
 
-/// Enriched order with ASOF-joined market data.
+/// Order enriched with the latest available market data.
 #[derive(Debug, Clone)]
 pub struct EnrichedOrder {
     pub order_id: String,

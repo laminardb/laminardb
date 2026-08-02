@@ -394,10 +394,205 @@ fn sum_pre_agg_batch(names: &[&str], values: &[f64]) -> RecordBatch {
     .unwrap()
 }
 
+async fn setup_retractable_min_state() -> IncrementalAggState {
+    let ctx = laminar_sql::create_session_context();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8, false),
+        Field::new("value", DataType::Float64, false),
+        Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+    ]));
+    let dummy = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(arrow::array::StringArray::from(vec!["seed"])),
+            Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            Arc::new(arrow::array::Int64Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![dummy]]).unwrap();
+    ctx.register_table("events", Arc::new(mem)).unwrap();
+    try_from_sql_local(
+        &ctx,
+        "SELECT name, MIN(value) AS minimum FROM events GROUP BY name",
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+fn retractable_min_pre_agg_batch(names: &[&str], values: &[f64], weights: &[i64]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(arrow::array::StringArray::from(names.to_vec())),
+            Arc::new(arrow::array::Float64Array::from(values.to_vec())),
+            Arc::new(arrow::array::Int64Array::from(weights.to_vec())),
+        ],
+    )
+    .unwrap()
+}
+
+fn selected_accumulator_charge(state: &IncrementalAggState) -> usize {
+    state
+        .vnode_states
+        .iter()
+        .flat_map(|(_, vnode_state)| vnode_state.groups.values())
+        .map(|entry| entry.accumulator_reported_bytes)
+        .sum()
+}
+
+#[derive(Debug)]
+struct StateCountingAccumulator {
+    inner: Box<dyn datafusion_expr::Accumulator>,
+    state_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl datafusion_expr::Accumulator for StateCountingAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion_common::Result<()> {
+        self.inner.update_batch(values)
+    }
+
+    fn evaluate(&mut self) -> datafusion_common::Result<ScalarValue> {
+        self.inner.evaluate()
+    }
+
+    fn size(&self) -> usize {
+        self.inner.size()
+    }
+
+    fn state(&mut self) -> datafusion_common::Result<Vec<ScalarValue>> {
+        self.state_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.state()
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion_common::Result<()> {
+        self.inner.merge_batch(states)
+    }
+}
+
+fn install_state_counters(
+    state: &mut IncrementalAggState,
+) -> Vec<Arc<std::sync::atomic::AtomicUsize>> {
+    let mut counters = Vec::new();
+    for (_, vnode_state) in state.vnode_states.iter_mut() {
+        for entry in vnode_state.groups.values_mut() {
+            let capacity = entry.accs.capacity();
+            let original = std::mem::take(&mut entry.accs);
+            let mut wrapped: Vec<Box<dyn datafusion_expr::Accumulator>> =
+                Vec::with_capacity(capacity);
+            for inner in original {
+                let state_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                wrapped.push(Box::new(StateCountingAccumulator {
+                    inner,
+                    state_calls: Arc::clone(&state_calls),
+                }));
+                counters.push(state_calls);
+            }
+            entry.accs = wrapped;
+        }
+    }
+    counters
+}
+
 fn checkpoint_bytes(state: &mut IncrementalAggState) -> Vec<u8> {
     rkyv::to_bytes::<rkyv::rancor::Error>(&state.checkpoint_groups().unwrap())
         .unwrap()
         .to_vec()
+}
+
+#[tokio::test]
+async fn retractable_extremum_checkpoint_budget_is_capture_wide_exact_and_pre_encoding() {
+    let mut state = setup_retractable_min_state().await;
+    state
+        .process_batch(
+            &retractable_min_pre_agg_batch(
+                &["a", "a", "b", "b"],
+                &[1.0, 2.0, 10.0, 20.0],
+                &[1, 1, 1, 1],
+            ),
+            1,
+        )
+        .unwrap();
+    let per_group_charges = state
+        .vnode_states
+        .iter()
+        .flat_map(|(_, vnode_state)| vnode_state.groups.values())
+        .map(|entry| entry.accumulator_reported_bytes)
+        .collect::<Vec<_>>();
+    assert_eq!(per_group_charges.len(), 2);
+    let exact_charge = per_group_charges.iter().sum::<usize>();
+    assert!(
+        per_group_charges
+            .iter()
+            .all(|charge| *charge < exact_charge),
+        "each group must fit while their combined capture consumes the exact allowance"
+    );
+
+    state.set_max_retractable_extremum_checkpoint_bytes(exact_charge);
+    let exact_checkpoint = rkyv::to_bytes::<rkyv::rancor::Error>(
+        &state
+            .checkpoint_groups()
+            .expect("an exact-budget capture must be accepted"),
+    )
+    .unwrap()
+    .to_vec();
+    assert_eq!(selected_accumulator_charge(&state), exact_charge);
+
+    let values_before = state.evaluated_groups_for_test().unwrap();
+    let bookkeeping_before = state.working_set_snapshot_for_test();
+    let state_calls = install_state_counters(&mut state);
+    state.set_max_retractable_extremum_checkpoint_bytes(exact_charge - 1);
+    for _ in 0..2 {
+        let error = match state.checkpoint_groups() {
+            Ok(_) => panic!("an over-budget capture must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            DbError::RetractableExtremumCheckpointBudgetExceeded {
+                charged_bytes,
+                limit_bytes,
+                ..
+            } if charged_bytes == exact_charge && limit_bytes == exact_charge - 1
+        ));
+    }
+    assert!(
+        state_calls
+            .iter()
+            .all(|calls| { calls.load(std::sync::atomic::Ordering::Relaxed) == 0 }),
+        "budget rejection must precede every Accumulator::state call"
+    );
+    assert_eq!(state.working_set_snapshot_for_test(), bookkeeping_before);
+    assert_eq!(state.evaluated_groups_for_test().unwrap(), values_before);
+
+    state.set_max_retractable_extremum_checkpoint_bytes(exact_charge);
+    let retry = rkyv::to_bytes::<rkyv::rancor::Error>(&state.checkpoint_groups().unwrap())
+        .unwrap()
+        .to_vec();
+    assert_eq!(retry, exact_checkpoint);
+    assert!(state_calls
+        .iter()
+        .all(|calls| { calls.load(std::sync::atomic::Ordering::Relaxed) == 1 }));
+}
+
+#[tokio::test]
+async fn extremum_checkpoint_budget_ignores_non_retractable_minimums() {
+    let (_, mut state) =
+        setup_agg_state("SELECT name, MIN(value) AS minimum FROM events GROUP BY name").await;
+    state
+        .process_batch(&sum_pre_agg_batch(&["a", "a"], &[1.0, 2.0]), 1)
+        .unwrap();
+    state.set_max_retractable_extremum_checkpoint_bytes(1);
+    state
+        .checkpoint_groups()
+        .expect("ordinary append-only MIN must not consume the retractable-extremum budget");
 }
 
 #[tokio::test]
@@ -468,8 +663,12 @@ async fn retained_state_accounting_includes_topology_and_changelog_lifecycle() {
     restored.restore_groups(&checkpoint).unwrap();
     assert!(restored.cached_usage_matches_structural_recompute());
     assert_eq!(
-        restored.accounted_state_bytes(),
-        changelog.accounted_state_bytes()
+        restored.evaluated_groups_for_test().unwrap(),
+        changelog.evaluated_groups_for_test().unwrap()
+    );
+    assert!(
+        restored.accounted_state_bytes() <= changelog.accounted_state_bytes(),
+        "a fresh restore may shed spare capacity retained by emptied live dirty sets"
     );
 }
 
@@ -1957,6 +2156,36 @@ async fn empty_restore_rejects_every_noncanonical_payload() {
             .last_emitted
             .is_empty());
     }
+}
+
+#[tokio::test]
+async fn whole_restore_group_limit_precedes_arrow_decode_and_accepts_exact_boundary() {
+    let sql = "SELECT name, SUM(value) as total FROM events GROUP BY name";
+    let (_, mut donor) = setup_agg_state(sql).await;
+    donor
+        .process_batch(&sum_pre_agg_batch(&["a"], &[10.0]), 1)
+        .unwrap();
+    let checkpoint = donor.checkpoint_groups().unwrap();
+    assert_eq!(checkpoint.last_updated_ms.len(), 1);
+
+    let (_, mut exact) = setup_agg_state(sql).await;
+    exact.set_max_groups_for_test(1);
+    assert_eq!(exact.restore_groups(&checkpoint).unwrap(), 1);
+    assert_eq!(exact.logical_group_count_for_test(), 1);
+
+    let mut oversized = checkpoint;
+    oversized.last_updated_ms.push(2);
+    oversized.keys_ipc = vec![0xff];
+    let (_, mut rejected) = setup_agg_state(sql).await;
+    rejected.set_max_groups_for_test(1);
+    let error = rejected
+        .restore_groups(&oversized)
+        .expect_err("two declared groups must exceed the one-group restore limit");
+    assert!(
+        error.to_string().contains("whole-state restore preflight"),
+        "{error}"
+    );
+    assert_eq!(rejected.logical_group_count_for_test(), 0);
 }
 
 #[tokio::test]

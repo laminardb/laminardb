@@ -44,12 +44,7 @@ SELECT
 FROM market_ticks
 GROUP BY symbol, tumble(ts, INTERVAL '5' SECOND);
 
--- 5. Enriched orders: ASOF JOIN orders with latest market tick
--- SQL definition (executed via application-level batch merge):
--- SELECT o.order_id, o.symbol, o.side, o.quantity, o.price as order_price,
---        t.price as market_price, t.bid, t.ask, o.price - t.price as slippage
--- FROM order_events o
--- ASOF JOIN market_ticks t MATCH_CONDITION(o.ts >= t.ts) ON o.symbol = t.symbol
+-- 5. Enriched orders are produced by the application's bounded latest-tick index.
 
 -- 6. Book imbalance: bid/ask depth ratio (5-second tumbling windows)
 CREATE STREAM book_imbalance AS

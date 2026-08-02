@@ -214,6 +214,11 @@ impl StateBackend for InProcessBackend {
         self.vnode_capacity
     }
 
+    fn sealed_partial_read_envelope(&self) -> Option<super::SealedPartialReadEnvelope> {
+        // The stored payload and a worst-case caller-owned alignment copy can coexist.
+        Some(super::SealedPartialReadEnvelope::new(2, 0))
+    }
+
     async fn bind_state_namespace(
         &self,
         deployment_id: &str,
@@ -468,6 +473,18 @@ impl StateBackend for InProcessBackend {
                 message: "assignment certificate is not canonical".into(),
             });
         }
+        CheckpointSealInventory::validate_request_control_limits(
+            assignment_fence,
+            vnodes,
+            required_descriptors,
+        )
+        .map_err(|message| StateBackendError::Conflict {
+            resource: format!(
+                "state-v2/epoch={}/checkpoint={}/_SEAL",
+                attempt.epoch, attempt.checkpoint_id
+            ),
+            message,
+        })?;
         let assignment_version = assignment_fence.map_or(0, |fence| fence.assignment_version);
         let sealed_partials = {
             let map = self.partials.read();
@@ -560,6 +577,28 @@ impl StateBackend for InProcessBackend {
             .map(CheckpointSeal::inventory))
     }
 
+    async fn checkpoint_seal_inventory_bounded(
+        &self,
+        attempt: CheckpointAttempt,
+    ) -> Result<Option<CheckpointSealInventory>, StateBackendError> {
+        let Some(_live_attempt) = self.readable_attempt_guard(attempt)? else {
+            return Ok(None);
+        };
+        let sealed = self.sealed.read();
+        let Some(seal) = sealed.get(&attempt) else {
+            return Ok(None);
+        };
+        seal.validate()
+            .map_err(|message| StateBackendError::Conflict {
+                resource: format!(
+                    "state-v2/epoch={}/checkpoint={}/_SEAL",
+                    attempt.epoch, attempt.checkpoint_id
+                ),
+                message,
+            })?;
+        Ok(Some(seal.inventory()))
+    }
+
     async fn verify_checkpoint_artifact_metadata(
         &self,
         inventory: &CheckpointSealInventory,
@@ -577,7 +616,7 @@ impl StateBackend for InProcessBackend {
                 message: "checkpoint seal is missing during metadata verification".into(),
             });
         };
-        if seal.inventory() != *inventory {
+        if !seal.matches_inventory(inventory) {
             return Err(StateBackendError::Conflict {
                 resource,
                 message: "checkpoint seal changed during metadata verification".into(),
@@ -668,6 +707,16 @@ mod tests {
 
     fn root_lineage(payload: &[u8]) -> VnodePartialLineage {
         VnodePartialLineage::root(payload.len() as u64)
+    }
+
+    #[test]
+    fn sealed_partial_read_envelope_covers_alignment_normalization() {
+        let backend = InProcessBackend::new(1);
+        let envelope = backend.sealed_partial_read_envelope().unwrap();
+
+        assert_eq!(envelope.payload_multiplier(), 2);
+        assert_eq!(envelope.fixed_bytes_per_artifact(), 0);
+        assert_eq!(envelope.checked_bytes(11, 3), Some(22));
     }
 
     #[tokio::test]

@@ -103,6 +103,18 @@ pub enum SourceTopology {
     NodeLocalIngress,
 }
 
+/// Update model emitted by a configured source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SourceInputMode {
+    /// Every row is an insertion.
+    #[default]
+    AppendOnly,
+    /// Current row images and deletes are reconciled by the declared primary key.
+    KeyedUpsert,
+    /// Decoded rows carry a non-null, non-zero `Int64` `__weight` column.
+    FullChangelog,
+}
+
 /// Complete source admission contract for a concrete connector configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct SourceContract {
@@ -110,17 +122,24 @@ pub struct SourceContract {
     pub consistency: SourceConsistency,
     /// Valid runtime placement model.
     pub topology: SourceTopology,
+    /// Update model produced after connector decoding.
+    pub input_mode: SourceInputMode,
     exact_delivery_certified: bool,
 }
 
 impl SourceContract {
-    /// Construct a source contract from its recovery and placement dimensions.
+    /// Construct a source contract from its recovery, placement, and update dimensions.
     /// Exactly-once certification defaults to fail-closed.
     #[must_use]
-    pub const fn new(consistency: SourceConsistency, topology: SourceTopology) -> Self {
+    pub const fn new(
+        consistency: SourceConsistency,
+        topology: SourceTopology,
+        input_mode: SourceInputMode,
+    ) -> Self {
         Self {
             consistency,
             topology,
+            input_mode,
             exact_delivery_certified: false,
         }
     }
@@ -213,6 +232,9 @@ pub struct SinkContract {
     pub topology: SinkTopology,
     /// Strongest supported input update model.
     pub input_mode: SinkInputMode,
+    /// True only for a built-in sink whose immutable phase-one and fenced
+    /// external cursor protocol is certified for multi-node exact delivery.
+    cluster_exact_delivery_certified: bool,
 }
 
 impl SinkContract {
@@ -227,7 +249,22 @@ impl SinkContract {
             consistency,
             topology,
             input_mode,
+            cluster_exact_delivery_certified: false,
         }
+    }
+
+    /// Mark a built-in sink whose cluster exact-delivery protocol is a release gate.
+    #[must_use]
+    pub(crate) const fn with_cluster_exact_delivery_certification(mut self) -> Self {
+        self.cluster_exact_delivery_certified = true;
+        self
+    }
+
+    /// Whether this sink's complete multi-node exact-delivery protocol is certified.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn is_cluster_exact_delivery_certified(self) -> bool {
+        self.cluster_exact_delivery_certified
     }
 
     /// Whether this contract participates in checkpoint-owned external commit.
@@ -617,7 +654,7 @@ pub trait SourceConnector: Send {
         max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError>;
 
-    /// Resolve the source schema from the `WITH (...)` properties before
+    /// Resolve the source schema from the connector and format properties before
     /// DDL reaches the planner. Implementations that perform network I/O must
     /// bound it with a timeout. Return `Err(ConnectorError::…)` on failure so
     /// the runtime can surface the cause to DDL — do not log and swallow.
@@ -756,16 +793,11 @@ pub trait SourceConnector: Send {
 
     /// Declare recovery and placement semantics for this exact configuration.
     ///
-    /// The fail-closed default is an ephemeral singleton. Durable or
-    /// distributed semantics must be opted into by the connector explicitly.
-    ///
     /// # Errors
     ///
     /// Returns an error when the concrete configuration cannot provide a valid
-    /// recovery or placement contract. The default implementation never fails.
-    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        Ok(SourceContract::default())
-    }
+    /// recovery, placement, or input contract.
+    fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError>;
 
     /// Return connector-owned semantic options for durable recovery identity.
     ///
@@ -1469,6 +1501,7 @@ mod tests {
         let contract = SourceContract::default();
         assert_eq!(contract.consistency, SourceConsistency::Ephemeral);
         assert_eq!(contract.topology, SourceTopology::Singleton);
+        assert_eq!(contract.input_mode, SourceInputMode::AppendOnly);
         assert!(!contract.supports_replay());
         assert!(!contract.requires_checkpointing());
         assert!(!contract.is_exact_delivery_certified());
@@ -1479,9 +1512,11 @@ mod tests {
         let contract = SourceContract::new(
             SourceConsistency::CommitCoupled,
             SourceTopology::NodeLocalIngress,
+            SourceInputMode::FullChangelog,
         );
         assert!(contract.supports_replay());
         assert!(contract.requires_checkpointing());
+        assert_eq!(contract.input_mode, SourceInputMode::FullChangelog);
     }
 
     #[test]

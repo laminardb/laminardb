@@ -96,7 +96,7 @@ impl<T: Clone> RegisteredMetricFamily<T> {
 /// Registers the WebSocket source connector with the given registry.
 ///
 /// After registration, the runtime can instantiate `WebSocketSource` by
-/// name when processing `CREATE SOURCE ... WITH (connector = 'websocket')`.
+/// name when processing `CREATE SOURCE ... FROM WEBSOCKET (...)`.
 ///
 /// # Errors
 ///

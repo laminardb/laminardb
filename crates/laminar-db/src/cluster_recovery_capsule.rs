@@ -26,7 +26,7 @@ pub(crate) const MAX_PARTICIPANT_READY_BYTES: u64 =
 
 #[cfg(test)]
 pub(crate) fn vnode_restore_limits_for_test(vnode_count: u32) -> VnodeRestoreLimits {
-    VnodeRestoreLimits::global_singleton_compatibility(64 * 1024 * 1024, 6, vnode_count)
+    VnodeRestoreLimits::managed_vnode(64 * 1024 * 1024, 6, vnode_count)
         .expect("test vnode restore limits")
 }
 
@@ -664,7 +664,7 @@ mod tests {
             .await
             .unwrap());
         backend
-            .checkpoint_seal_inventory(attempt)
+            .checkpoint_seal_inventory_bounded(attempt)
             .await
             .unwrap()
             .unwrap()
@@ -763,7 +763,7 @@ mod tests {
         let inventory = sealed_inventory(attempt, &fence, [(0, 1), (1, 2)]).await;
         let mut second = ready(attempt, &fence, 2, vec![1]);
         second.vnode_restore_limits =
-            VnodeRestoreLimits::global_singleton_compatibility(32 * 1024 * 1024, 6, 2).unwrap();
+            VnodeRestoreLimits::managed_vnode(32 * 1024 * 1024, 6, 2).unwrap();
         let readiness = vec![
             (participant_ready_key(1), ready(attempt, &fence, 1, vec![0])),
             (participant_ready_key(2), second),

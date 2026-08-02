@@ -16,7 +16,7 @@ use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
 use laminar_connectors::connector::{
     SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, SourceBatch,
     SourceConnector, SourceConsistency, SourceContract, SourceDrainRequest, SourceDrainResolution,
-    SourcePosition, SourceStart, SourceTopology, WriteResult,
+    SourceInputMode, SourcePosition, SourceStart, SourceTopology, WriteResult,
 };
 use laminar_connectors::error::ConnectorError;
 use laminar_core::changelog::WEIGHT_COLUMN;
@@ -47,9 +47,9 @@ const CONTROL_STORE_CONTRACT_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_LEASE_TTL: Duration = Duration::from_secs(2);
 const TEST_LEASE_RENEW_INTERVAL: Duration = Duration::from_millis(500);
 pub const TEST_SOURCE_DDL: &str =
-    "CREATE SOURCE src (key BIGINT, value BIGINT) WITH ('connector' = 'cluster-harness-scripted')";
+    "CREATE SOURCE src (key BIGINT, value BIGINT) FROM \"cluster-harness-scripted\"";
 pub const TEST_AGGREGATE_SINK_DDL: &str =
-    "CREATE SINK observed_totals FROM totals WITH ('connector' = 'cluster-harness-observer')";
+    "CREATE SINK observed_totals FROM totals INTO \"cluster-harness-observer\"";
 
 pub struct ScriptedClusterHarnessLog {
     rows: parking_lot::Mutex<Vec<(i64, i64)>>,
@@ -338,6 +338,7 @@ impl SourceConnector for ScriptedClusterHarnessSource {
         Ok(SourceContract::new(
             SourceConsistency::Replayable,
             SourceTopology::Splittable,
+            SourceInputMode::AppendOnly,
         ))
     }
 

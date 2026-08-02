@@ -23,7 +23,8 @@ use tracing::info;
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
-    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceTopology,
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
+    SourceTopology,
 };
 use crate::connector::{SourcePosition, SourceStart};
 use crate::error::ConnectorError;
@@ -237,10 +238,22 @@ impl SourceConnector for IcebergSource {
         cp
     }
 
-    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+    fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        let snapshot_id = if config.properties().is_empty() {
+            self.config.snapshot_id
+        } else {
+            IcebergSourceConfig::from_config(config)?.snapshot_id
+        };
+        if snapshot_id.is_none() {
+            return Err(ConnectorError::ConfigurationError(
+                "Iceberg streaming source requires snapshot.id to pin an immutable snapshot".into(),
+            ));
+        }
+
         Ok(SourceContract::new(
             SourceConsistency::Ephemeral,
             SourceTopology::Singleton,
+            SourceInputMode::AppendOnly,
         ))
     }
 
@@ -309,10 +322,19 @@ mod tests {
     }
 
     #[test]
-    fn test_source_contract_is_ephemeral_singleton() {
-        let source = IcebergSource::new(test_source_config(), None);
+    fn source_contract_requires_pinned_snapshot() {
+        let unpinned = IcebergSource::new(test_source_config(), None);
+        let error = unpinned
+            .contract(&ConnectorConfig::new("iceberg"))
+            .unwrap_err();
+        assert!(error.to_string().contains("snapshot.id"));
+
+        let mut config = test_source_config();
+        config.snapshot_id = Some(42);
+        let source = IcebergSource::new(config, None);
         let contract = source.contract(&ConnectorConfig::new("iceberg")).unwrap();
         assert_eq!(contract.consistency, SourceConsistency::Ephemeral);
         assert_eq!(contract.topology, SourceTopology::Singleton);
+        assert_eq!(contract.input_mode, SourceInputMode::AppendOnly);
     }
 }

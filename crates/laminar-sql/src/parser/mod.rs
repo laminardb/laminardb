@@ -489,6 +489,7 @@ fn parse_create_stream(
     let remaining = collect_remaining_tokens(parser);
     let (head_tokens, with_tokens) = split_off_trailing_with(&remaining);
     let (query_tokens, emit_tokens) = split_at_emit(&head_tokens);
+    reject_removed_temporal_probe_join(&query_tokens)?;
 
     let query_sql = query_body_sql(
         original_sql,
@@ -908,6 +909,7 @@ fn parse_create_materialized_view(
     // Collect remaining tokens and split at EMIT boundary (same strategy as continuous query)
     let remaining = collect_remaining_tokens(parser);
     let (query_tokens, emit_tokens) = split_at_emit(&remaining);
+    reject_removed_temporal_probe_join(&query_tokens)?;
 
     let query_sql = query_body_sql(original_sql, &query_tokens, &emit_tokens, None);
 
@@ -980,6 +982,38 @@ fn collect_remaining_tokens(
         tokens.push(token);
     }
     tokens
+}
+
+fn reject_removed_temporal_probe_join(
+    tokens: &[sqlparser::tokenizer::TokenWithSpan],
+) -> Result<(), ParseError> {
+    use sqlparser::tokenizer::Token;
+
+    let mut matched = 0;
+    for token in tokens
+        .iter()
+        .filter(|token| !matches!(token.token, Token::Whitespace(_) | Token::EOF))
+    {
+        let Token::Word(word) = &token.token else {
+            matched = 0;
+            continue;
+        };
+        let unquoted = word.quote_style.is_none();
+        matched = if matched == 0 && unquoted && word.value.eq_ignore_ascii_case("TEMPORAL") {
+            1
+        } else if matched == 1 && unquoted && word.value.eq_ignore_ascii_case("PROBE") {
+            2
+        } else if matched == 2 && unquoted && word.value.eq_ignore_ascii_case("JOIN") {
+            return Err(ParseError::StreamingError(
+                "TEMPORAL PROBE JOIN was removed; use a bounded INNER JOIN".to_string(),
+            ));
+        } else if unquoted && word.value.eq_ignore_ascii_case("TEMPORAL") {
+            1
+        } else {
+            0
+        };
+    }
+    Ok(())
 }
 
 /// Split tokens at the first standalone EMIT keyword (not inside parentheses).
@@ -1060,8 +1094,8 @@ mod tests {
         }
 
         let trailing = [
-            "CREATE SOURCE events (id BIGINT) WITH ('connector' = 'kafka') TRAILING",
-            "CREATE SINK output FROM events WITH ('topic' = 'a') TRAILING",
+            "CREATE SOURCE events (id BIGINT) WITH ('buffer_size' = '4096') TRAILING",
+            "CREATE SINK output FROM events INTO KAFKA ('topic' = 'a') TRAILING",
             "CREATE LOOKUP TABLE users (id BIGINT, PRIMARY KEY (id)) WITH ('connector' = 'postgres') TRAILING",
         ];
         for sql in trailing {
@@ -1699,52 +1733,16 @@ mod tests {
     }
 
     #[test]
-    fn create_stream_preserves_temporal_probe_join() {
+    fn create_stream_rejects_removed_temporal_probe_join() {
         let sql = "CREATE STREAM markouts_long AS \
                    SELECT t.s, p.offset_ms FROM trade_probe t \
                    TEMPORAL PROBE JOIN price_ref r \
                        ON (s) TIMESTAMPS (ts, ts) \
                        LIST (0s, 1s, 5s, 30s) AS p";
-        let StreamingStatement::CreateStream { query_sql, .. } = parse_one(sql) else {
-            panic!("expected CreateStream");
-        };
+        let error = parse_streaming_sql(sql).expect_err("removed syntax must fail closed");
         assert!(
-            query_sql.to_uppercase().contains("TEMPORAL PROBE JOIN"),
-            "got: {query_sql}"
-        );
-        assert!(
-            query_sql.contains("LIST (0s, 1s, 5s, 30s)"),
-            "got: {query_sql}"
-        );
-        assert!(query_sql.contains("AS p"), "got: {query_sql}");
-    }
-
-    #[test]
-    fn create_stream_temporal_probe_range_step_preserved() {
-        let sql = "CREATE STREAM mk AS \
-                   SELECT s FROM trades t TEMPORAL PROBE JOIN prices r \
-                   ON (symbol) TIMESTAMPS (ts, ts) \
-                   RANGE FROM 0s TO 30s STEP 5s AS p";
-        let StreamingStatement::CreateStream { query_sql, .. } = parse_one(sql) else {
-            panic!("expected CreateStream");
-        };
-        assert!(
-            query_sql.contains("RANGE FROM 0s TO 30s STEP 5s"),
-            "got: {query_sql}"
-        );
-    }
-
-    #[test]
-    fn create_mv_preserves_temporal_probe_join() {
-        let sql = "CREATE MATERIALIZED VIEW mv AS \
-                   SELECT t.s FROM trades t TEMPORAL PROBE JOIN prices r \
-                   ON (s) TIMESTAMPS (ts, ts) LIST (0s, 5s) AS p";
-        let StreamingStatement::CreateMaterializedView { query_sql, .. } = parse_one(sql) else {
-            panic!("expected CreateMaterializedView");
-        };
-        assert!(
-            query_sql.to_uppercase().contains("TEMPORAL PROBE JOIN"),
-            "got: {query_sql}"
+            error.to_string().contains("bounded INNER JOIN"),
+            "got: {error}"
         );
     }
 

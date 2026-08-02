@@ -120,6 +120,30 @@ pub enum DbError {
     /// its last durable cut.
     StatefulOperatorPartialApply(String),
 
+    /// Managed working state crossed the configured pipeline-wide charged-byte envelope. The
+    /// current graph generation must halt: replaying the same input against the same limit would
+    /// loop, and a record-path detection may follow state mutation but always precedes output.
+    ManagedStateBudgetExceeded {
+        /// Boundary at which the excess was detected.
+        context: String,
+        /// Combined live, prepared, and retired charged bytes.
+        accounted_bytes: usize,
+        /// Configured pipeline-wide maximum.
+        limit_bytes: usize,
+    },
+
+    /// Retractable MIN/MAX checkpoint work crossed its configured pre-encoding charge. The same
+    /// retained state and limit would fail every capture retry, including after restore, so the
+    /// pipeline must halt rather than enter a recovery loop.
+    RetractableExtremumCheckpointBudgetExceeded {
+        /// Aggregate/capture boundary at which the excess was detected.
+        context: String,
+        /// Combined pre-encoding work charge for the selected extrema.
+        charged_bytes: usize,
+        /// Configured maximum charge.
+        limit_bytes: usize,
+    },
+
     /// Query pipeline error — wraps a `DataFusion` error with stream context.
     /// Unlike `Pipeline`, this variant is translated to user-friendly messages.
     QueryPipeline {
@@ -223,6 +247,10 @@ impl DbError {
             | Self::ShuffleTerminal(_)
             | Self::ShufflePartialSend(_)
             | Self::StatefulOperatorPartialApply(_) => error_codes::PIPELINE_ERROR,
+            Self::ManagedStateBudgetExceeded { .. } => error_codes::MANAGED_STATE_BUDGET_EXCEEDED,
+            Self::RetractableExtremumCheckpointBudgetExceeded { .. } => {
+                error_codes::RETRACTABLE_EXTREMUM_CHECKPOINT_BUDGET_EXCEEDED
+            }
             Self::QueryPipeline { .. } => error_codes::QUERY_PIPELINE_ERROR,
             Self::MaterializedView(_) => error_codes::MATERIALIZED_VIEW_ERROR,
             Self::Storage(_) => error_codes::WAL_ERROR,
@@ -239,7 +267,13 @@ impl DbError {
     /// `true` when retry or recovery cannot repair the current input and the pipeline must stop.
     #[must_use]
     pub fn requires_pipeline_halt(&self) -> bool {
-        matches!(self, Self::BackpressureFail(_) | Self::ShuffleTerminal(_))
+        matches!(
+            self,
+            Self::BackpressureFail(_)
+                | Self::ShuffleTerminal(_)
+                | Self::ManagedStateBudgetExceeded { .. }
+                | Self::RetractableExtremumCheckpointBudgetExceeded { .. }
+        )
     }
 
     /// `true` when failure-domain isolation cannot safely keep the current pipeline alive.
@@ -379,6 +413,24 @@ impl std::fmt::Display for DbError {
                     self.code()
                 )
             }
+            Self::ManagedStateBudgetExceeded {
+                context,
+                accounted_bytes,
+                limit_bytes,
+            } => write!(
+                f,
+                "[{}] Managed state budget exceeded during {context}: accounted={accounted_bytes} bytes, limit={limit_bytes} bytes",
+                self.code()
+            ),
+            Self::RetractableExtremumCheckpointBudgetExceeded {
+                context,
+                charged_bytes,
+                limit_bytes,
+            } => write!(
+                f,
+                "[{}] Retractable MIN/MAX checkpoint budget exceeded during {context}: charged={charged_bytes} bytes, limit={limit_bytes} bytes",
+                self.code()
+            ),
             Self::QueryPipeline {
                 context,
                 translated,

@@ -141,23 +141,25 @@ LaminarDB supports multi-node cluster deployments. In this mode, streaming pipel
 * **Membership & Discovery**: Nodes discover one another using either a gossip-based protocol (Chitchat peer-to-peer membership over a configured `gossip_port`) or a static seeds list.
 * **Coordination**: Membership selects a leader candidate, while a renewable shared-store lease fences leader-only control paths. Vnode assignments are CAS-published through `AssignmentSnapshotStore`; there is no embedded Raft service.
 * **Dynamic Rebalancing**: Stable key groups (256 by default) are dynamically distributed across active cluster nodes. When a new node joins or an existing node departs (or fails), the leader automatically rebalances the assignments. When shutting down gracefully, a node announces a `Draining` state, letting the leader reallocate its key groups before the node terminates.
-* **Distributed Checkpoints**: Checkpoint barriers flow through the distributed operator graph and state is sealed in shared storage. Cluster delivery is currently admitted only as `at_least_once`.
+* **Distributed Checkpoints**: Checkpoint barriers flow through the distributed operator graph and state is sealed in shared storage. Delivery is admitted from the complete source/state/sink contract.
 * **State Store**: Requires a cluster-shared `object_store` backend (S3, GCS, or Azure Blob) so another node can read and recover state partitions. Local paths and `file://` URLs are node-durable, not cluster-shared.
 
 > [!IMPORTANT]
-> Cluster exactly-once currently fails closed with `[LDB-0013]`. Checkpoint decisions are term-fenced, but no supported connector path yet has both certified term-fenced source handoff and an external sink cursor commit. Use cluster `at_least_once`; the only admitted local exact candidate is the certified deterministic generator with append-mode Delta, and it is not yet production-certified end to end.
+> Cluster exactly-once is admitted only for exact-certified sources and a cluster-certified,
+> checkpoint-committable sink. The current admitted path is Kafka input to direct S3/S3A
+> append-mode Delta Lake. Kafka output remains at-least-once. Other exact combinations fail closed with `[LDB-5035]`
+> before connector I/O. The four-mode production soak matrix is still pending.
 > Embedded/single-node exactly-once requires node-durable state and the built-in local checkpoint/decision store, held under an OS-released exclusive deployment lock. For the standalone server, a `file://` checkpoint URL selects that store. Shared object-store URLs and library-injected object or decision stores fail closed with `[LDB-0014]` because their writer-fencing provenance cannot yet be proved.
-> Cluster SQL is deliberately narrower than embedded SQL. `CREATE STREAM` admits stateless
-> projection/filter pipelines and one direct ungrouped aggregate stage using supported
-> non-`DISTINCT` built-ins. Every `GROUP BY`, windowed aggregate, and implemented local stateful-join
-> shape that reaches cluster admission fails closed with `[LDB-4007]`. Physical-route rejection is
-> family-specific: bounded interval joins other than `INNER` fail earlier with `InvalidQuery`, while
-> temporal/lookup translation can coerce unsupported join types which then reach `[LDB-4007]`.
+> Cluster SQL admits stateless pipelines, supported non-windowed keyed aggregates, and one bounded
+> join stage over direct append-only, watermarked sources. The join supports `INNER`, `LEFT`,
+> `RIGHT`, `FULL`, `LEFT/RIGHT SEMI`, and `LEFT/RIGHT ANTI` with ordered `VARCHAR`/`BIGINT`
+> equality keys and a positive finite event-time bound. Every join projection needs an explicit
+> alias. Output from any of the eight kinds can feed a separate named keyed aggregate stream;
+> fused `JOIN ... GROUP BY` and cluster windowed aggregation remain fail-closed.
 > Cluster materialized views also fail closed regardless of query shape because their
 > retained output lacks a planner-certified distribution and assignment-fenced checkpoint/read
-> lifecycle. Embedded and single-node operators are unaffected. See the
-> [validation report](docs/reports/cluster-keyed-state-validation-2026-07-22.md) for the canonical
-> named-route matrix and its explicit DDL-coverage limits.
+> lifecycle. See the [current distributed-state status](docs/DISTRIBUTED_STATE.md) for the exact
+> boundary and validation gate.
 
 ### Cluster Configuration Example
 
@@ -235,63 +237,36 @@ EMIT ON WINDOW CLOSE;
 
 ### Join Types
 
-Stateful streaming joins currently run only in embedded/single-node mode for the implemented
-physical shapes. They comprise dual-live bounded interval `INNER`, incremental/changelog
-`INNER`/`LEFT`, ASOF and temporal-probe paths, plus one-live-input temporal, snapshot, on-demand,
-and static-dimension lookup paths. The partial/on-demand path currently owns fetched/cache rows and
-pending requests; a checkpoint-bound version or durable-response design is future work, not a
-current capability.
-
-Cluster rejects every such candidate that reaches its admission gate with `[LDB-4007]`. Bounded
-interval non-`INNER` forms currently fail during physical planning; temporal/lookup translation can
-coerce unsupported join types and those candidates may instead reach `[LDB-4007]`. DDL coverage is
-partial, so this paragraph is not an exhaustive syntax-to-error matrix. The
-[validation report](docs/reports/cluster-keyed-state-validation-2026-07-22.md) is the canonical
-current/future join inventory and admission evidence.
-
-The target includes finite bounded outer and existence joins, with unmatched output authorized by
-the opposite frontier and stable output identity before cleanup. `RIGHT` may lower through a valid
-side swap; `FULL`, semi, and anti need explicit matched/unmatched and retraction semantics. Arbitrary
-dual-unbounded joins and correlated `APPLY` remain fail-closed. Known local blockers also include
-forward/nearest ASOF finality, loss at the temporal-probe pending cap, extra interval/temporal equi
-keys, unchecked incremental multiplicity, join-type coercion, and reference recovery identity.
+LaminarDB uses one bounded event-time join machinery in local and cluster execution, under both
+at-least-once and exactly-once delivery. It supports `INNER`, `LEFT`, `RIGHT`, `FULL`, `LEFT SEMI`,
+`RIGHT SEMI`, `LEFT ANTI`, and `RIGHT ANTI` joins over direct append-only sources. Each source needs
+a watermark on a `TIMESTAMP NOT NULL` column. Equality keys may be ordered composites of
+`VARCHAR`/`BIGINT` columns, with the type matching at each position, and the directional time bound
+must be positive and finite. Every projected expression needs an explicit alias.
 
 ```sql
--- ASOF join: latest trade price for each order
-SELECT o.*, t.price AS last_trade_price
-FROM orders o
-ASOF JOIN trades t ON o.symbol = t.symbol AND o.ts >= t.ts;
-
--- Interval join: match orders to fills within a 10-second window
-SELECT o.order_id, f.fill_price
+CREATE STREAM order_fills AS
+SELECT o.account_id AS account_id,
+       o.amount AS amount,
+       f.fill_price AS fill_price
 FROM orders o
 INNER JOIN fills f
-ON o.order_id = f.order_id
+ON o.tenant_id = f.tenant_id
+AND o.order_id = f.order_id
 AND f.ts BETWEEN o.ts AND o.ts + INTERVAL '10' SECOND;
 
--- Temporal probe join: sample a reference price at fixed horizons after each trade
-SELECT t.symbol, p.offset_ms, mid AS ref_price
-FROM trades t
-TEMPORAL PROBE JOIN prices r
-    ON (symbol) TIMESTAMPS (ts, ts)
-    RANGE FROM 0s TO 30s STEP 5s AS p;
-
--- Lookup join against external Postgres table
-CREATE LOOKUP TABLE instruments (
-    symbol VARCHAR NOT NULL,
-    sector VARCHAR,
-    exchange VARCHAR,
-    PRIMARY KEY (symbol)
-) WITH (
-    'connector' = 'postgres',
-    'connection' = 'host=db.example.com port=5432 dbname=market',
-    'table' = 'instruments'
-);
-
-SELECT t.symbol, t.price, i.sector, i.exchange
-FROM trades t
-JOIN instruments i ON t.symbol = i.symbol;
+-- Any supported join kind can feed this separate named aggregate stage.
+CREATE STREAM filled_amounts AS
+SELECT account_id, SUM(amount) AS total_amount, COUNT(*) AS match_count
+FROM order_fills
+GROUP BY account_id;
 ```
+
+Within this bounded stream-stream path, fused `JOIN ... GROUP BY`, intermediate-input, cross,
+as-of, unbounded, general non-equality, and multi-way joins fail closed. Temporal and lookup joins
+are separate local enrichment paths and are rejected in cluster mode. A join cycle is capped at
+262,144 output rows and 64 MiB; exceeding either limit is a terminal hot-key fanout error, with no
+continuation or spill path.
 
 ### EMIT Strategies
 
@@ -320,10 +295,10 @@ Watermark types: per-partition, per-key, and alignment groups (synchronized acro
 ### DDL
 
 ```sql
-CREATE SOURCE ... [FROM connector(...)]
+CREATE SOURCE ... [FROM connector (...)] [FORMAT format [WITH (...)]]
 CREATE STREAM ... AS SELECT ...                    [WITH ('retain_history' = '64mb')]
 CREATE MATERIALIZED VIEW ... AS SELECT ...
-CREATE SINK ... INTO connector(...) AS SELECT ...
+CREATE SINK ... FROM input [INTO connector (...)] [FORMAT format [WITH (...)]]
 CREATE LOOKUP TABLE ... (...) WITH ('connector' = '<lookup-connector>', ...)
 DROP SOURCE | STREAM | SINK | MATERIALIZED VIEW
 SHOW SOURCES | STREAMS | SINKS | MATERIALIZED VIEWS
@@ -336,7 +311,9 @@ DECLARE c CURSOR FOR SUBSCRIBE … ; FETCH n FROM c -- cursored consumption
 
 `retain_history` keeps a bounded suffix of committed epochs in memory. Resume only from a progress marker the client durably recorded: WebSocket emits `type=progress` frames, while pgwire emits `__laminar_kind=progress` rows with epoch and checkpoint ID. `SUBSCRIBE … AS OF EPOCH n` then starts strictly after that committed cut or fails visibly if it is unavailable.
 
-All aggregation functions from DataFusion 52 are available: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `FIRST_VALUE`, `LAST_VALUE`, `STDDEV`, `PERCENTILE_CONT`, `APPROX_COUNT_DISTINCT`, `LAG`, `LEAD`, `ROW_NUMBER`, and 40+ more. JSON extraction, array/struct/map functions, and `UNNEST` are also supported.
+The managed non-windowed aggregate path used after a bounded join supports non-`DISTINCT` `COUNT`,
+`SUM`, `AVG`, `MIN`, and `MAX` in local and cluster mode. Local SQL has additional DataFusion and
+window-function paths, but they are not part of the distributed join-and-aggregate contract.
 
 ---
 
@@ -372,7 +349,7 @@ Feature-gated connectors for external systems. Each advertises a typed recovery,
 
 | Connector | Feature Flag | Notes | Status |
 |-----------|-------------|-------|--------|
-| Kafka | `kafka` | Replayable at-least-once; exact delivery rejected pending certification | ✅ |
+| Kafka | `kafka` | Replayable, splittable, and exact-delivery certified | ✅ |
 | PostgreSQL CDC | `postgres-cdc` | Resume-only pgoutput replication; fresh startup is rejected | ✅ |
 | MongoDB CDC | `mongodb-cdc` | UUID-bound fixed-collection resume; replayable at-least-once only | ✅ |
 | OpenTelemetry OTLP | `otel` | OTLP/gRPC receiver for traces, metrics, and logs | ✅ |
@@ -390,8 +367,8 @@ Feature-gated connectors for external systems. Each advertises a typed recovery,
 | Kafka | `kafka` | Durable at-least-once, configurable partitioning | ✅ |
 | PostgreSQL | `postgres-sink` | COPY BINARY and upsert, durable at-least-once | ✅ |
 | MongoDB | `mongodb-cdc` | Majority-journaled ordered writes, upsert/CDC replay, durable at-least-once | ✅ |
-| Delta Lake | `delta-lake` | Coordinated append candidate; not production-certified end to end | ✅ |
-| Iceberg | `iceberg` | REST catalog append, durable at-least-once; never checkpoint-committable | ✅ |
+| Delta Lake | `delta-lake` | Coordinated append supports local exact delivery; cluster exact admission is limited to direct S3/S3A. Azure/GCS targets remain cluster at-least-once pending native fault soaks | ✅ |
+| Iceberg | `iceberg` | REST catalog append, durable at-least-once; exactly-once is rejected because no checkpoint-bound catalog cursor is implemented | ✅ |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | ✅ |
 | WebSocket Client | `websocket` | Push to external WebSocket server | ✅ |
 | Files | `files` | Parquet/CSV with timestamp/partition templates | ✅ |
@@ -408,14 +385,15 @@ CREATE SOURCE trades (
     'bootstrap.servers' = '${KAFKA_BROKERS}',
     topic = 'market-trades',
     'group.id' = 'laminar-analytics',
-    format = 'json',
     'auto.offset.reset' = 'earliest'
-);
+) FORMAT JSON;
 
-CREATE SINK trade_archive INTO "delta-lake" (
+CREATE SINK trade_archive
+FROM trade_summary
+INTO "delta-lake" (
     "table.path" = 's3://my-bucket/trade_summary',
     "write.mode" = 'append'
-) AS SELECT * FROM trade_summary;
+);
 ```
 
 Delivery is one pipeline-wide runtime setting (`[server].delivery` for the standalone server or
@@ -645,7 +623,9 @@ graph TD
 ```
 
 ### 5. Internal Threading Model (Within a Single Node)
-Within any running engine node, CPU-bound streaming computation is strictly isolated from I/O tasks. A dedicated execution thread is assigned to stream execution, guaranteeing predictable scheduling and sub-microsecond latencies.
+Within each engine node, a dedicated execution thread isolates CPU-bound stream processing from
+connector I/O. This reduces scheduling interference; production latency remains workload-dependent
+and subject to the soak gate.
 
 ```mermaid
 graph TB
@@ -715,7 +695,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 ### Checkpointing and Recovery
 
 1. **Coordinated snapshots.** Chandy-Lamport barriers injected at sources; operators with multiple inputs align before snapshotting.
-2. **External commit.** In embedded/single-node exactly-once mode, checkpoint-committable sinks stage output and publish it only after the durable checkpoint decision.
+2. **External commit.** In admitted exactly-once pipelines, checkpoint-committable sinks stage output and publish it only after the durable checkpoint decision.
 3. **Durable decision.** Prepared and finalized manifests bind the deployment, pipeline, exact attempt, state seals, connector positions, and participants. Filesystem/object-store writes use create/CAS boundaries appropriate to the backend.
 4. **Recovery.** `RecoveryManager` accepts the latest finalized identity-matching manifest, restores state and source positions, and reconciles coordinated sinks from their exact external cursor.
 
@@ -731,7 +711,11 @@ let db = LaminarDB::builder()
     .await?;
 ```
 
-Recovery resumes from the latest finalized checkpoint. Replayable sources may resend records after that cut under at-least-once delivery; a certified single-node exactly-once pipeline suppresses duplicate external visibility through coordinated sink commits. Non-replayable sources are admitted only under `best_effort`, where failure can lose accepted events. Shorter checkpoint intervals reduce replay work but increase storage and coordination I/O.
+Recovery resumes from the latest finalized checkpoint. Replayable sources may resend records after
+that cut under at-least-once delivery; an admitted exactly-once pipeline suppresses duplicate
+external visibility through coordinated sink commits. Non-replayable sources are admitted only
+under `best_effort`, where failure can lose accepted events. Shorter checkpoint intervals reduce
+replay work but increase storage and coordination I/O.
 
 ### Compiled Query Execution
 

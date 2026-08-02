@@ -34,7 +34,7 @@ use crate::aggregate_state::{
 };
 #[cfg(feature = "cluster")]
 use crate::aggregate_state::{
-    AggVnodeRestore, PreparedAggVnodeTransition, RetiredAggVnodeTransition,
+    OwnedAggVnodeRestore, PreparedAggVnodeTransition, RetiredAggVnodeTransition,
 };
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
@@ -264,6 +264,7 @@ pub(crate) struct SqlQueryOperator {
     task_ctx: Arc<TaskContext>,
     state: QueryState,
     prom: Option<Arc<EngineMetrics>>,
+    max_retractable_extremum_checkpoint_bytes: usize,
     pending_restore: Option<AggStateCheckpoint>,
     // Validated vnode bases retained in their original serialized form while the SQL aggregate is
     // still uninitialized. Lazy initialization merges the entire set once, avoiding a whole-state
@@ -281,14 +282,9 @@ pub(crate) struct SqlQueryOperator {
     // since, whose delta chains must re-base FULL (`IncrementalAggState::reset_acquired_vnodes`).
     #[cfg(feature = "cluster")]
     prev_owned: rustc_hash::FxHashSet<u32>,
-    // `Some(chain_bound)` enables incremental delta checkpoints with that re-base bound. When set, the
-    // delta chain is the PRIMARY agg checkpoint; whole-node capture is skipped, partials recover.
+    // `Some(chain_bound)` enables incremental delta checkpoints with that re-base bound.
     #[cfg(feature = "cluster")]
     delta_chain_bound: Option<u32>,
-    // Per-vnode partials are the authoritative agg checkpoint; the whole-node manifest copy is
-    // skipped (one node's slices — recovery from another writer's manifest loses groups).
-    #[cfg(feature = "cluster")]
-    vnode_partials_authoritative: bool,
     // Deltas seen during restart (state Uninit), replayed after `lazy_init` restores the base.
     #[cfg(all(feature = "cluster", test))]
     pending_restore_deltas: Vec<crate::aggregate_state::AggVnodeDelta>,
@@ -336,6 +332,8 @@ impl SqlQueryOperator {
             task_ctx,
             state: QueryState::Uninit,
             prom,
+            max_retractable_extremum_checkpoint_bytes:
+                crate::config::DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES,
             pending_restore: None,
             #[cfg(all(feature = "cluster", test))]
             pending_restore_slices: Vec::new(),
@@ -350,8 +348,6 @@ impl SqlQueryOperator {
             prev_owned: rustc_hash::FxHashSet::default(),
             #[cfg(feature = "cluster")]
             delta_chain_bound: None,
-            #[cfg(feature = "cluster")]
-            vnode_partials_authoritative: false,
             #[cfg(all(feature = "cluster", test))]
             pending_restore_deltas: Vec::new(),
             #[cfg(all(feature = "cluster", test))]
@@ -374,18 +370,11 @@ impl SqlQueryOperator {
         }
     }
 
-    /// Mark per-vnode partials as the authoritative agg checkpoint (cluster + durable backend);
-    /// whole-node capture into the manifest is skipped.
-    #[cfg(feature = "cluster")]
-    pub fn set_vnode_partials_authoritative(&mut self) {
-        self.vnode_partials_authoritative = true;
-    }
-
-    /// Whether the whole-node aggregate capture should be skipped — true when delta checkpoints
-    /// or authoritative per-vnode partials make the chain the primary agg checkpoint.
+    /// Cluster aggregate groups recover only from their assignment-scoped vnode partials. The
+    /// portable graph checkpoint may still carry aligned shuffle replay.
     #[cfg(feature = "cluster")]
     fn skip_whole_node_agg(&self) -> bool {
-        self.delta_chain_bound.is_some() || self.vnode_partials_authoritative
+        self.cluster_shuffle.is_some()
     }
 
     #[cfg(feature = "cluster")]
@@ -470,6 +459,17 @@ impl SqlQueryOperator {
         .await
         {
             Ok(Some(mut agg_state)) => {
+                if self.emit_changelog
+                    && (agg_state.having_filter().is_some() || agg_state.having_sql().is_some())
+                {
+                    return Err(DbError::Pipeline(format!(
+                        "aggregate '{}' cannot use HAVING with changelog output until transition-aware HAVING retractions are implemented",
+                        self.op_name
+                    )));
+                }
+                agg_state.set_max_retractable_extremum_checkpoint_bytes(
+                    self.max_retractable_extremum_checkpoint_bytes,
+                );
                 #[cfg(feature = "cluster")]
                 if self.cluster_shuffle.is_some() {
                     let expected_state_class = if agg_state.num_group_cols() == 0 {
@@ -879,16 +879,12 @@ impl SqlQueryOperator {
 
         let mut batches = agg_state.emit()?;
 
-        // HAVING is skipped in changelog mode: a retraction that fails HAVING would be silently
-        // dropped, leaving stale state downstream.
-        if !self.emit_changelog {
-            let having_filter = agg_state.having_filter().cloned();
-            let having_sql = agg_state.having_sql().map(String::from);
-            if let Some(ref filter) = having_filter {
-                batches = apply_compiled_having(&batches, filter)?;
-            } else if let Some(ref having_sql) = having_sql {
-                batches = self.apply_having_sql(&batches, having_sql).await?;
-            }
+        let having_filter = agg_state.having_filter().cloned();
+        let having_sql = agg_state.having_sql().map(String::from);
+        if let Some(ref filter) = having_filter {
+            batches = apply_compiled_having(&batches, filter)?;
+        } else if let Some(ref having_sql) = having_sql {
+            batches = self.apply_having_sql(&batches, having_sql).await?;
         }
 
         #[cfg(feature = "cluster")]
@@ -1181,6 +1177,17 @@ impl GraphOperator for SqlQueryOperator {
             prepared: prepared_bytes,
             retired: retired_bytes,
         })
+    }
+
+    fn set_retractable_extremum_checkpoint_budget(&mut self, bytes: usize) {
+        assert!(
+            bytes > 0,
+            "retractable-extremum checkpoint budget must be nonzero"
+        );
+        self.max_retractable_extremum_checkpoint_bytes = bytes;
+        if let QueryState::Agg(aggregate) = &mut self.state {
+            aggregate.set_max_retractable_extremum_checkpoint_bytes(bytes);
+        }
     }
 
     async fn initialize_managed_state(&mut self) -> Result<(), DbError> {
@@ -1617,47 +1624,65 @@ impl GraphOperator for SqlQueryOperator {
             )));
         }
 
-        let mut decoded = Vec::new();
-        decoded
+        // Validate the complete borrowed roster before allocating any owned inner checkpoint.
+        let archive_profile = aggregate.vnode_archive_restore_profile();
+        let mut preflighted = Vec::new();
+        preflighted
             .try_reserve_exact(transition.restores.len())
             .map_err(|_| {
                 DbError::Checkpoint(format!(
-                    "aggregate '{}' could not reserve decoded vnode transition metadata",
+                    "aggregate '{}' could not reserve inner archive preflight metadata",
+                    self.op_name
+                ))
+            })?;
+        let mut restored_lower_bounds = Vec::new();
+        restored_lower_bounds
+            .try_reserve_exact(transition.restores.len())
+            .map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "aggregate '{}' could not reserve cardinality preflight metadata",
                     self.op_name
                 ))
             })?;
         for restore in transition.restores {
-            let base = rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(restore.base)
-                .map_err(|error| {
-                    DbError::Pipeline(format!(
-                        "per-vnode base deserialization for '{}' vnode {}: {error}",
-                        self.op_name, restore.vnode
+            let base = archive_profile.preflight(
+                restore.base,
+                format_args!(
+                    "per-vnode base for '{}' vnode {}",
+                    self.op_name, restore.vnode
+                ),
+            )?;
+            let mut vnode_lower_bound = base.group_count();
+
+            let mut deltas = Vec::new();
+            deltas
+                .try_reserve_exact(restore.deltas.len())
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "aggregate '{}' could not reserve delta archive preflight metadata",
+                        self.op_name
                     ))
                 })?;
-            let deltas = restore
-                .deltas
-                .iter()
-                .map(|changed| {
-                    rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(changed)
-                        .map(|changed| crate::aggregate_state::AggVnodeDelta { changed })
-                        .map_err(|error| {
-                            DbError::Pipeline(format!(
-                                "per-vnode delta deserialization for '{}' vnode {}: {error}",
-                                self.op_name, restore.vnode
-                            ))
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            decoded.push((restore.vnode, base, deltas));
+            for (link, changed) in restore.deltas.iter().enumerate() {
+                let delta = archive_profile.preflight(
+                    changed.as_slice(),
+                    format_args!(
+                        "per-vnode delta {link} for '{}' vnode {}",
+                        self.op_name, restore.vnode
+                    ),
+                )?;
+                vnode_lower_bound = vnode_lower_bound.max(delta.group_count());
+                deltas.push(delta);
+            }
+            restored_lower_bounds.push((restore.vnode, vnode_lower_bound));
+            preflighted.push((restore.vnode, base, deltas));
         }
-        let restore_refs: Vec<AggVnodeRestore<'_>> = decoded
-            .iter()
-            .map(|(vnode, base, deltas)| AggVnodeRestore {
-                vnode: *vnode,
-                base,
-                deltas,
-            })
-            .collect();
+        aggregate.preflight_vnode_transition_cardinality(
+            transition.target.vnode_count,
+            &restored_lower_bounds,
+            transition.revoked,
+        )?;
+        drop(restored_lower_bounds);
 
         let mut next_prev_owned = rustc_hash::FxHashSet::default();
         next_prev_owned
@@ -1673,15 +1698,37 @@ impl GraphOperator for SqlQueryOperator {
             next_prev_owned.remove(vnode);
         }
 
-        let QueryState::Agg(ref aggregate) = self.state else {
-            return Err(DbError::Checkpoint(format!(
-                "managed vnode transition for '{}' targeted a non-aggregate query",
+        // Deserialization stays lazy: aggregate preparation consumes and stages one vnode before
+        // asking this iterator for the next. The complete borrowed pass above has already
+        // validated every archive and the transition-wide cardinality lower bound.
+        let owned_restores = preflighted.into_iter().map(|(vnode, base, deltas)| {
+            let mut owned_deltas = Vec::new();
+            owned_deltas.try_reserve_exact(deltas.len()).map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "aggregate '{}' could not reserve owned delta metadata for vnode {vnode}",
+                    self.op_name
+                ))
+            })?;
+            let base = base.deserialize(format_args!(
+                "per-vnode base for '{}' vnode {vnode}",
                 self.op_name
-            )));
-        };
-        let aggregate = aggregate.prepare_vnode_transition(
+            ))?;
+            for (link, changed) in deltas.into_iter().enumerate() {
+                let changed = changed.deserialize(format_args!(
+                    "per-vnode delta {link} for '{}' vnode {vnode}",
+                    self.op_name
+                ))?;
+                owned_deltas.push(crate::aggregate_state::AggVnodeDelta { changed });
+            }
+            Ok(OwnedAggVnodeRestore {
+                vnode,
+                base,
+                deltas: owned_deltas,
+            })
+        });
+        let aggregate = aggregate.prepare_owned_vnode_transition(
             transition.target.vnode_count,
-            &restore_refs,
+            owned_restores,
             transition.revoked,
         )?;
         self.prepared_vnode_transition = Some(PreparedSqlVnodeTransition {
@@ -1876,10 +1923,7 @@ mod checkpoint_tests {
 
         let keyed = classify("SELECT key, SUM(value) AS total FROM events GROUP BY key");
         assert_eq!(keyed.state_class, OperatorStateClass::VnodeKeyed);
-        assert!(matches!(
-            keyed.cluster_status,
-            ClusterExecutionStatus::Rejected { .. }
-        ));
+        assert_eq!(keyed.cluster_status, ClusterExecutionStatus::DdlGuarded);
         assert_eq!(
             keyed.managed_state,
             Some(ManagedStateContract::SqlAggregateV1)
@@ -1971,6 +2015,28 @@ mod checkpoint_tests {
         assert_eq!(populated_accounting.prepared, 0);
         assert_eq!(populated_accounting.retired, 0);
         assert!(operator.checkpoint().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn changelog_aggregate_having_is_rejected_at_state_startup() {
+        let (context, _) = context_and_batch();
+        let mut operator = SqlQueryOperator::new(
+            "qualified-sums",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key HAVING SUM(value) > 0",
+            context,
+            None,
+            true,
+        );
+
+        let error = operator
+            .initialize_managed_state()
+            .await
+            .expect_err("changelog HAVING must fail before state becomes executable");
+        assert!(
+            error.to_string().contains("transition-aware HAVING"),
+            "{error}"
+        );
+        assert!(matches!(operator.state, QueryState::Uninit));
     }
 
     pub(super) fn context_and_batch() -> (SessionContext, RecordBatch) {
@@ -2254,6 +2320,36 @@ mod delta_primary_tests {
     }
 
     #[tokio::test]
+    async fn grouped_managed_aggregate_is_cluster_startup_admissible() {
+        use crate::operator::capability::{
+            ClusterExecutionStatus, ManagedStateContract, OperatorStateClass,
+        };
+
+        let (context, _) = super::checkpoint_tests::context_and_batch();
+        let mut operator = SqlQueryOperator::new(
+            "totals",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            false,
+        );
+        assert_eq!(
+            operator.cluster_capability(),
+            OperatorCapability {
+                implementation: OperatorImplementation::SqlQuery,
+                state_class: OperatorStateClass::VnodeKeyed,
+                cluster_status: ClusterExecutionStatus::DdlGuarded,
+                managed_state: Some(ManagedStateContract::SqlAggregateV1),
+            }
+        );
+
+        let (shuffle, _) = single_owner_shuffle().await;
+        operator.attach_cluster_shuffle(shuffle);
+        operator.initialize_managed_state().await.unwrap();
+        assert!(matches!(operator.state, QueryState::Agg(_)));
+    }
+
+    #[tokio::test]
     async fn pre_agg_shuffle_preserves_local_hints_and_marks_configless_batches_mixed() {
         let (_, batch) = super::checkpoint_tests::context_and_batch();
         let (configless, admitted) =
@@ -2402,8 +2498,7 @@ mod delta_primary_tests {
 
         let error = operator
             .checkpoint_by_vnode(&[0], 16)
-            .err()
-            .expect("capture must reject a count outside its immutable topology");
+            .expect_err("capture must reject a count outside its immutable topology");
         assert!(error.to_string().contains("state=8, requested=16"));
         assert!(operator.prev_owned.is_empty());
 
@@ -2501,11 +2596,10 @@ mod delta_primary_tests {
             }],
         )
         .unwrap();
-        let no_deltas: [&[u8]; 0] = [];
         let restores = [crate::operator_graph::ManagedVnodeRestore {
             vnode: 0,
             base: &donor_slice,
-            deltas: &no_deltas,
+            deltas: &[],
         }];
         let revoked = rustc_hash::FxHashSet::default();
 
@@ -2531,6 +2625,157 @@ mod delta_primary_tests {
         subject.publish_vnode_transition();
         subject.finish_vnode_transition();
         assert_eq!(current_state_bytes(&mut subject), donor_slice.as_ref());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn complete_inner_roster_preflight_precedes_owned_and_arrow_decode() {
+        let (context, _) = super::checkpoint_tests::context_and_batch();
+        let sql = "SELECT key, SUM(value) AS total FROM events GROUP BY key";
+        let (shuffle, version) = single_owner_shuffle().await;
+        let mut operator = SqlQueryOperator::new("totals", sql, context, None, false);
+        operator.attach_cluster_shuffle(shuffle);
+        operator.initialize_managed_state().await.unwrap();
+
+        let (empty_archive, invalid_ipc_archive, late_invalid_archive) = {
+            let QueryState::Agg(ref mut aggregate) = operator.state else {
+                panic!("expected initialized aggregate state");
+            };
+            aggregate.set_max_groups_for_test(1);
+            let mut checkpoint = aggregate.empty_checkpoint();
+            let empty = serialize_agg_cp(&checkpoint, &operator.op_name).unwrap();
+            checkpoint.keys_ipc = vec![0xff];
+            checkpoint.acc_state_ipc = vec![vec![0xff]];
+            checkpoint.last_updated_ms = vec![i64::MIN];
+            let invalid_ipc = serialize_agg_cp(&checkpoint, &operator.op_name).unwrap();
+            checkpoint.fingerprint = checkpoint.fingerprint.wrapping_add(1);
+            let late_invalid = serialize_agg_cp(&checkpoint, &operator.op_name).unwrap();
+            (empty, invalid_ipc, late_invalid)
+        };
+        let target = laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
+            version,
+            &[1; 8],
+            vec![laminar_core::checkpoint::CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: uuid::Uuid::from_u128(1),
+            }],
+        )
+        .unwrap();
+        let over_limit_restores = [
+            crate::operator_graph::ManagedVnodeRestore {
+                vnode: 0,
+                base: &invalid_ipc_archive,
+                deltas: &[],
+            },
+            crate::operator_graph::ManagedVnodeRestore {
+                vnode: 1,
+                base: &invalid_ipc_archive,
+                deltas: &[],
+            },
+        ];
+        let revoked = rustc_hash::FxHashSet::default();
+
+        let late_invalid_restores = [
+            crate::operator_graph::ManagedVnodeRestore {
+                vnode: 0,
+                base: &invalid_ipc_archive,
+                deltas: &[],
+            },
+            crate::operator_graph::ManagedVnodeRestore {
+                vnode: 1,
+                base: &late_invalid_archive,
+                deltas: &[],
+            },
+        ];
+        let late_invalid_delta = [crate::vnode_restore_input::VnodeRestoreArchive::Borrowed(
+            late_invalid_archive.as_slice(),
+        )];
+        let late_invalid_delta_restore = [crate::operator_graph::ManagedVnodeRestore {
+            vnode: 0,
+            base: &invalid_ipc_archive,
+            deltas: &late_invalid_delta,
+        }];
+        for restores in [
+            late_invalid_restores.as_slice(),
+            late_invalid_delta_restore.as_slice(),
+        ] {
+            crate::aggregate_state::reset_owned_restore_decode_count_for_test();
+            let error = operator
+                .prepare_vnode_transition(ManagedVnodeTransition {
+                    target: &target,
+                    revoked: &revoked,
+                    restores,
+                })
+                .expect_err("the late fingerprint mismatch must fail the borrowed pass");
+            assert!(
+                error.to_string().contains("fingerprint mismatch"),
+                "{error}"
+            );
+            assert_eq!(
+                crate::aggregate_state::owned_restore_decode_count_for_test(),
+                0,
+                "a late archive error must prevent every owned inner decode"
+            );
+        }
+
+        crate::aggregate_state::reset_owned_restore_decode_count_for_test();
+        let error = operator
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                target: &target,
+                revoked: &revoked,
+                restores: &over_limit_restores,
+            })
+            .expect_err("two one-row vnode bases must exceed the one-group lower bound");
+        assert!(
+            error.to_string().contains("replacement_lower_bound=2"),
+            "{error}"
+        );
+        assert_eq!(
+            crate::aggregate_state::owned_restore_decode_count_for_test(),
+            0,
+            "complete cardinality preflight must run before the first owned inner decode"
+        );
+        assert!(operator.prepared_vnode_transition.is_none());
+        assert!(operator.vnode_transition_cleanup.is_none());
+        let QueryState::Agg(ref aggregate) = operator.state else {
+            panic!("expected aggregate state after rejected preflight");
+        };
+        assert_eq!(aggregate.logical_group_count_for_test(), 0);
+
+        // Active negative control: both vnodes pass the complete borrowed/cardinality pass. Arrow
+        // rejects the first vnode, so lazy preparation must not deserialize the later EMPTY vnode.
+        let arrow_failure_restores = [
+            crate::operator_graph::ManagedVnodeRestore {
+                vnode: 0,
+                base: &invalid_ipc_archive,
+                deltas: &[],
+            },
+            crate::operator_graph::ManagedVnodeRestore {
+                vnode: 1,
+                base: &empty_archive,
+                deltas: &[],
+            },
+        ];
+        crate::aggregate_state::reset_owned_restore_decode_count_for_test();
+        let error = operator
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                target: &target,
+                revoked: &revoked,
+                restores: &arrow_failure_restores,
+            })
+            .expect_err("the malformed key IPC must fail after roster preflight");
+        assert!(error.to_string().contains("keys IPC decode"), "{error}");
+        assert_eq!(
+            crate::aggregate_state::owned_restore_decode_count_for_test(),
+            1,
+            "an earlier Arrow failure must prevent the later vnode's owned decode"
+        );
+        assert!(operator.prepared_vnode_transition.is_none());
+        assert!(operator.vnode_transition_cleanup.is_none());
+        let QueryState::Agg(ref aggregate) = operator.state else {
+            panic!("expected aggregate state after Arrow rejection");
+        };
+        assert_eq!(aggregate.logical_group_count_for_test(), 0);
     }
 
     async fn aggregate_state_checkpoint() -> (SessionContext, AggStateCheckpoint) {
@@ -2838,10 +3083,10 @@ mod delta_primary_tests {
         assert!(matches!(operator.state, QueryState::Uninit));
     }
 
-    // A sharded aggregate with the delta chain as primary must NOT capture its groups into the
-    // whole-node manifest blob (state lives in per-vnode partials); delta-off captures whole-node.
+    // A cluster-scoped aggregate never captures groups into the portable whole-node manifest;
+    // assignment-scoped vnode partials remain authoritative with or without delta encoding.
     #[tokio::test]
-    async fn delta_primary_skips_whole_node_agg_capture() {
+    async fn cluster_scope_skips_whole_node_agg_capture() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::Utf8, false),
             Field::new("val", DataType::Int64, false),
@@ -2897,79 +3142,15 @@ mod delta_primary_tests {
             .await
             .unwrap();
 
-        // Delta not yet enabled → whole-node capture present.
         assert!(
-            op.checkpoint().unwrap().is_some(),
-            "without delta the whole-node aggregate capture is present"
+            op.checkpoint().unwrap().is_none(),
+            "cluster aggregate groups must live only in vnode partials"
         );
 
-        // Enabling delta makes the chain authoritative → whole-node capture is skipped.
         op.enable_delta_checkpoints(4);
         assert!(
             op.checkpoint().unwrap().is_none(),
-            "delta-enabled aggregate must skip the whole-node capture (chain is primary)"
-        );
-    }
-
-    // Authoritative per-vnode partials (cluster + durable backend, delta off) must also skip the
-    // whole-node capture — the manifest copy is per-node-incomplete and traps boot recovery.
-    #[tokio::test]
-    async fn authoritative_partials_skip_whole_node_agg_capture() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("val", DataType::Int64, false),
-        ]));
-        let batch = |keys: &[&str], vals: &[i64]| {
-            RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(StringArray::from(keys.to_vec())),
-                    Arc::new(Int64Array::from(vals.to_vec())),
-                ],
-            )
-            .unwrap()
-        };
-        let ctx = laminar_sql::create_session_context();
-        let mem = datafusion::datasource::MemTable::try_new(
-            Arc::clone(&schema),
-            vec![vec![batch(&["seed"], &[0])]],
-        )
-        .unwrap();
-        ctx.register_table("events", Arc::new(mem)).unwrap();
-        let mut op = SqlQueryOperator::new(
-            "out",
-            "SELECT key, SUM(val) AS total FROM events GROUP BY key",
-            ctx,
-            None,
-            false,
-        );
-        let registry = Arc::new(VnodeRegistry::new(8));
-        registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
-        let receiver = Arc::new(
-            laminar_core::shuffle::ShuffleReceiver::bind(
-                1,
-                "127.0.0.1:0".parse().unwrap(),
-                uuid::Uuid::from_u128(1),
-            )
-            .await
-            .unwrap(),
-        );
-        op.attach_cluster_shuffle(ClusterShuffleConfig {
-            registry,
-            sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(
-                1,
-                uuid::Uuid::from_u128(1),
-            )),
-            receiver,
-            self_id: NodeId(1),
-        });
-        op.set_vnode_partials_authoritative();
-        op.process(&[vec![batch(&["a", "b"], &[1, 2])]], &[i64::MIN])
-            .await
-            .unwrap();
-        assert!(
-            op.checkpoint().unwrap().is_none(),
-            "authoritative-partials aggregate must skip the whole-node capture"
+            "delta encoding must keep vnode partials authoritative"
         );
     }
 
@@ -3145,130 +3326,6 @@ mod delta_primary_tests {
             total_sum(&mut replaced),
             remaining_after_revoke,
             "semantic EMPTY must remove every group in its authoritative vnode"
-        );
-    }
-
-    // A revoke that lands while the operator is still Uninit (restart + rebalance before the first
-    // process) must be deferred and applied after `lazy_init` folds `pending_restore`; otherwise
-    // this node can expose restored groups it no longer owns.
-    #[allow(clippy::too_many_lines)]
-    #[tokio::test]
-    async fn uninit_revoke_is_applied_before_reacquire() {
-        async fn populated_op() -> SqlQueryOperator {
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("key", DataType::Utf8, false),
-                Field::new("val", DataType::Int64, false),
-            ]));
-            let seed = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(StringArray::from(vec!["seed"])),
-                    Arc::new(Int64Array::from(vec![0_i64])),
-                ],
-            )
-            .unwrap();
-            let ctx = laminar_sql::create_session_context();
-            let mem =
-                datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![seed]])
-                    .unwrap();
-            ctx.register_table("events", Arc::new(mem)).unwrap();
-            let mut op = SqlQueryOperator::new(
-                "out",
-                "SELECT key, SUM(val) AS total FROM events GROUP BY key",
-                ctx,
-                None,
-                false,
-            );
-            let registry = Arc::new(VnodeRegistry::new(8));
-            registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
-            let receiver = Arc::new(
-                laminar_core::shuffle::ShuffleReceiver::bind(
-                    1,
-                    "127.0.0.1:0".parse().unwrap(),
-                    uuid::Uuid::from_u128(1),
-                )
-                .await
-                .unwrap(),
-            );
-            op.attach_cluster_shuffle(ClusterShuffleConfig {
-                registry,
-                sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(
-                    1,
-                    uuid::Uuid::from_u128(1),
-                )),
-                receiver,
-                self_id: NodeId(1),
-            });
-            op
-        }
-        fn total_sum(op: &mut SqlQueryOperator) -> i64 {
-            let QueryState::Agg(ref mut agg) = op.state else {
-                panic!("expected aggregate state");
-            };
-            agg.emit()
-                .unwrap()
-                .iter()
-                .map(|b| {
-                    let total = b
-                        .column(b.schema().index_of("total").unwrap())
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .unwrap();
-                    (0..b.num_rows()).map(|i| total.value(i)).sum::<i64>()
-                })
-                .sum()
-        }
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("val", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(StringArray::from(vec!["a", "b"])),
-                Arc::new(Int64Array::from(vec![1_i64, 2])),
-            ],
-        )
-        .unwrap();
-
-        // Durable whole-node checkpoint + a per-vnode slice, both from {a:1, b:2}.
-        let mut donor = populated_op().await;
-        donor.process(&[vec![batch]], &[i64::MIN]).await.unwrap();
-        let (v, slice_bytes) = donor
-            .checkpoint_by_vnode(&(0..8).collect::<Vec<_>>(), 8)
-            .unwrap()
-            .expect("per-vnode slices")
-            .iter()
-            .find_map(|(v, s)| match s {
-                crate::checkpoint_coordinator::StagedSlice::Bytes(b) => {
-                    let checkpoint =
-                        rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(b).unwrap();
-                    (!checkpoint.last_updated_ms.is_empty()).then(|| (*v, b.clone()))
-                }
-                _ => None,
-            })
-            .expect("a full vnode slice");
-        let whole = donor
-            .checkpoint()
-            .unwrap()
-            .expect("whole-node checkpoint")
-            .data;
-
-        // Revoke v while Uninit; lazy initialization folds the restore and then applies the drop.
-        let mut fixed = populated_op().await;
-        fixed.restore(OperatorCheckpoint { data: whole }).unwrap();
-        let revoked: rustc_hash::FxHashSet<u32> = [v].into_iter().collect();
-        fixed.drop_owned_vnodes(&revoked).unwrap(); // Uninit → deferred
-        fixed.process(&[], &[i64::MIN]).await.unwrap(); // lazy_init folds restore, then drops v
-        assert!(
-            total_sum(&mut fixed) < 3,
-            "deferred revocation must remove the lost vnode before output"
-        );
-        fixed.apply_vnode_state(v, &slice_bytes).unwrap();
-        assert_eq!(
-            total_sum(&mut fixed),
-            3,
-            "re-acquiring the vnode restores the committed aggregate"
         );
     }
 

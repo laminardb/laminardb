@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
 use laminar_connectors::connector::{
-    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceStart, SourceTopology,
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode, SourceStart,
+    SourceTopology,
 };
 use laminar_connectors::error::ConnectorError;
 use laminar_core::checkpoint_decision::{CheckpointVerdict, RecordOutcomeResult};
@@ -79,6 +80,7 @@ impl SourceConnector for IdleClusterTestSource {
         Ok(SourceContract::new(
             SourceConsistency::Replayable,
             SourceTopology::Splittable,
+            SourceInputMode::AppendOnly,
         ))
     }
 
@@ -125,6 +127,7 @@ impl SourceConnector for RejectingSplittableSource {
         Ok(SourceContract::new(
             SourceConsistency::Replayable,
             SourceTopology::Splittable,
+            SourceInputMode::AppendOnly,
         ))
     }
 
@@ -449,8 +452,8 @@ async fn splittable_source_without_assignment_hook_fails_before_start() {
                 CatalogManifestEntry {
                     canonical_name: "unsafe_input".into(),
                     kind: CatalogObjectKind::Source,
-                    ddl: "CREATE SOURCE unsafe_input (id BIGINT) WITH ('connector' = \
-                          'rejecting-splittable-test')"
+                    ddl: "CREATE SOURCE unsafe_input (id BIGINT) FROM \
+                          \"rejecting-splittable-test\""
                         .into(),
                 },
                 CatalogManifestEntry {
@@ -497,8 +500,8 @@ async fn cluster_source_start_failure_does_not_leave_graph_ready_vnode_state() {
                 CatalogManifestEntry {
                     canonical_name: "failing_input".into(),
                     kind: CatalogObjectKind::Source,
-                    ddl: "CREATE SOURCE failing_input (id BIGINT) WITH ('connector' = \
-                          'failing-start-cluster-test')"
+                    ddl: "CREATE SOURCE failing_input (id BIGINT) FROM \
+                          \"failing-start-cluster-test\""
                         .into(),
                 },
                 CatalogManifestEntry {
@@ -631,9 +634,7 @@ async fn cluster_startup_defers_source_actor_until_prepared_outcome_is_terminal(
                 CatalogManifestEntry {
                     canonical_name: "trades".into(),
                     kind: CatalogObjectKind::Source,
-                    ddl:
-                        "CREATE SOURCE trades (id BIGINT) WITH ('connector' = 'idle-cluster-test')"
-                            .into(),
+                    ddl: "CREATE SOURCE trades (id BIGINT) FROM \"idle-cluster-test\"".into(),
                 },
                 CatalogManifestEntry {
                     canonical_name: "out".into(),

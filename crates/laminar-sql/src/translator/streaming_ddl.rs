@@ -2,19 +2,16 @@
 
 #[allow(clippy::disallowed_types)] // cold path: SQL translation
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use sqlparser::ast::{ColumnDef, DataType as SqlDataType};
 
-use laminar_core::streaming::config::{
-    BackpressureStrategy, WaitStrategy, DEFAULT_BUFFER_SIZE, MAX_BUFFER_SIZE, MIN_BUFFER_SIZE,
-};
+use laminar_core::streaming::config::{DEFAULT_BUFFER_SIZE, MAX_BUFFER_SIZE, MIN_BUFFER_SIZE};
 
 use crate::parser::ParseError;
-use crate::parser::{CreateSinkStatement, CreateSourceStatement, SinkFrom, WatermarkDef};
+use crate::parser::{CreateSourceStatement, WatermarkDef};
 
 /// Watermark specification for a source.
 #[derive(Debug, Clone)]
@@ -35,21 +32,12 @@ pub struct WatermarkSpec {
 pub struct SourceConfigOptions {
     /// Buffer size for the channel.
     pub buffer_size: usize,
-    /// Backpressure strategy.
-    pub backpressure: BackpressureStrategy,
-    /// Wait strategy for consumers.
-    pub wait_strategy: WaitStrategy,
-    /// Whether to track statistics.
-    pub track_stats: bool,
 }
 
 impl Default for SourceConfigOptions {
     fn default() -> Self {
         Self {
             buffer_size: DEFAULT_BUFFER_SIZE,
-            backpressure: BackpressureStrategy::Block,
-            wait_strategy: WaitStrategy::SpinYield,
-            track_stats: false,
         }
     }
 }
@@ -75,6 +63,8 @@ pub struct SourceDefinition {
     pub name: String,
     /// Column definitions.
     pub columns: Vec<ColumnDefinition>,
+    /// Primary-key columns in declaration order.
+    pub primary_key: Vec<String>,
     /// Arrow schema.
     pub schema: SchemaRef,
     /// Watermark specification, if defined.
@@ -91,32 +81,12 @@ impl TryFrom<CreateSourceStatement> for SourceDefinition {
     }
 }
 
-/// A validated streaming sink definition.
-#[derive(Debug, Clone)]
-pub struct SinkDefinition {
-    /// Sink name.
-    pub name: String,
-    /// Input source or query.
-    pub input: String,
-    /// Configuration options.
-    pub config: SourceConfigOptions,
-}
-
-impl TryFrom<CreateSinkStatement> for SinkDefinition {
-    type Error = ParseError;
-
-    fn try_from(stmt: CreateSinkStatement) -> Result<Self, Self::Error> {
-        translate_create_sink(stmt)
-    }
-}
-
 /// Translates a CREATE SOURCE statement to a typed SourceDefinition.
 ///
 /// # Errors
 ///
 /// Returns `ParseError::ValidationError` if:
-/// - The `channel` option is specified (not user-configurable)
-/// - An invalid option value is provided
+/// - An invalid `buffer_size` is provided
 /// - Column types cannot be converted to Arrow types
 pub fn translate_create_source(
     stmt: CreateSourceStatement,
@@ -134,10 +104,29 @@ pub fn translate_create_source(
 /// Returns `ParseError` from option validation or watermark parsing.
 pub fn translate_create_source_with_columns(
     stmt: CreateSourceStatement,
-    columns: Vec<ColumnDefinition>,
+    mut columns: Vec<ColumnDefinition>,
 ) -> Result<SourceDefinition, ParseError> {
-    validate_source_options(&stmt.with_options)?;
     let config = parse_source_options(&stmt.with_options)?;
+    if let Some(column) = stmt
+        .columns
+        .iter()
+        .find(|column| is_reserved_mutation_column(&column.name.value))
+    {
+        return Err(ParseError::ValidationError(format!(
+            "CREATE SOURCE column '{}' is reserved mutation metadata",
+            column.name.value
+        )));
+    }
+    let (primary_key, primary_key_indices) = resolve_source_primary_key(&stmt, &columns)?;
+    for index in primary_key_indices {
+        if stmt.columns.is_empty() && columns[index].nullable {
+            return Err(ParseError::ValidationError(format!(
+                "CREATE SOURCE discovered PRIMARY KEY column '{}' must be non-nullable",
+                columns[index].name
+            )));
+        }
+        columns[index].nullable = false;
+    }
 
     let fields: Vec<Field> = columns
         .iter()
@@ -154,62 +143,99 @@ pub fn translate_create_source_with_columns(
     Ok(SourceDefinition {
         name: stmt.name.to_string(),
         columns,
+        primary_key,
         schema,
         watermark,
         config,
     })
 }
 
-/// Translates a CREATE SINK statement to a typed SinkDefinition.
-///
-/// # Errors
-///
-/// Returns `ParseError::ValidationError` if:
-/// - The `channel` option is specified (not user-configurable)
-/// - An invalid option value is provided
-pub fn translate_create_sink(stmt: CreateSinkStatement) -> Result<SinkDefinition, ParseError> {
-    // Validate options first
-    validate_source_options(&stmt.with_options)?;
+fn resolve_source_primary_key(
+    stmt: &CreateSourceStatement,
+    columns: &[ColumnDefinition],
+) -> Result<(Vec<String>, Vec<usize>), ParseError> {
+    let mut names = Vec::with_capacity(stmt.primary_key.len());
+    let mut indices = Vec::with_capacity(stmt.primary_key.len());
 
-    // Parse configuration options
-    let config = parse_source_options(&stmt.with_options)?;
-
-    // Get input name
-    let input = match stmt.from {
-        SinkFrom::Table(name) => name.to_string(),
-        SinkFrom::Query(_) => {
-            // For now, we don't support inline queries - need to create a view first
-            return Err(ParseError::ValidationError(
-                "inline queries not yet supported in CREATE SINK - use a view".to_string(),
-            ));
+    for key in &stmt.primary_key {
+        let matches: Vec<_> = if stmt.columns.is_empty() {
+            columns
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| discovered_identifier_matches(key, &column.name))
+                .map(|(index, _)| index)
+                .collect()
+        } else {
+            stmt.columns
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| declared_identifier_matches(key, &column.name))
+                .map(|(index, _)| index)
+                .collect()
+        };
+        let [index] = matches.as_slice() else {
+            let reason = if matches.is_empty() {
+                "does not exist"
+            } else {
+                "is ambiguous"
+            };
+            return Err(ParseError::ValidationError(format!(
+                "CREATE SOURCE PRIMARY KEY column '{key}' {reason}"
+            )));
+        };
+        let column = columns.get(*index).ok_or_else(|| {
+            ParseError::ValidationError(
+                "CREATE SOURCE resolved column metadata does not match its declaration".into(),
+            )
+        })?;
+        if indices.contains(index) {
+            return Err(ParseError::ValidationError(format!(
+                "CREATE SOURCE PRIMARY KEY repeats column '{}'",
+                column.name
+            )));
         }
-    };
+        if stmt.columns.get(*index).is_some_and(|declared| {
+            declared
+                .options
+                .iter()
+                .any(|option| matches!(&option.option, sqlparser::ast::ColumnOption::Null))
+        }) {
+            return Err(ParseError::ValidationError(format!(
+                "CREATE SOURCE PRIMARY KEY column '{}' cannot be declared NULL",
+                column.name
+            )));
+        }
+        names.push(column.name.clone());
+        indices.push(*index);
+    }
 
-    Ok(SinkDefinition {
-        name: stmt.name.to_string(),
-        input,
-        config,
-    })
+    Ok((names, indices))
 }
 
-/// Validates that source options don't include disallowed keys.
-fn validate_source_options(options: &HashMap<String, String>) -> Result<(), ParseError> {
-    // Reject 'channel' option - channel type is auto-derived
-    if options.contains_key("channel") {
-        return Err(ParseError::ValidationError(
-            "the 'channel' option is not user-configurable - channel type is automatically derived from usage patterns".to_string(),
-        ));
+fn discovered_identifier_matches(identifier: &sqlparser::ast::Ident, column: &str) -> bool {
+    if identifier.quote_style.is_some() {
+        identifier.value == column
+    } else {
+        identifier.value.eq_ignore_ascii_case(column)
     }
+}
 
-    // Reject 'type' option for same reason
-    if options.contains_key("type") {
-        return Err(ParseError::ValidationError(
-            "the 'type' option is not user-configurable for in-memory streaming sources"
-                .to_string(),
-        ));
+fn declared_identifier_matches(
+    reference: &sqlparser::ast::Ident,
+    declaration: &sqlparser::ast::Ident,
+) -> bool {
+    match (reference.quote_style, declaration.quote_style) {
+        (None, None) => reference.value.eq_ignore_ascii_case(&declaration.value),
+        (Some(_), Some(_)) => reference.value == declaration.value,
+        (None, Some(_)) => reference.value.to_ascii_lowercase() == declaration.value,
+        (Some(_), None) => reference.value == declaration.value.to_ascii_lowercase(),
     }
+}
 
-    Ok(())
+fn is_reserved_mutation_column(column: &str) -> bool {
+    ["_op", "__op", "__weight"]
+        .iter()
+        .any(|reserved| column.eq_ignore_ascii_case(reserved))
 }
 
 /// Parses source options from WITH clause.
@@ -220,24 +246,14 @@ fn parse_source_options(
 
     for (key, value) in options {
         match key.to_lowercase().as_str() {
-            "buffer_size" | "buffersize" => {
+            "buffer_size" => {
                 config.buffer_size = parse_buffer_size(value)?;
             }
-            "backpressure" => {
-                config.backpressure =
-                    BackpressureStrategy::from_str(value).map_err(ParseError::ValidationError)?;
+            _ => {
+                return Err(ParseError::ValidationError(format!(
+                    "unsupported CREATE SOURCE runtime option '{key}'; only 'buffer_size' is supported"
+                )));
             }
-            "wait_strategy" | "waitstrategy" => {
-                config.wait_strategy =
-                    WaitStrategy::from_str(value).map_err(ParseError::ValidationError)?;
-            }
-            "track_stats" | "trackstats" | "stats" => {
-                config.track_stats = parse_bool(value)?;
-            }
-            // Ignore connector-specific and unknown options.
-            // Connector-specific: handled by connector implementations.
-            // Unknown: allow forward compatibility with new options.
-            _ => {}
         }
     }
 
@@ -268,18 +284,6 @@ fn parse_buffer_size(value: &str) -> Result<usize, ParseError> {
     }
 
     Ok(size)
-}
-
-/// Parses a boolean option.
-fn parse_bool(value: &str) -> Result<bool, ParseError> {
-    match value.to_lowercase().as_str() {
-        "true" | "yes" | "on" | "1" => Ok(true),
-        "false" | "no" | "off" | "0" => Ok(false),
-        _ => Err(ParseError::ValidationError(format!(
-            "invalid boolean value: '{}' - expected true/false",
-            value
-        ))),
-    }
 }
 
 /// Converts SQL column definitions to Arrow types.
@@ -549,14 +553,12 @@ mod tests {
     fn test_source_with_options() {
         let def = parse_and_translate(
             "CREATE SOURCE events (id BIGINT) WITH (
-                'buffer_size' = '4096',
-                'backpressure' = 'reject'
+                'buffer_size' = '4096'
             )",
         )
         .unwrap();
 
         assert_eq!(def.config.buffer_size, 4096);
-        assert_eq!(def.config.backpressure, BackpressureStrategy::Reject);
     }
 
     #[test]
@@ -577,23 +579,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_channel_option() {
-        let result =
-            parse_and_translate("CREATE SOURCE events (id BIGINT) WITH ('channel' = 'mpsc')");
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("channel"));
-    }
-
-    #[test]
-    fn test_reject_type_option() {
-        let result = parse_and_translate("CREATE SOURCE events (id BIGINT) WITH ('type' = 'spsc')");
-
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_buffer_size_bounds() {
         // Too small
         let result =
@@ -610,34 +595,6 @@ mod tests {
         let result =
             parse_and_translate("CREATE SOURCE events (id BIGINT) WITH ('buffer_size' = '1024')");
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_backpressure_strategies() {
-        assert_eq!(
-            BackpressureStrategy::from_str("block").unwrap(),
-            BackpressureStrategy::Block
-        );
-        assert_eq!(
-            BackpressureStrategy::from_str("drop_oldest").unwrap(),
-            BackpressureStrategy::DropOldest
-        );
-        assert_eq!(
-            BackpressureStrategy::from_str("reject").unwrap(),
-            BackpressureStrategy::Reject
-        );
-        assert!(BackpressureStrategy::from_str("invalid").is_err());
-    }
-
-    #[test]
-    fn test_wait_strategies() {
-        assert_eq!(WaitStrategy::from_str("spin").unwrap(), WaitStrategy::Spin);
-        assert_eq!(
-            WaitStrategy::from_str("spin_yield").unwrap(),
-            WaitStrategy::SpinYield
-        );
-        assert_eq!(WaitStrategy::from_str("park").unwrap(), WaitStrategy::Park);
-        assert!(WaitStrategy::from_str("invalid").is_err());
     }
 
     #[test]
@@ -753,48 +710,95 @@ mod tests {
     }
 
     #[test]
-    fn test_track_stats_option() {
-        let def =
-            parse_and_translate("CREATE SOURCE events (id BIGINT) WITH ('track_stats' = 'true')")
-                .unwrap();
-
-        assert!(def.config.track_stats);
-    }
-
-    #[test]
-    fn test_wait_strategy_option() {
-        let def =
-            parse_and_translate("CREATE SOURCE events (id BIGINT) WITH ('wait_strategy' = 'park')")
-                .unwrap();
-
-        assert_eq!(def.config.wait_strategy, WaitStrategy::Park);
-    }
-
-    #[test]
     fn test_default_config() {
         let def = parse_and_translate("CREATE SOURCE events (id BIGINT)").unwrap();
 
         assert_eq!(def.config.buffer_size, DEFAULT_BUFFER_SIZE);
-        assert_eq!(def.config.backpressure, BackpressureStrategy::Block);
-        assert_eq!(def.config.wait_strategy, WaitStrategy::SpinYield);
-        assert!(!def.config.track_stats);
     }
 
     #[test]
-    fn test_external_connector_options_ignored() {
-        // External connector options should be accepted but not affect config
+    fn source_connector_options_require_from() {
+        let error =
+            parse_and_translate("CREATE SOURCE events (id BIGINT) WITH ('connector' = 'kafka')")
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("connector options in FROM"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn discovered_nullable_primary_key_is_rejected() {
+        let statements =
+            crate::parse_streaming_sql("CREATE SOURCE events FROM KAFKA SCHEMA (PRIMARY KEY (id))")
+                .unwrap();
+        let StreamingStatement::CreateSource(stmt) = statements.into_iter().next().unwrap() else {
+            panic!("expected CREATE SOURCE");
+        };
+
+        let error = translate_create_source_with_columns(
+            *stmt,
+            vec![ColumnDefinition {
+                name: "id".into(),
+                data_type: DataType::Int64,
+                nullable: true,
+            }],
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("discovered PRIMARY KEY column 'id' must be non-nullable"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn declared_primary_key_preserves_identifier_quote_semantics() {
+        let def =
+            parse_and_translate("CREATE SOURCE events (id BIGINT, PRIMARY KEY (\"id\"))").unwrap();
+        assert_eq!(def.primary_key, ["id"]);
+
         let def = parse_and_translate(
-            "CREATE SOURCE events (id BIGINT) WITH (
-                'connector' = 'kafka',
-                'topic' = 'events',
-                'bootstrap.servers' = 'localhost:9092',
-                'buffer_size' = '8192'
-            )",
+            "CREATE SOURCE events (id BIGINT, \"ID\" BIGINT, PRIMARY KEY (ID))",
         )
         .unwrap();
+        assert_eq!(def.primary_key, ["id"]);
+        assert!(!def.columns[0].nullable);
+        assert!(def.columns[1].nullable);
 
-        // Only buffer_size should affect config
-        assert_eq!(def.config.buffer_size, 8192);
+        let def = parse_and_translate(
+            "CREATE SOURCE events (id BIGINT, \"ID\" BIGINT, PRIMARY KEY (\"ID\"))",
+        )
+        .unwrap();
+        assert_eq!(def.primary_key, ["ID"]);
+        assert!(def.columns[0].nullable);
+        assert!(!def.columns[1].nullable);
+
+        let error = parse_and_translate("CREATE SOURCE events (\"ID\" BIGINT, PRIMARY KEY (id))")
+            .unwrap_err();
+        assert!(error.to_string().contains("does not exist"), "{error}");
+    }
+
+    #[test]
+    fn discovered_primary_key_uses_external_field_matching() {
+        let statements =
+            crate::parse_streaming_sql("CREATE SOURCE events FROM KAFKA SCHEMA (PRIMARY KEY (ID))")
+                .unwrap();
+        let StreamingStatement::CreateSource(stmt) = statements.into_iter().next().unwrap() else {
+            panic!("expected CREATE SOURCE");
+        };
+        let def = translate_create_source_with_columns(
+            *stmt,
+            vec![ColumnDefinition {
+                name: "id".into(),
+                data_type: DataType::Int64,
+                nullable: false,
+            }],
+        )
+        .unwrap();
+        assert_eq!(def.primary_key, ["id"]);
     }
 
     #[test]

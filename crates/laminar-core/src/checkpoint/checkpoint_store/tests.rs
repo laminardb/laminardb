@@ -7,8 +7,14 @@ fn make_store(dir: &Path) -> FileSystemCheckpointStore {
     FileSystemCheckpointStore::new(dir)
 }
 
-fn make_manifest(id: u64) -> CheckpointManifest {
+fn make_prepared_manifest(id: u64) -> CheckpointManifest {
     let mut manifest = CheckpointManifest::new(id, id);
+    manifest.deployment_id = uuid::Uuid::from_u128(1).to_string();
+    manifest
+}
+
+fn make_manifest(id: u64) -> CheckpointManifest {
+    let mut manifest = make_prepared_manifest(id);
     manifest.durable_phase = DurableCheckpointPhase::Finalized;
     manifest
 }
@@ -482,7 +488,7 @@ async fn test_save_and_load_latest() {
 async fn prepared_is_invisible_until_finalize() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(dir.path());
-    let prepared = CheckpointManifest::new(1, 1);
+    let prepared = make_prepared_manifest(1);
 
     let persisted = store.save_with_state(&prepared, None).await.unwrap();
     assert_eq!(persisted.durable_phase, DurableCheckpointPhase::Prepared);
@@ -499,7 +505,7 @@ async fn prepared_is_invisible_until_finalize() {
 
 #[tokio::test]
 async fn only_the_exact_prepared_to_finalized_manifest_transition_is_accepted() {
-    let prepared = CheckpointManifest::new(7, 7);
+    let prepared = make_prepared_manifest(7);
     let mut changed = make_manifest(7);
     changed.watermark = Some(42);
 
@@ -523,7 +529,7 @@ async fn validated_recovery_skips_newer_prepared_attempt() {
     let store = FileSystemCheckpointStore::new(dir.path());
     store.save(&make_manifest(1)).await.unwrap();
     store
-        .save_with_state(&CheckpointManifest::new(2, 2), None)
+        .save_with_state(&make_prepared_manifest(2), None)
         .await
         .unwrap();
 
@@ -651,7 +657,7 @@ async fn epoch_prune_preserves_latest_recovery_cut() {
     let store = FileSystemCheckpointStore::new(dir.path());
     store.save(&make_manifest(1)).await.unwrap();
     for id in 2..=5 {
-        store.save(&CheckpointManifest::new(id, id)).await.unwrap();
+        store.save(&make_prepared_manifest(id)).await.unwrap();
     }
 
     assert_eq!(store.prune_before(10).await.unwrap(), 4);
@@ -925,7 +931,7 @@ async fn test_full_manifest_round_trip() {
     assert_eq!(tbl.offsets.get("lsn"), Some(&"0/AB".into()));
 
     let op = loaded.operator_states.get("window").unwrap();
-    assert_eq!(op.decode_inline().unwrap(), b"data");
+    assert_eq!(op.try_decode_inline().unwrap().unwrap(), b"data");
 }
 
 #[tokio::test]
@@ -1265,7 +1271,7 @@ async fn obj_epoch_prune_preserves_latest_recovery_cut() {
     );
     store.save(&make_manifest(1)).await.unwrap();
     for id in 2..=5 {
-        store.save(&CheckpointManifest::new(id, id)).await.unwrap();
+        store.save(&make_prepared_manifest(id)).await.unwrap();
     }
 
     assert_eq!(store.prune_before(10).await.unwrap(), 4);
@@ -1785,7 +1791,7 @@ async fn test_obj_conditional_put_idempotent() {
 #[tokio::test]
 async fn object_store_finalize_only_publishes_the_stored_prepared_manifest() {
     let store = make_obj_store();
-    let prepared = CheckpointManifest::new(7, 7);
+    let prepared = make_prepared_manifest(7);
     store.save_with_state(&prepared, None).await.unwrap();
     assert!(store.load_latest().await.unwrap().is_none());
 
@@ -1869,7 +1875,7 @@ async fn test_obj_latest_pointing_to_missing_checkpoint_is_invalid() {
 async fn test_obj_latest_pointing_to_prepared_checkpoint_is_invalid() {
     let inner = Arc::new(object_store::memory::InMemory::new());
     let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new());
-    store.save(&CheckpointManifest::new(7, 7)).await.unwrap();
+    store.save(&make_prepared_manifest(7)).await.unwrap();
     let pointer = serde_json::to_vec(&LatestPointer { checkpoint_id: 7 }).unwrap();
     inner
         .put_opts(
@@ -1953,7 +1959,7 @@ async fn object_store_reconciles_lost_ack_for_finalize_and_latest_cas() {
     ));
     let finalize_store = ObjectStoreCheckpointStore::new(finalize_fault, String::new());
     finalize_store
-        .save(&CheckpointManifest::new(1, 1))
+        .save(&make_prepared_manifest(1))
         .await
         .unwrap();
     let finalized = finalize_store.finalize(1).await.unwrap();

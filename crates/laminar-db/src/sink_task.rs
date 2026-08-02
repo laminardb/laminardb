@@ -999,6 +999,10 @@ impl SinkTaskHandle {
         self.contract.is_checkpoint_committable()
     }
 
+    pub(crate) fn cluster_exact_delivery_certified(&self) -> bool {
+        self.contract.is_cluster_exact_delivery_certified()
+    }
+
     pub fn name(&self) -> &str {
         self.name.as_ref()
     }

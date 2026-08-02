@@ -284,7 +284,7 @@ fn synthetic_pending_boot_transition(
             owners,
             participant,
             identity,
-            restore_cut,
+            restore_cut.into_transition_binding().unwrap(),
             crate::recovery_manager::vnode_chains::LoadedVnodeChains::from_chains_for_test(
                 Some(attempt),
                 chains,

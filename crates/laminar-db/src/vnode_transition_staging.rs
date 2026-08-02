@@ -8,11 +8,13 @@ use laminar_core::checkpoint::{
 };
 use laminar_core::state::NodeId;
 
-use crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut;
+use crate::checkpoint_coordinator::ValidatedClusterVnodeTransitionBinding;
 use crate::error::DbError;
 use crate::rebalance::AuditedCommittedDrainTransition;
 use crate::recovery_manager::vnode_chains::LoadedVnodeChains;
-use crate::vnode_restore_input::{VnodeRestoreInputReservation, VnodeRestoreInputUsage};
+use crate::vnode_restore_input::{
+    VnodeRestoreAlignmentCopyReservation, VnodeRestoreInputReservation, VnodeRestoreInputUsage,
+};
 
 pub(crate) type PendingVnodeTransitionHandle =
     Arc<parking_lot::Mutex<Option<Arc<PendingVnodeTransition>>>>;
@@ -122,7 +124,7 @@ pub(crate) struct PendingVnodeTransition {
     kind: VnodeTransitionKind,
     target: CheckpointAssignmentFence,
     pipeline_identity: PipelineIdentity,
-    restore_cut: Option<ValidatedClusterVnodeRestoreCut>,
+    restore_binding: Option<ValidatedClusterVnodeTransitionBinding>,
     acquired_vnodes: Box<[u32]>,
     revoked_vnodes: Box<[u32]>,
     restores: Box<[PendingVnodeRestore]>,
@@ -148,7 +150,7 @@ impl PendingVnodeTransition {
         target_owners: &[NodeId],
         participant: CheckpointParticipant,
         pipeline_identity: PipelineIdentity,
-        restore_cut: ValidatedClusterVnodeRestoreCut,
+        restore_binding: ValidatedClusterVnodeTransitionBinding,
         loaded: LoadedVnodeChains,
     ) -> Result<Self, DbError> {
         Self::validate_fence_owners("boot target", &target, target_owners)?;
@@ -159,14 +161,18 @@ impl PendingVnodeTransition {
                 "boot recovery cannot publish an empty vnode transition",
             ));
         }
-        let validated =
-            Self::validate_restores(&acquired_vnodes, &pipeline_identity, &restore_cut, loaded)?;
+        let validated = Self::validate_restores(
+            &acquired_vnodes,
+            &pipeline_identity,
+            &restore_binding,
+            loaded,
+        )?;
         Ok(Self {
             origin: VnodeTransitionOrigin::BootRecovery,
             kind: VnodeTransitionKind::OwnershipChange,
             target,
             pipeline_identity,
-            restore_cut: Some(restore_cut),
+            restore_binding: Some(restore_binding),
             acquired_vnodes: acquired_vnodes.into_boxed_slice(),
             revoked_vnodes: Box::default(),
             restores: validated.restores.into_boxed_slice(),
@@ -182,7 +188,7 @@ impl PendingVnodeTransition {
         target_owners: &[NodeId],
         participant: CheckpointParticipant,
         pipeline_identity: PipelineIdentity,
-        restore_cut: Option<ValidatedClusterVnodeRestoreCut>,
+        restore_binding: Option<ValidatedClusterVnodeTransitionBinding>,
         loaded: LoadedVnodeChains,
         local_state_requires_full_restore: bool,
         final_owner_exit: Option<AuditedCommittedDrainTransition>,
@@ -220,9 +226,9 @@ impl PendingVnodeTransition {
         };
         let revoked_vnodes = sorted_difference(&predecessor_owned, &target_owned);
 
-        if restore_cut
+        if restore_binding
             .as_ref()
-            .is_some_and(|cut| cut.outcome().assignment_fence.as_ref() != Some(&predecessor))
+            .is_some_and(|binding| !binding.matches_source_assignment(&predecessor))
         {
             return Err(transition_error(
                 "live assignment restore cut does not match the exact predecessor certificate",
@@ -257,7 +263,7 @@ impl PendingVnodeTransition {
         };
 
         let (restores, restore_input_reservation) =
-            match (acquired_vnodes.is_empty(), restore_cut.as_ref()) {
+            match (acquired_vnodes.is_empty(), restore_binding.as_ref()) {
                 (true, None) if loaded.attempt.is_none() && loaded.chains.is_empty() => {
                     validate_restore_input_usage(&[], loaded.input_usage())?;
                     let mut loaded = loaded;
@@ -295,7 +301,7 @@ impl PendingVnodeTransition {
             kind,
             target,
             pipeline_identity,
-            restore_cut,
+            restore_binding,
             acquired_vnodes: acquired_vnodes.into_boxed_slice(),
             revoked_vnodes: revoked_vnodes.into_boxed_slice(),
             restores: restores.into_boxed_slice(),
@@ -339,25 +345,21 @@ impl PendingVnodeTransition {
     fn validate_restores(
         acquired_vnodes: &[u32],
         pipeline_identity: &PipelineIdentity,
-        restore_cut: &ValidatedClusterVnodeRestoreCut,
+        restore_binding: &ValidatedClusterVnodeTransitionBinding,
         mut loaded: LoadedVnodeChains,
     ) -> Result<ValidatedVnodeRestores, DbError> {
-        restore_cut
-            .validate_transition_binding()
-            .map_err(|error| transition_error(format!("invalid committed restore cut: {error}")))?;
-        if restore_cut.pipeline_identity() != pipeline_identity {
+        if restore_binding.pipeline_identity() != pipeline_identity {
             return Err(transition_error(
                 "restore cut pipeline identity does not match the pending transition",
             ));
         }
-        if loaded.attempt != Some(restore_cut.attempt()) {
+        if loaded.attempt != Some(restore_binding.attempt()) {
             return Err(transition_error(format!(
                 "loaded vnode attempt {:?} does not match restore cut {:?}",
                 loaded.attempt,
-                restore_cut.attempt()
+                restore_binding.attempt()
             )));
         }
-        let inventory = restore_cut.inventory();
         let mut loaded_vnodes: Vec<u32> = loaded.chains.keys().copied().collect();
         loaded_vnodes.sort_unstable();
         if loaded_vnodes != acquired_vnodes {
@@ -367,10 +369,10 @@ impl PendingVnodeTransition {
         }
         if acquired_vnodes
             .iter()
-            .any(|vnode| inventory.required_vnodes.binary_search(vnode).is_err())
+            .any(|vnode| !restore_binding.covers_vnode_index(*vnode))
         {
             return Err(transition_error(
-                "restore cut seal does not attest every acquired vnode",
+                "restore cut sealed domain does not cover every acquired vnode",
             ));
         }
         let usage = loaded.input_usage();
@@ -429,8 +431,8 @@ impl PendingVnodeTransition {
     }
 
     #[must_use]
-    pub(crate) const fn restore_cut(&self) -> Option<&ValidatedClusterVnodeRestoreCut> {
-        self.restore_cut.as_ref()
+    pub(crate) const fn restore_binding(&self) -> Option<&ValidatedClusterVnodeTransitionBinding> {
+        self.restore_binding.as_ref()
     }
 
     #[must_use]
@@ -446,6 +448,20 @@ impl PendingVnodeTransition {
     #[must_use]
     pub(crate) fn restores(&self) -> &[PendingVnodeRestore] {
         &self.restores
+    }
+
+    pub(crate) fn reserve_inner_alignment_copy(
+        &self,
+        bytes: u64,
+    ) -> Result<VnodeRestoreAlignmentCopyReservation, DbError> {
+        self.restore_input_reservation
+            .as_ref()
+            .ok_or_else(|| {
+                transition_error(
+                    "a vnode restore cannot align inner archives without its input reservation",
+                )
+            })?
+            .try_reserve_inner_alignment_copy(bytes)
     }
 }
 

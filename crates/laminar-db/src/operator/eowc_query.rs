@@ -1,5 +1,4 @@
-//! EOWC (Emit On Window Close) operator: routes to `CoreWindowState`,
-//! `IncrementalEowcState`, or raw-batch accumulation on first `process()`.
+//! EOWC (Emit On Window Close) operator backed by `CoreWindowState`.
 
 use std::sync::Arc;
 
@@ -8,187 +7,29 @@ use async_trait::async_trait;
 use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
 
-use crate::aggregate_state::{apply_compiled_having, EowcStateCheckpoint};
+use crate::aggregate_state::apply_compiled_having;
+#[cfg(feature = "cluster")]
+use crate::core_window_state::PreparedCoreWindowTransition;
 use crate::core_window_state::{CoreWindowCheckpoint, CoreWindowState};
 use crate::engine_metrics::EngineMetrics;
-use crate::eowc_state::IncrementalEowcState;
 use crate::error::DbError;
-use crate::operator_graph::{try_evaluate_compiled, GraphOperator, OperatorCheckpoint};
-use crate::sql_analysis::compute_closed_boundary;
+use crate::operator::capability::{
+    ManagedStateContract, OperatorCapability, OperatorImplementation,
+};
+#[cfg(feature = "cluster")]
+use crate::operator::sql_query::ClusterShuffleConfig;
+#[cfg(feature = "cluster")]
+use crate::operator_graph::ManagedVnodeTransition;
+use crate::operator_graph::{
+    try_evaluate_compiled, GraphOperator, ManagedStateAccountingSnapshot, OperatorCheckpoint,
+};
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::WindowOperatorConfig;
 
-const MAX_EOWC_ACCUMULATED_BYTES: usize = 256 * 1024 * 1024;
-
-#[derive(
-    serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
-enum EowcCheckpointEnvelope {
-    CoreWindow(CoreWindowCheckpoint),
-    EowcAgg(EowcStateCheckpoint),
-    /// Non-aggregate path; empty `ipc` means no rows were buffered.
-    Raw(RawCheckpoint),
-}
-
-#[derive(
-    serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
-struct RawCheckpoint {
-    ipc: Vec<u8>,
-    last_closed_boundary: i64,
-}
-
-/// Lazy-initialized EOWC state, variant chosen on the first `process()` call.
-enum EowcInnerState {
-    Uninit,
-    CoreWindow(Box<CoreWindowState>),
-    EowcAgg(Box<IncrementalEowcState>),
-    /// Non-aggregate path: accumulate batches, replay SQL when windows close.
-    Raw {
-        accumulated: Vec<RecordBatch>,
-        last_closed_boundary: i64,
-        accumulated_bytes: usize,
-        // Built on first close-cycle; cached thereafter to avoid re-planning.
-        sql_cache: Option<RawSqlCache>,
-    },
-}
-
-/// User SQL with its source AST-rewritten to a private table; cached physical plan.
-struct RawSqlCache(super::LiveSqlCache);
-
-impl RawSqlCache {
-    async fn build(
-        ctx: &SessionContext,
-        op_name: &str,
-        original_sql: &str,
-        source_schema: arrow::datatypes::SchemaRef,
-    ) -> Result<Self, DbError> {
-        let source = crate::sql_analysis::single_source_table(original_sql).ok_or_else(|| {
-            DbError::Unsupported(format!(
-                "[LDB-1001] non-aggregate EMIT ON WINDOW CLOSE on multi-source \
-                 query '{op_name}' is not supported"
-            ))
-        })?;
-        let temp_table = format!("_eowc_raw_{}", op_name.replace(['-', ' '], "_"));
-        let rewritten = rewrite_source(original_sql, &source, &temp_table)?;
-        super::LiveSqlCache::build(ctx, &temp_table, source_schema, &rewritten, "raw EOWC")
-            .await
-            .map(Self)
-    }
-
-    async fn apply(
-        &self,
-        op_name: &str,
-        batches: Vec<RecordBatch>,
-    ) -> Result<Vec<RecordBatch>, DbError> {
-        self.0.apply(op_name, batches).await
-    }
-}
-
-fn snapshot_raw(
-    accumulated: &[RecordBatch],
-    last_closed_boundary: i64,
-) -> Result<RawCheckpoint, DbError> {
-    let ipc = match accumulated.first() {
-        None => Vec::new(),
-        Some(first) => crate::mv_store::batches_to_ipc(&first.schema(), accumulated)?,
-    };
-    Ok(RawCheckpoint {
-        ipc,
-        last_closed_boundary,
-    })
-}
-
-fn raw_batches_bytes(batches: &[RecordBatch]) -> Result<usize, DbError> {
-    batches.iter().try_fold(0usize, |total, batch| {
-        total
-            .checked_add(batch.get_array_memory_size())
-            .ok_or_else(|| DbError::Pipeline("raw EOWC state byte accounting overflow".into()))
-    })
-}
-
-fn restore_raw(cp: &RawCheckpoint) -> Result<(Vec<RecordBatch>, usize), DbError> {
-    if cp.ipc.is_empty() {
-        return Ok((Vec::new(), 0));
-    }
-    if cp.ipc.len() > MAX_EOWC_ACCUMULATED_BYTES {
-        return Err(DbError::Checkpoint(format!(
-            "EOWC raw checkpoint is {} bytes, exceeding the {}-byte state limit",
-            cp.ipc.len(),
-            MAX_EOWC_ACCUMULATED_BYTES
-        )));
-    }
-    let batches = crate::mv_store::ipc_to_batches(&cp.ipc)
-        .map_err(|e| DbError::Checkpoint(format!("EOWC raw restore: {e}")))?;
-    let bytes = raw_batches_bytes(&batches)
-        .map_err(|e| DbError::Checkpoint(format!("EOWC raw restore accounting: {e}")))?;
-    if bytes > MAX_EOWC_ACCUMULATED_BYTES {
-        return Err(DbError::Checkpoint(format!(
-            "EOWC raw checkpoint expands to {bytes} bytes, exceeding the {MAX_EOWC_ACCUMULATED_BYTES}-byte state limit"
-        )));
-    }
-    Ok((batches, bytes))
-}
-
-/// Replace every unqualified `source` table reference in SQL with `temp`.
-fn rewrite_source(sql: &str, source: &str, temp: &str) -> Result<String, DbError> {
-    use sqlparser::ast::{Ident, ObjectName, SetExpr, Statement, TableFactor};
-    use sqlparser::dialect::GenericDialect;
-    use sqlparser::parser::Parser;
-
-    fn unqualify(s: &str) -> &str {
-        s.rsplit('.').next().unwrap_or(s)
-    }
-    fn walk_factor(f: &mut TableFactor, source: &str, temp: &str) {
-        match f {
-            TableFactor::Table { name, .. } => {
-                let s = name.to_string();
-                if unqualify(&s).eq_ignore_ascii_case(unqualify(source)) {
-                    *name = ObjectName::from(vec![Ident::new(temp)]);
-                }
-            }
-            TableFactor::Derived { subquery, .. } => walk_set(&mut subquery.body, source, temp),
-            TableFactor::NestedJoin {
-                table_with_joins, ..
-            } => {
-                walk_factor(&mut table_with_joins.relation, source, temp);
-                for j in &mut table_with_joins.joins {
-                    walk_factor(&mut j.relation, source, temp);
-                }
-            }
-            _ => {}
-        }
-    }
-    fn walk_set(s: &mut SetExpr, source: &str, temp: &str) {
-        match s {
-            SetExpr::Select(sel) => {
-                for twj in &mut sel.from {
-                    walk_factor(&mut twj.relation, source, temp);
-                    for j in &mut twj.joins {
-                        walk_factor(&mut j.relation, source, temp);
-                    }
-                }
-            }
-            SetExpr::Query(q) => walk_set(&mut q.body, source, temp),
-            SetExpr::SetOperation { left, right, .. } => {
-                walk_set(left, source, temp);
-                walk_set(right, source, temp);
-            }
-            _ => {}
-        }
-    }
-
-    let mut stmts = Parser::parse_sql(&GenericDialect {}, sql)
-        .map_err(|e| DbError::Pipeline(format!("raw EOWC sql parse: {e}")))?;
-    for stmt in &mut stmts {
-        if let Statement::Query(q) = stmt {
-            walk_set(&mut q.body, source, temp);
-        }
-    }
-    Ok(stmts
-        .first()
-        .map(std::string::ToString::to_string)
-        .unwrap_or_default())
+#[cfg(feature = "cluster")]
+enum CoreWindowTransitionCleanup {
+    Aborted(PreparedCoreWindowTransition),
+    Published(PreparedCoreWindowTransition),
 }
 
 /// EOWC query operator: suppresses intermediate results and emits only
@@ -200,9 +41,16 @@ pub(crate) struct EowcQueryOperator {
     window_config: Option<WindowOperatorConfig>,
     ctx: SessionContext,
     task_ctx: Arc<TaskContext>,
-    state: EowcInnerState,
-    pending_restore: Option<EowcCheckpointEnvelope>,
+    capability: OperatorCapability,
+    state: Option<Box<CoreWindowState>>,
+    pending_restore: Option<CoreWindowCheckpoint>,
     prom: Option<Arc<EngineMetrics>>,
+    #[cfg(feature = "cluster")]
+    cluster_scope: Option<ClusterShuffleConfig>,
+    #[cfg(feature = "cluster")]
+    prepared_vnode_transition: Option<PreparedCoreWindowTransition>,
+    #[cfg(feature = "cluster")]
+    vnode_transition_cleanup: Option<CoreWindowTransitionCleanup>,
 }
 
 impl EowcQueryOperator {
@@ -215,6 +63,16 @@ impl EowcQueryOperator {
         prom: Option<Arc<EngineMetrics>>,
     ) -> Self {
         let task_ctx = ctx.task_ctx();
+        let capability = if window_config.as_ref().is_some_and(|config| {
+            matches!(
+                config.window_type,
+                laminar_sql::translator::WindowType::Tumbling
+            )
+        }) {
+            OperatorCapability::managed_global_tumbling_window()
+        } else {
+            OperatorCapability::fixed(OperatorImplementation::EowcQuery)
+        };
         Self {
             op_name: Arc::from(name),
             sql: Arc::from(sql),
@@ -222,192 +80,119 @@ impl EowcQueryOperator {
             window_config,
             ctx,
             task_ctx,
-            state: EowcInnerState::Uninit,
+            capability,
+            state: None,
             pending_restore: None,
             prom,
+            #[cfg(feature = "cluster")]
+            cluster_scope: None,
+            #[cfg(feature = "cluster")]
+            prepared_vnode_transition: None,
+            #[cfg(feature = "cluster")]
+            vnode_transition_cleanup: None,
         }
     }
 
     async fn initialize(&mut self) -> Result<(), DbError> {
-        if let Some(ref cfg) = self.window_config {
-            let emit_ref = self.emit_clause.as_ref();
-            match CoreWindowState::try_from_sql(&self.ctx, &self.sql, cfg, emit_ref).await {
-                Ok(Some(mut cw)) => {
-                    cw.attach_metrics(self.prom.clone());
-                    tracing::info!(
-                        query = %self.op_name,
-                        window_type = ?cfg.window_type,
-                        "EOWC operator: routed to core window pipeline"
-                    );
-                    self.state = EowcInnerState::CoreWindow(Box::new(cw));
-                    self.apply_pending_restore()?;
-                    return Ok(());
-                }
-                Ok(None) => {}
-                // Propagate wallclock misuse; other gaps fall through.
-                Err(e @ DbError::Unsupported(_))
-                    if {
-                        let s = e.to_string();
-                        s.contains("now()") || s.contains("current_timestamp")
-                    } =>
-                {
-                    return Err(e);
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        query = %self.op_name,
-                        error = %e,
-                        "EOWC operator: core window detection failed, trying incremental"
-                    );
-                }
-            }
-
-            // Session windows must go through CoreWindowState; the incremental
-            // path would panic on a session query.
-            if matches!(
-                cfg.window_type,
-                laminar_sql::translator::WindowType::Session
-            ) {
-                tracing::warn!(
-                    query = %self.op_name,
-                    "Session window query could not route through CoreWindowState; \
-                     falling back to raw-batch EOWC"
-                );
-            } else {
-                match IncrementalEowcState::try_from_sql(&self.ctx, &self.sql, cfg, emit_ref).await
-                {
-                    Ok(Some(mut eowc)) => {
-                        eowc.attach_metrics(self.prom.clone());
-                        tracing::info!(
-                            query = %self.op_name,
-                            "EOWC operator: using incremental per-window accumulators"
-                        );
-                        self.state = EowcInnerState::EowcAgg(Box::new(eowc));
-                        self.apply_pending_restore()?;
-                        return Ok(());
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::debug!(
-                            query = %self.op_name,
-                            error = %e,
-                            "EOWC operator: incremental detection failed, using raw path"
-                        );
-                    }
-                }
-            }
-        }
-
-        tracing::debug!(
-            query = %self.op_name,
-            "EOWC operator: using raw-batch accumulation path"
-        );
-        self.state = EowcInnerState::Raw {
-            accumulated: Vec::new(),
-            last_closed_boundary: i64::MIN,
-            accumulated_bytes: 0,
-            sql_cache: None,
+        let cfg = self.window_config.as_ref().ok_or_else(|| {
+            DbError::Unsupported(format!(
+                "[LDB-1001] EOWC query '{}' requires a supported TUMBLE, HOP, or SESSION aggregate",
+                self.op_name
+            ))
+        })?;
+        let Some(mut window) =
+            CoreWindowState::try_from_sql(&self.ctx, &self.sql, cfg, self.emit_clause.as_ref())
+                .await?
+        else {
+            return Err(DbError::Unsupported(format!(
+                "[LDB-1001] EOWC query '{}' is not a supported TUMBLE, HOP, or SESSION aggregate",
+                self.op_name
+            )));
         };
+
+        window.attach_metrics(self.prom.clone());
+        tracing::info!(
+            query = %self.op_name,
+            window_type = ?cfg.window_type,
+            "EOWC operator: initialized core window state"
+        );
+        self.capability = if window.supports_managed_global_tumbling() {
+            OperatorCapability::managed_global_tumbling_window()
+        } else {
+            OperatorCapability::fixed(OperatorImplementation::EowcQuery)
+        };
+        self.state = Some(Box::new(window));
         self.apply_pending_restore()?;
         Ok(())
     }
 
+    #[cfg(feature = "cluster")]
+    pub(crate) fn attach_cluster_scope(&mut self, scope: ClusterShuffleConfig) {
+        self.cluster_scope = Some(scope);
+    }
+
+    fn resolve_managed_capability(&mut self) {
+        if self.capability.managed_state == Some(ManagedStateContract::CoreWindowV1)
+            && !self
+                .state
+                .as_ref()
+                .is_some_and(|window| window.supports_managed_global_tumbling())
+        {
+            self.capability = OperatorCapability::fixed(OperatorImplementation::EowcQuery);
+        }
+    }
+
     fn apply_pending_restore(&mut self) -> Result<(), DbError> {
-        let Some(envelope) = self.pending_restore.take() else {
+        let Some(checkpoint) = self.pending_restore.take() else {
             return Ok(());
         };
-        if let Err(error) = self.apply_checkpoint_envelope(&envelope) {
+        if let Err(error) = self.apply_checkpoint(&checkpoint) {
             // Keep recovery pending so a caller that mishandles the error cannot
             // process or checkpoint an empty/partially restored operator.
-            self.pending_restore = Some(envelope);
+            self.pending_restore = Some(checkpoint);
             return Err(error);
         }
         Ok(())
     }
 
-    fn apply_checkpoint_envelope(
-        &mut self,
-        envelope: &EowcCheckpointEnvelope,
-    ) -> Result<(), DbError> {
-        match (&mut self.state, envelope) {
-            (EowcInnerState::CoreWindow(cw), EowcCheckpointEnvelope::CoreWindow(cp)) => {
-                let previous = cw.checkpoint_windows().map_err(|error| {
+    fn apply_checkpoint(&mut self, checkpoint: &CoreWindowCheckpoint) -> Result<(), DbError> {
+        let window = self.state.as_mut().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "EOWC CoreWindow restore for '{}' targeted uninitialized state",
+                self.op_name
+            ))
+        })?;
+        let previous = window.checkpoint_windows().map_err(|error| {
+            DbError::Checkpoint(format!(
+                "EOWC CoreWindow restore snapshot for '{}': {error}",
+                self.op_name
+            ))
+        })?;
+        if let Err(apply_error) = window.restore_windows(checkpoint) {
+            window
+                .restore_windows(&previous)
+                .map_err(|rollback_error| {
                     DbError::Checkpoint(format!(
-                        "EOWC CoreWindow restore snapshot for '{}': {error}",
+                        "EOWC CoreWindow restore for '{}' failed: {apply_error}; \
+                         rollback also failed: {rollback_error}",
                         self.op_name
                     ))
                 })?;
-                if let Err(apply_error) = cw.restore_windows(cp) {
-                    cw.restore_windows(&previous).map_err(|rollback_error| {
-                        DbError::Checkpoint(format!(
-                            "EOWC CoreWindow restore for '{}' failed: {apply_error}; \
-                             rollback also failed: {rollback_error}",
-                            self.op_name
-                        ))
-                    })?;
-                    return Err(DbError::Checkpoint(format!(
-                        "EOWC CoreWindow restore for '{}': {apply_error}",
-                        self.op_name
-                    )));
-                }
-            }
-            (EowcInnerState::EowcAgg(eowc), EowcCheckpointEnvelope::EowcAgg(cp)) => {
-                let previous = eowc.checkpoint_windows().map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "EOWC aggregate restore snapshot for '{}': {error}",
-                        self.op_name
-                    ))
-                })?;
-                if let Err(apply_error) = eowc.restore_windows(cp) {
-                    eowc.restore_windows(&previous).map_err(|rollback_error| {
-                        DbError::Checkpoint(format!(
-                            "EOWC aggregate restore for '{}' failed: {apply_error}; \
-                             rollback also failed: {rollback_error}",
-                            self.op_name
-                        ))
-                    })?;
-                    return Err(DbError::Checkpoint(format!(
-                        "EOWC aggregate restore for '{}': {apply_error}",
-                        self.op_name
-                    )));
-                }
-            }
-            (
-                EowcInnerState::Raw {
-                    accumulated,
-                    last_closed_boundary,
-                    accumulated_bytes,
-                    ..
-                },
-                EowcCheckpointEnvelope::Raw(cp),
-            ) => {
-                // Decode before assigning any fields so malformed IPC cannot
-                // leave a mixture of old and restored raw state.
-                let (batches, bytes) = restore_raw(cp)?;
-                *accumulated = batches;
-                *accumulated_bytes = bytes;
-                *last_closed_boundary = cp.last_closed_boundary;
-            }
-            (state, envelope) => {
-                let state_name = match state {
-                    EowcInnerState::CoreWindow(_) => "CoreWindow",
-                    EowcInnerState::EowcAgg(_) => "EowcAgg",
-                    EowcInnerState::Raw { .. } => "Raw",
-                    EowcInnerState::Uninit => "Uninit",
-                };
-                let checkpoint_name = match envelope {
-                    EowcCheckpointEnvelope::CoreWindow(_) => "CoreWindow",
-                    EowcCheckpointEnvelope::EowcAgg(_) => "EowcAgg",
-                    EowcCheckpointEnvelope::Raw(_) => "Raw",
-                };
-                return Err(DbError::Checkpoint(format!(
-                    "EOWC checkpoint variant mismatch for '{}': state={} checkpoint={}; \
-                     refusing to discard state",
-                    self.op_name, state_name, checkpoint_name
-                )));
-            }
+            return Err(DbError::Checkpoint(format!(
+                "EOWC CoreWindow restore for '{}': {apply_error}",
+                self.op_name
+            )));
         }
         Ok(())
+    }
+
+    fn core_window_apply_error(op_name: &str, phase: &str, error: DbError) -> DbError {
+        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
+            return error;
+        }
+        DbError::StatefulOperatorPartialApply(format!(
+            "managed CoreWindow '{op_name}' {phase} failed after window state mutation began; recovery from the committed checkpoint is required: {error}"
+        ))
     }
 
     async fn process_core_window(
@@ -417,6 +202,7 @@ impl EowcQueryOperator {
         op_name: &str,
         ctx: &SessionContext,
         task_ctx: &Arc<TaskContext>,
+        recovery_fenced: bool,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let now_filtered = cw.apply_dynamic_now_filter(ctx, inputs, watermark)?;
         let inputs: &[RecordBatch] = now_filtered.as_deref().unwrap_or(inputs);
@@ -448,164 +234,138 @@ impl EowcQueryOperator {
         };
 
         for batch in &pre_agg_batches {
-            cw.update_batch(batch)?;
+            if let Err(error) = cw.update_batch(batch) {
+                return Err(if recovery_fenced {
+                    Self::core_window_apply_error(op_name, "state update", error)
+                } else {
+                    error
+                });
+            }
         }
 
         let having_filter = cw.having_filter().cloned();
         let having_sql = cw.having_sql().map(String::from);
-        let mut batches = cw.close_windows(watermark)?;
+        let mut batches = cw.close_windows(watermark).map_err(|error| {
+            if recovery_fenced {
+                Self::core_window_apply_error(op_name, "window close", error)
+            } else {
+                error
+            }
+        })?;
 
         if let Some(ref filter) = having_filter {
-            batches = apply_compiled_having(&batches, filter)?;
+            batches = apply_compiled_having(&batches, filter).map_err(|error| {
+                if recovery_fenced {
+                    Self::core_window_apply_error(op_name, "HAVING evaluation", error)
+                } else {
+                    error
+                }
+            })?;
         } else if let Some(ref sql) = having_sql {
             batches = apply_having_via_sql(ctx, op_name, &batches, sql, cw.having_sql_cache_mut())
-                .await?;
-        }
-
-        Ok(batches)
-    }
-
-    async fn process_eowc_agg(
-        eowc: &mut IncrementalEowcState,
-        inputs: &[RecordBatch],
-        watermark: i64,
-        op_name: &str,
-        ctx: &SessionContext,
-        task_ctx: &Arc<TaskContext>,
-    ) -> Result<Vec<RecordBatch>, DbError> {
-        let pre_agg_batches = if let Some(proj) = eowc.compiled_projection() {
-            match try_evaluate_compiled(proj, inputs) {
-                Ok(result) => result,
-                Err(e) => {
-                    tracing::debug!(
-                        query = %op_name,
-                        error = %e,
-                        "EOWC-agg compiled pre-agg failed, falling back to cached plan"
-                    );
-                    if let Some(physical) = eowc.cached_pre_agg_physical() {
-                        super::execute_cached_physical(task_ctx.clone(), op_name, physical).await?
+                .await
+                .map_err(|error| {
+                    if recovery_fenced {
+                        Self::core_window_apply_error(op_name, "HAVING execution", error)
                     } else {
-                        return Err(DbError::Pipeline(format!(
-                            "[LDB-8051] EOWC query '{op_name}': compiled pre-agg failed and no cached plan: {e}"
-                        )));
+                        error
                     }
-                }
-            }
-        } else if let Some(physical) = eowc.cached_pre_agg_physical() {
-            super::execute_cached_physical(task_ctx.clone(), op_name, physical).await?
-        } else {
-            return Err(DbError::Pipeline(format!(
-                "[LDB-8050] EOWC query '{op_name}': no compiled projection or cached plan"
-            )));
-        };
-
-        for batch in &pre_agg_batches {
-            eowc.update_batch(batch)?;
-        }
-
-        let having_filter = eowc.having_filter().cloned();
-        let having_sql = eowc.having_sql().map(String::from);
-        let mut batches = eowc.close_windows(watermark)?;
-
-        if let Some(ref filter) = having_filter {
-            batches = apply_compiled_having(&batches, filter)?;
-        } else if let Some(ref sql) = having_sql {
-            batches =
-                apply_having_via_sql(ctx, op_name, &batches, sql, eowc.having_sql_cache_mut())
-                    .await?;
+                })?;
         }
 
         Ok(batches)
     }
 
-    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-    async fn process_raw(
-        accumulated: &mut Vec<RecordBatch>,
-        last_closed_boundary: &mut i64,
-        accumulated_bytes: &mut usize,
-        sql_cache: &mut Option<RawSqlCache>,
-        inputs: &[RecordBatch],
-        watermark: i64,
-        window_config: Option<&WindowOperatorConfig>,
-        sql: &str,
+    fn encode_checkpoint(
+        checkpoint: &CoreWindowCheckpoint,
         op_name: &str,
-        ctx: &SessionContext,
-        max_accumulated_bytes: usize,
-    ) -> Result<Vec<RecordBatch>, DbError> {
-        let input_bytes = inputs
-            .iter()
-            .filter(|batch| batch.num_rows() > 0)
-            .try_fold(0usize, |total, batch| {
-                total
-                    .checked_add(batch.get_array_memory_size())
-                    .ok_or_else(|| DbError::Pipeline("raw EOWC input byte overflow".into()))
-            })?;
-        let next_bytes = (*accumulated_bytes)
-            .checked_add(input_bytes)
-            .ok_or_else(|| {
-                DbError::Pipeline(format!("raw EOWC state byte overflow for '{op_name}'"))
-            })?;
-        if next_bytes > max_accumulated_bytes {
-            return Err(DbError::Pipeline(format!(
-                "raw EOWC state for '{op_name}' would grow to {next_bytes} bytes, exceeding the \
-                 {max_accumulated_bytes}-byte limit; the batch was not applied"
+    ) -> Result<Vec<u8>, DbError> {
+        rkyv::to_bytes::<rkyv::rancor::Error>(checkpoint)
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| {
+                DbError::Pipeline(format!(
+                    "EOWC checkpoint serialization for '{op_name}': {error}"
+                ))
+            })
+    }
+
+    #[cfg(feature = "cluster")]
+    fn target_owns_global_vnode(
+        &self,
+        target: &laminar_core::checkpoint::CheckpointAssignmentFence,
+    ) -> Result<bool, DbError> {
+        let scope = self.cluster_scope.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' has no cluster assignment scope",
+                self.op_name
+            ))
+        })?;
+        let assignment = scope.registry.versioned_snapshot();
+        let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
+        if target.vnode_count != scope.registry.vnode_count()
+            || target.assignment_version != assignment.version()
+            || !target.matches_owner_map(&owners)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' transition target does not match assignment {}",
+                self.op_name,
+                assignment.version()
             )));
         }
+        Ok(assignment.owners()[0] == scope.self_id)
+    }
 
-        let mut staged = accumulated.clone();
-        staged.extend(inputs.iter().filter(|batch| batch.num_rows() > 0).cloned());
-
-        let closed_cut =
-            window_config.map_or(watermark, |cfg| compute_closed_boundary(watermark, cfg));
-
-        if closed_cut <= *last_closed_boundary {
-            *accumulated = staged;
-            *accumulated_bytes = next_bytes;
-            return Ok(Vec::new());
-        }
-
-        if staged.is_empty() {
-            *last_closed_boundary = closed_cut;
-            *accumulated_bytes = 0;
-            return Ok(Vec::new());
-        }
-
-        let (query_batches, retained_batches) = if let Some(cfg) = window_config {
-            split_by_timestamp(&staged, &cfg.time_column, closed_cut)
-        } else {
-            (staged, Vec::new())
-        };
-        let retained_bytes = raw_batches_bytes(&retained_batches)?;
-
-        if query_batches.is_empty() {
-            *accumulated = retained_batches;
-            *accumulated_bytes = retained_bytes;
-            *last_closed_boundary = closed_cut;
-            return Ok(Vec::new());
-        }
-
-        if sql_cache.is_none() {
-            *sql_cache =
-                Some(RawSqlCache::build(ctx, op_name, sql, query_batches[0].schema()).await?);
-        }
-        let output = sql_cache
-            .as_ref()
-            .expect("just initialized")
-            .apply(op_name, query_batches)
-            .await?;
-        *accumulated = retained_batches;
-        *accumulated_bytes = retained_bytes;
-        *last_closed_boundary = closed_cut;
-        Ok(output)
+    #[cfg(feature = "cluster")]
+    fn preflight_managed_base<'a>(
+        window: &CoreWindowState,
+        bytes: &'a [u8],
+    ) -> Result<crate::core_window_state::PreflightedCoreWindowArchive<'a>, DbError> {
+        window.preflight_managed_tumbling_bytes(bytes)
     }
 }
 
 #[async_trait]
 impl GraphOperator for EowcQueryOperator {
-    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
-        crate::operator::capability::OperatorCapability::fixed(
-            crate::operator::capability::OperatorImplementation::EowcQuery,
-        )
+    fn cluster_capability(&self) -> OperatorCapability {
+        self.capability
+    }
+
+    fn managed_state_accounting(&self) -> Option<ManagedStateAccountingSnapshot> {
+        if self.capability.managed_state != Some(ManagedStateContract::CoreWindowV1) {
+            return None;
+        }
+        let window = self.state.as_ref()?;
+        #[cfg(feature = "cluster")]
+        let (prepared, retired) = {
+            let staged = self
+                .prepared_vnode_transition
+                .as_ref()
+                .map_or(0, PreparedCoreWindowTransition::accounted_state_bytes);
+            match self.vnode_transition_cleanup.as_ref() {
+                Some(CoreWindowTransitionCleanup::Aborted(cleanup)) => {
+                    (staged.saturating_add(cleanup.accounted_state_bytes()), 0)
+                }
+                Some(CoreWindowTransitionCleanup::Published(cleanup)) => {
+                    (staged, cleanup.accounted_state_bytes())
+                }
+                None => (staged, 0),
+            }
+        };
+        #[cfg(not(feature = "cluster"))]
+        let (prepared, retired) = (0, 0);
+        Some(ManagedStateAccountingSnapshot {
+            live: window.accounted_state_bytes(),
+            prepared,
+            retired,
+        })
+    }
+
+    async fn initialize_managed_state(&mut self) -> Result<(), DbError> {
+        if self.state.is_none() {
+            self.initialize().await?;
+        }
+        self.resolve_managed_capability();
+        Ok(())
     }
 
     async fn process(
@@ -614,121 +374,59 @@ impl GraphOperator for EowcQueryOperator {
         watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
         let watermark = watermarks.first().copied().unwrap_or(i64::MIN);
-        // Flatten inputs from port 0
-        let input_batches: Vec<RecordBatch> = inputs.first().cloned().unwrap_or_default();
+        let input_batches = inputs.first().map_or(&[][..], Vec::as_slice);
 
-        if matches!(self.state, EowcInnerState::Uninit) {
+        if self.state.is_none() {
             self.initialize().await?;
         } else {
             // A failed deferred restore remains pending. Retrying it here
             // prevents processing against empty state if the first error was ignored.
             self.apply_pending_restore()?;
         }
+        self.resolve_managed_capability();
 
-        match &mut self.state {
-            EowcInnerState::Uninit => Err(DbError::Pipeline(format!(
+        let window = self.state.as_mut().ok_or_else(|| {
+            DbError::Pipeline(format!(
                 "EOWC query '{}': state not initialized",
                 self.op_name
-            ))),
-            EowcInnerState::CoreWindow(ref mut cw) => {
-                Self::process_core_window(
-                    cw,
-                    &input_batches,
-                    watermark,
-                    &self.op_name,
-                    &self.ctx,
-                    &self.task_ctx,
-                )
-                .await
-            }
-            EowcInnerState::EowcAgg(ref mut eowc) => {
-                Self::process_eowc_agg(
-                    eowc,
-                    &input_batches,
-                    watermark,
-                    &self.op_name,
-                    &self.ctx,
-                    &self.task_ctx,
-                )
-                .await
-            }
-            EowcInnerState::Raw {
-                ref mut accumulated,
-                ref mut last_closed_boundary,
-                ref mut accumulated_bytes,
-                ref mut sql_cache,
-            } => {
-                let wc = self.window_config.as_ref();
-                Self::process_raw(
-                    accumulated,
-                    last_closed_boundary,
-                    accumulated_bytes,
-                    sql_cache,
-                    &input_batches,
-                    watermark,
-                    wc,
-                    &self.sql,
-                    &self.op_name,
-                    &self.ctx,
-                    MAX_EOWC_ACCUMULATED_BYTES,
-                )
-                .await
-            }
-        }
+            ))
+        })?;
+        let recovery_fenced =
+            self.capability.managed_state == Some(ManagedStateContract::CoreWindowV1);
+        Self::process_core_window(
+            window,
+            input_batches,
+            watermark,
+            &self.op_name,
+            &self.ctx,
+            &self.task_ctx,
+            recovery_fenced,
+        )
+        .await
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
-        if !matches!(self.state, EowcInnerState::Uninit) {
-            // Never publish a checkpoint while recovery is unapplied.
-            self.apply_pending_restore()?;
-        }
-        let envelope = match &mut self.state {
-            EowcInnerState::Uninit => {
-                // Re-serialize a pending restore so a restore→checkpoint before
-                // the first process() doesn't silently drop buffered state.
-                if let Some(ref env) = self.pending_restore {
-                    let data = rkyv::to_bytes::<rkyv::rancor::Error>(env)
-                        .map(|v| v.to_vec())
-                        .map_err(|e| {
-                            DbError::Pipeline(format!(
-                                "EOWC checkpoint serialization of pending restore for '{}': {e}",
-                                self.op_name
-                            ))
-                        })?;
-                    return Ok(Some(OperatorCheckpoint { data }));
-                }
+        if self.state.is_none() {
+            let Some(checkpoint) = self.pending_restore.as_ref() else {
                 return Ok(None);
-            }
-            EowcInnerState::CoreWindow(ref mut cw) => {
-                let cp = cw.checkpoint_windows()?;
-                EowcCheckpointEnvelope::CoreWindow(cp)
-            }
-            EowcInnerState::EowcAgg(ref mut eowc) => {
-                let cp = eowc.checkpoint_windows()?;
-                EowcCheckpointEnvelope::EowcAgg(cp)
-            }
-            EowcInnerState::Raw {
-                accumulated,
-                last_closed_boundary,
-                ..
-            } => EowcCheckpointEnvelope::Raw(snapshot_raw(accumulated, *last_closed_boundary)?),
-        };
-
-        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&envelope)
-            .map(|v| v.to_vec())
-            .map_err(|e| {
-                DbError::Pipeline(format!(
-                    "EOWC checkpoint serialization for '{}': {e}",
-                    self.op_name
-                ))
-            })?;
-
+            };
+            let data = Self::encode_checkpoint(checkpoint, &self.op_name)?;
+            return Ok(Some(OperatorCheckpoint { data }));
+        }
+        // Never publish a checkpoint while recovery is unapplied.
+        self.apply_pending_restore()?;
+        let checkpoint = self
+            .state
+            .as_mut()
+            .expect("EOWC state was checked above")
+            .checkpoint_windows()?;
+        let data = Self::encode_checkpoint(&checkpoint, &self.op_name)?;
         Ok(Some(OperatorCheckpoint { data }))
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        let envelope: EowcCheckpointEnvelope =
-            rkyv::from_bytes::<EowcCheckpointEnvelope, rkyv::rancor::Error>(&checkpoint.data)
+        let checkpoint =
+            rkyv::from_bytes::<CoreWindowCheckpoint, rkyv::rancor::Error>(&checkpoint.data)
                 .map_err(|e| {
                     DbError::Checkpoint(format!(
                         "EOWC checkpoint deserialization for '{}': {e}",
@@ -736,13 +434,176 @@ impl GraphOperator for EowcQueryOperator {
                     ))
                 })?;
 
-        if matches!(self.state, EowcInnerState::Uninit) {
-            self.pending_restore = Some(envelope);
+        if self.state.is_none() {
+            self.pending_restore = Some(checkpoint);
         } else {
-            self.apply_checkpoint_envelope(&envelope)?;
+            self.apply_checkpoint(&checkpoint)?;
         }
 
         Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn checkpoint_by_vnode(
+        &mut self,
+        required_vnodes: &[u32],
+        vnode_count: u32,
+    ) -> Result<
+        Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
+        DbError,
+    > {
+        let scope = self.cluster_scope.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' has no cluster assignment scope",
+                self.op_name
+            ))
+        })?;
+        let assignment = scope.registry.versioned_snapshot();
+        let expected = if assignment.owners()[0] == scope.self_id {
+            &[0_u32][..]
+        } else {
+            &[][..]
+        };
+        if vnode_count != scope.registry.vnode_count()
+            || required_vnodes != expected
+            || required_vnodes.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' capture roster {required_vnodes:?} does not match vnode-zero ownership for vnode_count {vnode_count}",
+                self.op_name
+            )));
+        }
+        if required_vnodes.is_empty() {
+            return Ok(None);
+        }
+        if self.capability.managed_state != Some(ManagedStateContract::CoreWindowV1) {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow capture targeted unsupported operator '{}'",
+                self.op_name
+            )));
+        }
+        let Some(window) = self.state.as_mut() else {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow capture targeted uninitialized operator '{}'",
+                self.op_name
+            )));
+        };
+        let checkpoint = window.checkpoint_windows()?;
+        let bytes = Self::encode_checkpoint(&checkpoint, &self.op_name)?;
+        let mut captured = std::collections::HashMap::new();
+        captured.try_reserve(1).map_err(|error| {
+            DbError::Checkpoint(format!(
+                "managed CoreWindow capture roster reserve failed: {error}"
+            ))
+        })?;
+        captured.insert(
+            0,
+            crate::checkpoint_coordinator::StagedSlice::Bytes(bytes::Bytes::from(bytes)),
+        );
+        Ok(Some(captured))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn prepare_vnode_transition(
+        &mut self,
+        transition: ManagedVnodeTransition<'_>,
+    ) -> Result<(), DbError> {
+        if self.prepared_vnode_transition.is_some() || self.vnode_transition_cleanup.is_some() {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' already owns vnode transition state",
+                self.op_name
+            )));
+        }
+        if self.capability.managed_state != Some(ManagedStateContract::CoreWindowV1) {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow transition targeted unsupported operator '{}'",
+                self.op_name
+            )));
+        }
+        if transition.revoked.len() > 1
+            || transition.revoked.iter().any(|vnode| *vnode != 0)
+            || transition.restores.len() > 1
+            || transition.restores.iter().any(|restore| restore.vnode != 0)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' transition is not scoped exactly to vnode zero",
+                self.op_name
+            )));
+        }
+        let target_owns_global = self.target_owns_global_vnode(transition.target)?;
+        let Some(window) = self.state.as_ref() else {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow transition targeted uninitialized operator '{}'",
+                self.op_name
+            )));
+        };
+        let prepared = if target_owns_global {
+            if !transition.revoked.is_empty() {
+                return Err(DbError::Checkpoint(format!(
+                    "managed CoreWindow '{}' vnode-zero acquisition cannot also revoke vnode zero",
+                    self.op_name
+                )));
+            }
+            let restore = transition.restores.first().ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "managed CoreWindow '{}' acquisition is missing its vnode-zero FULL base",
+                    self.op_name
+                ))
+            })?;
+            if !restore.deltas.is_empty() {
+                return Err(DbError::Checkpoint(format!(
+                    "managed CoreWindow '{}' accepts FULL vnode-zero images only",
+                    self.op_name
+                )));
+            }
+            let archive = Self::preflight_managed_base(window, restore.base)?;
+            window.prepare_managed_tumbling_restore(&archive)?
+        } else {
+            if !transition.restores.is_empty() || !transition.revoked.contains(&0) {
+                return Err(DbError::Checkpoint(format!(
+                    "managed CoreWindow '{}' owner exit requires exact vnode-zero revoke without restore",
+                    self.op_name
+                )));
+            }
+            window.prepare_managed_tumbling_empty()
+        };
+        self.prepared_vnode_transition = Some(prepared);
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn abort_vnode_transition(&mut self) {
+        let Some(prepared) = self.prepared_vnode_transition.take() else {
+            return;
+        };
+        assert!(
+            self.vnode_transition_cleanup.is_none(),
+            "managed CoreWindow cleanup must finish before abort"
+        );
+        self.vnode_transition_cleanup = Some(CoreWindowTransitionCleanup::Aborted(prepared));
+    }
+
+    #[cfg(feature = "cluster")]
+    fn publish_vnode_transition(&mut self) {
+        let prepared = self
+            .prepared_vnode_transition
+            .take()
+            .expect("managed CoreWindow transition must be prepared before publication");
+        assert!(
+            self.vnode_transition_cleanup.is_none(),
+            "managed CoreWindow cleanup must finish before publication"
+        );
+        let window = self
+            .state
+            .as_mut()
+            .expect("managed CoreWindow publication targeted uninitialized state");
+        let retired = window.publish_managed_tumbling_transition(prepared);
+        self.vnode_transition_cleanup = Some(CoreWindowTransitionCleanup::Published(retired));
+    }
+
+    #[cfg(feature = "cluster")]
+    fn finish_vnode_transition(&mut self) {
+        drop(self.vnode_transition_cleanup.take());
     }
 }
 
@@ -770,47 +631,16 @@ async fn apply_having_via_sql(
         .await
 }
 
-/// Split batches at `boundary` into closed (ts < boundary) and retained rows.
-fn split_by_timestamp(
-    batches: &[RecordBatch],
-    time_column: &str,
-    boundary: i64,
-) -> (Vec<RecordBatch>, Vec<RecordBatch>) {
-    use laminar_core::time::{filter_batch_by_timestamp, ThresholdOp};
-
-    let mut closed_batches = Vec::new();
-    let mut retained_batches = Vec::new();
-
-    for batch in batches {
-        match filter_batch_by_timestamp(batch, time_column, boundary, ThresholdOp::Less) {
-            Ok(Some(closed)) => closed_batches.push(closed),
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(
-                    column = %time_column,
-                    error = %e,
-                    "split_by_timestamp: pushing batch to closed bucket due to filter error"
-                );
-                closed_batches.push(batch.clone());
-                continue;
-            }
-        }
-        if let Ok(Some(retained)) =
-            filter_batch_by_timestamp(batch, time_column, boundary, ThresholdOp::GreaterEq)
-        {
-            retained_batches.push(retained);
-        }
-    }
-
-    (closed_batches, retained_batches)
-}
-
 #[cfg(test)]
-mod tests {
+mod core_tests {
     use super::*;
     use arrow::array::{Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
+    #[cfg(feature = "cluster")]
+    use laminar_core::cluster::control::LeaseDeadline;
+    #[cfg(feature = "cluster")]
+    use laminar_core::state::{NodeId, VnodeRegistry};
     use std::time::Duration;
 
     const AGG_SQL: &str = "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol";
@@ -863,39 +693,211 @@ mod tests {
         }
     }
 
-    fn checkpoint_from_envelope(envelope: &EowcCheckpointEnvelope) -> OperatorCheckpoint {
+    fn checkpoint_from_core(checkpoint: &CoreWindowCheckpoint) -> OperatorCheckpoint {
         OperatorCheckpoint {
-            data: rkyv::to_bytes::<rkyv::rancor::Error>(envelope)
+            data: rkyv::to_bytes::<rkyv::rancor::Error>(checkpoint)
                 .unwrap()
                 .to_vec(),
         }
     }
 
-    fn envelope_from_checkpoint(checkpoint: &OperatorCheckpoint) -> EowcCheckpointEnvelope {
-        rkyv::from_bytes::<EowcCheckpointEnvelope, rkyv::rancor::Error>(&checkpoint.data).unwrap()
+    fn core_from_checkpoint(checkpoint: &OperatorCheckpoint) -> CoreWindowCheckpoint {
+        rkyv::from_bytes::<CoreWindowCheckpoint, rkyv::rancor::Error>(&checkpoint.data).unwrap()
     }
 
-    fn raw_operator() -> EowcQueryOperator {
-        let mut op = EowcQueryOperator::new(
-            "test_raw_restore",
-            "SELECT * FROM trades",
+    #[cfg(feature = "cluster")]
+    async fn single_owner_cluster_scope() -> (
+        ClusterShuffleConfig,
+        laminar_core::checkpoint::CheckpointAssignmentFence,
+    ) {
+        let self_id = NodeId(1);
+        let incarnation = uuid::Uuid::from_u128(1);
+        let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
+        let receiver = Arc::new(
+            laminar_core::shuffle::ShuffleReceiver::bind(
+                self_id.0,
+                "127.0.0.1:0".parse().unwrap(),
+                incarnation,
+            )
+            .await
+            .unwrap(),
+        );
+        let sender = Arc::new(laminar_core::shuffle::ShuffleSender::new(
+            self_id.0,
+            incarnation,
+        ));
+        let process_deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(60)));
+        receiver
+            .install_process_lease_deadline(Arc::clone(&process_deadline))
+            .unwrap();
+        sender
+            .install_process_lease_deadline(process_deadline)
+            .unwrap();
+        let owners = [self_id.0];
+        let target = laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
+            registry.assignment_version(),
+            &owners,
+            vec![laminar_core::checkpoint::CheckpointParticipant {
+                node_id: self_id.0,
+                boot_incarnation: incarnation,
+            }],
+        )
+        .unwrap();
+        sender.install_assignment_fence(&target, &owners).unwrap();
+        receiver.install_assignment_fence(&target, &owners).unwrap();
+        (
+            ClusterShuffleConfig {
+                registry,
+                sender,
+                receiver,
+                self_id,
+            },
+            target,
+        )
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn managed_core_window_operator(
+        name: &str,
+        updates: usize,
+    ) -> (
+        EowcQueryOperator,
+        laminar_core::checkpoint::CheckpointAssignmentFence,
+    ) {
+        const SQL: &str = "SELECT SUM(price) AS total FROM trades";
+
+        let ctx = aggregate_context();
+        let mut operator = EowcQueryOperator::new(
+            name,
+            SQL,
             Some(EmitClause::OnWindowClose),
-            None,
-            laminar_sql::create_session_context(),
+            Some(test_window_config()),
+            ctx,
             None,
         );
-        op.state = raw_state(vec![test_batch(vec![100, 200])], 99);
-        op
+        let (scope, target) = single_owner_cluster_scope().await;
+        operator.attach_cluster_scope(scope);
+        operator.initialize_managed_state().await.unwrap();
+        assert_eq!(
+            operator.cluster_capability().managed_state,
+            Some(ManagedStateContract::CoreWindowV1)
+        );
+        for _ in 0..updates {
+            operator
+                .process(&[vec![test_batch(vec![100])]], &[i64::MIN])
+                .await
+                .unwrap();
+        }
+        (operator, target)
     }
 
-    fn raw_state(accumulated: Vec<RecordBatch>, last_closed_boundary: i64) -> EowcInnerState {
-        let accumulated_bytes = raw_batches_bytes(&accumulated).unwrap();
-        EowcInnerState::Raw {
-            accumulated,
-            last_closed_boundary,
-            accumulated_bytes,
-            sql_cache: None,
-        }
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn managed_core_window_transition_is_offside_and_accounted() {
+        let (mut donor, _) = managed_core_window_operator("managed_donor", 1).await;
+        let donor_slice = donor
+            .checkpoint_by_vnode(&[0], 1)
+            .unwrap()
+            .expect("the vnode-zero owner must capture a full image")
+            .remove(&0)
+            .expect("the capture must name vnode zero");
+        let crate::checkpoint_coordinator::StagedSlice::Bytes(donor_slice) = donor_slice else {
+            panic!("managed CoreWindow capture must be a full image");
+        };
+
+        let (mut subject, target) = managed_core_window_operator("managed_subject", 2).await;
+        let revoked = rustc_hash::FxHashSet::default();
+        let before = subject.checkpoint().unwrap().unwrap().data;
+
+        let mut corrupt = core_from_checkpoint(&OperatorCheckpoint {
+            data: donor_slice.to_vec(),
+        });
+        corrupt.fingerprint = corrupt.fingerprint.wrapping_add(1);
+        let corrupt = checkpoint_from_core(&corrupt);
+        let corrupt_restores = [crate::operator_graph::ManagedVnodeRestore {
+            vnode: 0,
+            base: &corrupt.data,
+            deltas: &[],
+        }];
+        let error = subject
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                target: &target,
+                revoked: &revoked,
+                restores: &corrupt_restores,
+            })
+            .expect_err("borrowed fingerprint preflight must reject the image");
+        assert!(
+            error.to_string().contains("fingerprint mismatch"),
+            "{error}"
+        );
+        assert_eq!(subject.checkpoint().unwrap().unwrap().data, before);
+        assert_eq!(
+            subject.managed_state_accounting().unwrap().prepared,
+            0,
+            "rejected preflight must not retain an off-side image"
+        );
+
+        let restores = [crate::operator_graph::ManagedVnodeRestore {
+            vnode: 0,
+            base: donor_slice.as_ref(),
+            deltas: &[],
+        }];
+        let live_before = subject.managed_state_accounting().unwrap().live;
+        subject
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                target: &target,
+                revoked: &revoked,
+                restores: &restores,
+            })
+            .unwrap();
+        let prepared = subject.managed_state_accounting().unwrap();
+        assert_eq!(prepared.live, live_before);
+        assert!(prepared.prepared > 0);
+        assert_eq!(prepared.retired, 0);
+
+        subject.abort_vnode_transition();
+        let aborted = subject.managed_state_accounting().unwrap();
+        assert_eq!(aborted.live, live_before);
+        assert!(aborted.prepared > 0);
+        assert_eq!(aborted.retired, 0);
+        subject.finish_vnode_transition();
+        assert_eq!(subject.checkpoint().unwrap().unwrap().data, before);
+        let live_before = subject.managed_state_accounting().unwrap().live;
+        assert_eq!(
+            subject.managed_state_accounting().unwrap(),
+            ManagedStateAccountingSnapshot {
+                live: live_before,
+                prepared: 0,
+                retired: 0,
+            }
+        );
+
+        subject
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                target: &target,
+                revoked: &revoked,
+                restores: &restores,
+            })
+            .unwrap();
+        let prepared_bytes = subject.managed_state_accounting().unwrap().prepared;
+        subject.publish_vnode_transition();
+        let published = subject.managed_state_accounting().unwrap();
+        assert_eq!(published.live, prepared_bytes);
+        assert_eq!(published.prepared, 0);
+        assert_eq!(published.retired, live_before);
+        subject.finish_vnode_transition();
+        assert_eq!(subject.managed_state_accounting().unwrap().retired, 0);
+
+        let restored = subject
+            .checkpoint_by_vnode(&[0], 1)
+            .unwrap()
+            .unwrap()
+            .remove(&0)
+            .unwrap();
+        let crate::checkpoint_coordinator::StagedSlice::Bytes(restored) = restored else {
+            panic!("managed CoreWindow capture must remain full-only");
+        };
+        assert_eq!(restored, donor_slice);
     }
 
     async fn core_window_operator() -> EowcQueryOperator {
@@ -914,341 +916,26 @@ mod tests {
             ctx,
             None,
         );
-        op.state = EowcInnerState::CoreWindow(Box::new(state));
+        op.state = Some(Box::new(state));
         op.process(&[vec![test_batch(vec![100])]], &[i64::MIN])
             .await
             .unwrap();
         op
-    }
-
-    async fn eowc_aggregate_operator() -> EowcQueryOperator {
-        let ctx = aggregate_context();
-        let config = test_window_config();
-        let state = IncrementalEowcState::try_from_sql(
-            &ctx,
-            AGG_SQL,
-            &config,
-            Some(&EmitClause::OnWindowClose),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let mut op = EowcQueryOperator::new(
-            "test_eowc_agg_restore",
-            AGG_SQL,
-            Some(EmitClause::OnWindowClose),
-            Some(config),
-            ctx,
-            None,
-        );
-        op.state = EowcInnerState::EowcAgg(Box::new(state));
-        op.process(&[vec![test_batch(vec![100])]], &[i64::MIN])
-            .await
-            .unwrap();
-        op
-    }
-
-    #[test]
-    fn corrupt_checkpoint_envelope_fails_without_mutating_raw_state() {
-        let mut op = raw_operator();
-        let before = op.checkpoint().unwrap().unwrap();
-
-        let error = op
-            .restore(OperatorCheckpoint {
-                data: vec![0xff, 0x00, 0x7f],
-            })
-            .unwrap_err();
-
-        assert!(error.to_string().contains("deserialization"));
-        assert!(error.requires_pipeline_recovery());
-        assert_eq!(op.checkpoint().unwrap().unwrap().data, before.data);
-    }
-
-    #[test]
-    fn corrupt_raw_payload_fails_without_partial_state_mutation() {
-        let mut op = raw_operator();
-        let before = op.checkpoint().unwrap().unwrap();
-        let corrupt = EowcCheckpointEnvelope::Raw(RawCheckpoint {
-            ipc: vec![0xff, 0x00, 0x7f],
-            last_closed_boundary: 1234,
-        });
-
-        let error = op.restore(checkpoint_from_envelope(&corrupt)).unwrap_err();
-
-        assert!(error.to_string().contains("raw restore"));
-        assert!(error.requires_pipeline_recovery());
-        assert_eq!(op.checkpoint().unwrap().unwrap().data, before.data);
     }
 
     #[tokio::test]
     async fn corrupt_core_window_payload_rolls_back_all_state() {
         let mut op = core_window_operator().await;
         let before = op.checkpoint().unwrap().unwrap();
-        let mut corrupt = envelope_from_checkpoint(&before);
-        let EowcCheckpointEnvelope::CoreWindow(ref mut checkpoint) = corrupt else {
-            panic!("expected CoreWindow checkpoint");
-        };
-        checkpoint.high_watermark_ms = 1234;
-        checkpoint.windows[0].groups[0].key = vec![0xff, 0x00, 0x7f];
+        let mut corrupt = core_from_checkpoint(&before);
+        corrupt.high_watermark_ms = 1234;
+        corrupt.windows[0].groups[0].key = vec![0xff, 0x00, 0x7f];
 
-        let error = op.restore(checkpoint_from_envelope(&corrupt)).unwrap_err();
+        let error = op.restore(checkpoint_from_core(&corrupt)).unwrap_err();
 
         assert!(error.to_string().contains("CoreWindow restore"));
         assert!(error.requires_pipeline_recovery());
         assert_eq!(op.checkpoint().unwrap().unwrap().data, before.data);
-    }
-
-    #[tokio::test]
-    async fn corrupt_eowc_aggregate_payload_rolls_back_all_state() {
-        let mut op = eowc_aggregate_operator().await;
-        let before = op.checkpoint().unwrap().unwrap();
-        let mut corrupt = envelope_from_checkpoint(&before);
-        let EowcCheckpointEnvelope::EowcAgg(ref mut checkpoint) = corrupt else {
-            panic!("expected EowcAgg checkpoint");
-        };
-        checkpoint.high_watermark_ms = 1234;
-        checkpoint.windows[0].groups[0].key = vec![0xff, 0x00, 0x7f];
-
-        let error = op.restore(checkpoint_from_envelope(&corrupt)).unwrap_err();
-
-        assert!(error.to_string().contains("aggregate restore"));
-        assert!(error.requires_pipeline_recovery());
-        assert_eq!(op.checkpoint().unwrap().unwrap().data, before.data);
-    }
-
-    #[tokio::test]
-    async fn every_checkpoint_variant_mismatch_fails_without_mutation() {
-        let core_checkpoint = CoreWindowCheckpoint {
-            fingerprint: 0,
-            windows: Vec::new(),
-            session_state: Vec::new(),
-            window_type: "tumbling".to_string(),
-            high_watermark_ms: i64::MIN,
-        };
-        let aggregate_checkpoint = EowcStateCheckpoint {
-            fingerprint: 0,
-            windows: Vec::new(),
-            high_watermark_ms: i64::MIN,
-        };
-
-        let mut raw = raw_operator();
-        let raw_before = raw.checkpoint().unwrap().unwrap();
-        for envelope in [
-            EowcCheckpointEnvelope::CoreWindow(core_checkpoint),
-            EowcCheckpointEnvelope::EowcAgg(aggregate_checkpoint),
-        ] {
-            let error = raw
-                .restore(checkpoint_from_envelope(&envelope))
-                .unwrap_err();
-            assert!(error.to_string().contains("variant mismatch"));
-            assert!(error.requires_pipeline_recovery());
-            assert_eq!(raw.checkpoint().unwrap().unwrap().data, raw_before.data);
-        }
-
-        let raw_checkpoint = EowcCheckpointEnvelope::Raw(RawCheckpoint {
-            ipc: Vec::new(),
-            last_closed_boundary: 1234,
-        });
-        let mut core = core_window_operator().await;
-        let core_before = core.checkpoint().unwrap().unwrap();
-        let error = core
-            .restore(checkpoint_from_envelope(&raw_checkpoint))
-            .unwrap_err();
-        assert!(error.to_string().contains("variant mismatch"));
-        assert!(error.requires_pipeline_recovery());
-        assert_eq!(core.checkpoint().unwrap().unwrap().data, core_before.data);
-
-        let mut aggregate = eowc_aggregate_operator().await;
-        let aggregate_before = aggregate.checkpoint().unwrap().unwrap();
-        let error = aggregate
-            .restore(checkpoint_from_envelope(&raw_checkpoint))
-            .unwrap_err();
-        assert!(error.to_string().contains("variant mismatch"));
-        assert!(error.requires_pipeline_recovery());
-        assert_eq!(
-            aggregate.checkpoint().unwrap().unwrap().data,
-            aggregate_before.data
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_pending_restore_remains_fail_closed() {
-        let mut op = EowcQueryOperator::new(
-            "test_pending_restore",
-            "SELECT * FROM trades",
-            Some(EmitClause::OnWindowClose),
-            None,
-            laminar_sql::create_session_context(),
-            None,
-        );
-        let corrupt = EowcCheckpointEnvelope::Raw(RawCheckpoint {
-            ipc: vec![0xff, 0x00, 0x7f],
-            last_closed_boundary: 1234,
-        });
-        op.restore(checkpoint_from_envelope(&corrupt)).unwrap();
-
-        let error = op.process(&[vec![]], &[0]).await.unwrap_err();
-        assert!(error.requires_pipeline_recovery());
-        assert!(op.pending_restore.is_some());
-        let retry_error = op.process(&[vec![]], &[0]).await.unwrap_err();
-        assert!(retry_error.requires_pipeline_recovery());
-        let checkpoint_error = op
-            .checkpoint()
-            .err()
-            .expect("failed pending restore must reject checkpointing");
-        assert!(checkpoint_error.requires_pipeline_recovery());
-        let EowcInnerState::Raw {
-            accumulated,
-            last_closed_boundary,
-            accumulated_bytes,
-            ..
-        } = &op.state
-        else {
-            panic!("expected initialized Raw state");
-        };
-        assert!(accumulated.is_empty());
-        assert_eq!(*accumulated_bytes, 0);
-        assert_eq!(*last_closed_boundary, i64::MIN);
-    }
-
-    #[tokio::test]
-    async fn raw_byte_limit_accepts_boundary_and_close_releases_accounting() {
-        let ctx = laminar_sql::create_session_context();
-        let first = test_batch(vec![100]);
-        let second = test_batch(vec![200]);
-        let mut accumulated = vec![first];
-        let mut accumulated_bytes = raw_batches_bytes(&accumulated).unwrap();
-        let exact_limit = accumulated_bytes + second.get_array_memory_size();
-        let mut boundary = 0;
-        let mut cache = None;
-
-        let output = EowcQueryOperator::process_raw(
-            &mut accumulated,
-            &mut boundary,
-            &mut accumulated_bytes,
-            &mut cache,
-            &[second],
-            0,
-            None,
-            "SELECT * FROM trades",
-            "raw_limit",
-            &ctx,
-            exact_limit,
-        )
-        .await
-        .unwrap();
-        assert!(output.is_empty());
-        assert_eq!(accumulated_bytes, exact_limit);
-
-        let output = EowcQueryOperator::process_raw(
-            &mut accumulated,
-            &mut boundary,
-            &mut accumulated_bytes,
-            &mut cache,
-            &[],
-            1,
-            None,
-            "SELECT * FROM trades",
-            "raw_limit",
-            &ctx,
-            exact_limit,
-        )
-        .await
-        .unwrap();
-        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
-        assert!(accumulated.is_empty());
-        assert_eq!(accumulated_bytes, 0);
-        assert_eq!(boundary, 1);
-    }
-
-    #[tokio::test]
-    async fn raw_byte_limit_rejection_is_atomic_and_retryable() {
-        let ctx = laminar_sql::create_session_context();
-        let first = test_batch(vec![100]);
-        let incoming = test_batch(vec![200]);
-        let mut accumulated = vec![first];
-        let mut accumulated_bytes = raw_batches_bytes(&accumulated).unwrap();
-        let limit = accumulated_bytes + incoming.get_array_memory_size() - 1;
-        let mut boundary = 0;
-        let mut cache = None;
-        let before = snapshot_raw(&accumulated, boundary).unwrap();
-
-        for _ in 0..2 {
-            let error = EowcQueryOperator::process_raw(
-                &mut accumulated,
-                &mut boundary,
-                &mut accumulated_bytes,
-                &mut cache,
-                std::slice::from_ref(&incoming),
-                0,
-                None,
-                "SELECT * FROM trades",
-                "raw_limit",
-                &ctx,
-                limit,
-            )
-            .await
-            .unwrap_err();
-            assert!(error.to_string().contains("batch was not applied"));
-            let after = snapshot_raw(&accumulated, boundary).unwrap();
-            assert_eq!(after.ipc, before.ipc);
-            assert_eq!(after.last_closed_boundary, before.last_closed_boundary);
-            assert_eq!(accumulated_bytes, raw_batches_bytes(&accumulated).unwrap());
-        }
-    }
-
-    /// Regression test for the raw-EOWC source-leak bug: before the fix,
-    /// `process_raw` registered a `_eowc_raw_*` `MemTable` but then ran the
-    /// user SQL referencing the real source. We set up a `SessionContext`
-    /// where the source `trades` holds DIFFERENT data than the operator's
-    /// `accumulated`, then trigger a close. With the fix, output reflects
-    /// `accumulated`; pre-fix, it leaked the source's contents.
-    #[tokio::test]
-    async fn test_eowc_raw_runs_against_source_not_accumulated() {
-        use datafusion::datasource::MemTable;
-        let ctx = laminar_sql::create_session_context();
-        // Register `trades` in the SessionContext with batch_A (ts=999).
-        let batch_a = test_batch(vec![999]);
-        let mem = MemTable::try_new(test_schema(), vec![vec![batch_a]]).unwrap();
-        ctx.register_table("trades", Arc::new(mem)).unwrap();
-
-        // Construct an operator whose Raw state accumulates batch_B (ts=10,20).
-        let mut op = EowcQueryOperator::new(
-            "test_raw",
-            "SELECT symbol, ts FROM trades",
-            Some(EmitClause::OnWindowClose),
-            None,
-            ctx,
-            None,
-        );
-        op.state = raw_state(vec![test_batch(vec![10, 20])], i64::MIN);
-        // Drive process(): empty inputs, watermark advances to 100 — should
-        // close the window and emit accumulated (ts in {10,20}).
-        let out = op.process(&[vec![]], &[100]).await.unwrap();
-        let ts_out: Vec<i64> = out
-            .iter()
-            .flat_map(|b| {
-                b.column(b.schema().index_of("ts").unwrap())
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .iter()
-                    .map(Option::unwrap)
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        // Expected (the fix): {10, 20}. Bug: {999}.
-        assert!(
-            !ts_out.contains(&999),
-            "raw EOWC leaked source data (ts=999) into the close-cycle output: got {ts_out:?}"
-        );
-        let mut sorted = ts_out;
-        sorted.sort_unstable();
-        assert_eq!(
-            sorted,
-            vec![10_i64, 20],
-            "expected accumulated rows at close"
-        );
     }
 
     #[test]
@@ -1263,7 +950,7 @@ mod tests {
             None,
         );
         assert_eq!(&*op.op_name, "test_eowc");
-        assert!(matches!(op.state, EowcInnerState::Uninit));
+        assert!(op.state.is_none());
     }
 
     #[test]
@@ -1281,64 +968,18 @@ mod tests {
         assert!(cp.is_none());
     }
 
-    #[test]
-    fn test_raw_checkpoint_roundtrip() {
-        let mut op = EowcQueryOperator::new(
-            "test_eowc",
-            "SELECT * FROM trades",
-            Some(EmitClause::OnWindowClose),
-            None,
-            laminar_sql::create_session_context(),
-            None,
-        );
-        op.state = raw_state(vec![test_batch(vec![100, 200]), test_batch(vec![300])], 999);
-        let cp = op.checkpoint().unwrap().unwrap();
-
-        let mut restored = EowcQueryOperator::new(
-            "test_eowc",
-            "SELECT * FROM trades",
-            Some(EmitClause::OnWindowClose),
-            None,
-            laminar_sql::create_session_context(),
-            None,
-        );
-        restored.state = raw_state(Vec::new(), i64::MIN);
-        restored.restore(cp).unwrap();
-        let EowcInnerState::Raw {
-            accumulated,
-            last_closed_boundary,
-            accumulated_bytes,
-            ..
-        } = &restored.state
-        else {
-            panic!("expected Raw state after restore");
-        };
-        assert_eq!(*accumulated_bytes, raw_batches_bytes(accumulated).unwrap());
-        assert_eq!(*last_closed_boundary, 999);
-        assert_eq!(
-            accumulated.iter().map(RecordBatch::num_rows).sum::<usize>(),
-            3
-        );
-    }
-
     #[tokio::test]
     async fn test_eowc_process_empty_inputs() {
-        let ctx = laminar_sql::create_session_context();
-        laminar_sql::register_streaming_functions(&ctx);
-
-        // Register trades table so SQL planning works
-        let schema = test_schema();
-        let empty = datafusion::datasource::MemTable::try_new(schema, vec![vec![]]).unwrap();
-        ctx.register_table("trades", Arc::new(empty)).unwrap();
-
+        let ctx = aggregate_context();
         let mut op = EowcQueryOperator::new(
             "test_eowc",
-            "SELECT * FROM trades",
+            AGG_SQL,
             Some(EmitClause::OnWindowClose),
-            None,
+            Some(test_window_config()),
             ctx,
             None,
         );
+        op.initialize_managed_state().await.unwrap();
 
         let result = op.process(&[vec![]], &[0]).await.unwrap();
         assert!(result.is_empty());

@@ -34,7 +34,7 @@ LaminarDB is a Rust workspace with 6 crates. Here's what each one does:
 | Crate | What it does |
 |-------|-------------|
 | **laminar-core** | The engine. Operators, window assigners, streaming channels (crossfire), checkpoint barrier protocol, lookup tables, time/watermarks, structured error codes, checkpoint manifests, and object-store checkpoint persistence. |
-| **laminar-sql** | SQL parser with streaming extensions (EMIT, watermarks, windows, ASOF, temporal probe joins), query planner, DataFusion integration, custom UDFs, streaming physical optimizer. |
+| **laminar-sql** | SQL parser with streaming extensions (EMIT, watermarks, windows, and bounded joins), query planner, DataFusion integration, custom UDFs, streaming physical optimizer. |
 | **laminar-connectors** | All external connectors: Kafka, PostgreSQL CDC, MongoDB CDC, Delta Lake, Iceberg, WebSocket, OpenTelemetry (OTLP/gRPC), files, Postgres/Parquet lookup. Also the schema framework and serde layer. |
 | **laminar-db** | The main entry point. Ties everything together -- `StreamingCoordinator` pipeline, checkpoint coordination, recovery, FFI API. |
 | **laminar-derive** | Proc macros: `Record`, `FromRecordBatch`, `FromRow`, `ConnectorConfig`. |
@@ -153,7 +153,7 @@ We use [Conventional Commits](https://www.conventionalcommits.org/):
 
 ```
 feat(connectors): add Redis lookup table source
-fix(sql): handle NULL in ASOF JOIN match condition
+fix(sql): handle NULL in bounded JOIN keys
 test(checkpoint): add barrier alignment integration test
 perf(state): reduce AHashMap lookup from 500ns to 350ns
 docs(contributing): update project structure

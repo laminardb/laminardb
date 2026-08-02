@@ -119,6 +119,7 @@ pub enum CheckpointVerdict {
 
 /// Single create-once terminal outcome for one epoch.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointOutcome {
     /// Outcome payload format.
     pub version: u32,

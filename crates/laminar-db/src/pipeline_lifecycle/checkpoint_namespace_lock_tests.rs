@@ -35,8 +35,9 @@ async fn exact_db(root: &std::path::Path) -> Arc<crate::db::LaminarDB> {
 
 async fn install_generator_pipeline(db: &Arc<crate::db::LaminarDB>) {
     db.execute(
-        "CREATE SOURCE generated_source (seq BIGINT, ts_ms BIGINT, value VARCHAR) WITH \
-         ('connector' = 'generator', 'rows.per.second' = '1000', 'max.rows' = '1')",
+        "CREATE SOURCE generated_source (seq BIGINT NOT NULL, ts_ms BIGINT NOT NULL, \
+         value VARCHAR NOT NULL) FROM GENERATOR \
+         ('rows.per.second' = '1000', 'max.rows' = '1')",
     )
     .await
     .unwrap();

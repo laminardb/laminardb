@@ -5,15 +5,17 @@
 
 use std::time::Duration;
 
-use crate::parser::join_parser::{AsofSqlDirection, JoinAnalysis, JoinType, MultiJoinAnalysis};
+use crate::parser::join_parser::{JoinAnalysis, JoinType, MultiJoinAnalysis};
 
 /// Configuration for stream-stream join operator
 #[derive(Debug, Clone)]
 pub struct StreamJoinConfig {
-    /// Left side key column
-    pub left_key: String,
-    /// Right side key column
-    pub right_key: String,
+    /// SQL join kind.
+    pub join_type: JoinType,
+    /// Ordered left-side equality key columns.
+    pub left_keys: Vec<String>,
+    /// Ordered right-side equality key columns.
+    pub right_keys: Vec<String>,
     /// Left side time column for interval matching
     pub left_time_column: String,
     /// Right side time column for interval matching
@@ -24,8 +26,6 @@ pub struct StreamJoinConfig {
     pub right_table: String,
     /// Time bound for joining (max time difference between events)
     pub time_bound: Duration,
-    /// Join type
-    pub join_type: StreamJoinType,
 }
 
 /// Configuration for lookup join operator
@@ -39,23 +39,6 @@ pub struct LookupJoinConfig {
     pub join_type: LookupJoinType,
     /// Cache TTL for lookup results
     pub cache_ttl: Duration,
-}
-
-/// Stream-stream join types
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamJoinType {
-    /// Both sides required
-    Inner,
-    /// Left side always emitted
-    Left,
-    /// Right side always emitted
-    Right,
-    /// Both sides always emitted
-    Full,
-    /// At most one output per left row (first match)
-    LeftSemi,
-    /// Unmatched left rows only (emitted when deadline passes)
-    LeftAnti,
 }
 
 /// Lookup join types
@@ -88,36 +71,6 @@ pub struct TemporalJoinTranslatorConfig {
     pub join_type: String,
 }
 
-/// Configuration for ASOF join operator
-#[derive(Debug, Clone)]
-pub struct AsofJoinTranslatorConfig {
-    /// Left side table name
-    pub left_table: String,
-    /// Right side table name
-    pub right_table: String,
-    /// Key column for partitioning (e.g., symbol)
-    pub key_column: String,
-    /// Left side time column
-    pub left_time_column: String,
-    /// Right side time column
-    pub right_time_column: String,
-    /// Join direction (Backward, Forward, or Nearest)
-    pub direction: AsofSqlDirection,
-    /// Maximum allowed time difference
-    pub tolerance: Option<Duration>,
-    /// ASOF join type (Inner or Left)
-    pub join_type: AsofSqlJoinType,
-}
-
-/// ASOF join type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AsofSqlJoinType {
-    /// Both sides required
-    Inner,
-    /// Left side always emitted
-    Left,
-}
-
 /// Union type for join operator configurations
 #[derive(Debug, Clone)]
 pub enum JoinOperatorConfig {
@@ -125,25 +78,8 @@ pub enum JoinOperatorConfig {
     StreamStream(StreamJoinConfig),
     /// Lookup join
     Lookup(LookupJoinConfig),
-    /// ASOF join
-    Asof(AsofJoinTranslatorConfig),
     /// Temporal join (FOR SYSTEM_TIME AS OF)
     Temporal(TemporalJoinTranslatorConfig),
-    /// Temporal probe join (multi-offset ASOF)
-    TemporalProbe(super::temporal_probe::TemporalProbeConfig),
-}
-
-impl std::fmt::Display for StreamJoinType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StreamJoinType::Inner => write!(f, "INNER"),
-            StreamJoinType::Left => write!(f, "LEFT"),
-            StreamJoinType::Right => write!(f, "RIGHT"),
-            StreamJoinType::Full => write!(f, "FULL"),
-            StreamJoinType::LeftSemi => write!(f, "LEFT SEMI"),
-            StreamJoinType::LeftAnti => write!(f, "LEFT ANTI"),
-        }
-    }
 }
 
 impl std::fmt::Display for LookupJoinType {
@@ -155,25 +91,37 @@ impl std::fmt::Display for LookupJoinType {
     }
 }
 
-impl std::fmt::Display for AsofSqlJoinType {
+impl std::fmt::Display for JoinType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AsofSqlJoinType::Inner => write!(f, "INNER"),
-            AsofSqlJoinType::Left => write!(f, "LEFT"),
+            JoinType::Inner => write!(f, "INNER"),
+            JoinType::Left => write!(f, "LEFT"),
+            JoinType::Right => write!(f, "RIGHT"),
+            JoinType::Full => write!(f, "FULL"),
+            JoinType::LeftSemi => write!(f, "LEFT SEMI"),
+            JoinType::LeftAnti => write!(f, "LEFT ANTI"),
+            JoinType::RightSemi => write!(f, "RIGHT SEMI"),
+            JoinType::RightAnti => write!(f, "RIGHT ANTI"),
         }
     }
 }
 
 impl std::fmt::Display for StreamJoinConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} JOIN ON ", self.join_type)?;
+        for (index, (left, right)) in self.left_keys.iter().zip(&self.right_keys).enumerate() {
+            if index != 0 {
+                write!(f, " AND ")?;
+            }
+            write!(
+                f,
+                "{}.{} = {}.{}",
+                self.left_table, left, self.right_table, right
+            )?;
+        }
         write!(
             f,
-            "{} JOIN ON {}.{} = {}.{} (bound: {}s, time: {} ~ {})",
-            self.join_type,
-            self.left_table,
-            self.left_key,
-            self.right_table,
-            self.right_key,
+            " (bound: {}s, time: {} ~ {})",
             self.time_bound.as_secs(),
             self.left_time_column,
             self.right_time_column,
@@ -191,29 +139,6 @@ impl std::fmt::Display for LookupJoinConfig {
             self.lookup_key,
             self.cache_ttl.as_secs()
         )
-    }
-}
-
-impl std::fmt::Display for AsofJoinTranslatorConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} ASOF JOIN {}.{} = {}.{} ({}, {}.{} ~ {}.{}",
-            self.join_type,
-            self.left_table,
-            self.key_column,
-            self.right_table,
-            self.key_column,
-            self.direction,
-            self.left_table,
-            self.left_time_column,
-            self.right_table,
-            self.right_time_column,
-        )?;
-        if let Some(tol) = self.tolerance {
-            write!(f, ", tolerance: {}s", tol.as_secs())?;
-        }
-        write!(f, ")")
     }
 }
 
@@ -236,25 +161,33 @@ impl std::fmt::Display for JoinOperatorConfig {
         match self {
             JoinOperatorConfig::StreamStream(c) => write!(f, "{c}"),
             JoinOperatorConfig::Lookup(c) => write!(f, "{c}"),
-            JoinOperatorConfig::Asof(c) => write!(f, "{c}"),
             JoinOperatorConfig::Temporal(c) => write!(f, "{c}"),
-            JoinOperatorConfig::TemporalProbe(c) => write!(f, "{c}"),
         }
     }
 }
 
 impl JoinOperatorConfig {
     /// Create from join analysis.
-    #[must_use]
-    pub fn from_analysis(analysis: &JoinAnalysis) -> Self {
+    pub fn from_analysis(analysis: &JoinAnalysis) -> Result<Self, String> {
         if analysis.is_temporal_join {
+            if !analysis.additional_key_columns.is_empty() {
+                return Err(
+                    "temporal joins support exactly one equality key; composite predicates are not implemented"
+                        .to_string(),
+                );
+            }
             let join_type_str = match analysis.join_type {
+                JoinType::Inner => "inner",
                 JoinType::Left => "left",
-                _ => "inner",
+                unsupported => {
+                    return Err(format!(
+                        "temporal joins support only INNER or LEFT joins; {unsupported:?} is unsupported"
+                    ));
+                }
             };
             let stream_time_col = analysis.temporal_version_column.clone().unwrap_or_default();
             // table_version_column left empty — resolved from table schema at registration.
-            return JoinOperatorConfig::Temporal(TemporalJoinTranslatorConfig {
+            return Ok(JoinOperatorConfig::Temporal(TemporalJoinTranslatorConfig {
                 stream_table: analysis.left_table.clone(),
                 table_name: analysis.right_table.clone(),
                 stream_key_column: analysis.left_key_column.clone(),
@@ -263,66 +196,61 @@ impl JoinOperatorConfig {
                 table_version_column: String::new(),
                 semantics: "event_time".to_string(),
                 join_type: join_type_str.to_string(),
-            });
-        }
-
-        if analysis.is_asof_join {
-            return JoinOperatorConfig::Asof(AsofJoinTranslatorConfig {
-                left_table: analysis.left_table.clone(),
-                right_table: analysis.right_table.clone(),
-                key_column: analysis.left_key_column.clone(),
-                left_time_column: analysis.left_time_column.clone().unwrap_or_default(),
-                right_time_column: analysis.right_time_column.clone().unwrap_or_default(),
-                direction: analysis
-                    .asof_direction
-                    .unwrap_or(AsofSqlDirection::Backward),
-                tolerance: analysis.asof_tolerance,
-                join_type: if analysis.join_type == JoinType::Inner {
-                    AsofSqlJoinType::Inner
-                } else {
-                    AsofSqlJoinType::Left
-                },
-            });
+            }));
         }
 
         if analysis.is_lookup_join {
-            JoinOperatorConfig::Lookup(LookupJoinConfig {
+            if !analysis.additional_key_columns.is_empty() {
+                return Err(
+                    "lookup joins support exactly one equality key; composite predicates are not implemented"
+                        .to_string(),
+                );
+            }
+            let join_type = match analysis.join_type {
+                JoinType::Inner => LookupJoinType::Inner,
+                JoinType::Left => LookupJoinType::Left,
+                unsupported => {
+                    return Err(format!(
+                        "lookup joins support only INNER or LEFT joins; {unsupported:?} is unsupported"
+                    ));
+                }
+            };
+            Ok(JoinOperatorConfig::Lookup(LookupJoinConfig {
                 stream_key: analysis.left_key_column.clone(),
                 lookup_key: analysis.right_key_column.clone(),
-                join_type: match analysis.join_type {
-                    JoinType::Inner => LookupJoinType::Inner,
-                    _ => LookupJoinType::Left,
-                },
+                join_type,
                 cache_ttl: Duration::from_secs(300), // Default 5 min
-            })
+            }))
         } else {
-            JoinOperatorConfig::StreamStream(StreamJoinConfig {
-                left_key: analysis.left_key_column.clone(),
-                right_key: analysis.right_key_column.clone(),
+            let time_bound = analysis.time_bound.ok_or_else(|| {
+                "stream-stream joins require an explicit finite time bound".to_string()
+            })?;
+            if time_bound.is_zero() {
+                return Err("stream-stream joins require a positive finite time bound".to_string());
+            }
+            let mut left_keys = Vec::with_capacity(1 + analysis.additional_key_columns.len());
+            let mut right_keys = Vec::with_capacity(1 + analysis.additional_key_columns.len());
+            left_keys.push(analysis.left_key_column.clone());
+            right_keys.push(analysis.right_key_column.clone());
+            for (left, right) in &analysis.additional_key_columns {
+                left_keys.push(left.clone());
+                right_keys.push(right.clone());
+            }
+            Ok(JoinOperatorConfig::StreamStream(StreamJoinConfig {
+                join_type: analysis.join_type,
+                left_keys,
+                right_keys,
                 left_time_column: analysis.left_time_column.clone().unwrap_or_default(),
                 right_time_column: analysis.right_time_column.clone().unwrap_or_default(),
                 left_table: analysis.left_table.clone(),
                 right_table: analysis.right_table.clone(),
-                time_bound: analysis.time_bound.unwrap_or(Duration::from_secs(3600)),
-                join_type: match analysis.join_type {
-                    // RightSemi/RightAnti map to Inner here but are rejected
-                    // at detection time in sql_analysis.rs before reaching execution.
-                    JoinType::Inner | JoinType::RightSemi | JoinType::RightAnti => {
-                        StreamJoinType::Inner
-                    }
-                    JoinType::LeftSemi => StreamJoinType::LeftSemi,
-                    JoinType::LeftAnti => StreamJoinType::LeftAnti,
-                    JoinType::Left | JoinType::AsOf => StreamJoinType::Left,
-                    JoinType::Right => StreamJoinType::Right,
-                    JoinType::Full => StreamJoinType::Full,
-                },
-            })
+                time_bound,
+            }))
         }
     }
 
     /// Create from a multi-join analysis, producing one config per join step.
-    #[must_use]
-    pub fn from_multi_analysis(multi: &MultiJoinAnalysis) -> Vec<Self> {
+    pub fn from_multi_analysis(multi: &MultiJoinAnalysis) -> Result<Vec<Self>, String> {
         multi.joins.iter().map(Self::from_analysis).collect()
     }
 
@@ -338,43 +266,29 @@ impl JoinOperatorConfig {
         matches!(self, JoinOperatorConfig::Lookup(_))
     }
 
-    /// Check if this is an ASOF join.
-    #[must_use]
-    pub fn is_asof(&self) -> bool {
-        matches!(self, JoinOperatorConfig::Asof(_))
-    }
-
     /// Check if this is a temporal join.
     #[must_use]
     pub fn is_temporal(&self) -> bool {
         matches!(self, JoinOperatorConfig::Temporal(_))
     }
 
-    /// Get the left key column name.
+    /// Get the ordered left-side equality key columns.
     #[must_use]
-    pub fn left_key(&self) -> &str {
+    pub fn left_keys(&self) -> &[String] {
         match self {
-            JoinOperatorConfig::StreamStream(config) => &config.left_key,
-            JoinOperatorConfig::Lookup(config) => &config.stream_key,
-            JoinOperatorConfig::Asof(config) => &config.key_column,
-            JoinOperatorConfig::Temporal(config) => &config.stream_key_column,
-            JoinOperatorConfig::TemporalProbe(config) => {
-                config.key_columns.first().map_or("", String::as_str)
-            }
+            JoinOperatorConfig::StreamStream(config) => &config.left_keys,
+            JoinOperatorConfig::Lookup(config) => std::slice::from_ref(&config.stream_key),
+            JoinOperatorConfig::Temporal(config) => std::slice::from_ref(&config.stream_key_column),
         }
     }
 
-    /// Get the right key column name.
+    /// Get the ordered right-side equality key columns.
     #[must_use]
-    pub fn right_key(&self) -> &str {
+    pub fn right_keys(&self) -> &[String] {
         match self {
-            JoinOperatorConfig::StreamStream(config) => &config.right_key,
-            JoinOperatorConfig::Lookup(config) => &config.lookup_key,
-            JoinOperatorConfig::Asof(config) => &config.key_column,
-            JoinOperatorConfig::Temporal(config) => &config.table_key_column,
-            JoinOperatorConfig::TemporalProbe(config) => {
-                config.key_columns.first().map_or("", String::as_str)
-            }
+            JoinOperatorConfig::StreamStream(config) => &config.right_keys,
+            JoinOperatorConfig::Lookup(config) => std::slice::from_ref(&config.lookup_key),
+            JoinOperatorConfig::Temporal(config) => std::slice::from_ref(&config.table_key_column),
         }
     }
 }
@@ -383,33 +297,21 @@ impl StreamJoinConfig {
     /// Create a new stream-stream join configuration.
     #[must_use]
     pub fn new(
-        left_key: String,
-        right_key: String,
+        join_type: JoinType,
+        left_keys: Vec<String>,
+        right_keys: Vec<String>,
         time_bound: Duration,
-        join_type: StreamJoinType,
     ) -> Self {
         Self {
-            left_key,
-            right_key,
+            join_type,
+            left_keys,
+            right_keys,
             left_time_column: String::new(),
             right_time_column: String::new(),
             left_table: String::new(),
             right_table: String::new(),
             time_bound,
-            join_type,
         }
-    }
-
-    /// Create an inner join configuration.
-    #[must_use]
-    pub fn inner(left_key: String, right_key: String, time_bound: Duration) -> Self {
-        Self::new(left_key, right_key, time_bound, StreamJoinType::Inner)
-    }
-
-    /// Create a left join configuration.
-    #[must_use]
-    pub fn left(left_key: String, right_key: String, time_bound: Duration) -> Self {
-        Self::new(left_key, right_key, time_bound, StreamJoinType::Left)
     }
 }
 
@@ -466,16 +368,17 @@ mod tests {
 
     #[test]
     fn test_stream_join_config() {
-        let config = StreamJoinConfig::inner(
-            "order_id".to_string(),
-            "order_id".to_string(),
+        let config = StreamJoinConfig::new(
+            JoinType::RightAnti,
+            vec!["tenant_id".to_string(), "order_id".to_string()],
+            vec!["account_id".to_string(), "payment_order_id".to_string()],
             Duration::from_secs(3600),
         );
 
-        assert_eq!(config.left_key, "order_id");
-        assert_eq!(config.right_key, "order_id");
+        assert_eq!(config.join_type, JoinType::RightAnti);
+        assert_eq!(config.left_keys, ["tenant_id", "order_id"]);
+        assert_eq!(config.right_keys, ["account_id", "payment_order_id"]);
         assert_eq!(config.time_bound, Duration::from_secs(3600));
-        assert_eq!(config.join_type, StreamJoinType::Inner);
     }
 
     #[test]
@@ -499,118 +402,40 @@ mod tests {
             JoinType::Inner,
         );
 
-        let config = JoinOperatorConfig::from_analysis(&analysis);
+        let config = JoinOperatorConfig::from_analysis(&analysis).unwrap();
 
         assert!(config.is_lookup());
         assert!(!config.is_stream_stream());
-        assert_eq!(config.left_key(), "customer_id");
-        assert_eq!(config.right_key(), "id");
+        assert_eq!(config.left_keys(), ["customer_id"]);
+        assert_eq!(config.right_keys(), ["id"]);
     }
 
     #[test]
     fn test_from_analysis_stream_stream() {
-        let analysis = JoinAnalysis::stream_stream(
+        let mut analysis = JoinAnalysis::stream_stream(
             "orders".to_string(),
             "payments".to_string(),
-            "order_id".to_string(),
-            "order_id".to_string(),
+            "tenant_id".to_string(),
+            "account_id".to_string(),
             Duration::from_secs(3600),
-            JoinType::Inner,
+            JoinType::Full,
         );
+        analysis
+            .additional_key_columns
+            .push(("order_id".to_string(), "payment_order_id".to_string()));
 
-        let config = JoinOperatorConfig::from_analysis(&analysis);
+        let config = JoinOperatorConfig::from_analysis(&analysis).unwrap();
 
         assert!(config.is_stream_stream());
         assert!(!config.is_lookup());
 
         if let JoinOperatorConfig::StreamStream(stream_config) = config {
+            assert_eq!(stream_config.join_type, JoinType::Full);
+            assert_eq!(stream_config.left_keys, ["tenant_id", "order_id"]);
+            assert_eq!(stream_config.right_keys, ["account_id", "payment_order_id"]);
             assert_eq!(stream_config.time_bound, Duration::from_secs(3600));
-            assert_eq!(stream_config.join_type, StreamJoinType::Inner);
         }
     }
-
-    #[test]
-    fn test_from_analysis_asof() {
-        let analysis = JoinAnalysis::asof(
-            "trades".to_string(),
-            "quotes".to_string(),
-            "symbol".to_string(),
-            "symbol".to_string(),
-            AsofSqlDirection::Backward,
-            "ts".to_string(),
-            "ts".to_string(),
-            Some(Duration::from_secs(5)),
-        );
-
-        let config = JoinOperatorConfig::from_analysis(&analysis);
-        assert!(config.is_asof());
-        assert!(!config.is_stream_stream());
-        assert!(!config.is_lookup());
-    }
-
-    #[test]
-    fn test_asof_config_fields() {
-        let analysis = JoinAnalysis::asof(
-            "trades".to_string(),
-            "quotes".to_string(),
-            "symbol".to_string(),
-            "symbol".to_string(),
-            AsofSqlDirection::Forward,
-            "trade_ts".to_string(),
-            "quote_ts".to_string(),
-            Some(Duration::from_secs(5)),
-        );
-
-        let config = JoinOperatorConfig::from_analysis(&analysis);
-        if let JoinOperatorConfig::Asof(asof) = config {
-            assert_eq!(asof.direction, AsofSqlDirection::Forward);
-            assert_eq!(asof.left_time_column, "trade_ts");
-            assert_eq!(asof.right_time_column, "quote_ts");
-            assert_eq!(asof.tolerance, Some(Duration::from_secs(5)));
-            assert_eq!(asof.key_column, "symbol");
-            assert_eq!(asof.join_type, AsofSqlJoinType::Left);
-        } else {
-            panic!("Expected Asof config");
-        }
-    }
-
-    #[test]
-    fn test_asof_is_asof() {
-        let analysis = JoinAnalysis::asof(
-            "a".to_string(),
-            "b".to_string(),
-            "id".to_string(),
-            "id".to_string(),
-            AsofSqlDirection::Backward,
-            "ts".to_string(),
-            "ts".to_string(),
-            None,
-        );
-
-        let config = JoinOperatorConfig::from_analysis(&analysis);
-        assert!(config.is_asof());
-    }
-
-    #[test]
-    fn test_asof_key_accessors() {
-        let analysis = JoinAnalysis::asof(
-            "trades".to_string(),
-            "quotes".to_string(),
-            "sym".to_string(),
-            "sym".to_string(),
-            AsofSqlDirection::Backward,
-            "ts".to_string(),
-            "ts".to_string(),
-            None,
-        );
-
-        let config = JoinOperatorConfig::from_analysis(&analysis);
-        assert_eq!(config.left_key(), "sym");
-        assert_eq!(config.right_key(), "sym");
-    }
-
-    // -- Multi-way join translator tests --
-
     #[test]
     fn test_from_multi_analysis_single() {
         let analysis = JoinAnalysis::lookup(
@@ -625,7 +450,7 @@ mod tests {
             tables: vec!["a".to_string(), "b".to_string()],
         };
 
-        let configs = JoinOperatorConfig::from_multi_analysis(&multi);
+        let configs = JoinOperatorConfig::from_multi_analysis(&multi).unwrap();
         assert_eq!(configs.len(), 1);
         assert!(configs[0].is_lookup());
     }
@@ -644,55 +469,20 @@ mod tests {
             "c".to_string(),
             "id".to_string(),
             "b_id".to_string(),
-            JoinType::Left,
+            JoinType::Inner,
         );
         let multi = MultiJoinAnalysis {
             joins: vec![j1, j2],
             tables: vec!["a".to_string(), "b".to_string(), "c".to_string()],
         };
 
-        let configs = JoinOperatorConfig::from_multi_analysis(&multi);
+        let configs = JoinOperatorConfig::from_multi_analysis(&multi).unwrap();
         assert_eq!(configs.len(), 2);
         assert!(configs[0].is_lookup());
         assert!(configs[1].is_lookup());
-        assert_eq!(configs[0].left_key(), "id");
-        assert_eq!(configs[1].left_key(), "id");
+        assert_eq!(configs[0].left_keys(), ["id"]);
+        assert_eq!(configs[1].left_keys(), ["id"]);
     }
-
-    #[test]
-    fn test_from_multi_analysis_mixed_asof_lookup() {
-        let j1 = JoinAnalysis::asof(
-            "trades".to_string(),
-            "quotes".to_string(),
-            "symbol".to_string(),
-            "symbol".to_string(),
-            AsofSqlDirection::Backward,
-            "ts".to_string(),
-            "ts".to_string(),
-            None,
-        );
-        let j2 = JoinAnalysis::lookup(
-            "quotes".to_string(),
-            "products".to_string(),
-            "product_id".to_string(),
-            "id".to_string(),
-            JoinType::Inner,
-        );
-        let multi = MultiJoinAnalysis {
-            joins: vec![j1, j2],
-            tables: vec![
-                "trades".to_string(),
-                "quotes".to_string(),
-                "products".to_string(),
-            ],
-        };
-
-        let configs = JoinOperatorConfig::from_multi_analysis(&multi);
-        assert_eq!(configs.len(), 2);
-        assert!(configs[0].is_asof());
-        assert!(configs[1].is_lookup());
-    }
-
     #[test]
     fn test_from_multi_analysis_stream_stream_and_lookup() {
         let j1 = JoinAnalysis::stream_stream(
@@ -719,7 +509,7 @@ mod tests {
             ],
         };
 
-        let configs = JoinOperatorConfig::from_multi_analysis(&multi);
+        let configs = JoinOperatorConfig::from_multi_analysis(&multi).unwrap();
         assert_eq!(configs.len(), 2);
         assert!(configs[0].is_stream_stream());
         assert!(configs[1].is_lookup());
@@ -740,7 +530,7 @@ mod tests {
             "k2".to_string(),
             "k2".to_string(),
             Duration::from_secs(60),
-            JoinType::Left,
+            JoinType::Inner,
         );
         let j3 = JoinAnalysis::lookup(
             "c".to_string(),
@@ -759,70 +549,22 @@ mod tests {
             ],
         };
 
-        let configs = JoinOperatorConfig::from_multi_analysis(&multi);
+        let configs = JoinOperatorConfig::from_multi_analysis(&multi).unwrap();
         assert_eq!(configs.len(), 3);
         assert!(configs[0].is_lookup());
         assert!(configs[1].is_stream_stream());
         assert!(configs[2].is_lookup());
-        assert_eq!(configs[0].left_key(), "k1");
-        assert_eq!(configs[1].left_key(), "k2");
-        assert_eq!(configs[2].left_key(), "k3");
-    }
-
-    #[test]
-    fn test_join_types() {
-        // Test all join types map correctly
-        let left_analysis = JoinAnalysis::stream_stream(
-            "a".to_string(),
-            "b".to_string(),
-            "id".to_string(),
-            "id".to_string(),
-            Duration::from_secs(60),
-            JoinType::Left,
-        );
-
-        if let JoinOperatorConfig::StreamStream(config) =
-            JoinOperatorConfig::from_analysis(&left_analysis)
-        {
-            assert_eq!(config.join_type, StreamJoinType::Left);
-        }
-
-        let right_analysis = JoinAnalysis::stream_stream(
-            "a".to_string(),
-            "b".to_string(),
-            "id".to_string(),
-            "id".to_string(),
-            Duration::from_secs(60),
-            JoinType::Right,
-        );
-
-        if let JoinOperatorConfig::StreamStream(config) =
-            JoinOperatorConfig::from_analysis(&right_analysis)
-        {
-            assert_eq!(config.join_type, StreamJoinType::Right);
-        }
-
-        let full_analysis = JoinAnalysis::stream_stream(
-            "a".to_string(),
-            "b".to_string(),
-            "id".to_string(),
-            "id".to_string(),
-            Duration::from_secs(60),
-            JoinType::Full,
-        );
-
-        if let JoinOperatorConfig::StreamStream(config) =
-            JoinOperatorConfig::from_analysis(&full_analysis)
-        {
-            assert_eq!(config.join_type, StreamJoinType::Full);
-        }
+        assert_eq!(configs[0].left_keys(), ["k1"]);
+        assert_eq!(configs[1].left_keys(), ["k2"]);
+        assert_eq!(configs[2].left_keys(), ["k3"]);
     }
 
     #[test]
     fn test_display_stream_join() {
-        let mut config = StreamJoinConfig::inner(
-            "order_id".to_string(),
-            "order_id".to_string(),
+        let mut config = StreamJoinConfig::new(
+            JoinType::LeftSemi,
+            vec!["tenant_id".to_string(), "order_id".to_string()],
+            vec!["account_id".to_string(), "payment_order_id".to_string()],
             Duration::from_secs(3600),
         );
         config.left_table = "orders".to_string();
@@ -831,7 +573,7 @@ mod tests {
         config.right_time_column = "ts".to_string();
         assert_eq!(
             format!("{config}"),
-            "INNER JOIN ON orders.order_id = payments.order_id (bound: 3600s, time: ts ~ ts)"
+            "LEFT SEMI JOIN ON orders.tenant_id = payments.account_id AND orders.order_id = payments.payment_order_id (bound: 3600s, time: ts ~ ts)"
         );
     }
 
@@ -843,83 +585,21 @@ mod tests {
             "LEFT LOOKUP JOIN ON stream.cust_id = lookup.id (cache_ttl: 300s)"
         );
     }
-
-    #[test]
-    fn test_display_asof_join() {
-        let analysis = JoinAnalysis::asof(
-            "trades".to_string(),
-            "quotes".to_string(),
-            "symbol".to_string(),
-            "symbol".to_string(),
-            AsofSqlDirection::Backward,
-            "ts".to_string(),
-            "ts".to_string(),
-            Some(Duration::from_secs(5)),
-        );
-        let config = JoinOperatorConfig::from_analysis(&analysis);
-        let s = format!("{config}");
-        assert!(s.contains("ASOF JOIN"), "got: {s}");
-        assert!(s.contains("BACKWARD"), "got: {s}");
-        assert!(s.contains("tolerance: 5s"), "got: {s}");
-    }
-
     #[test]
     fn test_display_join_types() {
-        assert_eq!(format!("{}", StreamJoinType::Inner), "INNER");
-        assert_eq!(format!("{}", StreamJoinType::Left), "LEFT");
-        assert_eq!(format!("{}", StreamJoinType::Right), "RIGHT");
-        assert_eq!(format!("{}", StreamJoinType::Full), "FULL");
         assert_eq!(format!("{}", LookupJoinType::Inner), "INNER");
         assert_eq!(format!("{}", LookupJoinType::Left), "LEFT");
-        assert_eq!(format!("{}", AsofSqlJoinType::Inner), "INNER");
-        assert_eq!(format!("{}", AsofSqlJoinType::Left), "LEFT");
-    }
-
-    #[test]
-    fn test_from_analysis_semi_anti() {
-        let semi = JoinAnalysis::stream_stream(
-            "a".to_string(),
-            "b".to_string(),
-            "id".to_string(),
-            "id".to_string(),
-            Duration::from_secs(60),
-            JoinType::LeftSemi,
-        );
-        if let JoinOperatorConfig::StreamStream(config) = JoinOperatorConfig::from_analysis(&semi) {
-            assert_eq!(config.join_type, StreamJoinType::LeftSemi);
-        } else {
-            panic!("Expected StreamStream config");
-        }
-
-        let anti = JoinAnalysis::stream_stream(
-            "a".to_string(),
-            "b".to_string(),
-            "id".to_string(),
-            "id".to_string(),
-            Duration::from_secs(60),
-            JoinType::LeftAnti,
-        );
-        if let JoinOperatorConfig::StreamStream(config) = JoinOperatorConfig::from_analysis(&anti) {
-            assert_eq!(config.join_type, StreamJoinType::LeftAnti);
-        } else {
-            panic!("Expected StreamStream config");
-        }
-
-        // RightSemi/RightAnti still map to Inner (not yet implemented)
-        let right_anti = JoinAnalysis::stream_stream(
-            "a".to_string(),
-            "b".to_string(),
-            "id".to_string(),
-            "id".to_string(),
-            Duration::from_secs(60),
-            JoinType::RightAnti,
-        );
-        if let JoinOperatorConfig::StreamStream(config) =
-            JoinOperatorConfig::from_analysis(&right_anti)
-        {
-            assert_eq!(config.join_type, StreamJoinType::Inner);
-        } else {
-            panic!("Expected StreamStream config");
+        for (join_type, sql) in [
+            (JoinType::Inner, "INNER"),
+            (JoinType::Left, "LEFT"),
+            (JoinType::Right, "RIGHT"),
+            (JoinType::Full, "FULL"),
+            (JoinType::LeftSemi, "LEFT SEMI"),
+            (JoinType::LeftAnti, "LEFT ANTI"),
+            (JoinType::RightSemi, "RIGHT SEMI"),
+            (JoinType::RightAnti, "RIGHT ANTI"),
+        ] {
+            assert_eq!(join_type.to_string(), sql);
         }
     }
 
@@ -934,13 +614,12 @@ mod tests {
             JoinType::Inner,
         );
 
-        let config = JoinOperatorConfig::from_analysis(&analysis);
+        let config = JoinOperatorConfig::from_analysis(&analysis).unwrap();
         assert!(config.is_temporal());
-        assert!(!config.is_asof());
         assert!(!config.is_lookup());
         assert!(!config.is_stream_stream());
-        assert_eq!(config.left_key(), "product_id");
-        assert_eq!(config.right_key(), "id");
+        assert_eq!(config.left_keys(), ["product_id"]);
+        assert_eq!(config.right_keys(), ["id"]);
 
         if let JoinOperatorConfig::Temporal(tc) = config {
             assert!(tc.table_version_column.is_empty());
@@ -963,7 +642,7 @@ mod tests {
             JoinType::Left,
         );
 
-        let config = JoinOperatorConfig::from_analysis(&analysis);
+        let config = JoinOperatorConfig::from_analysis(&analysis).unwrap();
         if let JoinOperatorConfig::Temporal(tc) = config {
             assert_eq!(tc.join_type, "left");
         } else {
@@ -981,9 +660,79 @@ mod tests {
             "order_time".to_string(),
             JoinType::Inner,
         );
-        let config = JoinOperatorConfig::from_analysis(&analysis);
+        let config = JoinOperatorConfig::from_analysis(&analysis).unwrap();
         let s = format!("{config}");
         assert!(s.contains("TEMPORAL JOIN"), "got: {s}");
         assert!(s.contains("order_time"), "got: {s}");
+    }
+
+    #[test]
+    fn stream_join_requires_explicit_time_bound() {
+        let mut analysis = JoinAnalysis::stream_stream(
+            "orders".to_string(),
+            "payments".to_string(),
+            "order_id".to_string(),
+            "order_id".to_string(),
+            Duration::from_secs(1),
+            JoinType::Inner,
+        );
+        analysis.time_bound = None;
+
+        let error = JoinOperatorConfig::from_analysis(&analysis).unwrap_err();
+        assert!(error.contains("explicit finite time bound"));
+
+        analysis.time_bound = Some(Duration::ZERO);
+        let error = JoinOperatorConfig::from_analysis(&analysis).unwrap_err();
+        assert!(error.contains("positive finite time bound"));
+    }
+
+    #[test]
+    fn unsupported_join_analysis_fails_closed() {
+        let unsupported_lookup_types = [
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::LeftSemi,
+            JoinType::LeftAnti,
+            JoinType::RightSemi,
+            JoinType::RightAnti,
+        ];
+        for join_type in unsupported_lookup_types {
+            let lookup = JoinAnalysis::lookup(
+                "orders".to_string(),
+                "customers".to_string(),
+                "customer_id".to_string(),
+                "id".to_string(),
+                join_type,
+            );
+            assert!(JoinOperatorConfig::from_analysis(&lookup)
+                .unwrap_err()
+                .contains("only INNER or LEFT"));
+
+            let temporal = JoinAnalysis::temporal(
+                "orders".to_string(),
+                "customers".to_string(),
+                "customer_id".to_string(),
+                "id".to_string(),
+                "order_time".to_string(),
+                join_type,
+            );
+            assert!(JoinOperatorConfig::from_analysis(&temporal)
+                .unwrap_err()
+                .contains("only INNER or LEFT"));
+        }
+
+        let mut composite = JoinAnalysis::lookup(
+            "orders".to_string(),
+            "customers".to_string(),
+            "customer_id".to_string(),
+            "id".to_string(),
+            JoinType::Inner,
+        );
+        composite
+            .additional_key_columns
+            .push(("tenant_id".to_string(), "tenant_id".to_string()));
+        assert!(JoinOperatorConfig::from_analysis(&composite)
+            .unwrap_err()
+            .contains("exactly one equality key"));
     }
 }

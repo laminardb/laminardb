@@ -15,13 +15,14 @@ use crate::state::{KeyGroupCount, LOCAL_KEY_GROUP_COUNT, PARTITIONING_ABI_VERSIO
 pub const CHECKPOINT_MANIFEST_VERSION: u32 = 6;
 
 /// Canonical pipeline-identity payload version.
-pub const PIPELINE_IDENTITY_VERSION: u16 = 3;
+pub const PIPELINE_IDENTITY_VERSION: u16 = 5;
 
 /// SHA-256 identity of the logical pipeline and recovery-state ABI.
 ///
 /// The canonical version is part of the persisted contract: changing canonicalization or state
 /// compatibility requires a new version rather than silently comparing unlike digests.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineIdentity {
     /// Version of the canonical payload format.
     pub canonical_version: u16,
@@ -81,6 +82,7 @@ pub enum DurableCheckpointPhase {
 
 /// A point-in-time snapshot of all pipeline state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointManifest {
     /// Manifest format version (for future evolution).
     pub version: u32,
@@ -97,10 +99,8 @@ pub struct CheckpointManifest {
 
     // ── Connector State ──
     /// Per-source connector offsets (key: source name).
-    #[serde(default)]
     pub source_offsets: HashMap<String, ConnectorCheckpoint>,
     /// Per-table source offsets for reference tables (key: table name).
-    #[serde(default)]
     pub table_offsets: HashMap<String, ConnectorCheckpoint>,
 
     // ── Operator State ──
@@ -108,19 +108,15 @@ pub struct CheckpointManifest {
     ///
     /// Small state is inlined as base64. Large state is stored in a separate
     /// `state.bin` file and this map holds only a reference marker.
-    #[serde(default)]
     pub operator_states: HashMap<String, OperatorCheckpoint>,
 
     // ── Storage State ──
     /// Path to the table store checkpoint, if any.
-    #[serde(default)]
     pub table_store_checkpoint_path: Option<String>,
     // ── Time State ──
     /// Global watermark at checkpoint time.
-    #[serde(default)]
     pub watermark: Option<i64>,
     /// Per-source watermarks (key: source name).
-    #[serde(default)]
     pub source_watermarks: HashMap<String, i64>,
 
     // ── Topology ──
@@ -128,10 +124,8 @@ pub struct CheckpointManifest {
     ///
     /// Used during recovery to detect topology changes (added/removed sources)
     /// and warn the operator.
-    #[serde(default)]
     pub source_names: Vec<String>,
     /// Sorted names of all registered sinks at checkpoint time.
-    #[serde(default)]
     pub sink_names: Vec<String>,
 
     // ── Pipeline Identity ──
@@ -145,7 +139,6 @@ pub struct CheckpointManifest {
     /// Durable key encoding, hashing, and key-group mapping contract.
     pub partitioning_abi_version: u16,
     /// Virtual partition count for state key distribution.
-    #[serde(default)]
     pub vnode_count: u16,
 
     // ── Integrity ──
@@ -153,7 +146,6 @@ pub struct CheckpointManifest {
     ///
     /// Written during checkpoint commit so that recovery can verify the
     /// sidecar hasn't been corrupted or truncated on disk/S3.
-    #[serde(default)]
     pub state_checksum: Option<String>,
 }
 
@@ -219,14 +211,12 @@ impl CheckpointManifest {
         if let Some(message) = self.pipeline_identity.validation_error() {
             errors.push(ManifestValidationError { message });
         }
-        if !self.deployment_id.is_empty() {
-            let valid = uuid::Uuid::parse_str(&self.deployment_id)
-                .is_ok_and(|id| !id.is_nil() && id.to_string() == self.deployment_id);
-            if !valid {
-                errors.push(ManifestValidationError {
-                    message: "deployment_id must be a canonical non-nil UUID".into(),
-                });
-            }
+        let valid_deployment = uuid::Uuid::parse_str(&self.deployment_id)
+            .is_ok_and(|id| !id.is_nil() && id.to_string() == self.deployment_id);
+        if !valid_deployment {
+            errors.push(ManifestValidationError {
+                message: "deployment_id must be a canonical non-nil UUID".into(),
+            });
         }
 
         // Source offsets should reference known sources (if topology is recorded)
@@ -320,6 +310,7 @@ impl CheckpointManifest {
 /// duplicating its epoch in each connector payload would create conflicting
 /// authorities during recovery.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectorCheckpoint {
     /// Connector-specific offset data.
     pub offsets: HashMap<String, String>,
@@ -352,18 +343,15 @@ impl ConnectorCheckpoint {
 
 /// Serialized operator state stored in the manifest.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct OperatorCheckpoint {
     /// Base64-encoded binary state (for small payloads inlined in JSON).
-    #[serde(default)]
     pub state_b64: Option<String>,
     /// If true, state is stored externally in the state.bin sidecar file.
-    #[serde(default)]
     pub external: bool,
     /// Byte offset into the state.bin file (if external).
-    #[serde(default)]
     pub external_offset: u64,
     /// Byte length of the state in the state.bin file (if external).
-    #[serde(default)]
     pub external_length: u64,
 }
 
@@ -391,29 +379,6 @@ impl OperatorCheckpoint {
             external_offset: offset,
             external_length: length,
         }
-    }
-
-    /// Decodes the inline state, returning the raw bytes.
-    ///
-    /// Returns `None` if the state is external, no inline data is present,
-    /// or if the base64 data is corrupted (logs a warning in that case).
-    #[must_use]
-    pub fn decode_inline(&self) -> Option<Vec<u8>> {
-        use base64::Engine;
-        self.state_b64.as_ref().and_then(|b64| {
-            match base64::engine::general_purpose::STANDARD.decode(b64) {
-                Ok(data) => Some(data),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        b64_len = b64.len(),
-                        "[LDB-4004] Failed to decode inline operator state from base64 — \
-                         operator will start from scratch"
-                    );
-                    None
-                }
-            }
-        })
     }
 
     /// Decodes the inline state, returning a `Result` for callers that need
@@ -510,7 +475,8 @@ mod tests {
     #[test]
     fn test_manifest_new_with_explicit_key_group_count() {
         let key_group_count = KeyGroupCount::try_from(256_u16).unwrap();
-        let manifest = CheckpointManifest::new_with_key_group_count(5, 5, key_group_count);
+        let mut manifest = CheckpointManifest::new_with_key_group_count(5, 5, key_group_count);
+        manifest.deployment_id = uuid::Uuid::from_u128(1).to_string();
 
         assert_eq!(manifest.vnode_count, key_group_count.get());
         assert!(manifest.validate(key_group_count).is_empty());
@@ -542,7 +508,7 @@ mod tests {
         assert_eq!(src.source_assignment_version, std::num::NonZeroU64::new(12));
 
         let op = restored.operator_states.get("window-agg").unwrap();
-        assert_eq!(op.decode_inline().unwrap(), b"hello");
+        assert_eq!(op.try_decode_inline().unwrap().unwrap(), b"hello");
     }
 
     #[test]
@@ -596,7 +562,7 @@ mod tests {
         let op = OperatorCheckpoint::inline(b"state-data");
         assert!(!op.external);
         assert!(op.state_b64.is_some());
-        assert_eq!(op.decode_inline().unwrap(), b"state-data");
+        assert_eq!(op.try_decode_inline().unwrap().unwrap(), b"state-data");
     }
 
     #[test]
@@ -605,13 +571,13 @@ mod tests {
         assert!(op.external);
         assert_eq!(op.external_offset, 1024);
         assert_eq!(op.external_length, 256);
-        assert!(op.decode_inline().is_none());
+        assert!(op.try_decode_inline().unwrap().is_none());
     }
 
     #[test]
     fn test_operator_checkpoint_empty_inline() {
         let op = OperatorCheckpoint::inline(b"");
-        assert_eq!(op.decode_inline().unwrap(), b"");
+        assert_eq!(op.try_decode_inline().unwrap().unwrap(), b"");
     }
 
     #[test]
@@ -726,7 +692,7 @@ mod tests {
         let (op, sidecar) = OperatorCheckpoint::from_bytes(data, 1024, 0);
         assert!(!op.external);
         assert!(sidecar.is_none());
-        assert_eq!(op.decode_inline().unwrap(), data);
+        assert_eq!(op.try_decode_inline().unwrap().unwrap(), data);
     }
 
     #[test]
@@ -736,7 +702,7 @@ mod tests {
         assert!(op.external);
         assert_eq!(op.external_offset, 512);
         assert_eq!(op.external_length, 2048);
-        assert!(op.decode_inline().is_none());
+        assert!(op.try_decode_inline().unwrap().is_none());
         assert_eq!(sidecar.unwrap(), data);
     }
 
@@ -747,7 +713,7 @@ mod tests {
         let (op, sidecar) = OperatorCheckpoint::from_bytes(&data, 100, 0);
         assert!(!op.external);
         assert!(sidecar.is_none());
-        assert_eq!(op.decode_inline().unwrap(), data);
+        assert_eq!(op.try_decode_inline().unwrap().unwrap(), data);
 
         // One byte over threshold → external
         let data_over = vec![0xFF; 101];
@@ -761,7 +727,7 @@ mod tests {
         let (op, sidecar) = OperatorCheckpoint::from_bytes(b"", 1024, 0);
         assert!(!op.external);
         assert!(sidecar.is_none());
-        assert_eq!(op.decode_inline().unwrap(), b"");
+        assert_eq!(op.try_decode_inline().unwrap().unwrap(), b"");
     }
 
     #[test]

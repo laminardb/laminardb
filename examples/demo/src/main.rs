@@ -45,8 +45,8 @@ use laminar_core::streaming::StreamCheckpointConfig;
 use laminar_db::LaminarDB;
 
 use laminardb_demo::app::App;
-use laminardb_demo::asof_merge;
 use laminardb_demo::generator::MarketGenerator;
+use laminardb_demo::latest_tick;
 use laminardb_demo::system_stats::StatsCollector;
 use laminardb_demo::tui;
 use laminardb_demo::types::{
@@ -117,10 +117,10 @@ impl PipelineDataSource for EmbeddedDataSource {
         let orders = self.generator.generate_orders(5, ts);
         let book_updates = self.generator.generate_book_updates(ts);
 
-        // Buffer raw ticks for ASOF matching
-        app.ingest_ticks_for_asof(&ticks);
+        // Buffer raw ticks for latest-value enrichment.
+        app.ingest_ticks(&ticks);
 
-        // Run ASOF merge: enrich orders with latest market data
+        // Enrich orders with the latest market data available at their timestamp.
         let order_tuples: Vec<_> = orders
             .iter()
             .map(|o| {
@@ -134,7 +134,7 @@ impl PipelineDataSource for EmbeddedDataSource {
                 )
             })
             .collect();
-        let enriched = asof_merge::merge_orders_with_ticks(&order_tuples, &app.tick_buffer);
+        let enriched = latest_tick::merge_orders_with_ticks(&order_tuples, &app.tick_buffer);
         app.ingest_enriched_orders(enriched);
 
         // Apply book updates to in-memory L2 book
@@ -182,12 +182,12 @@ impl PipelineDataSource for KafkaDataSource {
             .map(|b| b.to_order_book_update())
             .collect();
 
-        app.ingest_ticks_for_asof(&app_ticks);
+        app.ingest_ticks(&app_ticks);
         app.apply_book_updates(&app_book);
         app.total_ticks += ticks.len() as u64;
         app.total_orders += orders.len() as u64;
 
-        // ASOF merge: enrich orders with latest market data
+        // Enrich orders with the latest market data available at their timestamp.
         let order_tuples: Vec<_> = orders
             .iter()
             .map(|o| {
@@ -201,7 +201,7 @@ impl PipelineDataSource for KafkaDataSource {
                 )
             })
             .collect();
-        let enriched = asof_merge::merge_orders_with_ticks(&order_tuples, &app.tick_buffer);
+        let enriched = latest_tick::merge_orders_with_ticks(&order_tuples, &app.tick_buffer);
         app.ingest_enriched_orders(enriched);
         app.cleanup_tick_buffer(ts);
 
@@ -385,7 +385,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|b| b.to_order_book_update())
         .collect();
-    app.ingest_ticks_for_asof(&app_ticks);
+    app.ingest_ticks(&app_ticks);
     app.apply_book_updates(&app_book);
     app.total_ticks += tick_count as u64;
     app.total_orders += order_count as u64;

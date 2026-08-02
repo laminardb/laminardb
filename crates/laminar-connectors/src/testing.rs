@@ -16,7 +16,8 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorInfo};
 use crate::connector::{
     SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, SourceBatch,
-    SourceConnector, WriteResult,
+    SourceConnector, SourceConsistency, SourceContract, SourceInputMode, SourceTopology,
+    WriteResult,
 };
 use crate::error::ConnectorError;
 use crate::registry::ConnectorRegistry;
@@ -119,6 +120,14 @@ impl Default for MockSourceConnector {
 
 #[async_trait]
 impl SourceConnector for MockSourceConnector {
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        Ok(SourceContract::new(
+            SourceConsistency::Replayable,
+            SourceTopology::Singleton,
+            SourceInputMode::AppendOnly,
+        ))
+    }
+
     async fn start(
         &mut self,
         request: crate::connector::SourceStart,

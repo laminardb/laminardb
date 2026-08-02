@@ -1185,14 +1185,38 @@ impl LaminarDB {
         connector_type: Option<&String>,
         connector_options: &HashMap<String, String>,
         format: Option<&laminar_sql::parser::FormatSpec>,
-        with_options: &HashMap<String, String>,
         kind: ConnectorKind,
     ) -> Result<Option<ResolvedConnector>, DbError> {
-        if connector_type.is_none() && !has_connector_key(with_options) {
+        let Some(connector_type) = connector_type else {
+            if format.is_some() {
+                let clause = match kind {
+                    ConnectorKind::Source => "FROM",
+                    ConnectorKind::Sink => "INTO",
+                };
+                return Err(DbError::InvalidOperation(format!(
+                    "FORMAT requires an explicit {clause} connector"
+                )));
+            }
             return Ok(None);
-        }
-        let mut resolved =
-            resolve_connector_info(connector_type, connector_options, format, with_options);
+        };
+        let mut resolved = ResolvedConnector {
+            connector_type: Some(connector_type.clone()),
+            connector_options: connector_options.clone(),
+            format: format.map(|format| format.format_type.clone()),
+            format_options: format
+                .map(|format| format.options.clone())
+                .unwrap_or_default(),
+        };
+        let kind_name = match kind {
+            ConnectorKind::Source => "Source",
+            ConnectorKind::Sink => "Sink",
+        };
+        crate::connector_manager::validate_connector_format_options(
+            kind_name,
+            &resolved.connector_options,
+            resolved.format.as_deref(),
+            &resolved.format_options,
+        )?;
         let lookup = |name: &str| {
             self.config_vars
                 .get(name)
@@ -1237,8 +1261,7 @@ impl LaminarDB {
                     .to_string(),
             ));
         }
-        let has_connector =
-            create.connector_type.is_some() || has_connector_key(&create.with_options);
+        let has_connector = create.connector_type.is_some();
 
         let source_name = canonical_object_name(&create.name)?;
         reject_reserved_namespace(&source_name)?;
@@ -1260,7 +1283,6 @@ impl LaminarDB {
             create.connector_type.as_ref(),
             &create.connector_options,
             create.format.as_ref(),
-            &create.with_options,
             ConnectorKind::Source,
         )?;
 
@@ -1403,6 +1425,7 @@ impl LaminarDB {
     ) -> Result<Option<Arc<crate::catalog::SourceEntry>>, DbError> {
         let name = &source_def.name;
         let schema = source_def.schema.clone();
+        let primary_key = source_def.primary_key.clone();
         let watermark_col = source_def.watermark.as_ref().map(|w| w.column.clone());
         let max_ooo = source_def
             .watermark
@@ -1420,6 +1443,7 @@ impl LaminarDB {
                 Some(self.catalog.register_source(
                     name,
                     schema,
+                    primary_key,
                     watermark_col,
                     max_ooo,
                     buffer_size,
@@ -1432,6 +1456,7 @@ impl LaminarDB {
             Some(self.catalog.register_source(
                 name,
                 schema,
+                primary_key,
                 watermark_col,
                 max_ooo,
                 buffer_size,
@@ -1491,7 +1516,6 @@ impl LaminarDB {
             create.connector_type.as_ref(),
             &create.connector_options,
             create.format.as_ref(),
-            &create.with_options,
             ConnectorKind::Sink,
         )?;
 
@@ -1706,6 +1730,8 @@ impl LaminarDB {
         self.validate_cluster_query_shape_before_plan("stream", &name_str, query_sql, emit_clause)?;
         let planned =
             self.plan_streaming_query(name, query, emit_clause.cloned(), query_sql, false)?;
+        self.validate_interval_join_schema(&name_str, query_sql, &planned)
+            .await?;
         self.validate_cluster_query_shape("stream", &name_str, query_sql, &planned)
             .await?;
         let PlannedStreamingQuery {
@@ -2106,34 +2132,17 @@ impl LaminarDB {
         query: &StreamingStatement,
         emit_clause: Option<laminar_sql::parser::EmitClause>,
         query_sql: &str,
-        certify_state_backed_join: bool,
+        certify_changelog_enrich: bool,
     ) -> Result<PlannedStreamingQuery, DbError> {
-        let admission = if certify_state_backed_join {
+        let admission = if certify_changelog_enrich {
             let incremental_mvs = self.incremental_mv_names();
-            if let Some(join) =
-                crate::sql_analysis::detect_changelog_incremental_join(query_sql, &incremental_mvs)
-            {
-                Some(
-                    laminar_sql::planner::StateBackedJoinAdmission::try_new(
-                        join.left_table,
-                        join.right_table,
-                        join.left_keys,
-                        join.right_keys,
-                        join.left_outer,
-                    )
-                    .map_err(|error| {
-                        DbError::InvalidOperation(format!(
-                            "invalid incremental-join admission certificate: {error}"
-                        ))
-                    })?,
-                )
-            } else if let Some(join) = crate::sql_analysis::detect_changelog_enrich_query(
+            if let Some(join) = crate::sql_analysis::detect_changelog_enrich_query(
                 query_sql,
                 &incremental_mvs,
                 &self.static_table_names(),
             ) {
                 Some(
-                    laminar_sql::planner::StateBackedJoinAdmission::try_new(
+                    laminar_sql::planner::ChangelogEnrichAdmission::try_new(
                         join.changelog_table,
                         join.static_table,
                         join.left_keys,
@@ -2163,7 +2172,7 @@ impl LaminarDB {
             retention_bytes: None,
         };
         let plan_result = if let Some(admission) = admission.as_ref() {
-            planner.plan_state_backed_join(&statement, admission)
+            planner.plan_changelog_enrich(&statement, admission)
         } else {
             planner.plan(&statement)
         };
@@ -2182,6 +2191,177 @@ impl LaminarDB {
             has_analytic: plan.analytic_config.is_some(),
             has_frame: plan.frame_config.is_some(),
         })
+    }
+
+    pub(crate) async fn validate_interval_join_schema(
+        &self,
+        object_name: &str,
+        query_sql: &str,
+        plan: &PlannedStreamingQuery,
+    ) -> Result<(), DbError> {
+        let Some(joins) = &plan.join_config else {
+            return Ok(());
+        };
+
+        let mut has_interval_join = false;
+        for join in joins {
+            let laminar_sql::translator::JoinOperatorConfig::StreamStream(config) = join else {
+                continue;
+            };
+            has_interval_join = true;
+            let left_schema = self
+                .ctx
+                .table_provider(exact_table_reference(&config.left_table))
+                .await
+                .map_err(|error| {
+                    DbError::InvalidOperation(format!(
+                        "cannot validate interval join '{object_name}' input '{}': {error}",
+                        config.left_table
+                    ))
+                })?
+                .schema();
+            let right_schema = self
+                .ctx
+                .table_provider(exact_table_reference(&config.right_table))
+                .await
+                .map_err(|error| {
+                    DbError::InvalidOperation(format!(
+                        "cannot validate interval join '{object_name}' input '{}': {error}",
+                        config.right_table
+                    ))
+                })?
+                .schema();
+
+            let field = |schema: &Schema, table: &str, column: &str| {
+                schema
+                    .field_with_name(column)
+                    .map(|field| (field.data_type().clone(), field.is_nullable()))
+                    .map_err(|_| {
+                        DbError::InvalidOperation(format!(
+                            "interval join '{object_name}' column '{table}.{column}' does not exist"
+                        ))
+                    })
+            };
+            if config.left_keys.is_empty() || config.left_keys.len() != config.right_keys.len() {
+                return Err(DbError::InvalidOperation(format!(
+                    "interval join '{object_name}' requires non-empty equality-key vectors with matching arity"
+                )));
+            }
+            for (left_column, right_column) in config.left_keys.iter().zip(config.right_keys.iter())
+            {
+                let (left_key, _) = field(&left_schema, &config.left_table, left_column)?;
+                let (right_key, _) = field(&right_schema, &config.right_table, right_column)?;
+                if !matches!(&left_key, DataType::Utf8 | DataType::Int64)
+                    || !matches!(&right_key, DataType::Utf8 | DataType::Int64)
+                    || left_key != right_key
+                {
+                    return Err(DbError::InvalidOperation(format!(
+                        "interval join '{object_name}' key pairs must have the same Utf8 or Int64 type; '{}.{}' is {} and '{}.{}' is {}",
+                        config.left_table,
+                        left_column,
+                        left_key,
+                        config.right_table,
+                        right_column,
+                        right_key
+                    )));
+                }
+            }
+
+            if matches!(
+                config.join_type,
+                laminar_sql::parser::join_parser::JoinType::Inner
+                    | laminar_sql::parser::join_parser::JoinType::Left
+                    | laminar_sql::parser::join_parser::JoinType::Right
+                    | laminar_sql::parser::join_parser::JoinType::Full
+            ) {
+                let mut output_names = std::collections::HashSet::new();
+                for field in left_schema.fields() {
+                    if !output_names.insert(field.name().clone()) {
+                        return Err(DbError::InvalidOperation(format!(
+                            "interval join '{object_name}' input schema repeats column '{}'",
+                            field.name()
+                        )));
+                    }
+                }
+                for field in right_schema.fields() {
+                    let name = format!("{}_{}", field.name(), config.right_table);
+                    if !output_names.insert(name.clone()) {
+                        return Err(DbError::InvalidOperation(format!(
+                            "interval join '{object_name}' internal output column '{name}' collides; rename the input column or relation"
+                        )));
+                    }
+                }
+            }
+
+            for (schema, table, column) in [
+                (&left_schema, &config.left_table, &config.left_time_column),
+                (
+                    &right_schema,
+                    &config.right_table,
+                    &config.right_time_column,
+                ),
+            ] {
+                let (time, nullable) = field(schema, table, column)?;
+                if !matches!(&time, DataType::Timestamp(_, _)) {
+                    return Err(DbError::InvalidOperation(format!(
+                        "interval join '{object_name}' event-time column '{table}.{column}' must be Timestamp(_), found {}",
+                        time
+                    )));
+                }
+                if nullable {
+                    return Err(DbError::InvalidOperation(format!(
+                        "interval join '{object_name}' event-time column '{table}.{column}' must be declared NOT NULL"
+                    )));
+                }
+            }
+
+            for (side, source_name, time_column) in [
+                (
+                    "left",
+                    config.left_table.as_str(),
+                    config.left_time_column.as_str(),
+                ),
+                (
+                    "right",
+                    config.right_table.as_str(),
+                    config.right_time_column.as_str(),
+                ),
+            ] {
+                let Some(source) = self.catalog.get_source(source_name) else {
+                    return Err(DbError::InvalidOperation(format!(
+                        "{side} interval join input '{source_name}' must be a directly watermarked source"
+                    )));
+                };
+                if source.watermark_column.as_deref() != Some(time_column)
+                    || source
+                        .is_processing_time
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(DbError::InvalidOperation(format!(
+                        "{side} interval join input '{source_name}' must define an event-time watermark on '{time_column}'"
+                    )));
+                }
+            }
+        }
+
+        if has_interval_join {
+            if crate::sql_analysis::has_unaliased_projection(query_sql) {
+                return Err(DbError::InvalidOperation(format!(
+                    "interval join '{object_name}' requires every projected expression to have an explicit alias"
+                )));
+            }
+            let dataframe = self.ctx.sql(query_sql).await.map_err(|error| {
+                DbError::InvalidOperation(format!(
+                    "interval join '{object_name}' could not be validated: {error}"
+                ))
+            })?;
+            if logical_aggregate_stage_count(dataframe.logical_plan()) != 0 {
+                return Err(DbError::InvalidOperation(format!(
+                    "interval join '{object_name}' cannot contain an aggregate stage"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn cluster_state_lifecycle_error(object_kind: &str, name: &str, reason: &str) -> DbError {
@@ -2243,28 +2423,12 @@ impl LaminarDB {
             );
         }
 
-        let incremental_mvs = self.incremental_mv_names();
-        if crate::sql_analysis::detect_changelog_incremental_join(query_sql, &incremental_mvs)
-            .is_some()
-            || crate::sql_analysis::is_multiway_incremental_join(query_sql, &incremental_mvs)
+        if crate::sql_analysis::has_join_clause(query_sql)
+            && self.first_incremental_ref(query_sql).is_some()
         {
             return reject(
                 "incremental changelog join state has no vnode-keyed checkpoint and rebalance lifecycle",
             );
-        }
-        if crate::sql_analysis::detect_temporal_probe_query(query_sql)
-            .0
-            .is_some()
-        {
-            return reject(
-                "temporal-probe join state has no vnode-keyed checkpoint and rebalance lifecycle",
-            );
-        }
-        if crate::sql_analysis::detect_asof_query(query_sql)
-            .0
-            .is_some()
-        {
-            return reject("ASOF join state has no vnode-keyed checkpoint and rebalance lifecycle");
         }
         if crate::sql_analysis::detect_temporal_query(query_sql)
             .0
@@ -2279,7 +2443,7 @@ impl LaminarDB {
 
     /// Cluster admission is based on configured runtime mode, never the current owner count.
     /// Every stateful route admitted here must implement key shuffle plus vnode capture, restore,
-    /// and revoke. Joins fail closed until their operator and output state have that lifecycle.
+    /// and revoke. Only the bounded interval-join contract is currently admitted.
     pub(crate) async fn validate_cluster_query_shape(
         &self,
         object_kind: &str,
@@ -2311,6 +2475,11 @@ impl LaminarDB {
                 "analytic/window-frame state has no vnode-keyed checkpoint and rebalance lifecycle",
             );
         }
+        if plan.window_config.is_some() {
+            return reject(
+                "windowed aggregate state has no certified watermark eviction lifecycle",
+            );
+        }
         if plan
             .order_config
             .as_ref()
@@ -2321,28 +2490,56 @@ impl LaminarDB {
             );
         }
         if let Some(joins) = &plan.join_config {
-            let reason = match joins.first() {
-                Some(JoinOperatorConfig::StreamStream(_)) => {
-                    "stream join state has no vnode-keyed checkpoint and rebalance lifecycle"
-                }
-                Some(JoinOperatorConfig::Asof(_)) => {
-                    "ASOF join state has no vnode-keyed checkpoint and rebalance lifecycle"
-                }
-                Some(JoinOperatorConfig::Temporal(_)) => {
-                    "temporal join state has no vnode-keyed checkpoint and rebalance lifecycle"
-                }
-                Some(JoinOperatorConfig::TemporalProbe(_)) => {
-                    "temporal-probe join state has no vnode-keyed checkpoint and rebalance lifecycle"
-                }
-                Some(JoinOperatorConfig::Lookup(_)) | None => {
-                    "lookup join operator and output state have no vnode lifecycle"
-                }
+            let [join] = joins.as_slice() else {
+                return reject("cluster streaming joins require exactly one two-input stage");
             };
-            return reject(reason);
+            let JoinOperatorConfig::StreamStream(config) = join else {
+                let reason = match join {
+                    JoinOperatorConfig::Temporal(_) => {
+                        "temporal join state has no vnode-keyed checkpoint and rebalance lifecycle"
+                    }
+                    JoinOperatorConfig::Lookup(_) => {
+                        "lookup join operator and output state have no vnode lifecycle"
+                    }
+                    JoinOperatorConfig::StreamStream(_) => unreachable!(),
+                };
+                return reject(reason);
+            };
+            if config.time_bound.is_zero() || i64::try_from(config.time_bound.as_millis()).is_err()
+            {
+                return reject(
+                    "the distributed join supports only append-only bounded equality joins with a positive finite event-time bound",
+                );
+            }
+            let detected =
+                crate::sql_analysis::detect_stream_join_query(query_sql).ok_or_else(|| {
+                    Self::cluster_state_lifecycle_error(
+                        object_kind,
+                        name,
+                        "the planner join does not map to the bounded interval-join execution path",
+                    )
+                })?;
+            if detected.config.left_table != config.left_table
+                || detected.config.right_table != config.right_table
+                || detected.config.join_type != config.join_type
+                || detected.config.left_keys != config.left_keys
+                || detected.config.right_keys != config.right_keys
+                || detected.config.left_time_column != config.left_time_column
+                || detected.config.right_time_column != config.right_time_column
+                || detected.config.time_bound != config.time_bound
+            {
+                return reject("planner and interval-join execution metadata disagree");
+            }
+            #[cfg(feature = "cluster")]
+            if self.shuffle_sender.lock().is_none()
+                || self.shuffle_receiver.lock().is_none()
+                || self.vnode_registry.lock().is_none()
+            {
+                return reject("interval join has no complete shuffle and vnode ownership scope");
+            }
+            return Ok(true);
         } else if crate::sql_analysis::detect_stream_join_query(query_sql).is_some() {
-            return reject(
-                "stream join state has no vnode-keyed checkpoint and rebalance lifecycle",
-            );
+            return reject("the planner did not bind the bounded interval-join contract");
         }
 
         let dataframe = self.ctx.sql(query_sql).await.map_err(|error| {
@@ -2465,14 +2662,9 @@ impl LaminarDB {
             }));
         };
 
-        let incremental_names = self.incremental_mv_names();
-        if crate::sql_analysis::is_multiway_incremental_join(query_sql, &incremental_names) {
-            return Err(DbError::MaterializedView(format!(
-                "multi-way incremental join '{name_str}' is disabled until the runtime supports \
-                 atomic batch topology admission"
-            )));
-        }
         let planned = self.plan_streaming_query(name, query, emit_clause, query_sql, true)?;
+        self.validate_interval_join_schema(&name_str, query_sql, &planned)
+            .await?;
         let PlannedStreamingQuery {
             emit_clause: plan_emit,
             window_config: plan_window,
@@ -2589,7 +2781,7 @@ impl LaminarDB {
         }))
     }
 
-    /// Falls back to executing the query for shapes `DataFusion` can't plan (e.g. ASOF).
+    /// Falls back to executing the query when static schema planning is unavailable.
     async fn resolve_mv_schema(&self, query_sql: &str) -> Result<Arc<Schema>, DbError> {
         if let Some(s) = crate::pipeline_lifecycle::plan_output_schema(&self.ctx, query_sql).await {
             return Ok(s);
@@ -2656,17 +2848,19 @@ impl LaminarDB {
         let Some(mv) = self.first_incremental_ref(query_sql) else {
             return Ok(());
         };
-        // Allowed: aggregate, simple projection/filter, `changelog ⋈ static dim` enrich, or
-        // `changelog ⋈ changelog` INNER or LEFT-outer IVM join. RIGHT/FULL, non-equi ON residuals,
-        // and other complex shapes are rejected.
+        // A changelog may enrich against a static table. Every other join shape is rejected;
+        // aggregates and simple projection/filter consumers continue to net retractions.
         let inc = self.incremental_mv_names();
-        let supported = crate::sql_analysis::detect_changelog_enrich_query(
+        let changelog_enrich = crate::sql_analysis::detect_changelog_enrich_query(
             query_sql,
             &inc,
             &self.static_table_names(),
         )
-        .is_some()
-            || crate::sql_analysis::detect_changelog_incremental_join(query_sql, &inc).is_some()
+        .is_some();
+        if crate::sql_analysis::has_join_clause(query_sql) && !changelog_enrich {
+            return Err(incremental_mv_consumer_error(&mv, consumer));
+        }
+        let supported = changelog_enrich
             || self.ctx.sql(query_sql).await.ok().is_some_and(|df| {
                 let plan = df.logical_plan();
                 crate::aggregate_state::find_aggregate(plan).is_some()
@@ -2714,16 +2908,6 @@ impl LaminarDB {
                 query_sql,
                 &self.incremental_mv_names(),
                 &self.static_table_names(),
-            )
-            .is_some()
-        {
-            return (IncEmit::Multiset, false);
-        }
-        // `changelog ⋈ changelog` inner IVM join → Z-set multiset snapshot.
-        if reads_incremental
-            && crate::sql_analysis::detect_changelog_incremental_join(
-                query_sql,
-                &self.incremental_mv_names(),
             )
             .is_some()
         {
@@ -2907,70 +3091,12 @@ impl LaminarDB {
     }
 }
 
-const STREAMING_OPTION_KEYS: &[&str] = &[
-    "connector",
-    "format",
-    "buffer_size",
-    "buffersize",
-    "backpressure",
-    "wait_strategy",
-    "waitstrategy",
-    "track_stats",
-    "trackstats",
-    "stats",
-    "event_time",
-    "watermark_delay",
-];
-
-/// Normalised connector info after merging the two CREATE SOURCE/SINK syntax forms.
+/// Normalized connector info from an explicit source `FROM` or sink `INTO` clause.
 pub(crate) struct ResolvedConnector {
     pub connector_type: Option<String>,
     pub connector_options: HashMap<String, String>,
     pub format: Option<String>,
     pub format_options: HashMap<String, String>,
-}
-
-/// Whether a `WITH (...)` clause names a connector, matched case-insensitively
-/// to stay consistent with `resolve_connector_info`.
-fn has_connector_key(with_options: &HashMap<String, String>) -> bool {
-    with_options
-        .keys()
-        .any(|k| k.eq_ignore_ascii_case("connector"))
-}
-
-pub(crate) fn resolve_connector_info(
-    connector_type: Option<&String>,
-    connector_options: &HashMap<String, String>,
-    format: Option<&laminar_sql::parser::FormatSpec>,
-    with_options: &HashMap<String, String>,
-) -> ResolvedConnector {
-    if connector_type.is_some() {
-        ResolvedConnector {
-            connector_type: connector_type.cloned(),
-            connector_options: connector_options.clone(),
-            format: format.map(|f| f.format_type.clone()),
-            format_options: format.map(|f| f.options.clone()).unwrap_or_default(),
-        }
-    } else if let Some(ct) = with_options
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("connector"))
-        .map(|(_, v)| v)
-    {
-        let (conn_opts, fmt, fmt_opts) = extract_connector_from_with_options(with_options);
-        ResolvedConnector {
-            connector_type: Some(ct.to_uppercase()),
-            connector_options: conn_opts,
-            format: fmt,
-            format_options: fmt_opts,
-        }
-    } else {
-        ResolvedConnector {
-            connector_type: None,
-            connector_options: HashMap::new(),
-            format: None,
-            format_options: HashMap::new(),
-        }
-    }
 }
 
 /// Validate that a resolved format string is known.
@@ -2980,40 +3106,6 @@ pub(crate) fn validate_format(format: Option<&String>) -> Result<(), DbError> {
             .map_err(|e| DbError::Connector(format!("Unknown format '{fmt_str}': {e}")))?;
     }
     Ok(())
-}
-
-/// Extract `(connector_options, format, format_options)` from a `WITH (...)` clause.
-pub(crate) fn extract_connector_from_with_options(
-    with_options: &HashMap<String, String>,
-) -> (
-    HashMap<String, String>,
-    Option<String>,
-    HashMap<String, String>,
-) {
-    let mut connector_options = HashMap::with_capacity(with_options.len());
-    let mut format: Option<String> = None;
-    let mut format_options = HashMap::with_capacity(4);
-
-    for (key, value) in with_options {
-        let lower = key.to_lowercase();
-        if lower == "connector" {
-            continue;
-        }
-        if lower == "format" {
-            format = Some(value.clone());
-            continue;
-        }
-        if let Some(suffix) = lower.strip_prefix("format.") {
-            format_options.insert(suffix.to_string(), value.clone());
-            continue;
-        }
-        if STREAMING_OPTION_KEYS.contains(&lower.as_str()) {
-            continue;
-        }
-        connector_options.insert(key.clone(), value.clone());
-    }
-
-    (connector_options, format, format_options)
 }
 
 #[cfg(test)]

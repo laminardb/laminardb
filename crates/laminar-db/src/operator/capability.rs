@@ -29,6 +29,10 @@ pub(crate) enum OperatorStateClass {
 pub(crate) enum ManagedStateContract {
     /// The existing incremental SQL aggregate checkpoint codec.
     SqlAggregateV1,
+    /// Whole-image event-time state for the bounded vnode-zero tumbling-window profile.
+    CoreWindowV1,
+    /// Whole-image state for the bounded, append-only vnode-keyed interval join.
+    BoundedIntervalJoinV1,
     #[cfg(test)]
     TestVnodeStateV1,
 }
@@ -60,16 +64,13 @@ pub(crate) enum OperatorImplementation {
     SqlFilter,
     ChangelogEnrich,
     AiInference,
-    AsofJoin,
     EowcQuery,
-    IncrementalJoin,
     IntervalJoin,
     LookupEnrich,
     SqlQuery,
     TemporalFilter,
     Rejecting,
     TemporalJoin,
-    TemporalProbeJoin,
     WindowFrame,
     #[cfg(test)]
     TestProbe,
@@ -152,10 +153,7 @@ impl OperatorCapability {
                 State::LocalOnly,
                 "checkpointed in-flight inference has no vnode ownership lifecycle",
             ),
-            Implementation::AsofJoin
-            | Implementation::IncrementalJoin
-            | Implementation::IntervalJoin
-            | Implementation::TemporalProbeJoin => Self::rejected(
+            Implementation::IntervalJoin => Self::rejected(
                 implementation,
                 State::LocalOnly,
                 "join state has no co-partitioned vnode ownership lifecycle",
@@ -207,12 +205,34 @@ impl OperatorCapability {
         .with_managed_state(ManagedStateContract::SqlAggregateV1)
     }
 
-    /// Descriptor for the current grouped-aggregate path.
-    pub(crate) const fn keyed_sql_aggregate() -> Self {
+    /// Lifecycle-only descriptor for the bounded vnode-zero tumbling-window profile.
+    ///
+    /// Cluster admission remains rejected because EOWC input routing and a cluster-wide source
+    /// watermark frontier are not implemented. The managed contract only makes the existing
+    /// production operator exercise capture and fenced whole-image replacement.
+    pub(crate) const fn managed_global_tumbling_window() -> Self {
         Self::rejected(
+            OperatorImplementation::EowcQuery,
+            OperatorStateClass::GlobalSingleton,
+            "window state has a vnode-zero lifecycle, but distributed input routing and global watermark authority are not certified",
+        )
+        .with_managed_state(ManagedStateContract::CoreWindowV1)
+    }
+
+    /// Descriptor for the one distributed stream-stream join shape admitted by the runtime.
+    pub(crate) const fn bounded_interval_join() -> Self {
+        Self::ddl_guarded(
+            OperatorImplementation::IntervalJoin,
+            OperatorStateClass::VnodeKeyed,
+        )
+        .with_managed_state(ManagedStateContract::BoundedIntervalJoinV1)
+    }
+
+    /// Descriptor for the DDL-guarded, vnode-managed grouped-aggregate path.
+    pub(crate) const fn keyed_sql_aggregate() -> Self {
+        Self::ddl_guarded(
             OperatorImplementation::SqlQuery,
             OperatorStateClass::VnodeKeyed,
-            "keyed working state remains an unbounded operator-owned map outside a qualified managed-state lifecycle",
         )
         .with_managed_state(ManagedStateContract::SqlAggregateV1)
     }
@@ -288,25 +308,11 @@ mod tests {
                 },
             ),
             (
-                Implementation::AsofJoin,
-                State::LocalOnly,
-                Rejected {
-                    reason: "join state has no co-partitioned vnode ownership lifecycle",
-                },
-            ),
-            (
                 Implementation::EowcQuery,
                 State::LocalOnly,
                 Rejected {
                     reason:
                         "whole-operator window state has no vnode ownership and timer lifecycle",
-                },
-            ),
-            (
-                Implementation::IncrementalJoin,
-                State::LocalOnly,
-                Rejected {
-                    reason: "join state has no co-partitioned vnode ownership lifecycle",
                 },
             ),
             (
@@ -336,13 +342,6 @@ mod tests {
                 State::RebuildableReplicated,
                 Rejected {
                     reason: "replicated lookup state has no cluster snapshot/version contract",
-                },
-            ),
-            (
-                Implementation::TemporalProbeJoin,
-                State::LocalOnly,
-                Rejected {
-                    reason: "join state has no co-partitioned vnode ownership lifecycle",
                 },
             ),
             (

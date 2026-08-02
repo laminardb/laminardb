@@ -3,7 +3,7 @@ use super::{
     admit_sink, admit_sink_contract, admit_source_contract, close_opened_sinks,
     open_prepared_sinks, resolve_stream_output_schemas, validate_source_recovery_assignment,
     ConnectorTaskFenceRegistration, DbError, PreparedSink, RuntimeMode, SinkAdmissionContext,
-    TrackedSourceRegistration, CLUSTER_BEST_EFFORT, EXACT_SINK_PROTOCOL,
+    TrackedSourceRegistration, CLUSTER_BEST_EFFORT, EXACT_SINK_PROTOCOL, KEYED_SOURCE_PRIMARY_KEY,
 };
 #[cfg(feature = "cluster")]
 use super::{
@@ -11,6 +11,7 @@ use super::{
     MAX_ARTIFACTS_PER_CLUSTER_VNODE_CHAIN,
 };
 use crate::db::DbState;
+use crate::pipeline::streaming_coordinator::MUTATION_SOURCE_NOT_ADMITTED;
 use crate::pipeline::PipelineConfig;
 use crate::sink_task::{SinkTaskConfig, DEFAULT_CHANNEL_CAPACITY, SINK_EVENT_CHANNEL_CAPACITY};
 use arrow_array::RecordBatch;
@@ -21,7 +22,8 @@ use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{
     ConnectorCancellationPolicy, ConnectorTaskOwner, ConnectorTaskTracker, DeliveryGuarantee,
     SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, SourceBatch,
-    SourceConnector, SourceConsistency, SourceContract, SourceStart, SourceTopology, WriteResult,
+    SourceConnector, SourceConsistency, SourceContract, SourceInputMode, SourceStart,
+    SourceTopology, WriteResult,
 };
 use laminar_connectors::error::ConnectorError;
 use laminar_core::state::StateBackendDurability;
@@ -258,6 +260,19 @@ fn cancelled_runtime_generation_cannot_publish_running() {
 
     assert!(matches!(error, crate::error::DbError::Shutdown));
     assert_eq!(DbState::load(&db.state), DbState::Created);
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn assignment_restore_cancellation_outlives_runtime_generation_but_not_close() {
+    let db = LaminarDB::open().unwrap();
+    let restore = db.assignment_restore_shutdown.clone();
+
+    db.runtime_shutdown.read().cancel();
+    assert!(!restore.is_cancelled());
+
+    db.close();
+    assert!(restore.is_cancelled());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -650,7 +665,11 @@ fn source_contract_admission_matrix_is_fail_closed() {
                                     .contract(&ConnectorConfig::new("generator"))
                                     .expect("static generator contract")
                             } else {
-                                SourceContract::new(consistency, topology)
+                                SourceContract::new(
+                                    consistency,
+                                    topology,
+                                    SourceInputMode::AppendOnly,
+                                )
                             };
                             contract.consistency = consistency;
                             contract.topology = topology;
@@ -667,13 +686,15 @@ fn source_contract_admission_matrix_is_fail_closed() {
                             let expected = expected
                                 && (delivery != DeliveryGuarantee::ExactlyOnce || certified)
                                 && !(runtime == RuntimeMode::Cluster
-                                    && delivery != DeliveryGuarantee::AtLeastOnce)
+                                    && delivery == DeliveryGuarantee::BestEffort)
                                 && (runtime != RuntimeMode::Cluster
                                     || topology == SourceTopology::Splittable);
 
                             assert_eq!(
                                 admit_source_contract(
                                     contract,
+                                    false,
+                                    false,
                                     delivery,
                                     checkpointing_enabled,
                                     runtime,
@@ -694,9 +715,15 @@ fn source_contract_admission_matrix_is_fail_closed() {
 
 #[test]
 fn cluster_best_effort_is_rejected_before_source_topology() {
-    let contract = SourceContract::new(SourceConsistency::Replayable, SourceTopology::Singleton);
+    let contract = SourceContract::new(
+        SourceConsistency::Replayable,
+        SourceTopology::Singleton,
+        SourceInputMode::AppendOnly,
+    );
     let error = admit_source_contract(
         contract,
+        false,
+        false,
         DeliveryGuarantee::BestEffort,
         true,
         RuntimeMode::Cluster,
@@ -713,6 +740,8 @@ fn commit_coupled_exactly_once_requires_a_certified_barrier_cut() {
     contract.consistency = SourceConsistency::CommitCoupled;
     let error = admit_source_contract(
         contract,
+        false,
+        false,
         DeliveryGuarantee::ExactlyOnce,
         true,
         RuntimeMode::Local,
@@ -732,6 +761,8 @@ fn deterministic_generator_is_admitted_for_local_exact_delivery() {
     assert!(contract.is_exact_delivery_certified());
     admit_source_contract(
         contract,
+        false,
+        false,
         DeliveryGuarantee::ExactlyOnce,
         true,
         RuntimeMode::Local,
@@ -741,16 +772,91 @@ fn deterministic_generator_is_admitted_for_local_exact_delivery() {
 
 #[test]
 fn uncertified_replayable_source_is_rejected_for_exact_delivery() {
-    let contract = SourceContract::new(SourceConsistency::Replayable, SourceTopology::Splittable);
+    let contract = SourceContract::new(
+        SourceConsistency::Replayable,
+        SourceTopology::Splittable,
+        SourceInputMode::AppendOnly,
+    );
     assert!(!contract.is_exact_delivery_certified());
     let error = admit_source_contract(
         contract,
+        false,
+        false,
         DeliveryGuarantee::ExactlyOnce,
         true,
         RuntimeMode::Local,
     )
     .expect_err("uncertified source recovery must fail closed for exact delivery");
     assert!(error.contains(laminar_core::error_codes::EXACTLY_ONCE_SOURCE_UNCERTIFIED));
+}
+
+#[test]
+fn mutation_sources_fail_before_connector_io() {
+    let keyed = SourceContract::new(
+        SourceConsistency::Replayable,
+        SourceTopology::Splittable,
+        SourceInputMode::KeyedUpsert,
+    );
+    assert_eq!(
+        admit_source_contract(
+            keyed,
+            false,
+            false,
+            DeliveryGuarantee::AtLeastOnce,
+            true,
+            RuntimeMode::Local,
+        )
+        .unwrap_err(),
+        KEYED_SOURCE_PRIMARY_KEY
+    );
+    assert_eq!(
+        admit_source_contract(
+            keyed,
+            true,
+            false,
+            DeliveryGuarantee::AtLeastOnce,
+            true,
+            RuntimeMode::Local,
+        )
+        .unwrap_err(),
+        MUTATION_SOURCE_NOT_ADMITTED
+    );
+
+    let changelog = SourceContract::new(
+        SourceConsistency::Replayable,
+        SourceTopology::Splittable,
+        SourceInputMode::FullChangelog,
+    );
+    assert_eq!(
+        admit_source_contract(
+            changelog,
+            false,
+            false,
+            DeliveryGuarantee::AtLeastOnce,
+            true,
+            RuntimeMode::Local,
+        )
+        .unwrap_err(),
+        MUTATION_SOURCE_NOT_ADMITTED
+    );
+
+    let append_only = SourceContract::new(
+        SourceConsistency::Replayable,
+        SourceTopology::Splittable,
+        SourceInputMode::AppendOnly,
+    );
+    assert_eq!(
+        admit_source_contract(
+            append_only,
+            false,
+            true,
+            DeliveryGuarantee::AtLeastOnce,
+            true,
+            RuntimeMode::Local,
+        )
+        .unwrap_err(),
+        MUTATION_SOURCE_NOT_ADMITTED
+    );
 }
 
 #[test]
@@ -891,6 +997,14 @@ impl SinkConnector for TrackedAdmissionSink {
 impl SourceConnector for TrackedPlanningSource {
     fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
         Some(self.tracker.clone())
+    }
+
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        Ok(SourceContract::new(
+            SourceConsistency::Replayable,
+            SourceTopology::Singleton,
+            SourceInputMode::AppendOnly,
+        ))
     }
 
     async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
@@ -1059,12 +1173,12 @@ async fn source_preplanning_failure_retains_captured_generation_fence() {
             name: "planning-failure".into(),
             connector: source,
             config: ConnectorConfig::new("planning-probe"),
-            contract: SourceContract::new(SourceConsistency::Replayable, SourceTopology::Singleton),
             assignment_scoped: false,
             position: laminar_connectors::connector::SourcePosition::Initial,
         },
         task_fence,
-    );
+    )
+    .expect("append-only planning source contract");
 
     let result: Result<(), DbError> = async move {
         let _source = source;
@@ -1084,7 +1198,7 @@ async fn source_preplanning_failure_retains_captured_generation_fence() {
                 incremental: false,
             },
         );
-        resolve_stream_output_schemas(&context, &streams).await?;
+        resolve_stream_output_schemas(&context, &streams, &Default::default()).await?;
         Ok(())
     }
     .await;

@@ -336,7 +336,7 @@ fn draw_sparkline(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(sparkline, area);
 }
 
-/// Enriched orders table (ASOF JOIN results).
+/// Orders enriched with the latest available market tick.
 fn draw_enriched_orders(f: &mut Frame, app: &App, area: Rect) {
     let header = Row::new(vec!["Order", "Sym", "Side", "Qty", "Price", "Mkt", "Slip"]).style(
         Style::default()
@@ -388,7 +388,7 @@ fn draw_enriched_orders(f: &mut Frame, app: &App, area: Rect) {
     .header(header)
     .block(
         Block::default()
-            .title(" ENRICHED ORDERS (ASOF) ")
+            .title(" ENRICHED ORDERS ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Magenta)),
     );

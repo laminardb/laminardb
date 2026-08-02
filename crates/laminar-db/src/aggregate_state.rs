@@ -25,16 +25,20 @@ use crate::db::exact_table_reference;
 use crate::error::DbError;
 
 mod accounting;
-mod artifact_v1;
 mod checkpoints;
 mod compile;
 mod keys;
-mod managed_v1;
 mod scalar_ipc;
 mod vnode_state;
+#[cfg(feature = "cluster")]
+pub(crate) use checkpoints::AggStateArchiveRestoreProfile;
+#[cfg(all(feature = "cluster", test))]
+pub(crate) use checkpoints::{
+    owned_restore_decode_count_for_test, reset_owned_restore_decode_count_for_test,
+};
 pub(crate) use checkpoints::{
     query_fingerprint, query_fingerprint_with_config, AggStateCheckpoint, EmittedCheckpoint,
-    EowcStateCheckpoint, GroupCheckpoint, JoinStateCheckpoint, WindowCheckpoint,
+    GroupCheckpoint, WindowCheckpoint,
 };
 pub(crate) use compile::{
     apply_compiled_having, compile_having_filter, expr_to_sql, extract_clauses, find_aggregate,
@@ -286,6 +290,46 @@ fn encode_groups_columnar(
     }
 
     Ok((keys_ipc, acc_state_ipc, last_updated_ms))
+}
+
+/// Reject retractable MIN/MAX checkpoint work before `Accumulator::state()` materializes the
+/// counted multisets as Arrow lists. The charge is the cached accumulator-reported working bytes
+/// for every selected group. It is deliberately conservative when the same group also contains a
+/// fixed-size SUM/COUNT/AVG accumulator, and is not an estimate of the final IPC wire size.
+fn ensure_retractable_extremum_checkpoint_budget<'a>(
+    agg_specs: &[AggFuncSpec],
+    retractable: bool,
+    entries: impl IntoIterator<Item = &'a GroupEntry>,
+    limit_bytes: usize,
+    context: &str,
+) -> Result<(), DbError> {
+    if !retractable
+        || !agg_specs
+            .iter()
+            .any(|spec| matches!(spec.udf.name().to_ascii_lowercase().as_str(), "min" | "max"))
+    {
+        return Ok(());
+    }
+
+    let mut charged_bytes = 0_usize;
+    for entry in entries {
+        let Some(next) = charged_bytes.checked_add(entry.accumulator_reported_bytes) else {
+            return Err(DbError::RetractableExtremumCheckpointBudgetExceeded {
+                context: context.to_string(),
+                charged_bytes: usize::MAX,
+                limit_bytes,
+            });
+        };
+        charged_bytes = next;
+        if charged_bytes > limit_bytes {
+            return Err(DbError::RetractableExtremumCheckpointBudgetExceeded {
+                context: context.to_string(),
+                charged_bytes,
+                limit_bytes,
+            });
+        }
+    }
+    Ok(())
 }
 
 struct DecodedGroup {
@@ -784,6 +828,7 @@ pub(crate) struct IncrementalAggState {
     having_filter: Option<Arc<dyn PhysicalExpr>>,
     having_sql: Option<String>,
     max_groups: usize,
+    max_retractable_extremum_checkpoint_bytes: usize,
     emit_changelog: bool,
     weight_col_idx: Option<usize>,
     #[cfg(feature = "cluster")]
@@ -817,12 +862,6 @@ impl IncrementalAggState {
     }
 
     pub(crate) fn cluster_state_rejection(&self, reads_changelog: bool) -> Option<String> {
-        if self.num_group_cols != 0 {
-            return Some(
-                "keyed aggregates retain operator-owned map state without a live-state byte budget"
-                    .into(),
-            );
-        }
         for spec in &self.agg_specs {
             let name = spec.udf.name().to_ascii_lowercase();
             if spec.distinct {
@@ -847,6 +886,106 @@ impl IncrementalAggState {
     #[cfg(test)]
     pub(crate) fn set_max_groups_for_test(&mut self, max_groups: usize) {
         self.max_groups = max_groups;
+    }
+
+    pub(crate) fn set_max_retractable_extremum_checkpoint_bytes(&mut self, bytes: usize) {
+        assert!(
+            bytes > 0,
+            "retractable-extremum checkpoint budget must be nonzero"
+        );
+        self.max_retractable_extremum_checkpoint_bytes = bytes;
+    }
+
+    /// Freeze the query-plan limits used by the complete archive preflight pass.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn vnode_archive_restore_profile(&self) -> AggStateArchiveRestoreProfile {
+        checkpoints::AggStateArchiveRestoreProfile::new(
+            self.query_fingerprint(),
+            self.agg_specs.len(),
+            self.max_groups,
+            self.num_group_cols > 0,
+            self.emit_changelog,
+        )
+    }
+
+    /// Reject an impossible final transition cardinality before any checked inner archive becomes
+    /// an owned rkyv value. Delta links are upserts, never deletes, so the largest row roster in a
+    /// vnode's base/delta chain is a sound lower bound for that vnode's final replacement.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn preflight_vnode_transition_cardinality(
+        &self,
+        vnode_count: u32,
+        restored_lower_bounds: &[(u32, usize)],
+        revoked: &rustc_hash::FxHashSet<u32>,
+    ) -> Result<(), DbError> {
+        let vnode_count = self.validate_vnode_count(vnode_count)?;
+        let mut transitioned_group_count = 0_usize;
+        for vnode in revoked {
+            if *vnode >= vnode_count.get() {
+                return Err(DbError::Pipeline(format!(
+                    "revoked vnode {vnode} is outside vnode_count {}",
+                    vnode_count.get()
+                )));
+            }
+            transitioned_group_count = checked_vnode_transition_capacity(
+                transitioned_group_count,
+                self.vnode_states
+                    .get(*vnode)
+                    .map_or(0, |state| state.groups.len()),
+            )?;
+        }
+
+        let mut restored = rustc_hash::FxHashSet::default();
+        restored
+            .try_reserve(restored_lower_bounds.len())
+            .map_err(|error| {
+                DbError::Pipeline(format!(
+                    "aggregate vnode transition could not reserve restored preflight roster: {error}"
+                ))
+            })?;
+        let mut replacement_lower_bound = 0_usize;
+        for &(vnode, vnode_lower_bound) in restored_lower_bounds {
+            if self.num_group_cols == 0 && vnode != 0 {
+                return Err(DbError::Pipeline(format!(
+                    "global aggregate restore targeted vnode {vnode}; only vnode 0 is valid"
+                )));
+            }
+            if vnode >= vnode_count.get() {
+                return Err(DbError::Pipeline(format!(
+                    "restored vnode {vnode} is outside vnode_count {}",
+                    vnode_count.get()
+                )));
+            }
+            if !restored.insert(vnode) {
+                return Err(DbError::Pipeline(format!(
+                    "aggregate vnode transition repeats restored vnode {vnode}"
+                )));
+            }
+            if !revoked.contains(&vnode) {
+                transitioned_group_count = checked_vnode_transition_capacity(
+                    transitioned_group_count,
+                    self.vnode_states
+                        .get(vnode)
+                        .map_or(0, |state| state.groups.len()),
+                )?;
+            }
+            replacement_lower_bound =
+                checked_vnode_transition_capacity(replacement_lower_bound, vnode_lower_bound)?;
+        }
+        let retained_group_count = checked_vnode_transition_final_count(
+            self.vnode_states.resident_group_count(),
+            transitioned_group_count,
+            0,
+        )?;
+        let final_lower_bound =
+            checked_vnode_transition_capacity(retained_group_count, replacement_lower_bound)?;
+        if final_lower_bound > self.max_groups {
+            return Err(DbError::Pipeline(format!(
+                "aggregate group limit exceeded during vnode transition preflight: retained={retained_group_count}, replacement_lower_bound={replacement_lower_bound}, limit={}",
+                self.max_groups
+            )));
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -946,7 +1085,7 @@ impl IncrementalAggState {
         snapshot
     }
 
-    #[cfg(all(test, feature = "cluster"))]
+    #[cfg(test)]
     pub(crate) fn evaluated_groups_for_test(
         &mut self,
     ) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<ScalarValue>>, DbError> {
@@ -1032,8 +1171,8 @@ impl GroupEntry {
         Self {
             accs,
             last_updated_ms,
-            // Generic `Accumulator::size()` is not guaranteed O(1). New groups therefore carry no
-            // dynamic accumulator charge until the next cold checkpoint/lifecycle reconciliation.
+            // Generic `Accumulator::size()` is not guaranteed O(1). Construction starts at zero;
+            // the first record mutation or lifecycle reconciliation installs the current charge.
             accumulator_reported_bytes: 0,
         }
     }
@@ -1066,15 +1205,20 @@ pub(crate) struct AggVnodeDelta {
     pub(crate) changed: AggStateCheckpoint,
 }
 
-/// One decoded authoritative vnode chain supplied to an aggregate transition preparation.
-///
-/// The graph owns the serialized recovery artifacts. `SqlQuery` decodes them once, then lends the
-/// complete operator roster here so every vnode is validated and staged before publication.
-#[cfg(feature = "cluster")]
+/// One borrowed authoritative vnode chain used by direct aggregate transition tests.
+#[cfg(all(feature = "cluster", test))]
 pub(crate) struct AggVnodeRestore<'a> {
     pub(crate) vnode: u32,
     pub(crate) base: &'a AggStateCheckpoint,
     pub(crate) deltas: &'a [AggVnodeDelta],
+}
+
+/// One owned inner checkpoint chain yielded only when aggregate preparation reaches its vnode.
+#[cfg(feature = "cluster")]
+pub(crate) struct OwnedAggVnodeRestore {
+    pub(crate) vnode: u32,
+    pub(crate) base: AggStateCheckpoint,
+    pub(crate) deltas: Vec<AggVnodeDelta>,
 }
 
 /// Fully decoded aggregate transition containing one replacement decision per transitioned vnode.
@@ -1412,6 +1556,8 @@ impl IncrementalAggState {
             having_filter,
             having_sql,
             max_groups: 1_000_000,
+            max_retractable_extremum_checkpoint_bytes:
+                crate::config::DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES,
             emit_changelog,
             weight_col_idx,
             #[cfg(feature = "cluster")]
@@ -1587,6 +1733,7 @@ impl IncrementalAggState {
             let key;
             let (inserted, update_result) = {
                 let vnode_state = self.vnode_states.get_or_insert(vnode);
+                let previous_spare = vnode_state.collection_spare_usage();
                 let (entry, inserted) = match vnode_state.groups.entry(owned_key) {
                     std::collections::hash_map::Entry::Occupied(e) => {
                         key = e.key().clone();
@@ -1614,11 +1761,24 @@ impl IncrementalAggState {
                     weight_col_idx,
                 );
                 entry.last_updated_ms = watermark_ms;
+                let accumulator_reconciliation = if inserted {
+                    entry.refresh_accumulator_usage();
+                    None
+                } else {
+                    Some(entry.refresh_accumulator_usage())
+                };
                 let inserted_usage =
                     inserted.then(|| AggregateVnodeState::group_usage(&key, entry));
                 if let Some(usage) = inserted_usage {
                     vnode_state.add_usage(usage);
                 }
+                if let Some((previous, current)) = accumulator_reconciliation {
+                    vnode_state.reconcile_accumulator_usage(
+                        accounting::AggregateStateUsage::from_parts(0, 0, 0, 0, previous),
+                        accounting::AggregateStateUsage::from_parts(0, 0, 0, 0, current),
+                    );
+                }
+                vnode_state.reconcile_collection_spare_usage(previous_spare);
                 if update_result.is_ok() {
                     if emit_changelog {
                         vnode_state.insert_emit_dirty_key(key.clone());
@@ -1661,21 +1821,31 @@ impl IncrementalAggState {
             let entry = GroupEntry::new(accs, watermark_ms);
             let usage = AggregateVnodeState::group_usage(&empty_key, &entry);
             let vnode_state = self.vnode_states.get_or_insert(0);
+            let previous_spare = vnode_state.collection_spare_usage();
             vnode_state.groups.insert(empty_key.clone(), entry);
             vnode_state.add_usage(usage);
+            vnode_state.reconcile_collection_spare_usage(previous_spare);
             self.vnode_states.increment_resident_groups();
         }
         #[allow(clippy::cast_possible_truncation)]
         let all_indices: Vec<u32> = (0..batch.num_rows() as u32).collect();
         let vnode_state = self.vnode_states.get_mut(0).unwrap();
-        let entry = vnode_state.groups.get_mut(&empty_key).unwrap();
-        entry.last_updated_ms = watermark_ms;
-        let res = Self::update_group_accumulators(
-            &mut entry.accs,
-            batch,
-            &all_indices,
-            &self.agg_specs,
-            self.weight_col_idx,
+        let (res, previous_accumulator_usage, current_accumulator_usage) = {
+            let entry = vnode_state.groups.get_mut(&empty_key).unwrap();
+            entry.last_updated_ms = watermark_ms;
+            let res = Self::update_group_accumulators(
+                &mut entry.accs,
+                batch,
+                &all_indices,
+                &self.agg_specs,
+                self.weight_col_idx,
+            );
+            let (previous, current) = entry.refresh_accumulator_usage();
+            (res, previous, current)
+        };
+        vnode_state.reconcile_accumulator_usage(
+            accounting::AggregateStateUsage::from_parts(0, 0, 0, 0, previous_accumulator_usage),
+            accounting::AggregateStateUsage::from_parts(0, 0, 0, 0, current_accumulator_usage),
         );
         if self.delta_tracking_active {
             vnode_state.insert_checkpoint_dirty_key(empty_key.clone());
@@ -1982,10 +2152,10 @@ impl IncrementalAggState {
     /// Deterministic lower-bound charge for the live aggregate working set.
     ///
     /// This walks only the bounded active-vnode roster over cached per-vnode counters; it does not
-    /// scan groups. Dynamic accumulator bytes reconcile during checkpoint/restore/rebalance rather
-    /// than record processing. Hash buckets, nested changelog/shared payloads, allocator overhead,
-    /// transient scratch, and RSS are intentionally excluded. Overflow is clamped because metrics
-    /// publication must not fault processing.
+    /// scan groups. Touched groups reconcile dynamic accumulator bytes during record processing.
+    /// Hash collection capacity and nested retained changelog scalars are charged, while allocator
+    /// overhead, transient scratch, and RSS remain outside this deterministic envelope. Overflow is
+    /// clamped because metrics publication must not fault processing.
     pub(crate) fn accounted_state_bytes(&self) -> usize {
         let usage = self.vnode_states.accounted_usage();
         if usage.is_saturated() {
@@ -2016,6 +2186,15 @@ impl IncrementalAggState {
     pub(crate) fn checkpoint_groups(&mut self) -> Result<AggStateCheckpoint, DbError> {
         let fingerprint = self.query_fingerprint();
         let retractable = self.weight_col_idx.is_some();
+        ensure_retractable_extremum_checkpoint_budget(
+            &self.agg_specs,
+            retractable,
+            self.vnode_states
+                .iter()
+                .flat_map(|(_, state)| state.groups.values()),
+            self.max_retractable_extremum_checkpoint_bytes,
+            "whole aggregate checkpoint capture",
+        )?;
         let mut entries: Vec<(arrow::row::OwnedRow, &mut GroupEntry)> = self
             .vnode_states
             .iter_mut()
@@ -2080,6 +2259,13 @@ impl IncrementalAggState {
             return Err(DbError::Pipeline(format!(
                 "checkpoint fingerprint mismatch: saved={}, current={}",
                 checkpoint.fingerprint, current_fp
+            )));
+        }
+        let group_count = checkpoint.last_updated_ms.len();
+        if group_count > self.max_groups {
+            return Err(DbError::Pipeline(format!(
+                "aggregate group limit exceeded during whole-state restore preflight: archive={group_count}, limit={}",
+                self.max_groups
             )));
         }
         validate_columnar_acc_shape(checkpoint, &self.agg_specs)?;
@@ -2200,6 +2386,15 @@ impl IncrementalAggState {
         self.validate_vnode_count(vnode_count)?;
         let fingerprint = self.query_fingerprint();
         let retractable = self.weight_col_idx.is_some();
+        ensure_retractable_extremum_checkpoint_budget(
+            &self.agg_specs,
+            retractable,
+            self.vnode_states
+                .iter()
+                .flat_map(|(_, state)| state.groups.values()),
+            self.max_retractable_extremum_checkpoint_bytes,
+            "per-vnode aggregate FULL checkpoint capture",
+        )?;
 
         let mut buckets: std::collections::HashMap<u32, AggStateCheckpoint> =
             std::collections::HashMap::new();
@@ -2341,29 +2536,63 @@ impl IncrementalAggState {
             })
             .collect::<Vec<_>>();
 
+        // Plan every vnode before encoding any of them. The preflight therefore has one
+        // aggregate-operator-wide allowance, and a later vnode cannot fail after an earlier vnode
+        // has consumed its dirty-chain bookkeeping.
+        let capture_plan = touched
+            .iter()
+            .map(|&vnode| {
+                let force_full = self.vnode_states.get(vnode).is_some_and(|state| {
+                    state.force_full_rebase
+                        || state
+                            .delta_chain_len
+                            .is_none_or(|chain_len| chain_len >= chain_bound)
+                });
+                (vnode, force_full)
+            })
+            .collect::<Vec<_>>();
+        let selected_entries = capture_plan
+            .iter()
+            .filter_map(|(vnode, force_full)| {
+                self.vnode_states
+                    .get(*vnode)
+                    .map(|state| (state, *force_full))
+            })
+            .flat_map(|(state, force_full)| {
+                state.groups.iter().filter_map(move |(key, entry)| {
+                    (force_full || state.checkpoint_dirty_keys.contains(key)).then_some(entry)
+                })
+            });
+        ensure_retractable_extremum_checkpoint_budget(
+            &self.agg_specs,
+            retractable,
+            selected_entries,
+            self.max_retractable_extremum_checkpoint_bytes,
+            "per-vnode aggregate delta checkpoint capture",
+        )?;
+
         let mut out: std::collections::HashMap<u32, VnodeCapture> =
             std::collections::HashMap::with_capacity(touched.len());
-        for v in touched {
-            let force_full = self.vnode_states.get(v).is_some_and(|state| {
-                state.force_full_rebase
-                    || state
-                        .delta_chain_len
-                        .is_none_or(|chain_len| chain_len >= chain_bound)
-            });
+        for &(v, force_full) in &capture_plan {
             if force_full {
                 let cap = self.checkpoint_full_vnode(v, vnode_count, fingerprint, retractable)?;
                 out.insert(v, cap);
-                let state = self.vnode_states.get_or_insert(v);
-                state.delta_chain_len = Some(0);
-                state.force_full_rebase = false;
             } else {
                 let delta = self.encode_delta_for_vnode(v)?;
                 out.insert(v, VnodeCapture::Delta(delta));
-                let state = self.vnode_states.get_or_insert(v);
+            }
+        }
+
+        // Encoding is complete. Only now consume the planned chain and dirty-set transition.
+        for (v, force_full) in capture_plan {
+            let state = self.vnode_states.get_or_insert(v);
+            if force_full {
+                state.delta_chain_len = Some(0);
+                state.force_full_rebase = false;
+            } else {
                 state.delta_chain_len =
                     Some(state.delta_chain_len.unwrap_or_default().saturating_add(1));
             }
-            let state = self.vnode_states.get_or_insert(v);
             state.clear_checkpoint_dirty_keys();
             state.clear_last_emitted_dirty_keys();
         }
@@ -2411,6 +2640,23 @@ impl IncrementalAggState {
         let fingerprint = self.query_fingerprint();
         let retractable = self.weight_col_idx.is_some();
 
+        if !self.delta_tracking_active {
+            return Err(DbError::Pipeline(
+                "aggregate delta encoding requires an established baseline".to_string(),
+            ));
+        }
+        ensure_retractable_extremum_checkpoint_budget(
+            &self.agg_specs,
+            retractable,
+            self.vnode_states.get(vnode).into_iter().flat_map(|state| {
+                state.groups.iter().filter_map(|(key, entry)| {
+                    state.checkpoint_dirty_keys.contains(key).then_some(entry)
+                })
+            }),
+            self.max_retractable_extremum_checkpoint_bytes,
+            "single-vnode aggregate delta checkpoint capture",
+        )?;
+
         let changed = self
             .vnode_states
             .get(vnode)
@@ -2441,8 +2687,8 @@ impl IncrementalAggState {
             &mut entries,
         );
         // Reconcile only the groups encoded into this delta. Generic `Accumulator::size()` can be
-        // proportional to retained values (notably retractable MIN/MAX), so scanning clean groups
-        // here would turn an incremental checkpoint into a full-state traversal.
+        // proportional to retained values, so scanning clean groups here would turn an incremental
+        // checkpoint into a full-state traversal.
         let (previous_accumulator_usage, current_accumulator_usage) = entries.iter_mut().fold(
             (
                 accounting::AggregateStateUsage::default(),
@@ -2468,11 +2714,6 @@ impl IncrementalAggState {
         let (keys_ipc, acc_state_ipc, last_updated_ms) = encoded?;
 
         // Changed emission entries ride in `changed.last_emitted`.
-        if !self.delta_tracking_active {
-            return Err(DbError::Pipeline(
-                "aggregate delta encoding requires an established baseline".to_string(),
-            ));
-        }
         let vnode_count = self.routing_vnode_count();
         let last_emitted =
             self.last_emitted_for_vnode(vnode, vnode_count, Some(&emitted_changed))?;
@@ -2493,8 +2734,8 @@ impl IncrementalAggState {
         &self,
         checkpoint: &AggStateCheckpoint,
         context: &str,
+        current_fp: u64,
     ) -> Result<DecodedAggMutation, DbError> {
-        let current_fp = self.query_fingerprint();
         if checkpoint.fingerprint != current_fp {
             return Err(DbError::Pipeline(format!(
                 "{context} fingerprint mismatch: saved={}, current={current_fp}",
@@ -2518,8 +2759,12 @@ impl IncrementalAggState {
     }
 
     #[cfg(feature = "cluster")]
-    fn decode_recovery_delta(&self, delta: &AggVnodeDelta) -> Result<DecodedAggMutation, DbError> {
-        self.decode_recovery_mutation(&delta.changed, "delta")
+    fn decode_recovery_delta(
+        &self,
+        delta: &AggVnodeDelta,
+        current_fp: u64,
+    ) -> Result<DecodedAggMutation, DbError> {
+        self.decode_recovery_mutation(&delta.changed, "delta", current_fp)
     }
 
     /// Rebuild one live group for an off-side recovery transaction.
@@ -2642,6 +2887,12 @@ impl IncrementalAggState {
     ) -> Result<(), DbError> {
         let retractable = self.weight_col_idx.is_some();
         for (row_key, last_updated_ms, state_arrays) in delta.groups {
+            if !staged.groups.contains_key(&row_key) && staged.groups.len() >= self.max_groups {
+                return Err(DbError::Pipeline(format!(
+                    "aggregate group limit exceeded while applying a recovery delta: limit={}",
+                    self.max_groups
+                )));
+            }
             staged.groups.insert(
                 row_key,
                 GroupEntry::new(
@@ -2718,14 +2969,16 @@ impl IncrementalAggState {
     }
 
     /// Decode and build complete replacement vnode slots without changing the live working set.
-    /// Every restored vnode is authoritative; a canonical empty restore and an explicitly revoked
-    /// vnode without a restore both clear the physical slot. Once this returns, the graph must keep
-    /// the operator quiescent until it aborts or publishes the prepared value.
+    ///
+    /// The caller has already validated the complete borrowed archive and cardinality roster. The
+    /// iterator deliberately yields one owned vnode chain at a time; its rkyv and Arrow expansion
+    /// is consumed into private replacement state before the next vnode is requested. Publication
+    /// remains one all-vnode operation after the complete iterator succeeds.
     #[cfg(feature = "cluster")]
-    pub(crate) fn prepare_vnode_transition(
+    pub(crate) fn prepare_owned_vnode_transition(
         &self,
         vnode_count: u32,
-        restores: &[AggVnodeRestore<'_>],
+        restores: impl ExactSizeIterator<Item = Result<OwnedAggVnodeRestore, DbError>>,
         revoked: &rustc_hash::FxHashSet<u32>,
     ) -> Result<PreparedAggVnodeTransition, DbError> {
         let vnode_count = self.validate_vnode_count(vnode_count)?;
@@ -2735,8 +2988,9 @@ impl IncrementalAggState {
             ))
         };
 
+        let restore_count = restores.len();
         let transitioned_capacity =
-            checked_vnode_transition_capacity(restores.len(), revoked.len())?;
+            checked_vnode_transition_capacity(restore_count, revoked.len())?;
         let mut transitioned = rustc_hash::FxHashSet::default();
         transitioned
             .try_reserve(transitioned_capacity)
@@ -2751,73 +3005,48 @@ impl IncrementalAggState {
             transitioned.insert(*vnode);
         }
 
-        // Decode and validate the complete roster before constructing any replacement
-        // accumulator. A corrupt late chain cannot leave an earlier chain partly published.
-        let mut decoded = Vec::new();
-        decoded
-            .try_reserve_exact(restores.len())
-            .map_err(|error| reserve_error("decoded restore roster", error))?;
         let mut restored_vnodes = rustc_hash::FxHashSet::default();
         restored_vnodes
-            .try_reserve(restores.len())
+            .try_reserve(restore_count)
             .map_err(|error| reserve_error("restored vnode roster", error))?;
+        let mut replacement_by_vnode = AHashMap::new();
+        replacement_by_vnode
+            .try_reserve(restore_count)
+            .map_err(|error| reserve_error("replacement vnode roster", error))?;
+        let mut replacement_group_count = 0_usize;
+        let current_fp = self.query_fingerprint();
         for restore in restores {
-            if restore.vnode >= vnode_count.get() {
+            let OwnedAggVnodeRestore {
+                vnode,
+                base,
+                deltas,
+            } = restore?;
+            if vnode >= vnode_count.get() {
                 return Err(DbError::Pipeline(format!(
                     "restored vnode {} is outside vnode_count {}",
-                    restore.vnode,
+                    vnode,
                     vnode_count.get()
                 )));
             }
-            if !restored_vnodes.insert(restore.vnode) {
+            if !restored_vnodes.insert(vnode) {
                 return Err(DbError::Pipeline(format!(
-                    "aggregate vnode transition repeats restored vnode {}",
-                    restore.vnode
+                    "aggregate vnode transition repeats restored vnode {vnode}"
                 )));
             }
-            transitioned.insert(restore.vnode);
+            transitioned.insert(vnode);
 
-            let base = self.decode_recovery_mutation(restore.base, "vnode transition base")?;
-            let deltas = restore
-                .deltas
+            let group_capacity = deltas
                 .iter()
-                .map(|delta| self.decode_recovery_delta(delta))
-                .collect::<Result<Vec<_>, _>>()?;
-            let belongs_to_vnode = |key: &arrow::row::OwnedRow| {
-                Self::vnode_for_group_key(self.num_group_cols, key, vnode_count) == restore.vnode
-            };
-            let base_has_foreign_key = base.groups.iter().any(|(key, _, _)| !belongs_to_vnode(key))
-                || base.last_emitted.keys().any(|key| !belongs_to_vnode(key));
-            let delta_has_foreign_key = deltas.iter().any(|delta| {
-                delta
-                    .groups
-                    .iter()
-                    .any(|(key, _, _)| !belongs_to_vnode(key))
-                    || delta.last_emitted.keys().any(|key| !belongs_to_vnode(key))
-            });
-            if base_has_foreign_key || delta_has_foreign_key {
-                return Err(DbError::Pipeline(format!(
-                    "authoritative vnode {} recovery chain contains a key for another vnode",
-                    restore.vnode
-                )));
-            }
-            decoded.push((restore.vnode, base, deltas));
-        }
-
-        let mut replacement_by_vnode = AHashMap::new();
-        replacement_by_vnode
-            .try_reserve(decoded.len())
-            .map_err(|error| reserve_error("replacement vnode roster", error))?;
-        let mut replacement_group_count = 0_usize;
-        for (vnode, base, deltas) in decoded {
-            let group_capacity = deltas.iter().try_fold(base.groups.len(), |total, delta| {
-                checked_vnode_transition_capacity(total, delta.groups.len())
-            })?;
+                .try_fold(base.last_updated_ms.len(), |total, delta| {
+                    checked_vnode_transition_capacity(total, delta.changed.last_updated_ms.len())
+                })?
+                .min(self.max_groups);
             let emitted_capacity = deltas
                 .iter()
                 .try_fold(base.last_emitted.len(), |total, delta| {
-                    checked_vnode_transition_capacity(total, delta.last_emitted.len())
-                })?;
+                    checked_vnode_transition_capacity(total, delta.changed.last_emitted.len())
+                })?
+                .min(self.max_groups);
             let mut staged_groups = AHashMap::new();
             staged_groups
                 .try_reserve(group_capacity)
@@ -2832,9 +3061,44 @@ impl IncrementalAggState {
                 #[cfg(test)]
                 affected: AHashSet::new(),
             };
-            self.stage_recovery_base(&mut staged, base)?;
+            let belongs_to_vnode = |key: &arrow::row::OwnedRow| {
+                Self::vnode_for_group_key(self.num_group_cols, key, vnode_count) == vnode
+            };
+
+            let decoded_base =
+                self.decode_recovery_mutation(&base, "vnode transition base", current_fp)?;
+            drop(base);
+            if decoded_base
+                .groups
+                .iter()
+                .any(|(key, _, _)| !belongs_to_vnode(key))
+                || decoded_base
+                    .last_emitted
+                    .keys()
+                    .any(|key| !belongs_to_vnode(key))
+            {
+                return Err(DbError::Pipeline(format!(
+                    "authoritative vnode {vnode} recovery chain contains a key for another vnode"
+                )));
+            }
+            self.stage_recovery_base(&mut staged, decoded_base)?;
             for delta in deltas {
-                self.apply_recovery_delta_to_image(&mut staged, delta)?;
+                let decoded_delta = self.decode_recovery_delta(&delta, current_fp)?;
+                drop(delta);
+                if decoded_delta
+                    .groups
+                    .iter()
+                    .any(|(key, _, _)| !belongs_to_vnode(key))
+                    || decoded_delta
+                        .last_emitted
+                        .keys()
+                        .any(|key| !belongs_to_vnode(key))
+                {
+                    return Err(DbError::Pipeline(format!(
+                        "authoritative vnode {vnode} recovery chain contains a key for another vnode"
+                    )));
+                }
+                self.apply_recovery_delta_to_image(&mut staged, decoded_delta)?;
             }
             if staged
                 .last_emitted
@@ -2849,6 +3113,12 @@ impl IncrementalAggState {
 
             replacement_group_count =
                 checked_vnode_transition_capacity(replacement_group_count, staged.groups.len())?;
+            if replacement_group_count > self.max_groups {
+                return Err(DbError::Pipeline(format!(
+                    "aggregate replacement group limit exceeded during vnode transition: replacement={}, limit={}",
+                    replacement_group_count, self.max_groups
+                )));
+            }
             let replacement = AggregateVnodeState::try_from_recovered(
                 staged.groups,
                 staged.last_emitted,
@@ -2930,6 +3200,29 @@ impl IncrementalAggState {
         })
     }
 
+    #[cfg(all(feature = "cluster", test))]
+    pub(crate) fn prepare_vnode_transition(
+        &self,
+        vnode_count: u32,
+        restores: &[AggVnodeRestore<'_>],
+        revoked: &rustc_hash::FxHashSet<u32>,
+    ) -> Result<PreparedAggVnodeTransition, DbError> {
+        let restores = restores.iter().map(|restore| {
+            Ok(OwnedAggVnodeRestore {
+                vnode: restore.vnode,
+                base: restore.base.clone(),
+                deltas: restore
+                    .deltas
+                    .iter()
+                    .map(|delta| AggVnodeDelta {
+                        changed: delta.changed.clone(),
+                    })
+                    .collect(),
+            })
+        });
+        self.prepare_owned_vnode_transition(vnode_count, restores, revoked)
+    }
+
     /// Publish an already prepared aggregate transition with one allocation-free pointer swap per
     /// transitioned vnode. Unchanged vnode boxes retain pointer identity.
     #[cfg(feature = "cluster")]
@@ -2972,12 +3265,13 @@ impl IncrementalAggState {
     ) -> Result<usize, DbError> {
         // Decode every payload before touching even the live accumulator snapshots. A malformed late
         // delta therefore cannot consume or partially merge the earlier base.
+        let current_fp = self.query_fingerprint();
         let decoded_base = base
-            .map(|checkpoint| self.decode_recovery_mutation(checkpoint, "merge"))
+            .map(|checkpoint| self.decode_recovery_mutation(checkpoint, "merge", current_fp))
             .transpose()?;
         let decoded_deltas = deltas
             .iter()
-            .map(|delta| self.decode_recovery_delta(delta))
+            .map(|delta| self.decode_recovery_delta(delta, current_fp))
             .collect::<Result<Vec<_>, _>>()?;
 
         let replacement_scope = replacement

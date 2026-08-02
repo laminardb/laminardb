@@ -53,13 +53,16 @@ use deltalake::protocol::SaveMode;
 use deltalake::DeltaTable;
 
 #[cfg(feature = "delta-lake")]
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 #[cfg(feature = "delta-lake")]
 use url::Url;
 
 #[cfg(feature = "delta-lake")]
 use crate::error::ConnectorError;
+
+#[cfg(feature = "delta-lake")]
+use crate::storage::StorageProvider;
 
 #[cfg(feature = "delta-lake")]
 use crate::connector::{
@@ -181,7 +184,7 @@ fn validate_coordinated_s3_options<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    if has_effective_value(
+    let custom_endpoint = has_effective_value(
         options,
         &[
             "endpoint",
@@ -191,7 +194,12 @@ where
         ],
         &["AWS_ENDPOINT", "AWS_ENDPOINT_URL"],
         environment,
-    ) {
+    );
+    let soak_emulator = cfg!(debug_assertions)
+        && environment("LAMINAR_SOAK_ALLOW_S3_EMULATOR")
+            .as_deref()
+            .is_some_and(is_truthy);
+    if custom_endpoint && !soak_emulator {
         return Err(ConnectorError::ConfigurationError(
             "Delta exactly-once does not admit custom S3 endpoints until their atomic-create behavior passes the release fault suite"
                 .into(),
@@ -322,17 +330,20 @@ fn validate_coordinated_storage_preflight_with_env<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    let scheme = table_path
-        .split_once("://")
-        .map_or("file", |(scheme, _)| scheme)
-        .to_ascii_lowercase();
-    match scheme.as_str() {
-        "s3" | "s3a" => validate_coordinated_s3_options(options, environment),
-        "az" | "azure" | "abfs" | "abfss" => {
+    match StorageProvider::detect_uri(table_path) {
+        Some(StorageProvider::AwsS3) => validate_coordinated_s3_options(options, environment),
+        Some(StorageProvider::AzureAdls) => {
             validate_coordinated_azure_options(options, environment)
         }
-        "gs" | "gcs" => validate_coordinated_gcs_options(options, environment),
-        _ => Ok(()),
+        Some(StorageProvider::Gcs) => validate_coordinated_gcs_options(options, environment),
+        Some(StorageProvider::Local) => Ok(()),
+        None => match table_path.split_once("://") {
+            None => Ok(()),
+            Some((scheme, _)) if scheme.eq_ignore_ascii_case("uc") => Ok(()),
+            Some((scheme, _)) => Err(ConnectorError::ConfigurationError(format!(
+                "Delta exactly-once does not admit unknown storage URI scheme '{scheme}'"
+            ))),
+        },
     }
 }
 
@@ -491,7 +502,7 @@ const MAX_COORDINATED_TABLE_ID_BYTES: usize = 1_024;
 fn path_to_url(path: &str) -> Result<Url, ConnectorError> {
     // If it already looks like a URL, parse it directly.
     if path.contains("://") {
-        Url::parse(path)
+        Url::parse(&StorageProvider::canonical_uri(path))
             .map_err(|e| ConnectorError::ConfigurationError(format!("invalid URL '{path}': {e}")))
     } else {
         // Local path - convert to file URL.
@@ -1782,7 +1793,7 @@ pub async fn get_latest_version(table: &mut DeltaTable) -> Result<i64, Connector
 /// Returns `(batches, fully_consumed)` — `fully_consumed` is `false` when
 /// `max_records` truncated the result and more rows remain.
 #[cfg(feature = "delta-lake")]
-pub async fn read_batches_at_version(
+pub(crate) async fn read_batches_at_version(
     table: &mut DeltaTable,
     version: i64,
     max_records: usize,
@@ -1865,349 +1876,23 @@ pub async fn read_batches_at_version(
     Ok((batches, fully_consumed))
 }
 
-/// Reads only the rows added in a specific Delta Lake version.
-///
-/// Parses `_delta_log/{version:020}.json` for `add` actions, then reads
-/// only those Parquet files via the table's object store. This is
-/// `O(new_files)` per version, not `O(table_size)`.
-///
-/// For version 0, delegates to [`read_batches_at_version`] (full snapshot).
-///
-/// # Errors
-///
-/// Returns `ConnectorError::ReadError` if the version cannot be loaded or read.
-///
-/// Returns `(batches, fully_consumed)` — see [`read_batches_at_version`].
-#[cfg(feature = "delta-lake")]
-#[allow(clippy::too_many_lines)]
-pub async fn read_version_diff(
-    table: &mut DeltaTable,
-    version: i64,
-    max_records: usize,
-    partition_filter: Option<&str>,
-) -> Result<(Vec<RecordBatch>, bool), ConnectorError> {
-    // Maximum file size (256 MB) for direct in-memory Parquet reads.
-    // Files larger than this fall back to DataFusion's streaming scan.
-    const MAX_DIRECT_READ_BYTES: u64 = 256 * 1024 * 1024;
-
-    // For version 0, read the full snapshot (no previous version to diff).
-    if version <= 0 {
-        return read_batches_at_version(table, version, max_records).await;
-    }
-
-    // Read the commit JSON via delta-rs's LogStore API (handles path
-    // resolution, checkpoints, and retries correctly).
-    let log_store = table.log_store();
-    let store = log_store.object_store(None);
-
-    let commit_data = log_store
-        .read_commit_entry(version)
-        .await
-        .map_err(|e| ConnectorError::ReadError(format!("read commit {version}: {e}")))?
-        .ok_or_else(|| {
-            ConnectorError::ReadError(format!(
-                "version {version} not available (cleaned up or never existed)"
-            ))
-        })?;
-    let commit_str = std::str::from_utf8(&commit_data)
-        .map_err(|e| ConnectorError::ReadError(format!("commit log is not valid UTF-8: {e}")))?;
-
-    // Each line in the commit JSON is a separate action object.
-    // Collect both add and remove actions to compute the net-new files.
-    let mut added_paths = Vec::new();
-    let mut removed_paths = std::collections::HashSet::new();
-    for line in commit_str.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(add) = obj.get("add") {
-                if let Some(path) = add.get("path").and_then(|p| p.as_str()) {
-                    added_paths.push(decode_delta_path(path));
-                }
-            }
-            if let Some(remove) = obj.get("remove") {
-                if let Some(path) = remove.get("path").and_then(|p| p.as_str()) {
-                    removed_paths.insert(decode_delta_path(path));
-                }
-            }
-        }
-    }
-
-    // Exclude any added file whose path also appears in a remove action.
-    added_paths.retain(|p| !removed_paths.contains(p));
-
-    if added_paths.is_empty() {
-        debug!(
-            version,
-            num_removed = removed_paths.len(),
-            "Delta Lake: no net-new add actions in version"
-        );
-        return Ok((Vec::new(), true));
-    }
-
-    debug!(
-        version,
-        num_added_files = added_paths.len(),
-        num_removed_files = removed_paths.len(),
-        "Delta Lake: reading added files"
-    );
-
-    // Load the version so we have the correct schema.
-    table
-        .load_version(version)
-        .await
-        .map_err(|e| ConnectorError::ReadError(format!("failed to load version {version}: {e}")))?;
-
-    let table_schema = table
-        .snapshot()
-        .map(|s| s.snapshot().arrow_schema())
-        .map_err(|e| ConnectorError::ReadError(format!("no snapshot at version {version}: {e}")))?;
-
-    // Filter file paths by partition predicate if provided.
-    // Supports simple Hive-style equality: "col = 'val'" matches "col=val/" in path.
-    let added_paths = if let Some(filter) = partition_filter {
-        filter_paths_by_partition(&added_paths, filter)
-    } else {
-        added_paths
-    };
-
-    // Read each added Parquet file as raw bytes via delta-rs's object_store,
-    // then parse with parquet's in-memory ArrowReaderBuilder (avoids the
-    // object_store 0.12 vs 0.13 version mismatch).
-    let mut batches = Vec::new();
-    let mut total_rows: usize = 0;
-
-    for file_path in &added_paths {
-        if total_rows >= max_records {
-            break;
-        }
-
-        let obj_path = deltalake::Path::from(file_path.as_str());
-
-        // Check file size before downloading. Large files fall back to
-        // DataFusion scan to avoid OOM on multi-GB Parquet files.
-        let file_meta = store
-            .head(&obj_path)
-            .await
-            .map_err(|e| ConnectorError::ReadError(format!("failed to stat '{file_path}': {e}")))?;
-        if file_meta.size > MAX_DIRECT_READ_BYTES {
-            warn!(
-                file_path,
-                file_size = file_meta.size,
-                "file too large for direct read, falling back to DataFusion scan"
-            );
-            return read_batches_at_version(table, version, max_records).await;
-        }
-
-        let file_bytes = get_with_retry(&store, &obj_path, file_path).await?;
-
-        let parquet_reader =
-            deltalake::parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(file_bytes)
-                .map_err(|e| {
-                    ConnectorError::ReadError(format!(
-                        "failed to open Parquet file '{file_path}': {e}"
-                    ))
-                })?;
-
-        // Read one extra row to probe whether the version is fully consumed.
-        let remaining = max_records.saturating_sub(total_rows).saturating_add(1);
-        let reader = parquet_reader.with_limit(remaining).build().map_err(|e| {
-            ConnectorError::ReadError(format!("failed to build reader for '{file_path}': {e}"))
-        })?;
-
-        for result in reader {
-            let batch: RecordBatch = result.map_err(|e| {
-                ConnectorError::ReadError(format!("Parquet read error in '{file_path}': {e}"))
-            })?;
-            if batch.num_rows() == 0 {
-                continue;
-            }
-
-            // Align the batch schema to the table schema (added files may
-            // predate schema evolution and have fewer columns).
-            let batch = if batch.schema() == table_schema {
-                batch
-            } else {
-                align_batch_to_schema(&batch, &table_schema)?
-            };
-
-            total_rows += batch.num_rows();
-            batches.push(batch);
-
-            if total_rows >= max_records {
-                break;
-            }
-        }
-    }
-
-    // We probed one extra row per file. If total_rows > max_records, there's
-    // more data — trim the excess and report not fully consumed.
-    let fully_consumed = total_rows <= max_records;
-    if !fully_consumed {
-        // Trim the last batch to remove the probe row(s).
-        let excess = total_rows - max_records;
-        let len = batches.len();
-        if len > 0 {
-            let last = &batches[len - 1];
-            if last.num_rows() > excess {
-                batches[len - 1] = last.slice(0, last.num_rows() - excess);
-            } else {
-                batches.pop();
-            }
-        }
-    }
-
-    debug!(
-        version,
-        num_batches = batches.len(),
-        fully_consumed,
-        num_added_files = added_paths.len(),
-        "Delta Lake: read version diff"
-    );
-
-    Ok((batches, fully_consumed))
-}
-
-/// Reads a file from `object_store` with retry (3x, exponential backoff).
-/// Does not retry 404s.
-#[cfg(feature = "delta-lake")]
-async fn get_with_retry(
-    store: &Arc<dyn deltalake::ObjectStore>,
-    path: &deltalake::Path,
-    display_path: &str,
-) -> Result<bytes::Bytes, ConnectorError> {
-    let backoff = [200u64, 1000, 4000];
-    let mut last_err = None;
-
-    for attempt in 0..=backoff.len() {
-        match store.get(path).await {
-            Ok(result) => {
-                return result.bytes().await.map_err(|e| {
-                    ConnectorError::ReadError(format!(
-                        "failed to read bytes of '{display_path}': {e}"
-                    ))
-                });
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("not found") || msg.contains("404") {
-                    return Err(ConnectorError::ReadError(format!(
-                        "file not found '{display_path}': {e}"
-                    )));
-                }
-                if let Some(&delay) = backoff.get(attempt) {
-                    warn!(
-                        attempt = attempt + 1,
-                        delay_ms = delay,
-                        error = %e,
-                        path = display_path,
-                        "object_store read failed, retrying"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                }
-                last_err = Some(e);
-            }
-        }
-    }
-
-    Err(ConnectorError::ReadError(format!(
-        "failed to read '{display_path}' after {} attempts: {}",
-        backoff.len() + 1,
-        last_err.map_or_else(|| "unknown".to_string(), |e| e.to_string())
-    )))
-}
-
-/// Filters file paths by a Hive-style partition predicate.
-///
-/// Supports simple equality predicates: `col = 'val'` matches paths
-/// containing `col=val/`. Multiple predicates joined by `AND` are all
-/// required to match. Predicates that can't be parsed are ignored
-/// (all paths pass through).
-#[cfg(feature = "delta-lake")]
-fn filter_paths_by_partition(paths: &[String], filter: &str) -> Vec<String> {
-    // Parse simple "col = 'val'" or "col = val" predicates from AND-joined expressions.
-    let mut required_segments: Vec<String> = Vec::new();
-    for clause in filter
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .split(" AND ")
-    {
-        let clause = clause.trim();
-        if let Some((col, val)) = clause.split_once('=') {
-            let col = col.trim();
-            let val = val.trim().trim_matches('\'').trim_matches('"');
-            if !col.is_empty() && !val.is_empty() {
-                required_segments.push(format!("{col}={val}"));
-            }
-        }
-    }
-
-    if required_segments.is_empty() {
-        return paths.to_vec();
-    }
-
-    paths
-        .iter()
-        .filter(|path| required_segments.iter().all(|seg| path.contains(seg)))
-        .cloned()
-        .collect()
-}
-
-/// Percent-decodes a file path from a Delta Lake commit JSON.
-///
-/// Delta Lake spec requires paths in `add`/`remove` actions to be
-/// percent-encoded (e.g., `part%3D1/file.parquet` for `part=1/file.parquet`).
-#[cfg(feature = "delta-lake")]
-fn decode_delta_path(encoded: &str) -> String {
-    url::Url::parse(&format!("file:///{encoded}")).map_or_else(
-        |_| encoded.to_string(),
-        |u| {
-            let p = u.path();
-            p.strip_prefix('/').unwrap_or(p).to_string()
-        },
-    )
-}
-
-/// Aligns a `RecordBatch` to a target schema by adding null columns for
-/// missing fields. Used when reading Parquet files that predate schema
-/// evolution (fewer columns than the current table schema).
-#[cfg(feature = "delta-lake")]
-fn align_batch_to_schema(
-    batch: &RecordBatch,
-    target_schema: &SchemaRef,
-) -> Result<RecordBatch, ConnectorError> {
-    use arrow_array::new_null_array;
-
-    let mut columns = Vec::with_capacity(target_schema.fields().len());
-    for field in target_schema.fields() {
-        if let Ok(col_idx) = batch.schema().index_of(field.name()) {
-            columns.push(batch.column(col_idx).clone());
-        } else {
-            columns.push(new_null_array(field.data_type(), batch.num_rows()));
-        }
-    }
-
-    RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| {
-        ConnectorError::ReadError(format!("failed to align batch to table schema: {e}"))
-    })
-}
-
 /// Reads CDF batches for a version range via `scan_cdf()`.
 ///
-/// `scan_cdf(self)` consumes the `DeltaTable` — caller must re-open afterward.
+/// `scan_cdf(self)` consumes the supplied `DeltaTable`; callers retaining a
+/// table handle can pass a clone.
 /// Output includes `_change_type`, `_commit_version`, `_commit_timestamp`.
 ///
 /// # Errors
 ///
-/// Returns `ConnectorError::ReadError` on scan failure.
+/// Returns a read error on scan failure or a non-transient configuration error
+/// when the collected version range exceeds either hard limit.
 #[cfg(feature = "delta-lake")]
 pub async fn read_cdf_batches(
     table: DeltaTable,
     start_version: i64,
     end_version: i64,
+    max_rows: usize,
+    max_bytes: usize,
 ) -> Result<Vec<RecordBatch>, ConnectorError> {
     use datafusion::prelude::SessionContext;
     use tokio_stream::StreamExt;
@@ -2227,7 +1912,7 @@ pub async fn read_cdf_batches(
     let plan = cdf_builder
         .build(&session_state, None)
         .await
-        .map_err(|e| ConnectorError::ReadError(format!("CDF scan build failed: {e}")))?;
+        .map_err(map_cdf_scan_build_error)?;
 
     // Execute the plan via DataFusion to get record batches.
     let task_ctx = ctx.task_ctx();
@@ -2235,10 +1920,13 @@ pub async fn read_cdf_batches(
         .map_err(|e| ConnectorError::ReadError(format!("CDF stream execution failed: {e}")))?;
 
     let mut batches = Vec::new();
+    let mut rows = 0;
+    let mut bytes = 0;
     while let Some(result) = stream.next().await {
         let batch: RecordBatch = result
             .map_err(|e| ConnectorError::ReadError(format!("CDF stream batch failed: {e}")))?;
         if batch.num_rows() > 0 {
+            (rows, bytes) = checked_cdf_commit_usage(rows, bytes, &batch, max_rows, max_bytes)?;
             batches.push(batch);
         }
     }
@@ -2247,27 +1935,82 @@ pub async fn read_cdf_batches(
         start_version,
         end_version,
         num_batches = batches.len(),
+        rows,
+        bytes,
         "CDF scan complete"
     );
 
     Ok(batches)
 }
 
-/// Maps CDF `_change_type` → `_op` (`I`/`U`/`D`), drops `update_preimage`
-/// rows and CDF metadata columns (`_change_type`, `_commit_version`,
-/// `_commit_timestamp`). Returns `None` if all rows were preimages.
+#[cfg(feature = "delta-lake")]
+fn map_cdf_scan_build_error(error: deltalake::DeltaTableError) -> ConnectorError {
+    match error {
+        error @ (deltalake::DeltaTableError::ChangeDataNotEnabled { .. }
+        | deltalake::DeltaTableError::ChangeDataNotRecorded { .. }) => {
+            ConnectorError::ConfigurationError(format!(
+                "Delta CDF is unavailable for the requested history: {error}"
+            ))
+        }
+        error => ConnectorError::ReadError(format!("CDF scan build failed: {error}")),
+    }
+}
+
+#[cfg(feature = "delta-lake")]
+fn checked_cdf_commit_usage(
+    rows: usize,
+    bytes: usize,
+    batch: &RecordBatch,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<(usize, usize), ConnectorError> {
+    let rows = rows.checked_add(batch.num_rows()).ok_or_else(|| {
+        ConnectorError::ConfigurationError("Delta CDF commit row count overflowed".into())
+    })?;
+    let bytes = bytes
+        .checked_add(batch.get_array_memory_size())
+        .ok_or_else(|| {
+            ConnectorError::ConfigurationError("Delta CDF commit byte count overflowed".into())
+        })?;
+    if rows > max_rows {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "Delta CDF commit exceeds the hard row limit: rows={rows}, limit={max_rows}"
+        )));
+    }
+    if bytes > max_bytes {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "Delta CDF commit exceeds the hard byte limit: bytes={bytes}, limit={max_bytes}"
+        )));
+    }
+    Ok((rows, bytes))
+}
+
+/// Maps Delta CDF rows to the canonical signed-weight changelog and drops CDF
+/// metadata columns (`_change_type`, `_commit_version`, `_commit_timestamp`).
 ///
 /// # Errors
 ///
-/// Returns `ConnectorError::ReadError` on Arrow operation failure.
+/// Returns `ConnectorError::ReadError` when CDF metadata is missing or invalid,
+/// or when the output batch cannot be built.
 #[cfg(feature = "delta-lake")]
-pub fn map_cdf_to_changelog(batch: &RecordBatch) -> Result<Option<RecordBatch>, ConnectorError> {
-    use arrow_array::StringArray;
+pub fn map_cdf_to_changelog(batch: &RecordBatch) -> Result<RecordBatch, ConnectorError> {
+    use arrow_array::{Array, Int64Array, StringArray};
+    use laminar_core::changelog::WEIGHT_COLUMN;
 
     let schema = batch.schema();
-    let Ok(ct_idx) = schema.index_of("_change_type") else {
-        return Ok(Some(batch.clone()));
-    };
+    let ct_idx = schema
+        .index_of("_change_type")
+        .map_err(|_| ConnectorError::ReadError("CDF batch is missing _change_type".into()))?;
+    if let Some(field) = schema.fields().iter().find(|field| {
+        ["_op", "__op", WEIGHT_COLUMN]
+            .iter()
+            .any(|reserved| field.name().eq_ignore_ascii_case(reserved))
+    }) {
+        return Err(ConnectorError::ReadError(format!(
+            "CDF batch contains reserved mutation column '{}'",
+            field.name()
+        )));
+    }
 
     let change_type = batch
         .column(ct_idx)
@@ -2275,48 +2018,49 @@ pub fn map_cdf_to_changelog(batch: &RecordBatch) -> Result<Option<RecordBatch>, 
         .downcast_ref::<StringArray>()
         .ok_or_else(|| ConnectorError::ReadError("_change_type is not Utf8".into()))?;
 
-    // Build filter (drop preimage rows) and mapped _op values in one pass.
-    let (keep, ops): (Vec<bool>, Vec<Option<&str>>) = (0..batch.num_rows())
-        .map(|i| match change_type.value(i) {
-            "update_postimage" => (true, Some("U")),
-            "delete" => (true, Some("D")),
-            "update_preimage" => (false, Some("")),
-            _ => (true, Some("I")), // insert + unknown → I
-        })
-        .unzip();
-
-    let filter = arrow_array::BooleanArray::from(keep);
-    let filtered = arrow_select::filter::filter_record_batch(batch, &filter)
-        .map_err(|e| ConnectorError::ReadError(format!("CDF filter failed: {e}")))?;
-    if filtered.num_rows() == 0 {
-        return Ok(None);
+    let mut weights = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        if change_type.is_null(row) {
+            return Err(ConnectorError::ReadError(format!(
+                "CDF _change_type is null at row {row}"
+            )));
+        }
+        weights.push(match change_type.value(row) {
+            "insert" | "update_postimage" => 1,
+            "delete" | "update_preimage" => -1,
+            value => {
+                return Err(ConnectorError::ReadError(format!(
+                    "unknown CDF _change_type '{value}' at row {row}"
+                )));
+            }
+        });
     }
 
-    // Build _op column from filtered ops.
-    let op_arr: StringArray = ops.into_iter().collect();
-    let op_filtered = arrow_select::filter::filter(&op_arr, &filter)
-        .map_err(|e| ConnectorError::ReadError(format!("CDF op filter: {e}")))?;
-
-    // Rebuild batch: keep user columns, drop CDF metadata, append _op.
+    // Rebuild batch: keep user columns, drop CDF metadata, append __weight.
     let cdf_meta = ["_change_type", "_commit_version", "_commit_timestamp"];
     let mut fields = Vec::new();
     let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::new();
-    for (i, field) in filtered.schema().fields().iter().enumerate() {
+    for (i, field) in schema.fields().iter().enumerate() {
         if !cdf_meta.contains(&field.name().as_str()) {
             fields.push(field.clone());
-            columns.push(filtered.column(i).clone());
+            columns.push(batch.column(i).clone());
         }
     }
     fields.push(Arc::new(arrow_schema::Field::new(
-        "_op",
-        arrow_schema::DataType::Utf8,
+        WEIGHT_COLUMN,
+        arrow_schema::DataType::Int64,
         false,
     )));
-    columns.push(op_filtered);
+    columns.push(Arc::new(Int64Array::from(weights)));
 
-    RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
-        .map(Some)
-        .map_err(|e| ConnectorError::ReadError(format!("CDF batch rebuild: {e}")))
+    RecordBatch::try_new(
+        Arc::new(arrow_schema::Schema::new_with_metadata(
+            fields,
+            schema.metadata().clone(),
+        )),
+        columns,
+    )
+    .map_err(|e| ConnectorError::ReadError(format!("CDF batch rebuild: {e}")))
 }
 
 /// Result of a MERGE (upsert) operation.

@@ -46,8 +46,9 @@ mod disk_persistence {
         let db = LaminarDB::open_with_config(config_with_storage(&storage)).unwrap();
 
         db.execute(
-            "CREATE SOURCE sensors (seq BIGINT, ts_ms BIGINT, value VARCHAR) WITH \
-             ('connector' = 'generator', 'rows.per.second' = '1000', 'max.rows' = '3')",
+            "CREATE SOURCE sensors (seq BIGINT NOT NULL, ts_ms BIGINT NOT NULL, \
+             value VARCHAR NOT NULL) FROM GENERATOR \
+             ('rows.per.second' = '1000', 'max.rows' = '3')",
         )
         .await
         .unwrap();
@@ -132,8 +133,9 @@ mod disk_persistence {
             .unwrap();
 
         db.execute(
-            "CREATE SOURCE sensors (seq BIGINT, ts_ms BIGINT, value VARCHAR) WITH \
-             ('connector' = 'generator', 'rows.per.second' = '1000', 'max.rows' = '3')",
+            "CREATE SOURCE sensors (seq BIGINT NOT NULL, ts_ms BIGINT NOT NULL, \
+             value VARCHAR NOT NULL) FROM GENERATOR \
+             ('rows.per.second' = '1000', 'max.rows' = '3')",
         )
         .await
         .unwrap();
@@ -189,8 +191,9 @@ mod disk_persistence {
         })
         .unwrap();
         db.execute(
-            "CREATE SOURCE input (seq BIGINT, ts_ms BIGINT, value VARCHAR) WITH \
-             ('connector' = 'generator', 'max.rows' = '1')",
+            "CREATE SOURCE input (seq BIGINT NOT NULL, ts_ms BIGINT NOT NULL, \
+             value VARCHAR NOT NULL) FROM GENERATOR \
+             ('max.rows' = '1')",
         )
         .await
         .unwrap();
@@ -227,7 +230,6 @@ mod exactly_once {
     use tokio::sync::Notify;
 
     use laminar_connectors::checkpoint::SourceCheckpoint;
-    use laminar_connectors::connector::{SourceConsistency, SourceContract, SourceTopology};
     use laminar_core::state::CheckpointAttempt;
     use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
     use laminar_db::checkpoint_coordinator::{
@@ -395,10 +397,6 @@ mod exactly_once {
                 laminar_connectors::testing::MockSourceConnector::with_batches(10_000, 10),
             ),
             config: laminar_connectors::config::ConnectorConfig::new("mock"),
-            contract: SourceContract::new(
-                SourceConsistency::Replayable,
-                SourceTopology::Splittable,
-            ),
             assignment_scoped: false,
             position: laminar_connectors::connector::SourcePosition::Initial,
         }];
@@ -461,10 +459,6 @@ mod exactly_once {
                     laminar_connectors::testing::MockSourceConnector::with_batches(50, 10),
                 ),
                 config: laminar_connectors::config::ConnectorConfig::new("mock"),
-                contract: SourceContract::new(
-                    SourceConsistency::Replayable,
-                    SourceTopology::Splittable,
-                ),
                 assignment_scoped: false,
                 position: laminar_connectors::connector::SourcePosition::Initial,
             },
@@ -474,10 +468,6 @@ mod exactly_once {
                     laminar_connectors::testing::MockSourceConnector::with_batches(50, 10),
                 ),
                 config: laminar_connectors::config::ConnectorConfig::new("mock"),
-                contract: SourceContract::new(
-                    SourceConsistency::Replayable,
-                    SourceTopology::Splittable,
-                ),
                 assignment_scoped: false,
                 position: laminar_connectors::connector::SourcePosition::Initial,
             },
@@ -549,10 +539,6 @@ mod exactly_once {
                 name: "src_a".to_string(),
                 connector: Box::new(src_a),
                 config: laminar_connectors::config::ConnectorConfig::new("mock"),
-                contract: SourceContract::new(
-                    SourceConsistency::Replayable,
-                    SourceTopology::Splittable,
-                ),
                 assignment_scoped: false,
                 position: laminar_connectors::connector::SourcePosition::Initial,
             },
@@ -560,10 +546,6 @@ mod exactly_once {
                 name: "src_b".to_string(),
                 connector: Box::new(src_b),
                 config: laminar_connectors::config::ConnectorConfig::new("mock"),
-                contract: SourceContract::new(
-                    SourceConsistency::Replayable,
-                    SourceTopology::Splittable,
-                ),
                 assignment_scoped: false,
                 position: laminar_connectors::connector::SourcePosition::Initial,
             },
@@ -696,7 +678,7 @@ mod exactly_once {
 
         let op_state = manifest.operator_states.get("stream_executor").unwrap();
         assert_eq!(
-            op_state.decode_inline().unwrap(),
+            op_state.try_decode_inline().unwrap().unwrap(),
             b"barrier-consistent-state"
         );
 
@@ -716,10 +698,6 @@ mod exactly_once {
                 laminar_connectors::testing::MockSourceConnector::with_batches(100, 5),
             ),
             config: laminar_connectors::config::ConnectorConfig::new("mock"),
-            contract: SourceContract::new(
-                SourceConsistency::Replayable,
-                SourceTopology::Splittable,
-            ),
             assignment_scoped: false,
             position: laminar_connectors::connector::SourcePosition::Initial,
         }];
@@ -776,10 +754,6 @@ mod exactly_once {
                     laminar_connectors::testing::MockSourceConnector::with_batches(3, 5),
                 ),
                 config: laminar_connectors::config::ConnectorConfig::new("mock"),
-                contract: SourceContract::new(
-                    SourceConsistency::Replayable,
-                    SourceTopology::Splittable,
-                ),
                 assignment_scoped: false,
                 position: laminar_connectors::connector::SourcePosition::Initial,
             },
@@ -789,10 +763,6 @@ mod exactly_once {
                     laminar_connectors::testing::MockSourceConnector::with_batches(3, 5),
                 ),
                 config: laminar_connectors::config::ConnectorConfig::new("mock"),
-                contract: SourceContract::new(
-                    SourceConsistency::Replayable,
-                    SourceTopology::Splittable,
-                ),
                 assignment_scoped: false,
                 position: laminar_connectors::connector::SourcePosition::Initial,
             },
@@ -1009,12 +979,16 @@ mod recovery {
         CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
     };
 
+    const TEST_DEPLOYMENT_ID: &str = "00000000-0000-0000-0000-000000000001";
+
     fn make_store(dir: &std::path::Path) -> FileSystemCheckpointStore {
         FileSystemCheckpointStore::new(dir)
     }
 
     async fn save_finalized(store: &FileSystemCheckpointStore, manifest: &CheckpointManifest) {
-        store.save_with_state(manifest, None).await.unwrap();
+        let mut manifest = manifest.clone();
+        manifest.deployment_id = TEST_DEPLOYMENT_ID.into();
+        store.save_with_state(&manifest, None).await.unwrap();
         store.finalize(manifest.checkpoint_id).await.unwrap();
     }
 
@@ -1059,7 +1033,10 @@ mod recovery {
         assert_eq!(manifest.watermark, Some(5000));
 
         let op = manifest.operator_states.get("window-agg").unwrap();
-        assert_eq!(op.decode_inline().unwrap(), b"accumulated-state");
+        assert_eq!(
+            op.try_decode_inline().unwrap().unwrap(),
+            b"accumulated-state"
+        );
     }
 
     #[tokio::test]
@@ -1155,10 +1132,10 @@ mod recovery {
         assert_eq!(manifest.operator_states.len(), 2);
 
         let w = manifest.operator_states.get("stream_executor").unwrap();
-        assert_eq!(w.decode_inline().unwrap(), executor_state);
+        assert_eq!(w.try_decode_inline().unwrap().unwrap(), executor_state);
 
         let f = manifest.operator_states.get("filter").unwrap();
-        assert_eq!(f.decode_inline().unwrap(), filter_state);
+        assert_eq!(f.try_decode_inline().unwrap().unwrap(), filter_state);
     }
 
     #[tokio::test]
@@ -1312,7 +1289,8 @@ mod recovery {
                 .operator_states
                 .get("0")
                 .unwrap()
-                .decode_inline()
+                .try_decode_inline()
+                .unwrap()
                 .unwrap(),
             b"state-bytes"
         );
@@ -1340,12 +1318,21 @@ mod restart {
     }
 
     fn make_batch(symbol: &str, price: f64, ts_ms: i64) -> RecordBatch {
-        RecordBatch::try_from_iter(vec![
-            ("symbol", Arc::new(StringArray::from(vec![symbol])) as _),
-            ("price", Arc::new(Float64Array::from(vec![price])) as _),
+        RecordBatch::try_from_iter_with_nullable(vec![
+            (
+                "symbol",
+                Arc::new(StringArray::from(vec![symbol])) as _,
+                true,
+            ),
+            (
+                "price",
+                Arc::new(Float64Array::from(vec![price])) as _,
+                true,
+            ),
             (
                 "ts",
                 Arc::new(TimestampMicrosecondArray::from(vec![ts_ms * 1000])) as _,
+                true,
             ),
         ])
         .unwrap()

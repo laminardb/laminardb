@@ -256,9 +256,11 @@ pub struct CreateSourceStatement {
     pub name: ObjectName,
     /// Column definitions
     pub columns: Vec<ColumnDef>,
+    /// Primary-key columns, empty when no key is declared.
+    pub primary_key: Vec<Ident>,
     /// Watermark definition
     pub watermark: Option<WatermarkDef>,
-    /// Source connector options (from WITH clause)
+    /// Source runtime options from the trailing `WITH` clause.
     pub with_options: HashMap<String, String>,
     /// Whether to replace existing source
     pub or_replace: bool,
@@ -270,10 +272,6 @@ pub struct CreateSourceStatement {
     pub connector_options: HashMap<String, String>,
     /// Format specification (e.g., `FORMAT JSON`)
     pub format: Option<FormatSpec>,
-    /// Whether the column list includes a `*` wildcard for schema inference.
-    pub has_wildcard: bool,
-    /// Optional prefix for wildcard-expanded columns (from `PREFIX 'str'`).
-    pub wildcard_prefix: Option<String>,
 }
 
 /// CREATE SINK statement
@@ -283,8 +281,6 @@ pub struct CreateSinkStatement {
     pub name: ObjectName,
     /// Input query or table
     pub from: SinkFrom,
-    /// Sink connector options (from WITH clause)
-    pub with_options: HashMap<String, String>,
     /// Whether to replace existing sink
     pub or_replace: bool,
     /// Whether to skip if exists
@@ -297,8 +293,6 @@ pub struct CreateSinkStatement {
     pub connector_options: HashMap<String, String>,
     /// Format specification (e.g., `FORMAT JSON`)
     pub format: Option<FormatSpec>,
-    /// Output options (from `WITH (key = ...)` after FORMAT)
-    pub output_options: HashMap<String, String>,
 }
 
 /// Source for a sink
@@ -588,29 +582,25 @@ mod tests {
                     options: vec![],
                 },
             ],
+            primary_key: vec![],
             watermark: Some(WatermarkDef {
                 column: Ident::new("timestamp"),
                 expression: Some(Expr::Identifier(Ident::new("timestamp"))),
             }),
-            with_options: HashMap::from([
-                ("connector".to_string(), "kafka".to_string()),
-                ("topic".to_string(), "events".to_string()),
-            ]),
+            with_options: HashMap::from([("buffer_size".to_string(), "4096".to_string())]),
             or_replace: false,
             if_not_exists: true,
             connector_type: None,
             connector_options: HashMap::new(),
             format: None,
-            has_wildcard: false,
-            wildcard_prefix: None,
         };
 
         // Check the statement fields
         assert_eq!(stmt.columns.len(), 2);
         assert!(stmt.watermark.is_some());
         assert_eq!(
-            stmt.with_options.get("connector"),
-            Some(&"kafka".to_string())
+            stmt.with_options.get("buffer_size"),
+            Some(&"4096".to_string())
         );
     }
 

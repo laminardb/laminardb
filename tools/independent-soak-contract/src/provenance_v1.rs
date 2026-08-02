@@ -742,7 +742,7 @@ mod tests {
         literal_preimage.extend_from_slice(OPERATION_ID_DOMAIN);
         literal_preimage.extend_from_slice(&deployment);
         literal_preimage.extend_from_slice(&incarnation);
-        literal_preimage.extend_from_slice(&3_u16.to_be_bytes());
+        literal_preimage.extend_from_slice(&5_u16.to_be_bytes());
         literal_preimage.extend_from_slice(&pipeline);
         for value in ["sink-a", "operator-grouped-aggregate-a", "output-a"] {
             literal_preimage.push(value.len() as u8);
@@ -753,11 +753,11 @@ mod tests {
         literal_preimage.extend_from_slice(&2_u64.to_be_bytes());
         assert_eq!(
             encode_hex(&literal_preimage),
-            "6c616d696e617264622f67726f757065642d636f756e742d73756d2f6f7065726174696f6e2d69642f76310000112233445566778899aabbccddeeff102132435465768798a9bacbdcedfe0f000333333333333333333333333333333333333333333333333333333333333333330673696e6b2d611c6f70657261746f722d67726f757065642d6167677265676174652d61086f75747075742d610000000a02616c706861000000050000000000000002"
+            "6c616d696e617264622f67726f757065642d636f756e742d73756d2f6f7065726174696f6e2d69642f76310000112233445566778899aabbccddeeff102132435465768798a9bacbdcedfe0f000533333333333333333333333333333333333333333333333333333333333333330673696e6b2d611c6f70657261746f722d67726f757065642d6167677265676174652d61086f75747075742d610000000a02616c706861000000050000000000000002"
         );
         assert_eq!(
             context.derive(&key, 2).unwrap(),
-            decode_hex::<32>("b21f5519a855d221cdf34cce7ae48234d29b5d88893dde6e2ea0b98998034c4c")
+            decode_hex::<32>("ef552fad285c75205cf8744f3dc9d9fdf91b6d69897199028dd375797688fffb")
         );
         assert_eq!(
             context.derive(&key, 2).unwrap(),

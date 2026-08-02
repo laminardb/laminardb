@@ -2048,12 +2048,9 @@ mod two_pc {
                 portable_state_sha256: portable_state_sha256.clone(),
             })
             .collect();
-        let vnode_restore_limits = VnodeRestoreLimits::global_singleton_compatibility(
-            u64::from(fence.vnode_count),
-            1,
-            fence.vnode_count,
-        )
-        .unwrap();
+        let vnode_restore_limits =
+            VnodeRestoreLimits::managed_vnode(u64::from(fence.vnode_count), 1, fence.vnode_count)
+                .unwrap();
         let vnode_restore_contract = VnodeRestoreContract::new(
             vnode_restore_limits,
             u64::from(fence.vnode_count),

@@ -25,9 +25,10 @@ use crate::checkpoint::{
 
 use super::backend::{
     digest_hex, sha256, CheckpointAttempt, CheckpointSeal, CheckpointSealInventory,
-    SealedCommitDescriptor, SealedCommitDescriptorWriter, SealedVnodePartial, SealedVnodeWriter,
-    StateBackend, StateBackendDurability, StateBackendError, StateNamespaceBinding,
-    VnodePartialLineage, CHECKPOINT_SEAL_VERSION, STATE_NAMESPACE_RESOURCE,
+    SealedCommitDescriptor, SealedCommitDescriptorWriter, SealedPartialReadEnvelope,
+    SealedVnodePartial, SealedVnodeWriter, StateBackend, StateBackendDurability, StateBackendError,
+    StateNamespaceBinding, VnodePartialLineage, CHECKPOINT_SEAL_VERSION, MAX_CHECKPOINT_SEAL_BYTES,
+    STATE_NAMESPACE_RESOURCE,
 };
 
 const VNODE_PARTIAL_MAGIC: &[u8; 8] = b"LDBVP3\0\0";
@@ -38,15 +39,16 @@ const COMMIT_DESCRIPTOR_MAGIC: &[u8; 8] = b"LDBCD2\0\0";
 const COMMIT_DESCRIPTOR_VERSION: u32 = 2;
 const COMMIT_DESCRIPTOR_HEADER_LEN: usize = 204;
 const DESCRIPTOR_ATTESTATION_READ_CONCURRENCY: usize = 32;
+const ARTIFACT_METADATA_HEAD_CONCURRENCY: usize = 32;
 const STATE_PRUNE_FLOOR_VERSION: u32 = 1;
 const STATE_PRUNE_FLOOR_MAX_BYTES: u64 = 512;
+const STATE_PRUNE_DISCOVERY_BATCH_SIZE: usize = 8;
+const STATE_PRUNE_DISCOVERY_SCAN_QUANTUM: usize = 256;
+const STATE_PRUNE_DIRECT_SWEEP_LIMIT: u64 = 8;
 const STATE_PRUNE_DELETE_BATCH_SIZE: usize = 256;
+const STATE_PRUNE_REPAIR_INTERVAL: u64 = 256;
 const STATE_NAMESPACE_VERSION: u32 = 1;
 const STATE_NAMESPACE_MAX_BYTES: u64 = 512;
-// MAX_KEY_GROUP_COUNT (65,535) at a conservative 768 encoded bytes of provenance per
-// vnode is under 48 MiB; 64 MiB leaves over 16 MiB for the assignment and descriptors.
-const MAX_CHECKPOINT_SEAL_BYTES: u64 = 64 * 1024 * 1024;
-
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StateNamespaceMarker {
@@ -400,12 +402,8 @@ impl ObjectStoreBackend {
     async fn verify_object_size_from_metadata(
         &self,
         path: &OsPath,
-        listed_size: Option<u64>,
         expected_size: u64,
     ) -> Result<(), StateBackendError> {
-        if listed_size == Some(expected_size) {
-            return Ok(());
-        }
         match self.store.head(path).await {
             Ok(metadata) if metadata.size == expected_size => Ok(()),
             Ok(metadata) => Err(StateBackendError::Conflict {
@@ -423,14 +421,17 @@ impl ObjectStoreBackend {
         }
     }
 
-    /// Parse one immediate `state-v2/epoch=N` delimiter prefix.
-    fn epoch_from_prefix(prefix: &OsPath) -> Option<u64> {
-        let encoded = prefix.as_ref().strip_prefix("state-v2/epoch=")?;
-        if encoded.is_empty() || encoded.contains('/') {
+    /// Parse the immediate epoch component from one recursively listed state object.
+    fn epoch_from_location(location: &OsPath) -> Option<u64> {
+        let suffix = location.as_ref().strip_prefix("state-v2/epoch=")?;
+        let encoded = suffix.split('/').next()?;
+        if encoded.is_empty()
+            || encoded.starts_with('0')
+            || !encoded.bytes().all(|byte| byte.is_ascii_digit())
+        {
             return None;
         }
-        let epoch = encoded.parse::<u64>().ok()?;
-        (epoch != 0 && epoch.to_string() == encoded).then_some(epoch)
+        encoded.parse::<u64>().ok()
     }
 
     /// Wrap raw operator state in a fixed-width provenance header. The fixed width lets the
@@ -1095,12 +1096,67 @@ impl ObjectStoreBackend {
             tokio::task::yield_now().await;
         }
     }
+
+    async fn discover_retired_epochs(
+        &self,
+        state_root: &OsPath,
+        before_epoch: u64,
+    ) -> Result<Vec<u64>, StateBackendError> {
+        use futures::StreamExt as _;
+
+        let mut retired_epochs = Vec::new();
+        retired_epochs
+            .try_reserve_exact(STATE_PRUNE_DISCOVERY_BATCH_SIZE)
+            .map_err(|error| StateBackendError::Conflict {
+                resource: state_root.to_string(),
+                message: format!("cannot reserve state prune discovery batch: {error}"),
+            })?;
+
+        let mut objects = self.store.list(Some(state_root));
+        let mut scanned_after_first_match = 0_usize;
+        let mut scanned_since_yield = 0_usize;
+        while let Some(entry) = objects.next().await {
+            let entry = entry.map_err(|error| StateBackendError::Io(error.to_string()))?;
+            scanned_since_yield += 1;
+            let retired = Self::epoch_from_location(&entry.location)
+                .filter(|epoch| *epoch < before_epoch && !retired_epochs.contains(epoch));
+            if let Some(epoch) = retired {
+                retired_epochs.push(epoch);
+            }
+
+            if !retired_epochs.is_empty() {
+                scanned_after_first_match += 1;
+                if retired_epochs.len() == STATE_PRUNE_DISCOVERY_BATCH_SIZE
+                    || scanned_after_first_match == STATE_PRUNE_DISCOVERY_SCAN_QUANTUM
+                {
+                    break;
+                }
+            }
+            if scanned_since_yield == STATE_PRUNE_DISCOVERY_SCAN_QUANTUM {
+                scanned_since_yield = 0;
+                tokio::task::yield_now().await;
+            }
+        }
+        drop(objects);
+        retired_epochs.sort_unstable();
+        Ok(retired_epochs)
+    }
 }
 
 #[async_trait]
 impl StateBackend for ObjectStoreBackend {
     fn key_group_capacity(&self) -> u32 {
         self.vnode_capacity
+    }
+
+    fn sealed_partial_read_envelope(&self) -> Option<SealedPartialReadEnvelope> {
+        // Stream collection can overlap one complete response with the collected response. The
+        // returned payload is normalized inside this backend, whose response/payload overlap is
+        // no larger. Charge both copies of the fixed LDBVP3 header as well as the payload.
+        Some(SealedPartialReadEnvelope::new(
+            2,
+            2 * VNODE_PARTIAL_HEADER_LEN as u64,
+        ))
     }
 
     async fn bind_state_namespace(
@@ -1498,17 +1554,38 @@ impl StateBackend for ObjectStoreBackend {
         vnodes: &[u32],
         required_descriptors: &[String],
     ) -> Result<bool, StateBackendError> {
-        use rustc_hash::FxHashSet;
-        use tokio_stream::StreamExt;
-
         Self::ensure_canonical_attempt(attempt)?;
         let assignment_version = self.seal_assignment_version(attempt, assignment_fence)?;
         self.check_assignment_version(assignment_version)?;
         self.ensure_attempt_live(attempt).await?;
-        let mut required_vnodes = vnodes.to_vec();
+        CheckpointSealInventory::validate_request_control_limits(
+            assignment_fence,
+            vnodes,
+            required_descriptors,
+        )
+        .map_err(|message| StateBackendError::Conflict {
+            resource: Self::seal_path(attempt).to_string(),
+            message,
+        })?;
+        let mut required_vnodes = Vec::new();
+        required_vnodes
+            .try_reserve_exact(vnodes.len())
+            .map_err(|error| StateBackendError::Conflict {
+                resource: Self::seal_path(attempt).to_string(),
+                message: format!("cannot reserve checkpoint vnode inventory: {error}"),
+            })?;
+        required_vnodes.extend_from_slice(vnodes);
         required_vnodes.sort_unstable();
         required_vnodes.dedup();
-        let mut required_descriptors = required_descriptors.to_vec();
+        let mut canonical_descriptors = Vec::new();
+        canonical_descriptors
+            .try_reserve_exact(required_descriptors.len())
+            .map_err(|error| StateBackendError::Conflict {
+                resource: Self::seal_path(attempt).to_string(),
+                message: format!("cannot reserve checkpoint descriptor inventory: {error}"),
+            })?;
+        canonical_descriptors.extend(required_descriptors.iter().cloned());
+        let mut required_descriptors = canonical_descriptors;
         required_descriptors.sort_unstable();
         required_descriptors.dedup();
         if required_descriptors.iter().any(String::is_empty) {
@@ -1551,29 +1628,6 @@ impl StateBackend for ObjectStoreBackend {
 
         for &v in &required_vnodes {
             self.check_vnode(v)?;
-        }
-
-        // List once for presence only. Some providers do not populate object size in LIST;
-        // descriptor length is checked from ranged-GET metadata below.
-        let prefix = OsPath::from(Self::attempt_prefix(attempt));
-        let mut entries = self.store.list(Some(&prefix));
-        let mut found_objects: FxHashSet<OsPath> = FxHashSet::default();
-        while let Some(entry) = entries.next().await {
-            let entry = entry.map_err(|e| StateBackendError::Io(e.to_string()))?;
-            found_objects.insert(entry.location);
-        }
-
-        for &v in &required_vnodes {
-            let path = Self::partial_path(attempt, v);
-            if !found_objects.contains(&path) {
-                return Ok(false);
-            }
-        }
-        // Commit descriptors live under this attempt's `commit/` prefix.
-        for key in &required_descriptors {
-            if !found_objects.contains(&Self::descriptor_path(attempt, key)) {
-                return Ok(false);
-            }
         }
 
         let Some(sealed_partials) = self
@@ -1651,7 +1705,7 @@ impl StateBackend for ObjectStoreBackend {
                         ),
                     });
                 }
-                Ok(Some(seal.inventory()))
+                Ok(Some(seal.into_inventory()))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(error) => Err(StateBackendError::Io(error.to_string())),
@@ -1662,9 +1716,15 @@ impl StateBackend for ObjectStoreBackend {
         &self,
         inventory: &CheckpointSealInventory,
     ) -> Result<(), StateBackendError> {
-        use futures::StreamExt as _;
+        use futures::{StreamExt as _, TryStreamExt as _};
 
         let attempt = inventory.attempt;
+        inventory
+            .validate_control_limits()
+            .map_err(|message| StateBackendError::Conflict {
+                resource: Self::seal_path(attempt).to_string(),
+                message,
+            })?;
         if self.attempt_is_pruned(attempt).await? {
             return Err(StateBackendError::Conflict {
                 resource: Self::attempt_prefix(attempt),
@@ -1672,14 +1732,21 @@ impl StateBackend for ObjectStoreBackend {
             });
         }
 
-        let prefix = OsPath::from(Self::attempt_prefix(attempt));
-        let mut objects = self.store.list(Some(&prefix));
-        let mut listed_sizes = rustc_hash::FxHashMap::default();
-        while let Some(entry) = objects.next().await {
-            let entry = entry.map_err(|error| StateBackendError::Io(error.to_string()))?;
-            listed_sizes.insert(entry.location, entry.size);
-        }
-
+        let artifact_count = inventory
+            .sealed_partials
+            .len()
+            .checked_add(inventory.sealed_descriptors.len())
+            .ok_or_else(|| StateBackendError::Conflict {
+                resource: Self::attempt_prefix(attempt),
+                message: "sealed artifact count overflows usize".into(),
+            })?;
+        let mut unresolved = rustc_hash::FxHashMap::default();
+        unresolved
+            .try_reserve(artifact_count)
+            .map_err(|error| StateBackendError::Conflict {
+                resource: Self::attempt_prefix(attempt),
+                message: format!("cannot reserve sealed artifact metadata inventory: {error}"),
+            })?;
         for partial in &inventory.sealed_partials {
             let path = Self::partial_path(attempt, partial.vnode);
             let header_len = u64::try_from(VNODE_PARTIAL_HEADER_LEN).map_err(|_| {
@@ -1694,12 +1761,12 @@ impl StateBackend for ObjectStoreBackend {
                     message: "sealed vnode partial length overflows storage size".into(),
                 }
             })?;
-            self.verify_object_size_from_metadata(
-                &path,
-                listed_sizes.get(&path).copied(),
-                expected_size,
-            )
-            .await?;
+            if unresolved.insert(path.clone(), expected_size).is_some() {
+                return Err(StateBackendError::Conflict {
+                    resource: path.to_string(),
+                    message: "sealed artifact inventory contains a duplicate storage path".into(),
+                });
+            }
         }
         for descriptor in &inventory.sealed_descriptors {
             let path = Self::descriptor_path(attempt, &descriptor.key);
@@ -1716,13 +1783,50 @@ impl StateBackend for ObjectStoreBackend {
                         resource: path.to_string(),
                         message: "sealed commit descriptor length overflows storage size".into(),
                     })?;
-            self.verify_object_size_from_metadata(
-                &path,
-                listed_sizes.get(&path).copied(),
-                expected_size,
+            if unresolved.insert(path.clone(), expected_size).is_some() {
+                return Err(StateBackendError::Conflict {
+                    resource: path.to_string(),
+                    message: "sealed artifact inventory contains a duplicate storage path".into(),
+                });
+            }
+        }
+
+        // LIST is the low-request fast path, but a noisy attempt prefix must not amplify control
+        // work. Scan at most the sealed artifact count plus the seal itself, then issue exact,
+        // bounded-concurrency HEADs for anything absent from or mismatched in LIST metadata.
+        let scan_limit =
+            artifact_count
+                .checked_add(1)
+                .ok_or_else(|| StateBackendError::Conflict {
+                    resource: Self::attempt_prefix(attempt),
+                    message: "sealed artifact metadata scan limit overflows usize".into(),
+                })?;
+        if !unresolved.is_empty() {
+            let prefix = OsPath::from(Self::attempt_prefix(attempt));
+            let mut objects = self.store.list(Some(&prefix));
+            let mut scanned = 0usize;
+            while scanned < scan_limit && !unresolved.is_empty() {
+                let Some(entry) = objects.next().await else {
+                    break;
+                };
+                let entry = entry.map_err(|error| StateBackendError::Io(error.to_string()))?;
+                scanned += 1;
+                if unresolved.get(&entry.location) == Some(&entry.size) {
+                    unresolved.remove(&entry.location);
+                }
+            }
+        }
+
+        futures::stream::iter(unresolved)
+            .map(Ok::<_, StateBackendError>)
+            .try_for_each_concurrent(
+                Some(ARTIFACT_METADATA_HEAD_CONCURRENCY),
+                |(path, expected_size)| async move {
+                    self.verify_object_size_from_metadata(&path, expected_size)
+                        .await
+                },
             )
             .await?;
-        }
 
         if self.attempt_is_pruned(attempt).await? {
             return Err(StateBackendError::Conflict {
@@ -1731,6 +1835,22 @@ impl StateBackend for ObjectStoreBackend {
             });
         }
         Ok(())
+    }
+
+    async fn checkpoint_seal_inventory_bounded(
+        &self,
+        attempt: CheckpointAttempt,
+    ) -> Result<Option<CheckpointSealInventory>, StateBackendError> {
+        let inventory = self.checkpoint_seal_inventory(attempt).await?;
+        if let Some(inventory) = &inventory {
+            inventory
+                .validate_control_limits()
+                .map_err(|message| StateBackendError::Conflict {
+                    resource: Self::seal_path(attempt).to_string(),
+                    message,
+                })?;
+        }
+        Ok(inventory)
     }
 
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
@@ -1763,6 +1883,7 @@ impl StateBackend for ObjectStoreBackend {
             tokio::task::yield_now().await;
         }
 
+        let mut recursive_target = None;
         'sweep: loop {
             let mut current =
                 self.read_prune_floor()
@@ -1772,74 +1893,135 @@ impl StateBackend for ObjectStoreBackend {
                         message: "state prune floor disappeared after publication".into(),
                     })?;
             let target = current.floor.before_epoch;
+            if current.floor.swept_before_epoch >= target {
+                return Ok(());
+            }
 
-            // Discover materialized epochs rather than issuing one LIST for every numeric ID in
-            // the retired range. Sparse checkpoint IDs are normal after allocation failures and
-            // can otherwise turn one retention pass into tens of thousands of remote requests.
-            // Revisit prefixes below the durable cursor too: a writer whose publication raced the
-            // floor can leave garbage after an ambiguously failed cleanup, even though readers
-            // already reject it.
-            let state_root = OsPath::from("state-v2");
-            let discovered = self
-                .store
-                .list_with_delimiter(Some(&state_root))
-                .await
-                .map_err(|error| StateBackendError::Io(error.to_string()))?;
-            let mut retired_prefixes = discovered
-                .common_prefixes
-                .into_iter()
-                .filter_map(|prefix| {
-                    let epoch = Self::epoch_from_prefix(&prefix)?;
-                    (epoch < target).then_some((epoch, prefix))
-                })
-                .collect::<Vec<_>>();
-            retired_prefixes.sort_unstable_by_key(|(epoch, _)| *epoch);
+            if recursive_target != Some(target) {
+                let exact_gap = target - current.floor.swept_before_epoch;
+                if exact_gap <= STATE_PRUNE_DIRECT_SWEEP_LIMIT {
+                    let swept_bucket =
+                        current.floor.swept_before_epoch / STATE_PRUNE_REPAIR_INTERVAL;
+                    let repair_boundary = swept_bucket != target / STATE_PRUNE_REPAIR_INTERVAL;
+                    let first_epoch = current.floor.swept_before_epoch.max(1);
+                    for epoch in first_epoch..target {
+                        let prefix = OsPath::from(format!("state-v2/epoch={epoch}"));
+                        self.delete_retired_prefix(&prefix).await?;
 
-            for (epoch, prefix) in retired_prefixes {
-                self.delete_retired_prefix(&prefix).await?;
-
-                // The numeric cursor can represent completion of a sparse materialized prefix:
-                // every lower prefix was absent from the same delimiter snapshot or was already
-                // swept. Publishing after deletion makes a crash resume at this prefix unless the
-                // entire prefix was removed.
-                let next = epoch.saturating_add(1).min(target);
-                if current.floor.swept_before_epoch < next {
-                    let swept = StatePruneFloor {
-                        swept_before_epoch: next,
-                        ..current.floor.clone()
-                    };
-                    if !self
-                        .compare_and_swap_prune_floor(&swept, Some(current.update_version.clone()))
-                        .await?
-                    {
-                        tokio::task::yield_now().await;
-                        continue 'sweep;
+                        let next = epoch + 1;
+                        // Keep a crossed bucket durable until its root repair completes.
+                        if (!repair_boundary || next / STATE_PRUNE_REPAIR_INTERVAL == swept_bucket)
+                            && current.floor.swept_before_epoch < next
+                        {
+                            let swept = StatePruneFloor {
+                                swept_before_epoch: next,
+                                ..current.floor.clone()
+                            };
+                            if !self
+                                .compare_and_swap_prune_floor(
+                                    &swept,
+                                    Some(current.update_version.clone()),
+                                )
+                                .await?
+                            {
+                                tokio::task::yield_now().await;
+                                continue 'sweep;
+                            }
+                            current = self.read_prune_floor().await?.ok_or_else(|| {
+                                StateBackendError::Conflict {
+                                    resource: Self::prune_floor_path().to_string(),
+                                    message:
+                                        "state prune floor disappeared after exact sweep progress"
+                                            .into(),
+                                }
+                            })?;
+                            if current.floor.before_epoch != target {
+                                continue 'sweep;
+                            }
+                        }
                     }
+
                     current = self.read_prune_floor().await?.ok_or_else(|| {
                         StateBackendError::Conflict {
                             resource: Self::prune_floor_path().to_string(),
-                            message: "state prune floor disappeared after sweep progress".into(),
+                            message: "state prune floor disappeared after exact sweep".into(),
                         }
                     })?;
                     if current.floor.before_epoch != target {
                         continue 'sweep;
                     }
+                    if current.floor.swept_before_epoch >= target {
+                        return Ok(());
+                    }
+                    if !repair_boundary {
+                        let swept = StatePruneFloor {
+                            swept_before_epoch: target,
+                            ..current.floor.clone()
+                        };
+                        if self
+                            .compare_and_swap_prune_floor(
+                                &swept,
+                                Some(current.update_version.clone()),
+                            )
+                            .await?
+                        {
+                            return Ok(());
+                        }
+                        tokio::task::yield_now().await;
+                        continue 'sweep;
+                    }
                 }
+                recursive_target = Some(target);
             }
 
-            if current.floor.swept_before_epoch >= target {
-                return Ok(());
+            // Recursive LIST is streamed by remote backends. Keep only a small prefix batch and
+            // revisit the whole retired namespace after deletion; object order is unspecified and
+            // a writer racing floor publication may leave repairable garbage below the cursor.
+            let state_root = OsPath::from("state-v2");
+            let retired_epochs = self.discover_retired_epochs(&state_root, target).await?;
+            if retired_epochs.is_empty() {
+                // Object-store LIST cannot observe a completely empty directory. The durable
+                // local adapter repairs a bounded batch of those implementation artifacts; cloud
+                // and in-memory backends have no directory objects to clean.
+                if let Some(cleanup) = &self.empty_prefix_cleanup {
+                    let cleaned = cleanup
+                        .cleanup_retired_empty_epoch_prefixes(
+                            &state_root,
+                            target,
+                            STATE_PRUNE_DISCOVERY_BATCH_SIZE,
+                        )
+                        .await
+                        .map_err(|error| StateBackendError::Io(error.to_string()))?;
+                    if cleaned != 0 {
+                        tokio::task::yield_now().await;
+                        continue 'sweep;
+                    }
+                }
+
+                if current.floor.swept_before_epoch >= target {
+                    return Ok(());
+                }
+                let swept = StatePruneFloor {
+                    swept_before_epoch: target,
+                    ..current.floor.clone()
+                };
+                if self
+                    .compare_and_swap_prune_floor(&swept, Some(current.update_version.clone()))
+                    .await?
+                {
+                    return Ok(());
+                }
+                tokio::task::yield_now().await;
+                continue 'sweep;
             }
-            let swept = StatePruneFloor {
-                swept_before_epoch: target,
-                ..current.floor.clone()
-            };
-            if self
-                .compare_and_swap_prune_floor(&swept, Some(current.update_version.clone()))
-                .await?
-            {
-                return Ok(());
+
+            for epoch in retired_epochs {
+                let prefix = OsPath::from(format!("state-v2/epoch={epoch}"));
+                self.delete_retired_prefix(&prefix).await?;
             }
+
+            // A batch boundary is not proof that no other retired prefix exists. Complete one
+            // fresh streamed scan before marking the sweep horizon complete.
             tokio::task::yield_now().await;
         }
     }
@@ -1873,7 +2055,13 @@ impl ObjectStoreBackend {
         assignment_version: u64,
         assignment_fence: Option<&CheckpointAssignmentFence>,
     ) -> Result<Option<Vec<SealedVnodePartial>>, StateBackendError> {
-        let mut sealed_partials = Vec::with_capacity(required_vnodes.len());
+        let mut sealed_partials = Vec::new();
+        sealed_partials
+            .try_reserve_exact(required_vnodes.len())
+            .map_err(|error| StateBackendError::Conflict {
+                resource: Self::seal_path(attempt).to_string(),
+                message: format!("cannot reserve vnode attestations: {error}"),
+            })?;
         for chunk in required_vnodes.chunks(PARTIAL_ATTESTATION_READ_CONCURRENCY) {
             let attestations = futures::future::try_join_all(
                 chunk
@@ -1917,7 +2105,13 @@ impl ObjectStoreBackend {
         required_descriptors: &[String],
         assignment_fence: Option<&CheckpointAssignmentFence>,
     ) -> Result<Option<Vec<SealedCommitDescriptor>>, StateBackendError> {
-        let mut sealed_descriptors = Vec::with_capacity(required_descriptors.len());
+        let mut sealed_descriptors = Vec::new();
+        sealed_descriptors
+            .try_reserve_exact(required_descriptors.len())
+            .map_err(|error| StateBackendError::Conflict {
+                resource: Self::seal_path(attempt).to_string(),
+                message: format!("cannot reserve descriptor attestations: {error}"),
+            })?;
         for chunk in required_descriptors.chunks(DESCRIPTOR_ATTESTATION_READ_CONCURRENCY) {
             let attestations = futures::future::try_join_all(
                 chunk

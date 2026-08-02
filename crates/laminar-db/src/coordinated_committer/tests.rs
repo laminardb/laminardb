@@ -553,35 +553,28 @@ async fn record_cluster_commit_with_inventory_digest<B: StateBackend>(
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn batches_sealed_epochs_into_one_commit() {
+async fn bounded_seal_window_resumes_without_skipping() {
     let backend = Arc::new(InProcessBackend::new(2));
-    let first = CheckpointAttempt::canonical(1);
-    let second = CheckpointAttempt::canonical(2);
+    let attempts = (1..=9)
+        .map(CheckpointAttempt::canonical)
+        .collect::<Vec<_>>();
     let fence = assignment_fence(3, &[7, 9]);
     let decisions = cluster_decisions(&fence, 7).await;
-    seal_with_fence(
-        &backend,
-        first,
-        &[(7, Some(b"e1")), (9, None)],
-        &[7, 9],
-        Some(&fence),
-        Some(&decisions.proof),
-    )
-    .await;
-    seal_with_fence(
-        &backend,
-        second,
-        &[(7, Some(b"e2")), (9, None)],
-        &[7, 9],
-        Some(&fence),
-        Some(&decisions.proof),
-    )
-    .await;
+    for attempt in &attempts {
+        seal_with_fence(
+            &backend,
+            *attempt,
+            &[(7, Some(b"payload")), (9, None)],
+            &[7, 9],
+            Some(&fence),
+            Some(&decisions.proof),
+        )
+        .await;
+        record_cluster_commit(&decisions, &backend, attempt.checkpoint_id, &fence).await;
+    }
 
     let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
     let handle = spawn_recording_sink(Arc::clone(&recorded));
-    record_cluster_commit(&decisions, &backend, 1, &fence).await;
-    record_cluster_commit(&decisions, &backend, 2, &fence).await;
     let floor = Arc::new(AtomicU64::new(0));
     let mut committer = CoordinatedCommitter::new(
         Arc::clone(&backend) as Arc<dyn StateBackend>,
@@ -606,26 +599,32 @@ async fn batches_sealed_epochs_into_one_commit() {
         }
     );
     assert_eq!(batches[0].fencing_token, 1);
-    assert_eq!(batches[0].target, second);
-    assert_eq!(batches[0].entries.len(), 4);
+    assert_eq!(batches[0].target, attempts[7]);
+    assert_eq!(batches[0].entries.len(), 16);
     assert_eq!(
         batches[0]
             .entries
             .iter()
-            .map(|entry| (entry.attempt, entry.participant_id, entry.payload.clone()))
+            .map(|entry| entry.attempt)
             .collect::<Vec<_>>(),
-        vec![
-            (first, 7, Some(b"e1".to_vec())),
-            (first, 9, None),
-            (second, 7, Some(b"e2".to_vec())),
-            (second, 9, None),
-        ]
+        attempts[..8]
+            .iter()
+            .flat_map(|attempt| [*attempt, *attempt])
+            .collect::<Vec<_>>()
     );
-    assert_eq!(floor.load(Ordering::Acquire), 3);
+    assert_eq!(floor.load(Ordering::Acquire), attempts[8].epoch);
 
-    // A second pass with no new sealed epochs is a no-op (cursor advanced).
+    // The next pass resumes at the exact unloaded predecessor.
     committer.commit_ready().await.unwrap();
-    assert_eq!(recorded.lock().len(), 1);
+    let batches = recorded.lock();
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[1].target, attempts[8]);
+    assert_eq!(batches[1].entries.len(), 2);
+    assert!(batches[1]
+        .entries
+        .iter()
+        .all(|entry| entry.attempt == attempts[8]));
+    assert_eq!(floor.load(Ordering::Acquire), 10);
 }
 
 #[cfg(feature = "cluster")]

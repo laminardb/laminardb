@@ -85,19 +85,15 @@ impl DeltaReferenceTableSource {
                 .ok_or_else(|| ConnectorError::Internal("Delta table is not open".into()))?,
         )
         .await?;
-        let batches = if self.config.partition_filter.is_some() {
-            self.load_filtered_snapshot(version).await?
-        } else {
-            delta_io::read_batches_at_version(
-                self.table
-                    .as_mut()
-                    .ok_or_else(|| ConnectorError::Internal("Delta table is not open".into()))?,
-                version,
-                usize::MAX,
-            )
-            .await?
-            .0
-        };
+        let batches = delta_io::read_batches_at_version(
+            self.table
+                .as_mut()
+                .ok_or_else(|| ConnectorError::Internal("Delta table is not open".into()))?,
+            version,
+            usize::MAX,
+        )
+        .await?
+        .0;
 
         if batches.is_empty() {
             let table_schema = delta_io::get_table_schema(
@@ -119,56 +115,6 @@ impl DeltaReferenceTableSource {
         info!(version, rows, "Delta reference snapshot loaded");
         self.pending_batches = batches.into();
         Ok(())
-    }
-
-    async fn load_filtered_snapshot(
-        &mut self,
-        version: i64,
-    ) -> Result<Vec<RecordBatch>, ConnectorError> {
-        use tokio_stream::StreamExt;
-
-        let table = self
-            .table
-            .as_mut()
-            .ok_or_else(|| ConnectorError::Internal("Delta table is not open".into()))?;
-        table
-            .load_version(version)
-            .await
-            .map_err(|error| ConnectorError::ReadError(format!("load Delta version: {error}")))?;
-        let provider = table
-            .table_provider()
-            .build()
-            .await
-            .map_err(|error| ConnectorError::ReadError(format!("build Delta scan: {error}")))?;
-
-        let context = datafusion::prelude::SessionContext::new();
-        context
-            .register_table("delta_reference_scan", std::sync::Arc::new(provider))
-            .map_err(|error| ConnectorError::ReadError(format!("register Delta scan: {error}")))?;
-        let filter = self.config.partition_filter.as_deref().ok_or_else(|| {
-            ConnectorError::Internal("filtered Delta snapshot has no filter".into())
-        })?;
-        let dataframe = context
-            .sql(&format!(
-                "SELECT * FROM delta_reference_scan WHERE {filter}"
-            ))
-            .await
-            .map_err(|error| {
-                ConnectorError::ReadError(format!("plan filtered Delta scan: {error}"))
-            })?;
-        let mut stream = dataframe.execute_stream().await.map_err(|error| {
-            ConnectorError::ReadError(format!("execute filtered Delta scan: {error}"))
-        })?;
-        let mut batches = Vec::new();
-        while let Some(batch) = stream.next().await {
-            let batch = batch.map_err(|error| {
-                ConnectorError::ReadError(format!("read filtered Delta batch: {error}"))
-            })?;
-            if batch.num_rows() != 0 {
-                batches.push(batch);
-            }
-        }
-        Ok(batches)
     }
 }
 

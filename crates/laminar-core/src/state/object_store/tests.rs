@@ -12,6 +12,7 @@ struct RetentionLogStore {
     operations: Arc<parking_lot::Mutex<Vec<String>>>,
     delete_calls: Arc<AtomicU64>,
     fail_delete_call: u64,
+    fail_list_entry: usize,
 }
 
 impl std::fmt::Debug for RetentionLogStore {
@@ -96,7 +97,20 @@ impl ObjectStore for RetentionLogStore {
             "list:{}",
             prefix.map_or("<root>", |path| path.as_ref())
         ));
-        self.inner.list(prefix)
+        let fail_list_entry = self.fail_list_entry;
+        self.inner
+            .list(prefix)
+            .enumerate()
+            .map(move |(index, entry)| {
+                if fail_list_entry != 0 && index + 1 == fail_list_entry {
+                    return Err(object_store::Error::Generic {
+                        store: "retention-test",
+                        source: Box::new(std::io::Error::other("injected list failure")),
+                    });
+                }
+                entry
+            })
+            .boxed()
     }
 
     async fn list_with_delimiter(
@@ -336,6 +350,23 @@ use tempfile::tempdir;
 
 fn make_store(dir: &std::path::Path) -> Arc<dyn ObjectStore> {
     Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap())
+}
+
+#[test]
+fn sealed_partial_read_envelope_covers_response_collection_and_alignment() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let backend = ObjectStoreBackend::new(store, "node-0", 1);
+    let envelope = backend.sealed_partial_read_envelope().unwrap();
+
+    assert_eq!(envelope.payload_multiplier(), 2);
+    assert_eq!(
+        envelope.fixed_bytes_per_artifact(),
+        2 * VNODE_PARTIAL_HEADER_LEN as u64
+    );
+    assert_eq!(
+        envelope.checked_bytes(11, 3),
+        Some(22 + 6 * VNODE_PARTIAL_HEADER_LEN as u64)
+    );
 }
 
 fn make_durable_store(dir: &std::path::Path) -> Arc<dyn ObjectStore> {
@@ -988,7 +1019,18 @@ async fn checkpoint_attempts_are_isolated() {
 #[tokio::test]
 async fn seal_checkpoint_cas_fixes_attempt_inventory() {
     let dir = tempdir().unwrap();
-    let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
+    let inner = make_store(dir.path());
+    let backend = ObjectStoreBackend::new(
+        Arc::new(RetentionLogStore {
+            inner: Arc::clone(&inner),
+            operations: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            delete_calls: Arc::new(AtomicU64::new(0)),
+            fail_delete_call: 0,
+            fail_list_entry: 1,
+        }),
+        "node-0",
+        4,
+    );
     let vnodes = [0u32, 1, 2];
 
     assert!(!backend
@@ -1007,6 +1049,13 @@ async fn seal_checkpoint_cas_fixes_attempt_inventory() {
             .await
             .unwrap();
     }
+    inner
+        .put(
+            &OsPath::from("state-v2/epoch=1/checkpoint=1/noise"),
+            PutPayload::from_static(b"noise"),
+        )
+        .await
+        .unwrap();
     assert!(backend
         .seal_checkpoint(attempt(1), None, &vnodes, &[])
         .await
@@ -1035,7 +1084,17 @@ async fn seal_checkpoint_cas_fixes_attempt_inventory() {
 #[tokio::test]
 async fn sealed_artifact_metadata_rejects_a_missing_or_wrong_sized_vnode_object() {
     let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-    let backend = ObjectStoreBackend::new(Arc::clone(&store), "node-0", 1);
+    let backend = ObjectStoreBackend::new(
+        Arc::new(RetentionLogStore {
+            inner: Arc::clone(&store),
+            operations: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            delete_calls: Arc::new(AtomicU64::new(0)),
+            fail_delete_call: 0,
+            fail_list_entry: 3,
+        }),
+        "node-0",
+        1,
+    );
     let checkpoint = attempt(1);
     backend
         .write_partial(
@@ -1056,6 +1115,15 @@ async fn sealed_artifact_metadata_rejects_a_missing_or_wrong_sized_vnode_object(
         .await
         .unwrap()
         .unwrap();
+    for name in ["noise-a", "noise-b"] {
+        store
+            .put(
+                &OsPath::from(format!("state-v2/epoch=1/checkpoint=1/{name}")),
+                PutPayload::from_static(b"noise"),
+            )
+            .await
+            .unwrap();
+    }
     backend
         .verify_checkpoint_artifact_metadata(&inventory)
         .await
@@ -2033,8 +2101,8 @@ async fn prune_before_deletes_old_epochs() {
     let dir = tempdir().unwrap();
     let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
 
-    // Seed epochs 1..=5 with one vnode each.
-    for epoch in 1..=5u64 {
+    // More retired epochs than one discovery batch exercises bounded repeated scans.
+    for epoch in 1..=12u64 {
         backend
             .write_partial(
                 attempt(epoch),
@@ -2047,9 +2115,9 @@ async fn prune_before_deletes_old_epochs() {
             .unwrap();
     }
 
-    backend.prune_before(4).await.unwrap();
+    backend.prune_before(11).await.unwrap();
 
-    for epoch in 1..=3 {
+    for epoch in 1..=10 {
         assert!(
             backend
                 .read_partial(attempt(epoch), 0)
@@ -2059,7 +2127,7 @@ async fn prune_before_deletes_old_epochs() {
             "epoch {epoch} should be pruned",
         );
     }
-    for epoch in 4..=5 {
+    for epoch in 11..=12 {
         assert!(
             backend
                 .read_partial(attempt(epoch), 0)
@@ -2186,6 +2254,7 @@ async fn prune_before_discovers_sparse_epochs_without_scanning_the_id_gap() {
         operations: Arc::clone(&operations),
         delete_calls: Arc::new(AtomicU64::new(0)),
         fail_delete_call: 0,
+        fail_list_entry: 0,
     });
     let backend = ObjectStoreBackend::new(store, "node-0", 1);
     let retired = attempt(1);
@@ -2235,11 +2304,12 @@ async fn prune_before_discovers_sparse_epochs_without_scanning_the_id_gap() {
     assert_eq!(
         listings,
         vec![
-            "delimiter:state-v2".to_string(),
+            "list:state-v2".to_string(),
             "list:state-v2/epoch=1".to_string(),
             "list:state-v2/epoch=1".to_string(),
+            "list:state-v2".to_string(),
         ],
-        "retention must collect and then verify only materialized retired epoch prefixes"
+        "retention must stream materialized epochs and verify a clean pass without scanning IDs"
     );
 }
 
@@ -2275,6 +2345,7 @@ async fn retention_publishes_one_floor_before_deleting_attested_artifacts() {
         operations: Arc::clone(&operations),
         delete_calls: Arc::new(AtomicU64::new(0)),
         fail_delete_call: 0,
+        fail_list_entry: 0,
     });
     let backend = ObjectStoreBackend::new(Arc::clone(&store), "node-0", 4);
     let ready_key = "participant-ready/0.json";
@@ -2404,6 +2475,7 @@ async fn prune_failure_preserves_completed_prefix_progress_and_repairs_the_rest(
         operations: Arc::new(parking_lot::Mutex::new(Vec::new())),
         delete_calls: Arc::new(AtomicU64::new(0)),
         fail_delete_call: 2,
+        fail_list_entry: 0,
     });
     let backend = ObjectStoreBackend::new(store, "node-0", 2);
     for checkpoint_id in 1..=2 {
@@ -2448,11 +2520,20 @@ async fn prune_failure_preserves_completed_prefix_progress_and_repairs_the_rest(
     ));
 }
 
-/// The durable sweep cursor advances so later retention lists only newly retired epochs.
+/// Small horizon advances delete exact prefixes; crossing a repair bucket scans old residue.
 #[tokio::test]
 async fn prune_before_is_incremental_and_advances_horizon() {
     let dir = tempdir().unwrap();
-    let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
+    let operations = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let physical_store = make_store(dir.path());
+    let store: Arc<dyn ObjectStore> = Arc::new(RetentionLogStore {
+        inner: Arc::clone(&physical_store),
+        operations: Arc::clone(&operations),
+        delete_calls: Arc::new(AtomicU64::new(0)),
+        fail_delete_call: 0,
+        fail_list_entry: 0,
+    });
+    let backend = ObjectStoreBackend::new(store, "node-0", 4);
 
     // Seed epochs 1..=6, two vnodes each so deletes touch >1 object.
     for epoch in 1..=6u64 {
@@ -2475,10 +2556,15 @@ async fn prune_before_is_incremental_and_advances_horizon() {
     assert_eq!(floor.before_epoch, 3);
     assert_eq!(floor.swept_before_epoch, 3);
 
+    operations.lock().clear();
     backend.prune_before(5).await.unwrap();
     let floor = backend.read_prune_floor().await.unwrap().unwrap().floor;
     assert_eq!(floor.before_epoch, 5);
     assert_eq!(floor.swept_before_epoch, 5);
+    assert!(operations
+        .lock()
+        .iter()
+        .all(|operation| operation != "list:state-v2"));
 
     for epoch in 1..=4u64 {
         for v in 0..2u32 {
@@ -2511,6 +2597,57 @@ async fn prune_before_is_incremental_and_advances_horizon() {
     assert_eq!(floor.before_epoch, 5);
     assert_eq!(floor.swept_before_epoch, 5);
     assert!(backend.read_partial(attempt(5), 0).await.unwrap().is_some());
+
+    for epoch in 5..=6 {
+        backend
+            .delete_retired_prefix(&OsPath::from(format!("state-v2/epoch={epoch}")))
+            .await
+            .unwrap();
+    }
+    let current = backend.read_prune_floor().await.unwrap().unwrap();
+    let seeded_horizon = STATE_PRUNE_REPAIR_INTERVAL - 3;
+    let seeded = StatePruneFloor {
+        before_epoch: seeded_horizon,
+        swept_before_epoch: seeded_horizon,
+        ..current.floor
+    };
+    assert!(backend
+        .compare_and_swap_prune_floor(&seeded, Some(current.update_version))
+        .await
+        .unwrap());
+
+    let late_path = ObjectStoreBackend::partial_path(attempt(1), 0);
+    physical_store
+        .put(&late_path, PutPayload::from_static(b"late"))
+        .await
+        .unwrap();
+    operations.lock().clear();
+    backend
+        .prune_before(STATE_PRUNE_REPAIR_INTERVAL - 1)
+        .await
+        .unwrap();
+    assert!(physical_store.head(&late_path).await.is_ok());
+    assert!(operations
+        .lock()
+        .iter()
+        .all(|operation| operation != "list:state-v2"));
+
+    operations.lock().clear();
+    backend
+        .prune_before(STATE_PRUNE_REPAIR_INTERVAL)
+        .await
+        .unwrap();
+    assert!(matches!(
+        physical_store.head(&late_path).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+    assert!(operations
+        .lock()
+        .iter()
+        .any(|operation| operation == "list:state-v2"));
+    let floor = backend.read_prune_floor().await.unwrap().unwrap().floor;
+    assert_eq!(floor.before_epoch, STATE_PRUNE_REPAIR_INTERVAL);
+    assert_eq!(floor.swept_before_epoch, STATE_PRUNE_REPAIR_INTERVAL);
 }
 
 #[tokio::test]

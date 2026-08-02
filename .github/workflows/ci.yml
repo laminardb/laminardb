@@ -395,47 +395,6 @@ jobs:
           grep -Fqx 'NOT CERTIFICATION EVIDENCE' <<< "$fixture_output"
           grep -Fq 'ORACLE_FIXTURE_OK' <<< "$fixture_output"
 
-      - name: Format standalone state qualification model tool
-        run: cargo fmt --manifest-path tools/state-backend-qual/Cargo.toml -- --check
-      - name: Lint standalone state qualification model tool
-        run: cargo clippy --locked --manifest-path tools/state-backend-qual/Cargo.toml --all-targets --all-features -- -D warnings
-      - name: Test standalone state qualification model tool
-        run: cargo test --locked --manifest-path tools/state-backend-qual/Cargo.toml --all-targets --all-features
-      - name: Test release Zipf feasibility corpus (NOT evidence)
-        run: cargo test --locked --release --manifest-path tools/state-backend-qual/Cargo.toml --lib --features zipf-feasibility
-      - name: Reject runtime and candidate dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          manifest=tools/state-backend-qual/Cargo.toml
-          if grep -Eq '(path|workspace)[[:space:]]*=' "$manifest"; then
-            echo "state qualification model tool unexpectedly uses a path or workspace dependency"
-            exit 1
-          fi
-          dependency_tree="$(cargo tree --locked --all-features --target all --manifest-path tools/state-backend-qual/Cargo.toml --prefix none)"
-          if grep -Eqi '^(laminar([[:space:]_-]|$)|fjall([[:space:]]|$)|redb([[:space:]]|$)|rocksdb([[:space:]]|$)|librocksdb[-_]|arrow([[:space:]_-]|$)|datafusion([[:space:]_-]|$))' <<< "$dependency_tree"; then
-            echo "state qualification model tool unexpectedly has a runtime or candidate dependency"
-            exit 1
-          fi
-      - name: Validate explicitly ineligible state qualification profile and model result
-        shell: bash
-        run: |
-          set -euo pipefail
-          profile_output="$(cargo run --quiet --locked --manifest-path tools/state-backend-qual/Cargo.toml -- validate-profile tools/state-backend-qual/profiles/linux-nvme-v1.candidate.json 2>&1)"
-          echo "$profile_output"
-          expected_output=$'NOT QUALIFICATION EVIDENCE\nVALID_INELIGIBLE_PROFILE schema=distributed-state-qual/v1 profile=linux-nvme-v1 status=candidate_unapproved'
-          [[ "$profile_output" == "$expected_output" ]]
-
-          profile_v2_output="$(cargo run --quiet --locked --manifest-path tools/state-backend-qual/Cargo.toml -- validate-profile tools/state-backend-qual/profiles/linux-nvme-v2.candidate.json 2>&1)"
-          echo "$profile_v2_output"
-          expected_v2_output=$'NOT QUALIFICATION EVIDENCE\nVALID_INELIGIBLE_PROFILE schema=distributed-state-qual/v2 profile=linux-nvme-v2 status=candidate_unapproved'
-          [[ "$profile_v2_output" == "$expected_v2_output" ]]
-
-          result_output="$(cargo run --quiet --locked --manifest-path tools/state-backend-qual/Cargo.toml -- validate-model-result tools/state-backend-qual/profiles/linux-nvme-v1.candidate.json tools/state-backend-qual/tests/fixtures/model-result-aggregate-v1.json 2>&1)"
-          echo "$result_output"
-          expected_result=$'NOT QUALIFICATION EVIDENCE\nVALID_INELIGIBLE_MODEL_RESULT profile=linux-nvme-v1 requests=2'
-          [[ "$result_output" == "$expected_result" ]]
-
   state-zipf-oracle-linux:
     name: Ineligible Zipf MPFR oracle (Linux x86-64, NOT evidence)
     runs-on: ubuntu-latest
@@ -461,59 +420,12 @@ jobs:
           [[ "$(wc -c <"$output" | tr -d '[:space:]')" == "865397" ]]
           echo "8ad14317bdb1f12d67b9f823bea0759d33034e4c01164c2dbac90ad870f2474b  $output" | sha256sum -c -
 
-  state-qualification-windows:
-    name: Ineligible state qualification validator (Windows, NOT evidence)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95"
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.13.1"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: tools/state-backend-qual
-      - name: Test all standalone validator targets and features
-        run: cargo test --locked --manifest-path tools/state-backend-qual/Cargo.toml --all-targets --all-features
-      - name: Test release Zipf feasibility corpus (NOT evidence)
-        run: cargo test --locked --release --manifest-path tools/state-backend-qual/Cargo.toml --lib --features zipf-feasibility
-      - name: Install hash-pinned oracle dependency
-        run: |
-          python -m pip install --only-binary=:all: --no-deps --require-hashes -r tools/state-backend-zipf-oracle/requirements.txt
-      - name: Test standalone MPFR oracle (NOT evidence)
-        run: python -m unittest discover -s tools/state-backend-zipf-oracle -p 'test_*.py' -v
-
-  state-qualification-arm64:
-    name: Ineligible Zipf feasibility (Linux arm64, NOT evidence)
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95"
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.13.1"
-          architecture: arm64
-      - name: Test debug Zipf feasibility corpus (NOT evidence)
-        run: cargo test --locked --manifest-path tools/state-backend-qual/Cargo.toml --lib --features zipf-feasibility
-      - name: Test release Zipf feasibility corpus (NOT evidence)
-        run: cargo test --locked --release --manifest-path tools/state-backend-qual/Cargo.toml --lib --features zipf-feasibility
-      - name: Install hash-pinned oracle dependency
-        run: |
-          python -m pip install --only-binary=:all: --no-deps --require-hashes -r tools/state-backend-zipf-oracle/requirements.txt
-      - name: Test standalone MPFR oracle (NOT evidence)
-        run: python -m unittest discover -s tools/state-backend-zipf-oracle -p 'test_*.py' -v
-
   # ============================================
   # CI Success Gate
   # ============================================
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, msrv, docs, soak-contract-scaffold, state-zipf-oracle-linux, state-qualification-windows, state-qualification-arm64]
+    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, msrv, docs, soak-contract-scaffold, state-zipf-oracle-linux]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -527,9 +439,7 @@ jobs:
              [[ "${{ needs.msrv.result }}" != "success" ]] || \
              [[ "${{ needs.docs.result }}" != "success" ]] || \
              [[ "${{ needs.soak-contract-scaffold.result }}" != "success" ]] || \
-             [[ "${{ needs.state-zipf-oracle-linux.result }}" != "success" ]] || \
-             [[ "${{ needs.state-qualification-windows.result }}" != "success" ]] || \
-             [[ "${{ needs.state-qualification-arm64.result }}" != "success" ]]; then
+             [[ "${{ needs.state-zipf-oracle-linux.result }}" != "success" ]]; then
             echo "One or more required jobs failed"
             exit 1
           fi
