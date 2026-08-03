@@ -6028,7 +6028,6 @@ advertise_host = "127.0.0.1"
 [checkpoint]
 url = "{url}"
 interval = "{interval_ms}ms"
-max_retained = 5
 
 [checkpoint.storage]
 {storage}
@@ -6105,7 +6104,6 @@ console_token = "{SOAK_CONSOLE_TOKEN}"
 url = "{checkpoint_url}"
 interval = "{interval_ms}ms"
 timeout = "30s"
-max_retained = 5
 
 {workload}
 "#,
@@ -6164,7 +6162,6 @@ delivery = "exactly_once"
 url = "{checkpoint_url}"
 interval = "{interval_ms}ms"
 timeout = "30s"
-max_retained = 5
 
 [[source]]
 name = "gen"

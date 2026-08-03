@@ -65,10 +65,12 @@ Recovery selects an exact committed outcome/index, verifies participant manifest
 ranges, restores the local runtime image, then starts sources at the stored offsets. It does not
 fall back to a different checkpoint when validation fails.
 
-Retention follows predecessor references and validated per-chunk frame counts. The retained live
-prefix is bounded; current garbage collection walks the predecessor index chain to genesis to
-enumerate and retire all older cuts. It deletes only chunks no longer referenced by a retained
-manifest and does not use object-store listing to infer liveness.
+Retention keeps the authoritative latest cut and follows exact predecessor references through a
+crash-resumable two-phase cursor. It deletes unreferenced data before deleting each retired cut's
+manifests and committed index. Local cursor updates use a dedicated durable head under the local
+namespace lease; shared-store updates use native conditional writes and cluster updates are
+leader-fenced authority records. No phase discovers liveness by listing objects or materializes
+the predecessor chain; one O(1) cursor advances to the prior floor or genesis.
 
 Checkpoint URLs are built through the `object_store` crate for local files, S3 (including
 S3-compatible stores through endpoint options), GCS, and Azure Blob. Startup probes the

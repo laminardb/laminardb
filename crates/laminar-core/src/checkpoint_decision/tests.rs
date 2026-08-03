@@ -42,6 +42,38 @@ async fn local_index(
     }
 }
 
+async fn publish_local_commit(
+    store: &CheckpointDecisionStore,
+    checkpoint_id: u64,
+    predecessor: Option<CommittedCheckpointRef>,
+) -> CommittedCheckpointRef {
+    let index = local_index(store, checkpoint_id, predecessor).await;
+    let reference = store.create_committed_checkpoint(&index).await.unwrap();
+    store
+        .record_outcome(
+            checkpoint_id,
+            checkpoint_id,
+            CheckpointScope::Local,
+            None,
+            None,
+            CheckpointVerdict::Commit,
+            Some(reference.clone()),
+        )
+        .await
+        .unwrap();
+    reference
+}
+
+fn retention_state(result: CheckpointRetentionUpdateResult) -> CheckpointRetentionState {
+    match result {
+        CheckpointRetentionUpdateResult::Applied(state)
+        | CheckpointRetentionUpdateResult::Unchanged(state) => state,
+        CheckpointRetentionUpdateResult::Conflict { current } => {
+            panic!("unexpected retention conflict: {current:?}")
+        }
+    }
+}
+
 #[tokio::test]
 async fn committed_index_create_is_idempotent_and_exactly_verified() {
     let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -223,6 +255,140 @@ async fn local_commit_must_extend_the_authoritative_commit() {
             .epoch,
         2
     );
+}
+
+#[tokio::test]
+async fn retention_journal_resumes_two_phases_and_stops_before_retired_history() {
+    let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let store = CheckpointDecisionStore::new(raw);
+    let first = publish_local_commit(&store, 1, None).await;
+
+    assert_eq!(
+        retention_state(store.begin_checkpoint_retention(&first).await.unwrap()),
+        CheckpointRetentionState::Idle {
+            protected: first.clone()
+        }
+    );
+
+    let second = publish_local_commit(&store, 2, Some(first.clone())).await;
+    let delete_first = retention_state(store.begin_checkpoint_retention(&second).await.unwrap());
+    let expected_cursor = CheckpointRetentionCursor {
+        protected: second.clone(),
+        current: first.clone(),
+        next: None,
+        stop_before: None,
+    };
+    assert_eq!(
+        delete_first,
+        CheckpointRetentionState::DeleteData {
+            cursor: expected_cursor.clone()
+        }
+    );
+    let delete_first_metadata = retention_state(
+        store
+            .advance_checkpoint_retention(&delete_first)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        delete_first_metadata,
+        CheckpointRetentionState::DeleteMetadata {
+            cursor: expected_cursor
+        }
+    );
+    store.delete_committed_checkpoint(&first).await.unwrap();
+    store.delete_committed_checkpoint(&first).await.unwrap();
+    assert!(store.load_committed_checkpoint(&first).await.is_err());
+    assert_eq!(
+        retention_state(
+            store
+                .advance_checkpoint_retention(&delete_first_metadata)
+                .await
+                .unwrap()
+        ),
+        CheckpointRetentionState::Idle {
+            protected: second.clone()
+        }
+    );
+
+    let third = publish_local_commit(&store, 3, Some(second.clone())).await;
+    let delete_second = retention_state(store.begin_checkpoint_retention(&third).await.unwrap());
+    assert_eq!(
+        delete_second,
+        CheckpointRetentionState::DeleteData {
+            cursor: CheckpointRetentionCursor {
+                protected: third.clone(),
+                current: second,
+                next: Some(first.clone()),
+                stop_before: Some(first),
+            }
+        }
+    );
+    let delete_second_metadata = retention_state(
+        store
+            .advance_checkpoint_retention(&delete_second)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        retention_state(
+            store
+                .advance_checkpoint_retention(&delete_second_metadata)
+                .await
+                .unwrap()
+        ),
+        CheckpointRetentionState::Idle { protected: third }
+    );
+}
+
+#[tokio::test]
+async fn retention_rejects_stale_cut_and_stale_phase_transition() {
+    let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let first_store = CheckpointDecisionStore::new(Arc::clone(&raw));
+    let second_store = CheckpointDecisionStore::new(raw);
+    let first = publish_local_commit(&first_store, 1, None).await;
+    first_store
+        .begin_checkpoint_retention(&first)
+        .await
+        .unwrap();
+    let second = publish_local_commit(&first_store, 2, Some(first.clone())).await;
+    assert!(second_store
+        .begin_checkpoint_retention(&first)
+        .await
+        .is_err());
+
+    let delete_data = retention_state(
+        first_store
+            .begin_checkpoint_retention(&second)
+            .await
+            .unwrap(),
+    );
+    let delete_metadata = retention_state(
+        first_store
+            .advance_checkpoint_retention(&delete_data)
+            .await
+            .unwrap(),
+    );
+    assert!(matches!(
+        second_store
+            .advance_checkpoint_retention(&delete_data)
+            .await
+            .unwrap(),
+        CheckpointRetentionUpdateResult::Conflict {
+            current: Some(current)
+        } if current == delete_metadata
+    ));
+    let idle = retention_state(
+        first_store
+            .advance_checkpoint_retention(&delete_metadata)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(idle, CheckpointRetentionState::Idle { protected: second });
+    assert!(first_store
+        .advance_checkpoint_retention(&idle)
+        .await
+        .is_err());
 }
 
 #[tokio::test]

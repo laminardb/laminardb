@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::{stream::FuturesUnordered, StreamExt, TryStreamExt};
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::{
     CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
@@ -33,12 +33,13 @@ use tracing::warn;
 use crate::error::DbError;
 
 const MAX_SINK_PHASE_ONE_CONCURRENCY: usize = 8;
+const MAX_RETENTION_IO_CONCURRENCY: usize = 8;
+const RETENTION_RETRY_DELAY: Duration = Duration::from_secs(30);
 #[cfg(feature = "cluster")]
 const FOLLOWER_DECISION_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub struct CheckpointConfig {
-    pub max_retained: usize,
     pub checkpoint_timeout: Duration,
     pub(crate) cleanup_timeout: Duration,
     pub(crate) quorum_timeout: Duration,
@@ -48,7 +49,6 @@ pub struct CheckpointConfig {
 impl Default for CheckpointConfig {
     fn default() -> Self {
         Self {
-            max_retained: 3,
             checkpoint_timeout: Duration::from_secs(120),
             cleanup_timeout: Duration::from_secs(30),
             quorum_timeout: Duration::from_secs(3),
@@ -391,137 +391,537 @@ struct PackedCheckpoint {
 }
 
 #[derive(Clone)]
+enum GcAuthority {
+    Local,
+    #[cfg(feature = "cluster")]
+    Cluster {
+        authority: Arc<laminar_core::cluster::control::LeaderLeaseStore>,
+        proof: LeaderProof,
+        controller: std::sync::Weak<laminar_core::cluster::control::ClusterController>,
+    },
+}
+
+impl GcAuthority {
+    fn can_retry(&self) -> bool {
+        match self {
+            Self::Local => true,
+            #[cfg(feature = "cluster")]
+            Self::Cluster {
+                proof, controller, ..
+            } => controller
+                .upgrade()
+                .is_some_and(|controller| controller.proof_is_live(proof)),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct GcRequest {
-    current: CommittedCheckpointIndex,
+    requested: Option<CommittedCheckpointIndex>,
     decision_store: Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>,
-    retained_predecessors: usize,
-    timeout: Duration,
+    authority: GcAuthority,
 }
 
 async fn load_index_manifests(
     store: &dyn CheckpointStore,
     index: &CommittedCheckpointIndex,
-    require_all: bool,
 ) -> Result<Vec<CheckpointManifest>, DbError> {
-    let mut loaded = Vec::with_capacity(index.participants.len());
-    for participant in &index.participants {
-        match store
-            .load_manifest_verified(
-                participant.participant_id,
-                index.checkpoint_id,
-                participant.manifest_len,
-                &participant.manifest_sha256,
-            )
-            .await
-            .map_err(DbError::from)?
-        {
-            Some(manifest) => {
-                let encoded = checkpoint_manifest_bytes(&manifest).map_err(|error| {
-                    DbError::Checkpoint(format!("encode checkpoint manifest: {error}"))
+    let checkpoint_id = index.checkpoint_id;
+    let reads = index
+        .participants
+        .clone()
+        .into_iter()
+        .map(|participant| async move {
+            let manifest = store
+                .load_manifest_verified(
+                    participant.participant_id,
+                    checkpoint_id,
+                    participant.manifest_len,
+                    &participant.manifest_sha256,
+                )
+                .await
+                .map_err(DbError::from)?
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "checkpoint {} participant {} manifest is missing",
+                        checkpoint_id, participant.participant_id
+                    ))
                 })?;
-                participant
-                    .verify_manifest(&manifest, &encoded)
-                    .map_err(DbError::Checkpoint)?;
-                if manifest.epoch != index.epoch
-                    || manifest.checkpoint_id != index.checkpoint_id
-                    || manifest.deployment_id != index.deployment_id
-                    || manifest.pipeline_identity != index.pipeline_identity
-                    || manifest.vnode_count != index.vnode_count
-                    || manifest.assignment_fence != index.assignment_fence
-                {
-                    return Err(DbError::Checkpoint(format!(
-                        "checkpoint {} participant {} manifest belongs to a different committed cut",
-                        index.checkpoint_id, participant.participant_id
-                    )));
-                }
-                loaded.push((manifest, encoded));
-            }
-            None if require_all => {
-                return Err(DbError::Checkpoint(format!(
-                    "retained checkpoint {} participant {} manifest is missing",
-                    index.checkpoint_id, participant.participant_id
-                )));
-            }
-            None => {}
+            let encoded = checkpoint_manifest_bytes(&manifest).map_err(|error| {
+                DbError::Checkpoint(format!("encode checkpoint manifest: {error}"))
+            })?;
+            participant
+                .verify_manifest(&manifest, &encoded)
+                .map_err(DbError::Checkpoint)?;
+            Ok::<_, DbError>((participant.participant_id, manifest, encoded))
+        });
+    let mut loaded = futures::stream::iter(reads)
+        .buffer_unordered(MAX_RETENTION_IO_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+    loaded.sort_unstable_by_key(|(participant_id, _, _)| *participant_id);
+    if let Some((participant_id, _, _)) = loaded.iter().find(|(_, manifest, _)| {
+        manifest.epoch != index.epoch
+            || manifest.checkpoint_id != index.checkpoint_id
+            || manifest.deployment_id != index.deployment_id
+            || manifest.pipeline_identity != index.pipeline_identity
+            || manifest.vnode_count != index.vnode_count
+            || manifest.assignment_fence != index.assignment_fence
+    }) {
+        return Err(DbError::Checkpoint(format!(
+            "checkpoint {} participant {} manifest belongs to a different committed cut",
+            index.checkpoint_id, participant_id
+        )));
+    }
+    let views = loaded
+        .iter()
+        .map(|(_, manifest, bytes)| (manifest, bytes.as_slice()))
+        .collect::<Vec<_>>();
+    index
+        .validate_participant_manifests(&views)
+        .map_err(DbError::Checkpoint)?;
+    Ok(loaded
+        .into_iter()
+        .map(|(_, manifest, _)| manifest)
+        .collect())
+}
+
+struct LiveChunkInventory {
+    references: BTreeSet<StateChunkId>,
+    pinned: BTreeSet<StateChunkId>,
+}
+
+fn live_chunk_inventory(manifests: &[CheckpointManifest]) -> LiveChunkInventory {
+    let mut references = BTreeSet::new();
+    let mut pinned = BTreeSet::new();
+    for manifest in manifests {
+        pinned.insert(manifest.node_data.chunk);
+        for reference in &manifest.referenced_chunks {
+            references.insert(reference.chunk);
         }
     }
-    if require_all {
-        let views = loaded
-            .iter()
-            .map(|(manifest, bytes)| (manifest, bytes.as_slice()))
-            .collect::<Vec<_>>();
-        index
-            .validate_participant_manifests(&views)
-            .map_err(DbError::Checkpoint)?;
+    LiveChunkInventory { references, pinned }
+}
+
+async fn delete_retired_data(
+    store: &dyn CheckpointStore,
+    manifests: &[CheckpointManifest],
+    live: &LiveChunkInventory,
+) -> Result<(), DbError> {
+    let mut candidates = BTreeSet::new();
+    for manifest in manifests {
+        candidates.insert(manifest.node_data.chunk);
+        candidates.extend(
+            manifest
+                .referenced_chunks
+                .iter()
+                .map(|reference| reference.chunk),
+        );
     }
-    Ok(loaded.into_iter().map(|(manifest, _)| manifest).collect())
+    let deletions = candidates
+        .into_iter()
+        .filter(|chunk| !live.pinned.contains(chunk) && !live.references.contains(chunk));
+    let results = futures::stream::iter(deletions)
+        .map(|chunk| async move { store.delete_node_data(chunk).await })
+        .buffer_unordered(MAX_RETENTION_IO_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for result in results {
+        result.map_err(DbError::from)?;
+    }
+    Ok(())
+}
+
+async fn delete_retired_manifests(
+    store: &dyn CheckpointStore,
+    checkpoint_id: u64,
+    participant_ids: &[u64],
+) -> Result<(), DbError> {
+    let results = futures::stream::iter(participant_ids.to_vec())
+        .map(|participant_id| async move {
+            store
+                .delete_manifest(StateChunkId {
+                    participant_id,
+                    checkpoint_id,
+                })
+                .await
+        })
+        .buffer_unordered(MAX_RETENTION_IO_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for result in results {
+        result.map_err(DbError::from)?;
+    }
+    Ok(())
+}
+
+struct ProtectedCheckpoint {
+    index: CommittedCheckpointIndex,
+    live: LiveChunkInventory,
+}
+
+async fn load_protected_checkpoint(
+    store: &dyn CheckpointStore,
+    decisions: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
+    reference: &CommittedCheckpointRef,
+) -> Result<ProtectedCheckpoint, DbError> {
+    let index = decisions
+        .load_committed_checkpoint(reference)
+        .await
+        .map_err(|error| DbError::Checkpoint(format!("load retained checkpoint index: {error}")))?;
+    let manifests = load_index_manifests(store, &index).await?;
+    let live = live_chunk_inventory(&manifests);
+    Ok(ProtectedCheckpoint { index, live })
+}
+
+async fn load_cleanup_target(
+    store: &dyn CheckpointStore,
+    decisions: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
+    protected: &CommittedCheckpointIndex,
+    current: &CommittedCheckpointRef,
+    next: Option<&CommittedCheckpointRef>,
+    participant_ids: Option<&[u64]>,
+) -> Result<(CommittedCheckpointIndex, Vec<CheckpointManifest>), DbError> {
+    let index = decisions
+        .load_committed_checkpoint(current)
+        .await
+        .map_err(|error| DbError::Checkpoint(format!("load retired checkpoint index: {error}")))?;
+    if index.deployment_id != protected.deployment_id
+        || index.pipeline_identity != protected.pipeline_identity
+        || index.scope != protected.scope
+        || index.vnode_count != protected.vnode_count
+        || index.epoch >= protected.epoch
+        || index.predecessor.as_ref() != next
+    {
+        return Err(DbError::Checkpoint(format!(
+            "checkpoint {} retention cursor breaks committed-cut continuity",
+            current.checkpoint_id
+        )));
+    }
+    if let Some(expected) = participant_ids {
+        let actual = index
+            .participants
+            .iter()
+            .map(|participant| participant.participant_id)
+            .collect::<Vec<_>>();
+        if actual != expected {
+            return Err(DbError::Checkpoint(format!(
+                "checkpoint {} retention cursor has a different participant roster",
+                current.checkpoint_id
+            )));
+        }
+    }
+    let manifests = load_index_manifests(store, &index).await?;
+    Ok((index, manifests))
+}
+
+fn local_retention_update_state(
+    result: laminar_core::checkpoint_decision::CheckpointRetentionUpdateResult,
+) -> Result<laminar_core::checkpoint_decision::CheckpointRetentionState, DbError> {
+    use laminar_core::checkpoint_decision::CheckpointRetentionUpdateResult;
+    match result {
+        CheckpointRetentionUpdateResult::Applied(state)
+        | CheckpointRetentionUpdateResult::Unchanged(state)
+        | CheckpointRetentionUpdateResult::Conflict {
+            current: Some(state),
+        } => Ok(state),
+        CheckpointRetentionUpdateResult::Conflict { current: None } => Err(DbError::Checkpoint(
+            "checkpoint retention head disappeared during a conditional update".into(),
+        )),
+    }
+}
+
+async fn run_local_gc_request(
+    store: &dyn CheckpointStore,
+    request: &GcRequest,
+) -> Result<(), DbError> {
+    use laminar_core::checkpoint_decision::CheckpointRetentionState;
+
+    let requested = request.requested.as_ref().ok_or_else(|| {
+        DbError::Checkpoint("local checkpoint retention requires a committed cut".into())
+    })?;
+    let (_, requested) = requested
+        .encode_and_reference()
+        .map_err(DbError::Checkpoint)?;
+    let mut state = local_retention_update_state(
+        request
+            .decision_store
+            .begin_checkpoint_retention(&requested)
+            .await
+            .map_err(|error| DbError::Checkpoint(format!("begin checkpoint retention: {error}")))?,
+    )?;
+    let mut protected = None::<(CommittedCheckpointRef, ProtectedCheckpoint)>;
+
+    loop {
+        match &state {
+            CheckpointRetentionState::Idle {
+                protected: retained,
+            } if retained == &requested || retained.epoch > requested.epoch => return Ok(()),
+            CheckpointRetentionState::Idle { .. } => {
+                state = local_retention_update_state(
+                    request
+                        .decision_store
+                        .begin_checkpoint_retention(&requested)
+                        .await
+                        .map_err(|error| {
+                            DbError::Checkpoint(format!("begin checkpoint retention: {error}"))
+                        })?,
+                )?;
+            }
+            CheckpointRetentionState::DeleteData { cursor } => {
+                if protected
+                    .as_ref()
+                    .is_none_or(|(reference, _)| reference != &cursor.protected)
+                {
+                    protected = Some((
+                        cursor.protected.clone(),
+                        load_protected_checkpoint(
+                            store,
+                            request.decision_store.as_ref(),
+                            &cursor.protected,
+                        )
+                        .await?,
+                    ));
+                }
+                let retained = &protected
+                    .as_ref()
+                    .expect("retained checkpoint was loaded")
+                    .1;
+                let (_, manifests) = load_cleanup_target(
+                    store,
+                    request.decision_store.as_ref(),
+                    &retained.index,
+                    &cursor.current,
+                    cursor.next.as_ref(),
+                    Some(&[laminar_core::state::LOCAL_NODE_ID.0]),
+                )
+                .await?;
+                delete_retired_data(store, &manifests, &retained.live).await?;
+                state = local_retention_update_state(
+                    request
+                        .decision_store
+                        .advance_checkpoint_retention(&state)
+                        .await
+                        .map_err(|error| {
+                            DbError::Checkpoint(format!("advance checkpoint retention: {error}"))
+                        })?,
+                )?;
+            }
+            CheckpointRetentionState::DeleteMetadata { cursor } => {
+                delete_retired_manifests(
+                    store,
+                    cursor.current.checkpoint_id,
+                    &[laminar_core::state::LOCAL_NODE_ID.0],
+                )
+                .await?;
+                request
+                    .decision_store
+                    .delete_committed_checkpoint(&cursor.current)
+                    .await
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!("delete retired checkpoint index: {error}"))
+                    })?;
+                state = local_retention_update_state(
+                    request
+                        .decision_store
+                        .advance_checkpoint_retention(&state)
+                        .await
+                        .map_err(|error| {
+                            DbError::Checkpoint(format!("advance checkpoint retention: {error}"))
+                        })?,
+                )?;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn begin_cluster_cleanup(
+    store: Arc<dyn CheckpointStore>,
+    decisions: Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+    authority: &laminar_core::cluster::control::LeaderLeaseStore,
+    proof: &LeaderProof,
+    protected: CommittedCheckpointRef,
+) -> Result<Option<laminar_core::cluster::control::ClusterArtifactCleanupCursor>, DbError> {
+    authority
+        .begin_cluster_artifact_cleanup(proof, protected, move |outcome| {
+            let store = Arc::clone(&store);
+            let decisions = Arc::clone(&decisions);
+            async move {
+                let reference = outcome
+                    .committed_checkpoint
+                    .as_ref()
+                    .ok_or_else(|| "retained Commit has no checkpoint index".to_owned())?;
+                load_protected_checkpoint(store.as_ref(), decisions.as_ref(), reference)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
+        })
+        .await
+        .map_err(|error| DbError::Checkpoint(format!("begin cluster retention: {error}")))
+}
+
+#[cfg(feature = "cluster")]
+async fn run_cluster_gc_request(
+    store: Arc<dyn CheckpointStore>,
+    request: &GcRequest,
+    authority: Arc<laminar_core::cluster::control::LeaderLeaseStore>,
+    proof: LeaderProof,
+) -> Result<(), DbError> {
+    use laminar_core::cluster::control::ClusterArtifactCleanupPhase;
+
+    let requested = request
+        .requested
+        .as_ref()
+        .map(CommittedCheckpointIndex::encode_and_reference)
+        .transpose()
+        .map_err(DbError::Checkpoint)?
+        .map(|(_, reference)| reference);
+    let mut cursor = authority
+        .cluster_artifact_cleanup()
+        .await
+        .map_err(|error| DbError::Checkpoint(format!("load cluster retention: {error}")))?;
+    if cursor.is_none() {
+        let Some(requested) = requested.as_ref() else {
+            return Ok(());
+        };
+        cursor = begin_cluster_cleanup(
+            Arc::clone(&store),
+            Arc::clone(&request.decision_store),
+            authority.as_ref(),
+            &proof,
+            requested.clone(),
+        )
+        .await?;
+    }
+    let mut protected = None::<(CommittedCheckpointRef, ProtectedCheckpoint)>;
+
+    loop {
+        let Some(current) = cursor.clone() else {
+            return Ok(());
+        };
+        match current.phase {
+            ClusterArtifactCleanupPhase::DeleteData => {
+                if protected
+                    .as_ref()
+                    .is_none_or(|(reference, _)| reference != &current.protected)
+                {
+                    protected = Some((
+                        current.protected.clone(),
+                        load_protected_checkpoint(
+                            store.as_ref(),
+                            request.decision_store.as_ref(),
+                            &current.protected,
+                        )
+                        .await?,
+                    ));
+                }
+                let retained = &protected
+                    .as_ref()
+                    .expect("retained checkpoint was loaded")
+                    .1;
+                let (_, manifests) = load_cleanup_target(
+                    store.as_ref(),
+                    request.decision_store.as_ref(),
+                    &retained.index,
+                    &current.current,
+                    current.next.as_ref(),
+                    Some(&current.participant_ids),
+                )
+                .await?;
+                delete_retired_data(store.as_ref(), &manifests, &retained.live).await?;
+                cursor = Some(
+                    authority
+                        .mark_cluster_artifact_data_deleted(&proof, &current)
+                        .await
+                        .map_err(|error| {
+                            DbError::Checkpoint(format!(
+                                "advance cluster retention data phase: {error}"
+                            ))
+                        })?,
+                );
+            }
+            ClusterArtifactCleanupPhase::DeleteMetadata => {
+                delete_retired_manifests(
+                    store.as_ref(),
+                    current.current.checkpoint_id,
+                    &current.participant_ids,
+                )
+                .await?;
+                request
+                    .decision_store
+                    .delete_committed_checkpoint(&current.current)
+                    .await
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!("delete retired checkpoint index: {error}"))
+                    })?;
+                let completed = current.protected.clone();
+                cursor = authority
+                    .mark_cluster_artifact_metadata_deleted(&proof, &current)
+                    .await
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "advance cluster retention metadata phase: {error}"
+                        ))
+                    })?;
+                if cursor.is_none() {
+                    let Some(requested) = requested.as_ref() else {
+                        return Ok(());
+                    };
+                    if completed.epoch >= requested.epoch {
+                        return Ok(());
+                    }
+                    cursor = begin_cluster_cleanup(
+                        Arc::clone(&store),
+                        Arc::clone(&request.decision_store),
+                        authority.as_ref(),
+                        &proof,
+                        requested.clone(),
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
 }
 
 async fn run_gc_request(
     store: Arc<dyn CheckpointStore>,
     request: GcRequest,
 ) -> Result<(), DbError> {
-    let mut chain = vec![request.current];
-    while let Some(reference) = chain.last().and_then(|index| index.predecessor.clone()) {
-        let predecessor = request
-            .decision_store
-            .load_committed_checkpoint(&reference)
-            .await
-            .map_err(|error| {
-                DbError::Checkpoint(format!("load checkpoint predecessor index: {error}"))
-            })?;
-        chain
-            .last()
-            .ok_or_else(|| DbError::Checkpoint("checkpoint predecessor chain is empty".into()))?
-            .validate_predecessor_index(&predecessor)
-            .map_err(DbError::Checkpoint)?;
-        chain.push(predecessor);
-    }
-
-    let retained_count = request
-        .retained_predecessors
-        .saturating_add(1)
-        .min(chain.len());
-    let (retained, expired) = chain.split_at(retained_count);
-
-    let mut live_chunks = BTreeSet::new();
-    for index in retained {
-        for manifest in load_index_manifests(store.as_ref(), index, true).await? {
-            live_chunks.extend(manifest.state_frames.iter().map(|frame| frame.chunk));
+    match request.authority.clone() {
+        GcAuthority::Local
+            if request
+                .requested
+                .as_ref()
+                .is_some_and(|index| index.scope == CheckpointScope::Local) =>
+        {
+            run_local_gc_request(store.as_ref(), &request).await
         }
-    }
-
-    for index in expired.iter().rev() {
-        // Loading through the exact committed references distinguishes an already-retired
-        // manifest from a corrupt one. Missing expired manifests are safe on GC retry.
-        load_index_manifests(store.as_ref(), index, false).await?;
-        for participant in &index.participants {
-            let chunk = StateChunkId {
-                participant_id: participant.participant_id,
-                checkpoint_id: index.checkpoint_id,
-            };
-            if !live_chunks.contains(&chunk) {
-                store.delete_node_data(chunk).await.map_err(DbError::from)?;
-            }
+        #[cfg(feature = "cluster")]
+        GcAuthority::Cluster {
+            authority, proof, ..
+        } if request
+            .requested
+            .as_ref()
+            .is_none_or(|index| index.scope == CheckpointScope::Cluster) =>
+        {
+            run_cluster_gc_request(store, &request, authority, proof).await
         }
-        for participant in &index.participants {
-            store
-                .delete_manifest(StateChunkId {
-                    participant_id: participant.participant_id,
-                    checkpoint_id: index.checkpoint_id,
-                })
-                .await
-                .map_err(DbError::from)?;
-        }
+        _ => Err(DbError::Checkpoint(
+            "checkpoint retention authority does not match the committed scope".into(),
+        )),
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod artifact_tests {
     use super::*;
     use laminar_core::checkpoint::ObjectStoreCheckpointStore;
-    use laminar_core::checkpoint_decision::CheckpointDecisionStore;
+    use laminar_core::checkpoint_decision::{
+        CheckpointDecisionStore, CheckpointRetentionState, CheckpointRetentionUpdateResult,
+    };
     use laminar_core::state::KeyGroupCount;
     use object_store::memory::InMemory;
 
@@ -566,8 +966,18 @@ mod artifact_tests {
         (manifest, payload)
     }
 
+    fn retention_state(result: CheckpointRetentionUpdateResult) -> CheckpointRetentionState {
+        match result {
+            CheckpointRetentionUpdateResult::Applied(state)
+            | CheckpointRetentionUpdateResult::Unchanged(state) => state,
+            result => panic!("unexpected retention update: {result:?}"),
+        }
+    }
+
     #[tokio::test]
-    async fn coalesced_gc_retires_every_expired_cut_but_keeps_live_predecessor_data() {
+    async fn retention_reclaims_last_referenced_chunk_and_keeps_latest_cut() {
+        use laminar_core::checkpoint_decision::CheckpointVerdict;
+
         let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let key_groups = KeyGroupCount::try_from(1_u16).unwrap();
         let store: Arc<dyn CheckpointStore> = Arc::new(
@@ -578,7 +988,7 @@ mod artifact_tests {
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
 
         let mut predecessor = None;
-        let mut indexes = Vec::new();
+        let mut latest = None;
         let mut checkpoint_three = None;
         for checkpoint_id in 1..=6 {
             let retained_chunk = (checkpoint_id == 6)
@@ -613,23 +1023,54 @@ mod artifact_tests {
                 channel_progress: Vec::new(),
                 checkpoint_watermark: None,
             };
-            predecessor = Some(decisions.create_committed_checkpoint(&index).await.unwrap());
-            indexes.push(index);
+            let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
+            decisions
+                .record_outcome(
+                    checkpoint_id,
+                    checkpoint_id,
+                    CheckpointScope::Local,
+                    None,
+                    None,
+                    CheckpointVerdict::Commit,
+                    Some(reference.clone()),
+                )
+                .await
+                .unwrap();
+            predecessor = Some(reference);
+            latest = Some(index);
         }
+
+        let protected = predecessor.clone().unwrap();
+        let interrupted = retention_state(
+            decisions
+                .begin_checkpoint_retention(&protected)
+                .await
+                .unwrap(),
+        );
+        let CheckpointRetentionState::DeleteData { cursor } = interrupted else {
+            panic!("retention did not enter its data phase");
+        };
+        assert_eq!(cursor.current.checkpoint_id, 5);
+        store
+            .delete_node_data(StateChunkId {
+                participant_id: 1,
+                checkpoint_id: 5,
+            })
+            .await
+            .unwrap();
 
         run_gc_request(
             Arc::clone(&store),
             GcRequest {
-                current: indexes.pop().unwrap(),
-                decision_store: decisions,
-                retained_predecessors: 1,
-                timeout: Duration::from_secs(1),
+                requested: Some(latest.take().unwrap()),
+                decision_store: Arc::clone(&decisions),
+                authority: GcAuthority::Local,
             },
         )
         .await
         .unwrap();
 
-        for checkpoint_id in [1, 2, 4] {
+        for checkpoint_id in [1, 2, 4, 5] {
             let chunk = StateChunkId {
                 participant_id: 1,
                 checkpoint_id,
@@ -644,7 +1085,7 @@ mod artifact_tests {
             .await
             .unwrap()
             .is_some());
-        for checkpoint_id in 1..=4 {
+        for checkpoint_id in 1..=5 {
             assert_eq!(
                 store
                     .load_manifest_for_participant(1, checkpoint_id)
@@ -653,13 +1094,117 @@ mod artifact_tests {
                 None
             );
         }
-        for checkpoint_id in 5..=6 {
-            assert!(store
-                .load_manifest_for_participant(1, checkpoint_id)
+        assert!(store
+            .load_manifest_for_participant(1, 6)
+            .await
+            .unwrap()
+            .is_some());
+
+        let (manifest, payload) = manifest(7, &deployment_id, None);
+        store
+            .save_checkpoint(&manifest, std::slice::from_ref(&payload))
+            .await
+            .unwrap();
+        let encoded = checkpoint_manifest_bytes(&manifest).unwrap();
+        let index = CommittedCheckpointIndex {
+            version: COMMITTED_CHECKPOINT_INDEX_VERSION,
+            deployment_id,
+            pipeline_identity: manifest.pipeline_identity.clone(),
+            epoch: 7,
+            checkpoint_id: 7,
+            scope: CheckpointScope::Local,
+            vnode_count: 1,
+            assignment_fence: None,
+            predecessor,
+            participants: vec![CommittedParticipantRef::from_manifest(&manifest, &encoded).unwrap()],
+            source_offsets: BTreeMap::new(),
+            channel_progress: Vec::new(),
+            checkpoint_watermark: None,
+        };
+        let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
+        decisions
+            .record_outcome(
+                7,
+                7,
+                CheckpointScope::Local,
+                None,
+                None,
+                CheckpointVerdict::Commit,
+                Some(reference.clone()),
+            )
+            .await
+            .unwrap();
+
+        let delete_data = retention_state(
+            decisions
+                .begin_checkpoint_retention(&reference)
                 .await
-                .unwrap()
-                .is_some());
+                .unwrap(),
+        );
+        let CheckpointRetentionState::DeleteData { cursor } = &delete_data else {
+            panic!("retention did not enter its data phase");
+        };
+        let retained = load_protected_checkpoint(store.as_ref(), decisions.as_ref(), &reference)
+            .await
+            .unwrap();
+        let (_, retired) = load_cleanup_target(
+            store.as_ref(),
+            decisions.as_ref(),
+            &retained.index,
+            &cursor.current,
+            cursor.next.as_ref(),
+            Some(&[1]),
+        )
+        .await
+        .unwrap();
+        delete_retired_data(store.as_ref(), &retired, &retained.live)
+            .await
+            .unwrap();
+        let delete_metadata = retention_state(
+            decisions
+                .advance_checkpoint_retention(&delete_data)
+                .await
+                .unwrap(),
+        );
+        assert!(matches!(
+            delete_metadata,
+            CheckpointRetentionState::DeleteMetadata { .. }
+        ));
+        store
+            .delete_manifest(StateChunkId {
+                participant_id: 1,
+                checkpoint_id: 6,
+            })
+            .await
+            .unwrap();
+        run_gc_request(
+            Arc::clone(&store),
+            GcRequest {
+                requested: Some(index),
+                decision_store: decisions,
+                authority: GcAuthority::Local,
+            },
+        )
+        .await
+        .unwrap();
+
+        for checkpoint_id in [3, 6] {
+            assert_eq!(
+                store
+                    .node_data_len(StateChunkId {
+                        participant_id: 1,
+                        checkpoint_id,
+                    })
+                    .await
+                    .unwrap(),
+                None
+            );
         }
+        assert!(store
+            .load_manifest_for_participant(1, 7)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     async fn coordinator_with_store(
@@ -862,19 +1407,31 @@ async fn run_gc_worker(
     mut requests: tokio::sync::watch::Receiver<Option<GcRequest>>,
 ) {
     while requests.changed().await.is_ok() {
-        let Some(request) = requests.borrow_and_update().clone() else {
+        let Some(mut request) = requests.borrow_and_update().clone() else {
             continue;
         };
-        let timeout = request.timeout;
-        match tokio::time::timeout(timeout, run_gc_request(Arc::clone(&store), request)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                warn!(%error, "checkpoint retention failed; retrying at the next commit");
+        loop {
+            match run_gc_request(Arc::clone(&store), request.clone()).await {
+                Ok(()) => break,
+                Err(error) => {
+                    warn!(%error, retry_delay = ?RETENTION_RETRY_DELAY, "checkpoint retention paused at its durable cursor");
+                }
             }
-            Err(_) => warn!(
-                ?timeout,
-                "checkpoint retention timed out; retrying at the next commit"
-            ),
+            if !request.authority.can_retry() {
+                break;
+            }
+            tokio::select! {
+                changed = requests.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let Some(next) = requests.borrow_and_update().clone() else {
+                        break;
+                    };
+                    request = next;
+                }
+                () = tokio::time::sleep(RETENTION_RETRY_DELAY) => {}
+            }
         }
     }
 }
@@ -925,11 +1482,6 @@ impl CheckpointCoordinator {
         if store.participant_id() == 0 {
             return Err(DbError::Config(
                 "checkpoint participant ID must be nonzero".into(),
-            ));
-        }
-        if config.max_retained == 0 {
-            return Err(DbError::Config(
-                "checkpoint.max_retained must be greater than zero".into(),
             ));
         }
         let vnode_count = store.key_group_count().get();
@@ -1142,22 +1694,96 @@ impl CheckpointCoordinator {
         Ok(())
     }
 
-    fn schedule_retention(&self, current: CommittedCheckpointIndex) {
+    fn schedule_retention(
+        &self,
+        current: CommittedCheckpointIndex,
+        leader_proof: Option<LeaderProof>,
+    ) {
         let Some(decision_store) = self.decision_store.as_ref() else {
             return;
+        };
+        let authority = match current.scope {
+            CheckpointScope::Local => GcAuthority::Local,
+            CheckpointScope::Cluster => {
+                #[cfg(feature = "cluster")]
+                {
+                    let Some(proof) = leader_proof else {
+                        warn!("cluster checkpoint retention has no live leader proof");
+                        return;
+                    };
+                    let Some(controller) = self.cluster_controller.as_ref() else {
+                        warn!("cluster checkpoint retention has no cluster controller");
+                        return;
+                    };
+                    let authority = match controller.checkpoint_authority() {
+                        Ok(authority) => authority,
+                        Err(error) => {
+                            warn!(%error, "cluster checkpoint retention authority is unavailable");
+                            return;
+                        }
+                    };
+                    GcAuthority::Cluster {
+                        authority,
+                        proof,
+                        controller: Arc::downgrade(controller),
+                    }
+                }
+                #[cfg(not(feature = "cluster"))]
+                {
+                    let _ = leader_proof;
+                    warn!("cluster checkpoint retention requires the cluster feature");
+                    return;
+                }
+            }
         };
         if self
             .gc_requests
             .send(Some(GcRequest {
-                current,
+                requested: Some(current),
                 decision_store: Arc::clone(decision_store),
-                retained_predecessors: self.config.max_retained,
-                timeout: self.config.cleanup_timeout,
+                authority,
             }))
             .is_err()
         {
             warn!("checkpoint retention worker is unavailable");
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn schedule_cluster_retention_resume(
+        &self,
+        proof: LeaderProof,
+    ) -> Result<(), DbError> {
+        let decision_store = self.decision_store.as_ref().ok_or_else(|| {
+            DbError::Checkpoint("cluster checkpoint retention has no decision store".into())
+        })?;
+        let controller = self.cluster_controller.as_ref().ok_or_else(|| {
+            DbError::Checkpoint("cluster checkpoint retention has no controller".into())
+        })?;
+        if !controller.proof_is_live(&proof) {
+            return Err(DbError::Checkpoint(
+                "cluster checkpoint retention leader proof is no longer live".into(),
+            ));
+        }
+        let authority = controller.checkpoint_authority().map_err(|error| {
+            DbError::Checkpoint(format!("cluster checkpoint retention authority: {error}"))
+        })?;
+        let requested = self
+            .gc_requests
+            .borrow()
+            .as_ref()
+            .and_then(|request| request.requested.clone());
+        self.gc_requests
+            .send(Some(GcRequest {
+                requested,
+                decision_store: Arc::clone(decision_store),
+                authority: GcAuthority::Cluster {
+                    authority,
+                    proof,
+                    controller: Arc::downgrade(controller),
+                },
+            }))
+            .map_err(|_| DbError::Checkpoint("checkpoint retention worker is unavailable".into()))
     }
 
     #[must_use]
@@ -1223,15 +1849,22 @@ impl CheckpointCoordinator {
                 .map_err(|_| DbError::Checkpoint("checkpoint recovery timed out".into()))??
         };
 
-        let owns_continuation = match committed.scope {
+        #[cfg(feature = "cluster")]
+        let continuation_proof = if committed.scope == CheckpointScope::Cluster {
+            self.cluster_controller
+                .as_ref()
+                .and_then(|controller| controller.capture_leader_proof())
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cluster"))]
+        let continuation_proof: Option<LeaderProof> = None;
+        let continuation_fencing_token = match committed.scope {
             CheckpointScope::Local => Some(1),
             CheckpointScope::Cluster => {
                 #[cfg(feature = "cluster")]
                 {
-                    self.cluster_controller
-                        .as_ref()
-                        .and_then(|controller| controller.capture_leader_proof())
-                        .map(|proof| proof.fencing_token)
+                    continuation_proof.as_ref().map(|proof| proof.fencing_token)
                 }
                 #[cfg(not(feature = "cluster"))]
                 {
@@ -1239,7 +1872,7 @@ impl CheckpointCoordinator {
                 }
             }
         };
-        if let Some(fencing_token) = owns_continuation {
+        if let Some(fencing_token) = continuation_fencing_token {
             let manifests = recovered.manifests.iter().collect::<Vec<_>>();
             self.commit_external_sinks_until(
                 CheckpointAttempt::canonical(committed.checkpoint_id),
@@ -1252,7 +1885,7 @@ impl CheckpointCoordinator {
                 deadline,
             )
             .await?;
-            self.schedule_retention(committed.clone());
+            self.schedule_retention(committed.clone(), continuation_proof);
         }
 
         let reference = outcome.committed_checkpoint.clone().ok_or_else(|| {
@@ -3047,7 +3680,7 @@ impl CheckpointCoordinator {
             .await;
         let continuation = match continuation {
             Ok(()) => {
-                self.schedule_retention(index.clone());
+                self.schedule_retention(index.clone(), leader_proof.clone());
                 if let Err(error) = self.clear_sink_witness_until(continuation_deadline).await {
                     Err(error)
                 } else if self.has_checkpoint_committable_sinks() {

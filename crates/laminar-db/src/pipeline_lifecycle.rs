@@ -2696,12 +2696,6 @@ impl LaminarDB {
                 CheckpointConfig as CkpConfig, CheckpointCoordinator,
             };
 
-            let max_retained = cp_config.max_retained.unwrap_or(3);
-            if max_retained == 0 {
-                return Err(DbError::Config(
-                    "checkpoint.max_retained must be greater than zero".into(),
-                ));
-            }
             let max_node_data_bytes = cp_config.max_node_data_bytes.ok_or_else(|| {
                 DbError::Config(
                     "checkpoint.max_node_data_bytes was not resolved at construction".into(),
@@ -2817,7 +2811,6 @@ impl LaminarDB {
 
             let defaults = CkpConfig::default();
             let config = CkpConfig {
-                max_retained,
                 checkpoint_timeout: cp_config.timeout_ms.map_or(
                     defaults.checkpoint_timeout,
                     std::time::Duration::from_millis,

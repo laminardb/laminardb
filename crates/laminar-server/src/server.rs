@@ -393,7 +393,6 @@ fn apply_checkpoint_settings(
         interval_ms: Some(u64::try_from(checkpoint.interval.as_millis()).unwrap_or(u64::MAX)),
         timeout_ms: Some(u64::try_from(checkpoint.timeout.as_millis()).unwrap_or(u64::MAX)),
         data_dir: None,
-        max_retained: Some(checkpoint.max_retained),
         max_node_data_bytes: Some(max_node_data_bytes),
     }))
 }

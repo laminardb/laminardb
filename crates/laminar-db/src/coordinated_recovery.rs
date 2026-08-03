@@ -207,6 +207,8 @@ pub(crate) fn spawn_monitor(db: &Arc<LaminarDB>, runtime: &Handle) -> tokio::tas
 struct RecoveryMonitor {
     applied_gen: u64,
     handled_faults: FxHashMap<NodeId, u64>,
+    /// Leader term for which this node has resumed any durable artifact cleanup.
+    retention_leader: Option<laminar_core::checkpoint::LeaderProof>,
     /// Whether a visible, unhandled durable fault has already suspended local assignment
     /// authority. The report remains level-triggered, but the suspension revision advances only
     /// once per continuously held fault period.
@@ -261,6 +263,22 @@ impl RecoveryMonitor {
             let Some(controller) = db.cluster_controller.lock().clone() else {
                 continue;
             };
+
+            match controller.capture_leader_proof() {
+                None => self.retention_leader = None,
+                Some(proof) if self.retention_leader.as_ref() != Some(&proof) => {
+                    let coordinator = db.coordinator.lock().await;
+                    if let Some(coordinator) = coordinator.as_ref() {
+                        match coordinator.schedule_cluster_retention_resume(proof.clone()) {
+                            Ok(()) => self.retention_leader = Some(proof),
+                            Err(error) => {
+                                tracing::warn!(%error, "could not resume cluster checkpoint retention after leadership acquisition");
+                            }
+                        }
+                    }
+                }
+                Some(_) => {}
+            }
 
             let pending_published = self.publish_pending_local_fault(&db, &controller).await;
             if db.pending_recovery_fault.load(Ordering::Acquire) != 0 && !pending_published {

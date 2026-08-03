@@ -44,7 +44,7 @@ const LEASE_PREFIX: &str = "control/leader-lease/";
 const AUTHORITY_HEAD_PATH: &str = "control/leader-lease-head/v1.json";
 const STORE_CONTRACT_PROBE_PREFIX: &str = "control/object-store-contract-probes/v1/";
 const RECOVERY_RELEASE_TERMINAL_PREFIX: &str = "control/recovery-release-terminals/v2/";
-const AUTHORITY_RECORD_VERSION: u32 = 9;
+const AUTHORITY_RECORD_VERSION: u32 = 10;
 const AUTHORITY_HEAD_VERSION: u32 = 1;
 const MAX_AUTHORITY_RECORD_BYTES: u64 = 256 * 1024;
 const MAX_AUTHORITY_HEAD_BYTES: u64 = 128;
@@ -789,6 +789,102 @@ enum RecordAuthorityAssignmentDecisionResult {
     Conflict { winner: AuthorityAssignmentDecision },
 }
 
+/// Destructive phase authorized by the cluster leader authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterArtifactCleanupPhase {
+    /// Delete state objects that are not referenced by the protected recovery cuts.
+    DeleteData,
+    /// Delete the exact participant manifests and committed-checkpoint index.
+    DeleteMetadata,
+}
+
+/// Exact, crash-resumable cluster checkpoint artifact cleanup position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterArtifactCleanupCursor {
+    /// Oldest live committed checkpoint protected by this retention segment.
+    pub protected: CommittedCheckpointRef,
+    /// Exact expired committed checkpoint being reclaimed.
+    pub current: CommittedCheckpointRef,
+    /// Exact older checkpoint to process after `current`, if any.
+    pub next: Option<CommittedCheckpointRef>,
+    /// Previously reclaimed checkpoint at which this segment must stop.
+    pub stop_before: Option<CommittedCheckpointRef>,
+    /// Exact participants whose manifests belong to `current`.
+    pub participant_ids: Vec<u64>,
+    /// Destructive operation durably authorized for `current`.
+    pub phase: ClusterArtifactCleanupPhase,
+}
+
+impl ClusterArtifactCleanupCursor {
+    fn validate(&self) -> Result<(), LeaseError> {
+        for (name, reference) in [
+            ("protected", Some(&self.protected)),
+            ("current", Some(&self.current)),
+            ("next", self.next.as_ref()),
+            ("stop-before", self.stop_before.as_ref()),
+        ] {
+            if let Some(reference) = reference {
+                reference.validate().map_err(|error| {
+                    LeaseError::Invalid(format!(
+                        "cluster artifact cleanup {name} reference: {error}"
+                    ))
+                })?;
+            }
+        }
+        if self.current.epoch >= self.protected.epoch
+            || self.current.checkpoint_id >= self.protected.checkpoint_id
+        {
+            return Err(LeaseError::Invalid(
+                "cluster artifact cleanup current checkpoint is not older than its protected cut"
+                    .into(),
+            ));
+        }
+        if let Some(next) = self.next.as_ref() {
+            if next.epoch >= self.current.epoch || next.checkpoint_id >= self.current.checkpoint_id
+            {
+                return Err(LeaseError::Invalid(
+                    "cluster artifact cleanup next checkpoint is not older than its current checkpoint"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(stop) = self.stop_before.as_ref() {
+            if stop.epoch >= self.current.epoch || stop.checkpoint_id >= self.current.checkpoint_id
+            {
+                return Err(LeaseError::Invalid(
+                    "cluster artifact cleanup stop boundary is not older than its current checkpoint"
+                        .into(),
+                ));
+            }
+            let next = self.next.as_ref().ok_or_else(|| {
+                LeaseError::Invalid(
+                    "cluster artifact cleanup lost the path to its stop boundary".into(),
+                )
+            })?;
+            if next.epoch < stop.epoch || next.checkpoint_id < stop.checkpoint_id {
+                return Err(LeaseError::Invalid(
+                    "cluster artifact cleanup next checkpoint crosses its stop boundary".into(),
+                ));
+            }
+        }
+        if self.participant_ids.is_empty()
+            || self.participant_ids.len() > MAX_CHECKPOINT_PARTICIPANTS
+            || self.participant_ids[0] == 0
+            || !self
+                .participant_ids
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        {
+            return Err(LeaseError::Invalid(
+                "cluster artifact cleanup participants are not canonical".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuthorityOutcomeFloor {
@@ -827,6 +923,8 @@ struct LeaderAuthorityRecord {
     commit_head: Option<OutcomeLink>,
     /// Monotonic cluster outcome retention boundary and its continuity anchors.
     outcome_floor: Option<AuthorityOutcomeFloor>,
+    /// Exact leader-fenced artifact cleanup position, preserved across leadership terms.
+    artifact_cleanup: Option<ClusterArtifactCleanupCursor>,
     /// Present only on the sequence that admitted an assignment decision.
     assignment_decision: Option<AuthorityAssignmentDecision>,
     /// Link to the preceding assignment decision, present only on a decision-bearing record.
@@ -1033,6 +1131,7 @@ impl LeaderAuthorityRecord {
             previous_commit: None,
             commit_head: None,
             outcome_floor: None,
+            artifact_cleanup: None,
             assignment_decision: None,
             previous_assignment_decision: None,
             assignment_decision_head: None,
@@ -1054,6 +1153,7 @@ impl LeaderAuthorityRecord {
             previous_commit: None,
             commit_head: self.commit_head,
             outcome_floor: self.outcome_floor.clone(),
+            artifact_cleanup: self.artifact_cleanup.clone(),
             assignment_decision: None,
             previous_assignment_decision: None,
             assignment_decision_head: self.assignment_decision_head,
@@ -1093,6 +1193,7 @@ impl LeaderAuthorityRecord {
         self.validate_recovery_fault_inventory()?;
         self.validate_checkpoint_outcome_chain()?;
         self.validate_outcome_floor()?;
+        self.validate_artifact_cleanup()?;
         self.validate_assignment_decision_chain()?;
         self.validate_assignment_decision_floor()?;
         self.validate_recovery_release()?;
@@ -1317,6 +1418,28 @@ impl LeaderAuthorityRecord {
                     "outcome floor Commit anchor is disconnected from the Commit head".into(),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    fn validate_artifact_cleanup(&self) -> Result<(), LeaseError> {
+        let Some(cursor) = self.artifact_cleanup.as_ref() else {
+            return Ok(());
+        };
+        cursor.validate()?;
+        let floor = self.outcome_floor.as_ref().ok_or_else(|| {
+            LeaseError::Invalid(
+                "cluster artifact cleanup exists without an outcome retention floor".into(),
+            )
+        })?;
+        if floor.artifact_before_epoch != cursor.protected.epoch
+            || self
+                .commit_head
+                .is_none_or(|head| head.epoch < cursor.protected.epoch)
+        {
+            return Err(LeaseError::Invalid(
+                "cluster artifact cleanup is not bound to its protected retention cut".into(),
+            ));
         }
         Ok(())
     }
@@ -4995,54 +5118,393 @@ impl LeaderLeaseStore {
         }
     }
 
-    async fn validate_cluster_recovery_cut(
-        &self,
-        floor: &AuthorityOutcomeFloor,
-        audited_outcomes: &[CheckpointOutcome],
-    ) -> Result<Option<CheckpointOutcome>, ClusterCheckpointAuthorityError> {
-        if floor.artifact_before_epoch == 0 {
-            return Ok(None);
-        }
-        let recovery_cut = audited_outcomes
+    fn cleanup_participant_ids(
+        index: &CommittedCheckpointIndex,
+    ) -> Result<Vec<u64>, ClusterCheckpointAuthorityError> {
+        index.validate().map_err(DecisionError::Conflict)?;
+        let participant_ids = index
+            .participants
             .iter()
-            .rev()
-            .find(|outcome| outcome.epoch >= floor.artifact_before_epoch && outcome.is_commit())
-            .ok_or_else(|| {
-                DecisionError::Conflict(format!(
-                    "cluster outcome floor {} has no live commit recovery cut",
-                    floor.artifact_before_epoch
-                ))
-            })?;
-        CheckpointDecisionStore::new(Arc::clone(&self.store))
-            .validate_committed_checkpoint_for_outcome(recovery_cut)
-            .await?;
-        Ok(Some(recovery_cut.clone()))
+            .map(|participant| participant.participant_id)
+            .collect::<Vec<_>>();
+        if participant_ids.is_empty()
+            || participant_ids.len() > MAX_CHECKPOINT_PARTICIPANTS
+            || participant_ids[0] == 0
+            || !participant_ids.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            return Err(DecisionError::Conflict(
+                "committed checkpoint participants are not canonical".into(),
+            )
+            .into());
+        }
+        Ok(participant_ids)
     }
 
-    async fn preflight_cluster_recovery_cut<V, Fut>(
+    fn cleanup_stop_before(head: &LeaderAuthorityRecord) -> Option<CommittedCheckpointRef> {
+        head.outcome_floor
+            .as_ref()
+            .filter(|floor| floor.artifact_before_epoch != 0)
+            .and_then(|floor| floor.committed_anchor.as_ref())
+            .and_then(|outcome| outcome.committed_checkpoint.clone())
+    }
+
+    /// Read the exact cluster checkpoint artifact cleanup position.
+    ///
+    /// The returned cursor was admitted through the shared leader-authority sequence. `None`
+    /// means no destructive checkpoint cleanup is currently authorized.
+    ///
+    /// # Errors
+    /// Fails when the durable authority head is unavailable or invalid.
+    pub async fn cluster_artifact_cleanup(
         &self,
-        floor: &AuthorityOutcomeFloor,
-        audited_outcomes: &[CheckpointOutcome],
-        validate_artifacts: &V,
-    ) -> Result<Option<CheckpointOutcome>, ClusterCheckpointAuthorityError>
+    ) -> Result<Option<ClusterArtifactCleanupCursor>, ClusterCheckpointAuthorityError> {
+        Ok(self
+            .load_record()
+            .await?
+            .and_then(|head| head.artifact_cleanup))
+    }
+
+    /// Atomically advance the artifact floor and authorize its first expired checkpoint.
+    ///
+    /// `protected` must name a live cluster Commit. Its exact predecessor becomes the first
+    /// cleanup target. An already covered horizon or a protected genesis cut returns `None`.
+    /// An identical retry returns the active cursor; a different active segment is rejected.
+    ///
+    /// # Errors
+    /// Fails for a stale proof, invalid committed-index chain, failed protected-artifact
+    /// validation, concurrent cleanup segment, or object-store failure.
+    pub async fn begin_cluster_artifact_cleanup<V, Fut>(
+        &self,
+        proof: &LeaderProof,
+        protected: CommittedCheckpointRef,
+        validate_artifacts: V,
+    ) -> Result<Option<ClusterArtifactCleanupCursor>, ClusterCheckpointAuthorityError>
     where
-        V: Fn(CheckpointOutcome) -> Fut,
-        Fut: std::future::Future<Output = Result<(), String>>,
+        V: Fn(CheckpointOutcome) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
     {
-        let recovery_cut = self
-            .validate_cluster_recovery_cut(floor, audited_outcomes)
-            .await?;
-        if let Some(recovery_cut) = recovery_cut.as_ref() {
-            validate_artifacts(recovery_cut.clone())
+        if !proof.is_canonical() {
+            return Err(ClusterCheckpointAuthorityError::Fenced);
+        }
+        protected.validate().map_err(DecisionError::Conflict)?;
+        loop {
+            let published = self
+                .load_published_authority_head()
+                .await?
+                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            let current = &published.record;
+            if !current.lease.matches_proof(proof) {
+                return Err(ClusterCheckpointAuthorityError::Fenced);
+            }
+            if let Some(active) = current.artifact_cleanup.as_ref() {
+                if active.protected == protected {
+                    return Ok(Some(active.clone()));
+                }
+                return Err(DecisionError::Conflict(format!(
+                    "cluster artifact cleanup for protected checkpoint {} is still active",
+                    active.protected.checkpoint_id
+                ))
+                .into());
+            }
+            if current
+                .outcome_floor
+                .as_ref()
+                .is_some_and(|floor| floor.artifact_before_epoch >= protected.epoch)
+            {
+                return Ok(None);
+            }
+
+            let snapshot = self.cached_audited_cluster_outcomes_from(current).await?;
+            let protected_outcome = snapshot
+                .outcomes
+                .iter()
+                .find(|outcome| {
+                    outcome.is_commit() && outcome.committed_checkpoint.as_ref() == Some(&protected)
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    DecisionError::Conflict(format!(
+                        "protected checkpoint {} is not a live cluster Commit",
+                        protected.checkpoint_id
+                    ))
+                })?;
+            let decisions = CheckpointDecisionStore::new(Arc::clone(&self.store));
+            let protected_index = decisions
+                .validate_committed_checkpoint_for_outcome(&protected_outcome)
+                .await?;
+            validate_artifacts(protected_outcome.clone())
                 .await
                 .map_err(|error| {
                     DecisionError::Conflict(format!(
-                        "cluster recovery cut epoch {} checkpoint {} failed durable recovery metadata preflight: {error}",
-                        recovery_cut.epoch, recovery_cut.checkpoint_id
+                        "protected cluster checkpoint {} failed durable artifact preflight: {error}",
+                        protected.checkpoint_id
                     ))
                 })?;
+            let Some(expired) = protected_index.predecessor.clone() else {
+                return Ok(None);
+            };
+            let expired_index = decisions.load_committed_checkpoint(&expired).await?;
+            protected_index
+                .validate_predecessor_index(&expired_index)
+                .map_err(DecisionError::Conflict)?;
+
+            let authority_before_epoch = current
+                .outcome_floor
+                .as_ref()
+                .map_or(protected.epoch, |floor| {
+                    floor.authority_before_epoch.max(protected.epoch)
+                });
+            let floor = self
+                .build_cluster_outcome_floor(
+                    current,
+                    &snapshot,
+                    protected.epoch,
+                    authority_before_epoch,
+                )
+                .await?;
+            if floor
+                .committed_anchor
+                .as_ref()
+                .and_then(|outcome| outcome.committed_checkpoint.as_ref())
+                != Some(&expired)
+            {
+                return Err(DecisionError::Conflict(
+                    "protected checkpoint predecessor is not the artifact-floor Commit anchor"
+                        .into(),
+                )
+                .into());
+            }
+            let cursor = ClusterArtifactCleanupCursor {
+                protected: protected.clone(),
+                current: expired,
+                next: expired_index.predecessor.clone(),
+                stop_before: Self::cleanup_stop_before(current),
+                participant_ids: Self::cleanup_participant_ids(&expired_index)?,
+                phase: ClusterArtifactCleanupPhase::DeleteData,
+            };
+            cursor.validate()?;
+
+            // Artifact preflight and index reads may race harmless authority mutations. Publish
+            // only from the exact outcome/floor/cursor snapshot used to derive this segment.
+            let rechecked = self
+                .load_published_authority_head()
+                .await?
+                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            if !rechecked.record.lease.matches_proof(proof) {
+                return Err(ClusterCheckpointAuthorityError::Fenced);
+            }
+            if rechecked.record.outcome_head != current.outcome_head
+                || rechecked.record.commit_head != current.commit_head
+                || rechecked.record.outcome_floor != current.outcome_floor
+                || rechecked.record.artifact_cleanup != current.artifact_cleanup
+            {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let sequence =
+                rechecked.record.lease.seq.checked_add(1).ok_or_else(|| {
+                    LeaseError::Invalid("leader authority sequence exhausted".into())
+                })?;
+            let mut lease = rechecked.record.lease.clone();
+            lease.seq = sequence;
+            let mut next = rechecked.record.preserve_with_lease(lease);
+            next.outcome_floor = Some(floor.clone());
+            next.artifact_cleanup = Some(cursor.clone());
+            next.validate()?;
+            match self
+                .create_authority_record(Some(&rechecked), &next)
+                .await?
+            {
+                AuthorityCreateOutcome::Created | AuthorityCreateOutcome::ExistingIdentical => {
+                    self.install_cluster_outcome_audit(
+                        Self::cluster_outcome_audit_key(&next),
+                        next.lease.seq,
+                        Self::outcomes_retained_by_floor(&floor, &snapshot),
+                    );
+                    return Ok(Some(cursor));
+                }
+                AuthorityCreateOutcome::Contended(winner) => {
+                    if !winner.lease.matches_proof(proof) {
+                        return Err(ClusterCheckpointAuthorityError::Fenced);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
         }
-        Ok(recovery_cut)
+    }
+
+    /// Durably authorize metadata deletion after the exact current data cleanup completes.
+    ///
+    /// # Errors
+    /// Fails for a stale proof, stale or non-`DeleteData` cursor, or object-store failure.
+    pub async fn mark_cluster_artifact_data_deleted(
+        &self,
+        proof: &LeaderProof,
+        expected: &ClusterArtifactCleanupCursor,
+    ) -> Result<ClusterArtifactCleanupCursor, ClusterCheckpointAuthorityError> {
+        if !proof.is_canonical() {
+            return Err(ClusterCheckpointAuthorityError::Fenced);
+        }
+        expected.validate()?;
+        if expected.phase != ClusterArtifactCleanupPhase::DeleteData {
+            return Err(DecisionError::Conflict(
+                "cluster artifact data transition requires a DeleteData cursor".into(),
+            )
+            .into());
+        }
+        let mut replacement = expected.clone();
+        replacement.phase = ClusterArtifactCleanupPhase::DeleteMetadata;
+        loop {
+            let published = self
+                .load_published_authority_head()
+                .await?
+                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            let current = &published.record;
+            if !current.lease.matches_proof(proof) {
+                return Err(ClusterCheckpointAuthorityError::Fenced);
+            }
+            if current.artifact_cleanup.as_ref() == Some(&replacement) {
+                return Ok(replacement);
+            }
+            if current.artifact_cleanup.as_ref() != Some(expected) {
+                return Err(DecisionError::Conflict(
+                    "cluster artifact cleanup cursor changed before data completion".into(),
+                )
+                .into());
+            }
+            let sequence =
+                current.lease.seq.checked_add(1).ok_or_else(|| {
+                    LeaseError::Invalid("leader authority sequence exhausted".into())
+                })?;
+            let mut lease = current.lease.clone();
+            lease.seq = sequence;
+            let mut next = current.preserve_with_lease(lease);
+            next.artifact_cleanup = Some(replacement.clone());
+            next.validate()?;
+            match self
+                .create_authority_record(Some(&published), &next)
+                .await?
+            {
+                AuthorityCreateOutcome::Created | AuthorityCreateOutcome::ExistingIdentical => {
+                    return Ok(replacement);
+                }
+                AuthorityCreateOutcome::Contended(winner) => {
+                    if !winner.lease.matches_proof(proof) {
+                        return Err(ClusterCheckpointAuthorityError::Fenced);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+
+    /// Complete metadata deletion and authorize the exact next expired checkpoint, if any.
+    ///
+    /// The transition clears the journal at genesis or immediately before the previously
+    /// reclaimed stop boundary. Otherwise it loads the immutable next index and records its exact
+    /// predecessor and participants before any deletion of that target is allowed.
+    ///
+    /// # Errors
+    /// Fails for a stale proof, stale or non-`DeleteMetadata` cursor, a broken predecessor chain,
+    /// or object-store failure.
+    pub async fn mark_cluster_artifact_metadata_deleted(
+        &self,
+        proof: &LeaderProof,
+        expected: &ClusterArtifactCleanupCursor,
+    ) -> Result<Option<ClusterArtifactCleanupCursor>, ClusterCheckpointAuthorityError> {
+        if !proof.is_canonical() {
+            return Err(ClusterCheckpointAuthorityError::Fenced);
+        }
+        expected.validate()?;
+        if expected.phase != ClusterArtifactCleanupPhase::DeleteMetadata {
+            return Err(DecisionError::Conflict(
+                "cluster artifact metadata transition requires a DeleteMetadata cursor".into(),
+            )
+            .into());
+        }
+        loop {
+            let published = self
+                .load_published_authority_head()
+                .await?
+                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            let current = &published.record;
+            if !current.lease.matches_proof(proof) {
+                return Err(ClusterCheckpointAuthorityError::Fenced);
+            }
+            if current.artifact_cleanup.as_ref() != Some(expected) {
+                let completed = expected.next.is_none()
+                    || expected.next.as_ref() == expected.stop_before.as_ref();
+                if completed && current.artifact_cleanup.is_none() {
+                    return Ok(None);
+                }
+                if let (Some(next_reference), Some(actual)) =
+                    (expected.next.as_ref(), current.artifact_cleanup.as_ref())
+                {
+                    if actual.phase == ClusterArtifactCleanupPhase::DeleteData
+                        && actual.protected == expected.protected
+                        && &actual.current == next_reference
+                        && actual.stop_before == expected.stop_before
+                    {
+                        return Ok(Some(actual.clone()));
+                    }
+                }
+                return Err(DecisionError::Conflict(
+                    "cluster artifact cleanup cursor changed before metadata completion".into(),
+                )
+                .into());
+            }
+
+            let replacement = match expected.next.as_ref() {
+                None => None,
+                Some(next_reference) if Some(next_reference) == expected.stop_before.as_ref() => {
+                    None
+                }
+                Some(next_reference) => {
+                    let decisions = CheckpointDecisionStore::new(Arc::clone(&self.store));
+                    let index = decisions.load_committed_checkpoint(next_reference).await?;
+                    if index.scope != CheckpointScope::Cluster {
+                        return Err(DecisionError::Conflict(
+                            "cluster artifact cleanup next checkpoint is not cluster-scoped".into(),
+                        )
+                        .into());
+                    }
+                    let replacement = ClusterArtifactCleanupCursor {
+                        protected: expected.protected.clone(),
+                        current: next_reference.clone(),
+                        next: index.predecessor.clone(),
+                        stop_before: expected.stop_before.clone(),
+                        participant_ids: Self::cleanup_participant_ids(&index)?,
+                        phase: ClusterArtifactCleanupPhase::DeleteData,
+                    };
+                    replacement.validate()?;
+                    Some(replacement)
+                }
+            };
+
+            let sequence =
+                current.lease.seq.checked_add(1).ok_or_else(|| {
+                    LeaseError::Invalid("leader authority sequence exhausted".into())
+                })?;
+            let mut lease = current.lease.clone();
+            lease.seq = sequence;
+            let mut next = current.preserve_with_lease(lease);
+            next.artifact_cleanup = replacement.clone();
+            next.validate()?;
+            match self
+                .create_authority_record(Some(&published), &next)
+                .await?
+            {
+                AuthorityCreateOutcome::Created | AuthorityCreateOutcome::ExistingIdentical => {
+                    return Ok(replacement);
+                }
+                AuthorityCreateOutcome::Contended(winner) => {
+                    if !winner.lease.matches_proof(proof) {
+                        return Err(ClusterCheckpointAuthorityError::Fenced);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
     }
 
     /// Exact continuity boundary for cluster outcomes compacted from the authority history.
@@ -5057,223 +5519,6 @@ impl LeaderLeaseStore {
         Ok(ClusterOutcomeRetentionBoundary::from_floor(
             head.as_ref().and_then(|head| head.outcome_floor.as_ref()),
         ))
-    }
-
-    /// Read an existing cluster retention boundary after auditing its outcome chain and selected
-    /// committed checkpoint, without invoking a caller-supplied state-artifact preflight.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the authority history or selected committed checkpoint is invalid.
-    pub async fn audited_cluster_outcome_retention_boundary(
-        &self,
-    ) -> Result<ClusterOutcomeRetentionBoundary, ClusterCheckpointAuthorityError> {
-        Ok(self
-            .validated_cluster_outcome_inventory(|_| async { Ok(()) })
-            .await?
-            .retention_boundary)
-    }
-
-    /// Read live outcomes and their retention boundary only after the selected live Commit passes
-    /// the caller's durable recovery metadata preflight and both outcome heads and the floor remain
-    /// unchanged.
-    ///
-    /// # Errors
-    ///
-    /// Fails when authority history is invalid or artifact validation fails.
-    pub async fn validated_cluster_outcome_inventory<V, Fut>(
-        &self,
-        validate_artifacts: V,
-    ) -> Result<ClusterOutcomeInventory, ClusterCheckpointAuthorityError>
-    where
-        V: Fn(CheckpointOutcome) -> Fut,
-        Fut: std::future::Future<Output = Result<(), String>>,
-    {
-        loop {
-            let current = self
-                .load_record()
-                .await?
-                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-            let snapshot = self.cached_audited_cluster_outcomes_from(&current).await?;
-            if let Some(floor) = current.outcome_floor.as_ref() {
-                self.preflight_cluster_recovery_cut(floor, &snapshot.outcomes, &validate_artifacts)
-                    .await?;
-            }
-            let rechecked = self
-                .load_record()
-                .await?
-                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-            if rechecked.outcome_head == current.outcome_head
-                && rechecked.commit_head == current.commit_head
-                && rechecked.outcome_floor == current.outcome_floor
-            {
-                return Ok(Self::cluster_outcome_inventory_from_audit(
-                    Some(&current),
-                    &snapshot.outcomes,
-                ));
-            }
-            tokio::task::yield_now().await;
-        }
-    }
-
-    /// Advance the cluster outcome floor through the exact next authority sequence.
-    ///
-    /// At least one live commit remains at or above the requested horizon. Outcome-bearing
-    /// records below the floor become eligible for deletion only after the floor is durable.
-    ///
-    /// # Errors
-    ///
-    /// Fails for a stale proof, invalid horizon, failed artifact validation, or storage failure.
-    pub async fn prune_cluster_outcomes_before<V, Fut>(
-        &self,
-        proof: &LeaderProof,
-        before_epoch: u64,
-        validate_artifacts: V,
-    ) -> Result<u64, ClusterCheckpointAuthorityError>
-    where
-        V: Fn(CheckpointOutcome) -> Fut,
-        Fut: std::future::Future<Output = Result<(), String>>,
-    {
-        if before_epoch == 0 {
-            return Ok(self
-                .cluster_outcome_retention_boundary()
-                .await?
-                .artifact_before_epoch);
-        }
-        if !proof.is_canonical() {
-            return Err(ClusterCheckpointAuthorityError::Fenced);
-        }
-        loop {
-            let current = self
-                .load_record()
-                .await?
-                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-            if !current.lease.matches_proof(proof) {
-                return Err(ClusterCheckpointAuthorityError::Fenced);
-            }
-            if let Some(floor) = current
-                .outcome_floor
-                .as_ref()
-                .filter(|floor| floor.artifact_before_epoch >= before_epoch)
-            {
-                self.schedule_history_prune();
-                return Ok(floor.artifact_before_epoch);
-            }
-            let snapshot = self.cached_audited_cluster_outcomes_from(&current).await?;
-            if !snapshot
-                .outcomes
-                .iter()
-                .any(|outcome| outcome.epoch >= before_epoch && outcome.is_commit())
-            {
-                return Err(DecisionError::Conflict(format!(
-                    "cannot advance cluster outcome floor to {before_epoch}: no live commit recovery cut would remain"
-                ))
-                .into());
-            }
-            let authority_before_epoch = current
-                .outcome_floor
-                .as_ref()
-                .map_or(before_epoch, |floor| {
-                    floor.authority_before_epoch.max(before_epoch)
-                });
-            let floor = self
-                .build_cluster_outcome_floor(
-                    &current,
-                    &snapshot,
-                    before_epoch,
-                    authority_before_epoch,
-                )
-                .await?;
-            self.preflight_cluster_recovery_cut(&floor, &snapshot.outcomes, &validate_artifacts)
-                .await?;
-
-            // Lease renewals and catalog seals may advance the shared sequence while the complete
-            // recovery metadata preflight performs remote reads. They are harmless only when both the
-            // outcome heads and retention floor remain exactly the same.
-            let published = self
-                .load_published_authority_head()
-                .await?
-                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-            let rechecked = &published.record;
-            if !rechecked.lease.matches_proof(proof) {
-                return Err(ClusterCheckpointAuthorityError::Fenced);
-            }
-            if rechecked.outcome_head != current.outcome_head
-                || rechecked.commit_head != current.commit_head
-                || rechecked.outcome_floor != current.outcome_floor
-            {
-                tokio::task::yield_now().await;
-                continue;
-            }
-            let base_sequence = rechecked.lease.seq;
-            let sequence = base_sequence
-                .checked_add(1)
-                .ok_or_else(|| LeaseError::Invalid("leader authority sequence exhausted".into()))?;
-            let mut next = rechecked.preserve_with_lease(LeaderLease {
-                seq: sequence,
-                renewal_sequence: rechecked.lease.renewal_sequence,
-                token: rechecked.lease.token,
-                owner: rechecked.lease.owner.clone(),
-                expires_at_ms: rechecked.lease.expires_at_ms,
-                catalog_manifest: rechecked.lease.catalog_manifest.clone(),
-            });
-            next.outcome_floor = Some(floor.clone());
-            next.validate()?;
-            match self
-                .create_authority_record(Some(&published), &next)
-                .await?
-            {
-                AuthorityCreateOutcome::Created => {
-                    self.install_cluster_outcome_audit(
-                        Self::cluster_outcome_audit_key(&next),
-                        next.lease.seq,
-                        Self::outcomes_retained_by_floor(&floor, &snapshot),
-                    );
-                    return Ok(before_epoch);
-                }
-                AuthorityCreateOutcome::ExistingIdentical => {
-                    let winner_floor = next.outcome_floor.as_ref().ok_or_else(|| {
-                        LeaseError::Invalid(
-                            "durable floor winner lost its retention boundary".into(),
-                        )
-                    })?;
-                    let winner_snapshot = self.cached_audited_cluster_outcomes_from(&next).await?;
-                    self.preflight_cluster_recovery_cut(
-                        winner_floor,
-                        &winner_snapshot.outcomes,
-                        &validate_artifacts,
-                    )
-                    .await?;
-                    let confirmed = self
-                        .load_record()
-                        .await?
-                        .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-                    if !confirmed.lease.matches_proof(proof) {
-                        return Err(ClusterCheckpointAuthorityError::Fenced);
-                    }
-                    if confirmed.outcome_head == next.outcome_head
-                        && confirmed.commit_head == next.commit_head
-                        && confirmed.outcome_floor == next.outcome_floor
-                    {
-                        return Ok(before_epoch);
-                    }
-                    tokio::task::yield_now().await;
-                }
-                AuthorityCreateOutcome::Contended(winner) => {
-                    if !winner.lease.matches_proof(proof) {
-                        return Err(ClusterCheckpointAuthorityError::Fenced);
-                    }
-                    if winner.lease.seq <= base_sequence {
-                        return Err(LeaseError::Invalid(
-                            "outcome floor contention did not advance the authority sequence"
-                                .into(),
-                        )
-                        .into());
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }
-        }
     }
 
     /// Acquire an empty authority as a new term, or rotate the fencing token when this exact

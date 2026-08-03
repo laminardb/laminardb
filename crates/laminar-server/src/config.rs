@@ -394,9 +394,6 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     if config.checkpoint.max_node_data_bytes == Some(0) {
         errors.push("checkpoint.max_node_data_bytes must be > 0".to_string());
     }
-    if config.checkpoint.max_retained == 0 {
-        errors.push("checkpoint.max_retained must be > 0".to_string());
-    }
     // 0 prunes every prior timestamp, so the restart-rate budget never trips (unbounded restart loop).
     if config.supervision.window_secs == Some(0) {
         errors.push("supervision.window_secs must be > 0".to_string());
@@ -643,9 +640,6 @@ pub struct CheckpointSection {
     /// One end-to-end checkpoint-attempt deadline.
     #[serde(default = "default_checkpoint_timeout", with = "humantime_serde")]
     pub timeout: Duration,
-    /// Number of predecessor checkpoints retained alongside the current recovery cut.
-    #[serde(default = "default_max_retained")]
-    pub max_retained: usize,
     /// Cloud storage credentials/config (e.g., `aws_access_key_id`).
     #[serde(default)]
     pub storage: std::collections::HashMap<String, String>,
@@ -661,7 +655,6 @@ impl Default for CheckpointSection {
             url: default_checkpoint_url(),
             interval: default_checkpoint_interval(),
             timeout: default_checkpoint_timeout(),
-            max_retained: default_max_retained(),
             storage: std::collections::HashMap::new(),
             max_node_data_bytes: None,
         }
@@ -675,7 +668,6 @@ impl std::fmt::Debug for CheckpointSection {
             .field("url", &self.url)
             .field("interval", &self.interval)
             .field("timeout", &self.timeout)
-            .field("max_retained", &self.max_retained)
             .field(
                 "storage",
                 &self
@@ -1032,9 +1024,6 @@ fn default_checkpoint_url() -> String {
     } else {
         format!("file:///{path_str}")
     }
-}
-fn default_max_retained() -> usize {
-    10
 }
 fn default_incremental_emit() -> bool {
     true

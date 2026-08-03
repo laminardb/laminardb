@@ -640,7 +640,7 @@ async fn run_conditional_probe(
             mode: PutMode::Create,
             ..PutOptions::default()
         };
-        let created = store
+        store
             .put_opts(
                 &path,
                 PutPayload::from_static(b"laminardb-conditional-create-v1"),
@@ -667,13 +667,18 @@ async fn run_conditional_probe(
             Err(error) => return Err(error.into()),
         }
         if require_update {
-            let stale: UpdateVersion = created.into();
+            let observed = store.get(&path).await?;
+            let stale = UpdateVersion {
+                e_tag: observed.meta.e_tag.clone(),
+                version: observed.meta.version.clone(),
+            };
             if stale.e_tag.is_none() && stale.version.is_none() {
                 return Err(CheckpointStoreError::Invalid(
-                    "object store returned no version for conditional update".into(),
+                    "object store GET returned neither ETag nor version for conditional update"
+                        .into(),
                 ));
             }
-            let updated = store
+            store
                 .put_opts(
                     &path,
                     PutPayload::from_static(b"laminardb-conditional-update-v2"),
@@ -702,12 +707,27 @@ async fn run_conditional_probe(
                 }
                 Err(error) => return Err(error.into()),
             }
-            let current: UpdateVersion = updated.into();
+            let observed = store.get(&path).await?;
+            let current = UpdateVersion {
+                e_tag: observed.meta.e_tag.clone(),
+                version: observed.meta.version.clone(),
+            };
             if current.e_tag.is_none() && current.version.is_none() {
                 return Err(CheckpointStoreError::Invalid(
-                    "object store returned no version after conditional update".into(),
+                    "object store GET returned neither ETag nor version after conditional update"
+                        .into(),
                 ));
             }
+            store
+                .put_opts(
+                    &path,
+                    PutPayload::from_static(b"laminardb-conditional-update-v3"),
+                    PutOptions {
+                        mode: PutMode::Update(current),
+                        ..PutOptions::default()
+                    },
+                )
+                .await?;
         }
         Ok::<(), CheckpointStoreError>(())
     };

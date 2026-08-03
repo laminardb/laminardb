@@ -26,11 +26,14 @@ leader-fenced authority chain. Recovery verifies each manifest and range, restor
 participant frames, then replays sources from the committed offsets. It never scans checkpoint
 objects to infer state references.
 
-Retention follows explicit predecessor references, and manifests bind referenced chunks to
-validated frame counts. The live prefix is bounded, but garbage collection currently walks the
-committed-index chain to genesis to enumerate every expired cut. It computes live chunks from
-retained manifests, deletes only expired node objects absent from that live set, then removes
-expired manifests. It does not use object-store LIST to discover liveness.
+Retention keeps only the authoritative latest recovery cut because its manifests are a complete
+logical inventory and directly reference every older live chunk. A bounded two-phase cursor
+retires one exact predecessor at a time: data first, then manifests and the committed index. Local
+mode updates a dedicated durable head under its namespace lease; shared-store updates use native
+conditional writes, and cluster mode records every transition in the leader-fenced authority
+sequence. Restart or takeover resumes the durable phase without LIST or a pre-scan of checkpoint
+history; the O(1) cursor advances toward the prior durable floor or genesis. Validated per-manifest
+frame counts determine chunk liveness.
 
 Checkpoint storage is provider-neutral through the `object_store` crate. Configuration selects
 local filesystem, S3 (including R2/MinIO through S3 endpoint options), GCS, or Azure Blob by URL.
@@ -55,7 +58,6 @@ The following remain production gaps, not alternate state implementations:
   assignment-fenced installation are complete. Revoke-only changes remain supported.
 - Durable Aborts reclaim exact prepared objects, including after restart. An attempt that crashes
   before publishing a terminal decision can still leave unreferenced checkpoint metadata.
-- Retention traversal and deletion are not yet bounded by a crash-resumable artifact journal.
 - Checkpoint capture still performs state-sized snapshot work synchronously; its tail latency is
   not certified.
 - Mutable update/merge joins, materialized-view joins, unbounded retention policy, and the complete

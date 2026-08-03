@@ -26,10 +26,10 @@ same vnode frames and include its retained history.
 
 Node data is created before its immutable manifest; the manifest is created last as the participant
 readiness marker. Recovery restores the latest committed checkpoint and replays sources from its
-offsets. Range GETs load only the vnodes assigned to the recovering node. The retained live prefix
-is bounded, while current garbage collection follows predecessor indices to genesis to enumerate
-expired cuts. Validated manifest chunk counts and frame references drive deletion; object listing
-is never used to infer references.
+offsets. Range GETs load only the vnodes assigned to the recovering node. Retention keeps that one
+complete recovery cut and retires exact predecessors through a crash-resumable data-then-metadata
+cursor. Validated manifest chunk counts and frame references drive deletion; object listing is
+never used to infer references.
 
 Checkpoint configuration is a provider-neutral URL. S3, GCS, Azure Blob, S3-compatible R2 and
 MinIO, and local filesystem storage use the same `object_store` path. LaminarDB does not add

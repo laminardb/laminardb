@@ -260,7 +260,6 @@ async fn run_embedded_mode() -> Result<(), Box<dyn std::error::Error>> {
         .checkpoint(StreamCheckpointConfig {
             data_dir: Some(ckpt_dir),
             interval_ms: Some(30_000),
-            max_retained: Some(5),
             ..StreamCheckpointConfig::default()
         })
         .build()
@@ -333,7 +332,6 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
         .checkpoint(StreamCheckpointConfig {
             data_dir: Some(ckpt_dir),
             interval_ms: Some(30_000),
-            max_retained: Some(5),
             ..StreamCheckpointConfig::default()
         })
         .build()
