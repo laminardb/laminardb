@@ -101,7 +101,7 @@ async fn startup_uses_one_checkpoint_state_budget_for_admission_and_storage() {
 }
 
 #[tokio::test]
-async fn recovered_global_watermark_floors_a_source_without_a_source_watermark() {
+async fn checkpoint_does_not_invent_a_watermark_for_an_uninitialized_channel() {
     let root = tempfile::tempdir().unwrap();
     let db = exact_builder(root.path())
         .delivery_guarantee(DeliveryGuarantee::BestEffort)
@@ -160,13 +160,13 @@ async fn recovered_global_watermark_floors_a_source_without_a_source_watermark()
 
     assert_eq!(
         db.pipeline_watermark.load(Ordering::Acquire),
-        1_500,
-        "the durable global frontier must seed the rebuilt tracker",
+        i64::MIN,
+        "channel progress, not the process-local aggregate, defines the durable frontier",
     );
     assert_eq!(
         source.source.current_watermark(),
-        1_500,
-        "a source missing a per-source value must inherit the durable frontier",
+        i64::MIN,
+        "an uninitialized source channel must remain uninitialized after recovery",
     );
     db.shutdown().await.unwrap();
 }

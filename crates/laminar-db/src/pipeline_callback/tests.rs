@@ -1598,7 +1598,7 @@ async fn follower_capture_request_includes_whole_operator_graph_state() {
         .find(|frame| {
             frame.key
                 == laminar_core::checkpoint::StateFrameKey::OperatorWhole {
-                    operator_id: "follower-checkpoint-evidence".into(),
+                    operator_id: "graph:follower-checkpoint-evidence".into(),
                 }
         })
         .expect("the operator frame must be present in the follower request");

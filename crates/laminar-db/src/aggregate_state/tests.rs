@@ -627,11 +627,12 @@ async fn retained_state_accounting_tracks_groups_without_drifting_on_fixed_size_
 #[tokio::test]
 async fn retained_state_accounting_includes_topology_and_changelog_lifecycle() {
     let sql = "SELECT name, SUM(value) AS total FROM events GROUP BY name";
-    let (_, local) = setup_agg_state(sql).await;
-    let (_, sharded) =
+    let (_, smaller_topology) =
+        setup_agg_state_for_key_groups(sql, false, KeyGroupCount::try_from(1_u32).unwrap()).await;
+    let (_, larger_topology) =
         setup_agg_state_for_key_groups(sql, false, KeyGroupCount::try_from(16_u32).unwrap()).await;
     assert!(
-        sharded.accounted_state_bytes() > local.accounted_state_bytes(),
+        larger_topology.accounted_state_bytes() > smaller_topology.accounted_state_bytes(),
         "a larger immutable vnode address space must carry a larger topology charge"
     );
 

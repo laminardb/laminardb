@@ -3976,6 +3976,7 @@ async fn caught_stateful_cycle_panic_poison_prevents_graph_reuse() {
 async fn test_og_checkpoint_roundtrip_aggregate() {
     // Aggregate state should survive checkpoint + restore
     let mut graph = test_graph();
+    graph.register_source_schema("trades".to_string(), test_schema());
     graph.add_query(
         "agg".to_string(),
         "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol".to_string(),
@@ -3985,6 +3986,7 @@ async fn test_og_checkpoint_roundtrip_aggregate() {
         None,
         false,
     );
+    let mut graph = graph.initialize_managed_state().await.unwrap();
 
     let mut source = FxHashMap::default();
     source.insert(Arc::from("trades"), vec![test_batch()]);
@@ -3997,6 +3999,7 @@ async fn test_og_checkpoint_roundtrip_aggregate() {
 
     // Create a new graph with same query and restore
     let mut graph2 = test_graph();
+    graph2.register_source_schema("trades".to_string(), test_schema());
     graph2.add_query(
         "agg".to_string(),
         "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol".to_string(),
@@ -4006,6 +4009,7 @@ async fn test_og_checkpoint_roundtrip_aggregate() {
         None,
         false,
     );
+    let graph2 = graph2.initialize_managed_state().await.unwrap();
 
     let (restored_graph, restored) = graph2
         .restore_state_frames(

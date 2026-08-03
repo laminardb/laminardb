@@ -305,7 +305,7 @@ async fn assignment_zero_cannot_publish_a_predecessor_process_certificate() {
     assert!(
         error
             .to_string()
-            .contains("target assignment does not bind the local ownership"),
+            .contains("target assignment does not bind local ownership"),
         "{error}"
     );
     assert_eq!(registry.assignment_version(), 0);
@@ -2127,6 +2127,7 @@ async fn source_drain_validation_requires_a_vnode_registry() {
     use uuid::Uuid;
 
     let db = LaminarDB::builder().build().await.unwrap();
+    *db.vnode_registry.lock() = None;
     let participant = CheckpointParticipant {
         node_id: 1,
         boot_incarnation: Uuid::from_u128(11),
@@ -9037,7 +9038,7 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
     assignment_store.save_if_absent(&assignment).await.unwrap();
     controller.publish_checkpoint_assignment_fence(Some(assignment.assignment_fence().unwrap()));
     controller.set_active(true);
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
     let db = LaminarDB::builder()
         .cluster_controller(controller)
         .cluster_checkpoint_object_store(Arc::clone(&authority.checkpoint_store))

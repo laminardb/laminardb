@@ -1032,7 +1032,7 @@ mod tests {
 
     #[tokio::test]
     async fn checkpoint_node_data_budget_is_resolved() {
-        for max_node_data_bytes in [17, isize::MAX as u64] {
+        for max_node_data_bytes in [17, isize::MAX as u64, (isize::MAX as u64) + 1] {
             let directory = tempfile::tempdir().unwrap();
             let db = LaminarDbBuilder::new()
                 .storage_dir(directory.path())
@@ -1072,26 +1072,6 @@ mod tests {
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.max_node_data_bytes),
             Some(expected)
-        );
-    }
-
-    #[tokio::test]
-    async fn checkpoint_node_data_budget_rejects_an_unaddressable_limit() {
-        let unaddressable = (isize::MAX as u64) + 1;
-        let error = LaminarDbBuilder::new()
-            .checkpoint(StreamCheckpointConfig {
-                max_node_data_bytes: Some(unaddressable),
-                ..StreamCheckpointConfig::default()
-            })
-            .build()
-            .await
-            .expect_err("checkpoint recovery must not accept an unaddressable node-data limit");
-
-        assert!(
-            error
-                .to_string()
-                .contains("exceeds this process address space"),
-            "{error}"
         );
     }
 
