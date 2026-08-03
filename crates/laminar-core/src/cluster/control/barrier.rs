@@ -15,7 +15,7 @@ use crate::checkpoint::CheckpointAttempt;
 use crate::checkpoint::CheckpointWatermark;
 use crate::cluster::discovery::NodeId;
 #[cfg(feature = "cluster")]
-use crate::cluster::discovery::{NodeInfo, NodeState};
+use crate::cluster::discovery::NodeInfo;
 #[cfg(feature = "cluster")]
 use tokio::sync::watch;
 
@@ -221,17 +221,15 @@ pub struct BarrierAnnouncement {
     pub checkpoint_id: u64,
     /// Exact clustered assignment cut captured when this attempt was admitted. Required on every
     /// clustered `Prepare` and retained on terminal phases for exact follower validation.
-    #[serde(default)]
     pub assignment_fence: Option<super::CheckpointAssignmentFence>,
     /// Exact durable leader term that issued this announcement. Clustered reversible phases
     /// (`Prepare` and `Aligned`) are rejected unless this proof is present and still live.
     /// Terminal notifications carry it only for diagnostics; their authority comes from the
     /// immutable durable checkpoint outcome.
-    #[serde(default)]
     pub leader_proof: Option<super::LeaderProof>,
     /// Phase this announcement signals.
     pub phase: Phase,
-    /// Reserved for unaligned/other flags.
+    /// Checkpoint behavior flags from [`crate::checkpoint::flags`].
     pub flags: u64,
 }
 
@@ -445,36 +443,58 @@ fn validate_scanned_announcements(
         })
 }
 
-/// Follower ack. `ok = false` forces the leader to abort instead of wait.
+/// Follower checkpoint-prepare disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BarrierAckDisposition {
+    /// Local alignment, capture, and durable preparation completed.
+    Prepared,
+    /// Local preparation completed and the captured cut retains handoff replay work.
+    PreparedWithReplay,
+    /// Local checkpoint preparation failed and requires normal failure handling.
+    Failed,
+}
+
+impl BarrierAckDisposition {
+    const fn precedence(self) -> u8 {
+        match self {
+            Self::Prepared => 0,
+            Self::PreparedWithReplay => 1,
+            Self::Failed => 2,
+        }
+    }
+}
+
+/// Follower acknowledgement for one exact announcement identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BarrierAck {
     /// Canonical checkpoint ID retained in the wire field named `epoch`.
     pub epoch: u64,
     /// The same nonzero coordinator-assigned checkpoint ID being acknowledged.
-    #[serde(default)]
     pub checkpoint_id: u64,
     /// SHA-256 binding of the announcement's assignment certificate.
-    #[serde(default)]
     pub assignment_digest: Option<[u8; 32]>,
-    /// `false` = snapshot failed locally; leader should abort.
-    pub ok: bool,
-    /// Free-text error; populated when `ok = false`.
+    /// Exact behavior flags echoed from the announcement.
+    pub flags: u64,
+    /// Typed local prepare result.
+    pub disposition: BarrierAckDisposition,
+    /// Free-text reason; populated when preparation fails.
     pub error: Option<String>,
     /// Follower event-time state at ack time. Uninitialized inputs block advancement; only
     /// explicitly idle inputs are excluded from the active cluster minimum.
-    #[serde(default)]
     pub watermark: CheckpointWatermark,
 }
 
 /// Outcome of `wait_for_quorum`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuorumOutcome {
-    /// All expected peers acked with `ok = true`.
+    /// All expected peers prepared successfully.
     Reached {
         /// Peers that acked successfully.
         acks: Vec<NodeId>,
         /// Safe aggregate across all required followers.
         follower_watermark: CheckpointWatermark,
+        /// At least one follower retained replay in the prepared handoff cut.
+        handoff_replay_pending: bool,
     },
     /// Deadline expired with at least one peer silent.
     TimedOut {
@@ -483,7 +503,7 @@ pub enum QuorumOutcome {
         /// Peers that didn't.
         missing: Vec<NodeId>,
     },
-    /// At least one peer acked `ok = false`.
+    /// At least one peer reported a fatal prepare failure.
     Failed {
         /// `(peer, error_message)` for every failed ack.
         failures: Vec<(NodeId, String)>,
@@ -598,6 +618,7 @@ type BarrierFlavor = crossfire::mpsc::Array<BarrierAnnouncement>;
 struct BarrierIdentity {
     attempt: CheckpointAttempt,
     assignment_digest: Option<[u8; 32]>,
+    flags: u64,
 }
 
 #[cfg(feature = "cluster")]
@@ -609,6 +630,7 @@ impl BarrierIdentity {
                 .assignment_fence
                 .as_ref()
                 .map(super::CheckpointAssignmentFence::digest),
+            flags: ann.flags,
         }
     }
 
@@ -616,6 +638,7 @@ impl BarrierIdentity {
         Self {
             attempt: CheckpointAttempt::new(ack.epoch, ack.checkpoint_id),
             assignment_digest: ack.assignment_digest,
+            flags: ack.flags,
         }
     }
 }
@@ -707,7 +730,7 @@ impl PrepareAckState {
         let cached = match self.completed.entry(identity) {
             Entry::Vacant(entry) => entry.insert(ack.clone()),
             Entry::Occupied(mut entry) => {
-                if entry.get().ok && !ack.ok {
+                if ack.disposition.precedence() > entry.get().disposition.precedence() {
                     entry.insert(ack.clone());
                 }
                 entry.into_mut()
@@ -788,7 +811,6 @@ struct GrpcState {
     clients: BarrierClientPool,
     server_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     relay_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    advertise_addr: String,
     local_process: Arc<std::sync::OnceLock<BarrierProcessIdentity>>,
 }
 
@@ -977,6 +999,19 @@ fn checkpoint_watermark_from_wire(
 }
 
 #[cfg(feature = "cluster")]
+fn ack_disposition_to_wire(disposition: BarrierAckDisposition) -> i32 {
+    use barrier_v1::BarrierAckDisposition as WireDisposition;
+
+    match disposition {
+        BarrierAckDisposition::Prepared => WireDisposition::BarrierAckPrepared as i32,
+        BarrierAckDisposition::PreparedWithReplay => {
+            WireDisposition::BarrierAckPreparedWithReplay as i32
+        }
+        BarrierAckDisposition::Failed => WireDisposition::BarrierAckFailed as i32,
+    }
+}
+
+#[cfg(feature = "cluster")]
 fn grpc_ack(ack: BarrierAck) -> barrier_v1::Ack {
     use barrier_v1::CheckpointWatermarkStatus as WireStatus;
 
@@ -991,7 +1026,7 @@ fn grpc_ack(ack: BarrierAck) -> barrier_v1::Ack {
     };
     barrier_v1::Ack {
         epoch: ack.epoch,
-        ok: ack.ok,
+        disposition: ack_disposition_to_wire(ack.disposition),
         error: ack.error,
         local_watermark_ms,
         checkpoint_id: ack.checkpoint_id,
@@ -999,6 +1034,26 @@ fn grpc_ack(ack: BarrierAck) -> barrier_v1::Ack {
             .assignment_digest
             .map_or_else(Vec::new, |digest| digest.to_vec()),
         watermark_status,
+        flags: ack.flags,
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn ack_disposition_from_wire(value: i32) -> Result<BarrierAckDisposition, String> {
+    use barrier_v1::BarrierAckDisposition as WireDisposition;
+
+    match WireDisposition::try_from(value) {
+        Ok(WireDisposition::BarrierAckUnspecified) => {
+            Err("barrier acknowledgement disposition is unspecified".into())
+        }
+        Ok(WireDisposition::BarrierAckPrepared) => Ok(BarrierAckDisposition::Prepared),
+        Ok(WireDisposition::BarrierAckPreparedWithReplay) => {
+            Ok(BarrierAckDisposition::PreparedWithReplay)
+        }
+        Ok(WireDisposition::BarrierAckFailed) => Ok(BarrierAckDisposition::Failed),
+        Err(_) => Err(format!(
+            "unknown barrier acknowledgement disposition {value}"
+        )),
     }
 }
 
@@ -1013,6 +1068,7 @@ fn validate_phase_ack(ack: &barrier_v1::Ack, ann: &BarrierAnnouncement) -> Resul
         .map(super::CheckpointAssignmentFence::digest);
     if ack.epoch != ann.epoch
         || ack.checkpoint_id != ann.checkpoint_id
+        || ack.flags != ann.flags
         || ack.assignment_digest.as_slice()
             != expected_digest
                 .as_ref()
@@ -1020,11 +1076,11 @@ fn validate_phase_ack(ack: &barrier_v1::Ack, ann: &BarrierAnnouncement) -> Resul
     {
         return Err("Barrier phase acknowledgement identity mismatch".into());
     }
-    if !ack.ok {
+    if ack_disposition_from_wire(ack.disposition)? != BarrierAckDisposition::Prepared {
         return Err(ack
             .error
             .clone()
-            .unwrap_or_else(|| "Barrier phase was rejected by follower".into()));
+            .unwrap_or_else(|| "Barrier phase was rejected by follower with no reason".into()));
     }
     Ok(())
 }
@@ -1226,6 +1282,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         let identity = BarrierIdentity {
             attempt,
             assignment_digest,
+            flags: req.flags,
         };
 
         self.require_live_process_lease()?;
@@ -1283,6 +1340,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         if ack.epoch != attempt.epoch
             || ack.checkpoint_id != attempt.checkpoint_id
             || ack.assignment_digest != assignment_digest
+            || ack.flags != req.flags
         {
             return Err(tonic::Status::failed_precondition(
                 "Follower acknowledgement identity mismatch",
@@ -1326,7 +1384,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         self.require_live_process_lease()?;
         Ok(tonic::Response::new(barrier_v1::Ack {
             epoch: req.epoch,
-            ok: true,
+            disposition: ack_disposition_to_wire(BarrierAckDisposition::Prepared),
             error: None,
             local_watermark_ms: None,
             checkpoint_id: req.checkpoint_id,
@@ -1334,6 +1392,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
                 .as_ref()
                 .map_or_else(Vec::new, |fence| fence.digest().to_vec()),
             watermark_status: 0,
+            flags: req.flags,
         }))
     }
 
@@ -1365,7 +1424,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         self.require_live_process_lease()?;
         Ok(tonic::Response::new(barrier_v1::Ack {
             epoch: req.epoch,
-            ok: true,
+            disposition: ack_disposition_to_wire(BarrierAckDisposition::Prepared),
             error: None,
             local_watermark_ms: None,
             checkpoint_id: req.checkpoint_id,
@@ -1373,6 +1432,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
                 .as_ref()
                 .map_or_else(Vec::new, |fence| fence.digest().to_vec()),
             watermark_status: 0,
+            flags: req.flags,
         }))
     }
 
@@ -1404,7 +1464,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         self.require_live_process_lease()?;
         Ok(tonic::Response::new(barrier_v1::Ack {
             epoch: req.epoch,
-            ok: true,
+            disposition: ack_disposition_to_wire(BarrierAckDisposition::Prepared),
             error: None,
             local_watermark_ms: None,
             checkpoint_id: req.checkpoint_id,
@@ -1412,6 +1472,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
                 .as_ref()
                 .map_or_else(Vec::new, |fence| fence.digest().to_vec()),
             watermark_status: 0,
+            flags: req.flags,
         }))
     }
 }
@@ -1688,10 +1749,7 @@ fn send_local_phase_notification(
     Ok(())
 }
 
-/// Typed prepare-failure classification for the quorum wait:
-/// `Unreachable` counts toward `TimedOut{missing}` (the peer cannot
-/// participate), `Nack` toward `Failed` (a live follower answered
-/// `ok = false`).
+/// Typed prepare-failure classification for the quorum wait.
 #[cfg(feature = "cluster")]
 enum PeerFailure {
     Unreachable,
@@ -1704,7 +1762,7 @@ struct PrepareFanoutBatch {
     announcement: BarrierAnnouncement,
     expected: Vec<NodeId>,
     // `JoinSet` aborts all remaining tasks when the batch or quorum future is dropped.
-    tasks: tokio::task::JoinSet<Result<(NodeId, CheckpointWatermark), (NodeId, PeerFailure)>>,
+    tasks: tokio::task::JoinSet<Result<(NodeId, CheckpointWatermark, bool), (NodeId, PeerFailure)>>,
 }
 
 #[cfg(feature = "cluster")]
@@ -2032,9 +2090,10 @@ fn validate_prepare_ack(
     prepare: &BarrierAnnouncement,
     assignment_digest: Option<&[u8; 32]>,
     ack: barrier_v1::Ack,
-) -> Result<(NodeId, CheckpointWatermark), (NodeId, PeerFailure)> {
+) -> Result<(NodeId, CheckpointWatermark, bool), (NodeId, PeerFailure)> {
     if ack.epoch != prepare.epoch
         || ack.checkpoint_id != prepare.checkpoint_id
+        || ack.flags != prepare.flags
         || ack.assignment_digest.as_slice()
             != assignment_digest.map_or(&[][..], <[u8; 32]>::as_slice)
     {
@@ -2043,17 +2102,31 @@ fn validate_prepare_ack(
             PeerFailure::Nack("Prepare acknowledgement identity mismatch".into()),
         ));
     }
-    if !ack.ok {
-        return Err((
-            peer,
-            PeerFailure::Nack(
-                ack.error
-                    .unwrap_or_else(|| "Unknown prepare failure".to_string()),
-            ),
-        ));
-    }
+    let reason = || {
+        ack.error
+            .clone()
+            .unwrap_or_else(|| "Prepare acknowledgement has no reason".to_string())
+    };
+    let handoff_replay_pending = match ack_disposition_from_wire(ack.disposition) {
+        Ok(BarrierAckDisposition::Prepared) => false,
+        Ok(BarrierAckDisposition::PreparedWithReplay) => {
+            if prepare.flags & crate::checkpoint::flags::HANDOFF == 0 {
+                return Err((
+                    peer,
+                    PeerFailure::Nack(
+                        "Prepare acknowledgement retained replay without the HANDOFF flag".into(),
+                    ),
+                ));
+            }
+            true
+        }
+        Ok(BarrierAckDisposition::Failed) => {
+            return Err((peer, PeerFailure::Nack(reason())));
+        }
+        Err(error) => return Err((peer, PeerFailure::Nack(error))),
+    };
     checkpoint_watermark_from_wire(ack.watermark_status, ack.local_watermark_ms)
-        .map(|watermark| (peer, watermark))
+        .map(|watermark| (peer, watermark, handoff_replay_pending))
         .map_err(|error| (peer, PeerFailure::Nack(error)))
 }
 
@@ -2082,7 +2155,7 @@ async fn prepare_peer_until_deadline(
     prepare: BarrierAnnouncement,
     deadline: tokio::time::Instant,
     max_attempt_duration: Duration,
-) -> Result<(NodeId, CheckpointWatermark), (NodeId, PeerFailure)> {
+) -> Result<(NodeId, CheckpointWatermark, bool), (NodeId, PeerFailure)> {
     let assignment = assignment_fence_to_wire(prepare.assignment_fence.as_ref());
     let assignment_digest = prepare
         .assignment_fence
@@ -2564,7 +2637,6 @@ impl BarrierCoordinator {
             clients,
             server_handle: Arc::new(parking_lot::Mutex::new(Some(server_task))),
             relay_handle: Arc::new(parking_lot::Mutex::new(Some(relay_task))),
-            advertise_addr: advertise_addr.clone(),
             local_process: Arc::clone(&local_process),
         });
 
@@ -2694,43 +2766,6 @@ impl BarrierCoordinator {
             return Err("explicit Prepare fan-out requires an assignment certificate".into());
         }
         self.announce_inner(ann, Some(quorum_window)).await
-    }
-
-    #[cfg(feature = "cluster")]
-    async fn discover_assignment_less_phase_peers(&self, local_address: &str) -> Vec<NodeId> {
-        let live: Option<FxHashSet<NodeId>> =
-            self.leader_election
-                .lock()
-                .clone()
-                .map(|(_, members_rx, _)| {
-                    members_rx
-                        .borrow()
-                        .iter()
-                        .filter(|member| {
-                            matches!(member.state, NodeState::Active | NodeState::Draining)
-                        })
-                        .map(|member| member.id)
-                        .collect()
-                });
-        let mut discovered = Vec::new();
-        for (node_id, raw_endpoint) in self.kv.scan(BARRIER_ADDR_KEY).await {
-            let address = match decode_barrier_endpoint(&raw_endpoint) {
-                Ok((address, None)) => address,
-                Ok((_, Some(_))) => continue,
-                Err(error) => {
-                    tracing::warn!(peer = node_id.0, %error, "ignoring invalid cluster control endpoint");
-                    continue;
-                }
-            };
-            if address == local_address {
-                continue;
-            }
-            if live.as_ref().is_some_and(|live| !live.contains(&node_id)) {
-                continue;
-            }
-            discovered.push(node_id);
-        }
-        discovered
     }
 
     async fn announce_inner(
@@ -2904,10 +2939,7 @@ impl BarrierCoordinator {
                         // path and excludes Active processes outside the frozen cut.
                         roster
                     } else {
-                        // Feature-enabled embedded and single-node use remains assignment-less.
-                        // Only that compatibility path discovers direct peers from membership.
-                        self.discover_assignment_less_phase_peers(&state.advertise_addr)
-                            .await
+                        Vec::new()
                     };
 
                     let results = send_phase_notifications(&state, &self.kv, ann, expected).await;
@@ -3089,6 +3121,21 @@ impl BarrierCoordinator {
             .assignment_fence
             .as_ref()
             .map(super::CheckpointAssignmentFence::digest);
+        if prepare.assignment_fence.is_none() {
+            if expected.is_empty() {
+                return QuorumOutcome::Reached {
+                    acks: Vec::new(),
+                    follower_watermark: CheckpointWatermark::Uninitialized,
+                    handoff_replay_pending: false,
+                };
+            }
+            return QuorumOutcome::Failed {
+                failures: vec![(
+                    expected[0],
+                    "remote checkpoint quorum requires an assignment certificate".into(),
+                )],
+            };
+        }
         #[cfg(feature = "cluster")]
         {
             let grpc_opt = self.grpc.lock().clone();
@@ -3104,7 +3151,7 @@ impl BarrierCoordinator {
                         };
                     }
                 };
-                let eager_batch = if prepare.assignment_fence.is_some() {
+                let mut batch = {
                     let mut pending = state.prepare_fanout.lock();
                     match pending.take() {
                         Some(PrepareFanoutState::Pending(batch))
@@ -3112,7 +3159,7 @@ impl BarrierCoordinator {
                                 && batch.expected == expected_roster =>
                         {
                             *pending = Some(PrepareFanoutState::Claimed(prepare.clone()));
-                            Some(batch)
+                            batch
                         }
                         Some(state @ PrepareFanoutState::Pending(_))
                             if state.announcement() != prepare =>
@@ -3177,52 +3224,42 @@ impl BarrierCoordinator {
                             };
                         }
                     }
-                } else {
-                    None
                 };
 
                 let prepare_deadline = tokio::time::Instant::now() + deadline;
-                let results = if let Some(mut batch) = eager_batch {
-                    debug_assert_eq!(batch.tasks.len(), expected_roster.len());
-                    let mut results = Vec::with_capacity(expected_roster.len());
-                    loop {
-                        match tokio::time::timeout_at(prepare_deadline, batch.tasks.join_next())
-                            .await
-                        {
-                            Ok(Some(Ok(result))) => results.push(result),
-                            Ok(Some(Err(error))) => results.push(Err((
-                                NodeId::UNASSIGNED,
-                                PeerFailure::Nack(format!("Prepare RPC task failed: {error}")),
-                            ))),
-                            Ok(None) | Err(_) => break,
+                debug_assert_eq!(batch.tasks.len(), expected_roster.len());
+                let mut results = Vec::with_capacity(expected_roster.len());
+                loop {
+                    match tokio::time::timeout_at(prepare_deadline, batch.tasks.join_next()).await {
+                        Ok(Some(Ok(Err((peer, PeerFailure::Nack(message)))))) => {
+                            return QuorumOutcome::Failed {
+                                failures: vec![(peer, message)],
+                            };
                         }
+                        Ok(Some(Ok(result))) => results.push(result),
+                        Ok(Some(Err(error))) => {
+                            return QuorumOutcome::Failed {
+                                failures: vec![(
+                                    NodeId::UNASSIGNED,
+                                    format!("Prepare RPC task failed: {error}"),
+                                )],
+                            };
+                        }
+                        Ok(None) | Err(_) => break,
                     }
-                    results
-                } else {
-                    // Embedded/single-node use with the cluster feature and legacy direct tests
-                    // have no assignment certificate. Keep their on-demand direct path intact.
-                    let futures = expected.iter().map(|&peer| {
-                        prepare_peer_until_deadline(
-                            peer,
-                            Arc::clone(&state.clients),
-                            Arc::clone(&self.kv),
-                            prepare.clone(),
-                            prepare_deadline,
-                            deadline / 2,
-                        )
-                    });
-                    futures::future::join_all(futures).await
-                };
+                }
 
                 let mut successful = Vec::new();
                 let mut failures = Vec::new();
                 let mut follower_watermark = None;
+                let mut handoff_replay_pending = false;
                 let mut timed_out = Vec::new();
 
                 for res in results {
                     match res {
-                        Ok((peer, wm)) => {
+                        Ok((peer, wm, replay_pending)) => {
                             successful.push(peer);
+                            handoff_replay_pending |= replay_pending;
                             follower_watermark = Some(follower_watermark.map_or(wm, |current| {
                                 CheckpointWatermark::cluster_min(current, wm)
                             }));
@@ -3250,11 +3287,10 @@ impl BarrierCoordinator {
                 if !failures.is_empty() {
                     return QuorumOutcome::Failed { failures };
                 }
-
-                if !timed_out.is_empty() || successful.len() < expected.len() {
+                if !timed_out.is_empty() || successful.len() < expected_roster.len() {
                     let got = successful;
                     let mut missing = timed_out;
-                    for &peer in expected {
+                    for &peer in &expected_roster {
                         if !got.contains(&peer) && !missing.contains(&peer) {
                             missing.push(peer);
                         }
@@ -3281,6 +3317,7 @@ impl BarrierCoordinator {
                     acks: successful,
                     follower_watermark: follower_watermark
                         .unwrap_or(CheckpointWatermark::Uninitialized),
+                    handoff_replay_pending,
                 };
             }
         }
@@ -3290,11 +3327,13 @@ impl BarrierCoordinator {
         let mut successful: Vec<NodeId> = Vec::new();
         let mut failures: Vec<(NodeId, String)> = Vec::new();
         let mut follower_watermark: Option<CheckpointWatermark>;
+        let mut handoff_replay_pending: bool;
 
         loop {
             successful.clear();
             failures.clear();
             follower_watermark = None;
+            handoff_replay_pending = false;
 
             for (from, json) in self.kv.scan(ACK_KEY).await {
                 if !expected_set.contains(&from) {
@@ -3306,32 +3345,62 @@ impl BarrierCoordinator {
                 if ack.epoch != epoch
                     || ack.checkpoint_id != checkpoint_id
                     || ack.assignment_digest != assignment_digest
+                    || ack.flags != prepare.flags
                 {
                     continue;
                 }
-                if ack.ok {
-                    if let Err(error) = ack.watermark.validate() {
-                        failures.push((from, error));
-                    } else {
-                        successful.push(from);
-                        follower_watermark =
-                            Some(follower_watermark.map_or(ack.watermark, |current| {
-                                current.cluster_min(ack.watermark)
-                            }));
+                match ack.disposition {
+                    BarrierAckDisposition::Prepared => {
+                        if let Err(error) = ack.watermark.validate() {
+                            failures.push((from, error));
+                        } else {
+                            successful.push(from);
+                            follower_watermark =
+                                Some(follower_watermark.map_or(ack.watermark, |current| {
+                                    current.cluster_min(ack.watermark)
+                                }));
+                        }
                     }
-                } else {
-                    failures.push((from, ack.error.unwrap_or_default()));
+                    BarrierAckDisposition::PreparedWithReplay => {
+                        if prepare.flags & crate::checkpoint::flags::HANDOFF == 0 {
+                            failures.push((
+                                from,
+                                "Prepare acknowledgement retained replay without the HANDOFF flag"
+                                    .into(),
+                            ));
+                        } else if let Err(error) = ack.watermark.validate() {
+                            failures.push((from, error));
+                        } else {
+                            handoff_replay_pending = true;
+                            successful.push(from);
+                            follower_watermark =
+                                Some(follower_watermark.map_or(ack.watermark, |current| {
+                                    current.cluster_min(ack.watermark)
+                                }));
+                        }
+                    }
+                    BarrierAckDisposition::Failed => {
+                        failures.push((
+                            from,
+                            ack.error.unwrap_or_else(|| {
+                                "Prepare acknowledgement has no reason".to_string()
+                            }),
+                        ));
+                    }
                 }
             }
 
             if !failures.is_empty() {
+                failures.sort_unstable_by_key(|(peer, _)| peer.0);
                 return QuorumOutcome::Failed { failures };
             }
             if successful.len() == expected.len() {
+                successful.sort_unstable_by_key(|peer| peer.0);
                 return QuorumOutcome::Reached {
                     acks: successful,
                     follower_watermark: follower_watermark
                         .unwrap_or(CheckpointWatermark::Uninitialized),
+                    handoff_replay_pending,
                 };
             }
             if start.elapsed() >= deadline {
@@ -3341,10 +3410,9 @@ impl BarrierCoordinator {
                     .copied()
                     .filter(|n| !got.contains(n))
                     .collect();
-                return QuorumOutcome::TimedOut {
-                    got: successful,
-                    missing,
-                };
+                let mut got = got.into_iter().collect::<Vec<_>>();
+                got.sort_unstable_by_key(|peer| peer.0);
+                return QuorumOutcome::TimedOut { got, missing };
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

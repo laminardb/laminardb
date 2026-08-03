@@ -16,8 +16,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use laminar_core::cluster::control::{
-    AssignmentSnapshot, AssignmentSnapshotStore, BarrierAck, BarrierAnnouncement,
-    CheckpointParticipant, QuorumOutcome,
+    AssignmentSnapshot, AssignmentSnapshotStore, BarrierAck, BarrierAckDisposition,
+    BarrierAnnouncement, CheckpointAssignmentFence, CheckpointParticipant,
+    CheckpointPrepareObservation, LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline, LeaseOutcome,
+    ProcessLease, QuorumOutcome,
 };
 use laminar_core::cluster::discovery::NodeId;
 use laminar_core::cluster::testing::{FaultyObjectStore, MiniCluster, ObjectStoreFault};
@@ -48,6 +50,115 @@ fn test_snapshot(vnodes: BTreeMap<u32, NodeId>) -> AssignmentSnapshot {
     AssignmentSnapshot::empty()
         .next_for_participants(vnodes, participants)
         .unwrap()
+}
+
+async fn announce_certified_prepare(
+    cluster: &MiniCluster,
+    checkpoint_id: u64,
+    quorum_window: Duration,
+) -> BarrierAnnouncement {
+    let owners = cluster
+        .nodes
+        .iter()
+        .map(|node| node.instance_id.0)
+        .collect::<Vec<_>>();
+    let participants = cluster
+        .nodes
+        .iter()
+        .map(|node| CheckpointParticipant {
+            node_id: node.instance_id.0,
+            boot_incarnation: node.controller.recovery_incarnation(),
+        })
+        .collect();
+    let fence = CheckpointAssignmentFence::from_owner_map(checkpoint_id, &owners, participants)
+        .expect("canonical assignment fence");
+
+    let leader = &cluster.nodes[0];
+    let leader_owner = LeaderLeaseOwner {
+        node: leader.instance_id,
+        boot: leader.controller.recovery_incarnation(),
+        process_term: 1,
+    };
+    let authority = Arc::new(LeaderLeaseStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        30_000,
+    ));
+    let leader_lease = match authority.begin_new_term(&leader_owner, 1).await.unwrap() {
+        LeaseOutcome::Acquired(lease) => lease,
+        LeaseOutcome::Held(_) => unreachable!("fresh authority cannot already be held"),
+    };
+
+    for node in &cluster.nodes {
+        node.controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(30))))
+            .unwrap();
+        node.controller
+            .set_leader_lease_store(Arc::clone(&authority));
+        node.controller
+            .publish_checkpoint_assignment_fence(Some(fence.clone()));
+        node.controller
+            .start_leased_barrier_server(
+                "127.0.0.1:0".parse().unwrap(),
+                None,
+                &ProcessLease {
+                    node: node.instance_id,
+                    owner: node.controller.recovery_incarnation(),
+                    term: 1,
+                    seq: 1,
+                    expires_at_ms: i64::MAX,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    leader
+        .controller
+        .set_leader_lease_watch(
+            tokio::sync::watch::channel(Some(leader_lease.clone())).1,
+            leader_owner,
+            Arc::new(LeaseDeadline::live_for(Duration::from_secs(30))),
+        )
+        .unwrap();
+    leader.controller.install_local_leader_proof_provider();
+
+    let announcement = BarrierAnnouncement {
+        epoch: checkpoint_id,
+        checkpoint_id,
+        assignment_fence: Some(fence),
+        leader_proof: Some(leader_lease.proof()),
+        phase: laminar_core::cluster::control::Phase::Prepare,
+        flags: 0,
+    };
+    leader
+        .controller
+        .announce_prepare_barrier(&announcement, quorum_window)
+        .await
+        .expect("announce certified Prepare");
+    announcement
+}
+
+async fn wait_for_certified_prepare(
+    node: &laminar_core::cluster::testing::NodeHandle,
+    expected: &BarrierAnnouncement,
+) {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            match node.controller.observe_checkpoint_prepare().await {
+                Ok(Some(CheckpointPrepareObservation::AssignmentReady(observed)))
+                    if observed == *expected =>
+                {
+                    return;
+                }
+                Ok(Some(CheckpointPrepareObservation::AssignmentRejected { error, .. })) => {
+                    panic!("certified Prepare rejected: {error}");
+                }
+                _ => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("node {} did not observe Prepare", node.instance_id.0));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -104,11 +215,7 @@ async fn leader_is_consistent_across_nodes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn barrier_announce_then_follower_observes_and_acks() {
-    // End-to-end barrier round-trip across real chitchat gossip:
-    //   1. Leader announces a barrier via ClusterKv.
-    //   2. Followers observe via gossip (~100–500 ms).
-    //   3. Followers ack via ClusterKv.
-    //   4. Leader waits for quorum and sees all acks.
+    // Certified Prepare uses leased direct endpoints discovered through gossip.
     let cluster = MiniCluster::spawn(3).await;
     cluster
         .wait_for_convergence(CONVERGENCE_DEADLINE)
@@ -118,49 +225,23 @@ async fn barrier_announce_then_follower_observes_and_acks() {
     let leader = &cluster.nodes[0];
     let followers: Vec<_> = cluster.nodes.iter().skip(1).collect();
     let follower_ids: Vec<_> = followers.iter().map(|n| n.instance_id).collect();
-    let announcement = BarrierAnnouncement {
-        epoch: 7,
-        checkpoint_id: 7,
-        assignment_fence: None,
-        leader_proof: None,
-        phase: laminar_core::cluster::control::Phase::Prepare,
-        flags: 0,
-    };
+    let announcement = announce_certified_prepare(&cluster, 7, Duration::from_secs(6)).await;
+    let assignment_digest = announcement
+        .assignment_fence
+        .as_ref()
+        .map(CheckpointAssignmentFence::digest);
 
-    // Step 1: leader announces.
-    leader
-        .controller
-        .announce_barrier(&announcement)
-        .await
-        .expect("announce");
-
-    // Step 2+3: each follower observes the leader's KV and acks.
-    //   Retry loop tolerates gossip propagation delay.
+    // Each follower validates the exact assignment and authority before acknowledging.
     for follower in &followers {
-        let mut observed = None;
-        let start = std::time::Instant::now();
-        while start.elapsed() < Duration::from_secs(4) {
-            match follower.controller.observe_barrier_matching(|_| true).await {
-                Ok(Some(ann)) if ann.epoch == 7 => {
-                    observed = Some(ann);
-                    break;
-                }
-                _ => tokio::time::sleep(Duration::from_millis(50)).await,
-            }
-        }
-        observed.unwrap_or_else(|| {
-            panic!(
-                "follower {} never observed the barrier",
-                follower.instance_id.0
-            )
-        });
+        wait_for_certified_prepare(follower, &announcement).await;
         follower
             .controller
             .ack_barrier(&BarrierAck {
                 epoch: 7,
                 checkpoint_id: 7,
-                assignment_digest: None,
-                ok: true,
+                assignment_digest,
+                flags: 0,
+                disposition: BarrierAckDisposition::Prepared,
                 error: None,
                 watermark: laminar_core::checkpoint::CheckpointWatermark::Uninitialized,
             })
@@ -168,10 +249,7 @@ async fn barrier_announce_then_follower_observes_and_acks() {
             .expect("ack");
     }
 
-    // Step 4: leader observes quorum. Quorum is just the followers;
-    // the leader does not ack itself in this test (the orchestration
-    // in the eventual checkpoint flow will — but the BarrierCoordinator
-    // doesn't enforce that semantically).
+    // The leader collects the remote roster; its local capture is coordinated separately.
     let outcome = leader
         .controller
         .wait_for_quorum(&announcement, &follower_ids, Duration::from_secs(6))
@@ -556,10 +634,7 @@ async fn killed_node_can_rejoin() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quorum_times_out_when_follower_silent() {
-    // Negative-path regression for the barrier protocol: if a
-    // follower never acks, the leader's wait_for_quorum times out.
-    // The checkpoint coordinator interprets this as "abort the epoch,
-    // retry on the next tick".
+    // A certified Prepare must time out when one exact participant stays silent.
     let cluster = MiniCluster::spawn(3).await;
     cluster
         .wait_for_convergence(CONVERGENCE_DEADLINE)
@@ -571,30 +646,22 @@ async fn quorum_times_out_when_follower_silent() {
     let acker = &cluster.nodes[2];
     let expected_acks = vec![silent, acker.instance_id];
 
-    let announcement = BarrierAnnouncement {
-        epoch: 42,
-        checkpoint_id: 42,
-        assignment_fence: None,
-        leader_proof: None,
-        phase: laminar_core::cluster::control::Phase::Prepare,
-        flags: 0,
-    };
-    leader
-        .controller
-        .announce_barrier(&announcement)
-        .await
-        .unwrap();
+    let announcement = announce_certified_prepare(&cluster, 42, Duration::from_secs(3)).await;
+    let assignment_digest = announcement
+        .assignment_fence
+        .as_ref()
+        .map(CheckpointAssignmentFence::digest);
 
-    // Wait briefly for gossip to deliver the announcement, then have
-    // only one follower ack. The other stays silent.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Only one follower acknowledges; the other retains its pending Prepare.
+    wait_for_certified_prepare(acker, &announcement).await;
     acker
         .controller
         .ack_barrier(&BarrierAck {
             epoch: 42,
             checkpoint_id: 42,
-            assignment_digest: None,
-            ok: true,
+            assignment_digest,
+            flags: 0,
+            disposition: BarrierAckDisposition::Prepared,
             error: None,
             watermark: laminar_core::checkpoint::CheckpointWatermark::Uninitialized,
         })

@@ -416,6 +416,7 @@ async fn zero_cycle_barrier_is_not_suppressed_by_process_metrics() {
         source_checkpoints,
         CheckpointAttempt::new(38, 38),
         std::time::Instant::now(),
+        laminar_core::checkpoint::flags::NONE,
         None,
     )
     .await;
@@ -598,21 +599,23 @@ async fn leader_only_prepare_quorum_admits_exact_aligned() {
         .await
         .unwrap();
 
-    let (watermark, participants) = CheckpointCoordinator::run_prepare_quorum(
-        &leader.controller,
-        Duration::from_secs(1),
-        PrepareQuorum::new(
-            attempt,
-            CheckpointWatermark::Active(100),
-            &leader.fence,
-            &leader.proof,
-            false,
-        ),
-    )
-    .await
-    .unwrap();
+    let (watermark, participants, handoff_replay_pending) =
+        CheckpointCoordinator::run_prepare_quorum(
+            &leader.controller,
+            Duration::from_secs(1),
+            PrepareQuorum::new(
+                attempt,
+                CheckpointWatermark::Active(100),
+                &leader.fence,
+                &leader.proof,
+                laminar_core::checkpoint::flags::NONE,
+            ),
+        )
+        .await
+        .unwrap();
     assert_eq!(watermark, CheckpointWatermark::Active(100));
     assert!(participants.is_empty());
+    assert!(!handoff_replay_pending);
 
     let aligned = BarrierAnnouncement {
         phase: Phase::Aligned,
@@ -661,6 +664,7 @@ async fn source_less_leader_holds_rotation_fence_through_whole_and_vnode_capture
         FxHashMap::default(),
         attempt,
         std::time::Instant::now(),
+        laminar_core::checkpoint::flags::NONE,
         Some(leader.fence),
     )
     .await;
@@ -975,6 +979,7 @@ async fn source_less_immediate_follower_holds_rotation_fence_through_capture() {
         crate::pipeline::CheckpointControlOutcome::Started {
             attempt: observed,
             captured: true,
+            flags: laminar_core::checkpoint::flags::NONE,
         } if observed == attempt
     ));
     drop(assignment_writer);
@@ -1030,6 +1035,7 @@ async fn retained_follower_capture_keeps_ownership_after_promotion() {
         FxHashMap::default(),
         attempt,
         std::time::Instant::now(),
+        laminar_core::checkpoint::flags::NONE,
         None,
     ));
     let assignment_writer = assignment_writer_after_checkpoint_tail_handoff(
@@ -1077,6 +1083,7 @@ async fn promoted_follower_faults_on_retained_attempt_mismatch() {
         FxHashMap::default(),
         CheckpointAttempt::new(28, 28),
         std::time::Instant::now(),
+        laminar_core::checkpoint::flags::NONE,
         None,
     )
     .await;
@@ -1513,6 +1520,7 @@ async fn callback_publishes_prepare_directly_before_checkpoint_work() {
         &mut callback,
         expired,
         std::time::Instant::now() - Duration::from_secs(2),
+        laminar_core::checkpoint::flags::NONE,
         Some(fence.clone()),
     )
     .await
@@ -1535,6 +1543,7 @@ async fn callback_publishes_prepare_directly_before_checkpoint_work() {
         &mut callback,
         attempt,
         std::time::Instant::now(),
+        laminar_core::checkpoint::flags::NONE,
         Some(fence),
     )
     .await
@@ -1564,6 +1573,7 @@ async fn follower_capture_request_includes_whole_operator_graph_state() {
     let (mut request, operator_state) = callback
         .build_follower_checkpoint_request_until(
             &assignment_fence,
+            laminar_core::checkpoint::flags::NONE,
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .unwrap();
@@ -1608,6 +1618,7 @@ async fn follower_capture_request_rejects_an_expired_deadline() {
     let error = callback
         .build_follower_checkpoint_request_until(
             &assignment_fence,
+            laminar_core::checkpoint::flags::NONE,
             tokio::time::Instant::now() - Duration::from_millis(1),
         )
         .err()
@@ -2313,6 +2324,7 @@ async fn reserved_attempt_cleanup_deadline_includes_coordinator_lock() {
         &coordinator,
         CheckpointAttempt::new(7, 7),
         "injected admission failure".into(),
+        laminar_core::checkpoint::flags::NONE,
         None,
         None,
         deadline,
@@ -2432,6 +2444,7 @@ fn follower_identity(epoch: u64, checkpoint_id: u64, digest: u8) -> CertifiedChe
     CertifiedCheckpointAttempt {
         attempt: CheckpointAttempt::new(epoch, checkpoint_id),
         assignment_digest: [digest; 32],
+        flags: laminar_core::checkpoint::flags::NONE,
         leader_proof: leader_proof(1),
     }
 }
@@ -2646,6 +2659,7 @@ fn resume_identity(
     let identity = CertifiedCheckpointAttempt {
         attempt: CheckpointAttempt::new(epoch, checkpoint_id),
         assignment_digest: fence.digest(),
+        flags: laminar_core::checkpoint::flags::NONE,
         leader_proof: leader_proof(1),
     };
     (fence, identity)
@@ -2897,7 +2911,7 @@ async fn record_gate_abort(
 async fn follower_rejection_publishes_negative_ack_and_cleans_local_attempt() {
     use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
     use laminar_core::cluster::control::{
-        BarrierAck, BarrierAnnouncement, ClusterKv, Phase, ACK_KEY,
+        BarrierAck, BarrierAckDisposition, BarrierAnnouncement, ClusterKv, Phase, ACK_KEY,
     };
 
     let (kv, controller, _leader_id, _members_tx, _decision_store) = gate_controller().await;
@@ -2946,7 +2960,8 @@ async fn follower_rejection_publishes_negative_ack_and_cleans_local_attempt() {
     assert_eq!(acknowledgement.epoch, attempt.epoch);
     assert_eq!(acknowledgement.checkpoint_id, attempt.checkpoint_id);
     assert_eq!(acknowledgement.assignment_digest, Some(fence.digest()));
-    assert!(!acknowledgement.ok);
+    assert_eq!(acknowledgement.flags, laminar_core::checkpoint::flags::NONE);
+    assert_eq!(acknowledgement.disposition, BarrierAckDisposition::Failed);
     assert_eq!(acknowledgement.error.as_deref(), Some(reason));
     assert!(callback.pending_follower_checkpoint.is_none());
     assert!(callback.follower_tail.in_flight().is_empty());
@@ -3132,7 +3147,7 @@ async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement() {
     let in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut request = crate::checkpoint_coordinator::CheckpointRequest::default();
     request.assignment_fence = Some(fence.clone());
-    let tail = LeaderTail {
+    let mut tail = LeaderTail {
         _in_flight: EpochInFlightGuard::claim(&in_flight),
         coordinator,
         complete_tx,
@@ -3142,6 +3157,7 @@ async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement() {
         mutable_operator_capture_guard: None,
         fan_out: FxHashMap::default(),
         local_watermark: CheckpointWatermark::Uninitialized,
+        handoff_replay_pending: false,
         attempt,
         attempt_started: std::time::Instant::now(),
         checkpoint_timeout: Duration::from_secs(2),
@@ -3181,7 +3197,7 @@ async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement() {
         assert!(!control.can_trigger());
 
         let leader_tail = ConnectorPipelineCallback::prepare_leader_quorum(
-            &tail,
+            &mut tail,
             tokio::time::Instant::now() + Duration::from_secs(1),
         );
         let (quorum, cancellation_result) = tokio::join!(leader_tail, &mut cancellation);
@@ -3480,7 +3496,8 @@ async fn follower_rejection_keeps_source_fenced_when_process_lease_expires_durin
 async fn mismatched_observed_assignment_sends_exact_negative_prepare_ack() {
     use laminar_core::checkpoint::CheckpointAssignmentFence;
     use laminar_core::cluster::control::{
-        BarrierAck, BarrierAnnouncement, ClusterKv, Phase, ACK_KEY, ANNOUNCEMENT_KEY,
+        BarrierAck, BarrierAckDisposition, BarrierAnnouncement, ClusterKv, Phase, ACK_KEY,
+        ANNOUNCEMENT_KEY,
     };
 
     let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
@@ -3525,7 +3542,8 @@ async fn mismatched_observed_assignment_sends_exact_negative_prepare_ack() {
         acknowledgement.assignment_digest,
         Some(announced_fence.digest())
     );
-    assert!(!acknowledgement.ok);
+    assert_eq!(acknowledgement.flags, laminar_core::checkpoint::flags::NONE);
+    assert_eq!(acknowledgement.disposition, BarrierAckDisposition::Failed);
     assert_eq!(acknowledgement.error.as_deref(), Some(error.as_str()));
 }
 

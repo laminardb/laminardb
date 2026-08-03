@@ -857,6 +857,11 @@ impl GraphOperator for SqlQueryOperator {
         self.capability
     }
 
+    #[cfg(feature = "cluster")]
+    fn checkpoint_aligned_replay_pending(&self) -> bool {
+        !self.aligned_replay.is_empty()
+    }
+
     fn managed_state_accounting(&self) -> Option<ManagedStateAccountingSnapshot> {
         let QueryState::Agg(aggregate) = &self.state else {
             return None;

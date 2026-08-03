@@ -16,8 +16,8 @@ pub use crate::checkpoint::{
     LeaderProofOwner,
 };
 pub use barrier::{
-    BarrierAck, BarrierAnnouncement, BarrierCoordinator, ClusterKv, InMemoryKv, Phase,
-    QuorumOutcome, ACK_KEY, ANNOUNCEMENT_KEY,
+    BarrierAck, BarrierAckDisposition, BarrierAnnouncement, BarrierCoordinator, ClusterKv,
+    InMemoryKv, Phase, QuorumOutcome, ACK_KEY, ANNOUNCEMENT_KEY,
 };
 #[cfg(feature = "cluster")]
 pub use controller::CheckpointPrepareObservation;

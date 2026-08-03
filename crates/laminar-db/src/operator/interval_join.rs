@@ -847,6 +847,11 @@ impl GraphOperator for IntervalJoinOperator {
         crate::operator::capability::OperatorCapability::bounded_interval_join()
     }
 
+    #[cfg(feature = "cluster")]
+    fn checkpoint_aligned_replay_pending(&self) -> bool {
+        !self.aligned_replay.is_empty()
+    }
+
     fn managed_state_accounting(&self) -> Option<ManagedStateAccountingSnapshot> {
         let (prepared, retired) = {
             let prepared = self

@@ -256,6 +256,8 @@ pub(crate) enum CheckpointCompletion {
         result: crate::checkpoint_coordinator::CheckpointResult,
         /// Per-source positions persisted by that exact attempt.
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
+        /// The committed handoff cut retained aligned replay and is not yet the final cut.
+        handoff_replay_pending: bool,
     },
     /// The admitted attempt terminated without a durable commit.
     Failed {
@@ -281,6 +283,7 @@ pub enum CheckpointControlOutcome {
     Started {
         attempt: CheckpointAttempt,
         captured: bool,
+        flags: u64,
     },
     /// The exact leader-prepared attempt was authoritatively aborted before capture.
     Aborted { attempt: CheckpointAttempt },
@@ -298,7 +301,10 @@ pub enum CheckpointControlOutcome {
 #[derive(Debug)]
 pub enum CheckpointAssignmentAdmission {
     /// Admission may continue with a local cut or the exact certified cluster assignment.
-    Ready(Option<CheckpointAssignmentFence>),
+    Ready {
+        assignment_fence: Option<CheckpointAssignmentFence>,
+        flags: u64,
+    },
     /// Topology is transitioning; retry later without faulting or reserving an attempt.
     Deferred(String),
     /// Assignment authority is invalid or unavailable and the pipeline must fail closed.
@@ -312,6 +318,7 @@ impl CheckpointCompletion {
     pub(crate) fn new(
         attempt: CheckpointAttempt,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
+        handoff_replay_pending: bool,
     ) -> Self {
         Self::Committed {
             attempt,
@@ -324,6 +331,7 @@ impl CheckpointCompletion {
                 failure_disposition: None,
             },
             source_checkpoints,
+            handoff_replay_pending,
         }
     }
 
@@ -332,6 +340,7 @@ impl CheckpointCompletion {
         admitted: CheckpointAttempt,
         result: crate::checkpoint_coordinator::CheckpointResult,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
+        handoff_replay_pending: bool,
     ) -> Result<Self, String> {
         let completed = CheckpointAttempt::new(result.epoch, result.checkpoint_id);
         if completed != admitted {
@@ -345,6 +354,7 @@ impl CheckpointCompletion {
             attempt: admitted,
             result,
             source_checkpoints,
+            handoff_replay_pending,
         })
     }
 
@@ -583,6 +593,7 @@ pub trait PipelineCallback: Send + 'static {
         &mut self,
         _attempt: CheckpointAttempt,
         _attempt_started: std::time::Instant,
+        _flags: u64,
         _assignment_fence: Option<CheckpointAssignmentFence>,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send {
         std::future::ready(Ok(()))
@@ -594,6 +605,7 @@ pub trait PipelineCallback: Send + 'static {
         &mut self,
         _attempt: CheckpointAttempt,
         _reason: &str,
+        _flags: u64,
         _assignment_fence: Option<CheckpointAssignmentFence>,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 
@@ -626,7 +638,10 @@ pub trait PipelineCallback: Send + 'static {
     fn checkpoint_assignment_for_admission(
         &mut self,
     ) -> impl std::future::Future<Output = CheckpointAssignmentAdmission> + Send {
-        std::future::ready(CheckpointAssignmentAdmission::Ready(None))
+        std::future::ready(CheckpointAssignmentAdmission::Ready {
+            assignment_fence: None,
+            flags: laminar_core::checkpoint::flags::NONE,
+        })
     }
 
     /// Wake the coordinator for leader-originated checkpoint control. `None` keeps local
@@ -653,6 +668,7 @@ pub trait PipelineCallback: Send + 'static {
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
         attempt: CheckpointAttempt,
         attempt_started: std::time::Instant,
+        flags: u64,
         assignment_fence: Option<CheckpointAssignmentFence>,
     ) -> BarrierOutcome;
 

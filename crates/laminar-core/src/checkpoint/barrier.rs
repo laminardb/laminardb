@@ -17,6 +17,8 @@ pub mod flags {
     pub const DRAIN: u64 = 1 << 1;
     /// Cancel any in-progress checkpoint with this ID.
     pub const CANCEL: u64 = 1 << 2;
+    /// This checkpoint participates in an assignment handoff.
+    pub const HANDOFF: u64 = 1 << 3;
 }
 
 /// A checkpoint barrier that flows through the dataflow graph.

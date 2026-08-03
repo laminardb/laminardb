@@ -40,6 +40,53 @@ fn default_operator_rejects_checkpointed_shuffle() {
         .contains("does not accept checkpointed shuffle stage"));
 }
 
+#[cfg(feature = "cluster")]
+struct CheckpointAlignedReplayProbe(Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(feature = "cluster")]
+#[async_trait]
+impl GraphOperator for CheckpointAlignedReplayProbe {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn checkpoint_aligned_replay_pending(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn handoff_quiescence_includes_checkpoint_aligned_replay() {
+    let replay_pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+    graph.push_test_node(
+        "replay",
+        Box::new(CheckpointAlignedReplayProbe(Arc::clone(&replay_pending))),
+    );
+    graph.compute_topo_order();
+
+    assert!(graph.checkpoint_is_quiescent());
+    assert!(!graph.handoff_is_quiescent());
+    graph.record_cycle_deferrals();
+    assert!(graph.take_cycle_deferrals().0);
+
+    replay_pending.store(false, std::sync::atomic::Ordering::Release);
+    assert!(graph.handoff_is_quiescent());
+}
+
 struct RestoreProbe(Arc<std::sync::atomic::AtomicUsize>);
 
 #[async_trait]

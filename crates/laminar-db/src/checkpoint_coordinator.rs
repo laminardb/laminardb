@@ -25,8 +25,6 @@ use laminar_core::checkpoint::{
     PipelineIdentity, PreparedSinkDescriptor, ReferencedStateChunk, StateChunkId, StateFrame,
     StateFrameKey, COMMITTED_CHECKPOINT_INDEX_VERSION, PREPARED_SINK_DESCRIPTOR_VERSION,
 };
-#[cfg(feature = "cluster")]
-use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
@@ -60,6 +58,8 @@ impl Default for CheckpointConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct CheckpointRequest {
+    pub flags: u64,
+    pub handoff_replay_pending: bool,
     pub assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
     pub state_frames: Vec<CapturedStateFrame>,
     pub channel_progress: Vec<ChannelProgress>,
@@ -358,7 +358,7 @@ pub(crate) struct PrepareQuorum<'a> {
     local_watermark: laminar_core::checkpoint::CheckpointWatermark,
     assignment_fence: &'a laminar_core::checkpoint::CheckpointAssignmentFence,
     leader_proof: &'a LeaderProof,
-    announce_prepare: bool,
+    flags: u64,
 }
 
 #[cfg(feature = "cluster")]
@@ -368,14 +368,14 @@ impl<'a> PrepareQuorum<'a> {
         local_watermark: laminar_core::checkpoint::CheckpointWatermark,
         assignment_fence: &'a laminar_core::checkpoint::CheckpointAssignmentFence,
         leader_proof: &'a LeaderProof,
-        announce_prepare: bool,
+        flags: u64,
     ) -> Self {
         Self {
             attempt,
             local_watermark,
             assignment_fence,
             leader_proof,
-            announce_prepare,
+            flags,
         }
     }
 }
@@ -2373,6 +2373,34 @@ impl CheckpointCoordinator {
     }
 
     fn validate_request(&self, request: &CheckpointRequest) -> Result<(), DbError> {
+        let unsupported_flags = request.flags & !laminar_core::checkpoint::flags::HANDOFF;
+        if unsupported_flags != 0 {
+            return Err(DbError::Checkpoint(format!(
+                "checkpoint request carries unsupported flags {unsupported_flags:#x}"
+            )));
+        }
+        if request.handoff_replay_pending
+            && request.flags & laminar_core::checkpoint::flags::HANDOFF == 0
+        {
+            return Err(DbError::Checkpoint(
+                "aligned replay may only qualify an assignment handoff checkpoint".into(),
+            ));
+        }
+        #[cfg(feature = "cluster")]
+        if request.flags & laminar_core::checkpoint::flags::HANDOFF != 0
+            && self.cluster_controller.is_none()
+        {
+            return Err(DbError::Checkpoint(
+                "assignment handoff checkpoint requires a cluster runtime".into(),
+            ));
+        }
+        #[cfg(not(feature = "cluster"))]
+        if request.flags != 0 {
+            return Err(DbError::Checkpoint(
+                "assignment handoff checkpoint requires cluster support".into(),
+            ));
+        }
+
         #[cfg(feature = "cluster")]
         let vnode_count = u32::from(self.store.key_group_count().get());
         #[cfg(feature = "cluster")]
@@ -3319,10 +3347,13 @@ impl CheckpointCoordinator {
         attempt: CheckpointAttempt,
         started: Instant,
         error: DbError,
+        flags: u64,
         assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
         leader_proof: Option<LeaderProof>,
         deadline: tokio::time::Instant,
     ) -> CheckpointResult {
+        #[cfg(not(feature = "cluster"))]
+        let _ = flags;
         let message = error.to_string();
         match self
             .abort_attempt_until(
@@ -3344,7 +3375,7 @@ impl CheckpointCoordinator {
                             assignment_fence,
                             leader_proof,
                             phase: Phase::Abort,
-                            flags: 0,
+                            flags,
                         })
                         .await;
                 }
@@ -3353,18 +3384,14 @@ impl CheckpointCoordinator {
                 } else {
                     None
                 };
-                let error = match successor {
-                    Some(successor) => {
-                        format!("{message}; successor sink epoch failed: {successor}")
-                    }
-                    None => message,
+                let (error, disposition) = match successor {
+                    Some(successor) => (
+                        format!("{message}; successor sink epoch failed: {successor}"),
+                        CheckpointFailureDisposition::RequiresRecovery,
+                    ),
+                    None => (message, CheckpointFailureDisposition::Retryable),
                 };
-                self.failed_result(
-                    attempt,
-                    started,
-                    error,
-                    CheckpointFailureDisposition::Retryable,
-                )
+                self.failed_result(attempt, started, error, disposition)
             }
             Err(abort) => self.failed_result(
                 attempt,
@@ -3383,6 +3410,7 @@ impl CheckpointCoordinator {
         started: Instant,
     ) -> Result<CheckpointResult, DbError> {
         require_canonical_attempt(attempt, "checkpoint admission")?;
+        let flags = request.flags;
         if self.failure_requires_recovery {
             return Ok(self.failed_result(
                 attempt,
@@ -3411,12 +3439,14 @@ impl CheckpointCoordinator {
         };
         #[cfg(not(feature = "cluster"))]
         let validation_proof = None;
-        if let Err(error) = self.validate_request(&request) {
+        let request_validation = self.validate_request(&request);
+        if let Err(error) = request_validation {
             return Ok(self
                 .fail_before_commit(
                     attempt,
                     started,
                     error,
+                    flags,
                     assignment_fence,
                     validation_proof,
                     deadline,
@@ -3433,32 +3463,21 @@ impl CheckpointCoordinator {
                 })?;
                 let (proof, participants, cluster_watermark) = match quorum {
                     QuorumStage::RunInline => {
-                        let proof = controller.capture_leader_proof().ok_or_else(|| {
-                            DbError::Checkpoint("no live leader proof for checkpoint".into())
-                        })?;
-                        let (watermark, participants) = Self::run_prepare_quorum(
-                            &controller,
-                            self.config.quorum_timeout,
-                            PrepareQuorum::new(attempt, self.local_watermark, fence, &proof, true),
-                        )
-                        .await
-                        .map_err(DbError::Checkpoint)?;
-                        controller
-                            .announce_barrier(&BarrierAnnouncement {
-                                epoch: attempt.epoch,
-                                checkpoint_id: attempt.checkpoint_id,
-                                assignment_fence: Some(fence.clone()),
-                                leader_proof: Some(proof.clone()),
-                                phase: Phase::Aligned,
-                                flags: 0,
-                            })
-                            .await
-                            .map_err(|error| {
-                                DbError::Checkpoint(format!(
-                                    "checkpoint Aligned publication failed: {error}"
-                                ))
-                            })?;
-                        (proof, participants, watermark)
+                        return Ok(self
+                            .fail_before_commit(
+                                attempt,
+                                started,
+                                DbError::Checkpoint(
+                                    "cluster checkpoint reached durable execution without a \
+                                 precomputed certified quorum"
+                                        .into(),
+                                ),
+                                flags,
+                                assignment_fence,
+                                validation_proof,
+                                deadline,
+                            )
+                            .await);
                     }
                     QuorumStage::Done {
                         cluster_watermark,
@@ -3486,6 +3505,7 @@ impl CheckpointCoordinator {
                                 "checkpoint quorum does not match its assignment or leader proof"
                                     .into(),
                             ),
+                            flags,
                             assignment_fence,
                             Some(proof),
                             deadline,
@@ -3516,6 +3536,7 @@ impl CheckpointCoordinator {
                         attempt,
                         started,
                         error,
+                        flags,
                         assignment_fence,
                         leader_proof,
                         deadline,
@@ -3531,6 +3552,7 @@ impl CheckpointCoordinator {
                         attempt,
                         started,
                         error,
+                        flags,
                         assignment_fence,
                         leader_proof,
                         deadline,
@@ -3546,6 +3568,7 @@ impl CheckpointCoordinator {
                         attempt,
                         started,
                         error,
+                        flags,
                         assignment_fence,
                         leader_proof,
                         deadline,
@@ -3570,6 +3593,7 @@ impl CheckpointCoordinator {
                         attempt,
                         started,
                         error,
+                        flags,
                         assignment_fence,
                         leader_proof,
                         deadline,
@@ -3591,6 +3615,7 @@ impl CheckpointCoordinator {
                         attempt,
                         started,
                         error,
+                        flags,
                         assignment_fence,
                         leader_proof,
                         deadline,
@@ -3606,6 +3631,7 @@ impl CheckpointCoordinator {
                         attempt,
                         started,
                         error,
+                        flags,
                         assignment_fence,
                         leader_proof,
                         deadline,
@@ -3664,7 +3690,7 @@ impl CheckpointCoordinator {
                     assignment_fence: assignment_fence.clone(),
                     leader_proof: leader_proof.clone(),
                     phase: Phase::Commit,
-                    flags: 0,
+                    flags,
                 })
                 .await;
         }
@@ -3754,6 +3780,7 @@ impl CheckpointCoordinator {
         checkpoint_id: u64,
         epoch: u64,
         error: String,
+        flags: u64,
         assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
         leader_proof: Option<LeaderProof>,
         deadline: tokio::time::Instant,
@@ -3768,6 +3795,7 @@ impl CheckpointCoordinator {
                 attempt,
                 started,
                 DbError::Checkpoint(error),
+                flags,
                 assignment_fence,
                 leader_proof,
                 deadline,
@@ -3807,6 +3835,7 @@ impl CheckpointCoordinator {
         (
             laminar_core::checkpoint::CheckpointWatermark,
             Vec<laminar_core::cluster::discovery::NodeId>,
+            bool,
         ),
         String,
     > {
@@ -3817,7 +3846,7 @@ impl CheckpointCoordinator {
             local_watermark,
             assignment_fence,
             leader_proof,
-            announce_prepare,
+            flags,
         } = request;
         if !controller.proof_is_live(leader_proof) {
             return Err("leader proof is stale before checkpoint Prepare".into());
@@ -3828,14 +3857,8 @@ impl CheckpointCoordinator {
             assignment_fence: Some(assignment_fence.clone()),
             leader_proof: Some(leader_proof.clone()),
             phase: Phase::Prepare,
-            flags: 0,
+            flags,
         };
-        if announce_prepare {
-            controller
-                .announce_prepare_barrier(&announcement, quorum_timeout)
-                .await
-                .map_err(|error| format!("checkpoint Prepare publication failed: {error}"))?;
-        }
         let mut followers = assignment_fence
             .participants
             .iter()
@@ -3854,12 +3877,18 @@ impl CheckpointCoordinator {
             QuorumOutcome::Reached {
                 follower_watermark,
                 ref acks,
+                handoff_replay_pending,
             } => {
                 controller.note_responsive(acks);
-                let watermark = local_watermark.cluster_min(follower_watermark);
+                let watermark = if followers.is_empty() {
+                    local_watermark
+                } else {
+                    local_watermark.cluster_min(follower_watermark)
+                };
                 Ok((
                     Self::validate_cluster_watermark_candidate(controller, watermark)?,
                     followers,
+                    handoff_replay_pending,
                 ))
             }
             QuorumOutcome::TimedOut { missing, .. } => {
@@ -3910,6 +3939,7 @@ impl CheckpointCoordinator {
             .as_ref()
             .ok_or_else(|| DbError::Checkpoint("follower checkpoint has no leader proof".into()))?;
         if announcement.assignment_fence.as_ref() != Some(fence)
+            || announcement.flags != request.flags
             || !fence.contains(controller.instance_id().0)
             || fence.participant_incarnation(proof.owner.node_id) != Some(proof.owner.boot_id)
             || controller
@@ -3934,7 +3964,7 @@ impl CheckpointCoordinator {
         checkpoint_id: u64,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
-        use laminar_core::cluster::control::BarrierAck;
+        use laminar_core::cluster::control::{BarrierAck, BarrierAckDisposition};
 
         let attempt = require_canonical_attempt(
             CheckpointAttempt::new(epoch, checkpoint_id),
@@ -3957,6 +3987,7 @@ impl CheckpointCoordinator {
             ));
         }
         let was_prepared = self.prepared.contains_key(&attempt);
+        let flags = request.flags;
         self.allocator.advance_epoch_to(epoch);
         self.phase = CheckpointPhase::PreCommitting;
         let descriptors = self.pre_commit_sinks_until(epoch, deadline).await;
@@ -3976,7 +4007,8 @@ impl CheckpointCoordinator {
                     epoch,
                     checkpoint_id,
                     assignment_digest: Some(fence.digest()),
-                    ok: false,
+                    flags,
+                    disposition: BarrierAckDisposition::Failed,
                     error: Some(error.to_string()),
                     watermark: self.local_watermark,
                 })
@@ -4016,13 +4048,14 @@ impl CheckpointCoordinator {
         announcement: laminar_core::cluster::control::BarrierAnnouncement,
         decision_timeout: Duration,
     ) -> Result<bool, DbError> {
-        use laminar_core::cluster::control::BarrierAck;
+        use laminar_core::cluster::control::{BarrierAck, BarrierAckDisposition};
 
         let controller = self.cluster_controller.clone().ok_or_else(|| {
             DbError::Checkpoint("follower checkpoint has no cluster controller".into())
         })?;
         let (fence, proof) =
             Self::validate_follower_prepare_context(&controller, &request, &announcement).await?;
+        let handoff_replay_pending = request.handoff_replay_pending;
         let deadline = tokio::time::Instant::now() + self.config.checkpoint_timeout;
         self.follower_prepare_acked_until(
             request,
@@ -4037,7 +4070,12 @@ impl CheckpointCoordinator {
                 epoch: announcement.epoch,
                 checkpoint_id: announcement.checkpoint_id,
                 assignment_digest: Some(fence.digest()),
-                ok: true,
+                flags: announcement.flags,
+                disposition: if handoff_replay_pending {
+                    BarrierAckDisposition::PreparedWithReplay
+                } else {
+                    BarrierAckDisposition::Prepared
+                },
                 error: None,
                 watermark: self.local_watermark,
             })
@@ -4218,8 +4256,6 @@ impl CheckpointCoordinator {
             self.prepared.remove(&attempt);
             self.checkpoints_completed = self.checkpoints_completed.saturating_add(1);
         } else {
-            use laminar_core::checkpoint_decision::CheckpointVerdict;
-
             let controller = self.cluster_controller.as_ref().ok_or_else(|| {
                 DbError::Checkpoint("follower completion has no cluster controller".into())
             })?;
@@ -4239,7 +4275,8 @@ impl CheckpointCoordinator {
             let settled = CheckpointAttempt::new(settlement.epoch, settlement.checkpoint_id);
             match settled.relation_to(attempt) {
                 CheckpointAttemptRelation::Exact
-                    if settlement.verdict == CheckpointVerdict::Abort => {}
+                    if settlement.verdict
+                        == laminar_core::checkpoint_decision::CheckpointVerdict::Abort => {}
                 CheckpointAttemptRelation::Newer => {}
                 _ => {
                     return Err(DbError::Checkpoint(

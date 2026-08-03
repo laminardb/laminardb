@@ -126,9 +126,8 @@ message AbortRequest {
 // Follower reply to any phase. Mirrors `BarrierAck`.
 message Ack {
   uint64 epoch = 1;
-  // false = the local snapshot/commit failed; the leader should abort.
-  bool ok = 2;
-  // Populated only when ok = false.
+  reserved 2;
+  // Populated when disposition is BARRIER_ACK_FAILED.
   optional string error = 3;
   // Present only when watermark_status is CHECKPOINT_WATERMARK_ACTIVE.
   optional int64 local_watermark_ms = 4;
@@ -138,6 +137,16 @@ message Ack {
   // corresponding announcement has no assignment fence.
   bytes assignment_digest = 6;
   CheckpointWatermarkStatus watermark_status = 7;
+  // Exact behavior flags from the corresponding announcement.
+  uint64 flags = 8;
+  BarrierAckDisposition disposition = 9;
+}
+
+enum BarrierAckDisposition {
+  BARRIER_ACK_UNSPECIFIED = 0;
+  BARRIER_ACK_PREPARED = 1;
+  BARRIER_ACK_PREPARED_WITH_REPLAY = 2;
+  BARRIER_ACK_FAILED = 3;
 }
 
 enum CheckpointWatermarkStatus {

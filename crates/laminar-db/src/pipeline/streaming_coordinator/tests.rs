@@ -135,7 +135,11 @@ async fn ready_completion_does_not_drop_the_parked_intake_message() {
         checkpoint: checkpoint_at(8),
     });
     completion_tx
-        .send(CheckpointCompletion::new(attempt, FxHashMap::default()))
+        .send(CheckpointCompletion::new(
+            attempt,
+            FxHashMap::default(),
+            false,
+        ))
         .await
         .unwrap();
 
@@ -506,7 +510,10 @@ impl PipelineCallback for MockCallback {
         if let Some(error) = self.assignment_fault.take() {
             CheckpointAssignmentAdmission::Fault(error)
         } else if self.runtime.assignment_ready {
-            CheckpointAssignmentAdmission::Ready(self.assignment_fence.clone())
+            CheckpointAssignmentAdmission::Ready {
+                assignment_fence: self.assignment_fence.clone(),
+                flags: laminar_core::checkpoint::flags::NONE,
+            }
         } else {
             CheckpointAssignmentAdmission::Deferred("assignment is not checkpoint-ready".into())
         }
@@ -527,6 +534,7 @@ impl PipelineCallback for MockCallback {
         &mut self,
         attempt: CheckpointAttempt,
         _attempt_started: Instant,
+        _flags: u64,
         assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
     ) -> Result<(), String> {
         self.prepared_attempts.push((attempt, assignment_fence));
@@ -542,6 +550,7 @@ impl PipelineCallback for MockCallback {
         &mut self,
         attempt: CheckpointAttempt,
         reason: &str,
+        _flags: u64,
         assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
     ) -> Result<(), String> {
         self.checkpoint_order.lock().push("cleanup");
@@ -685,6 +694,7 @@ impl PipelineCallback for MockCallback {
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
         attempt: CheckpointAttempt,
         _attempt_started: Instant,
+        _flags: u64,
         _assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
     ) -> BarrierOutcome {
         self.checkpoint_order.lock().push("capture");
@@ -847,7 +857,11 @@ async fn pending_checkpoint_control_rechecks_when_completion_precedes_claim_drop
 
     let completed = CheckpointAttempt::new(6, 6);
     completion_tx
-        .send(CheckpointCompletion::new(completed, FxHashMap::default()))
+        .send(CheckpointCompletion::new(
+            completed,
+            FxHashMap::default(),
+            false,
+        ))
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_millis(10), async {
@@ -1068,6 +1082,7 @@ fn test_coordinator(
         checkpoint_complete_rx: None,
         force_ckpt_rx: None,
         manual_waiting: Vec::new(),
+        manual_handoff_required: false,
         manual_active: None,
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
@@ -1473,6 +1488,7 @@ async fn process_lease_loss_after_prepare_abandons_the_exact_attempt() {
     let attempt = CheckpointAttempt::new(41, 41);
     let admission = CheckpointAdmission {
         manual: false,
+        flags: laminar_core::checkpoint::flags::NONE,
         assignment_fence: None,
     };
     let mut callback = MockCallback::new();
@@ -1516,6 +1532,7 @@ async fn source_less_checkpoint_rechecks_authority_after_each_async_cut_boundary
         let attempt = CheckpointAttempt::new(node, node);
         let admission = CheckpointAdmission {
             manual: false,
+            flags: laminar_core::checkpoint::flags::NONE,
             assignment_fence: None,
         };
         let mut callback = MockCallback::new();
@@ -1613,6 +1630,7 @@ async fn follower_control_outcome_is_not_applied_after_process_lease_loss() {
     callback.control_checkpoint_outcome = Some(CheckpointControlOutcome::Started {
         attempt,
         captured: false,
+        flags: laminar_core::checkpoint::flags::NONE,
     });
     *callback.process_authority_fence.lock() =
         Some((ProcessAuthorityFencePoint::CheckpointControl, controller));
@@ -1715,6 +1733,7 @@ async fn source_barrier_state_is_not_installed_after_process_lease_loss() {
     coordinator.manual_waiting.push(reply_tx);
     let admission = CheckpointAdmission {
         manual: true,
+        flags: laminar_core::checkpoint::flags::NONE,
         assignment_fence: None,
     };
     let mut callback = MockCallback::new();
@@ -1746,6 +1765,7 @@ fn durable_completion_publication_requires_strict_identity_progress() {
         newer,
         successful_checkpoint_result(newer),
         FxHashMap::default(),
+        false,
     )
     .unwrap();
     assert!(coordinator
@@ -1765,6 +1785,7 @@ fn durable_completion_publication_requires_strict_identity_progress() {
             invalid,
             successful_checkpoint_result(invalid),
             FxHashMap::default(),
+            false,
         )
         .unwrap();
         let error = coordinator
@@ -1794,6 +1815,7 @@ async fn durable_completion_acks_sources_when_subscription_publication_fails() {
         attempt,
         successful_checkpoint_result(attempt),
         source_checkpoints,
+        false,
     )
     .unwrap();
 
@@ -1822,7 +1844,7 @@ fn durable_completion_reports_successor_epoch_continuation_failure() {
     let mut result = successful_checkpoint_result(attempt);
     result.error = Some("injected successor epoch failure".into());
     let completion =
-        CheckpointCompletion::validated(attempt, result, FxHashMap::default()).unwrap();
+        CheckpointCompletion::validated(attempt, result, FxHashMap::default(), false).unwrap();
 
     let error = coordinator
         .handle_checkpoint_completion(completion, &mut callback)
@@ -1838,6 +1860,60 @@ fn durable_completion_reports_successor_epoch_continuation_failure() {
         vec![(attempt.epoch, attempt.checkpoint_id)]
     );
     assert_eq!(coordinator.last_published_checkpoint, Some(attempt));
+}
+
+#[tokio::test]
+async fn committed_handoff_replay_requeues_manual_request_without_advancing_cadence() {
+    let mut coordinator = admission_coordinator(Vec::new());
+    let mut callback = MockCallback::new();
+    let attempt = CheckpointAttempt::canonical(132);
+    let (reply_tx, _reply_rx) = crossfire::oneshot::oneshot();
+    coordinator.manual_active = Some(ManualCheckpointAttempt {
+        attempt,
+        flags: laminar_core::checkpoint::flags::HANDOFF,
+        replies: vec![reply_tx],
+    });
+    coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
+    let previous_cadence = coordinator.last_checkpoint;
+
+    let completion = CheckpointCompletion::validated(
+        attempt,
+        crate::checkpoint_coordinator::CheckpointResult {
+            success: true,
+            checkpoint_id: attempt.checkpoint_id,
+            epoch: attempt.epoch,
+            duration: Duration::ZERO,
+            error: None,
+            failure_disposition: None,
+        },
+        FxHashMap::default(),
+        true,
+    )
+    .unwrap();
+
+    assert!(coordinator
+        .handle_checkpoint_completion(completion, &mut callback)
+        .is_none());
+
+    assert!(coordinator.manual_active.is_none());
+    assert_eq!(coordinator.manual_waiting.len(), 1);
+    assert!(coordinator.manual_handoff_required);
+    assert!(coordinator.replay_pending);
+    assert!(callback.checkpoint_failures.is_empty());
+    assert_eq!(coordinator.last_checkpoint, previous_cadence);
+    assert!(callback.aborted_subscription_cuts.lock().is_empty());
+    assert_eq!(coordinator.last_published_checkpoint, Some(attempt));
+    assert_eq!(
+        callback.published_barriers.lock().as_slice(),
+        &[(attempt.epoch, attempt.checkpoint_id)]
+    );
+
+    assert!(coordinator
+        .checkpoint_admission(&mut callback)
+        .await
+        .is_none());
+    assert!(coordinator.manual_waiting.is_empty());
+    assert!(!coordinator.manual_handoff_required);
 }
 
 #[cfg(feature = "cluster")]
@@ -1867,6 +1943,7 @@ async fn durable_completion_does_not_publish_or_ack_after_process_lease_loss() {
         attempt,
         successful_checkpoint_result(attempt),
         source_checkpoints,
+        false,
     )
     .unwrap();
 
@@ -1964,6 +2041,7 @@ async fn terminal_completions_start_the_next_periodic_delay() {
                 committed,
                 successful_checkpoint_result(committed),
                 FxHashMap::default(),
+                false,
             )
             .unwrap(),
             false,
@@ -2468,7 +2546,8 @@ async fn manual_requests_coalesce_onto_one_new_exact_source_barrier() {
 
     let result = successful_checkpoint_result(attempt);
     let completion =
-        CheckpointCompletion::validated(attempt, result.clone(), FxHashMap::default()).unwrap();
+        CheckpointCompletion::validated(attempt, result.clone(), FxHashMap::default(), false)
+            .unwrap();
     assert!(coordinator
         .handle_checkpoint_completion(completion, &mut callback)
         .is_none());
@@ -2539,6 +2618,7 @@ async fn manual_request_after_admission_waits_for_the_next_attempt() {
                 first,
                 successful_checkpoint_result(first),
                 FxHashMap::default(),
+                false,
             )
             .unwrap(),
             &mut callback,
@@ -2787,7 +2867,9 @@ async fn follower_aligned_abort_resolves_after_role_change_without_failure() {
     let mut coordinator = admission_coordinator(vec![source]);
     install_test_process_authority(&mut coordinator, 56);
     let attempt = CheckpointAttempt::new(56, 56);
-    coordinator.pending_barrier.reset_follower(attempt, 1);
+    coordinator
+        .pending_barrier
+        .reset_follower(attempt, 1, laminar_core::checkpoint::flags::NONE);
     let mut callback = MockCallback::new();
     callback.runtime.leader = true;
     callback.barrier_outcome = Some(BarrierOutcome::Aborted);
@@ -2822,7 +2904,9 @@ async fn follower_topology_cancellation_preserves_checkpoint_cadence_after_promo
     coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
     let previous_cadence = coordinator.last_checkpoint;
     let attempt = CheckpointAttempt::new(56, 56);
-    coordinator.pending_barrier.reset_follower(attempt, 1);
+    coordinator
+        .pending_barrier
+        .reset_follower(attempt, 1, laminar_core::checkpoint::flags::NONE);
     let mut callback = MockCallback::new();
     callback.runtime.leader = true;
     callback.barrier_outcome = Some(BarrierOutcome::CancelledBeforeCapture);
@@ -2853,7 +2937,9 @@ async fn follower_aligned_abort_cleanup_failure_keeps_sources_fenced() {
     let mut coordinator = admission_coordinator(vec![source]);
     install_test_process_authority(&mut coordinator, 57);
     let attempt = CheckpointAttempt::new(57, 57);
-    coordinator.pending_barrier.reset_follower(attempt, 1);
+    coordinator
+        .pending_barrier
+        .reset_follower(attempt, 1, laminar_core::checkpoint::flags::NONE);
     let mut callback = MockCallback::new();
     callback.barrier_outcome = Some(BarrierOutcome::Aborted);
     callback.resolve_follower_abort_error = Some("injected local cleanup failure".into());
@@ -2883,6 +2969,7 @@ async fn authoritative_source_less_abort_abandons_without_failure() {
     let mut coordinator = admission_coordinator(Vec::new());
     let admission = CheckpointAdmission {
         manual: false,
+        flags: laminar_core::checkpoint::flags::NONE,
         assignment_fence: None,
     };
     let attempt = CheckpointAttempt::new(55, 55);
@@ -7151,6 +7238,7 @@ async fn test_coordinator_direct_channel() {
         checkpoint_complete_rx: None,
         force_ckpt_rx: None,
         manual_waiting: Vec::new(),
+        manual_handoff_required: false,
         manual_active: None,
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
@@ -7371,6 +7459,7 @@ fn completion_rejects_result_for_a_different_attempt() {
             failure_disposition: None,
         },
         FxHashMap::default(),
+        false,
     )
     .expect_err("a different durable checkpoint ID must be rejected");
     assert!(error.contains("identity mismatch"));
@@ -7399,7 +7488,11 @@ async fn async_completion_publishes_exact_attempt() {
 
     let attempt = CheckpointAttempt::new(7, 7);
     completion_tx
-        .send(CheckpointCompletion::new(attempt, FxHashMap::default()))
+        .send(CheckpointCompletion::new(
+            attempt,
+            FxHashMap::default(),
+            false,
+        ))
         .await
         .expect("completion receiver must be live");
 
@@ -7517,7 +7610,7 @@ async fn committed_cut_with_successor_failure_acks_then_faults_before_next_write
         .unwrap();
     completion_tx
         .send(
-            CheckpointCompletion::validated(attempt, result, source_checkpoints)
+            CheckpointCompletion::validated(attempt, result, source_checkpoints, false)
                 .expect("completion identity must match"),
         )
         .await
@@ -7603,6 +7696,7 @@ async fn shutdown_does_not_synthesize_final_checkpoint() {
         checkpoint_complete_rx: None,
         force_ckpt_rx: None,
         manual_waiting: Vec::new(),
+        manual_handoff_required: false,
         manual_active: None,
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
@@ -7656,6 +7750,7 @@ async fn shutdown_abandons_exact_pending_barrier_and_fails_manual_caller() {
     let (reply_tx, reply_rx) = crossfire::oneshot::oneshot();
     coordinator.manual_active = Some(ManualCheckpointAttempt {
         attempt,
+        flags: laminar_core::checkpoint::flags::NONE,
         replies: vec![reply_tx],
     });
 
@@ -7745,7 +7840,11 @@ async fn shutdown_settles_async_tail_before_closing_sinks() {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
         completion_tx
-            .send(CheckpointCompletion::new(attempt, FxHashMap::default()))
+            .send(CheckpointCompletion::new(
+                attempt,
+                FxHashMap::default(),
+                false,
+            ))
             .await
             .unwrap();
         tail_in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -7888,6 +7987,7 @@ async fn test_barrier_excludes_post_barrier_data() {
         checkpoint_complete_rx: None,
         force_ckpt_rx: None,
         manual_waiting: Vec::new(),
+        manual_handoff_required: false,
         manual_active: None,
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
@@ -8078,6 +8178,7 @@ async fn test_settle_pending_offsets_holds_failed_source() {
         checkpoint_complete_rx: None,
         force_ckpt_rx: None,
         manual_waiting: Vec::new(),
+        manual_handoff_required: false,
         manual_active: None,
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
@@ -8267,10 +8368,11 @@ impl PipelineCallback for BackpressuredCallback {
         cp: FxHashMap<String, SourceCheckpoint>,
         attempt: CheckpointAttempt,
         attempt_started: Instant,
+        flags: u64,
         assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
     ) -> BarrierOutcome {
         self.inner
-            .checkpoint_with_barrier(cp, attempt, attempt_started, assignment_fence)
+            .checkpoint_with_barrier(cp, attempt, attempt_started, flags, assignment_fence)
             .await
     }
     async fn reserve_checkpoint_attempt(
@@ -8283,10 +8385,11 @@ impl PipelineCallback for BackpressuredCallback {
         &mut self,
         attempt: CheckpointAttempt,
         reason: &str,
+        flags: u64,
         assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
     ) -> Result<(), String> {
         self.inner
-            .abandon_checkpoint_attempt(attempt, reason, assignment_fence)
+            .abandon_checkpoint_attempt(attempt, reason, flags, assignment_fence)
             .await
     }
     async fn cancel_source_barrier_attempt(
@@ -8366,6 +8469,7 @@ async fn test_drain_skip_under_backpressure() {
         checkpoint_complete_rx: None,
         force_ckpt_rx: None,
         manual_waiting: Vec::new(),
+        manual_handoff_required: false,
         manual_active: None,
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,

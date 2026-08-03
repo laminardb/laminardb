@@ -140,6 +140,11 @@ pub(crate) trait GraphOperator: Send {
         true
     }
 
+    /// Whether barrier alignment retained shuffle input that must replay before vnode handoff.
+    fn checkpoint_aligned_replay_pending(&self) -> bool {
+        false
+    }
+
     /// Retain a peer-shipped shuffle batch as channel state outside the normal `process` path so
     /// the barrier-aligned row and its pending downstream emission enter the snapshot together.
     #[cfg(feature = "cluster")]
@@ -896,6 +901,17 @@ impl OperatorGraph {
             .enumerate()
             .filter(|(_, node)| !node.removed)
             .all(|(node_id, _)| !self.node_has_buffered_input(node_id))
+    }
+
+    /// Whether the graph can hand off vnode state without transferring retained shuffle replay.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn handoff_is_quiescent(&self) -> bool {
+        self.checkpoint_is_quiescent()
+            && self
+                .nodes
+                .iter()
+                .filter(|node| !node.removed)
+                .all(|node| !node.operator.checkpoint_aligned_replay_pending())
     }
 
     #[cfg(feature = "cluster")]
@@ -2799,7 +2815,11 @@ impl OperatorGraph {
             .nodes
             .iter()
             .enumerate()
-            .filter(|(node_id, node)| !node.removed && self.node_has_buffered_input(*node_id))
+            .filter(|(node_id, node)| {
+                !node.removed
+                    && (self.node_has_buffered_input(*node_id)
+                        || node.operator.checkpoint_aligned_replay_pending())
+            })
             .map(|(node_id, _)| node_id)
             .collect();
         if deferred_nodes.is_empty() {

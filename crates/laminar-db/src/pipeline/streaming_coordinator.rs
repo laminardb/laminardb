@@ -1141,6 +1141,8 @@ pub struct StreamingCoordinator {
     /// Public checkpoint requests waiting for the next newly-admitted exact attempt.
     force_ckpt_rx: Option<crate::db::ForceCheckpointRx>,
     manual_waiting: Vec<ForceCheckpointReply>,
+    /// A committed intermediate cut retained replay, so these waiters still require HANDOFF.
+    manual_handoff_required: bool,
     /// Requests attached at admission. Later requests remain in `manual_waiting`.
     manual_active: Option<ManualCheckpointAttempt>,
     /// Epochs between admission and durable (tails still running); shared with callback.
@@ -1227,11 +1229,13 @@ impl Drop for StreamingCoordinator {
 /// Public checkpoint callers attached to one exact attempt at admission time.
 struct ManualCheckpointAttempt {
     attempt: CheckpointAttempt,
+    flags: u64,
     replies: Vec<ForceCheckpointReply>,
 }
 
 struct CheckpointAdmission {
     manual: bool,
+    flags: u64,
     assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
 }
 
@@ -1247,6 +1251,7 @@ struct AlignedCheckpointContext {
     cleanup_owner: CheckpointCleanupOwner,
     attempt: CheckpointAttempt,
     started_at: Instant,
+    flags: u64,
     assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
 }
 
@@ -1258,6 +1263,7 @@ struct PendingBarrier {
     source_checkpoints: FxHashMap<String, SourceCheckpoint>,
     started_at: Instant,
     active: bool,
+    flags: u64,
     assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
     cleanup_owner: CheckpointCleanupOwner,
 }
@@ -1271,6 +1277,7 @@ impl PendingBarrier {
             source_checkpoints: FxHashMap::default(),
             started_at: Instant::now(),
             active: false,
+            flags: laminar_core::checkpoint::flags::NONE,
             assignment_fence: None,
             cleanup_owner: CheckpointCleanupOwner::Originator,
         }
@@ -1278,13 +1285,19 @@ impl PendingBarrier {
 
     #[cfg(test)]
     fn reset(&mut self, attempt: CheckpointAttempt, sources_total: usize) {
-        self.reset_with_assignment(attempt, sources_total, None);
+        self.reset_with_assignment(
+            attempt,
+            sources_total,
+            laminar_core::checkpoint::flags::NONE,
+            None,
+        );
     }
 
-    fn reset_follower(&mut self, attempt: CheckpointAttempt, sources_total: usize) {
+    fn reset_follower(&mut self, attempt: CheckpointAttempt, sources_total: usize, flags: u64) {
         self.reset_inner(
             attempt,
             sources_total,
+            flags,
             None,
             CheckpointCleanupOwner::Follower,
         );
@@ -1294,11 +1307,13 @@ impl PendingBarrier {
         &mut self,
         attempt: CheckpointAttempt,
         sources_total: usize,
+        flags: u64,
         assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
     ) {
         self.reset_inner(
             attempt,
             sources_total,
+            flags,
             assignment_fence,
             CheckpointCleanupOwner::Originator,
         );
@@ -1308,6 +1323,7 @@ impl PendingBarrier {
         &mut self,
         attempt: CheckpointAttempt,
         sources_total: usize,
+        flags: u64,
         assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
         cleanup_owner: CheckpointCleanupOwner,
     ) {
@@ -1317,6 +1333,7 @@ impl PendingBarrier {
         self.source_checkpoints.clear();
         self.started_at = Instant::now();
         self.active = true;
+        self.flags = flags;
         self.assignment_fence = assignment_fence;
         self.cleanup_owner = cleanup_owner;
     }
@@ -1331,6 +1348,7 @@ impl PendingBarrier {
         self.sources_total = 0;
         self.sources_aligned.clear();
         self.source_checkpoints.clear();
+        self.flags = laminar_core::checkpoint::flags::NONE;
         self.assignment_fence = None;
         self.cleanup_owner = CheckpointCleanupOwner::Originator;
         self.attempt.take().map(|attempt| (attempt, cleanup_owner))
@@ -1342,6 +1360,7 @@ impl PendingBarrier {
         self.sources_total = 0;
         self.sources_aligned.clear();
         self.source_checkpoints.clear();
+        self.flags = laminar_core::checkpoint::flags::NONE;
         self.assignment_fence = None;
         self.cleanup_owner = CheckpointCleanupOwner::Originator;
     }
@@ -4192,6 +4211,7 @@ impl StreamingCoordinator {
             checkpoint_complete_rx: None,
             force_ckpt_rx: None,
             manual_waiting: Vec::new(),
+            manual_handoff_required: false,
             manual_active: None,
             checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
             last_published_checkpoint: None,
@@ -4237,15 +4257,39 @@ impl StreamingCoordinator {
         }
     }
 
-    fn activate_manual_attempt(&mut self, attempt: CheckpointAttempt) {
+    fn activate_manual_attempt(&mut self, attempt: CheckpointAttempt, flags: u64) {
         if self.manual_waiting.is_empty() {
             return;
         }
         debug_assert!(self.manual_active.is_none());
         self.manual_active = Some(ManualCheckpointAttempt {
             attempt,
+            flags,
             replies: std::mem::take(&mut self.manual_waiting),
         });
+        self.manual_handoff_required = false;
+    }
+
+    fn retry_manual_handoff(&mut self, attempt: CheckpointAttempt) {
+        let Some(active) = self.manual_active.take() else {
+            return;
+        };
+        if active.attempt != attempt {
+            self.manual_active = Some(active);
+            return;
+        }
+        if active.flags & laminar_core::checkpoint::flags::HANDOFF == 0 {
+            for reply in active.replies {
+                reply.send(Err(DbError::Checkpoint(
+                    "non-handoff checkpoint reported pending handoff replay".into(),
+                )));
+            }
+            return;
+        }
+        let mut replies = active.replies;
+        replies.append(&mut self.manual_waiting);
+        self.manual_waiting = replies;
+        self.manual_handoff_required = true;
     }
 
     fn fail_waiting_manual(&mut self, error: impl Into<String>) {
@@ -4253,6 +4297,7 @@ impl StreamingCoordinator {
         for reply in self.manual_waiting.drain(..) {
             reply.send(Err(DbError::Checkpoint(error.clone())));
         }
+        self.manual_handoff_required = false;
     }
 
     fn finish_manual_success(
@@ -4316,12 +4361,13 @@ impl StreamingCoordinator {
         cleanup_owner: CheckpointCleanupOwner,
         attempt: CheckpointAttempt,
         reason: &str,
+        flags: u64,
         assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
     ) -> Result<(), String> {
         match cleanup_owner {
             CheckpointCleanupOwner::Originator => {
                 callback
-                    .abandon_checkpoint_attempt(attempt, reason, assignment_fence)
+                    .abandon_checkpoint_attempt(attempt, reason, flags, assignment_fence)
                     .await
             }
             CheckpointCleanupOwner::Follower => {
@@ -4339,6 +4385,7 @@ impl StreamingCoordinator {
         release_sources: bool,
     ) -> Result<(), String> {
         let was_active = self.pending_barrier.active;
+        let flags = self.pending_barrier.flags;
         let assignment_fence = self.pending_barrier.assignment_fence.clone();
         let attempt = self.pending_barrier.take_active_attempt();
         self.barrier_seen.clear();
@@ -4352,16 +4399,18 @@ impl StreamingCoordinator {
                     "abandoning checkpoint interrupted before source alignment"
                 );
                 if cleanup_owner == CheckpointCleanupOwner::Originator {
-                    self.cancel_local_source_barriers(CheckpointBarrier::new(
-                        attempt.checkpoint_id,
-                        attempt.epoch,
-                    ));
+                    self.cancel_local_source_barriers(CheckpointBarrier {
+                        checkpoint_id: attempt.checkpoint_id,
+                        epoch: attempt.epoch,
+                        flags,
+                    });
                 }
                 Self::cleanup_checkpoint_attempt(
                     callback,
                     cleanup_owner,
                     attempt,
                     reason,
+                    flags,
                     assignment_fence,
                 )
                 .await?;
@@ -4488,6 +4537,7 @@ impl StreamingCoordinator {
             CheckpointCompletion::Committed {
                 result,
                 source_checkpoints,
+                handoff_replay_pending,
                 ..
             } => {
                 let completed = CheckpointAttempt::new(result.epoch, result.checkpoint_id);
@@ -4538,9 +4588,18 @@ impl StreamingCoordinator {
                     self.last_published_checkpoint = Some(attempt);
                     let publication_error = callback.publish_barrier(attempt).err();
                     self.broadcast_epoch_committed(attempt.epoch, &source_checkpoints);
-                    self.finish_manual_success(attempt, &result);
-                    self.advance_checkpoint_cadence();
                     let continuation_error = publication_error.or(continuation_error);
+                    if handoff_replay_pending {
+                        self.replay_pending = true;
+                        if let Some(reason) = continuation_error.as_deref() {
+                            self.fail_manual_attempt(attempt, reason);
+                        } else {
+                            self.retry_manual_handoff(attempt);
+                        }
+                    } else {
+                        self.finish_manual_success(attempt, &result);
+                        self.advance_checkpoint_cadence();
+                    }
                     if let Some(reason) = continuation_error.as_deref() {
                         callback.record_checkpoint_continuation_fault(attempt, reason);
                     }
@@ -5661,6 +5720,7 @@ impl StreamingCoordinator {
             cleanup_owner,
             attempt,
             started_at,
+            flags,
             assignment_fence,
         } = context;
         let authoritative_abort = matches!(&outcome, BarrierOutcome::Aborted);
@@ -5753,6 +5813,7 @@ impl StreamingCoordinator {
                 cleanup_owner,
                 attempt,
                 &cleanup_reason,
+                flags,
                 assignment_fence,
             )
             .await?;
@@ -5777,6 +5838,16 @@ impl StreamingCoordinator {
             self.release_source_barrier_for(source_idx, barrier_attempt);
             return Ok(());
         }
+        if self.pending_barrier.flags != barrier.flags {
+            let reason = format!(
+                "source barrier flags {:#x} do not match admitted checkpoint flags {:#x}",
+                barrier.flags, self.pending_barrier.flags
+            );
+            self.cancel_pending_barrier_for_stop(callback, &reason, true)
+                .await
+                .map_err(CycleError::Recovery)?;
+            return Err(CycleError::Recovery(reason));
+        }
         #[cfg(feature = "cluster")]
         self.require_process_authority("source barrier handling")
             .map_err(|error| CycleError::Recovery(error.to_string()))?;
@@ -5791,6 +5862,7 @@ impl StreamingCoordinator {
             let fan_out = checkpoints.clone();
             let attempt = barrier_attempt;
             let attempt_started = self.pending_barrier.started_at;
+            let flags = self.pending_barrier.flags;
             let assignment_fence = self.pending_barrier.assignment_fence.clone();
             let cleanup_owner = self.pending_barrier.cleanup_owner;
             self.pending_barrier.clear();
@@ -5814,6 +5886,7 @@ impl StreamingCoordinator {
                         cleanup_owner,
                         attempt,
                         started_at: attempt_started,
+                        flags,
                         assignment_fence,
                     },
                     &fan_out,
@@ -5832,6 +5905,7 @@ impl StreamingCoordinator {
                     cleanup_owner,
                     attempt,
                     &reason,
+                    flags,
                     assignment_fence.clone(),
                 )
                 .await;
@@ -5850,6 +5924,7 @@ impl StreamingCoordinator {
                         cleanup_owner,
                         attempt,
                         started_at: attempt_started,
+                        flags,
                         assignment_fence,
                     },
                     &fan_out,
@@ -5869,6 +5944,7 @@ impl StreamingCoordinator {
                     cleanup_owner,
                     attempt,
                     &reason,
+                    flags,
                     assignment_fence.clone(),
                 )
                 .await;
@@ -5884,6 +5960,7 @@ impl StreamingCoordinator {
                     checkpoints,
                     attempt,
                     attempt_started,
+                    flags,
                     assignment_fence.clone(),
                 )
                 .await;
@@ -5896,6 +5973,7 @@ impl StreamingCoordinator {
                     cleanup_owner,
                     attempt,
                     started_at: attempt_started,
+                    flags,
                     assignment_fence,
                 },
                 &fan_out,
@@ -5979,8 +6057,11 @@ impl StreamingCoordinator {
             }
             return None;
         }
-        let assignment_fence = match callback.checkpoint_assignment_for_admission().await {
-            CheckpointAssignmentAdmission::Ready(fence) => fence,
+        let (assignment_fence, flags) = match callback.checkpoint_assignment_for_admission().await {
+            CheckpointAssignmentAdmission::Ready {
+                assignment_fence,
+                flags,
+            } => (assignment_fence, flags),
             CheckpointAssignmentAdmission::Deferred(reason) => {
                 tracing::debug!(reason = %reason, "checkpoint admission waits for stable topology");
                 self.defer_checkpoint_until_topology_ready();
@@ -6001,11 +6082,21 @@ impl StreamingCoordinator {
                 return None;
             }
         };
+        if manual
+            && self.manual_handoff_required
+            && flags & laminar_core::checkpoint::flags::HANDOFF == 0
+        {
+            let reason = "assignment handoff ended before its replay-quiescent checkpoint";
+            callback.record_checkpoint_admission_failure(reason);
+            self.fail_waiting_manual(reason);
+            return None;
+        }
         if !self.checkpoint_capacity_available() {
             return None;
         }
         Some(CheckpointAdmission {
             manual,
+            flags,
             assignment_fence,
         })
     }
@@ -6026,7 +6117,12 @@ impl StreamingCoordinator {
         if let Err(error) = self.require_process_authority("checkpoint prepare publication") {
             let reason = error.to_string();
             callback
-                .abandon_checkpoint_attempt(attempt, &reason, admission.assignment_fence.clone())
+                .abandon_checkpoint_attempt(
+                    attempt,
+                    &reason,
+                    admission.flags,
+                    admission.assignment_fence.clone(),
+                )
                 .await
                 .map_err(|cleanup| {
                     format!("{reason}; reserved checkpoint cleanup failed: {cleanup}")
@@ -6037,12 +6133,18 @@ impl StreamingCoordinator {
             .publish_checkpoint_prepare(
                 attempt,
                 attempt_started,
+                admission.flags,
                 admission.assignment_fence.clone(),
             )
             .await
         {
             if let Err(cleanup_error) = callback
-                .abandon_checkpoint_attempt(attempt, &error, admission.assignment_fence.clone())
+                .abandon_checkpoint_attempt(
+                    attempt,
+                    &error,
+                    admission.flags,
+                    admission.assignment_fence.clone(),
+                )
                 .await
             {
                 return Err(format!(
@@ -6055,7 +6157,12 @@ impl StreamingCoordinator {
         if let Err(error) = self.require_process_authority("checkpoint prepare completion") {
             let reason = error.to_string();
             callback
-                .abandon_checkpoint_attempt(attempt, &reason, admission.assignment_fence.clone())
+                .abandon_checkpoint_attempt(
+                    attempt,
+                    &reason,
+                    admission.flags,
+                    admission.assignment_fence.clone(),
+                )
                 .await
                 .map_err(|cleanup| {
                     format!("{reason}; prepared checkpoint cleanup failed: {cleanup}")
@@ -6145,6 +6252,7 @@ impl StreamingCoordinator {
             CheckpointCleanupOwner::Originator,
             attempt,
             &cleanup_reason,
+            admission.flags,
             admission.assignment_fence.clone(),
         )
         .await?;
@@ -6193,7 +6301,7 @@ impl StreamingCoordinator {
         attempt_started: Instant,
     ) {
         if admission.manual {
-            self.activate_manual_attempt(attempt);
+            self.activate_manual_attempt(attempt, admission.flags);
         }
         let attempt_deadline =
             tokio::time::Instant::from_std(attempt_started) + self.config.checkpoint_timeout;
@@ -6227,6 +6335,7 @@ impl StreamingCoordinator {
                 CheckpointCleanupOwner::Originator,
                 attempt,
                 &reason,
+                admission.flags,
                 admission.assignment_fence.clone(),
             )
             .await;
@@ -6269,6 +6378,7 @@ impl StreamingCoordinator {
                 CheckpointCleanupOwner::Originator,
                 attempt,
                 &reason,
+                admission.flags,
                 admission.assignment_fence.clone(),
             )
             .await;
@@ -6288,6 +6398,7 @@ impl StreamingCoordinator {
                 FxHashMap::default(),
                 attempt,
                 attempt_started,
+                admission.flags,
                 admission.assignment_fence.clone(),
             )
             .await;
@@ -6351,7 +6462,7 @@ impl StreamingCoordinator {
         attempt_started: Instant,
     ) {
         if admission.manual {
-            self.activate_manual_attempt(attempt);
+            self.activate_manual_attempt(attempt, admission.flags);
         }
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("source barrier injection") {
@@ -6361,6 +6472,7 @@ impl StreamingCoordinator {
                 CheckpointCleanupOwner::Originator,
                 attempt,
                 &reason,
+                admission.flags,
                 admission.assignment_fence.clone(),
             )
             .await;
@@ -6377,11 +6489,16 @@ impl StreamingCoordinator {
         self.pending_barrier.reset_with_assignment(
             attempt,
             self.source_handles.len(),
+            admission.flags,
             admission.assignment_fence.clone(),
         );
         // Attempt time includes reservation, alignment, capture, quorum, and publication.
         self.pending_barrier.started_at = attempt_started;
-        let barrier = CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch);
+        let barrier = CheckpointBarrier {
+            checkpoint_id: attempt.checkpoint_id,
+            epoch: attempt.epoch,
+            flags: admission.flags,
+        };
 
         for handle in &self.source_handles {
             if !handle.barrier_injector.trigger(barrier) {
@@ -6392,6 +6509,7 @@ impl StreamingCoordinator {
                     CheckpointCleanupOwner::Originator,
                     attempt,
                     "source barrier injection was rejected after preflight",
+                    admission.flags,
                     admission.assignment_fence.clone(),
                 )
                 .await;
@@ -6472,10 +6590,17 @@ impl StreamingCoordinator {
                 CheckpointControlOutcome::AdmissionFailed { error } => {
                     callback.record_checkpoint_admission_failure(&error);
                 }
-                CheckpointControlOutcome::Started { attempt, captured } => {
+                CheckpointControlOutcome::Started {
+                    attempt,
+                    captured,
+                    flags,
+                } => {
                     if !captured {
-                        self.pending_barrier
-                            .reset_follower(attempt, self.source_handles.len());
+                        self.pending_barrier.reset_follower(
+                            attempt,
+                            self.source_handles.len(),
+                            flags,
+                        );
                     }
                 }
                 CheckpointControlOutcome::Aborted { attempt } => {
