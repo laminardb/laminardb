@@ -537,7 +537,27 @@ fn source_contract_is_replayable_and_splittable() {
     assert_eq!(contract.consistency, SourceConsistency::Replayable);
     assert_eq!(contract.topology, SourceTopology::Splittable);
     assert_eq!(contract.input_mode, SourceInputMode::AppendOnly);
+    assert_eq!(
+        contract.row_positions,
+        SourceRowPositionCapability::Deterministic
+    );
     assert!(contract.is_exact_delivery_certified());
+}
+
+#[test]
+fn kafka_positions_use_topic_partition_and_ordered_offset() {
+    let staged = vec![
+        (Arc::<str>::from("events"), 3, 7),
+        (Arc::<str>::from("events"), 3, 8),
+    ];
+    let positions = kafka_row_positions("prices", &staged, None).unwrap();
+    let encoded_partition = positions.partition().value(0);
+
+    assert_eq!(&encoded_partition[4..10], b"prices");
+    assert_eq!(&encoded_partition[14..20], b"events");
+    assert_eq!(&encoded_partition[20..], &3_i32.to_be_bytes());
+    assert!(positions.order_key().value(0) < positions.order_key().value(1));
+    assert_eq!(positions.sub_offset().values(), &[0, 0]);
 }
 
 #[test]

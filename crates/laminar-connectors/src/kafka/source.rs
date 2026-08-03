@@ -1,6 +1,8 @@
 //! Kafka source connector: consumes topics via rdkafka's `StreamConsumer`,
 //! deserializes with pluggable formats, and yields Arrow `RecordBatch`es.
 
+use arrow_array::builder::BinaryBuilder;
+use arrow_array::UInt32Array;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
@@ -20,7 +22,8 @@ use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
     ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, DeliveryGuarantee, SourceBatch,
     SourceConnector, SourceConsistency, SourceContract, SourceDrainOutcome, SourceDrainRequest,
-    SourceDrainResolution, SourceInputMode, SourcePosition, SourceStart, SourceTopology,
+    SourceDrainResolution, SourceInputMode, SourcePosition, SourceRowPositionCapability,
+    SourceRowPositions, SourceStart, SourceTopology,
 };
 use crate::error::{ConnectorError, SerdeError};
 use crate::serde::{self, Format, RecordDeserializer};
@@ -2942,6 +2945,84 @@ fn consumer_creation_error(error: &KafkaError) -> ConnectorError {
     ))
 }
 
+fn kafka_row_positions(
+    source_name: &str,
+    positions: &[(Arc<str>, i32, i64)],
+    good_indices: Option<&[usize]>,
+) -> Result<SourceRowPositions, ConnectorError> {
+    if source_name.is_empty() {
+        return Err(ConnectorError::ConfigurationError(
+            "Kafka row positions require a canonical Laminar source name".into(),
+        ));
+    }
+    let source_len = u32::try_from(source_name.len()).map_err(|_| {
+        ConnectorError::Internal("Kafka source name exceeds the row-position encoding limit".into())
+    })?;
+    let row_count = good_indices.map_or(positions.len(), <[usize]>::len);
+    let partition_bytes = match good_indices {
+        Some(indices) => indices.iter().try_fold(0_usize, |total, &index| {
+            let (topic, _, _) = positions.get(index).ok_or_else(|| {
+                ConnectorError::Internal(
+                    "Kafka decoded-row index is outside the staged position batch".into(),
+                )
+            })?;
+            Ok::<_, ConnectorError>(total.saturating_add(source_name.len() + topic.len() + 12))
+        })?,
+        None => positions.iter().fold(0_usize, |total, (topic, _, _)| {
+            total.saturating_add(source_name.len() + topic.len() + 12)
+        }),
+    };
+    let mut partitions = BinaryBuilder::with_capacity(row_count, partition_bytes);
+    let mut order_keys = BinaryBuilder::with_capacity(row_count, row_count.saturating_mul(8));
+    let mut encoded_partition = Vec::new();
+    let mut append = |(topic, partition, offset): &(Arc<str>, i32, i64)| {
+        if *partition < 0 || *offset < 0 {
+            return Err(ConnectorError::Internal(format!(
+                "Kafka emitted invalid row position '{}-{partition}@{offset}'",
+                topic.as_ref()
+            )));
+        }
+        let topic_len = u32::try_from(topic.len()).map_err(|_| {
+            ConnectorError::Internal("Kafka topic exceeds the row-position encoding limit".into())
+        })?;
+        encoded_partition.clear();
+        encoded_partition.extend_from_slice(&source_len.to_be_bytes());
+        encoded_partition.extend_from_slice(source_name.as_bytes());
+        encoded_partition.extend_from_slice(&topic_len.to_be_bytes());
+        encoded_partition.extend_from_slice(topic.as_bytes());
+        encoded_partition.extend_from_slice(&partition.to_be_bytes());
+        partitions.append_value(&encoded_partition);
+
+        let mut ordered_offset = offset.to_be_bytes();
+        ordered_offset[0] ^= 0x80;
+        order_keys.append_value(ordered_offset);
+        Ok::<_, ConnectorError>(())
+    };
+
+    match good_indices {
+        Some(indices) => {
+            for &index in indices {
+                append(positions.get(index).ok_or_else(|| {
+                    ConnectorError::Internal(
+                        "Kafka decoded-row index is outside the staged position batch".into(),
+                    )
+                })?)?;
+            }
+        }
+        None => {
+            for position in positions {
+                append(position)?;
+            }
+        }
+    }
+
+    SourceRowPositions::try_new(
+        partitions.finish(),
+        order_keys.finish(),
+        UInt32Array::from(vec![0; row_count]),
+    )
+}
+
 async fn fetch_explicit_topic_metadata(
     blocking_tasks: KafkaBlockingTasks,
     consumer: Arc<StreamConsumer<LaminarConsumerContext>>,
@@ -3913,6 +3994,7 @@ impl SourceConnector for KafkaSource {
             SourceTopology::Splittable,
             input_mode,
         )
+        .with_row_positions(SourceRowPositionCapability::Deterministic)
         .with_exact_delivery_certification())
     }
 
@@ -4745,6 +4827,20 @@ impl SourceConnector for KafkaSource {
         }
 
         let (batch, good_indices) = self.decode_polled_payloads().await?;
+        let row_positions = kafka_row_positions(
+            self.source_name.as_ref(),
+            &self.poll_staged_offsets,
+            good_indices.as_deref(),
+        )
+        .map_err(|error| {
+            terminalize_guaranteed_poll_error(
+                self.delivery,
+                &mut self.state,
+                &self.metrics,
+                self.reader_shutdown.as_ref(),
+                error,
+            )
+        })?;
 
         let batch = self.append_metadata_columns(
             batch,
@@ -4755,7 +4851,15 @@ impl SourceConnector for KafkaSource {
         // Construct the complete output before publishing its cursor. In particular,
         // metadata/header column validation above is fallible and must not retire a rotation
         // baseline or advance the recovery position for a batch that cannot be returned.
-        let output = SourceBatch::new(batch);
+        let output = SourceBatch::positioned(batch, row_positions).map_err(|error| {
+            terminalize_guaranteed_poll_error(
+                self.delivery,
+                &mut self.state,
+                &self.metrics,
+                self.reader_shutdown.as_ref(),
+                error,
+            )
+        })?;
         let num_rows = output.num_rows();
 
         if !self.poll_staged_offsets.is_empty() {

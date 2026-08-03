@@ -4,8 +4,8 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
-use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt32Array};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
@@ -115,6 +115,16 @@ pub enum SourceInputMode {
     FullChangelog,
 }
 
+/// Whether a source emits a deterministic position for every decoded row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SourceRowPositionCapability {
+    /// The source does not provide row positions.
+    #[default]
+    Unavailable,
+    /// Every emitted row carries a deterministic replay position.
+    Deterministic,
+}
+
 /// Complete source admission contract for a concrete connector configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct SourceContract {
@@ -124,6 +134,8 @@ pub struct SourceContract {
     pub topology: SourceTopology,
     /// Update model produced after connector decoding.
     pub input_mode: SourceInputMode,
+    /// Deterministic per-row position support.
+    pub row_positions: SourceRowPositionCapability,
     exact_delivery_certified: bool,
 }
 
@@ -140,8 +152,16 @@ impl SourceContract {
             consistency,
             topology,
             input_mode,
+            row_positions: SourceRowPositionCapability::Unavailable,
             exact_delivery_certified: false,
         }
+    }
+
+    /// Declare the source's per-row position contract.
+    #[must_use]
+    pub const fn with_row_positions(mut self, capability: SourceRowPositionCapability) -> Self {
+        self.row_positions = capability;
+        self
     }
 
     /// Mark a built-in connector whose exact-delivery suite is an engine release gate.
@@ -280,18 +300,209 @@ impl SinkContract {
     }
 }
 
+/// Reserved column carrying the source partition bytes.
+pub const SOURCE_PARTITION_COLUMN: &str = "__source_partition";
+/// Reserved column carrying an order-preserving source cursor.
+pub const SOURCE_ORDER_KEY_COLUMN: &str = "__source_order_key";
+/// Reserved column carrying a row ordinal within one source cursor.
+pub const SOURCE_SUB_OFFSET_COLUMN: &str = "__source_sub_offset";
+
+const SOURCE_POSITION_COLUMNS: [&str; 3] = [
+    SOURCE_PARTITION_COLUMN,
+    SOURCE_ORDER_KEY_COLUMN,
+    SOURCE_SUB_OFFSET_COLUMN,
+];
+
+/// Append the reserved row-position fields to a connector's declared schema.
+///
+/// # Errors
+/// Returns an error when the declared schema already uses a reserved field name.
+pub fn schema_with_source_row_positions(schema: &SchemaRef) -> Result<SchemaRef, ConnectorError> {
+    if let Some(field) = schema.fields().iter().find(|field| {
+        SOURCE_POSITION_COLUMNS
+            .iter()
+            .any(|reserved| field.name().eq_ignore_ascii_case(reserved))
+    }) {
+        return Err(ConnectorError::SchemaMismatch(format!(
+            "source schema contains reserved row-position column '{}'",
+            field.name()
+        )));
+    }
+
+    let mut fields = schema.fields().to_vec();
+    fields.extend([
+        Arc::new(Field::new(SOURCE_PARTITION_COLUMN, DataType::Binary, false)),
+        Arc::new(Field::new(SOURCE_ORDER_KEY_COLUMN, DataType::Binary, false)),
+        Arc::new(Field::new(
+            SOURCE_SUB_OFFSET_COLUMN,
+            DataType::UInt32,
+            false,
+        )),
+    ]);
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )))
+}
+
+/// Deterministic source coordinates aligned one-for-one with decoded rows.
+#[derive(Debug, Clone)]
+pub struct SourceRowPositions {
+    partition: BinaryArray,
+    order_key: BinaryArray,
+    sub_offset: UInt32Array,
+}
+
+impl SourceRowPositions {
+    /// Construct a validated row-position sidecar.
+    ///
+    /// # Errors
+    /// Returns an error when arrays differ in length or contain nulls.
+    pub fn try_new(
+        partition: BinaryArray,
+        order_key: BinaryArray,
+        sub_offset: UInt32Array,
+    ) -> Result<Self, ConnectorError> {
+        let len = partition.len();
+        if order_key.len() != len || sub_offset.len() != len {
+            return Err(ConnectorError::SchemaMismatch(format!(
+                "source row-position arrays have different lengths: partition={len}, order={}, sub_offset={}",
+                order_key.len(),
+                sub_offset.len()
+            )));
+        }
+        if partition.null_count() != 0
+            || order_key.null_count() != 0
+            || sub_offset.null_count() != 0
+        {
+            return Err(ConnectorError::SchemaMismatch(
+                "source row-position arrays must not contain nulls".into(),
+            ));
+        }
+        Ok(Self {
+            partition,
+            order_key,
+            sub_offset,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.partition.len()
+    }
+
+    /// Partition coordinate for each row.
+    #[must_use]
+    pub const fn partition(&self) -> &BinaryArray {
+        &self.partition
+    }
+
+    /// Order-preserving cursor for each row.
+    #[must_use]
+    pub const fn order_key(&self) -> &BinaryArray {
+        &self.order_key
+    }
+
+    /// Row ordinal within one source cursor.
+    #[must_use]
+    pub const fn sub_offset(&self) -> &UInt32Array {
+        &self.sub_offset
+    }
+
+    fn validate_row_count(&self, rows: usize) -> Result<(), ConnectorError> {
+        if self.len() == rows {
+            Ok(())
+        } else {
+            Err(ConnectorError::SchemaMismatch(format!(
+                "source row-position count {} does not match decoded row count {rows}",
+                self.len()
+            )))
+        }
+    }
+
+    fn append_to(
+        self,
+        records: &RecordBatch,
+        positioned_schema: &SchemaRef,
+    ) -> Result<RecordBatch, ConnectorError> {
+        self.validate_row_count(records.num_rows())?;
+        let mut columns = records.columns().to_vec();
+        columns.extend([
+            Arc::new(self.partition) as ArrayRef,
+            Arc::new(self.order_key) as ArrayRef,
+            Arc::new(self.sub_offset) as ArrayRef,
+        ]);
+        RecordBatch::try_new(Arc::clone(positioned_schema), columns).map_err(|error| {
+            ConnectorError::SchemaMismatch(format!(
+                "failed to append source row positions: {error}"
+            ))
+        })
+    }
+}
+
 /// A batch of records read from a source connector.
 #[derive(Debug, Clone)]
 pub struct SourceBatch {
     /// Arrow batch carrying the records.
     pub records: RecordBatch,
+    row_positions: Option<SourceRowPositions>,
 }
 
 impl SourceBatch {
     /// Construct a source batch.
     #[must_use]
     pub fn new(records: RecordBatch) -> Self {
-        Self { records }
+        Self {
+            records,
+            row_positions: None,
+        }
+    }
+
+    /// Construct a batch with deterministic positions for every decoded row.
+    ///
+    /// # Errors
+    /// Returns an error when the sidecar is not row-aligned with `records`.
+    pub fn positioned(
+        records: RecordBatch,
+        row_positions: SourceRowPositions,
+    ) -> Result<Self, ConnectorError> {
+        row_positions.validate_row_count(records.num_rows())?;
+        Ok(Self {
+            records,
+            row_positions: Some(row_positions),
+        })
+    }
+
+    /// Deterministic row positions, when supplied by the connector.
+    #[must_use]
+    pub const fn row_positions(&self) -> Option<&SourceRowPositions> {
+        self.row_positions.as_ref()
+    }
+
+    /// Validate and append deterministic positions as reserved Arrow columns.
+    ///
+    /// # Errors
+    /// Returns an error when the contract and sidecar disagree or the sidecar is malformed.
+    pub fn into_records_with_positions(
+        self,
+        capability: SourceRowPositionCapability,
+        positioned_schema: &SchemaRef,
+    ) -> Result<RecordBatch, ConnectorError> {
+        match (capability, self.row_positions) {
+            (SourceRowPositionCapability::Unavailable, None) => Ok(self.records),
+            (SourceRowPositionCapability::Unavailable, Some(_)) => {
+                Err(ConnectorError::SchemaMismatch(
+                    "source emitted row positions without declaring the capability".into(),
+                ))
+            }
+            (SourceRowPositionCapability::Deterministic, None) => {
+                Err(ConnectorError::SchemaMismatch(
+                    "source declared deterministic row positions but omitted the sidecar".into(),
+                ))
+            }
+            (SourceRowPositionCapability::Deterministic, Some(positions)) => {
+                positions.append_to(&self.records, positioned_schema)
+            }
+        }
     }
 
     /// Record count in the batch.
@@ -1469,6 +1680,25 @@ mod tests {
     fn test_source_batch() {
         let batch = SourceBatch::new(test_batch(10));
         assert_eq!(batch.num_rows(), 10);
+        assert!(batch.row_positions().is_none());
+    }
+
+    #[test]
+    fn source_row_positions_reject_nulls_and_misalignment() {
+        let null_partition = BinaryArray::from(vec![Some(&b"p0"[..]), None]);
+        let order = BinaryArray::from(vec![&b"0"[..], &b"1"[..]]);
+        let sub_offset = UInt32Array::from(vec![0, 0]);
+        assert!(
+            SourceRowPositions::try_new(null_partition, order.clone(), sub_offset.clone()).is_err()
+        );
+
+        let positions = SourceRowPositions::try_new(
+            BinaryArray::from(vec![&b"p0"[..], &b"p0"[..]]),
+            order,
+            sub_offset,
+        )
+        .unwrap();
+        assert!(SourceBatch::positioned(test_batch(1), positions).is_err());
     }
 
     #[test]
@@ -1502,6 +1732,10 @@ mod tests {
         assert_eq!(contract.consistency, SourceConsistency::Ephemeral);
         assert_eq!(contract.topology, SourceTopology::Singleton);
         assert_eq!(contract.input_mode, SourceInputMode::AppendOnly);
+        assert_eq!(
+            contract.row_positions,
+            SourceRowPositionCapability::Unavailable
+        );
         assert!(!contract.supports_replay());
         assert!(!contract.requires_checkpointing());
         assert!(!contract.is_exact_delivery_certified());

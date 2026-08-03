@@ -11,7 +11,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_array::builder::BinaryBuilder;
+use arrow_array::{Int64Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 
@@ -19,7 +20,7 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConfigKeySpec, ConnectorConfig, ConnectorInfo};
 use crate::connector::{
     SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
-    SourcePosition, SourceStart, SourceTopology,
+    SourcePosition, SourceRowPositionCapability, SourceRowPositions, SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 use crate::registry::ConnectorRegistry;
@@ -56,6 +57,7 @@ pub struct GeneratorSource {
     rows_per_second: u64,
     batch_max: usize,
     max_rows: Option<u64>,
+    source_name: Arc<str>,
     /// Next sequence number to emit (== rows emitted so far across
     /// restarts; restored from the checkpoint).
     next_seq: u64,
@@ -106,6 +108,39 @@ impl GeneratorSource {
         )
         .map_err(|e| ConnectorError::ReadError(e.to_string()))
     }
+
+    fn build_row_positions(
+        &self,
+        start: u64,
+        n: usize,
+    ) -> Result<SourceRowPositions, ConnectorError> {
+        let source_len = u32::try_from(self.source_name.len()).map_err(|_| {
+            ConnectorError::ConfigurationError(
+                "generator source identity exceeds the row-position encoding limit".into(),
+            )
+        })?;
+        let mut partition = Vec::with_capacity(self.source_name.len() + 8);
+        partition.extend_from_slice(&source_len.to_be_bytes());
+        partition.extend_from_slice(self.source_name.as_bytes());
+        partition.extend_from_slice(&0_u32.to_be_bytes());
+
+        let mut partitions = BinaryBuilder::with_capacity(n, partition.len().saturating_mul(n));
+        let mut order_keys = BinaryBuilder::with_capacity(n, 8_usize.saturating_mul(n));
+        for row in 0..n {
+            let sequence = start
+                .checked_add(u64::try_from(row).map_err(|_| {
+                    ConnectorError::Internal("generator batch row index exceeds u64".into())
+                })?)
+                .ok_or_else(|| ConnectorError::Internal("generator sequence overflow".into()))?;
+            partitions.append_value(&partition);
+            order_keys.append_value(sequence.to_be_bytes());
+        }
+        SourceRowPositions::try_new(
+            partitions.finish(),
+            order_keys.finish(),
+            UInt32Array::from(vec![0; n]),
+        )
+    }
 }
 
 impl Default for GeneratorSource {
@@ -115,6 +150,7 @@ impl Default for GeneratorSource {
             rows_per_second: 1000,
             batch_max: 1024,
             max_rows: None,
+            source_name: Arc::from("generator"),
             next_seq: 0,
             anchor: None,
         }
@@ -129,11 +165,18 @@ impl SourceConnector for GeneratorSource {
             SourceTopology::Singleton,
             SourceInputMode::AppendOnly,
         )
+        .with_row_positions(SourceRowPositionCapability::Deterministic)
         .with_exact_delivery_certification())
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         let (config, position, _) = request.into_parts();
+        self.source_name = Arc::from(
+            config
+                .get("laminar.source.name")
+                .filter(|name| !name.is_empty())
+                .unwrap_or("generator"),
+        );
         if let Some(rps) = config.get_parsed::<u64>("rows.per.second")? {
             if rps == 0 {
                 return Err(ConnectorError::ConfigurationError(
@@ -197,8 +240,14 @@ impl SourceConnector for GeneratorSource {
             return Ok(None);
         }
         let batch = self.build_batch(self.next_seq, n)?;
-        self.next_seq += n as u64;
-        Ok(Some(SourceBatch::new(batch)))
+        let row_positions = self.build_row_positions(self.next_seq, n)?;
+        self.next_seq =
+            self.next_seq
+                .checked_add(u64::try_from(n).map_err(|_| {
+                    ConnectorError::Internal("generator batch size exceeds u64".into())
+                })?)
+                .ok_or_else(|| ConnectorError::Internal("generator sequence overflow".into()))?;
+        Ok(Some(SourceBatch::positioned(batch, row_positions)?))
     }
 
     fn schema(&self) -> SchemaRef {
@@ -267,7 +316,27 @@ mod tests {
             .expect("static generator contract");
         assert_eq!(contract.consistency, SourceConsistency::Replayable);
         assert_eq!(contract.topology, SourceTopology::Singleton);
+        assert_eq!(
+            contract.row_positions,
+            SourceRowPositionCapability::Deterministic
+        );
         assert!(contract.is_exact_delivery_certified());
+    }
+
+    #[test]
+    fn row_positions_bind_source_partition_and_sequence() {
+        let mut source = GeneratorSource::default();
+        source.source_name = Arc::from("prices");
+        let positions = source.build_row_positions(7, 2).unwrap();
+
+        assert_eq!(&positions.partition().value(0)[4..10], b"prices");
+        assert_eq!(
+            positions.partition().value(0),
+            positions.partition().value(1)
+        );
+        assert_eq!(positions.order_key().value(0), 7_u64.to_be_bytes());
+        assert_eq!(positions.order_key().value(1), 8_u64.to_be_bytes());
+        assert_eq!(positions.sub_offset().values(), &[0, 0]);
     }
 
     #[tokio::test]
