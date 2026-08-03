@@ -134,8 +134,9 @@ For source code or local deployment options, see the [`laminardb-console-ui`](ht
 
 ## Cluster Mode & Setup
 
-LaminarDB supports multi-node cluster deployments. Streaming pipelines are partitioned across
-virtual nodes (vnodes), the same unit used by embedded and single-node execution.
+LaminarDB supports multi-node cluster deployments. Keyed aggregates and interval joins use 256
+stable virtual nodes (vnodes) by default in every deployment tier. Embedded and single-node
+runtimes own all configured vnodes in process; clusters distribute the same topology across nodes.
 
 ### Architecture & Dynamics
 

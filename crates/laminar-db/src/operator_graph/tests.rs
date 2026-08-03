@@ -1026,6 +1026,7 @@ async fn vnode_transition_harness_from_pending(
     sender.install_assignment_fence(&fence, &owner_ids).unwrap();
 
     let mut graph = test_graph();
+    graph.set_key_group_count(laminar_core::state::KeyGroupCount::try_from(vnode_count).unwrap());
     graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
         registry: Arc::clone(&registry),
         sender,
@@ -1147,6 +1148,9 @@ async fn final_owner_exit_harness(endpoint_incarnation: uuid::Uuid) -> FinalOwne
     );
     let pending = Arc::new(parking_lot::Mutex::new(Some(Arc::clone(&published))));
     let mut graph = test_graph();
+    graph.set_key_group_count(
+        laminar_core::state::KeyGroupCount::try_from(registry.vnode_count()).unwrap(),
+    );
     graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
         registry: Arc::clone(&registry),
         sender: Arc::clone(&sender),
@@ -1248,6 +1252,9 @@ async fn alignment_harness() -> AlignmentHarness {
 
     let recorded = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+    graph.set_key_group_count(
+        laminar_core::state::KeyGroupCount::try_from(registry.vnode_count()).unwrap(),
+    );
     graph.push_test_node("out", Box::new(RecordingOperator(Arc::clone(&recorded))));
     graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
         registry,
@@ -1373,6 +1380,9 @@ async fn three_node_alignment_harness() -> ThreeNodeAlignmentHarness {
 
     let recorded = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+    graph.set_key_group_count(
+        laminar_core::state::KeyGroupCount::try_from(registry.vnode_count()).unwrap(),
+    );
     graph.push_test_node("out", Box::new(RecordingOperator(Arc::clone(&recorded))));
     graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
         registry,

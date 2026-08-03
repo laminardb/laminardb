@@ -8,6 +8,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
+use laminar_core::state::{KeyGroupCount, DEFAULT_KEY_GROUP_COUNT};
 use laminar_sql::datafusion::live_source::{LiveSourceHandle, LiveSourceProvider};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
@@ -622,6 +623,7 @@ pub(crate) struct OperatorGraph {
     // Since-last-sample high watermarks make synchronous prepare/publish/finish ownership visible
     // without invoking Prometheus inside the vnode publication section. Indices mirror `nodes`.
     managed_state_accounting_peaks: Vec<ManagedStateAccountingSnapshot>,
+    key_group_count: KeyGroupCount,
     ctx: SessionContext,
     prom: Option<Arc<EngineMetrics>>,
     lookup_registry: Option<Arc<laminar_sql::datafusion::LookupTableRegistry>>,
@@ -710,6 +712,7 @@ impl OperatorGraph {
             max_retractable_extremum_checkpoint_bytes:
                 crate::config::DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES,
             managed_state_accounting_peaks: Vec::new(),
+            key_group_count: DEFAULT_KEY_GROUP_COUNT,
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
             #[cfg(feature = "cluster")]
@@ -958,13 +961,31 @@ impl OperatorGraph {
         self.lookup_registry = Some(registry);
     }
 
+    pub(crate) fn set_key_group_count(&mut self, key_group_count: KeyGroupCount) {
+        if !self.nodes.is_empty() {
+            self.build_errors.push(DbError::Config(
+                "key-group topology must be installed before graph operators".into(),
+            ));
+            return;
+        }
+        self.key_group_count = key_group_count;
+    }
+
     /// Install the cluster shuffle config for streaming aggregates.
     #[cfg(feature = "cluster")]
     pub fn set_cluster_shuffle(
         &mut self,
         config: crate::operator::sql_query::ClusterShuffleConfig,
     ) {
-        self.vnode_count = Some(config.registry.vnode_count());
+        let vnode_count = config.registry.vnode_count();
+        if vnode_count != u32::from(self.key_group_count) {
+            self.build_errors.push(DbError::Config(format!(
+                "cluster vnode registry count {vnode_count} does not match graph key-group topology {}",
+                self.key_group_count.get()
+            )));
+            return;
+        }
+        self.vnode_count = Some(vnode_count);
         self.cluster_shuffle = Some(config);
     }
 
@@ -1971,11 +1992,12 @@ impl OperatorGraph {
         }
 
         if let Some(cfg) = stream_join_config {
-            let mut op = operator::interval_join::IntervalJoinOperator::new(
+            let mut op = operator::interval_join::IntervalJoinOperator::new_with_key_groups(
                 name,
                 cfg.clone(),
                 projection_sql.map(Arc::from),
                 self.ctx.clone(),
+                self.key_group_count,
             );
             if let (Some(left_schema), Some(right_schema)) = (
                 self.source_schemas.get(&cfg.left_table),
@@ -1985,6 +2007,10 @@ impl OperatorGraph {
             }
             #[cfg(feature = "cluster")]
             if let Some(ref scope) = self.cluster_shuffle {
+                debug_assert_eq!(
+                    scope.registry.vnode_count(),
+                    u32::from(self.key_group_count)
+                );
                 op.attach_cluster_shuffle(scope.clone());
             }
             return Box::new(op);
@@ -2051,17 +2077,19 @@ impl OperatorGraph {
         let emit_changelog =
             incremental || emit_clause.is_some_and(|ec| matches!(ec, EmitClause::Changes));
 
-        let op = operator::sql_query::SqlQueryOperator::new(
+        let op = operator::sql_query::SqlQueryOperator::new_with_key_groups(
             name,
             sql,
             self.ctx.clone(),
             self.prom.clone(),
             emit_changelog,
+            self.key_group_count,
         );
         #[cfg(feature = "cluster")]
         let mut op = op;
         #[cfg(feature = "cluster")]
         if let Some(ref cfg) = self.cluster_shuffle {
+            debug_assert_eq!(cfg.registry.vnode_count(), u32::from(self.key_group_count));
             op.attach_cluster_shuffle(cfg.clone());
             // Delta checkpoints are a cluster (per-vnode) capability — only wire when sharded.
             // Enabling delta also makes the chain the primary agg checkpoint.
@@ -3754,6 +3782,8 @@ impl OperatorGraph {
                 && !owned_vnodes.windows(2).any(|pair| pair[0] >= pair[1]),
             "test owned-vnode roster must be canonical and in range"
         );
+        self.key_group_count = KeyGroupCount::try_from(vnode_count)
+            .expect("test vnode count must fit the checkpoint key-group ABI");
         self.vnode_count = Some(vnode_count);
         self.test_owned_vnodes = Some(owned_vnodes);
     }

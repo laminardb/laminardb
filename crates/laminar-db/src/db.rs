@@ -1286,7 +1286,14 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
             cluster_authority_transition: parking_lot::Mutex::new(()),
             state_backend: parking_lot::Mutex::new(None),
-            vnode_registry: parking_lot::Mutex::new(None),
+            vnode_registry: parking_lot::Mutex::new((runtime_mode == RuntimeMode::Local).then(
+                || {
+                    Arc::new(laminar_core::state::VnodeRegistry::single_owner(
+                        u32::from(laminar_core::state::DEFAULT_KEY_GROUP_COUNT),
+                        laminar_core::state::LOCAL_NODE_ID,
+                    ))
+                },
+            )),
             physical_optimizer_rules: physical_rules.into(),
             pipeline_target_partitions: target_partitions,
             #[cfg(feature = "cluster")]
@@ -4626,20 +4633,16 @@ impl LaminarDB {
     }
 
     /// Stable logical partition count used by checkpoint and state identity.
-    /// Local runtimes have one key group. Cluster runtimes use their exact registry or the
-    /// fixed cluster default when no keyed state topology is installed.
+    /// Uses the exact registry topology, or the common deployment default when no registry is
+    /// installed.
     pub(crate) fn checkpoint_key_groups(&self) -> laminar_core::state::KeyGroupCount {
-        let runtime_default = match self.runtime_mode() {
-            RuntimeMode::Local => laminar_core::state::LOCAL_KEY_GROUP_COUNT,
-            RuntimeMode::Cluster => laminar_core::state::DEFAULT_CLUSTER_KEY_GROUP_COUNT,
-        };
-        self.vnode_registry
-            .lock()
-            .as_ref()
-            .map_or(runtime_default, |registry| {
+        self.vnode_registry.lock().as_ref().map_or(
+            laminar_core::state::DEFAULT_KEY_GROUP_COUNT,
+            |registry| {
                 laminar_core::state::KeyGroupCount::try_from(registry.vnode_count())
                     .expect("builder validated the vnode registry key-group count")
-            })
+            },
+        )
     }
 
     /// Return a checkpoint store for the resolved runtime configuration, if any.

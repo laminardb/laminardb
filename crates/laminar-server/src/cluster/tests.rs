@@ -511,7 +511,7 @@ async fn dropping_cluster_handle_fences_authority_and_aborts_owned_tasks() {
     let state_backend = cluster_state_backend(
         verified_namespaces.state_store(),
         node,
-        laminar_core::state::LOCAL_KEY_GROUP_COUNT,
+        laminar_core::state::KeyGroupCount::try_from(1_u16).unwrap(),
     );
     let vnode_registry = Arc::new(laminar_core::state::VnodeRegistry::new(1));
     let (_members_tx, members_rx) = watch::channel(Vec::new());
@@ -672,7 +672,7 @@ async fn process_lease_loss_revokes_http_controller_and_database_authority() {
     let state_backend = cluster_state_backend(
         verified_namespaces.state_store(),
         node,
-        laminar_core::state::LOCAL_KEY_GROUP_COUNT,
+        laminar_core::state::KeyGroupCount::try_from(1_u16).unwrap(),
     );
     let vnode_registry = Arc::new(laminar_core::state::VnodeRegistry::new(1));
     let (_members_tx, members_rx) = watch::channel(Vec::new());
@@ -825,7 +825,7 @@ async fn cluster_state_seal_records_runtime_node_id() {
     let backend = cluster_state_backend(
         Arc::clone(&store),
         node_id,
-        laminar_core::state::LOCAL_KEY_GROUP_COUNT,
+        laminar_core::state::KeyGroupCount::try_from(1_u16).unwrap(),
     );
     let attempt = laminar_core::state::CheckpointAttempt::canonical(17);
     let payload = bytes::Bytes::from_static(b"state");

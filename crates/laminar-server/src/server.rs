@@ -223,7 +223,7 @@ pub async fn run_server(
         .map_err(|error| ServerError::Build(format!("checkpoint storage: {error}")))?;
     let vnode_registry = Arc::new(laminar_core::state::VnodeRegistry::single_owner(
         u32::from(key_groups),
-        laminar_core::state::NodeId(0),
+        laminar_core::state::LOCAL_NODE_ID,
     ));
     builder = builder
         .state_backend(state_backend)

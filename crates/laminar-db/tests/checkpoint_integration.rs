@@ -95,7 +95,7 @@ mod disk_persistence {
         assert_eq!(manifest.epoch, 1);
         assert_eq!(
             manifest.vnode_count,
-            laminar_core::state::LOCAL_KEY_GROUP_COUNT.get()
+            laminar_core::state::DEFAULT_KEY_GROUP_COUNT.get()
         );
         assert_eq!(
             manifest.partitioning_abi_version,
@@ -126,7 +126,10 @@ mod disk_persistence {
                 laminar_core::state::ObjectStoreBackend::node_durable(state_store, "node-0", 1),
             ))
             .vnode_registry(std::sync::Arc::new(
-                laminar_core::state::VnodeRegistry::single_owner(1, laminar_core::state::NodeId(0)),
+                laminar_core::state::VnodeRegistry::single_owner(
+                    1,
+                    laminar_core::state::LOCAL_NODE_ID,
+                ),
             ))
             .build()
             .await

@@ -683,7 +683,7 @@ async fn local_checkpoint_barrier_timings_fixture_with_auth(
     )
     .await
     .unwrap();
-    let vnode_count = u32::from(laminar_core::state::DEFAULT_CLUSTER_KEY_GROUP_COUNT);
+    let vnode_count = u32::from(laminar_core::state::DEFAULT_KEY_GROUP_COUNT);
     let state_backend: Arc<dyn laminar_core::state::StateBackend> =
         Arc::new(laminar_core::state::ObjectStoreBackend::cluster_shared(
             namespaces.state_store(),

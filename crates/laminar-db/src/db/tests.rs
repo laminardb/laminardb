@@ -1413,7 +1413,12 @@ async fn test_open_default() {
     assert!(db.sinks().is_empty());
     assert_eq!(
         db.checkpoint_key_groups(),
-        laminar_core::state::LOCAL_KEY_GROUP_COUNT
+        laminar_core::state::DEFAULT_KEY_GROUP_COUNT
+    );
+    let registry = db.vnode_registry.lock().clone().unwrap();
+    assert_eq!(
+        laminar_core::state::owned_vnodes(&registry, laminar_core::state::LOCAL_NODE_ID).len(),
+        usize::from(laminar_core::state::DEFAULT_KEY_GROUP_COUNT.get())
     );
 }
 

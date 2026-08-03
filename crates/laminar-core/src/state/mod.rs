@@ -21,6 +21,6 @@ pub use partition_key::{PartitionKeyCodecError, PartitionKeyCodecV1, PartitionKe
 pub use vnode::{
     key_hash, owned_vnodes, owners_per_domain, peer_owners, rendezvous_assignment,
     InvalidKeyGroupCount, KeyGroupCount, Locality, NodeId, VnodeAssignmentReadGuard,
-    VnodeAssignmentSnapshot, VnodeLifecycleState, VnodeRegistry, DEFAULT_CLUSTER_KEY_GROUP_COUNT,
-    LOCAL_KEY_GROUP_COUNT, MAX_KEY_GROUP_COUNT, PARTITIONING_ABI_VERSION,
+    VnodeAssignmentSnapshot, VnodeLifecycleState, VnodeRegistry, DEFAULT_KEY_GROUP_COUNT,
+    LOCAL_NODE_ID, MAX_KEY_GROUP_COUNT, PARTITIONING_ABI_VERSION,
 };

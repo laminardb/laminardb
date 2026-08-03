@@ -26,9 +26,7 @@ data:
     mode = "{{ if $isCluster }}cluster{{ else }}{{ .Values.laminardb.mode }}{{ end }}"
     delivery = "{{ .Values.laminardb.delivery }}"
     bind = "{{ .Values.laminardb.httpBind }}"
-    {{- if $isCluster }}
-    key_groups = {{ $cluster.keyGroups }}
-    {{- end }}
+    key_groups = {{ .Values.laminardb.keyGroups }}
     {{- if (.Values.laminardb.consoleToken | default dict).existingSecret }}
     # Resolved from the pod env at config load; the token never enters the ConfigMap.
     console_token = "${LAMINAR_CONSOLE_TOKEN}"

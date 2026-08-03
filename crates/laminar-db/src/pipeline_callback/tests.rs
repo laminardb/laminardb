@@ -3132,6 +3132,9 @@ async fn install_callback_shuffle(
     sender.register_peer(7, receiver.local_addr());
     callback
         .graph
+        .set_key_group_count(laminar_core::state::KeyGroupCount::try_from(2_u16).unwrap());
+    callback
+        .graph
         .set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
             registry: Arc::new(VnodeRegistry::single_owner(2, NodeId(7))),
             sender: Arc::clone(&sender),

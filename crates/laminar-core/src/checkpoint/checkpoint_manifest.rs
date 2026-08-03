@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use crate::state::{KeyGroupCount, LOCAL_KEY_GROUP_COUNT, PARTITIONING_ABI_VERSION};
+use crate::state::{KeyGroupCount, DEFAULT_KEY_GROUP_COUNT, PARTITIONING_ABI_VERSION};
 
 /// Current checkpoint manifest format. Older manifests are rejected rather
 /// than guessed at recovery time.
@@ -252,12 +252,12 @@ impl CheckpointManifest {
         errors
     }
 
-    /// Creates a new manifest for an embedded or single-node runtime.
+    /// Creates a new manifest with the common deployment topology.
     ///
     /// Validation rejects values where `checkpoint_id` and `epoch` differ.
     #[must_use]
     pub fn new(checkpoint_id: u64, epoch: u64) -> Self {
-        Self::new_with_key_group_count(checkpoint_id, epoch, LOCAL_KEY_GROUP_COUNT)
+        Self::new_with_key_group_count(checkpoint_id, epoch, DEFAULT_KEY_GROUP_COUNT)
     }
 
     /// Creates a new manifest with an explicit stable key-group count.
@@ -466,7 +466,7 @@ mod tests {
         assert_eq!(m.durable_phase, DurableCheckpointPhase::Prepared);
         assert_eq!(m.checkpoint_id, 5);
         assert_eq!(m.epoch, 5);
-        assert_eq!(m.vnode_count, LOCAL_KEY_GROUP_COUNT.get());
+        assert_eq!(m.vnode_count, DEFAULT_KEY_GROUP_COUNT.get());
         assert!(m.timestamp_ms > 0);
         assert!(m.source_offsets.is_empty());
         assert!(m.operator_states.is_empty());
@@ -474,13 +474,13 @@ mod tests {
 
     #[test]
     fn test_manifest_new_with_explicit_key_group_count() {
-        let key_group_count = KeyGroupCount::try_from(256_u16).unwrap();
+        let key_group_count = KeyGroupCount::try_from(64_u16).unwrap();
         let mut manifest = CheckpointManifest::new_with_key_group_count(5, 5, key_group_count);
         manifest.deployment_id = uuid::Uuid::from_u128(1).to_string();
 
         assert_eq!(manifest.vnode_count, key_group_count.get());
         assert!(manifest.validate(key_group_count).is_empty());
-        assert!(!manifest.validate(LOCAL_KEY_GROUP_COUNT).is_empty());
+        assert!(!manifest.validate(DEFAULT_KEY_GROUP_COUNT).is_empty());
     }
 
     #[test]
@@ -517,7 +517,7 @@ mod tests {
         manifest.version = CHECKPOINT_MANIFEST_VERSION - 1;
         let restored: CheckpointManifest =
             serde_json::from_str(&serde_json::to_string(&manifest).unwrap()).unwrap();
-        let errors = restored.validate(LOCAL_KEY_GROUP_COUNT);
+        let errors = restored.validate(DEFAULT_KEY_GROUP_COUNT);
         let previous = CHECKPOINT_MANIFEST_VERSION - 1;
         assert!(
             errors.iter().any(|error| error
@@ -531,7 +531,7 @@ mod tests {
     fn test_manifest_rejects_noncanonical_attempt_identity() {
         for (checkpoint_id, epoch) in [(0, 0), (5, 0), (0, 5), (5, 6)] {
             let manifest = CheckpointManifest::new(checkpoint_id, epoch);
-            let errors = manifest.validate(LOCAL_KEY_GROUP_COUNT);
+            let errors = manifest.validate(DEFAULT_KEY_GROUP_COUNT);
             assert!(
                 errors.iter().any(|error| error
                     .message
@@ -647,7 +647,7 @@ mod tests {
         let mut manifest = CheckpointManifest::new(5, 5);
         manifest.partitioning_abi_version = PARTITIONING_ABI_VERSION + 1;
 
-        let errors = manifest.validate(LOCAL_KEY_GROUP_COUNT);
+        let errors = manifest.validate(DEFAULT_KEY_GROUP_COUNT);
         assert!(
             errors
                 .iter()
@@ -663,7 +663,7 @@ mod tests {
         m.source_offsets
             .insert("c".into(), ConnectorCheckpoint::new());
 
-        let errors = m.validate(LOCAL_KEY_GROUP_COUNT);
+        let errors = m.validate(DEFAULT_KEY_GROUP_COUNT);
         assert!(
             errors
                 .iter()

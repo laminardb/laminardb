@@ -63,6 +63,7 @@ pub struct LaminarDbBuilder {
     unchecked_cluster_checkpoint_store: Option<Arc<dyn object_store::ObjectStore>>,
     state_backend: Option<std::sync::Arc<dyn laminar_core::state::StateBackend>>,
     vnode_registry: Option<std::sync::Arc<laminar_core::state::VnodeRegistry>>,
+    key_groups: Option<laminar_core::state::KeyGroupCount>,
     physical_optimizer_rules: Vec<
         std::sync::Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>,
     >,
@@ -103,6 +104,7 @@ impl LaminarDbBuilder {
             unchecked_cluster_checkpoint_store: None,
             state_backend: None,
             vnode_registry: None,
+            key_groups: None,
             physical_optimizer_rules: Vec::new(),
             target_partitions: None,
             ai_runtime: None,
@@ -145,13 +147,22 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Install a vnode registry; must be paired with [`Self::state_backend`].
+    /// Install a vnode registry. A legacy state backend, when supplied, must use the same count.
     #[must_use]
     pub fn vnode_registry(
         mut self,
         registry: std::sync::Arc<laminar_core::state::VnodeRegistry>,
     ) -> Self {
         self.vnode_registry = Some(registry);
+        self
+    }
+
+    /// Set the stable key-group topology for a local runtime.
+    ///
+    /// When no registry is injected, the local node owns every configured key group.
+    #[must_use]
+    pub fn key_groups(mut self, key_groups: laminar_core::state::KeyGroupCount) -> Self {
+        self.key_groups = Some(key_groups);
         self
     }
 
@@ -588,6 +599,15 @@ impl LaminarDbBuilder {
 
         Self::validate_backpressure(&self.config)?;
         self.validate_state_topology(runtime_mode)?;
+        if let Some(key_groups) = self
+            .key_groups
+            .filter(|_| runtime_mode == RuntimeMode::Local && self.vnode_registry.is_none())
+        {
+            self.vnode_registry = Some(Arc::new(laminar_core::state::VnodeRegistry::single_owner(
+                u32::from(key_groups),
+                laminar_core::state::LOCAL_NODE_ID,
+            )));
+        }
         #[cfg(feature = "cluster")]
         self.bind_cluster_process_lease(runtime_mode)?;
 
@@ -665,16 +685,48 @@ impl LaminarDbBuilder {
                     "state_backend is set but vnode_registry is missing".into(),
                 ));
             }
-            (None, Some(_)) => {
-                return Err(DbError::Config(
-                    "vnode_registry is set but state_backend is missing".into(),
-                ));
-            }
             _ => {}
         }
-        if let (Some(backend), Some(registry)) =
-            (self.state_backend.as_ref(), self.vnode_registry.as_ref())
+        let registry_key_groups = self
+            .vnode_registry
+            .as_ref()
+            .map(|registry| {
+                let registry_count = registry.vnode_count();
+                laminar_core::state::KeyGroupCount::try_from(registry_count).map_err(|_| {
+                    DbError::Config(format!(
+                        "vnode_registry count must be between 1 and {}, got {registry_count}",
+                        laminar_core::state::MAX_KEY_GROUP_COUNT
+                    ))
+                })
+            })
+            .transpose()?;
+        if let Some(registry) = self
+            .vnode_registry
+            .as_ref()
+            .filter(|_| runtime_mode == RuntimeMode::Local)
         {
+            let assignment = registry.versioned_snapshot();
+            if let Some((vnode, owner)) = assignment
+                .owners()
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, owner)| *owner != laminar_core::state::LOCAL_NODE_ID)
+            {
+                return Err(DbError::Config(format!(
+                    "local vnode {vnode} must be owned by {}, got {owner}",
+                    laminar_core::state::LOCAL_NODE_ID.0
+                )));
+            }
+        }
+        if let (Some(configured), Some(registry)) = (self.key_groups, registry_key_groups) {
+            if configured != registry {
+                return Err(DbError::Config(format!(
+                    "configured key-group count {configured} does not match vnode_registry count {registry}"
+                )));
+            }
+        }
+        if let Some(backend) = self.state_backend.as_ref() {
             let backend_capacity = backend.key_group_capacity();
             let backend_key_groups =
                 laminar_core::state::KeyGroupCount::try_from(backend_capacity).map_err(|_| {
@@ -683,25 +735,11 @@ impl LaminarDbBuilder {
                         laminar_core::state::MAX_KEY_GROUP_COUNT
                     ))
                 })?;
-            let registry_count = registry.vnode_count();
-            let registry_key_groups = laminar_core::state::KeyGroupCount::try_from(registry_count)
-                .map_err(|_| {
-                    DbError::Config(format!(
-                        "vnode_registry count must be between 1 and {}, got {registry_count}",
-                        laminar_core::state::MAX_KEY_GROUP_COUNT
-                    ))
-                })?;
+            let registry_key_groups = registry_key_groups
+                .expect("state backend without a vnode registry was rejected above");
             if backend_key_groups != registry_key_groups {
                 return Err(DbError::Config(format!(
                     "state_backend key-group capacity {backend_key_groups} does not match vnode_registry count {registry_key_groups}"
-                )));
-            }
-            if !runtime_mode.is_cluster()
-                && registry_key_groups != laminar_core::state::LOCAL_KEY_GROUP_COUNT
-            {
-                return Err(DbError::Config(format!(
-                    "local runtime requires exactly {} key group; got {registry_key_groups}. Multi-key-group ownership requires cluster mode",
-                    laminar_core::state::LOCAL_KEY_GROUP_COUNT
                 )));
             }
         }
@@ -882,6 +920,7 @@ impl std::fmt::Debug for LaminarDbBuilder {
             .field("profile", &self.profile)
             .field("profile_explicit", &self.profile_explicit)
             .field("delivery_explicit", &self.delivery_explicit)
+            .field("key_groups", &self.key_groups)
             .field("object_store_url", &self.object_store_url)
             .field(
                 "object_store_options_count",
@@ -986,7 +1025,7 @@ mod tests {
         Arc<dyn laminar_core::state::StateBackend>,
         Arc<laminar_core::state::VnodeRegistry>,
     ) {
-        let vnode_count = u32::from(laminar_core::state::DEFAULT_CLUSTER_KEY_GROUP_COUNT);
+        let vnode_count = u32::from(laminar_core::state::DEFAULT_KEY_GROUP_COUNT);
         (
             Arc::new(laminar_core::state::ObjectStoreBackend::cluster_shared(
                 namespaces.state_store(),
@@ -1002,6 +1041,15 @@ mod tests {
         let db = LaminarDbBuilder::new().build().await.unwrap();
         assert!(!db.is_closed());
         assert!(!db.is_cluster_runtime());
+        assert_eq!(
+            db.checkpoint_key_groups(),
+            laminar_core::state::DEFAULT_KEY_GROUP_COUNT
+        );
+        let registry = db.vnode_registry.lock().clone().unwrap();
+        assert_eq!(
+            laminar_core::state::owned_vnodes(&registry, laminar_core::state::LOCAL_NODE_ID).len(),
+            usize::from(laminar_core::state::DEFAULT_KEY_GROUP_COUNT.get())
+        );
         #[cfg(feature = "cluster")]
         assert!(!db.cluster_intake_fenced());
     }
@@ -1404,7 +1452,7 @@ mod tests {
 
         assert_eq!(
             db.checkpoint_key_groups(),
-            laminar_core::state::DEFAULT_CLUSTER_KEY_GROUP_COUNT
+            laminar_core::state::DEFAULT_KEY_GROUP_COUNT
         );
         assert!(db.state_backend.lock().is_none());
         assert!(db.vnode_registry.lock().is_none());
@@ -1714,16 +1762,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_runtime_rejects_multi_key_group_registry() {
-        let error = LaminarDbBuilder::new()
-            .state_backend(Arc::new(laminar_core::state::InProcessBackend::new(2)))
-            .vnode_registry(Arc::new(laminar_core::state::VnodeRegistry::new(2)))
+    async fn local_runtime_accepts_owned_multi_key_group_registry() {
+        let db = LaminarDbBuilder::new()
+            .vnode_registry(Arc::new(laminar_core::state::VnodeRegistry::single_owner(
+                2,
+                laminar_core::state::LOCAL_NODE_ID,
+            )))
             .build()
             .await
-            .expect_err("local runtime must not expose cluster rescaling dimensions");
-        assert!(
-            error.to_string().contains("requires exactly 1 key group"),
-            "{error}"
+            .expect("local runtimes use the same multi-key-group topology");
+        assert_eq!(db.checkpoint_key_groups().get(), 2);
+    }
+
+    #[tokio::test]
+    async fn local_runtime_rejects_nonlocal_vnode_ownership() {
+        for registry in [
+            Arc::new(laminar_core::state::VnodeRegistry::new(2)),
+            Arc::new(laminar_core::state::VnodeRegistry::single_owner(
+                2,
+                laminar_core::state::NodeId(9),
+            )),
+        ] {
+            let error = LaminarDbBuilder::new()
+                .vnode_registry(registry)
+                .build()
+                .await
+                .expect_err("local runtimes must own every configured vnode");
+            assert!(error.to_string().contains("must be owned by 1"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_key_groups_build_an_owned_local_registry() {
+        let configured = laminar_core::state::KeyGroupCount::try_from(64_u16).unwrap();
+        let db = LaminarDbBuilder::new()
+            .key_groups(configured)
+            .build()
+            .await
+            .unwrap();
+        let registry = db.vnode_registry.lock().clone().unwrap();
+        assert_eq!(registry.vnode_count(), 64);
+        assert_eq!(
+            laminar_core::state::owned_vnodes(&registry, laminar_core::state::LOCAL_NODE_ID).len(),
+            64
         );
     }
 

@@ -39,6 +39,8 @@ laminardb:
   logLevel: info
   # -- HTTP API bind address
   httpBind: "0.0.0.0:8080"
+  # -- Stable key groups used by every deployment tier
+  keyGroups: 256
 
   # -- Checkpoint configuration
   checkpoint:
@@ -97,8 +99,6 @@ laminardb:
   cluster:
     # -- Node ID (auto-generated from pod name if empty)
     nodeId: ""
-    # -- Stable key groups distributed across cluster nodes
-    keyGroups: 256
     discovery:
       # -- Discovery strategy: "gossip" (recommended) or "static"
       strategy: gossip

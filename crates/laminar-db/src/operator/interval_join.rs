@@ -5,16 +5,17 @@
 
 use std::sync::Arc;
 
+use std::collections::BTreeMap;
 #[cfg(feature = "cluster")]
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 
 use arrow::array::RecordBatch;
-#[cfg(feature = "cluster")]
 use arrow::datatypes::DataType;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
 
+use laminar_core::state::{KeyGroupCount, VnodeAssignmentSnapshot, VnodeRegistry, LOCAL_NODE_ID};
 use laminar_sql::translator::StreamJoinConfig;
 
 use crate::error::DbError;
@@ -65,6 +66,8 @@ enum IntervalJoinTransitionCleanup {
 
 pub(crate) struct IntervalJoinOperator {
     config: StreamJoinConfig,
+    key_group_count: KeyGroupCount,
+    local_assignment: VnodeAssignmentSnapshot,
     vnode_states: Vec<Option<Box<IntervalJoinState>>>,
     max_managed_state_bytes: usize,
     input_schemas: Option<(SchemaRef, SchemaRef)>,
@@ -82,15 +85,39 @@ pub(crate) struct IntervalJoinOperator {
 }
 
 impl IntervalJoinOperator {
+    #[cfg(test)]
     pub(crate) fn new(
         name: &str,
         config: StreamJoinConfig,
         projection_sql: Option<Arc<str>>,
         ctx: SessionContext,
     ) -> Self {
+        Self::new_with_key_groups(
+            name,
+            config,
+            projection_sql,
+            ctx,
+            KeyGroupCount::try_from(1_u16).expect("one test key group is valid"),
+        )
+    }
+
+    pub(crate) fn new_with_key_groups(
+        name: &str,
+        config: StreamJoinConfig,
+        projection_sql: Option<Arc<str>>,
+        ctx: SessionContext,
+        key_group_count: KeyGroupCount,
+    ) -> Self {
+        let vnode_count = u32::from(key_group_count);
+        let local_assignment =
+            VnodeRegistry::single_owner(vnode_count, LOCAL_NODE_ID).versioned_snapshot();
         Self {
             config,
-            vnode_states: vec![None],
+            key_group_count,
+            local_assignment,
+            vnode_states: std::iter::repeat_with(|| None)
+                .take(usize::from(key_group_count.get()))
+                .collect(),
             max_managed_state_bytes: crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
             input_schemas: None,
             projection: ProjectingJoinState::new(name, ctx, projection_sql, "__interval_tmp"),
@@ -115,6 +142,8 @@ impl IntervalJoinOperator {
     #[cfg(feature = "cluster")]
     pub(crate) fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
         debug_assert!(self.vnode_states.iter().all(Option::is_none));
+        self.key_group_count = KeyGroupCount::try_from(config.registry.vnode_count())
+            .expect("vnode registry count must fit the checkpoint key-group ABI");
         self.vnode_states
             .resize_with(config.registry.vnode_count() as usize, || None);
         self.cluster_shuffle = Some(config);
@@ -267,7 +296,6 @@ impl IntervalJoinOperator {
         result
     }
 
-    #[cfg(feature = "cluster")]
     fn execute_routed_shards(
         &mut self,
         routed: BTreeMap<u32, [Vec<RecordBatch>; 2]>,
@@ -327,7 +355,6 @@ impl IntervalJoinOperator {
         })
     }
 
-    #[cfg(feature = "cluster")]
     fn push_routed_batch(
         routed: &mut BTreeMap<u32, [Vec<RecordBatch>; 2]>,
         vnode: u32,
@@ -341,7 +368,6 @@ impl IntervalJoinOperator {
         routed.entry(vnode).or_default()[port].push(batch);
     }
 
-    #[cfg(feature = "cluster")]
     fn add_resident_vnodes(&self, routed: &mut BTreeMap<u32, [Vec<RecordBatch>; 2]>) {
         for (vnode, state) in self.vnode_states.iter().enumerate() {
             if state.is_some() {
@@ -361,8 +387,7 @@ impl IntervalJoinOperator {
         ))
     }
 
-    #[cfg(feature = "cluster")]
-    fn prevalidate_cluster_inputs(&self, inputs: &[Vec<RecordBatch>]) -> Result<(), DbError> {
+    fn prevalidate_inputs(&self, inputs: &[Vec<RecordBatch>]) -> Result<(), DbError> {
         if self.config.left_keys.is_empty()
             || self.config.left_keys.len() != self.config.right_keys.len()
             || self.config.left_time_column.is_empty()
@@ -449,6 +474,78 @@ impl IntervalJoinOperator {
         Ok(())
     }
 
+    fn route_local_inputs(
+        &self,
+        inputs: &[Vec<RecordBatch>],
+    ) -> Result<BTreeMap<u32, [Vec<RecordBatch>; 2]>, DbError> {
+        self.prevalidate_inputs(inputs)?;
+        let mut routed = BTreeMap::new();
+        let vnode_count = u32::from(self.key_group_count);
+
+        for (side, batches) in [
+            (
+                JoinInputSide::Left,
+                inputs.first().map_or(&[] as &[RecordBatch], Vec::as_slice),
+            ),
+            (
+                JoinInputSide::Right,
+                inputs.get(1).map_or(&[] as &[RecordBatch], Vec::as_slice),
+            ),
+        ] {
+            let (side_name, key_names) = match side {
+                JoinInputSide::Left => ("left", self.config.left_keys.as_slice()),
+                JoinInputSide::Right => ("right", self.config.right_keys.as_slice()),
+            };
+            for batch in batches {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let key_indices = key_names
+                    .iter()
+                    .map(|key_name| {
+                        batch.schema().index_of(key_name).map_err(|error| {
+                            DbError::SchemaMismatch(format!(
+                                "interval join [{}] {side_name} routing key '{key_name}': {error}",
+                                self.projection.op_name
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let row_vnodes =
+                    laminar_core::shuffle::row_vnodes(batch, &key_indices, vnode_count).map_err(
+                        |error| {
+                            DbError::Pipeline(format!(
+                                "interval join [{}] {side_name} routing: {error}",
+                                self.projection.op_name
+                            ))
+                        },
+                    )?;
+                let plan = laminar_core::shuffle::route_checkpointed_batch(
+                    batch,
+                    &row_vnodes,
+                    &self.local_assignment,
+                    LOCAL_NODE_ID,
+                )
+                .map_err(|error| {
+                    DbError::Pipeline(format!(
+                        "interval join [{}] {side_name} routing: {error}",
+                        self.projection.op_name
+                    ))
+                })?;
+                if !plan.remote.is_empty() {
+                    return Err(DbError::Pipeline(format!(
+                        "interval join [{}] local topology routed rows off-node",
+                        self.projection.op_name
+                    )));
+                }
+                for route in plan.local {
+                    Self::push_routed_batch(&mut routed, route.vnode, side, route.batch);
+                }
+            }
+        }
+        Ok(routed)
+    }
+
     #[cfg(feature = "cluster")]
     fn route_owned_batch(
         &self,
@@ -533,7 +630,7 @@ impl IntervalJoinOperator {
         ),
         DbError,
     > {
-        self.prevalidate_cluster_inputs(inputs)?;
+        self.prevalidate_inputs(inputs)?;
         let config = self.cluster_shuffle.as_ref().ok_or_else(|| {
             DbError::Checkpoint(format!(
                 "interval join [{}] has no cluster shuffle scope",
@@ -799,17 +896,13 @@ impl GraphOperator for IntervalJoinOperator {
                 .await;
         }
 
-        let mut accounted_total = self.accounted_state_bytes();
-        let mut output_budget = IntervalJoinOutputBudget::default();
-        let output = self.execute_shard_cycle(
-            0,
-            inputs.first().map_or(&[], Vec::as_slice),
-            inputs.get(1).map_or(&[], Vec::as_slice),
-            left_watermark,
-            right_watermark,
-            &mut accounted_total,
-            &mut output_budget,
-        )?;
+        let mut routed = self.route_local_inputs(inputs)?;
+        let frontier_advanced = left_watermark > self.applied_left_watermark
+            || right_watermark > self.applied_right_watermark;
+        if frontier_advanced {
+            self.add_resident_vnodes(&mut routed);
+        }
+        let output = self.execute_routed_shards(routed, left_watermark, right_watermark)?;
         let output = self.project_output(output).await?;
         self.applied_left_watermark = self.applied_left_watermark.max(left_watermark);
         self.applied_right_watermark = self.applied_right_watermark.max(right_watermark);
@@ -1691,7 +1784,6 @@ mod tests {
         .unwrap()
     }
 
-    #[cfg(feature = "cluster")]
     fn key_for_vnode(target: u32, vnode_count: u32) -> String {
         for candidate in 0..1_000 {
             let key = format!("vnode-{candidate}");
@@ -1767,6 +1859,37 @@ mod tests {
         // B: |200 - 250| = 50 <= 100 -> match
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn local_join_routes_into_configured_vnodes() {
+        let key_group_count = KeyGroupCount::try_from(8_u16).unwrap();
+        let mut op = IntervalJoinOperator::new_with_key_groups(
+            "local_vnodes",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+            key_group_count,
+        );
+        let key_zero = key_for_vnode(0, u32::from(key_group_count));
+        let key_one = key_for_vnode(1, u32::from(key_group_count));
+        let keys = [key_zero.as_str(), key_one.as_str()];
+
+        let output = op
+            .process(
+                &[
+                    vec![left_batch(&keys, &[100, 200], &[10.0, 20.0])],
+                    vec![right_batch(&keys, &[110, 210], &[1.0, 2.0])],
+                ],
+                &[0, 0],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        assert!(op.vnode_states[0].is_some());
+        assert!(op.vnode_states[1].is_some());
+        assert!(op.vnode_states[2..].iter().all(Option::is_none));
     }
 
     #[cfg(feature = "cluster")]

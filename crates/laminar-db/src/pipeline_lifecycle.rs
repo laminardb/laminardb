@@ -1035,7 +1035,7 @@ async fn resolve_stream_output_schemas(
                     ctx,
                     &reg.query_sql,
                     true,
-                    laminar_core::state::LOCAL_KEY_GROUP_COUNT,
+                    laminar_core::state::DEFAULT_KEY_GROUP_COUNT,
                 )
                 .await
                 {
@@ -3104,17 +3104,6 @@ impl LaminarDB {
                          cluster-shared."
                 )));
             }
-            // Local exact recovery may use the same node's durable filesystem.
-            RuntimeMode::Local
-                if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-                    && !state_backend_scope.satisfies(StateBackendDurability::NodeDurable) =>
-            {
-                return Err(DbError::Config(format!(
-                    "[LDB-5035] local exactly-once delivery requires NodeDurable state, but the \
-                     configured backend is {state_backend_scope:?}; configure a local path, \
-                     file:// URL, or shared cloud object store"
-                )));
-            }
             _ => {}
         }
         Ok((injected_cluster_checkpoint_store, state_backend_scope))
@@ -3409,21 +3398,23 @@ impl LaminarDB {
                         self.cluster_controller
                             .lock()
                             .as_ref()
-                            .map_or(laminar_core::state::NodeId(0), |c| {
+                            .map_or(laminar_core::state::LOCAL_NODE_ID, |c| {
                                 laminar_core::state::NodeId(c.instance_id().0)
                             })
                     }
                     #[cfg(not(feature = "cluster"))]
                     {
-                        laminar_core::state::NodeId(0)
+                        laminar_core::state::LOCAL_NODE_ID
                     }
                 };
                 let version = registry.assignment_version();
                 backend.set_authoritative_version(version);
                 coord.set_state_backend(backend)?;
                 coord.set_assignment_version(version);
-                coord.set_vnode_set(laminar_core::state::owned_vnodes(&registry, owner));
-                coord.set_gate_vnode_set((0..registry.vnode_count()).collect());
+                if startup_runtime == RuntimeMode::Cluster {
+                    coord.set_vnode_set(laminar_core::state::owned_vnodes(&registry, owner));
+                    coord.set_gate_vnode_set((0..registry.vnode_count()).collect());
+                }
             }
 
             *self.coordinator.lock().await = Some(coord);
@@ -3633,6 +3624,7 @@ impl LaminarDB {
         }
 
         let mut graph = OperatorGraph::new(ctx);
+        graph.set_key_group_count(self.checkpoint_key_groups());
         graph.set_lookup_registry(Arc::clone(&self.lookup_registry));
         graph.set_reference_tables(reference_table_names);
         if let Some(ref prom) = *self.engine_metrics.lock() {

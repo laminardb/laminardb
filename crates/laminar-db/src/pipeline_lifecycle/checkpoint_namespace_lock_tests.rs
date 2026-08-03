@@ -2,18 +2,12 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use laminar_connectors::connector::DeliveryGuarantee;
-use laminar_core::state::{NodeId, ObjectStoreBackend, VnodeRegistry};
 use laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase;
 use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
 
-fn exact_builder_with_roots(
-    state_dir: &std::path::Path,
+fn exact_builder_for_checkpoint(
     checkpoint_dir: &std::path::Path,
 ) -> crate::builder::LaminarDbBuilder {
-    std::fs::create_dir_all(state_dir).unwrap();
-    let store: Arc<dyn object_store::ObjectStore> =
-        Arc::new(object_store::local::LocalFileSystem::new_with_prefix(state_dir).unwrap());
-    let backend = Arc::new(ObjectStoreBackend::node_durable(store, "node-0", 1));
     crate::db::LaminarDB::builder()
         .storage_dir(checkpoint_dir)
         .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
@@ -21,12 +15,10 @@ fn exact_builder_with_roots(
             ..Default::default()
         })
         .delivery_guarantee(DeliveryGuarantee::ExactlyOnce)
-        .state_backend(backend)
-        .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, NodeId(0))))
 }
 
 fn exact_builder(root: &std::path::Path) -> crate::builder::LaminarDbBuilder {
-    exact_builder_with_roots(&root.join("state"), &root.join("checkpoints"))
+    exact_builder_for_checkpoint(&root.join("checkpoints"))
 }
 
 async fn exact_db(root: &std::path::Path) -> Arc<crate::db::LaminarDB> {
@@ -154,29 +146,6 @@ async fn local_startup_settles_prepared_witness_before_reconciliation() {
         laminar_core::checkpoint_decision::CheckpointVerdict::Abort
     );
     restarted.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn startup_rejects_a_state_root_from_another_deployment_before_installing_coordinator() {
-    let root = tempfile::tempdir().unwrap();
-    let state_dir = root.path().join("state");
-    let first = exact_builder_with_roots(&state_dir, &root.path().join("checkpoint-a"))
-        .build()
-        .await
-        .unwrap();
-    first.start().await.unwrap();
-    first.shutdown().await.unwrap();
-
-    let second = exact_builder_with_roots(&state_dir, &root.path().join("checkpoint-b"))
-        .build()
-        .await
-        .unwrap();
-    let error = second.start().await.unwrap_err();
-    assert!(
-        error.to_string().contains("belongs to deployment"),
-        "{error}"
-    );
-    assert!(second.coordinator.lock().await.is_none());
 }
 
 #[tokio::test]
@@ -353,13 +322,12 @@ async fn local_at_least_once_rejects_an_unfenced_shared_checkpoint_namespace() {
 async fn local_best_effort_cannot_bypass_a_replay_namespace_lock() {
     let root = tempfile::tempdir().unwrap();
     let checkpoint_dir = root.path().join("checkpoints");
-    let best_effort =
-        exact_builder_with_roots(&root.path().join("best-effort-state"), &checkpoint_dir)
-            .delivery_guarantee(DeliveryGuarantee::BestEffort)
-            .build()
-            .await
-            .unwrap();
-    let replay = exact_builder_with_roots(&root.path().join("replay-state"), &checkpoint_dir)
+    let best_effort = exact_builder_for_checkpoint(&checkpoint_dir)
+        .delivery_guarantee(DeliveryGuarantee::BestEffort)
+        .build()
+        .await
+        .unwrap();
+    let replay = exact_builder_for_checkpoint(&checkpoint_dir)
         .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
         .build()
         .await

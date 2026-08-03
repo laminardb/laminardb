@@ -9,7 +9,7 @@ async fn try_from_sql_local(
         ctx,
         sql,
         emit_changelog,
-        laminar_core::state::LOCAL_KEY_GROUP_COUNT,
+        laminar_core::state::DEFAULT_KEY_GROUP_COUNT,
     )
     .await
 }
@@ -172,7 +172,7 @@ async fn test_try_from_sql_with_group_by() {
     assert_eq!(state.agg_specs.len(), 1);
     assert_eq!(
         state.key_group_count(),
-        laminar_core::state::LOCAL_KEY_GROUP_COUNT
+        laminar_core::state::DEFAULT_KEY_GROUP_COUNT
     );
 }
 
@@ -347,7 +347,7 @@ async fn setup_agg_state_with_changelog(
     setup_agg_state_for_key_groups(
         sql,
         emit_changelog,
-        laminar_core::state::LOCAL_KEY_GROUP_COUNT,
+        laminar_core::state::DEFAULT_KEY_GROUP_COUNT,
     )
     .await
 }
@@ -673,38 +673,64 @@ async fn retained_state_accounting_includes_topology_and_changelog_lifecycle() {
 }
 
 #[tokio::test]
-async fn local_keyed_state_uses_only_vnode_zero_and_roundtrips_whole_checkpoint() {
+async fn local_keyed_state_routes_across_common_vnodes_and_roundtrips_whole_checkpoint() {
     let sql = "SELECT name, SUM(value) as total FROM events GROUP BY name";
     let (_, mut state) = setup_agg_state(sql).await;
-    state
-        .process_batch(&sum_pre_agg_batch(&["a", "b", "a"], &[1.0, 2.0, 3.0]), 42)
+    let batch = sum_pre_agg_batch(&["a", "b", "a"], &[1.0, 2.0, 3.0]);
+    let rows = state
+        .row_converter
+        .convert_columns(&[Arc::clone(batch.column(0))])
         .unwrap();
+    let mut expected_vnodes = (0..batch.num_rows())
+        .map(|row| {
+            IncrementalAggState::vnode_for_group_key(
+                state.num_group_cols,
+                &rows.row(row).owned(),
+                state.routing_vnode_count(),
+            )
+        })
+        .collect::<Vec<_>>();
+    expected_vnodes.sort_unstable();
+    expected_vnodes.dedup();
+    assert_eq!(expected_vnodes.len(), 2);
+
+    state.process_batch(&batch, 42).unwrap();
 
     assert_eq!(
         state.key_group_count(),
-        laminar_core::state::LOCAL_KEY_GROUP_COUNT
+        laminar_core::state::DEFAULT_KEY_GROUP_COUNT
     );
     assert_eq!(state.logical_group_count_for_test(), 2);
-    assert_eq!(state.active_vnodes_for_test(), &[0]);
-    let vnode_zero_slot = state
-        .vnode_slot_identity_for_test(0)
-        .expect("local keyed state must allocate vnode zero");
-    assert!(state.vnode_slot_identity_for_test(1).is_none());
+    assert_eq!(state.active_vnodes_for_test(), expected_vnodes);
+    let live_slots = expected_vnodes
+        .iter()
+        .map(|&vnode| {
+            (
+                vnode,
+                state
+                    .vnode_slot_identity_for_test(vnode)
+                    .expect("routed local vnode must be resident"),
+            )
+        })
+        .collect::<Vec<_>>();
     let before = state.working_set_snapshot_for_test();
 
     let checkpoint = state.checkpoint_groups().unwrap();
-    assert_eq!(
-        state.vnode_slot_identity_for_test(0),
-        Some(vnode_zero_slot),
-        "whole-state capture must not replace the live local shard",
-    );
+    for (vnode, slot) in live_slots {
+        assert_eq!(
+            state.vnode_slot_identity_for_test(vnode),
+            Some(slot),
+            "whole-state capture must not replace a live local shard",
+        );
+    }
 
     let (_, mut restored) = setup_agg_state(sql).await;
     assert_eq!(restored.restore_groups(&checkpoint).unwrap(), 2);
     assert_eq!(restored.logical_group_count_for_test(), 2);
-    assert_eq!(restored.active_vnodes_for_test(), &[0]);
-    assert!(restored.vnode_slot_identity_for_test(0).is_some());
-    assert!(restored.vnode_slot_identity_for_test(1).is_none());
+    assert_eq!(restored.active_vnodes_for_test(), expected_vnodes);
+    assert!(expected_vnodes
+        .iter()
+        .all(|&vnode| restored.vnode_slot_identity_for_test(vnode).is_some()));
     assert_eq!(restored.working_set_snapshot_for_test(), before);
 
     let mut totals = std::collections::BTreeMap::new();

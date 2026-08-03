@@ -41,11 +41,8 @@ pub const PARTITIONING_ABI_VERSION: u16 = 1;
 #[serde(transparent)]
 pub struct KeyGroupCount(NonZeroU16);
 
-/// Fixed key-group count for embedded and single-node runtimes.
-pub const LOCAL_KEY_GROUP_COUNT: KeyGroupCount = KeyGroupCount(NonZeroU16::MIN);
-
-/// Default key-group count for cluster runtimes.
-pub const DEFAULT_CLUSTER_KEY_GROUP_COUNT: KeyGroupCount = match NonZeroU16::new(256) {
+/// Default stable key-group count for every deployment tier.
+pub const DEFAULT_KEY_GROUP_COUNT: KeyGroupCount = match NonZeroU16::new(256) {
     Some(value) => KeyGroupCount(value),
     None => unreachable!(),
 };
@@ -163,6 +160,9 @@ impl From<KeyGroupCount> for usize {
     rkyv::Deserialize,
 )]
 pub struct NodeId(pub u64);
+
+/// Stable owner identity for embedded and standalone runtimes.
+pub const LOCAL_NODE_ID: NodeId = NodeId(1);
 
 impl NodeId {
     /// Sentinel meaning "unassigned".
@@ -412,10 +412,11 @@ impl VnodeRegistry {
     /// Used by single-instance / embedded deployments.
     ///
     /// # Panics
-    /// Panics if `vnode_count == 0`.
+    /// Panics if `vnode_count == 0` or `owner` is [`NodeId::UNASSIGNED`].
     #[must_use]
     pub fn single_owner(vnode_count: u32, owner: NodeId) -> Self {
         assert!(vnode_count > 0, "vnode_count must be > 0");
+        assert_ne!(owner, NodeId::UNASSIGNED, "owner must be assigned");
         let assignment: Arc<[NodeId]> = std::iter::repeat_n(owner, vnode_count as usize)
             .collect::<Vec<_>>()
             .into();

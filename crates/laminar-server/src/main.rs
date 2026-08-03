@@ -257,7 +257,7 @@ mod tests {
         let store = build_checkpoint_store(&config).unwrap();
         assert_eq!(
             store.key_group_count(),
-            laminar_core::state::LOCAL_KEY_GROUP_COUNT
+            laminar_core::state::DEFAULT_KEY_GROUP_COUNT
         );
         assert_eq!(
             store.max_state_data_bytes(),

@@ -605,8 +605,8 @@ docker run -d -p 8080:8080 laminardb/laminardb-server:latest
           <tr>
             <td class="field-name">key_groups</td>
             <td class="field-type">u16</td>
-            <td class="field-default">256 (cluster)</td>
-            <td>Stable hash partitions for cluster placement and rescaling. Optional in cluster mode; rejected in single mode, which always uses one key group.</td>
+            <td class="field-default">256</td>
+            <td>Stable hash partitions for keyed aggregates and interval joins. A single-node runtime owns all of them; a cluster distributes them across nodes.</td>
           </tr>
           <tr>
             <td class="field-name">bind</td>

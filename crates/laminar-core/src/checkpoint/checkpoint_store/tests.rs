@@ -33,7 +33,7 @@ fn make_external_manifest(id: u64, length: usize) -> CheckpointManifest {
 }
 
 #[test]
-fn checkpoint_stores_default_to_local_key_group_count() {
+fn checkpoint_stores_default_to_common_key_group_count() {
     let dir = tempfile::tempdir().unwrap();
     let filesystem = FileSystemCheckpointStore::new(dir.path());
     let object_store = ObjectStoreCheckpointStore::new(
@@ -41,8 +41,8 @@ fn checkpoint_stores_default_to_local_key_group_count() {
         String::new(),
     );
 
-    assert_eq!(filesystem.key_group_count(), LOCAL_KEY_GROUP_COUNT);
-    assert_eq!(object_store.key_group_count(), LOCAL_KEY_GROUP_COUNT);
+    assert_eq!(filesystem.key_group_count(), DEFAULT_KEY_GROUP_COUNT);
+    assert_eq!(object_store.key_group_count(), DEFAULT_KEY_GROUP_COUNT);
     assert_eq!(
         filesystem.max_state_data_bytes(),
         DEFAULT_MAX_CHECKPOINT_STATE_BYTES

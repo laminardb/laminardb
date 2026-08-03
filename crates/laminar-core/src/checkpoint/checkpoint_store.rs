@@ -37,7 +37,7 @@ use crate::checkpoint::checkpoint_manifest::{
     CheckpointManifest, DurableCheckpointPhase, OperatorCheckpoint,
 };
 use crate::durable_fs::{durable_rename, ensure_durable_directory, DurableRenameMode};
-use crate::state::{KeyGroupCount, LOCAL_KEY_GROUP_COUNT};
+use crate::state::{KeyGroupCount, DEFAULT_KEY_GROUP_COUNT};
 
 const MAX_LATEST_POINTER_BYTES: u64 = 1_024;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1_024 * 1_024;
@@ -1080,10 +1080,9 @@ pub trait CheckpointStore: Send + Sync {
     fn max_state_data_bytes(&self) -> u64;
 
     /// Runtime key-group count that manifests written by this store are
-    /// expected to use. Consulted when validating loaded manifests. Embedded
-    /// and single-node stores default to one key group.
+    /// expected to use. Consulted when validating loaded manifests.
     fn key_group_count(&self) -> KeyGroupCount {
-        LOCAL_KEY_GROUP_COUNT
+        DEFAULT_KEY_GROUP_COUNT
     }
 
     /// Participant whose manifests belong in this store namespace.
@@ -1575,13 +1574,13 @@ impl FileSystemCheckpointStore {
     /// The `base_dir` is the parent directory; checkpoints are stored under
     /// `{base_dir}/checkpoints/`. The directory is created lazily on first save.
     ///
-    /// Embedded and single-node stores default to one key group. Cluster hosts
-    /// must chain [`Self::with_key_group_count`] with their durable topology.
+    /// Stores default to the common stable key-group topology. Callers may
+    /// override it with their exact configured topology.
     #[must_use]
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
             base_dir: base_dir.into(),
-            key_group_count: LOCAL_KEY_GROUP_COUNT,
+            key_group_count: DEFAULT_KEY_GROUP_COUNT,
             participant_id: 0,
             max_state_data_bytes: DEFAULT_MAX_CHECKPOINT_STATE_BYTES,
             #[cfg(test)]
@@ -2337,14 +2336,14 @@ impl ObjectStoreCheckpointStore {
     /// `prefix` is prepended to all object paths (e.g., `"nodes/abc123/"`).
     /// It should end with `/` or be empty.
     ///
-    /// Embedded and single-node stores default to one key group. Cluster hosts
-    /// must chain [`Self::with_key_group_count`] with their durable topology.
+    /// Stores default to the common stable key-group topology. Callers may
+    /// override it with their exact configured topology.
     #[must_use]
     pub fn new(store: Arc<dyn ObjectStore>, prefix: String) -> Self {
         Self {
             store,
             prefix,
-            key_group_count: LOCAL_KEY_GROUP_COUNT,
+            key_group_count: DEFAULT_KEY_GROUP_COUNT,
             participant_id: 0,
             max_state_data_bytes: DEFAULT_MAX_CHECKPOINT_STATE_BYTES,
         }

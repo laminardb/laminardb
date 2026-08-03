@@ -9,9 +9,7 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use laminar_core::state::{
-    KeyGroupCount, StateBackendDurability, DEFAULT_CLUSTER_KEY_GROUP_COUNT, LOCAL_KEY_GROUP_COUNT,
-};
+use laminar_core::state::{KeyGroupCount, StateBackendDurability, DEFAULT_KEY_GROUP_COUNT};
 use laminar_db::DeliveryGuarantee;
 use regex::Regex;
 use serde::Deserialize;
@@ -329,13 +327,6 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
     }
 
-    if config.server.mode == ServerMode::Single && config.server.key_groups.is_some() {
-        errors.push(
-            "server.key_groups is cluster-only; single mode always uses exactly 1 key group"
-                .to_string(),
-        );
-    }
-
     if config.server.mode == ServerMode::Cluster {
         match config.server.delivery {
             DeliveryGuarantee::BestEffort => errors.push(
@@ -491,7 +482,7 @@ pub enum ServerMode {
 pub struct ServerSection {
     #[serde(default)]
     pub mode: ServerMode,
-    /// Stable hash partitions. Configurable only in cluster mode.
+    /// Stable hash partitions used by every deployment mode.
     #[serde(default)]
     pub key_groups: Option<KeyGroupCount>,
     #[serde(default = "default_bind")]
@@ -577,13 +568,10 @@ impl Default for ServerSection {
 }
 
 impl ServerSection {
-    /// Key-group topology selected by the runtime mode.
+    /// Configured key-group topology, or the common deployment default.
     #[must_use]
     pub(crate) fn resolved_key_groups(&self) -> KeyGroupCount {
-        match self.mode {
-            ServerMode::Single => LOCAL_KEY_GROUP_COUNT,
-            ServerMode::Cluster => self.key_groups.unwrap_or(DEFAULT_CLUSTER_KEY_GROUP_COUNT),
-        }
+        self.key_groups.unwrap_or(DEFAULT_KEY_GROUP_COUNT)
     }
 }
 
@@ -2398,33 +2386,30 @@ alice = "wonderland-key"
     }
 
     #[test]
-    fn key_groups_are_mode_scoped_and_typed() {
+    fn key_groups_are_mode_neutral_and_typed() {
         let single: ServerConfig = toml::from_str("[server]\n").unwrap();
-        assert_eq!(single.server.resolved_key_groups(), LOCAL_KEY_GROUP_COUNT);
+        assert_eq!(single.server.resolved_key_groups(), DEFAULT_KEY_GROUP_COUNT);
 
-        for explicit in [1, 256] {
-            let input = format!("[server]\nmode = \"single\"\nkey_groups = {explicit}\n");
-            let config: ServerConfig = toml::from_str(&input).unwrap();
-            let ConfigError::ValidationErrors { errors } = validate_config(&config).unwrap_err()
-            else {
-                panic!("expected a cluster-only key_groups validation error");
-            };
-            assert!(errors.iter().any(|error| error.contains("cluster-only")));
-        }
+        let configured_single: ServerConfig =
+            toml::from_str("[server]\nmode = \"single\"\nkey_groups = 64\n").unwrap();
+        assert_eq!(configured_single.server.resolved_key_groups().get(), 64);
+        validate_config(&configured_single).unwrap();
 
         let cluster: ServerConfig = toml::from_str("[server]\nmode = \"cluster\"\n").unwrap();
         assert_eq!(
             cluster.server.resolved_key_groups(),
-            DEFAULT_CLUSTER_KEY_GROUP_COUNT
+            DEFAULT_KEY_GROUP_COUNT
         );
 
         let configured: ServerConfig =
             toml::from_str("[server]\nmode = \"cluster\"\nkey_groups = 1024\n").unwrap();
         assert_eq!(configured.server.resolved_key_groups().get(), 1024);
 
-        for invalid in [0_u32, u32::from(u16::MAX) + 1] {
-            let input = format!("[server]\nmode = \"cluster\"\nkey_groups = {invalid}\n");
-            assert!(toml::from_str::<ServerConfig>(&input).is_err());
+        for mode in ["single", "cluster"] {
+            for invalid in [0_u32, u32::from(u16::MAX) + 1] {
+                let input = format!("[server]\nmode = \"{mode}\"\nkey_groups = {invalid}\n");
+                assert!(toml::from_str::<ServerConfig>(&input).is_err());
+            }
         }
     }
 

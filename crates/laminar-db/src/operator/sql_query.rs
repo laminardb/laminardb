@@ -18,9 +18,7 @@ use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
 #[cfg(feature = "cluster")]
 use laminar_core::shuffle::ShuffleMessage;
-#[cfg(feature = "cluster")]
 use laminar_core::state::KeyGroupCount;
-use laminar_core::state::LOCAL_KEY_GROUP_COUNT;
 use sqlparser::ast::{
     visit_expressions, Expr, GroupByExpr, Query, Select, SetExpr, Statement, TableFactor,
 };
@@ -263,6 +261,7 @@ pub(crate) struct SqlQueryOperator {
     ctx: SessionContext,
     task_ctx: Arc<TaskContext>,
     state: QueryState,
+    key_group_count: KeyGroupCount,
     prom: Option<Arc<EngineMetrics>>,
     max_retractable_extremum_checkpoint_bytes: usize,
     pending_restore: Option<AggStateCheckpoint>,
@@ -315,12 +314,31 @@ fn stateful_apply_outcome_unknown(op_name: &str, phase: &str, error: DbError) ->
 }
 
 impl SqlQueryOperator {
+    #[cfg(test)]
     pub fn new(
         name: &str,
         sql: &str,
         ctx: SessionContext,
         prom: Option<Arc<EngineMetrics>>,
         emit_changelog: bool,
+    ) -> Self {
+        Self::new_with_key_groups(
+            name,
+            sql,
+            ctx,
+            prom,
+            emit_changelog,
+            KeyGroupCount::try_from(1_u16).expect("one test key group is valid"),
+        )
+    }
+
+    pub fn new_with_key_groups(
+        name: &str,
+        sql: &str,
+        ctx: SessionContext,
+        prom: Option<Arc<EngineMetrics>>,
+        emit_changelog: bool,
+        key_group_count: KeyGroupCount,
     ) -> Self {
         let capability = classify_sql_capability(sql, &ctx);
         let task_ctx = ctx.task_ctx();
@@ -331,6 +349,7 @@ impl SqlQueryOperator {
             ctx,
             task_ctx,
             state: QueryState::Uninit,
+            key_group_count,
             prom,
             max_retractable_extremum_checkpoint_bytes:
                 crate::config::DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES,
@@ -379,6 +398,8 @@ impl SqlQueryOperator {
 
     #[cfg(feature = "cluster")]
     pub fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
+        self.key_group_count = KeyGroupCount::try_from(config.registry.vnode_count())
+            .expect("vnode registry count must fit the checkpoint key-group ABI");
         self.cluster_shuffle = Some(config);
     }
 
@@ -435,26 +456,11 @@ impl SqlQueryOperator {
 
     #[allow(clippy::too_many_lines)]
     async fn lazy_init(&mut self) -> Result<(), DbError> {
-        #[cfg(feature = "cluster")]
-        let key_group_count = self.cluster_shuffle.as_ref().map_or_else(
-            || Ok(LOCAL_KEY_GROUP_COUNT),
-            |config| {
-                KeyGroupCount::try_from(config.registry.vnode_count()).map_err(|error| {
-                    DbError::Pipeline(format!(
-                        "aggregate '{}' has invalid cluster key-group topology: {error}",
-                        self.op_name
-                    ))
-                })
-            },
-        )?;
-        #[cfg(not(feature = "cluster"))]
-        let key_group_count = LOCAL_KEY_GROUP_COUNT;
-
         match IncrementalAggState::try_from_sql(
             &self.ctx,
             &self.sql,
             self.emit_changelog,
-            key_group_count,
+            self.key_group_count,
         )
         .await
         {
@@ -1988,12 +1994,14 @@ mod checkpoint_tests {
     #[tokio::test]
     async fn managed_aggregate_initializes_before_receiving_input() {
         let (context, batch) = context_and_batch();
-        let mut operator = SqlQueryOperator::new(
+        let key_group_count = KeyGroupCount::try_from(8_u16).unwrap();
+        let mut operator = SqlQueryOperator::new_with_key_groups(
             "sum",
             "SELECT key, SUM(value) AS total FROM events GROUP BY key",
             context,
             None,
             false,
+            key_group_count,
         );
 
         operator.initialize_managed_state().await.unwrap();
@@ -2001,7 +2009,7 @@ mod checkpoint_tests {
         let QueryState::Agg(ref aggregate) = operator.state else {
             panic!("expected initialized aggregate state");
         };
-        assert_eq!(aggregate.key_group_count(), LOCAL_KEY_GROUP_COUNT);
+        assert_eq!(aggregate.key_group_count(), key_group_count);
         let empty_accounting = operator
             .managed_state_accounting()
             .expect("initialized aggregate must report managed state");

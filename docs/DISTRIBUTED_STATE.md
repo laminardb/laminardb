@@ -18,9 +18,10 @@ or production readiness until that code is deleted and the final soaks pass.
 
 ## Settled target contract
 
-Every deployment uses the same state machinery. Embedded and single-node runtimes are one node
-owning every vnode and use local shuffle channels. A cluster runs the same operators with vnodes
-spread across nodes and remote shuffles only when ownership crosses a node boundary.
+Every deployment uses the same state machinery and defaults to 256 stable vnodes. Embedded and
+single-node runtimes are one node owning every configured vnode and use local shuffle channels. A
+cluster runs the same operators with vnodes spread across nodes and remote shuffles only when
+ownership crosses a node boundary.
 
 Vnodes are the unit of ownership, routing, checkpointing, restore, and rescale for joins,
 aggregations, windows, sessions, timers, temporal history, and materialized views. Authoritative

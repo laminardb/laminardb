@@ -39,6 +39,7 @@ laminardb:
   mode: cluster
   delivery: at_least_once
   logLevel: info
+  keyGroups: 256
   
   checkpoint:
     interval: "30s"
@@ -47,7 +48,6 @@ laminardb:
     url: "az://laminardb-checkpoints/cluster"
     
   cluster:
-    keyGroups: 256
     discovery:
       strategy: gossip
       gossipPort: 7946
@@ -152,13 +152,13 @@ prometheusRule:
 | `laminardb.mode` | Server mode: `single` or `cluster` | `single` |
 | `laminardb.logLevel` | Log level: `trace`, `debug`, `info`, `warn`, `error` | `info` |
 | `laminardb.httpBind` | HTTP API bind address | `0.0.0.0:8080` |
+| `laminardb.keyGroups` | Stable hash partitions; one node owns all in single mode and clusters distribute them | `256` |
 | `laminardb.consoleToken.existingSecret` | Secret holding the console API bearer token (key from `secretKey`, default `token`); empty = unauthenticated | `""` |
 | `laminardb.consoleCorsAllowedOrigins` | CORS allow-list of console origins; empty = permissive legacy policy | `[]` |
 | `laminardb.delivery` | Pipeline-wide delivery: `best_effort`, `at_least_once`, or capability-gated `exactly_once` | `best_effort` |
 | `laminardb.checkpoint.interval` | Checkpoint frequency | `30s` |
 | `laminardb.checkpoint.url` | Provider-neutral checkpoint URL: `s3://` (including R2/MinIO), `gs://`, `az://`, `abfs(s)://`, or local `file://`. Empty = local default. | `""` |
 | `laminardb.configWatch` | Hot-reload config on file change. Off in K8s (config changes roll pods via the checksum annotation); sets `LAMINAR_DISABLE_FILE_WATCH=1`. | `false` |
-| `laminardb.cluster.keyGroups` | Stable hash partitions used for cluster placement and rescaling | `256` |
 | `laminardb.cluster.discovery.strategy` | Discovery method (`gossip`, `static`) | `gossip` |
 | `persistence.checkpoints.enabled` | Provision a dedicated checkpoints PVC. Off by default — prefer an object store via `laminardb.checkpoint.url`. | `false` |
 | `guaranteedQoS` | Pin requests == limits for guaranteed CPU/Mem | `false` |

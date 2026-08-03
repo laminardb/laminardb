@@ -24,6 +24,9 @@
 - The public `[state]` backend selector is removed; `[checkpoint]` is the sole durability
   configuration. Aggregate and window hot maps now use `FxHashMap`. The final one-node-object
   checkpoint cutover and production soak certification remain pending.
+- Embedded, standalone, and cluster runtimes now share one configurable key-group topology with a
+  default of 256. Local keyed aggregates and interval joins route across all locally owned vnodes;
+  the unified v7 checkpoint image and remaining stateful operators are still pending.
 - The v0.28 checkpoint and state format is intentionally incompatible with older persisted formats,
   which are rejected and require a fresh deployment namespace.
 
