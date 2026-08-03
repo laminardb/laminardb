@@ -3177,73 +3177,35 @@ impl LaminarDB {
         graph.take_build_errors()?;
 
         for tcfg in graph.temporal_join_configs() {
-            if self.lookup_registry.get_entry(&tcfg.table_name).is_none() {
-                let initial_batch = self
-                    .table_store
-                    .read()
-                    .to_record_batch(&tcfg.table_name)?
-                    .or_else(|| {
-                        self.catalog
-                            .get_source(&tcfg.table_name)
-                            .map(|e| RecordBatch::new_empty(e.schema.clone()))
-                    })
-                    .unwrap_or_else(|| {
-                        RecordBatch::new_empty(Arc::new(arrow::datatypes::Schema::empty()))
-                    });
-                let key_columns = vec![tcfg.table_key_column.clone()];
-                let key_indices: Vec<usize> = key_columns
+            if self.lookup_registry.get_entry(&tcfg.right_table).is_none() {
+                let source = self.catalog.get_source(&tcfg.right_table).ok_or_else(|| {
+                    DbError::InvalidOperation(format!(
+                        "temporal right input '{}' is not a registered source",
+                        tcfg.right_table
+                    ))
+                })?;
+                let initial_batch = RecordBatch::new_empty(source.schema.clone());
+                let key_columns = vec![tcfg.right_key_column.clone()];
+                let key_indices = key_columns
                     .iter()
-                    .filter_map(|k| initial_batch.schema().index_of(k).ok())
-                    .collect();
-
-                // If the AS OF clause didn't resolve a version column, pick the first
-                // timestamp/int column that isn't the join key.
-                let resolved_version_col = if tcfg.table_version_column.is_empty() {
-                    let schema = initial_batch.schema();
-                    schema
-                        .fields()
-                        .iter()
-                        .find(|f| {
-                            f.name() != &tcfg.table_key_column
-                                && matches!(
-                                    f.data_type(),
-                                    arrow::datatypes::DataType::Int64
-                                        | arrow::datatypes::DataType::Timestamp(_, _)
-                                )
+                    .map(|column| {
+                        initial_batch.schema().index_of(column).map_err(|error| {
+                            DbError::InvalidOperation(format!(
+                                "temporal right key '{}.{}': {error}",
+                                tcfg.right_table, column
+                            ))
                         })
-                        .map(|f| f.name().clone())
-                        .unwrap_or_default()
-                } else {
-                    tcfg.table_version_column.clone()
-                };
-
-                let Ok(version_col_idx) = initial_batch.schema().index_of(&resolved_version_col)
-                else {
-                    if !initial_batch.schema().fields().is_empty() {
-                        tracing::warn!(
-                            table=%tcfg.table_name,
-                            version_col=%resolved_version_col,
-                            "Version column not found in temporal table schema; \
-                             will resolve on first CDC batch"
-                        );
-                    }
-                    // Index built on first CDC update.
-                    self.lookup_registry.register_versioned(
-                        &tcfg.table_name,
-                        laminar_sql::datafusion::VersionedLookupState {
-                            batch: initial_batch,
-                            index: Arc::new(
-                                laminar_sql::datafusion::lookup_join_exec::VersionedIndex::default(
-                                ),
-                            ),
-                            key_columns,
-                            version_column: resolved_version_col,
-                            stream_time_column: tcfg.stream_time_column.clone(),
-                            max_versions_per_key: usize::MAX,
-                        },
-                    );
-                    continue;
-                };
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let version_col_idx = initial_batch
+                    .schema()
+                    .index_of(&tcfg.right_time_column)
+                    .map_err(|error| {
+                        DbError::InvalidOperation(format!(
+                            "temporal right version column '{}.{}': {error}",
+                            tcfg.right_table, tcfg.right_time_column
+                        ))
+                    })?;
                 let index = Arc::new(
                     laminar_sql::datafusion::lookup_join_exec::VersionedIndex::build(
                         &initial_batch,
@@ -3251,16 +3213,21 @@ impl LaminarDB {
                         version_col_idx,
                         usize::MAX,
                     )
-                    .unwrap_or_default(),
+                    .map_err(|error| {
+                        DbError::InvalidOperation(format!(
+                            "temporal right index '{}': {error}",
+                            tcfg.right_table
+                        ))
+                    })?,
                 );
                 self.lookup_registry.register_versioned(
-                    &tcfg.table_name,
+                    &tcfg.right_table,
                     laminar_sql::datafusion::VersionedLookupState {
                         batch: initial_batch,
                         index,
                         key_columns,
-                        version_column: resolved_version_col,
-                        stream_time_column: tcfg.stream_time_column.clone(),
+                        version_column: tcfg.right_time_column.clone(),
+                        stream_time_column: tcfg.left_time_column.clone(),
                         max_versions_per_key: usize::MAX,
                     },
                 );

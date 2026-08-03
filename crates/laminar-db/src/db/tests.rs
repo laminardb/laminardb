@@ -2761,6 +2761,54 @@ async fn test_create_source_with_watermark() {
 }
 
 #[tokio::test]
+async fn temporal_queries_fail_closed_before_managed_runtime_admission() {
+    let db = LaminarDB::open().unwrap();
+    db.execute(
+        "CREATE SOURCE trades (symbol VARCHAR, trade_time TIMESTAMP, WATERMARK FOR trade_time)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE SOURCE quotes (symbol VARCHAR PRIMARY KEY, price DOUBLE, quote_time TIMESTAMP, WATERMARK FOR quote_time)",
+    )
+    .await
+    .unwrap();
+
+    let direct = db
+        .execute(
+            "SELECT t.symbol, q.price FROM trades t \
+             JOIN quotes FOR SYSTEM_TIME AS OF t.trade_time AS q \
+             ON t.symbol = q.symbol",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(direct, DbError::Unsupported(_)), "{direct}");
+
+    let nested = db
+        .execute(
+            "WITH matched AS (\
+                 SELECT t.symbol FROM trades t \
+                 JOIN quotes FOR SYSTEM_TIME AS OF t.trade_time AS q \
+                 ON t.symbol = q.symbol\
+             ) SELECT * FROM matched",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(nested, DbError::Unsupported(_)), "{nested}");
+
+    let named = db
+        .execute(
+            "CREATE STREAM markouts AS SELECT probe.offset_ms, probe.probe_time, q.price \
+             FROM trades t TEMPORAL PROBE JOIN quotes q ON (symbol) \
+             TIMESTAMPS (trade_time, quote_time) LIST (5s, 15s) AS probe",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(named, DbError::Unsupported(_)), "{named}");
+    assert!(db.catalog.get_stream_entry("markouts").is_none());
+}
+
+#[tokio::test]
 async fn test_create_source_duplicate_error() {
     let db = LaminarDB::open().unwrap();
     db.execute("CREATE SOURCE test (id INT)").await.unwrap();

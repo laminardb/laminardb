@@ -10,11 +10,13 @@ use std::time::Duration;
 
 use sqlparser::ast::{
     BinaryOperator, Expr, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, Select,
-    TableFactor, TableVersion,
+    SetExpr, Statement, TableFactor, TableVersion,
 };
+use sqlparser::tokenizer::{Token, TokenWithSpan, Word};
 
 use super::window_rewriter::WindowRewriter;
 use super::ParseError;
+use crate::temporal::TemporalProbeSchedule;
 
 /// Join type classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +113,7 @@ fn resolve_time_cols(
 }
 
 /// Analysis result for a JOIN clause
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinAnalysis {
     /// Type of join (inner, left, right, full)
     pub join_type: JoinType,
@@ -135,10 +137,10 @@ pub struct JoinAnalysis {
     pub left_time_column: Option<String>,
     /// Right side time column for a bounded join
     pub right_time_column: Option<String>,
-    /// Whether this is a temporal join (FOR SYSTEM_TIME AS OF)
-    pub is_temporal_join: bool,
-    /// The version column from FOR SYSTEM_TIME AS OF (e.g., `order_time`)
-    pub temporal_version_column: Option<String>,
+    /// Target-time schedule for a temporal join.
+    pub temporal_probe_schedule: Option<TemporalProbeSchedule>,
+    /// Pseudo-table alias exposing `offset_ms` and `probe_time` for multi-horizon probes.
+    pub temporal_probe_alias: Option<String>,
     /// Additional key columns for composite join keys (beyond the primary key pair)
     pub additional_key_columns: Vec<(String, String)>,
 }
@@ -166,8 +168,8 @@ impl JoinAnalysis {
             right_alias: None,
             left_time_column: None,
             right_time_column: None,
-            is_temporal_join: false,
-            temporal_version_column: None,
+            temporal_probe_schedule: None,
+            temporal_probe_alias: None,
             additional_key_columns: vec![],
         }
     }
@@ -193,8 +195,8 @@ impl JoinAnalysis {
             right_alias: None,
             left_time_column: None,
             right_time_column: None,
-            is_temporal_join: false,
-            temporal_version_column: None,
+            temporal_probe_schedule: None,
+            temporal_probe_alias: None,
             additional_key_columns: vec![],
         }
     }
@@ -206,7 +208,7 @@ impl JoinAnalysis {
         right_table: String,
         left_key: String,
         right_key: String,
-        version_column: String,
+        left_time_column: String,
         join_type: JoinType,
     ) -> Self {
         Self {
@@ -219,10 +221,10 @@ impl JoinAnalysis {
             is_lookup_join: false,
             left_alias: None,
             right_alias: None,
-            left_time_column: None,
+            left_time_column: Some(left_time_column),
             right_time_column: None,
-            is_temporal_join: true,
-            temporal_version_column: Some(version_column),
+            temporal_probe_schedule: Some(TemporalProbeSchedule::as_of()),
+            temporal_probe_alias: None,
             additional_key_columns: vec![],
         }
     }
@@ -230,7 +232,13 @@ impl JoinAnalysis {
     /// True if this step has a `BETWEEN` bound or `FOR SYSTEM_TIME AS OF`.
     #[must_use]
     pub fn is_bounded(&self) -> bool {
-        self.time_bound.is_some() || self.is_temporal_join
+        self.time_bound.is_some() || self.is_temporal_join()
+    }
+
+    /// Whether this step uses versioned event-time lookup state.
+    #[must_use]
+    pub fn is_temporal_join(&self) -> bool {
+        self.temporal_probe_schedule.is_some()
     }
 }
 
@@ -270,7 +278,7 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
     };
 
     // Check for temporal join (FOR SYSTEM_TIME AS OF)
-    if let Some(version_col) = extract_temporal_version(&join.relation) {
+    if let Some(left_time_col) = extract_temporal_left_time(&join.relation, &sides)? {
         let (left_key, right_key, additional, _, _) =
             analyze_join_constraint(&join.join_operator, &sides)?;
         let mut analysis = JoinAnalysis::temporal(
@@ -278,7 +286,7 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
             right_table,
             left_key,
             right_key,
-            version_col,
+            left_time_col,
             join_type,
         );
         analysis.left_alias = left_alias;
@@ -341,32 +349,36 @@ fn extract_table_name(factor: &TableFactor) -> Result<String, ParseError> {
     }
 }
 
-/// Extract the version column from a temporal join's `FOR SYSTEM_TIME AS OF` clause.
-///
-/// Returns `Some(column_name)` if the table factor has a temporal version qualifier,
-/// `None` otherwise.
-fn extract_temporal_version(factor: &TableFactor) -> Option<String> {
+/// Extract and bind the left event-time column in `FOR SYSTEM_TIME AS OF`.
+fn extract_temporal_left_time(
+    factor: &TableFactor,
+    sides: &JoinSides<'_>,
+) -> Result<Option<String>, ParseError> {
     if let TableFactor::Table {
         version: Some(TableVersion::ForSystemTimeAsOf(expr)),
         ..
     } = factor
     {
-        Some(extract_column_name_from_expr(expr))
+        let Expr::CompoundIdentifier(parts) = expr else {
+            return Err(ParseError::StreamingError(
+                "FOR SYSTEM_TIME AS OF requires a qualified left event-time column".into(),
+            ));
+        };
+        let [qualifier, column] = parts.as_slice() else {
+            return Err(ParseError::StreamingError(
+                "FOR SYSTEM_TIME AS OF requires a two-part left event-time column".into(),
+            ));
+        };
+        if sides.resolve_qualifier(&qualifier.value, "temporal AS OF timestamp")? != JoinSide::Left
+        {
+            return Err(ParseError::StreamingError(
+                "FOR SYSTEM_TIME AS OF must reference the left join input's event-time column"
+                    .into(),
+            ));
+        }
+        Ok(Some(column.value.clone()))
     } else {
-        None
-    }
-}
-
-/// Extract a column name from an expression (e.g., `o.order_time` → `order_time`).
-///
-/// Falls back to the full expression string for complex expressions.
-fn extract_column_name_from_expr(expr: &Expr) -> String {
-    match expr {
-        Expr::Identifier(ident) => ident.value.clone(),
-        Expr::CompoundIdentifier(parts) => parts
-            .last()
-            .map_or_else(|| expr.to_string(), |p| p.value.clone()),
-        _ => expr.to_string(),
+        Ok(None)
     }
 }
 
@@ -376,6 +388,437 @@ fn extract_table_alias(factor: &TableFactor) -> Option<String> {
         TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
         TableFactor::Derived { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
         _ => None,
+    }
+}
+
+pub(crate) struct ParsedTemporalProbeQuery {
+    pub(crate) statement: Statement,
+    pub(crate) analysis: JoinAnalysis,
+}
+
+#[derive(Clone)]
+struct ProbeRelation {
+    table: Word,
+    alias: Option<Word>,
+}
+
+impl ProbeRelation {
+    fn name(&self) -> &str {
+        &self.table.value
+    }
+
+    fn reference(&self) -> &Word {
+        self.alias.as_ref().unwrap_or(&self.table)
+    }
+
+    fn matches_qualifier(&self, qualifier: &Word) -> bool {
+        qualifier.value == self.table.value
+            || self
+                .alias
+                .as_ref()
+                .is_some_and(|alias| qualifier.value == alias.value)
+    }
+
+    fn versioned_sql(&self, left_time: &Word, left: &Self) -> String {
+        let alias = self
+            .alias
+            .as_ref()
+            .map_or_else(String::new, |alias| format!(" AS {alias}"));
+        format!(
+            "{} FOR SYSTEM_TIME AS OF {}.{}{alias}",
+            self.table,
+            left.reference(),
+            left_time
+        )
+    }
+}
+
+/// Parse the markout syntax and normalize it into the canonical AS-OF AST.
+pub(crate) fn parse_temporal_probe_query(
+    tokens: &[TokenWithSpan],
+) -> Result<Option<ParsedTemporalProbeQuery>, ParseError> {
+    let tokens: Vec<Token> = tokens
+        .iter()
+        .filter(|token| !matches!(token.token, Token::Whitespace(_) | Token::EOF))
+        .map(|token| token.token.clone())
+        .collect();
+    let Some(temporal_index) = find_temporal_probe(&tokens)? else {
+        return Ok(None);
+    };
+
+    let (clause_start, join_type) =
+        if temporal_index > 0 && token_is_word(&tokens[temporal_index - 1], "LEFT") {
+            (temporal_index - 1, JoinType::Left)
+        } else {
+            (temporal_index, JoinType::Inner)
+        };
+    if temporal_index > 0
+        && ["RIGHT", "FULL", "ANTI", "SEMI"]
+            .iter()
+            .any(|kind| token_is_word(&tokens[temporal_index - 1], kind))
+    {
+        return Err(ParseError::StreamingError(
+            "TEMPORAL PROBE JOIN supports only INNER or LEFT semantics".into(),
+        ));
+    }
+
+    let from_index =
+        find_last_top_level_word(&tokens[..clause_start], "FROM").ok_or_else(|| {
+            ParseError::StreamingError("TEMPORAL PROBE JOIN requires one left relation".into())
+        })?;
+    let left = parse_probe_relation(&tokens[from_index + 1..clause_start], "left")?;
+
+    let mut cursor = temporal_index + 3;
+    let on_index = find_top_level_word_from(&tokens, cursor, "ON").ok_or_else(|| {
+        ParseError::StreamingError("TEMPORAL PROBE JOIN requires ON (key)".into())
+    })?;
+    let right = parse_probe_relation(&tokens[cursor..on_index], "right")?;
+    cursor = on_index + 1;
+
+    expect_token(&tokens, &mut cursor, &Token::LParen, "ON (")?;
+    let key = take_word(&tokens, &mut cursor, "temporal probe equality key")?;
+    expect_token(&tokens, &mut cursor, &Token::RParen, "ON (key)")?;
+    expect_word(&tokens, &mut cursor, "TIMESTAMPS")?;
+    expect_token(&tokens, &mut cursor, &Token::LParen, "TIMESTAMPS (")?;
+    let left_time = parse_probe_column(&tokens, &mut cursor, &Token::Comma)?;
+    expect_token(
+        &tokens,
+        &mut cursor,
+        &Token::Comma,
+        "TIMESTAMPS (left, right)",
+    )?;
+    let right_time = parse_probe_column(&tokens, &mut cursor, &Token::RParen)?;
+    expect_token(
+        &tokens,
+        &mut cursor,
+        &Token::RParen,
+        "TIMESTAMPS (left, right)",
+    )?;
+    validate_probe_column_side(&left_time, &left, "left")?;
+    validate_probe_column_side(&right_time, &right, "right")?;
+
+    let schedule = if consume_word(&tokens, &mut cursor, "LIST") {
+        parse_probe_list(&tokens, &mut cursor)?
+    } else if consume_word(&tokens, &mut cursor, "RANGE") {
+        parse_probe_range(&tokens, &mut cursor)?
+    } else {
+        return Err(ParseError::StreamingError(
+            "TEMPORAL PROBE JOIN requires LIST (...) or RANGE FROM ... TO ... STEP ...".into(),
+        ));
+    };
+    expect_word(&tokens, &mut cursor, "AS")?;
+    let probe_alias = take_word(&tokens, &mut cursor, "temporal probe output alias")?;
+
+    let join = match join_type {
+        JoinType::Inner => "JOIN",
+        JoinType::Left => "LEFT JOIN",
+        _ => unreachable!("temporal probe parser admits only INNER or LEFT"),
+    };
+    let right_sql = right.versioned_sql(&left_time.column, &left);
+    let normalized_join = format!(
+        "{join} {right_sql} ON {}.{} = {}.{}",
+        left.reference(),
+        key,
+        right.reference(),
+        key
+    );
+    let normalized_sql = tokens[..clause_start]
+        .iter()
+        .map(ToString::to_string)
+        .chain(std::iter::once(normalized_join))
+        .chain(tokens[cursor..].iter().map(ToString::to_string))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let dialect = crate::parser::dialect::LaminarDialect::default();
+    let mut statements = sqlparser::parser::Parser::parse_sql(&dialect, &normalized_sql)
+        .map_err(ParseError::SqlParseError)?;
+    let [statement] = statements.as_mut_slice() else {
+        return Err(ParseError::StreamingError(
+            "TEMPORAL PROBE JOIN must contain exactly one SELECT query".into(),
+        ));
+    };
+    let Statement::Query(query) = statement else {
+        return Err(ParseError::StreamingError(
+            "TEMPORAL PROBE JOIN is valid only in a SELECT query".into(),
+        ));
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(ParseError::StreamingError(
+            "TEMPORAL PROBE JOIN requires a direct SELECT query".into(),
+        ));
+    };
+    let mut analysis = analyze_join(select)?.ok_or_else(|| {
+        ParseError::StreamingError("normalized temporal probe join is missing its join".into())
+    })?;
+    if analysis.left_table != left.name()
+        || analysis.right_table != right.name()
+        || analysis.left_key_column != key.value
+        || analysis.right_key_column != key.value
+    {
+        return Err(ParseError::StreamingError(
+            "TEMPORAL PROBE JOIN normalization changed its relation or key binding".into(),
+        ));
+    }
+    analysis.join_type = join_type;
+    analysis.right_time_column = Some(right_time.column.value);
+    analysis.temporal_probe_schedule = Some(schedule);
+    analysis.temporal_probe_alias = Some(probe_alias.value);
+
+    Ok(Some(ParsedTemporalProbeQuery {
+        statement: statements.remove(0),
+        analysis,
+    }))
+}
+
+#[derive(Clone)]
+struct ProbeColumn {
+    qualifier: Option<Word>,
+    column: Word,
+}
+
+fn find_temporal_probe(tokens: &[Token]) -> Result<Option<usize>, ParseError> {
+    let mut depth = 0i32;
+    let mut found = None;
+    for index in 0..tokens.len().saturating_sub(2) {
+        match tokens[index] {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            _ => {}
+        }
+        if depth == 0
+            && token_is_word(&tokens[index], "TEMPORAL")
+            && token_is_word(&tokens[index + 1], "PROBE")
+            && token_is_word(&tokens[index + 2], "JOIN")
+        {
+            if found.is_some() {
+                return Err(ParseError::StreamingError(
+                    "a query may contain only one TEMPORAL PROBE JOIN".into(),
+                ));
+            }
+            found = Some(index);
+        }
+    }
+    Ok(found)
+}
+
+fn find_last_top_level_word(tokens: &[Token], expected: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut found = None;
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            _ if depth == 0 && token_is_word(token, expected) => found = Some(index),
+            _ => {}
+        }
+    }
+    found
+}
+
+fn find_top_level_word_from(tokens: &[Token], start: usize, expected: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        match token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            _ if depth == 0 && token_is_word(token, expected) => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_probe_relation(tokens: &[Token], side: &str) -> Result<ProbeRelation, ParseError> {
+    let error = || {
+        ParseError::StreamingError(format!(
+            "TEMPORAL PROBE JOIN {side} relation must be a single-part table with an optional alias"
+        ))
+    };
+    let (table, alias) = match tokens {
+        [Token::Word(table)] => (table.clone(), None),
+        [Token::Word(table), Token::Word(alias)] if !token_is_word(&tokens[1], "AS") => {
+            (table.clone(), Some(alias.clone()))
+        }
+        [Token::Word(table), as_token, Token::Word(alias)] if token_is_word(as_token, "AS") => {
+            (table.clone(), Some(alias.clone()))
+        }
+        _ => return Err(error()),
+    };
+    Ok(ProbeRelation { table, alias })
+}
+
+fn parse_probe_column(
+    tokens: &[Token],
+    cursor: &mut usize,
+    terminator: &Token,
+) -> Result<ProbeColumn, ParseError> {
+    let first = take_word(tokens, cursor, "temporal probe timestamp column")?;
+    if tokens.get(*cursor) == Some(&Token::Period) {
+        *cursor += 1;
+        let column = take_word(tokens, cursor, "temporal probe timestamp column")?;
+        if tokens.get(*cursor) != Some(terminator) {
+            return Err(ParseError::StreamingError(
+                "temporal probe timestamps must be one- or two-part column references".into(),
+            ));
+        }
+        Ok(ProbeColumn {
+            qualifier: Some(first),
+            column,
+        })
+    } else {
+        if tokens.get(*cursor) != Some(terminator) {
+            return Err(ParseError::StreamingError(
+                "temporal probe timestamps must be one- or two-part column references".into(),
+            ));
+        }
+        Ok(ProbeColumn {
+            qualifier: None,
+            column: first,
+        })
+    }
+}
+
+fn validate_probe_column_side(
+    column: &ProbeColumn,
+    relation: &ProbeRelation,
+    side: &str,
+) -> Result<(), ParseError> {
+    if column
+        .qualifier
+        .as_ref()
+        .is_some_and(|qualifier| !relation.matches_qualifier(qualifier))
+    {
+        return Err(ParseError::StreamingError(format!(
+            "TEMPORAL PROBE JOIN {side} timestamp must reference its {side} relation"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_probe_list(
+    tokens: &[Token],
+    cursor: &mut usize,
+) -> Result<TemporalProbeSchedule, ParseError> {
+    expect_token(tokens, cursor, &Token::LParen, "LIST (")?;
+    let mut offsets = Vec::new();
+    loop {
+        offsets.push(parse_probe_duration_ms(tokens, cursor)?);
+        if tokens.get(*cursor) == Some(&Token::Comma) {
+            *cursor += 1;
+            continue;
+        }
+        expect_token(tokens, cursor, &Token::RParen, "LIST (...)")?;
+        break;
+    }
+    TemporalProbeSchedule::list(offsets).map_err(ParseError::StreamingError)
+}
+
+fn parse_probe_range(
+    tokens: &[Token],
+    cursor: &mut usize,
+) -> Result<TemporalProbeSchedule, ParseError> {
+    expect_word(tokens, cursor, "FROM")?;
+    let start_ms = parse_probe_duration_ms(tokens, cursor)?;
+    expect_word(tokens, cursor, "TO")?;
+    let end_ms = parse_probe_duration_ms(tokens, cursor)?;
+    expect_word(tokens, cursor, "STEP")?;
+    let step_ms = parse_probe_duration_ms(tokens, cursor)?;
+    TemporalProbeSchedule::range(start_ms, end_ms, step_ms).map_err(ParseError::StreamingError)
+}
+
+fn parse_probe_duration_ms(tokens: &[Token], cursor: &mut usize) -> Result<i64, ParseError> {
+    let negative = if tokens.get(*cursor) == Some(&Token::Minus) {
+        *cursor += 1;
+        true
+    } else {
+        false
+    };
+    let value = match tokens.get(*cursor) {
+        Some(Token::Number(value, false)) => value.parse::<i64>().map_err(|_| {
+            ParseError::StreamingError(format!("invalid temporal probe duration '{value}'"))
+        })?,
+        other => {
+            return Err(ParseError::StreamingError(format!(
+                "temporal probe duration requires an integer, found {other:?}"
+            )))
+        }
+    };
+    *cursor += 1;
+    let unit = take_word(tokens, cursor, "temporal probe duration unit")?;
+    let multiplier = match unit.value.to_ascii_lowercase().as_str() {
+        "ms" => 1,
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => {
+            return Err(ParseError::StreamingError(format!(
+                "unsupported temporal probe duration unit '{}'; use ms, s, m, h, or d",
+                unit.value
+            )))
+        }
+    };
+    let value = value.checked_mul(multiplier).ok_or_else(|| {
+        ParseError::StreamingError("temporal probe duration overflows milliseconds".into())
+    })?;
+    if negative {
+        value.checked_neg().ok_or_else(|| {
+            ParseError::StreamingError("temporal probe duration overflows milliseconds".into())
+        })
+    } else {
+        Ok(value)
+    }
+}
+
+fn token_is_word(token: &Token, expected: &str) -> bool {
+    matches!(token, Token::Word(word) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected))
+}
+
+fn consume_word(tokens: &[Token], cursor: &mut usize, expected: &str) -> bool {
+    if tokens
+        .get(*cursor)
+        .is_some_and(|token| token_is_word(token, expected))
+    {
+        *cursor += 1;
+        true
+    } else {
+        false
+    }
+}
+
+fn expect_word(tokens: &[Token], cursor: &mut usize, expected: &str) -> Result<(), ParseError> {
+    if consume_word(tokens, cursor, expected) {
+        Ok(())
+    } else {
+        Err(ParseError::StreamingError(format!(
+            "TEMPORAL PROBE JOIN expected {expected}"
+        )))
+    }
+}
+
+fn take_word(tokens: &[Token], cursor: &mut usize, context: &str) -> Result<Word, ParseError> {
+    let Some(Token::Word(word)) = tokens.get(*cursor) else {
+        return Err(ParseError::StreamingError(format!(
+            "expected {context} identifier"
+        )));
+    };
+    *cursor += 1;
+    Ok(word.clone())
+}
+
+fn expect_token(
+    tokens: &[Token],
+    cursor: &mut usize,
+    expected: &Token,
+    context: &str,
+) -> Result<(), ParseError> {
+    if tokens.get(*cursor) == Some(expected) {
+        *cursor += 1;
+        Ok(())
+    } else {
+        Err(ParseError::StreamingError(format!(
+            "TEMPORAL PROBE JOIN expected {context}"
+        )))
     }
 }
 
@@ -774,7 +1217,7 @@ pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, Parse
             right_alias: right_alias.as_deref(),
         };
 
-        if let Some(version_col) = extract_temporal_version(&join.relation) {
+        if let Some(left_time_col) = extract_temporal_left_time(&join.relation, &sides)? {
             // Temporal join: right side has FOR SYSTEM_TIME AS OF
             let (left_key, right_key, additional, _, _) =
                 analyze_join_constraint(&join.join_operator, &sides)?;
@@ -784,7 +1227,7 @@ pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, Parse
                 right_table.clone(),
                 left_key,
                 right_key,
-                version_col,
+                left_time_col,
                 join_type,
             );
             analysis.left_alias.clone_from(&prev_left_alias);
@@ -1364,11 +1807,8 @@ mod tests {
         let select = parse_select_laminar(sql);
         let analysis = analyze_join(&select).unwrap().unwrap();
 
-        assert!(analysis.is_temporal_join);
-        assert_eq!(
-            analysis.temporal_version_column,
-            Some("order_time".to_string())
-        );
+        assert!(analysis.is_temporal_join());
+        assert_eq!(analysis.left_time_column.as_deref(), Some("order_time"));
         assert_eq!(analysis.left_table, "orders");
         assert_eq!(analysis.right_table, "products");
         assert_eq!(analysis.left_key_column, "product_id");
@@ -1387,11 +1827,8 @@ mod tests {
 
         assert_eq!(multi.len(), 1);
         let first = multi.first().unwrap();
-        assert!(first.is_temporal_join);
-        assert_eq!(
-            first.temporal_version_column,
-            Some("order_time".to_string())
-        );
+        assert!(first.is_temporal_join());
+        assert_eq!(first.left_time_column.as_deref(), Some("order_time"));
     }
 
     #[test]
@@ -1400,8 +1837,8 @@ mod tests {
         let select = parse_select(sql);
         let analysis = analyze_join(&select).unwrap().unwrap();
 
-        assert!(!analysis.is_temporal_join);
-        assert!(analysis.temporal_version_column.is_none());
+        assert!(!analysis.is_temporal_join());
+        assert!(analysis.temporal_probe_schedule.is_none());
     }
 
     #[test]

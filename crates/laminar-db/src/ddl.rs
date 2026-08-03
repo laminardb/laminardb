@@ -1730,6 +1730,7 @@ impl LaminarDB {
         self.validate_cluster_query_shape_before_plan("stream", &name_str, query_sql, emit_clause)?;
         let planned =
             self.plan_streaming_query(name, query, emit_clause.cloned(), query_sql, false)?;
+        self.reject_unmanaged_temporal_plan(&planned)?;
         self.validate_interval_join_schema(&name_str, query_sql, &planned)
             .await?;
         self.validate_cluster_query_shape("stream", &name_str, query_sql, &planned)
@@ -2193,6 +2194,23 @@ impl LaminarDB {
         })
     }
 
+    fn reject_unmanaged_temporal_plan(&self, plan: &PlannedStreamingQuery) -> Result<(), DbError> {
+        if plan.join_config.as_ref().is_some_and(|joins| {
+            joins.iter().any(|join| {
+                matches!(
+                    join,
+                    laminar_sql::translator::JoinOperatorConfig::Temporal(_)
+                )
+            })
+        }) {
+            return Err(DbError::Unsupported(
+                "temporal joins require the managed two-input vnode runtime; legacy lookup execution is disabled"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn validate_interval_join_schema(
         &self,
         object_name: &str,
@@ -2430,10 +2448,7 @@ impl LaminarDB {
                 "incremental changelog join state has no vnode-keyed checkpoint and rebalance lifecycle",
             );
         }
-        if crate::sql_analysis::detect_temporal_query(query_sql)
-            .0
-            .is_some()
-        {
+        if crate::sql_analysis::has_temporal_query(query_sql) {
             return reject(
                 "temporal join state has no vnode-keyed checkpoint and rebalance lifecycle",
             );
@@ -2663,6 +2678,7 @@ impl LaminarDB {
         };
 
         let planned = self.plan_streaming_query(name, query, emit_clause, query_sql, true)?;
+        self.reject_unmanaged_temporal_plan(&planned)?;
         self.validate_interval_join_schema(&name_str, query_sql, &planned)
             .await?;
         let PlannedStreamingQuery {

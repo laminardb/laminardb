@@ -12,7 +12,7 @@ use laminar_sql::datafusion::lookup_join::LookupJoinType;
 use laminar_sql::datafusion::lookup_join_exec::{
     LookupTableRegistry, RegisteredLookup, VersionedLookupJoinExec,
 };
-use laminar_sql::translator::TemporalJoinTranslatorConfig;
+use laminar_sql::translator::{TemporalJoinKind, TemporalJoinTranslatorConfig};
 
 use crate::error::DbError;
 use crate::operator::ProjectingJoinState;
@@ -65,17 +65,19 @@ impl TemporalJoinOperator {
             ))
         })?;
 
-        let entry = registry.get_entry(&self.config.table_name).ok_or_else(|| {
-            DbError::Pipeline(format!(
-                "temporal join [{}]: table '{}' not registered",
-                self.op_name, self.config.table_name
-            ))
-        })?;
+        let entry = registry
+            .get_entry(&self.config.right_table)
+            .ok_or_else(|| {
+                DbError::Pipeline(format!(
+                    "temporal join [{}]: table '{}' not registered",
+                    self.op_name, self.config.right_table
+                ))
+            })?;
 
         let RegisteredLookup::Versioned(versioned) = entry else {
             return Err(DbError::Pipeline(format!(
                 "temporal join [{}]: table '{}' not registered as versioned",
-                self.op_name, self.config.table_name
+                self.op_name, self.config.right_table
             )));
         };
 
@@ -83,7 +85,7 @@ impl TemporalJoinOperator {
         if current_rows < self.last_temporal_row_count {
             tracing::warn!(
                 query = %self.op_name,
-                table = %self.config.table_name,
+                table = %self.config.right_table,
                 previous_rows = self.last_temporal_row_count,
                 current_rows = current_rows,
                 "Temporal join table has been modified. \
@@ -101,23 +103,23 @@ impl TemporalJoinOperator {
         let stream_schema = stream_batches[0].schema();
 
         let stream_key_idx = stream_schema
-            .index_of(&self.config.stream_key_column)
+            .index_of(&self.config.left_key_column)
             .map_err(|_| {
                 DbError::Pipeline(format!(
                     "temporal join [{}]: stream key column '{}' not found",
-                    self.op_name, self.config.stream_key_column
+                    self.op_name, self.config.left_key_column
                 ))
             })?;
         let stream_time_idx = stream_schema
-            .index_of(&self.config.stream_time_column)
+            .index_of(&self.config.left_time_column)
             .map_err(|_| {
                 DbError::Pipeline(format!(
                     "temporal join [{}]: stream time column '{}' not found",
-                    self.op_name, self.config.stream_time_column
+                    self.op_name, self.config.left_time_column
                 ))
             })?;
 
-        let join_type = if self.config.join_type == "left" {
+        let join_type = if self.config.join_kind == TemporalJoinKind::Left {
             LookupJoinType::LeftOuter
         } else {
             LookupJoinType::Inner
@@ -134,7 +136,8 @@ impl TemporalJoinOperator {
             })
             .collect();
 
-        let output_schema = build_temporal_output_schema(&stream_schema, &table_schema);
+        let output_schema =
+            build_temporal_output_schema(&stream_schema, &table_schema, &self.config);
 
         let mem_table = datafusion::datasource::MemTable::try_new(
             Arc::clone(&stream_schema),
@@ -184,9 +187,24 @@ impl TemporalJoinOperator {
     }
 }
 
-fn build_temporal_output_schema(stream_schema: &SchemaRef, table_schema: &SchemaRef) -> SchemaRef {
+fn build_temporal_output_schema(
+    stream_schema: &SchemaRef,
+    table_schema: &SchemaRef,
+    config: &TemporalJoinTranslatorConfig,
+) -> SchemaRef {
     let mut fields = stream_schema.fields().to_vec();
-    fields.extend(table_schema.fields().iter().cloned());
+    fields.extend(table_schema.fields().iter().map(|field| {
+        let field =
+            field
+                .as_ref()
+                .clone()
+                .with_name(format!("{}_{}", field.name(), config.right_table));
+        if config.join_kind == TemporalJoinKind::Left {
+            Arc::new(field.with_nullable(true))
+        } else {
+            Arc::new(field)
+        }
+    }));
     Arc::new(arrow::datatypes::Schema::new(fields))
 }
 
@@ -224,14 +242,15 @@ mod tests {
 
     fn test_config() -> TemporalJoinTranslatorConfig {
         TemporalJoinTranslatorConfig {
-            stream_table: "orders".to_string(),
-            table_name: "rates".to_string(),
-            stream_key_column: "currency".to_string(),
-            table_key_column: "currency".to_string(),
-            stream_time_column: "order_ts".to_string(),
-            table_version_column: "valid_from".to_string(),
-            semantics: "event_time".to_string(),
-            join_type: "inner".to_string(),
+            left_table: "orders".to_string(),
+            right_table: "rates".to_string(),
+            left_key_column: "currency".to_string(),
+            right_key_column: "currency".to_string(),
+            left_time_column: "order_ts".to_string(),
+            right_time_column: "valid_from".to_string(),
+            join_kind: TemporalJoinKind::Inner,
+            probe_schedule: laminar_sql::translator::TemporalProbeSchedule::as_of(),
+            probe_alias: None,
         }
     }
 

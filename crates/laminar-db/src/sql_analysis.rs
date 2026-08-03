@@ -505,7 +505,7 @@ pub(crate) fn detect_lookup_enrich_query(
         return (None, None);
     }
     let j = &multi.joins[0];
-    if j.is_temporal_join || j.time_bound.is_some() || !j.additional_key_columns.is_empty() {
+    if j.is_temporal_join() || j.time_bound.is_some() || !j.additional_key_columns.is_empty() {
         return (None, None);
     }
     let lookup_table = j.right_table.clone();
@@ -655,7 +655,7 @@ pub(crate) fn detect_changelog_enrich_query(
         return None;
     }
     let j = &multi.joins[0];
-    if j.is_temporal_join || j.time_bound.is_some() {
+    if j.is_temporal_join() || j.time_bound.is_some() {
         return None;
     }
     // Only changelog-left to static-right enrichment is supported. Every other changelog join
@@ -1257,42 +1257,62 @@ fn bivariate_column_args(func: &sqlparser::ast::Function) -> Option<(String, Str
     }
 }
 
-pub(crate) fn detect_temporal_query(
+fn parse_temporal_query(
     sql: &str,
-) -> (Option<TemporalJoinTranslatorConfig>, Option<String>) {
+) -> Option<(
+    sqlparser::ast::Select,
+    laminar_sql::parser::join_parser::JoinAnalysis,
+)> {
     let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
-        return (None, None);
+        return None;
     };
 
     let Some(laminar_sql::parser::StreamingStatement::Standard(stmt)) = statements.first() else {
-        return (None, None);
+        return None;
     };
 
     let Statement::Query(query) = stmt.as_ref() else {
-        return (None, None);
+        return None;
     };
 
     let SetExpr::Select(select) = query.body.as_ref() else {
-        return (None, None);
+        return None;
     };
 
     let Ok(Some(multi)) = analyze_joins(select) else {
-        return (None, None);
+        return None;
     };
 
-    let Some(temporal_analysis) = multi.joins.iter().find(|j| j.is_temporal_join) else {
-        return (None, None);
+    let temporal_analysis = multi
+        .joins
+        .into_iter()
+        .find(laminar_sql::parser::join_parser::JoinAnalysis::is_temporal_join)?;
+    Some((select.as_ref().clone(), temporal_analysis))
+}
+
+pub(crate) fn has_temporal_query(sql: &str) -> bool {
+    let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
+        return false;
     };
+    statements.iter().any(|statement| match statement {
+        laminar_sql::parser::StreamingStatement::Standard(statement) => {
+            laminar_sql::temporal::temporal_table_version_count(statement) > 0
+        }
+        laminar_sql::parser::StreamingStatement::TemporalProbeQuery { .. } => true,
+        _ => false,
+    })
+}
 
-    let Ok(JoinOperatorConfig::Temporal(config)) =
-        JoinOperatorConfig::from_analysis(temporal_analysis)
-    else {
-        return (None, None);
-    };
-
-    let projection_sql = build_temporal_projection_sql(select, temporal_analysis, &config);
-
-    (Some(config), Some(projection_sql))
+pub(crate) fn temporal_projection_sql(
+    sql: &str,
+    config: &TemporalJoinTranslatorConfig,
+) -> Option<String> {
+    let (select, temporal_analysis) = parse_temporal_query(sql)?;
+    Some(build_temporal_projection_sql(
+        &select,
+        &temporal_analysis,
+        config,
+    ))
 }
 
 fn split_conjunction_sqlparser(expr: &Expr) -> Vec<Expr> {
@@ -1641,7 +1661,7 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
     }
     let stream_analysis = analyze_join(select).ok()??;
     if stream_analysis.time_bound.is_none()
-        || stream_analysis.is_temporal_join
+        || stream_analysis.is_temporal_join()
         || stream_analysis.is_lookup_join
     {
         return None;
@@ -1903,10 +1923,13 @@ fn rewrite_temporal_expr(
         }
         let table = parts[0].value.as_str();
         let column = parts[1].value.as_str();
-        let is_left = Some(table) == left_alias || table == config.stream_table;
-        let is_right = Some(table) == right_alias || table == config.table_name;
-        Some(if is_left || is_right {
+        let is_left = Some(table) == left_alias || table == config.left_table;
+        let is_right = Some(table) == right_alias || table == config.right_table;
+        let is_probe = config.probe_alias.as_deref() == Some(table);
+        Some(if is_left || is_probe {
             column.to_string()
+        } else if is_right {
+            format!("{column}_{}", config.right_table)
         } else {
             e.to_string()
         })

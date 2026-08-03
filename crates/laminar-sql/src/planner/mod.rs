@@ -32,6 +32,7 @@ use crate::parser::{
     CreateLookupTableStatement, CreateSinkStatement, CreateSourceStatement, EmitClause, SinkFrom,
     StreamingStatement, WindowFunction, WindowRewriter,
 };
+use crate::temporal::temporal_table_version_count;
 use crate::translator::{
     AnalyticWindowConfig, HavingFilterConfig, JoinOperatorConfig, OrderOperatorConfig,
     WindowFrameConfig, WindowOperatorConfig,
@@ -73,6 +74,8 @@ pub struct SourceInfo {
     pub name: String,
     /// Watermark column (if configured)
     pub watermark_column: Option<String>,
+    /// Declared non-null primary-key columns.
+    pub primary_key: Vec<String>,
 }
 
 /// Information about a registered sink
@@ -220,7 +223,7 @@ impl ChangelogEnrichAdmission {
             && self.join_type == step.join_type
             && self.left_keys.iter().map(String::as_str).eq(left_keys)
             && self.right_keys.iter().map(String::as_str).eq(right_keys)
-            && !step.is_temporal_join
+            && !step.is_temporal_join()
             && step.time_bound.is_none()
     }
 }
@@ -291,7 +294,11 @@ impl StreamingPlanner {
                 emit_clause,
                 ..
             } => self.plan_continuous_query(name, query, emit_clause.as_ref(), changelog_enrich),
-            StreamingStatement::Standard(stmt) => self.plan_standard_statement(stmt),
+            StreamingStatement::Standard(stmt) => self.plan_standard_statement(stmt, None),
+            StreamingStatement::TemporalProbeQuery {
+                statement,
+                analysis,
+            } => self.plan_standard_statement(statement, Some(analysis)),
             StreamingStatement::CreateLookupTable(lt) => self.plan_create_lookup_table(lt),
             StreamingStatement::DropLookupTable { name, if_exists } => {
                 self.plan_drop_lookup_table(name, *if_exists)
@@ -368,6 +375,11 @@ impl StreamingPlanner {
         let info = SourceInfo {
             name: name.clone(),
             watermark_column,
+            primary_key: source
+                .primary_key
+                .iter()
+                .map(|column| column.value.clone())
+                .collect(),
         };
 
         // Register the source
@@ -417,8 +429,12 @@ impl StreamingPlanner {
         changelog_enrich: Option<&ChangelogEnrichAdmission>,
     ) -> Result<StreamingPlan, PlanningError> {
         // The query inside should be a standard SELECT
-        let stmt = match query {
-            StreamingStatement::Standard(stmt) => stmt.as_ref().clone(),
+        let (stmt, temporal_probe) = match query {
+            StreamingStatement::Standard(stmt) => (stmt.as_ref().clone(), None),
+            StreamingStatement::TemporalProbeQuery {
+                statement,
+                analysis,
+            } => (statement.as_ref().clone(), Some(analysis.as_ref())),
             _ => {
                 return Err(PlanningError::InvalidQuery(
                     "Continuous query must contain a SELECT statement".to_string(),
@@ -427,7 +443,8 @@ impl StreamingPlanner {
         };
 
         // Analyze the query for streaming features
-        let query_plan = self.analyze_query(&stmt, emit_clause, changelog_enrich)?;
+        let query_plan =
+            self.analyze_query(&stmt, emit_clause, changelog_enrich, temporal_probe)?;
 
         // Keep planner classification in sync with catalog rollback/drop. A windowed query is the
         // only query shape for which the planner retains classification after planning.
@@ -453,7 +470,11 @@ impl StreamingPlanner {
 
     /// Plans a standard SQL statement.
     #[allow(clippy::unused_self)] // Will use planner state for plan optimization
-    fn plan_standard_statement(&self, stmt: &Statement) -> Result<StreamingPlan, PlanningError> {
+    fn plan_standard_statement(
+        &self,
+        stmt: &Statement,
+        temporal_probe: Option<&JoinAnalysis>,
+    ) -> Result<StreamingPlan, PlanningError> {
         // Check if it's a query that might have streaming features
         if let Statement::Query(query) = stmt {
             if let SetExpr::Select(select) = query.body.as_ref() {
@@ -467,11 +488,24 @@ impl StreamingPlanner {
                 let window_function = Self::extract_window_from_select(select);
 
                 // Check for joins (multi-way)
-                let join_analysis = analyze_joins(select).map_err(|e| {
+                let mut join_analysis = analyze_joins(select).map_err(|e| {
                     PlanningError::InvalidQuery(format!("Join analysis failed: {e}"))
                 })?;
 
-                if let Some(ref multi) = join_analysis {
+                validate_temporal_version_shape(
+                    stmt,
+                    join_analysis.as_ref().map_or(0, |multi| {
+                        multi
+                            .joins
+                            .iter()
+                            .filter(|join| join.is_temporal_join())
+                            .count()
+                    }),
+                )?;
+
+                if let Some(ref mut multi) = join_analysis {
+                    apply_temporal_probe_analysis(multi, temporal_probe)?;
+                    self.resolve_temporal_source_contracts(multi)?;
                     validate_streaming_joins(multi, &self.lookup_tables, None)?;
                 }
 
@@ -543,6 +577,8 @@ impl StreamingPlanner {
             }
         }
 
+        validate_temporal_version_shape(stmt, 0)?;
+
         // Pass through standard SQL
         Ok(StreamingPlan::Standard(Box::new(stmt.clone())))
     }
@@ -553,8 +589,10 @@ impl StreamingPlanner {
         stmt: &Statement,
         emit_clause: Option<&EmitClause>,
         changelog_enrich: Option<&ChangelogEnrichAdmission>,
+        temporal_probe: Option<&JoinAnalysis>,
     ) -> Result<QueryAnalysis, PlanningError> {
         let mut analysis = QueryAnalysis::default();
+        let mut recognized_temporal_versions = 0;
 
         if let Statement::Query(query) = stmt {
             if let SetExpr::Select(select) = query.body.as_ref() {
@@ -580,9 +618,19 @@ impl StreamingPlanner {
                 }
 
                 // Extract join info (multi-way)
-                if let Some(multi) = analyze_joins(select).map_err(|e| {
+                let join_analysis = analyze_joins(select).map_err(|e| {
                     PlanningError::InvalidQuery(format!("Join analysis failed: {e}"))
-                })? {
+                })?;
+                recognized_temporal_versions = join_analysis.as_ref().map_or(0, |multi| {
+                    multi
+                        .joins
+                        .iter()
+                        .filter(|join| join.is_temporal_join())
+                        .count()
+                });
+                if let Some(mut multi) = join_analysis {
+                    apply_temporal_probe_analysis(&mut multi, temporal_probe)?;
+                    self.resolve_temporal_source_contracts(&mut multi)?;
                     validate_streaming_joins(&multi, &self.lookup_tables, changelog_enrich)?;
                     analysis.join_config = Some(
                         JoinOperatorConfig::from_multi_analysis(&multi)
@@ -591,6 +639,8 @@ impl StreamingPlanner {
                 }
             }
         }
+
+        validate_temporal_version_shape(stmt, recognized_temporal_versions)?;
 
         // Extract ORDER BY info
         let order_analysis = analyze_order_by(stmt);
@@ -733,6 +783,72 @@ impl StreamingPlanner {
         self.sources.values().collect()
     }
 
+    fn resolve_temporal_source_contracts(
+        &self,
+        multi: &mut MultiJoinAnalysis,
+    ) -> Result<(), PlanningError> {
+        for step in &mut multi.joins {
+            if !step.is_temporal_join() {
+                continue;
+            }
+            let left = self.sources.get(&step.left_table).ok_or_else(|| {
+                PlanningError::SourceNotFound(format!(
+                    "{} (temporal left input must be a registered event-time source)",
+                    step.left_table
+                ))
+            })?;
+            let left_time = step.left_time_column.as_ref().ok_or_else(|| {
+                PlanningError::InvalidQuery(
+                    "temporal join is missing its explicit left event-time column".into(),
+                )
+            })?;
+            let left_watermark = left.watermark_column.as_ref().ok_or_else(|| {
+                PlanningError::InvalidQuery(format!(
+                    "temporal left source '{}' must declare WATERMARK FOR {}",
+                    step.left_table, left_time
+                ))
+            })?;
+            if left_watermark != left_time {
+                return Err(PlanningError::InvalidQuery(format!(
+                    "temporal left timestamp '{}' does not match WATERMARK FOR {} on source '{}'",
+                    left_time, left_watermark, step.left_table
+                )));
+            }
+            let right = self.sources.get(&step.right_table).ok_or_else(|| {
+                PlanningError::SourceNotFound(format!(
+                    "{} (temporal right input must be a registered source)",
+                    step.right_table
+                ))
+            })?;
+            if right.primary_key.as_slice() != [step.right_key_column.as_str()] {
+                return Err(PlanningError::InvalidQuery(format!(
+                    "temporal right source '{}' must declare PRIMARY KEY ({}) matching the join key",
+                    step.right_table, step.right_key_column
+                )));
+            }
+            let right_time = right.watermark_column.as_ref().ok_or_else(|| {
+                PlanningError::InvalidQuery(format!(
+                    "temporal right source '{}' must declare WATERMARK FOR its version column",
+                    step.right_table
+                ))
+            })?;
+            if step
+                .right_time_column
+                .as_ref()
+                .is_some_and(|column| column != right_time)
+            {
+                return Err(PlanningError::InvalidQuery(format!(
+                    "temporal right timestamp '{}' does not match WATERMARK FOR {} on source '{}'",
+                    step.right_time_column.as_deref().unwrap_or_default(),
+                    right_time,
+                    step.right_table
+                )));
+            }
+            step.right_time_column = Some(right_time.clone());
+        }
+        Ok(())
+    }
+
     /// Lists all registered sinks.
     #[must_use]
     pub fn list_sinks(&self) -> Vec<&SinkInfo> {
@@ -809,6 +925,48 @@ fn object_name_to_string(name: &ObjectName) -> String {
     }
 }
 
+fn apply_temporal_probe_analysis(
+    multi: &mut MultiJoinAnalysis,
+    temporal_probe: Option<&JoinAnalysis>,
+) -> Result<(), PlanningError> {
+    let Some(temporal_probe) = temporal_probe else {
+        return Ok(());
+    };
+    let [normalized] = multi.joins.as_slice() else {
+        return Err(PlanningError::InvalidQuery(
+            "TEMPORAL PROBE JOIN requires one explicitly named two-way stage".into(),
+        ));
+    };
+    if !normalized.is_temporal_join()
+        || normalized.left_table != temporal_probe.left_table
+        || normalized.right_table != temporal_probe.right_table
+        || normalized.left_key_column != temporal_probe.left_key_column
+        || normalized.right_key_column != temporal_probe.right_key_column
+        || normalized.left_time_column != temporal_probe.left_time_column
+        || normalized.join_type != temporal_probe.join_type
+    {
+        return Err(PlanningError::InvalidQuery(
+            "TEMPORAL PROBE JOIN metadata does not match its normalized AS-OF plan".into(),
+        ));
+    }
+    multi.joins[0] = temporal_probe.clone();
+    Ok(())
+}
+
+fn validate_temporal_version_shape(
+    statement: &Statement,
+    recognized_versions: usize,
+) -> Result<(), PlanningError> {
+    let ast_versions = temporal_table_version_count(statement);
+    if ast_versions != recognized_versions {
+        return Err(PlanningError::InvalidQuery(
+            "FOR SYSTEM_TIME AS OF is supported only on the right input of one direct two-input temporal join; nested and set-operation temporal joins are unsupported"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Fail closed on stream-join shapes whose state/output semantics are not implemented.
 fn validate_streaming_joins(
     multi: &MultiJoinAnalysis,
@@ -883,6 +1041,16 @@ impl std::fmt::Display for PlanningError {
 mod tests {
     use super::*;
     use crate::parser::StreamingParser;
+
+    fn register_temporal_sources(planner: &mut StreamingPlanner) {
+        for sql in [
+            "CREATE SOURCE trades (symbol VARCHAR, trade_time TIMESTAMP, WATERMARK FOR trade_time)",
+            "CREATE SOURCE quotes (symbol VARCHAR PRIMARY KEY, quote_time TIMESTAMP, WATERMARK FOR quote_time)",
+        ] {
+            let statement = StreamingParser::parse_sql(sql).unwrap();
+            planner.plan(&statement[0]).unwrap();
+        }
+    }
 
     #[test]
     fn test_plan_create_source() {
@@ -1477,6 +1645,102 @@ mod tests {
             StreamingPlan::Standard(_) => {} // No join → pass-through
             _ => panic!("Expected Standard plan for simple SELECT"),
         }
+    }
+
+    #[test]
+    fn temporal_as_of_resolves_both_event_time_contracts() {
+        let mut planner = StreamingPlanner::new();
+        register_temporal_sources(&mut planner);
+        let statement = StreamingParser::parse_sql(
+            "SELECT t.symbol, q.price FROM trades t \
+             JOIN quotes FOR SYSTEM_TIME AS OF t.trade_time AS q \
+             ON t.symbol = q.symbol",
+        )
+        .unwrap();
+        let StreamingPlan::Query(plan) = planner.plan(&statement[0]).unwrap() else {
+            panic!("expected temporal query plan");
+        };
+        let Some(JoinOperatorConfig::Temporal(config)) =
+            plan.join_config.and_then(|mut configs| configs.pop())
+        else {
+            panic!("expected canonical temporal config");
+        };
+        assert_eq!(config.left_time_column, "trade_time");
+        assert_eq!(config.right_time_column, "quote_time");
+        assert_eq!(config.join_kind, crate::temporal::TemporalJoinKind::Inner);
+        assert_eq!(config.probe_schedule.offsets_ms(), [0]);
+    }
+
+    #[test]
+    fn temporal_probe_list_uses_the_as_of_config() {
+        let mut planner = StreamingPlanner::new();
+        register_temporal_sources(&mut planner);
+        let statement = StreamingParser::parse_sql(
+            "CREATE STREAM markouts AS SELECT probe.offset_ms, probe.probe_time, q.price \
+             FROM trades t TEMPORAL PROBE JOIN quotes q ON (symbol) \
+             TIMESTAMPS (trade_time, quote_time) LIST (-1s, 0s, 5s) AS probe",
+        )
+        .unwrap();
+        let StreamingPlan::Query(plan) = planner.plan(&statement[0]).unwrap() else {
+            panic!("expected temporal probe query plan");
+        };
+        let Some(JoinOperatorConfig::Temporal(config)) =
+            plan.join_config.and_then(|mut configs| configs.pop())
+        else {
+            panic!("expected canonical temporal config");
+        };
+        assert_eq!(config.probe_schedule.offsets_ms(), [-1_000, 0, 5_000]);
+        assert_eq!(config.probe_alias.as_deref(), Some("probe"));
+    }
+
+    #[test]
+    fn temporal_join_requires_source_watermarks_and_matching_right_key() {
+        for (left, right, expected) in [
+            (
+                "CREATE SOURCE trades (symbol VARCHAR, trade_time TIMESTAMP)",
+                "CREATE SOURCE quotes (symbol VARCHAR PRIMARY KEY, quote_time TIMESTAMP, WATERMARK FOR quote_time)",
+                "temporal left source 'trades' must declare WATERMARK",
+            ),
+            (
+                "CREATE SOURCE trades (symbol VARCHAR, trade_time TIMESTAMP, WATERMARK FOR trade_time)",
+                "CREATE SOURCE quotes (symbol VARCHAR, quote_time TIMESTAMP, WATERMARK FOR quote_time)",
+                "must declare PRIMARY KEY (symbol)",
+            ),
+            (
+                "CREATE SOURCE trades (symbol VARCHAR, trade_time TIMESTAMP, WATERMARK FOR trade_time)",
+                "CREATE SOURCE quotes (symbol VARCHAR PRIMARY KEY, quote_time TIMESTAMP)",
+                "must declare WATERMARK FOR its version column",
+            ),
+        ] {
+            let mut planner = StreamingPlanner::new();
+            for sql in [left, right] {
+                let statement = StreamingParser::parse_sql(sql).unwrap();
+                planner.plan(&statement[0]).unwrap();
+            }
+            let query = StreamingParser::parse_sql(
+                "SELECT * FROM trades t JOIN quotes FOR SYSTEM_TIME AS OF t.trade_time AS q \
+                 ON t.symbol = q.symbol",
+            )
+            .unwrap();
+            let error = planner.plan(&query[0]).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn nested_temporal_versions_fail_closed() {
+        let mut planner = StreamingPlanner::new();
+        register_temporal_sources(&mut planner);
+        let statement = StreamingParser::parse_sql(
+            "WITH matched AS (\
+                 SELECT t.symbol FROM trades t \
+                 JOIN quotes FOR SYSTEM_TIME AS OF t.trade_time AS q \
+                 ON t.symbol = q.symbol\
+             ) SELECT * FROM matched",
+        )
+        .unwrap();
+        let error = planner.plan(&statement[0]).unwrap_err().to_string();
+        assert!(error.contains("nested and set-operation"), "{error}");
     }
 
     // -- Window Frame planner tests --

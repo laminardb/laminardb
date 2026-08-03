@@ -22,8 +22,8 @@ use crate::operator::capability::{OperatorCapability, OperatorImplementation, Op
 #[cfg(feature = "cluster")]
 use crate::operator::RetainedBatch;
 use crate::sql_analysis::{
-    apply_topk_filter, detect_stream_join_query, detect_temporal_query,
-    detect_unbounded_join_steps, extract_table_references, has_join_clause, join_clause_count,
+    apply_topk_filter, detect_stream_join_query, detect_unbounded_join_steps,
+    extract_table_references, has_join_clause, join_clause_count, temporal_projection_sql,
     StreamJoinDetection,
 };
 use laminar_sql::parser::EmitClause;
@@ -1435,8 +1435,8 @@ impl OperatorGraph {
             self.find_node(&sjc.right_table)
                 .unwrap_or_else(|| self.ensure_source_node(&sjc.right_table));
         } else if let Some(tc) = temporal_config {
-            if self.find_node(&tc.stream_table).is_none() {
-                self.ensure_source_node(&tc.stream_table);
+            if self.find_node(&tc.left_table).is_none() {
+                self.ensure_source_node(&tc.left_table);
             }
         } else {
             for table_ref in table_refs {
@@ -1494,9 +1494,9 @@ impl OperatorGraph {
             }
             false
         } else if let Some(tc) = temporal_config {
-            let stream_id = self.find_node(&tc.stream_table).expect("source ensured");
+            let stream_id = self.find_node(&tc.left_table).expect("source ensured");
             self.add_edge(stream_id, node_id, 0);
-            self.output_map.contains_key(tc.stream_table.as_str())
+            self.output_map.contains_key(tc.left_table.as_str())
         } else {
             let mut depends_on_query = false;
             for table_ref in table_refs {
@@ -1532,6 +1532,18 @@ impl OperatorGraph {
         incremental: bool,
     ) {
         use laminar_sql::translator::JoinOperatorConfig;
+
+        if join_config.as_ref().is_some_and(|joins| {
+            joins
+                .iter()
+                .any(|join| matches!(join, JoinOperatorConfig::Temporal(_)))
+        }) {
+            self.build_errors.push(DbError::Unsupported(
+                "temporal joins require the managed two-input vnode operator; legacy lookup execution is disabled"
+                    .into(),
+            ));
+            return;
+        }
 
         if join_clause_count(&sql) > 1 {
             self.build_errors.push(DbError::InvalidOperation(
@@ -1595,26 +1607,30 @@ impl OperatorGraph {
             return;
         }
 
-        let needs_specialized_detection = join_config.as_ref().is_none_or(|jcs| {
-            jcs.iter().any(|c| {
-                matches!(
-                    c,
-                    JoinOperatorConfig::StreamStream(_) | JoinOperatorConfig::Temporal(_)
-                )
-            })
-        });
-
-        let specialized = !enrich && needs_specialized_detection;
-        let (temporal_config, temporal_projection_sql) = if specialized {
-            detect_temporal_query(&sql)
-        } else {
-            (None, None)
-        };
-        let stream_join_detection = if specialized {
-            detect_stream_join_query(&sql)
-        } else {
+        let temporal_config = if enrich {
             None
+        } else {
+            join_config
+                .as_ref()
+                .and_then(|configs| match configs.as_slice() {
+                    [JoinOperatorConfig::Temporal(config)] => Some(config.clone()),
+                    _ => None,
+                })
         };
+        let temporal_projection_sql = temporal_config
+            .as_ref()
+            .and_then(|config| temporal_projection_sql(&sql, config));
+        let needs_stream_detection = join_config.as_ref().is_none_or(|configs| {
+            configs
+                .iter()
+                .any(|config| matches!(config, JoinOperatorConfig::StreamStream(_)))
+        });
+        let stream_join_detection =
+            if !enrich && temporal_config.is_none() && needs_stream_detection {
+                detect_stream_join_query(&sql)
+            } else {
+                None
+            };
         let stream_join_config = stream_join_detection.as_ref().map(|d| d.config.clone());
         if let Some(config) = &stream_join_config {
             if config.time_bound.is_zero() || i64::try_from(config.time_bound.as_millis()).is_err()

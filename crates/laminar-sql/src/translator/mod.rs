@@ -15,6 +15,7 @@ pub mod streaming_ddl;
 mod window_translator;
 
 pub use crate::parser::order_analyzer::RankType;
+pub use crate::temporal::{TemporalJoinKind, TemporalProbeSchedule};
 pub use analytic_translator::{
     AnalyticFunctionConfig, AnalyticWindowConfig, WindowFrameConfig, WindowFrameFunctionConfig,
 };

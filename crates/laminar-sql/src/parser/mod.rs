@@ -235,6 +235,14 @@ impl StreamingParser {
                 Ok(vec![stmt])
             }
             StreamingDdlKind::None => {
+                if let Some(parsed) = join_parser::parse_temporal_probe_query(&tokens)
+                    .map_err(parse_error_to_parser_error)?
+                {
+                    return Ok(vec![StreamingStatement::TemporalProbeQuery {
+                        statement: Box::new(parsed.statement),
+                        analysis: Box::new(parsed.analysis),
+                    }]);
+                }
                 // Standard SQL - check for INSERT INTO and convert
                 let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql_trimmed)?;
                 Ok(statements
@@ -489,9 +497,7 @@ fn parse_create_stream(
     let remaining = collect_remaining_tokens(parser);
     let (head_tokens, with_tokens) = split_off_trailing_with(&remaining);
     let (query_tokens, emit_tokens) = split_at_emit(&head_tokens);
-    reject_removed_temporal_probe_join(&query_tokens)?;
-
-    let query_sql = query_body_sql(
+    let raw_query_sql = query_body_sql(
         original_sql,
         &query_tokens,
         &emit_tokens,
@@ -500,20 +506,27 @@ fn parse_create_stream(
 
     let stream_dialect = LaminarDialect::default();
 
-    let query = if query_tokens.is_empty() {
+    let query_stmt = if query_tokens.is_empty() {
         return Err(ParseError::StreamingError(
             "Expected SELECT query after AS".to_string(),
         ));
+    } else if let Some(parsed) = join_parser::parse_temporal_probe_query(&query_tokens)? {
+        StreamingStatement::TemporalProbeQuery {
+            statement: Box::new(parsed.statement),
+            analysis: Box::new(parsed.analysis),
+        }
     } else {
         let mut query_parser = sqlparser::parser::Parser::new(&stream_dialect)
             .with_tokens_with_locations(query_tokens);
-        query_parser
+        let query = query_parser
             .parse_query()
-            .map_err(ParseError::SqlParseError)?
+            .map_err(ParseError::SqlParseError)?;
+        StreamingStatement::Standard(Box::new(sqlparser::ast::Statement::Query(query)))
     };
-
-    let query_stmt =
-        StreamingStatement::Standard(Box::new(sqlparser::ast::Statement::Query(query)));
+    let query_sql = match &query_stmt {
+        StreamingStatement::TemporalProbeQuery { statement, .. } => statement.to_string(),
+        _ => raw_query_sql,
+    };
 
     let emit_clause = if emit_tokens.is_empty() {
         None
@@ -909,26 +922,31 @@ fn parse_create_materialized_view(
     // Collect remaining tokens and split at EMIT boundary (same strategy as continuous query)
     let remaining = collect_remaining_tokens(parser);
     let (query_tokens, emit_tokens) = split_at_emit(&remaining);
-    reject_removed_temporal_probe_join(&query_tokens)?;
-
-    let query_sql = query_body_sql(original_sql, &query_tokens, &emit_tokens, None);
+    let raw_query_sql = query_body_sql(original_sql, &query_tokens, &emit_tokens, None);
 
     let mv_dialect = LaminarDialect::default();
 
-    let query = if query_tokens.is_empty() {
+    let query_stmt = if query_tokens.is_empty() {
         return Err(ParseError::StreamingError(
             "Expected SELECT query after AS".to_string(),
         ));
+    } else if let Some(parsed) = join_parser::parse_temporal_probe_query(&query_tokens)? {
+        StreamingStatement::TemporalProbeQuery {
+            statement: Box::new(parsed.statement),
+            analysis: Box::new(parsed.analysis),
+        }
     } else {
         let mut query_parser =
             sqlparser::parser::Parser::new(&mv_dialect).with_tokens_with_locations(query_tokens);
-        query_parser
+        let query = query_parser
             .parse_query()
-            .map_err(ParseError::SqlParseError)?
+            .map_err(ParseError::SqlParseError)?;
+        StreamingStatement::Standard(Box::new(sqlparser::ast::Statement::Query(query)))
     };
-
-    let query_stmt =
-        StreamingStatement::Standard(Box::new(sqlparser::ast::Statement::Query(query)));
+    let query_sql = match &query_stmt {
+        StreamingStatement::TemporalProbeQuery { statement, .. } => statement.to_string(),
+        _ => raw_query_sql,
+    };
 
     let emit_clause = if emit_tokens.is_empty() {
         None
@@ -982,38 +1000,6 @@ fn collect_remaining_tokens(
         tokens.push(token);
     }
     tokens
-}
-
-fn reject_removed_temporal_probe_join(
-    tokens: &[sqlparser::tokenizer::TokenWithSpan],
-) -> Result<(), ParseError> {
-    use sqlparser::tokenizer::Token;
-
-    let mut matched = 0;
-    for token in tokens
-        .iter()
-        .filter(|token| !matches!(token.token, Token::Whitespace(_) | Token::EOF))
-    {
-        let Token::Word(word) = &token.token else {
-            matched = 0;
-            continue;
-        };
-        let unquoted = word.quote_style.is_none();
-        matched = if matched == 0 && unquoted && word.value.eq_ignore_ascii_case("TEMPORAL") {
-            1
-        } else if matched == 1 && unquoted && word.value.eq_ignore_ascii_case("PROBE") {
-            2
-        } else if matched == 2 && unquoted && word.value.eq_ignore_ascii_case("JOIN") {
-            return Err(ParseError::StreamingError(
-                "TEMPORAL PROBE JOIN was removed; use a bounded INNER JOIN".to_string(),
-            ));
-        } else if unquoted && word.value.eq_ignore_ascii_case("TEMPORAL") {
-            1
-        } else {
-            0
-        };
-    }
-    Ok(())
 }
 
 /// Split tokens at the first standalone EMIT keyword (not inside parentheses).
@@ -1733,17 +1719,66 @@ mod tests {
     }
 
     #[test]
-    fn create_stream_rejects_removed_temporal_probe_join() {
+    fn create_stream_normalizes_temporal_probe_join() {
         let sql = "CREATE STREAM markouts_long AS \
                    SELECT t.s, p.offset_ms FROM trade_probe t \
                    TEMPORAL PROBE JOIN price_ref r \
                        ON (s) TIMESTAMPS (ts, ts) \
                        LIST (0s, 1s, 5s, 30s) AS p";
-        let error = parse_streaming_sql(sql).expect_err("removed syntax must fail closed");
-        assert!(
-            error.to_string().contains("bounded INNER JOIN"),
-            "got: {error}"
+        let StreamingStatement::CreateStream {
+            query, query_sql, ..
+        } = parse_one(sql)
+        else {
+            panic!("expected CreateStream");
+        };
+        let StreamingStatement::TemporalProbeQuery { analysis, .. } = *query else {
+            panic!("expected normalized temporal probe query");
+        };
+        assert_eq!(
+            analysis
+                .temporal_probe_schedule
+                .as_ref()
+                .unwrap()
+                .offsets_ms(),
+            [0, 1_000, 5_000, 30_000]
         );
+        assert_eq!(analysis.temporal_probe_alias.as_deref(), Some("p"));
+        assert!(query_sql.contains("FOR SYSTEM_TIME AS OF"), "{query_sql}");
+        assert!(!query_sql.contains("TEMPORAL PROBE"), "{query_sql}");
+    }
+
+    #[test]
+    fn temporal_probe_range_is_checked_and_expanded_once() {
+        let sql = "SELECT probe.offset_ms, probe.probe_time FROM trades t \
+                   TEMPORAL PROBE JOIN quotes q ON (symbol) \
+                   TIMESTAMPS (trade_time, quote_time) \
+                   RANGE FROM -5s TO 5s STEP 5s AS probe";
+        let statements = parse_streaming_sql(sql).unwrap();
+        let [StreamingStatement::TemporalProbeQuery { analysis, .. }] = statements.as_slice()
+        else {
+            panic!("expected temporal probe query");
+        };
+        assert_eq!(
+            analysis
+                .temporal_probe_schedule
+                .as_ref()
+                .unwrap()
+                .offsets_ms(),
+            [-5_000, 0, 5_000]
+        );
+
+        for invalid in [
+            "LIST (0s, 0s)",
+            "RANGE FROM 0s TO 256s STEP 1s",
+            "RANGE FROM 0s TO 10s STEP 3s",
+            "LIST (366d)",
+        ] {
+            let sql = format!(
+                "SELECT * FROM trades t TEMPORAL PROBE JOIN quotes q ON (symbol) \
+                 TIMESTAMPS (trade_time, quote_time) {invalid} AS probe"
+            );
+            assert!(parse_streaming_sql(&sql).is_err(), "accepted: {sql}");
+        }
     }
 
     #[test]

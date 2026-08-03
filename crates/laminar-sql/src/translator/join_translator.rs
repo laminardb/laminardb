@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use crate::parser::join_parser::{JoinAnalysis, JoinType, MultiJoinAnalysis};
+use crate::temporal::{TemporalJoinKind, TemporalProbeSchedule};
 
 /// Configuration for stream-stream join operator
 #[derive(Debug, Clone)]
@@ -53,22 +54,24 @@ pub enum LookupJoinType {
 /// Configuration for temporal join operator (FOR SYSTEM_TIME AS OF).
 #[derive(Debug, Clone)]
 pub struct TemporalJoinTranslatorConfig {
-    /// Stream (left) side table name
-    pub stream_table: String,
-    /// Table (right) side table name
-    pub table_name: String,
-    /// Stream side key column
-    pub stream_key_column: String,
-    /// Table side key column
-    pub table_key_column: String,
-    /// Stream-side column for lookup timestamp (from `FOR SYSTEM_TIME AS OF`)
-    pub stream_time_column: String,
-    /// Table-side version column. Empty string = auto-detect from table schema at registration.
-    pub table_version_column: String,
-    /// Temporal semantics: "event_time" or "process_time"
-    pub semantics: String,
-    /// Join type: "inner" or "left"
-    pub join_type: String,
+    /// Left input relation.
+    pub left_table: String,
+    /// Versioned right input relation.
+    pub right_table: String,
+    /// Left equality key.
+    pub left_key_column: String,
+    /// Right equality key.
+    pub right_key_column: String,
+    /// Left event-time column.
+    pub left_time_column: String,
+    /// Explicit right event-time/version column.
+    pub right_time_column: String,
+    /// INNER or LEFT output semantics.
+    pub join_kind: TemporalJoinKind,
+    /// One canonical target-time schedule.
+    pub probe_schedule: TemporalProbeSchedule,
+    /// Alias exposing multi-horizon `offset_ms` and `probe_time` columns.
+    pub probe_alias: Option<String>,
 }
 
 /// Union type for join operator configurations
@@ -146,12 +149,15 @@ impl std::fmt::Display for TemporalJoinTranslatorConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} TEMPORAL JOIN ON stream.{} = table.{} (AS OF: {}, {})",
-            self.join_type.to_uppercase(),
-            self.stream_key_column,
-            self.table_key_column,
-            self.stream_time_column,
-            self.semantics,
+            "{:?} TEMPORAL JOIN ON {}.{} = {}.{} ({} -> {}, probes: {})",
+            self.join_kind,
+            self.left_table,
+            self.left_key_column,
+            self.right_table,
+            self.right_key_column,
+            self.left_time_column,
+            self.right_time_column,
+            self.probe_schedule.len(),
         )
     }
 }
@@ -168,34 +174,50 @@ impl std::fmt::Display for JoinOperatorConfig {
 
 impl JoinOperatorConfig {
     /// Create from join analysis.
+    ///
+    /// # Errors
+    /// Returns an error when the analyzed join has no supported, complete runtime contract.
     pub fn from_analysis(analysis: &JoinAnalysis) -> Result<Self, String> {
-        if analysis.is_temporal_join {
+        if analysis.is_temporal_join() {
             if !analysis.additional_key_columns.is_empty() {
                 return Err(
                     "temporal joins support exactly one equality key; composite predicates are not implemented"
                         .to_string(),
                 );
             }
-            let join_type_str = match analysis.join_type {
-                JoinType::Inner => "inner",
-                JoinType::Left => "left",
+            let join_kind = match analysis.join_type {
+                JoinType::Inner => TemporalJoinKind::Inner,
+                JoinType::Left => TemporalJoinKind::Left,
                 unsupported => {
                     return Err(format!(
                         "temporal joins support only INNER or LEFT joins; {unsupported:?} is unsupported"
                     ));
                 }
             };
-            let stream_time_col = analysis.temporal_version_column.clone().unwrap_or_default();
-            // table_version_column left empty — resolved from table schema at registration.
+            let left_time_column = analysis.left_time_column.clone().ok_or_else(|| {
+                "temporal joins require an explicit left event-time column".to_string()
+            })?;
+            let right_time_column = analysis.right_time_column.clone().ok_or_else(|| {
+                "temporal joins require an explicit right event-time column from the source contract"
+                    .to_string()
+            })?;
+            let probe_schedule = analysis
+                .temporal_probe_schedule
+                .clone()
+                .ok_or_else(|| "temporal join probe schedule is missing".to_string())?;
+            if probe_schedule.is_multi_horizon() && analysis.temporal_probe_alias.is_none() {
+                return Err("multi-horizon temporal probes require an output alias".into());
+            }
             return Ok(JoinOperatorConfig::Temporal(TemporalJoinTranslatorConfig {
-                stream_table: analysis.left_table.clone(),
-                table_name: analysis.right_table.clone(),
-                stream_key_column: analysis.left_key_column.clone(),
-                table_key_column: analysis.right_key_column.clone(),
-                stream_time_column: stream_time_col,
-                table_version_column: String::new(),
-                semantics: "event_time".to_string(),
-                join_type: join_type_str.to_string(),
+                left_table: analysis.left_table.clone(),
+                right_table: analysis.right_table.clone(),
+                left_key_column: analysis.left_key_column.clone(),
+                right_key_column: analysis.right_key_column.clone(),
+                left_time_column,
+                right_time_column,
+                join_kind,
+                probe_schedule,
+                probe_alias: analysis.temporal_probe_alias.clone(),
             }));
         }
 
@@ -250,6 +272,9 @@ impl JoinOperatorConfig {
     }
 
     /// Create from a multi-join analysis, producing one config per join step.
+    ///
+    /// # Errors
+    /// Returns an error when any join step has no supported, complete runtime contract.
     pub fn from_multi_analysis(multi: &MultiJoinAnalysis) -> Result<Vec<Self>, String> {
         multi.joins.iter().map(Self::from_analysis).collect()
     }
@@ -278,7 +303,7 @@ impl JoinOperatorConfig {
         match self {
             JoinOperatorConfig::StreamStream(config) => &config.left_keys,
             JoinOperatorConfig::Lookup(config) => std::slice::from_ref(&config.stream_key),
-            JoinOperatorConfig::Temporal(config) => std::slice::from_ref(&config.stream_key_column),
+            JoinOperatorConfig::Temporal(config) => std::slice::from_ref(&config.left_key_column),
         }
     }
 
@@ -288,7 +313,7 @@ impl JoinOperatorConfig {
         match self {
             JoinOperatorConfig::StreamStream(config) => &config.right_keys,
             JoinOperatorConfig::Lookup(config) => std::slice::from_ref(&config.lookup_key),
-            JoinOperatorConfig::Temporal(config) => std::slice::from_ref(&config.table_key_column),
+            JoinOperatorConfig::Temporal(config) => std::slice::from_ref(&config.right_key_column),
         }
     }
 }
@@ -605,7 +630,7 @@ mod tests {
 
     #[test]
     fn test_from_analysis_temporal() {
-        let analysis = JoinAnalysis::temporal(
+        let mut analysis = JoinAnalysis::temporal(
             "orders".to_string(),
             "products".to_string(),
             "product_id".to_string(),
@@ -613,6 +638,7 @@ mod tests {
             "order_time".to_string(),
             JoinType::Inner,
         );
+        analysis.right_time_column = Some("version_time".into());
 
         let config = JoinOperatorConfig::from_analysis(&analysis).unwrap();
         assert!(config.is_temporal());
@@ -622,10 +648,10 @@ mod tests {
         assert_eq!(config.right_keys(), ["id"]);
 
         if let JoinOperatorConfig::Temporal(tc) = config {
-            assert!(tc.table_version_column.is_empty());
-            assert_eq!(tc.stream_time_column, "order_time");
-            assert_eq!(tc.semantics, "event_time");
-            assert_eq!(tc.join_type, "inner");
+            assert_eq!(tc.left_time_column, "order_time");
+            assert_eq!(tc.right_time_column, "version_time");
+            assert_eq!(tc.join_kind, TemporalJoinKind::Inner);
+            assert_eq!(tc.probe_schedule.offsets_ms(), [0]);
         } else {
             panic!("Expected Temporal config");
         }
@@ -633,7 +659,7 @@ mod tests {
 
     #[test]
     fn test_temporal_left_join() {
-        let analysis = JoinAnalysis::temporal(
+        let mut analysis = JoinAnalysis::temporal(
             "orders".to_string(),
             "products".to_string(),
             "product_id".to_string(),
@@ -641,10 +667,11 @@ mod tests {
             "order_time".to_string(),
             JoinType::Left,
         );
+        analysis.right_time_column = Some("version_time".into());
 
         let config = JoinOperatorConfig::from_analysis(&analysis).unwrap();
         if let JoinOperatorConfig::Temporal(tc) = config {
-            assert_eq!(tc.join_type, "left");
+            assert_eq!(tc.join_kind, TemporalJoinKind::Left);
         } else {
             panic!("Expected Temporal config");
         }
@@ -652,7 +679,7 @@ mod tests {
 
     #[test]
     fn test_display_temporal_join() {
-        let analysis = JoinAnalysis::temporal(
+        let mut analysis = JoinAnalysis::temporal(
             "orders".to_string(),
             "products".to_string(),
             "product_id".to_string(),
@@ -660,6 +687,7 @@ mod tests {
             "order_time".to_string(),
             JoinType::Inner,
         );
+        analysis.right_time_column = Some("version_time".into());
         let config = JoinOperatorConfig::from_analysis(&analysis).unwrap();
         let s = format!("{config}");
         assert!(s.contains("TEMPORAL JOIN"), "got: {s}");
@@ -708,7 +736,7 @@ mod tests {
                 .unwrap_err()
                 .contains("only INNER or LEFT"));
 
-            let temporal = JoinAnalysis::temporal(
+            let mut temporal = JoinAnalysis::temporal(
                 "orders".to_string(),
                 "customers".to_string(),
                 "customer_id".to_string(),
@@ -716,6 +744,7 @@ mod tests {
                 "order_time".to_string(),
                 join_type,
             );
+            temporal.right_time_column = Some("version_time".into());
             assert!(JoinOperatorConfig::from_analysis(&temporal)
                 .unwrap_err()
                 .contains("only INNER or LEFT"));

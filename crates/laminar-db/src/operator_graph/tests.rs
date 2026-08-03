@@ -1724,14 +1724,15 @@ fn test_remove_query() {
     let original_node = graph.output_map["q1"];
     graph.ensure_live_provider("q1", &test_schema());
     let temporal_config = TemporalJoinTranslatorConfig {
-        stream_table: "trades".to_string(),
-        table_name: "versions".to_string(),
-        stream_key_column: "symbol".to_string(),
-        table_key_column: "symbol".to_string(),
-        stream_time_column: "ts".to_string(),
-        table_version_column: "valid_from".to_string(),
-        semantics: "event_time".to_string(),
-        join_type: "inner".to_string(),
+        left_table: "trades".to_string(),
+        right_table: "versions".to_string(),
+        left_key_column: "symbol".to_string(),
+        right_key_column: "symbol".to_string(),
+        left_time_column: "ts".to_string(),
+        right_time_column: "valid_from".to_string(),
+        join_kind: laminar_sql::translator::TemporalJoinKind::Inner,
+        probe_schedule: laminar_sql::translator::TemporalProbeSchedule::as_of(),
+        probe_alias: None,
     };
     graph
         .temporal_configs

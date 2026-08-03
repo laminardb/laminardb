@@ -7,8 +7,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use sqlparser::ast::{ColumnDef, Expr, Ident, ObjectName};
+use sqlparser::ast::{ColumnDef, Expr, Ident, ObjectName, Statement};
 
+use super::join_parser::JoinAnalysis;
 use super::window_rewriter::WindowRewriter;
 use super::ParseError;
 
@@ -46,6 +47,14 @@ pub enum ShowCommand {
 pub enum StreamingStatement {
     /// Standard SQL statement
     Standard(Box<sqlparser::ast::Statement>),
+
+    /// A multi-horizon temporal probe normalized to the canonical AS-OF query shape.
+    TemporalProbeQuery {
+        /// Standard SQL AST used for projection and non-join analysis.
+        statement: Box<Statement>,
+        /// Explicit temporal join contract parsed from the probe clause.
+        analysis: Box<JoinAnalysis>,
+    },
 
     /// CREATE SOURCE statement
     CreateSource(Box<CreateSourceStatement>),

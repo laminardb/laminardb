@@ -541,13 +541,14 @@ fn reads_catalog(statement: &StreamingStatement) -> bool {
         statement,
         StreamingStatement::Standard(statement)
             if matches!(statement.as_ref(), sqlparser::ast::Statement::Query(_))
-    ) || matches!(
-        statement,
-        StreamingStatement::InsertInto { .. }
-            | StreamingStatement::Show(_)
-            | StreamingStatement::Describe { .. }
-            | StreamingStatement::Explain { .. }
-    )
+    ) || matches!(statement, StreamingStatement::TemporalProbeQuery { .. })
+        || matches!(
+            statement,
+            StreamingStatement::InsertInto { .. }
+                | StreamingStatement::Show(_)
+                | StreamingStatement::Describe { .. }
+                | StreamingStatement::Explain { .. }
+        )
 }
 
 #[cfg(feature = "cluster")]
@@ -3528,13 +3529,24 @@ impl LaminarDB {
                             .into(),
                     ))
                 } else if matches!(stmt.as_ref(), sqlparser::ast::Statement::Query(_)) {
-                    self.handle_query(sql).await
+                    if crate::sql_analysis::has_temporal_query(sql) {
+                        Err(DbError::Unsupported(
+                            "direct temporal queries require the managed vnode runtime; create a stream or materialized view after temporal runtime admission is enabled"
+                                .into(),
+                        ))
+                    } else {
+                        self.handle_query(sql).await
+                    }
                 } else {
                     Err(DbError::InvalidOperation(format!(
                         "unsupported standard SQL statement; catalog mutation is not typed or transactional: {stmt}"
                     )))
                 }
             }
+            StreamingStatement::TemporalProbeQuery { .. } => Err(DbError::Unsupported(
+                "TEMPORAL PROBE JOIN requires the managed vnode runtime and cannot execute as an ordinary SQL join"
+                    .into(),
+            )),
             StreamingStatement::InsertInto {
                 table_name,
                 columns,
@@ -4063,6 +4075,19 @@ impl LaminarDB {
                 }))
             }
             laminar_sql::planner::StreamingPlan::Query(query_plan) => {
+                if query_plan.join_config.as_ref().is_some_and(|joins| {
+                    joins.iter().any(|join| {
+                        matches!(
+                            join,
+                            laminar_sql::translator::JoinOperatorConfig::Temporal(_)
+                        )
+                    })
+                }) {
+                    return Err(DbError::Unsupported(
+                        "temporal queries require the managed vnode runtime and cannot execute through DataFusion's ordinary join path"
+                            .into(),
+                    ));
+                }
                 let plan_sql = query_plan.statement.to_string();
                 let logical_plan = self.ctx.state().create_logical_plan(&plan_sql).await?;
                 let df = self.ctx.execute_logical_plan(logical_plan).await?;

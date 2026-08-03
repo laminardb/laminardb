@@ -13,6 +13,7 @@ pub mod datafusion;
 pub mod error;
 pub mod parser;
 pub mod planner;
+pub mod temporal;
 pub mod translator;
 
 // Re-export key types
