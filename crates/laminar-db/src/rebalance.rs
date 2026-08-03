@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use laminar_connectors::connector::{SourceDrainOutcome, SourceDrainResolution};
-use laminar_core::checkpoint::{AssignmentDrainId, AssignmentDrainTransition};
+use laminar_core::checkpoint::{
+    AssignmentDrainId, AssignmentDrainTransition, CommittedCheckpointRef,
+};
 use laminar_core::cluster::control::{
     AssignmentDrainDecision, AssignmentDrainVerdict, AssignmentRecoveryDecision,
     AssignmentSnapshot, AssignmentSnapshotStore, CheckpointAssignmentAdoption,
@@ -1196,6 +1198,7 @@ fn finalized_drain_outcome(
 pub(crate) struct AuditedDrainOutcome {
     transition: AssignmentDrainTransition,
     outcome: SourceDrainOutcome,
+    handoff_checkpoint: Option<CommittedCheckpointRef>,
 }
 
 /// Durable authority proof for one materialized assignment target.
@@ -1206,6 +1209,7 @@ pub(crate) struct AuditedDrainOutcome {
 pub(crate) struct AuditedAssignmentAuthority {
     target_version: u64,
     predecessor: Option<CheckpointAssignmentFence>,
+    handoff_checkpoint: Option<CommittedCheckpointRef>,
     terminal: Option<AuditedDrainOutcome>,
 }
 
@@ -1214,22 +1218,30 @@ impl AuditedAssignmentAuthority {
         Self {
             target_version,
             predecessor: None,
+            handoff_checkpoint: None,
             terminal: None,
         }
     }
 
-    fn recovery(target_version: u64, predecessor: CheckpointAssignmentFence) -> Self {
+    fn recovery(
+        target_version: u64,
+        predecessor: CheckpointAssignmentFence,
+        handoff_checkpoint: CommittedCheckpointRef,
+    ) -> Self {
         Self {
             target_version,
             predecessor: Some(predecessor),
+            handoff_checkpoint: Some(handoff_checkpoint),
             terminal: None,
         }
     }
 
     fn drain(target_version: u64, terminal: AuditedDrainOutcome) -> Self {
+        let handoff_checkpoint = terminal.committed_handoff_checkpoint().cloned();
         Self {
             target_version,
             predecessor: Some(terminal.transition.predecessor.clone()),
+            handoff_checkpoint,
             terminal: Some(terminal),
         }
     }
@@ -1244,6 +1256,10 @@ impl AuditedAssignmentAuthority {
 
     pub(crate) fn predecessor(&self) -> Option<&CheckpointAssignmentFence> {
         self.predecessor.as_ref()
+    }
+
+    pub(crate) fn handoff_checkpoint(&self) -> Option<&CommittedCheckpointRef> {
+        self.handoff_checkpoint.as_ref()
     }
 
     pub(crate) fn into_terminal(self) -> Option<AuditedDrainOutcome> {
@@ -1292,6 +1308,15 @@ impl AuditedCommittedDrainTransition {
 }
 
 impl AuditedDrainOutcome {
+    #[must_use]
+    pub(crate) fn committed_handoff_checkpoint(&self) -> Option<&CommittedCheckpointRef> {
+        if self.outcome == SourceDrainOutcome::Commit {
+            self.handoff_checkpoint.as_ref()
+        } else {
+            None
+        }
+    }
+
     /// The exact transition whose target durably committed, if this was not an abort.
     #[must_use]
     pub(crate) fn into_committed_transition(self) -> Option<AuditedCommittedDrainTransition> {
@@ -1429,12 +1454,13 @@ pub(crate) async fn audit_assignment_snapshot_authority_outcome(
         .await
         .map_err(|error| error.to_string())?
     else {
-        let predecessor =
+        let (predecessor, handoff_checkpoint) =
             audit_materialized_recovery_with_authority(store, authority.as_deref(), snapshot)
                 .await?;
         return Ok(AuditedAssignmentAuthority::recovery(
             snapshot.version,
             predecessor,
+            handoff_checkpoint,
         ));
     };
     audit_materialized_drain_transition(store, authority.as_deref(), snapshot, transition)
@@ -1470,7 +1496,7 @@ async fn audit_materialized_recovery_with_authority(
     store: &AssignmentSnapshotStore,
     authority: Option<&LeaderLeaseStore>,
     snapshot: &AssignmentSnapshot,
-) -> Result<CheckpointAssignmentFence, String> {
+) -> Result<(CheckpointAssignmentFence, CommittedCheckpointRef), String> {
     let authority = authority.ok_or_else(|| {
         format!(
             "materialized assignment recovery {} has no cluster authority",
@@ -1527,7 +1553,7 @@ async fn audit_materialized_recovery_with_authority(
             snapshot.version
         ));
     }
-    Ok(decision.predecessor)
+    Ok((decision.predecessor, decision.recovery_checkpoint))
 }
 
 async fn audit_materialized_drain_transition(
@@ -1593,6 +1619,7 @@ async fn audit_materialized_drain_transition(
     Ok(AuditedDrainOutcome {
         transition,
         outcome: observed,
+        handoff_checkpoint: decision.handoff_checkpoint,
     })
 }
 
@@ -2334,6 +2361,38 @@ async fn authorize_recovery_successor(
         }
     }
 
+    let authority = controller
+        .checkpoint_authority()
+        .map_err(|error| error.to_string())?;
+    let pinned_checkpoint = tokio::time::timeout_at(
+        deadline,
+        authority.assignment_handoff_checkpoint(&predecessor),
+    )
+    .await
+    .map_err(|_| "recovery handoff lookup exceeded the fencing deadline".to_string())?
+    .map_err(|error| error.to_string())?;
+    let recovery_checkpoint = if let Some(reference) = pinned_checkpoint {
+        reference
+    } else {
+        let outcome =
+            tokio::time::timeout_at(deadline, authority.highest_cluster_committed_outcome())
+                .await
+                .map_err(|_| {
+                    "recovery checkpoint lookup exceeded the fencing deadline".to_string()
+                })?
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "assignment recovery requires a committed predecessor checkpoint".to_string()
+                })?;
+        if outcome.assignment_fence.as_ref() != Some(&predecessor) {
+            return Err(
+                "latest committed cluster checkpoint does not bind the recovery predecessor".into(),
+            );
+        }
+        outcome.committed_checkpoint.ok_or_else(|| {
+            "latest committed cluster checkpoint has no committed index reference".to_string()
+        })?
+    };
     let leader_proof = controller
         .capture_leader_proof()
         .ok_or_else(|| "assignment recovery lost the current durable leader proof".to_string())?;
@@ -2342,6 +2401,7 @@ async fn authorize_recovery_successor(
         target,
         proposal_ref,
         process_fences,
+        recovery_checkpoint,
         leader_proof.clone(),
     )?;
     let decision = match tokio::time::timeout_at(
@@ -2539,6 +2599,7 @@ fn execute_graceful_rotation_owned(
                         &drain,
                         &current,
                         AssignmentDrainVerdict::Abort,
+                        None,
                         config,
                     )
                     .await
@@ -2559,41 +2620,42 @@ fn execute_graceful_rotation_owned(
                 .await?;
                 // Abort the drain on failure OR timeout (not just Ok(false)) — a bare
                 // `?` here would leave nodes stuck draining.
-                let checkpointed = pre_rotation_checkpoint(&db, config).await;
-                if !matches!(checkpointed, Ok(true)) {
-                    let failure = checkpointed
-                        .err()
-                        .unwrap_or_else(|| "pre-rotation checkpoint failed during drain".into());
-                    if let Err(error) = audit_exact_drain_head(
-                        &store,
-                        &registry,
-                        &drain,
-                        &controller,
-                        tokio::time::Instant::now() + config.checkpoint_timeout,
-                    )
-                    .await
-                    {
-                        return Err(format!(
-                            "{failure}; drain is no longer authoritative: {error}"
-                        ));
-                    }
-                    if let Err(abort_error) = finalize_drain_snapshot(
-                        &db,
-                        &store,
-                        &controller,
-                        &drain,
-                        &current,
-                        AssignmentDrainVerdict::Abort,
-                        config,
-                    )
-                    .await
-                    {
-                        return Err(format!(
-                            "{failure}; assignment drain abort failed: {abort_error}"
-                        ));
-                    }
-                    return Err(failure);
-                }
+                let handoff_checkpoint =
+                    match pre_rotation_checkpoint(&db, &controller, &transition, config).await {
+                        Ok(reference) => reference,
+                        Err(failure) => {
+                            if let Err(error) = audit_exact_drain_head(
+                                &store,
+                                &registry,
+                                &drain,
+                                &controller,
+                                tokio::time::Instant::now() + config.checkpoint_timeout,
+                            )
+                            .await
+                            {
+                                return Err(format!(
+                                    "{failure}; drain is no longer authoritative: {error}"
+                                ));
+                            }
+                            if let Err(abort_error) = finalize_drain_snapshot(
+                                &db,
+                                &store,
+                                &controller,
+                                &drain,
+                                &current,
+                                AssignmentDrainVerdict::Abort,
+                                None,
+                                config,
+                            )
+                            .await
+                            {
+                                return Err(format!(
+                                    "{failure}; assignment drain abort failed: {abort_error}"
+                                ));
+                            }
+                            return Err(failure);
+                        }
+                    };
                 audit_exact_drain_head(
                     &store,
                     &registry,
@@ -2609,6 +2671,7 @@ fn execute_graceful_rotation_owned(
                     &drain,
                     &current,
                     AssignmentDrainVerdict::Commit,
+                    Some(handoff_checkpoint),
                     config,
                 )
                 .await;
@@ -2735,6 +2798,7 @@ fn try_rebalance_owned(
                 &current,
                 &prior,
                 AssignmentDrainVerdict::Abort,
+                None,
                 config,
             )
             .await;
@@ -3042,12 +3106,80 @@ fn retain_recovery_predecessors(
     Ok(())
 }
 
-/// Run the pre-rotation checkpoint with the configured timeout. `Ok(true)` on a
-/// successful seal, `Ok(false)` if the checkpoint ran but did not succeed.
+#[cfg(test)]
+pub(crate) async fn record_assignment_checkpoint_for_test(
+    authority: &LeaderLeaseStore,
+    authority_store: &Arc<dyn object_store::ObjectStore>,
+    fence: &CheckpointAssignmentFence,
+    proof: &laminar_core::checkpoint::LeaderProof,
+) -> CommittedCheckpointRef {
+    use laminar_core::checkpoint::{
+        CheckpointScope, CommittedCheckpointIndex, CommittedParticipantRef, PipelineIdentity,
+        COMMITTED_CHECKPOINT_INDEX_VERSION,
+    };
+    use laminar_core::checkpoint_decision::{CheckpointDecisionStore, CheckpointVerdict};
+
+    let epoch = authority
+        .highest_cluster_terminal_outcome()
+        .await
+        .unwrap()
+        .map_or(1, |outcome| outcome.epoch.checked_add(1).unwrap());
+    let predecessor = authority
+        .highest_cluster_committed_outcome()
+        .await
+        .unwrap()
+        .and_then(|outcome| outcome.committed_checkpoint);
+    let deployment_id = CheckpointDecisionStore::new(Arc::clone(authority_store))
+        .load_or_create_deployment_id()
+        .await
+        .unwrap();
+    let index = CommittedCheckpointIndex {
+        version: COMMITTED_CHECKPOINT_INDEX_VERSION,
+        deployment_id,
+        pipeline_identity: PipelineIdentity::empty(),
+        epoch,
+        checkpoint_id: epoch,
+        scope: CheckpointScope::Cluster,
+        vnode_count: u16::try_from(fence.vnode_count).unwrap(),
+        assignment_fence: Some(fence.clone()),
+        predecessor,
+        participants: fence
+            .participants
+            .iter()
+            .map(|participant| CommittedParticipantRef {
+                participant_id: participant.node_id,
+                manifest_len: 1,
+                manifest_sha256: "0".repeat(64),
+                node_data_len: 0,
+                node_data_sha256: "1".repeat(64),
+            })
+            .collect(),
+        source_offsets: Default::default(),
+        channel_progress: Vec::new(),
+        checkpoint_watermark: None,
+    };
+    let reference = authority.create_committed_checkpoint(&index).await.unwrap();
+    authority
+        .record_cluster_outcome(
+            proof,
+            epoch,
+            epoch,
+            fence.clone(),
+            CheckpointVerdict::Commit,
+            Some(reference.clone()),
+        )
+        .await
+        .unwrap();
+    reference
+}
+
+/// Seal and resolve the exact predecessor-fenced checkpoint used for state handoff.
 async fn pre_rotation_checkpoint(
     db: &Arc<LaminarDB>,
+    controller: &ClusterController,
+    transition: &AssignmentDrainTransition,
     config: RebalanceConfig,
-) -> Result<bool, String> {
+) -> Result<CommittedCheckpointRef, String> {
     let ckpt = tokio::time::timeout(config.checkpoint_timeout, db.checkpoint())
         .await
         .map_err(|_| {
@@ -3057,7 +3189,38 @@ async fn pre_rotation_checkpoint(
             )
         })?
         .map_err(|e| e.to_string())?;
-    Ok(ckpt.success)
+    if !ckpt.success {
+        return Err(ckpt
+            .error
+            .unwrap_or_else(|| "pre-rotation checkpoint did not commit".into()));
+    }
+    if let Some(error) = ckpt.continuation_error() {
+        return Err(format!(
+            "pre-rotation checkpoint committed but cannot continue safely: {error}"
+        ));
+    }
+
+    let authority = controller
+        .checkpoint_authority()
+        .map_err(|error| error.to_string())?;
+    let outcome = tokio::time::timeout(
+        config.checkpoint_timeout,
+        authority.cluster_outcome(ckpt.epoch),
+    )
+    .await
+    .map_err(|_| "pre-rotation checkpoint authority read timed out".to_string())?
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "pre-rotation checkpoint disappeared from cluster authority".to_string())?;
+    if !outcome.is_commit()
+        || outcome.epoch != ckpt.epoch
+        || outcome.checkpoint_id != ckpt.checkpoint_id
+        || outcome.assignment_fence.as_ref() != Some(&transition.predecessor)
+    {
+        return Err("pre-rotation checkpoint authority does not bind the predecessor cut".into());
+    }
+    outcome
+        .committed_checkpoint
+        .ok_or_else(|| "pre-rotation Commit has no checkpoint reference".to_string())
 }
 
 /// Wait until every exact process in the draining assignment certificate has durably proved it
@@ -3114,6 +3277,7 @@ async fn finalize_drain_snapshot(
     draining: &AssignmentSnapshot,
     predecessor: &AssignmentSnapshot,
     requested_verdict: AssignmentDrainVerdict,
+    handoff_checkpoint: Option<CommittedCheckpointRef>,
     config: RebalanceConfig,
 ) -> Result<Option<u64>, String> {
     let transition = draining
@@ -3130,9 +3294,15 @@ async fn finalize_drain_snapshot(
     let deciding_proof = controller
         .capture_leader_proof()
         .ok_or_else(|| "drain finalization requires a current leader proof".to_string())?;
-    let requested =
-        AssignmentDrainDecision::new(transition, deciding_proof.clone(), requested_verdict)
-            .map_err(|error| error.clone())?;
+    let requested = match (requested_verdict, handoff_checkpoint) {
+        (AssignmentDrainVerdict::Commit, Some(reference)) => {
+            AssignmentDrainDecision::commit(transition, deciding_proof.clone(), reference)
+        }
+        (AssignmentDrainVerdict::Abort, None) => {
+            AssignmentDrainDecision::abort(transition, deciding_proof.clone())
+        }
+        _ => Err("drain finalization has an invalid handoff checkpoint".into()),
+    }?;
     let authority = controller
         .checkpoint_authority()
         .map_err(|error| error.to_string())?;
@@ -3276,6 +3446,7 @@ pub(crate) async fn settle_source_drain_before_recovery(
         &draining,
         &predecessor,
         AssignmentDrainVerdict::Abort,
+        None,
         config,
     )
     .await

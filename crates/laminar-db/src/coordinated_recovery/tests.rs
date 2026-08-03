@@ -1,9 +1,9 @@
 use super::*;
 use laminar_core::checkpoint::{CheckpointAssignmentFence, LeaderProof, LeaderProofOwner};
 use laminar_core::cluster::control::{
-    AssignmentDrainDecision, AssignmentDrainVerdict, AssignmentSnapshot, AssignmentSnapshotStore,
-    CheckpointParticipant, ClusterKv, InMemoryKv, LeaderLeaseOwner, LeaderLeaseStore,
-    LeaseDeadline, LeaseOutcome, ProcessLeaseAuthority, ProcessLeaseOutcome,
+    AssignmentDrainDecision, AssignmentSnapshot, AssignmentSnapshotStore, CheckpointParticipant,
+    ClusterKv, InMemoryKv, LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline, LeaseOutcome,
+    ProcessLeaseAuthority, ProcessLeaseOutcome,
 };
 use laminar_core::cluster::discovery::{NodeInfo, NodeMetadata, NodeState};
 use tokio::sync::watch;
@@ -988,7 +988,10 @@ async fn coordinated_restart_requires_a_committed_assignment_head() {
 async fn recovery_assignment_admission_requires_the_exact_committed_head() {
     use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
 
-    let (controller, _members_tx, kv) = controller(vec![info(2)]).await;
+    let authority_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let (controller, _members_tx, kv) =
+        controller_on(vec![info(2)], Arc::clone(&authority_store)).await;
     let controller = Arc::new(controller);
     report_test_fault(&controller).await;
     let round = round_for_current_faults_at_assignment(&controller, 7, 1, &[1, 2]).await;
@@ -1101,12 +1104,17 @@ async fn recovery_assignment_admission_requires_the_exact_committed_head() {
 
     let newer = draining.committed_target().unwrap();
     let transition = draining.drain_transition.as_ref().unwrap();
-    let decision = AssignmentDrainDecision::new(
-        transition,
-        transition.leader.clone(),
-        AssignmentDrainVerdict::Commit,
+    let authority = controller.checkpoint_authority().unwrap();
+    let handoff_checkpoint = crate::rebalance::record_assignment_checkpoint_for_test(
+        &authority,
+        &authority_store,
+        &transition.predecessor,
+        &transition.leader,
     )
-    .unwrap();
+    .await;
+    let decision =
+        AssignmentDrainDecision::commit(transition, transition.leader.clone(), handoff_checkpoint)
+            .unwrap();
     controller
         .checkpoint_authority()
         .unwrap()
@@ -1324,12 +1332,17 @@ async fn rejected_committed_release_does_not_starve_a_successor_prepare() {
         laminar_core::cluster::control::RotateOutcome::Rotated
     ));
     let transition = draining.drain_transition.as_ref().unwrap();
-    let decision = AssignmentDrainDecision::new(
-        transition,
-        transition.leader.clone(),
-        AssignmentDrainVerdict::Commit,
+    let authority = controller.checkpoint_authority().unwrap();
+    let handoff_checkpoint = crate::rebalance::record_assignment_checkpoint_for_test(
+        &authority,
+        &backing,
+        &transition.predecessor,
+        &transition.leader,
     )
-    .unwrap();
+    .await;
+    let decision =
+        AssignmentDrainDecision::commit(transition, transition.leader.clone(), handoff_checkpoint)
+            .unwrap();
     controller
         .checkpoint_authority()
         .unwrap()

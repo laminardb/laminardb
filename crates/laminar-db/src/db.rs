@@ -2320,6 +2320,7 @@ impl LaminarDB {
             ))
         })?;
         let audited_predecessor = audited_target.predecessor().cloned();
+        let committed_handoff_checkpoint = audited_target.handoff_checkpoint().cloned();
         let audited_drain = audited_target.into_terminal();
         let self_id = laminar_core::state::NodeId(controller.instance_id().0);
         let observed_assignment = registry.versioned_snapshot();
@@ -2512,16 +2513,22 @@ impl LaminarDB {
             })
             .collect();
         // Startup installs the exact committed assignment before the lifecycle restores its
-        // complete graph. A live graph, however, must not acquire even one vnode until direct v7
-        // committed-frame transfer is available. Reject before publishing ownership and never
-        // reinterpret a missing frame as empty state.
+        // complete graph. A live graph, however, must not acquire even one vnode until committed
+        // range and replay/frontier state can be installed together. Reject before publishing
+        // ownership and never reinterpret a missing frame as empty state.
         let startup_restore_deferred = observed_version == 0
             && DbState::load(&self.state) != DbState::Running
             && predecessor_snapshot.is_none();
         if !vnodes_requiring_restore.is_empty() && !startup_restore_deferred {
+            let handoff = committed_handoff_checkpoint.as_ref().ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6050] assignment {} has no exact committed checkpoint authority for vnode acquisition",
+                    snapshot.version
+                ))
+            })?;
             return Err(DbError::Checkpoint(format!(
-                "[LDB-6050] v7 committed-frame vnode reassignment is not implemented; refusing assignment {} before acquiring vnodes {:?}",
-                snapshot.version, vnodes_requiring_restore
+                "[LDB-6050] committed-frame vnode reassignment from checkpoint {} is not implemented; refusing assignment {} before acquiring vnodes {:?}",
+                handoff.checkpoint_id, snapshot.version, vnodes_requiring_restore
             )));
         }
 

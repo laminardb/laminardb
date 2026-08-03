@@ -44,7 +44,7 @@ const LEASE_PREFIX: &str = "control/leader-lease/";
 const AUTHORITY_HEAD_PATH: &str = "control/leader-lease-head/v1.json";
 const STORE_CONTRACT_PROBE_PREFIX: &str = "control/object-store-contract-probes/v1/";
 const RECOVERY_RELEASE_TERMINAL_PREFIX: &str = "control/recovery-release-terminals/v2/";
-const AUTHORITY_RECORD_VERSION: u32 = 10;
+const AUTHORITY_RECORD_VERSION: u32 = 11;
 const AUTHORITY_HEAD_VERSION: u32 = 1;
 const MAX_AUTHORITY_RECORD_BYTES: u64 = 256 * 1024;
 const MAX_AUTHORITY_HEAD_BYTES: u64 = 128;
@@ -569,28 +569,49 @@ pub struct AssignmentDrainDecision {
     pub leader_proof: LeaderProof,
     /// Whether to install the certified target or restore the predecessor map.
     pub verdict: AssignmentDrainVerdict,
+    /// Exact predecessor-fenced checkpoint used to hand moved vnodes to the target assignment.
+    /// Present if and only if the drain commits.
+    pub handoff_checkpoint: Option<CommittedCheckpointRef>,
 }
 
 impl AssignmentDrainDecision {
-    /// Construct a decision for an exact canonical transition.
+    /// Commit an exact canonical transition against its state handoff cut.
     ///
     /// # Errors
-    /// Rejects a malformed transition.
-    pub fn new(
+    /// Rejects malformed authority or checkpoint references.
+    pub fn commit(
         transition: &AssignmentDrainTransition,
         leader_proof: LeaderProof,
-        verdict: AssignmentDrainVerdict,
+        handoff_checkpoint: CommittedCheckpointRef,
     ) -> Result<Self, String> {
-        if !transition.is_canonical()
-            || !leader_proof.is_canonical()
-            || (verdict == AssignmentDrainVerdict::Commit && leader_proof != transition.leader)
-        {
+        handoff_checkpoint.validate()?;
+        if !transition.is_canonical() || leader_proof != transition.leader {
             return Err("assignment drain decision requires a canonical transition".into());
         }
         Ok(Self {
             transition: transition.clone(),
             leader_proof,
-            verdict,
+            verdict: AssignmentDrainVerdict::Commit,
+            handoff_checkpoint: Some(handoff_checkpoint),
+        })
+    }
+
+    /// Abort an exact canonical transition under the deciding leader term.
+    ///
+    /// # Errors
+    /// Rejects malformed transition or leader authority.
+    pub fn abort(
+        transition: &AssignmentDrainTransition,
+        leader_proof: LeaderProof,
+    ) -> Result<Self, String> {
+        if !transition.is_canonical() || !leader_proof.is_canonical() {
+            return Err("assignment drain decision requires a canonical transition".into());
+        }
+        Ok(Self {
+            transition: transition.clone(),
+            leader_proof,
+            verdict: AssignmentDrainVerdict::Abort,
+            handoff_checkpoint: None,
         })
     }
 
@@ -615,6 +636,17 @@ impl AssignmentDrainDecision {
             return Err(LeaseError::Invalid(
                 "assignment drain decision is not canonical".into(),
             ));
+        }
+        match (self.verdict, self.handoff_checkpoint.as_ref()) {
+            (AssignmentDrainVerdict::Commit, Some(reference)) => {
+                reference.validate().map_err(LeaseError::Invalid)?;
+            }
+            (AssignmentDrainVerdict::Abort, None) => {}
+            _ => {
+                return Err(LeaseError::Invalid(
+                    "assignment drain decision has an invalid handoff checkpoint".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -656,6 +688,8 @@ pub struct AssignmentRecoveryDecision {
     pub proposal: AssignmentSnapshotRef,
     /// Exact process-lease takeover proofs for every predecessor process absent from `target`.
     pub removed_process_fences: Vec<ProcessLeaseFence>,
+    /// Exact committed state cut installed by this recovery.
+    pub recovery_checkpoint: CommittedCheckpointRef,
     /// Durable leader term that authorized this recovery.
     pub leader_proof: LeaderProof,
 }
@@ -670,6 +704,7 @@ impl AssignmentRecoveryDecision {
         target: CheckpointAssignmentFence,
         proposal: AssignmentSnapshotRef,
         removed_process_fences: Vec<ProcessLeaseFence>,
+        recovery_checkpoint: CommittedCheckpointRef,
         leader_proof: LeaderProof,
     ) -> Result<Self, String> {
         let decision = Self {
@@ -677,6 +712,7 @@ impl AssignmentRecoveryDecision {
             target,
             proposal,
             removed_process_fences,
+            recovery_checkpoint,
             leader_proof,
         };
         decision.validate().map_err(|error| error.to_string())?;
@@ -698,6 +734,7 @@ impl AssignmentRecoveryDecision {
                 != Some(self.target.assignment_version)
             || self.proposal.validate().is_err()
             || self.proposal.version != self.target.assignment_version
+            || self.recovery_checkpoint.validate().is_err()
         {
             return Err(LeaseError::Invalid(
                 "assignment recovery decision is not a canonical successor".into(),
@@ -905,6 +942,24 @@ struct AuthorityAssignmentDecisionFloor {
     terminal_anchor_link: Option<AssignmentDecisionLink>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssignmentHandoffPin {
+    target: CheckpointAssignmentFence,
+    checkpoint: CommittedCheckpointRef,
+}
+
+impl AssignmentHandoffPin {
+    fn validate(&self) -> Result<(), LeaseError> {
+        if !self.target.is_canonical() {
+            return Err(LeaseError::Invalid(
+                "assignment handoff pin has an invalid target fence".into(),
+            ));
+        }
+        self.checkpoint.validate().map_err(LeaseError::Invalid)
+    }
+}
+
 /// One immutable entry in the cluster's shared leadership and checkpoint-decision sequence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -933,6 +988,8 @@ struct LeaderAuthorityRecord {
     assignment_decision_head: Option<AssignmentDecisionLink>,
     /// Monotonic assignment-decision retention boundary and its continuity anchor.
     assignment_decision_floor: Option<AuthorityAssignmentDecisionFloor>,
+    /// State handoff cut retained until a complete checkpoint commits under its target fence.
+    assignment_handoff_pin: Option<AssignmentHandoffPin>,
     /// Authority sequence that admitted the current recovery-fault slot state.
     recovery_fault_revision: u64,
     /// One active or tombstoned request identity per stable node.
@@ -1136,6 +1193,7 @@ impl LeaderAuthorityRecord {
             previous_assignment_decision: None,
             assignment_decision_head: None,
             assignment_decision_floor: None,
+            assignment_handoff_pin: None,
             recovery_fault_revision: 0,
             recovery_fault_slots: Vec::new(),
             recovery_release_commit: None,
@@ -1158,6 +1216,7 @@ impl LeaderAuthorityRecord {
             previous_assignment_decision: None,
             assignment_decision_head: self.assignment_decision_head,
             assignment_decision_floor: self.assignment_decision_floor.clone(),
+            assignment_handoff_pin: self.assignment_handoff_pin.clone(),
             recovery_fault_revision: self.recovery_fault_revision,
             recovery_fault_slots: self.recovery_fault_slots.clone(),
             recovery_release_commit: None,
@@ -1196,6 +1255,7 @@ impl LeaderAuthorityRecord {
         self.validate_artifact_cleanup()?;
         self.validate_assignment_decision_chain()?;
         self.validate_assignment_decision_floor()?;
+        self.validate_assignment_handoff_pin()?;
         self.validate_recovery_release()?;
         Ok(())
     }
@@ -1520,6 +1580,29 @@ impl LeaderAuthorityRecord {
                         .into(),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    fn validate_assignment_handoff_pin(&self) -> Result<(), LeaseError> {
+        let Some(pin) = self.assignment_handoff_pin.as_ref() else {
+            return Ok(());
+        };
+        pin.validate()?;
+        if self.commit_head.is_none_or(|head| {
+            head.epoch != pin.checkpoint.epoch || head.checkpoint_id != pin.checkpoint.checkpoint_id
+        }) || self
+            .outcome_floor
+            .as_ref()
+            .is_some_and(|floor| floor.artifact_before_epoch > pin.checkpoint.epoch)
+            || self
+                .artifact_cleanup
+                .as_ref()
+                .is_some_and(|cursor| cursor.protected.epoch > pin.checkpoint.epoch)
+        {
+            return Err(LeaseError::Invalid(
+                "assignment handoff pin is outside its live checkpoint retention range".into(),
+            ));
         }
         Ok(())
     }
@@ -4098,6 +4181,17 @@ impl LeaderLeaseStore {
                     .into());
                 }
             }
+            if candidate.is_commit()
+                && current
+                    .assignment_handoff_pin
+                    .as_ref()
+                    .is_some_and(|pin| candidate.assignment_fence.as_ref() != Some(&pin.target))
+            {
+                return Err(DecisionError::Conflict(
+                    "cluster Commit does not bind the active assignment handoff target".into(),
+                )
+                .into());
+            }
             let (commit_index, expected_predecessor) = if candidate.is_commit() {
                 let index = committed_index.as_ref().ok_or_else(|| {
                     DecisionError::Conflict(
@@ -4177,6 +4271,13 @@ impl LeaderLeaseStore {
             if candidate.is_commit() {
                 next.previous_commit = current.commit_head;
                 next.commit_head = Some(new_link);
+                if next
+                    .assignment_handoff_pin
+                    .as_ref()
+                    .is_some_and(|pin| candidate.assignment_fence.as_ref() == Some(&pin.target))
+                {
+                    next.assignment_handoff_pin = None;
+                }
             }
             next.validate()?;
             match self
@@ -4286,6 +4387,179 @@ impl LeaderLeaseStore {
         Ok(())
     }
 
+    async fn current_assignment_checkpoint(
+        &self,
+        current: &LeaderAuthorityRecord,
+        predecessor: &CheckpointAssignmentFence,
+        purpose: &str,
+    ) -> Result<Option<CommittedCheckpointRef>, ClusterCheckpointAuthorityError> {
+        let Some(commit_head) = current.commit_head else {
+            return Ok(None);
+        };
+        let outcome = self
+            .cluster_outcome_from_snapshot(current, commit_head.epoch)
+            .await?
+            .ok_or_else(|| {
+                DecisionError::Conflict(format!(
+                    "{purpose} checkpoint {} is not live",
+                    commit_head.checkpoint_id
+                ))
+            })?;
+        if !outcome.is_commit()
+            || outcome.checkpoint_id != commit_head.checkpoint_id
+            || outcome.assignment_fence.as_ref() != Some(predecessor)
+        {
+            return Err(DecisionError::Conflict(format!(
+                "{purpose} checkpoint {} does not bind its predecessor fence",
+                commit_head.checkpoint_id
+            ))
+            .into());
+        }
+        let reference = outcome.committed_checkpoint.as_ref().ok_or_else(|| {
+            DecisionError::Conflict(format!(
+                "{purpose} checkpoint {} has no committed index reference",
+                commit_head.checkpoint_id
+            ))
+        })?;
+        let index = CheckpointDecisionStore::new(Arc::clone(&self.store))
+            .validate_committed_checkpoint_for_outcome(&outcome)
+            .await?;
+        if index.assignment_fence.as_ref() != Some(predecessor) {
+            return Err(DecisionError::Conflict(format!(
+                "{purpose} checkpoint index {} does not bind its predecessor fence",
+                commit_head.checkpoint_id
+            ))
+            .into());
+        }
+        Ok(Some(reference.clone()))
+    }
+
+    async fn validate_current_assignment_checkpoint(
+        &self,
+        current: &LeaderAuthorityRecord,
+        reference: &CommittedCheckpointRef,
+        predecessor: &CheckpointAssignmentFence,
+        purpose: &str,
+    ) -> Result<(), ClusterCheckpointAuthorityError> {
+        let current_reference = self
+            .current_assignment_checkpoint(current, predecessor, purpose)
+            .await?
+            .ok_or_else(|| {
+                DecisionError::Conflict(format!("{purpose} has no authoritative checkpoint Commit"))
+            })?;
+        if current_reference != *reference {
+            return Err(DecisionError::Conflict(format!(
+                "{purpose} checkpoint {} is not the current Commit head {}",
+                reference.checkpoint_id, current_reference.checkpoint_id
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    fn aborted_handoff_target(
+        transition: &AssignmentDrainTransition,
+    ) -> Result<CheckpointAssignmentFence, ClusterCheckpointAuthorityError> {
+        let mut target = transition.predecessor.clone();
+        target.assignment_version = transition.target.assignment_version;
+        if !target.is_canonical() {
+            return Err(LeaseError::Invalid(
+                "assignment drain abort produced an invalid handoff target".into(),
+            )
+            .into());
+        }
+        Ok(target)
+    }
+
+    async fn next_assignment_handoff_pin(
+        &self,
+        current: &LeaderAuthorityRecord,
+        decision: &AuthorityAssignmentDecision,
+    ) -> Result<Option<AssignmentHandoffPin>, ClusterCheckpointAuthorityError> {
+        match decision {
+            AuthorityAssignmentDecision::Drain(drain) => match drain.verdict {
+                AssignmentDrainVerdict::Commit => {
+                    if current.assignment_handoff_pin.is_some() {
+                        return Err(DecisionError::Conflict(
+                            "assignment decision cannot overtake an unresolved state handoff"
+                                .into(),
+                        )
+                        .into());
+                    }
+                    let reference = drain.handoff_checkpoint.as_ref().ok_or_else(|| {
+                        LeaseError::Invalid(
+                            "committed assignment drain has no handoff checkpoint".into(),
+                        )
+                    })?;
+                    self.validate_current_assignment_checkpoint(
+                        current,
+                        reference,
+                        &drain.transition.predecessor,
+                        "assignment drain handoff",
+                    )
+                    .await?;
+                    Ok(Some(AssignmentHandoffPin {
+                        target: drain.transition.target.clone(),
+                        checkpoint: reference.clone(),
+                    }))
+                }
+                AssignmentDrainVerdict::Abort => match current.assignment_handoff_pin.as_ref() {
+                    None => {
+                        let checkpoint = self
+                            .current_assignment_checkpoint(
+                                current,
+                                &drain.transition.predecessor,
+                                "assignment drain abort",
+                            )
+                            .await?;
+                        match checkpoint {
+                            Some(checkpoint) => Ok(Some(AssignmentHandoffPin {
+                                target: Self::aborted_handoff_target(&drain.transition)?,
+                                checkpoint,
+                            })),
+                            None => Ok(None),
+                        }
+                    }
+                    Some(pin) if pin.target == drain.transition.predecessor => {
+                        Ok(Some(AssignmentHandoffPin {
+                            target: Self::aborted_handoff_target(&drain.transition)?,
+                            checkpoint: pin.checkpoint.clone(),
+                        }))
+                    }
+                    Some(_) => Err(DecisionError::Conflict(
+                        "assignment decision cannot overtake an unresolved state handoff".into(),
+                    )
+                    .into()),
+                },
+            },
+            AuthorityAssignmentDecision::Recovery(recovery) => {
+                if let Some(pin) = current.assignment_handoff_pin.as_ref() {
+                    if pin.target != recovery.predecessor
+                        || pin.checkpoint != recovery.recovery_checkpoint
+                    {
+                        return Err(DecisionError::Conflict(
+                            "assignment recovery does not continue the exact unresolved state handoff"
+                                .into(),
+                        )
+                        .into());
+                    }
+                } else {
+                    self.validate_current_assignment_checkpoint(
+                        current,
+                        &recovery.recovery_checkpoint,
+                        &recovery.predecessor,
+                        "assignment recovery",
+                    )
+                    .await?;
+                }
+                Ok(Some(AssignmentHandoffPin {
+                    target: recovery.target.clone(),
+                    checkpoint: recovery.recovery_checkpoint.clone(),
+                }))
+            }
+        }
+    }
+
     async fn record_assignment_decision(
         &self,
         proof: &LeaderProof,
@@ -4343,6 +4617,8 @@ impl LeaderLeaseStore {
             if let AuthorityAssignmentDecision::Recovery(recovery) = &decision {
                 self.validate_assignment_recovery_snapshot(recovery).await?;
             }
+            let assignment_handoff_pin =
+                self.next_assignment_handoff_pin(current, &decision).await?;
 
             let base_sequence = current.lease.seq;
             let sequence = base_sequence
@@ -4362,6 +4638,7 @@ impl LeaderLeaseStore {
                 sequence,
                 target_version: decision.target_version(),
             });
+            candidate.assignment_handoff_pin = assignment_handoff_pin;
             candidate.validate()?;
 
             match self
@@ -4591,6 +4868,27 @@ impl LeaderLeaseStore {
             .into()),
             None => Ok(None),
         }
+    }
+
+    /// Read the state handoff checkpoint pinned for one exact target assignment.
+    ///
+    /// # Errors
+    /// Fails when `target` is invalid or the durable authority head is unavailable.
+    pub async fn assignment_handoff_checkpoint(
+        &self,
+        target: &CheckpointAssignmentFence,
+    ) -> Result<Option<CommittedCheckpointRef>, ClusterCheckpointAuthorityError> {
+        if !target.is_canonical() {
+            return Err(LeaseError::Invalid(
+                "assignment handoff checkpoint lookup requires a canonical target fence".into(),
+            )
+            .into());
+        }
+        Ok(self.load_record().await?.and_then(|head| {
+            head.assignment_handoff_pin
+                .filter(|pin| pin.target == *target)
+                .map(|pin| pin.checkpoint)
+        }))
     }
 
     /// Materialize the immutable authority winner for one recovery target version.
@@ -5205,6 +5503,12 @@ impl LeaderLeaseStore {
                     active.protected.checkpoint_id
                 ))
                 .into());
+            }
+            if current.assignment_handoff_pin.as_ref().is_some_and(|pin| {
+                protected.epoch > pin.checkpoint.epoch
+                    && protected.checkpoint_id > pin.checkpoint.checkpoint_id
+            }) {
+                return Ok(None);
             }
             if current
                 .outcome_floor

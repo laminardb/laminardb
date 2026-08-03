@@ -119,7 +119,7 @@ impl PendingVnodeTransition {
         let acquired = sorted_difference(&target_owned, &predecessor_owned);
         if !acquired.is_empty() {
             return Err(transition_error(format!(
-                "v7 committed-frame vnode reassignment is not implemented; refusing to acquire vnodes {acquired:?} before assignment publication"
+                "committed-frame vnode reassignment is not implemented; refusing to acquire vnodes {acquired:?} before assignment publication"
             )));
         }
         let revoked_vnodes = sorted_difference(&predecessor_owned, &target_owned);
@@ -303,7 +303,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("v7 committed-frame vnode reassignment is not implemented"),
+                .contains("committed-frame vnode reassignment is not implemented"),
             "{error}"
         );
     }

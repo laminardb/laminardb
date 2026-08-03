@@ -37,7 +37,9 @@ machinery. State exceeding configured memory/work limits fails explicitly.
 Embedded and single-node runtimes own every vnode. Cluster nodes own the vnodes in the current
 assignment fence. Exact committed-assignment recovery completes before graph launch. Live
 reassignment currently supports exact-fenced revoke-only changes; a change that would acquire a
-vnode fails before assignment publication until v7 range transfer is completed.
+vnode fails before assignment publication until its committed range state and replay/frontier
+state can be installed atomically. Drain and failure-recovery decisions bind and retain their exact
+state cut until the target assignment completes a checkpoint.
 
 The detailed implemented boundary and remaining SQL gaps are in
 [Distributed state](DISTRIBUTED_STATE.md). The accepted design and research basis are in

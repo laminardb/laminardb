@@ -504,6 +504,12 @@ async fn recovery_authority_rejects_a_structural_but_undurable_process_fence() {
             encoded_len: 1,
         },
         vec![forged],
+        crate::checkpoint::CommittedCheckpointRef {
+            epoch: 1,
+            checkpoint_id: 1,
+            sha256: "0".repeat(64),
+            len: 1,
+        },
         lease.proof(),
     )
     .unwrap();

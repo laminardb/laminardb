@@ -2312,11 +2312,21 @@ async fn recovery_authority_cannot_revoke_the_final_local_vnode() {
         )
         .await
         .unwrap();
+    let predecessor_fence = current.assignment_fence().unwrap();
+    let authority = controller.checkpoint_authority().unwrap();
+    let recovery_checkpoint = crate::rebalance::record_assignment_checkpoint_for_test(
+        &authority,
+        &authority_store,
+        &predecessor_fence,
+        &leader_proof,
+    )
+    .await;
     let decision = AssignmentRecoveryDecision::new(
-        current.assignment_fence().unwrap(),
+        predecessor_fence,
         successor.assignment_fence().unwrap(),
         proposal,
         vec![process_fence],
+        recovery_checkpoint,
         leader_proof.clone(),
     )
     .unwrap();
@@ -2372,10 +2382,11 @@ async fn recovery_authority_cannot_revoke_the_final_local_vnode() {
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn replacement_process_removal_has_no_local_final_owner_callback() {
-    use laminar_core::checkpoint::CheckpointParticipant;
+    use laminar_core::checkpoint::{AssignmentDrainTransition, CheckpointParticipant};
     use laminar_core::cluster::control::{
-        AssignmentRecoveryDecision, AssignmentSnapshot, AssignmentSnapshotStore, ClusterController,
-        ClusterKv, InMemoryKv, ProcessLeaseAuthority, ProcessLeaseOutcome,
+        AssignmentDrainDecision, AssignmentRecoveryDecision, AssignmentSnapshot,
+        AssignmentSnapshotStore, ClusterController, ClusterKv, InMemoryKv, ProcessLeaseAuthority,
+        ProcessLeaseOutcome,
     };
     use laminar_core::cluster::discovery::{NodeId as ClusterNodeId, NodeInfo};
     use laminar_core::state::{NodeId, VnodeRegistry};
@@ -2440,13 +2451,49 @@ async fn replacement_process_removal_has_no_local_final_owner_callback() {
     )
     .await;
 
-    let current = AssignmentSnapshot::empty()
+    let base = AssignmentSnapshot::empty()
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[self_id]),
+            vec![CheckpointParticipant {
+                node_id: self_id.0,
+                boot_incarnation: current_boot,
+            }],
+        )
+        .unwrap();
+    assignments.save_if_absent(&base).await.unwrap();
+    let current = base
         .next_for_participants(
             AssignmentSnapshot::vnodes_from_vec(&[self_id]),
             vec![predecessor_process],
         )
         .unwrap();
-    assignments.save_if_absent(&current).await.unwrap();
+    assignments
+        .save_if_version(&current, base.version)
+        .await
+        .unwrap();
+    let base_fence = base.assignment_fence().unwrap();
+    let current_fence = current.assignment_fence().unwrap();
+    let authority = controller.checkpoint_authority().unwrap();
+    let recovery_checkpoint = crate::rebalance::record_assignment_checkpoint_for_test(
+        &authority,
+        &authority_store,
+        &base_fence,
+        &leader_proof,
+    )
+    .await;
+    let transition =
+        AssignmentDrainTransition::new(base_fence, current_fence.clone(), leader_proof.clone())
+            .unwrap();
+    let drain = AssignmentDrainDecision::commit(
+        &transition,
+        leader_proof.clone(),
+        recovery_checkpoint.clone(),
+    )
+    .unwrap();
+    authority
+        .record_assignment_drain_decision(&leader_proof, drain)
+        .await
+        .unwrap();
     let successor = current
         .next_for_participants(
             AssignmentSnapshot::vnodes_from_vec(&[successor_id]),
@@ -2461,10 +2508,11 @@ async fn replacement_process_removal_has_no_local_final_owner_callback() {
         .await
         .unwrap();
     let decision = AssignmentRecoveryDecision::new(
-        current.assignment_fence().unwrap(),
+        current_fence,
         successor.assignment_fence().unwrap(),
         proposal,
         vec![process_fence],
+        recovery_checkpoint,
         leader_proof.clone(),
     )
     .unwrap();
@@ -2482,6 +2530,7 @@ async fn replacement_process_removal_has_no_local_final_owner_callback() {
         .unwrap();
 
     let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
+    registry.set_assignment_and_version(Arc::from([self_id]), current.version);
     let db = LaminarDB::builder()
         .cluster_controller(controller)
         .cluster_checkpoint_object_store(authority_store)

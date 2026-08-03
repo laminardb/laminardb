@@ -154,9 +154,16 @@ fn test_cluster_controller(
 async fn grant_test_leadership(
     controller: &Arc<ClusterController>,
 ) -> tokio::sync::watch::Sender<Option<laminar_core::cluster::control::LeaderLease>> {
+    grant_test_leadership_on(controller, Arc::new(InMemory::new())).await
+}
+
+async fn grant_test_leadership_on(
+    controller: &Arc<ClusterController>,
+    authority_store: Arc<dyn ObjectStore>,
+) -> tokio::sync::watch::Sender<Option<laminar_core::cluster::control::LeaderLease>> {
     use laminar_core::cluster::control::{LeaderLeaseOwner, LeaseOutcome};
 
-    let authority = Arc::new(LeaderLeaseStore::new(Arc::new(InMemory::new()), 10_000));
+    let authority = Arc::new(LeaderLeaseStore::new(authority_store, 10_000));
     let owner = LeaderLeaseOwner {
         node: controller.instance_id(),
         boot: controller.recovery_incarnation(),
@@ -304,6 +311,7 @@ async fn predecessor_failure_fixture(
     Arc<VnodeRegistry>,
     AssignmentSnapshot,
     Arc<laminar_core::cluster::control::ProcessLeaseAuthority>,
+    Arc<dyn ObjectStore>,
     tempfile::TempDir,
 ) {
     use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
@@ -408,6 +416,14 @@ async fn predecessor_failure_fixture(
         .publish_leased_recovery_incarnation(&local_process_lease)
         .await
         .unwrap();
+    let checkpoint_authority = controller.checkpoint_authority().unwrap();
+    record_assignment_checkpoint_for_test(
+        &checkpoint_authority,
+        &shared_store,
+        &current.assignment_fence().unwrap(),
+        &controller.capture_leader_proof().unwrap(),
+    )
+    .await;
 
     let vnode_count = u32::try_from(owners.len()).unwrap();
     let registry = Arc::new(VnodeRegistry::new_unassigned(vnode_count));
@@ -442,6 +458,7 @@ async fn predecessor_failure_fixture(
         registry,
         current,
         process_authority,
+        shared_store,
         checkpoint_dir,
     )
 }
@@ -453,6 +470,7 @@ async fn dead_predecessor_fixture() -> (
     Arc<VnodeRegistry>,
     AssignmentSnapshot,
     Arc<laminar_core::cluster::control::ProcessLeaseAuthority>,
+    Arc<dyn ObjectStore>,
     tempfile::TempDir,
 ) {
     predecessor_failure_fixture(
@@ -499,14 +517,22 @@ async fn failure_recovery_retains_a_healthy_predecessor_with_no_rendezvous_share
         rendezvous_assignment(2, &[NodeId(3), NodeId(5), NodeId(7)]).as_ref(),
         &[NodeId(5), NodeId(7)]
     );
-    let (db, controller, durable, registry, current, _process_authority, _checkpoint_dir) =
-        predecessor_failure_fixture(
-            healthy,
-            failed,
-            vec![NodeId(3), NodeId(9)],
-            vec![successor_five, successor_seven],
-        )
-        .await;
+    let (
+        db,
+        controller,
+        durable,
+        registry,
+        current,
+        _process_authority,
+        _authority_store,
+        _checkpoint_dir,
+    ) = predecessor_failure_fixture(
+        healthy,
+        failed,
+        vec![NodeId(3), NodeId(9)],
+        vec![successor_five, successor_seven],
+    )
+    .await;
     controller.note_unresponsive(&[NodeId(9)]);
 
     let version = try_rebalance(
@@ -749,8 +775,16 @@ async fn at_least_once_live_rotation_uses_the_global_drain_protocol() {
 #[tokio::test]
 async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
     let self_id = NodeId(1);
-    let (db, controller, durable, registry, current, _process_authority, _checkpoint_dir) =
-        dead_predecessor_fixture().await;
+    let (
+        db,
+        controller,
+        durable,
+        registry,
+        current,
+        _process_authority,
+        _authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
     controller.note_unresponsive(&[NodeId(2)]);
 
     let error = try_rebalance(
@@ -762,9 +796,9 @@ async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("the successor cannot restore acquired state without a recovery namespace");
+    .expect_err("the successor cannot install acquired state until vnode transfer is implemented");
     assert!(
-        error.contains("requires an active cluster recovery namespace"),
+        error.contains("committed-frame vnode reassignment"),
         "{error}"
     );
     let successor = durable.load().await.unwrap().unwrap();
@@ -819,8 +853,16 @@ async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
 #[tokio::test]
 async fn renewing_predecessor_cannot_be_removed_by_failure_recovery() {
     let self_id = NodeId(1);
-    let (db, controller, durable, registry, current, process_authority, _checkpoint_dir) =
-        dead_predecessor_fixture().await;
+    let (
+        db,
+        controller,
+        durable,
+        registry,
+        current,
+        process_authority,
+        _authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
     let predecessor = current.participants[1];
     let predecessor_store = process_authority.store_for(NodeId(predecessor.node_id));
     let keep_renewing = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -1388,7 +1430,8 @@ async fn wait_until_drained_does_not_treat_draining_target_as_committed() {
         "a standalone materialization cannot certify shutdown"
     );
 
-    let authority = LeaderLeaseStore::new(Arc::new(InMemory::new()), 1_000);
+    let authority_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let authority = LeaderLeaseStore::new(Arc::clone(&authority_store), 1_000);
     let owner = laminar_core::cluster::control::LeaderLeaseOwner {
         node: me,
         boot: committed.participants[0].boot_incarnation,
@@ -1401,9 +1444,15 @@ async fn wait_until_drained_does_not_treat_draining_target_as_committed() {
     };
     let transition = draining.drain_transition.as_ref().unwrap();
     assert_eq!(lease.proof(), transition.leader);
+    let handoff_checkpoint = record_assignment_checkpoint_for_test(
+        &authority,
+        &authority_store,
+        &transition.predecessor,
+        &transition.leader,
+    )
+    .await;
     let decision =
-        AssignmentDrainDecision::new(transition, lease.proof(), AssignmentDrainVerdict::Commit)
-            .unwrap();
+        AssignmentDrainDecision::commit(transition, lease.proof(), handoff_checkpoint).unwrap();
     authority
         .record_assignment_drain_decision(&lease.proof(), decision)
         .await
@@ -1470,8 +1519,16 @@ async fn bare_recovery_successor_without_an_authority_decision_is_rejected() {
 #[tokio::test]
 async fn successor_adoption_accepts_a_retained_predecessor_after_ancestry_pruning() {
     let self_id = NodeId(1);
-    let (db, controller, durable, registry, current, _process_authority, _checkpoint_dir) =
-        dead_predecessor_fixture().await;
+    let (
+        db,
+        controller,
+        durable,
+        registry,
+        current,
+        _process_authority,
+        authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
     controller.note_unresponsive(&[NodeId(2)]);
 
     let error = try_rebalance(
@@ -1483,9 +1540,9 @@ async fn successor_adoption_accepts_a_retained_predecessor_after_ancestry_prunin
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("the test recovery has no checkpoint handoff namespace");
+    .expect_err("the test recovery cannot install transferred vnode state");
     assert!(
-        error.contains("requires an active cluster recovery namespace"),
+        error.contains("committed-frame vnode reassignment"),
         "{error}"
     );
     let recovery = durable.load().await.unwrap().unwrap();
@@ -1509,15 +1566,19 @@ async fn successor_adoption_accepts_a_retained_predecessor_after_ancestry_prunin
             .unwrap(),
         RotateOutcome::Rotated
     ));
-    let decision = AssignmentDrainDecision::new(
-        draining.drain_transition.as_ref().unwrap(),
-        leader_proof.clone(),
-        AssignmentDrainVerdict::Commit,
+    let authority = controller.checkpoint_authority().unwrap();
+    let transition = draining.drain_transition.as_ref().unwrap();
+    let handoff_checkpoint = record_assignment_checkpoint_for_test(
+        &authority,
+        &authority_store,
+        &transition.predecessor,
+        &transition.leader,
     )
-    .unwrap();
-    controller
-        .checkpoint_authority()
-        .unwrap()
+    .await;
+    let decision =
+        AssignmentDrainDecision::commit(transition, leader_proof.clone(), handoff_checkpoint)
+            .unwrap();
+    authority
         .record_assignment_drain_decision(&leader_proof, decision)
         .await
         .unwrap();
@@ -1589,7 +1650,7 @@ async fn materialized_drain_rejects_missing_corrupt_or_mismatched_predecessor() 
     let self_id = NodeId(1);
     let boot = uuid::Uuid::from_u128(11);
     let controller = test_cluster_controller(self_id, boot, Some(Arc::clone(&durable)));
-    let _leader_lease = grant_test_leadership(&controller).await;
+    let _leader_lease = grant_test_leadership_on(&controller, Arc::clone(&object_store)).await;
     let leader_proof = controller.capture_leader_proof().unwrap();
     let participant = CheckpointParticipant {
         node_id: self_id.0,
@@ -1624,15 +1685,19 @@ async fn materialized_drain_rejects_missing_corrupt_or_mismatched_predecessor() 
             .unwrap(),
         RotateOutcome::Rotated
     ));
-    let decision = AssignmentDrainDecision::new(
-        draining.drain_transition.as_ref().unwrap(),
-        leader_proof.clone(),
-        AssignmentDrainVerdict::Commit,
+    let authority = controller.checkpoint_authority().unwrap();
+    let transition = draining.drain_transition.as_ref().unwrap();
+    let handoff_checkpoint = record_assignment_checkpoint_for_test(
+        &authority,
+        &object_store,
+        &transition.predecessor,
+        &transition.leader,
     )
-    .unwrap();
-    controller
-        .checkpoint_authority()
-        .unwrap()
+    .await;
+    let decision =
+        AssignmentDrainDecision::commit(transition, leader_proof.clone(), handoff_checkpoint)
+            .unwrap();
+    authority
         .record_assignment_drain_decision(&leader_proof, decision)
         .await
         .unwrap();
@@ -1918,7 +1983,7 @@ async fn watcher_resumes_exact_authority_after_transient_audit_gaps() {
 }
 
 #[tokio::test]
-async fn unassigned_restarted_process_authorizes_successor_before_boot_adoption() {
+async fn unassigned_restarted_process_authorizes_and_adopts_the_boot_assignment() {
     use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
     use laminar_core::cluster::discovery::NodeInfo;
     use uuid::Uuid;
@@ -1966,6 +2031,26 @@ async fn unassigned_restarted_process_authorizes_successor_before_boot_adoption(
     else {
         panic!("old process must seed its lease");
     };
+    let leader_authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&shared_store), 1));
+    let old_leader_owner = laminar_core::cluster::control::LeaderLeaseOwner {
+        node: self_id,
+        boot: old_process.boot_incarnation,
+        process_term: old_lease.term,
+    };
+    let laminar_core::cluster::control::LeaseOutcome::Acquired(old_leader_lease) = leader_authority
+        .begin_new_term(&old_leader_owner, 0)
+        .await
+        .unwrap()
+    else {
+        panic!("old process must seed leadership");
+    };
+    record_assignment_checkpoint_for_test(
+        &leader_authority,
+        &shared_store,
+        &first.assignment_fence().unwrap(),
+        &old_leader_lease.proof(),
+    )
+    .await;
     let observation = process_store.observe_rival(&old_lease).unwrap();
     tokio::time::sleep(Duration::from_millis(2)).await;
     let laminar_core::cluster::control::ProcessLeaseOutcome::Acquired(new_lease) = process_store
@@ -1988,18 +2073,21 @@ async fn unassigned_restarted_process_authorizes_successor_before_boot_adoption(
         .await
         .unwrap();
     controller.set_active(true);
-    let leader_authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&shared_store), 10_000));
     let leader_owner = laminar_core::cluster::control::LeaderLeaseOwner {
         node: self_id,
         boot: new_boot,
         process_term: new_lease.term,
     };
+    let leader_observation = leader_authority
+        .observe_rival(&leader_owner, &old_leader_lease)
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(2)).await;
     let laminar_core::cluster::control::LeaseOutcome::Acquired(leader_lease) = leader_authority
-        .begin_new_term(&leader_owner, 0)
+        .try_takeover(&leader_owner, &leader_observation, 2)
         .await
         .unwrap()
     else {
-        panic!("replacement process must acquire leadership");
+        panic!("replacement process must take over leadership");
     };
     let _leader_lease =
         install_test_leadership(&controller, leader_authority, leader_owner, leader_lease);
@@ -2013,7 +2101,7 @@ async fn unassigned_restarted_process_authorizes_successor_before_boot_adoption(
         .build()
         .await
         .unwrap();
-    let error = try_rebalance(
+    let version = try_rebalance(
         &db,
         &controller,
         &durable,
@@ -2022,9 +2110,9 @@ async fn unassigned_restarted_process_authorizes_successor_before_boot_adoption(
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("a new process incarnation must restore before adopting its old vnodes");
+    .expect("the replacement must authorize recovery for startup restoration");
 
-    assert!(error.contains("cannot acquire 2 vnodes"), "{error}");
+    assert_eq!(version, Some(first.version + 1));
     let advanced = durable.load().await.unwrap().unwrap();
     assert_eq!(advanced.version, first.version + 1);
     assert_eq!(advanced.vnodes, vnodes);
@@ -2036,7 +2124,7 @@ async fn unassigned_restarted_process_authorizes_successor_before_boot_adoption(
         }]
     );
     assert!(db.cluster_intake_fenced());
-    assert_eq!(registry.assignment_version(), 0);
+    assert_eq!(registry.assignment_version(), advanced.version);
 }
 
 #[tokio::test]
@@ -2233,7 +2321,8 @@ async fn recovery_release_reapplies_a_committed_drain_to_replacement_sources() {
         boot,
     ));
     controller.publish_recovery_incarnation().await.unwrap();
-    let _leader_lease = grant_test_leadership(&controller).await;
+    let authority_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let _leader_lease = grant_test_leadership_on(&controller, Arc::clone(&authority_store)).await;
     let draining = committed
         .next_draining(
             owners,
@@ -2259,6 +2348,15 @@ async fn recovery_release_reapplies_a_committed_drain_to_replacement_sources() {
         .await
         .unwrap();
     let _checkpoint_dir = install_running_test_vnode_state(&db, &committed).await;
+    let transition = draining.drain_transition.as_ref().unwrap();
+    let authority = controller.checkpoint_authority().unwrap();
+    let handoff_checkpoint = record_assignment_checkpoint_for_test(
+        &authority,
+        &authority_store,
+        &transition.predecessor,
+        &transition.leader,
+    )
+    .await;
     assert_eq!(
         finalize_drain_snapshot(
             &db,
@@ -2267,6 +2365,7 @@ async fn recovery_release_reapplies_a_committed_drain_to_replacement_sources() {
             &draining,
             &committed,
             AssignmentDrainVerdict::Commit,
+            Some(handoff_checkpoint),
             RebalanceConfig::test_defaults(),
         )
         .await
@@ -2523,6 +2622,13 @@ async fn replacement_process_aborts_drain_through_the_same_authority_sequence() 
         .save_if_version(&draining, committed.version)
         .await
         .unwrap();
+    record_assignment_checkpoint_for_test(
+        &authority,
+        &shared,
+        &committed.assignment_fence().unwrap(),
+        &old_proof,
+    )
+    .await;
 
     let new_owner = LeaderLeaseOwner {
         node: self_id,
@@ -2624,7 +2730,7 @@ async fn replacement_process_aborts_drain_through_the_same_authority_sequence() 
     assert_eq!(registry.assignment_version(), 0);
     assert!(db.cluster_intake_fenced());
 
-    let error = try_rebalance(
+    let recovered_version = try_rebalance(
         &db,
         &controller,
         &durable,
@@ -2633,9 +2739,9 @@ async fn replacement_process_aborts_drain_through_the_same_authority_sequence() 
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("the recovery successor must restore before boot adoption");
-    assert!(error.contains("cannot acquire 1 vnodes"), "{error}");
+    .expect("the replacement must authorize recovery for startup restoration");
     let recovered = durable.load().await.unwrap().unwrap();
+    assert_eq!(recovered_version, Some(recovered.version));
     assert_eq!(recovered.version, draining.version + 1);
     assert_eq!(recovered.vnodes, committed.vnodes);
     assert_eq!(
@@ -2645,12 +2751,12 @@ async fn replacement_process_aborts_drain_through_the_same_authority_sequence() 
             boot_incarnation: new_boot,
         }]
     );
-    assert_eq!(registry.assignment_version(), 0);
+    assert_eq!(registry.assignment_version(), recovered.version);
+    assert!(db.cluster_intake_fenced());
 
-    let stale = AssignmentDrainDecision::new(
+    let stale = AssignmentDrainDecision::abort(
         draining.drain_transition.as_ref().unwrap(),
         old_proof.clone(),
-        AssignmentDrainVerdict::Abort,
     )
     .unwrap();
     assert!(matches!(
@@ -2670,7 +2776,8 @@ async fn takeover_materializes_decision_written_before_snapshot_cas() {
     let self_id = NodeId(1);
     let old_boot = Uuid::from_u128(11);
     let new_boot = Uuid::from_u128(111);
-    let authority = Arc::new(LeaderLeaseStore::new(Arc::new(InMemory::new()), 10));
+    let authority_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&authority_store), 10));
     let old_owner = LeaderLeaseOwner {
         node: self_id,
         boot: old_boot,
@@ -2706,12 +2813,16 @@ async fn takeover_materializes_decision_written_before_snapshot_cas() {
         .save_if_version(&draining, committed.version)
         .await
         .unwrap();
-    let committed_decision = AssignmentDrainDecision::new(
-        draining.drain_transition.as_ref().unwrap(),
-        old_proof.clone(),
-        AssignmentDrainVerdict::Commit,
+    let transition = draining.drain_transition.as_ref().unwrap();
+    let handoff_checkpoint = record_assignment_checkpoint_for_test(
+        &authority,
+        &authority_store,
+        &transition.predecessor,
+        &transition.leader,
     )
-    .unwrap();
+    .await;
+    let committed_decision =
+        AssignmentDrainDecision::commit(transition, old_proof.clone(), handoff_checkpoint).unwrap();
     assert!(matches!(
         authority
             .record_assignment_drain_decision(&old_proof, committed_decision)

@@ -33,7 +33,9 @@ mode updates a dedicated durable head under its namespace lease; shared-store up
 conditional writes, and cluster mode records every transition in the leader-fenced authority
 sequence. Restart or takeover resumes the durable phase without LIST or a pre-scan of checkpoint
 history; the O(1) cursor advances toward the prior durable floor or genesis. Validated per-manifest
-frame counts determine chunk liveness.
+frame counts determine chunk liveness. Committed drains and failure-recovery assignments bind
+their exact state cut in the same authority sequence. Retention pins that cut across leader
+takeover until a complete checkpoint commits under the target assignment.
 
 Checkpoint storage is provider-neutral through the `object_store` crate. Configuration selects
 local filesystem, S3 (including R2/MinIO through S3 endpoint options), GCS, or Azure Blob by URL.
@@ -54,8 +56,9 @@ them fail closed until they have assignment-fenced vnode ownership and restore.
 
 The following remain production gaps, not alternate state implementations:
 
-- Assignment changes that acquire a vnode fail closed until direct v7 range transfer and
-  assignment-fenced installation are complete. Revoke-only changes remain supported.
+- Assignment changes that acquire a vnode fail closed until range restore, replay/frontier
+  transfer, and assignment-fenced installation are complete. Revoke-only changes remain
+  supported.
 - Durable Aborts reclaim exact prepared objects, including after restart. An attempt that crashes
   before publishing a terminal decision can still leave unreferenced checkpoint metadata.
 - Checkpoint capture still performs state-sized snapshot work synchronously; its tail latency is

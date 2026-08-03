@@ -37,6 +37,30 @@ fn store(ttl_ms: i64) -> LeaderLeaseStore {
     LeaderLeaseStore::new(Arc::new(InMemory::new()), ttl_ms)
 }
 
+fn handoff_checkpoint(epoch: u64) -> CommittedCheckpointRef {
+    CommittedCheckpointRef {
+        epoch,
+        checkpoint_id: epoch,
+        sha256: "0".repeat(64),
+        len: 1,
+    }
+}
+
+fn drain_decision_for_test(
+    transition: &AssignmentDrainTransition,
+    proof: LeaderProof,
+    verdict: AssignmentDrainVerdict,
+) -> Result<AssignmentDrainDecision, String> {
+    match verdict {
+        AssignmentDrainVerdict::Commit => AssignmentDrainDecision::commit(
+            transition,
+            proof,
+            handoff_checkpoint(transition.target.assignment_version),
+        ),
+        AssignmentDrainVerdict::Abort => AssignmentDrainDecision::abort(transition, proof),
+    }
+}
+
 #[test]
 fn live_authority_link_budget_is_exact() {
     let mut traversed = 0;
@@ -345,11 +369,14 @@ async fn assignment_recovery_decision(
             ProcessLeaseFence::new(predecessor, successor).unwrap()
         })
         .collect();
+    let recovery_checkpoint =
+        recovery_checkpoint_for_test(store, &leader_proof, &predecessor).await;
     AssignmentRecoveryDecision::new(
         predecessor,
         target,
         proposal,
         removed_process_fences,
+        recovery_checkpoint,
         leader_proof,
     )
     .unwrap()
@@ -420,6 +447,18 @@ async fn record_commit(
     epoch: u64,
     checkpoint_id: u64,
 ) -> RecordOutcomeResult {
+    try_record_commit(store, proof, fence, epoch, checkpoint_id)
+        .await
+        .unwrap()
+}
+
+async fn try_record_commit(
+    store: &LeaderLeaseStore,
+    proof: &LeaderProof,
+    fence: &CheckpointAssignmentFence,
+    epoch: u64,
+    checkpoint_id: u64,
+) -> Result<RecordOutcomeResult, ClusterCheckpointAuthorityError> {
     assert_eq!(epoch, checkpoint_id, "test outcome must be canonical");
     let predecessor = store
         .highest_cluster_committed_outcome()
@@ -438,6 +477,61 @@ async fn record_commit(
             Some(committed_checkpoint),
         )
         .await
+}
+
+async fn recovery_checkpoint_for_test(
+    store: &LeaderLeaseStore,
+    proof: &LeaderProof,
+    predecessor: &CheckpointAssignmentFence,
+) -> CommittedCheckpointRef {
+    if let Some(reference) = store
+        .assignment_handoff_checkpoint(predecessor)
+        .await
+        .unwrap()
+    {
+        return reference;
+    }
+    if let Some(outcome) = store.highest_cluster_committed_outcome().await.unwrap() {
+        if outcome.assignment_fence.as_ref() == Some(predecessor) {
+            return outcome.committed_checkpoint.unwrap();
+        }
+    }
+    let checkpoint_id = store
+        .highest_cluster_terminal_outcome()
+        .await
+        .unwrap()
+        .map_or(1, |outcome| outcome.checkpoint_id.checked_add(1).unwrap());
+    match record_commit(store, proof, predecessor, checkpoint_id, checkpoint_id).await {
+        RecordOutcomeResult::Created(outcome) | RecordOutcomeResult::Unchanged(outcome) => {
+            outcome.committed_checkpoint.unwrap()
+        }
+        RecordOutcomeResult::Conflict { winner } => {
+            panic!("unexpected recovery checkpoint winner: {winner:?}")
+        }
+    }
+}
+
+async fn committed_drain_decision_for_test(
+    store: &LeaderLeaseStore,
+    transition: &AssignmentDrainTransition,
+    proof: LeaderProof,
+    checkpoint_id: u64,
+) -> AssignmentDrainDecision {
+    let outcome = match record_commit(
+        store,
+        &proof,
+        &transition.predecessor,
+        checkpoint_id,
+        checkpoint_id,
+    )
+    .await
+    {
+        RecordOutcomeResult::Created(outcome) | RecordOutcomeResult::Unchanged(outcome) => outcome,
+        RecordOutcomeResult::Conflict { winner } => {
+            panic!("unexpected checkpoint winner: {winner:?}")
+        }
+    };
+    AssignmentDrainDecision::commit(transition, proof, outcome.committed_checkpoint.unwrap())
         .unwrap()
 }
 
@@ -3222,15 +3316,14 @@ fn replacement_term_may_abort_but_cannot_commit_an_existing_drain() {
     }
     .proof();
 
-    assert!(AssignmentDrainDecision::new(
+    assert!(drain_decision_for_test(
         &transition,
         replacement.clone(),
         AssignmentDrainVerdict::Commit,
     )
     .is_err());
     assert!(
-        AssignmentDrainDecision::new(&transition, replacement, AssignmentDrainVerdict::Abort,)
-            .is_ok()
+        drain_decision_for_test(&transition, replacement, AssignmentDrainVerdict::Abort,).is_ok()
     );
 }
 
@@ -3294,12 +3387,85 @@ async fn assignment_recovery_requires_exact_sorted_removals_and_matching_proposa
             LeaseError::Invalid(_)
         ))
     ));
-    assert_eq!(store.load().await.unwrap().unwrap().seq, 1);
+    assert_eq!(store.load().await.unwrap().unwrap().seq, 2);
+}
+
+#[tokio::test]
+async fn recovery_requires_the_current_cut_and_pins_it_until_the_target_commits() {
+    let store = store(1_000);
+    let incumbent = owner(1, 11, 1);
+    let failed = owner(2, 22, 1);
+    let LeaseOutcome::Acquired(lease) = store
+        .acquire_or_renew_current_term_for_test(&incumbent, 0)
+        .await
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let proof = lease.proof();
+    let stale = assignment_recovery_decision(
+        &store,
+        1,
+        &[incumbent.clone(), failed.clone()],
+        std::slice::from_ref(&incumbent),
+        proof.clone(),
+        1,
+    )
+    .await;
+    let current = match record_commit(&store, &proof, &stale.predecessor, 2, 2).await {
+        RecordOutcomeResult::Created(outcome) => outcome.committed_checkpoint.unwrap(),
+        outcome => panic!("unexpected recovery checkpoint result: {outcome:?}"),
+    };
+    assert!(matches!(
+        store
+            .record_assignment_recovery_decision(&proof, stale)
+            .await,
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(_)
+        ))
+    ));
+
+    let recovery = assignment_recovery_decision(
+        &store,
+        1,
+        &[incumbent.clone(), failed],
+        std::slice::from_ref(&incumbent),
+        proof.clone(),
+        2,
+    )
+    .await;
+    assert_eq!(recovery.recovery_checkpoint, current);
+    assert!(matches!(
+        store
+            .record_assignment_recovery_decision(&proof, recovery.clone())
+            .await
+            .unwrap(),
+        RecordAssignmentRecoveryDecisionResult::Created(_)
+    ));
+    assert_eq!(
+        store
+            .assignment_handoff_checkpoint(&recovery.target)
+            .await
+            .unwrap(),
+        Some(current)
+    );
+
+    assert!(matches!(
+        record_commit(&store, &proof, &recovery.target, 3, 3).await,
+        RecordOutcomeResult::Created(_)
+    ));
+    assert_eq!(
+        store
+            .assignment_handoff_checkpoint(&recovery.target)
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
 async fn competing_assignment_recoveries_have_one_same_version_winner() {
-    let (raw, store) = blocking_store_at(1_000, lease_path(2));
+    let (raw, store) = blocking_store_at(1_000, lease_path(3));
     let incumbent = owner(1, 11, 1);
     let failed = owner(2, 22, 1);
     let LeaseOutcome::Acquired(first) = store
@@ -3491,9 +3657,7 @@ async fn drain_and_recovery_share_one_ordered_retention_chain() {
     )
     .unwrap();
     let transition = AssignmentDrainTransition::new(predecessor, target, proof.clone()).unwrap();
-    let drain =
-        AssignmentDrainDecision::new(&transition, proof.clone(), AssignmentDrainVerdict::Commit)
-            .unwrap();
+    let drain = committed_drain_decision_for_test(&store, &transition, proof.clone(), 1).await;
     assert!(matches!(
         store
             .record_assignment_drain_decision(&proof, drain.clone())
@@ -3536,9 +3700,21 @@ async fn drain_and_recovery_share_one_ordered_retention_chain() {
             .unwrap(),
         RecordAssignmentRecoveryDecisionResult::Created(_)
     ));
+    let propagated_pin = store
+        .load_record()
+        .await
+        .unwrap()
+        .unwrap()
+        .assignment_handoff_pin
+        .unwrap();
+    assert_eq!(propagated_pin.target, recovery.target);
+    assert_eq!(
+        Some(&propagated_pin.checkpoint),
+        drain.handoff_checkpoint.as_ref()
+    );
 
     let losing_drain_transition = assignment_drain_transition_at(&incumbent, proof.clone(), 3);
-    let losing_drain = AssignmentDrainDecision::new(
+    let losing_drain = drain_decision_for_test(
         &losing_drain_transition,
         proof.clone(),
         AssignmentDrainVerdict::Commit,
@@ -3607,7 +3783,7 @@ async fn drain_and_recovery_share_one_ordered_retention_chain() {
 
 #[tokio::test]
 async fn takeover_fences_a_delayed_assignment_recovery_decision() {
-    let (raw, store) = blocking_once_at(10, lease_path(2));
+    let (raw, store) = blocking_once_at(10, lease_path(3));
     let incumbent = owner(1, 11, 1);
     let successor = owner(1, 12, 2);
     let failed = owner(2, 22, 1);
@@ -3684,7 +3860,7 @@ async fn takeover_fences_a_delayed_assignment_recovery_decision() {
 
 #[tokio::test]
 async fn competing_assignment_drain_decisions_have_one_immutable_winner() {
-    let (raw, store) = blocking_store_at(1_000, lease_path(2));
+    let (raw, store) = blocking_store_at(1_000, lease_path(3));
     let incumbent = owner(1, 1, 1);
     let LeaseOutcome::Acquired(first) = store
         .acquire_or_renew_current_term_for_test(&incumbent, 0)
@@ -3696,11 +3872,9 @@ async fn competing_assignment_drain_decisions_have_one_immutable_winner() {
     let proof = first.proof();
     let transition = assignment_drain_transition(&incumbent, proof.clone());
     let commit =
-        AssignmentDrainDecision::new(&transition, proof.clone(), AssignmentDrainVerdict::Commit)
-            .unwrap();
+        committed_drain_decision_for_test(store.as_ref(), &transition, proof.clone(), 1).await;
     let abort =
-        AssignmentDrainDecision::new(&transition, proof.clone(), AssignmentDrainVerdict::Abort)
-            .unwrap();
+        drain_decision_for_test(&transition, proof.clone(), AssignmentDrainVerdict::Abort).unwrap();
 
     let commit_store = Arc::clone(&store);
     let commit_proof = proof.clone();
@@ -3759,7 +3933,7 @@ async fn competing_assignment_drain_decisions_have_one_immutable_winner() {
 
 #[tokio::test]
 async fn takeover_fences_delayed_drain_commit_and_can_abort_the_transition() {
-    let (raw, store) = blocking_once_at(10, lease_path(2));
+    let (raw, store) = blocking_once_at(10, lease_path(3));
     let incumbent = owner(1, 1, 1);
     let successor = owner(2, 2, 1);
     let LeaseOutcome::Acquired(first) = store
@@ -3774,12 +3948,8 @@ async fn takeover_fences_delayed_drain_commit_and_can_abort_the_transition() {
     let observation = store.observe_rival(&successor, &first).unwrap();
     tokio::time::sleep(Duration::from_millis(15)).await;
 
-    let delayed = AssignmentDrainDecision::new(
-        &transition,
-        old_proof.clone(),
-        AssignmentDrainVerdict::Commit,
-    )
-    .unwrap();
+    let delayed =
+        committed_drain_decision_for_test(store.as_ref(), &transition, old_proof.clone(), 1).await;
     let delayed_store = Arc::clone(&store);
     let delayed_proof = old_proof.clone();
     let delayed_task = tokio::spawn(async move {
@@ -3807,7 +3977,7 @@ async fn takeover_fences_delayed_drain_commit_and_can_abort_the_transition() {
     ));
 
     let takeover_proof = takeover.proof();
-    let abort = AssignmentDrainDecision::new(
+    let abort = drain_decision_for_test(
         &transition,
         takeover_proof.clone(),
         AssignmentDrainVerdict::Abort,
@@ -3845,12 +4015,9 @@ async fn assignment_drain_floor_compacts_history_and_rejects_stale_versions() {
     let proof = first.proof();
     for target_version in 2..=5 {
         let transition = assignment_drain_transition_at(&incumbent, proof.clone(), target_version);
-        let decision = AssignmentDrainDecision::new(
-            &transition,
-            proof.clone(),
-            AssignmentDrainVerdict::Commit,
-        )
-        .unwrap();
+        let decision =
+            drain_decision_for_test(&transition, proof.clone(), AssignmentDrainVerdict::Abort)
+                .unwrap();
         assert!(matches!(
             store
                 .record_assignment_drain_decision(&proof, decision)
@@ -3907,7 +4074,7 @@ async fn assignment_drain_floor_compacts_history_and_rejects_stale_versions() {
     }
 
     let stale_transition = assignment_drain_transition_at(&incumbent, proof.clone(), 3);
-    let stale = AssignmentDrainDecision::new(
+    let stale = drain_decision_for_test(
         &stale_transition,
         proof.clone(),
         AssignmentDrainVerdict::Commit,
@@ -3970,12 +4137,9 @@ async fn assignment_drain_floor_rejects_a_rewritten_anchor_link() {
     let proof = first.proof();
     for target_version in [2, 4] {
         let transition = assignment_drain_transition_at(&incumbent, proof.clone(), target_version);
-        let decision = AssignmentDrainDecision::new(
-            &transition,
-            proof.clone(),
-            AssignmentDrainVerdict::Commit,
-        )
-        .unwrap();
+        let decision =
+            drain_decision_for_test(&transition, proof.clone(), AssignmentDrainVerdict::Abort)
+                .unwrap();
         store
             .record_assignment_drain_decision(&proof, decision)
             .await
@@ -5996,6 +6160,159 @@ async fn artifact_cleanup_chain(
         references.push(outcome.committed_checkpoint.unwrap());
     }
     (store, incumbent, proof, fence, references)
+}
+
+#[tokio::test]
+async fn drain_abort_requires_a_matching_cut_and_pins_it_until_rollback_commits() {
+    let store = store(1_000);
+    let incumbent = owner(1, 1, 1);
+    let LeaseOutcome::Acquired(lease) = store
+        .acquire_or_renew_current_term_for_test(&incumbent, 0)
+        .await
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let proof = lease.proof();
+    let transition = assignment_drain_transition(&incumbent, proof.clone());
+    assert!(matches!(
+        record_commit(&store, &proof, &transition.target, 1, 1).await,
+        RecordOutcomeResult::Created(_)
+    ));
+    let abort = AssignmentDrainDecision::abort(&transition, proof.clone()).unwrap();
+    assert!(matches!(
+        store
+            .record_assignment_drain_decision(&proof, abort.clone())
+            .await,
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(_)
+        ))
+    ));
+
+    let checkpoint = match record_commit(&store, &proof, &transition.predecessor, 2, 2).await {
+        RecordOutcomeResult::Created(outcome) => outcome.committed_checkpoint.unwrap(),
+        outcome => panic!("unexpected rollback checkpoint result: {outcome:?}"),
+    };
+    assert!(matches!(
+        store
+            .record_assignment_drain_decision(&proof, abort)
+            .await
+            .unwrap(),
+        RecordAssignmentDrainDecisionResult::Created(_)
+    ));
+    let rollback = LeaderLeaseStore::aborted_handoff_target(&transition).unwrap();
+    assert_eq!(
+        store
+            .assignment_handoff_checkpoint(&rollback)
+            .await
+            .unwrap(),
+        Some(checkpoint)
+    );
+
+    assert!(matches!(
+        record_commit(&store, &proof, &rollback, 3, 3).await,
+        RecordOutcomeResult::Created(_)
+    ));
+    assert_eq!(
+        store
+            .assignment_handoff_checkpoint(&rollback)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn drain_commit_rejects_a_handoff_that_is_not_the_current_commit() {
+    let store = store(1_000);
+    let incumbent = owner(1, 1, 1);
+    let LeaseOutcome::Acquired(lease) = store
+        .acquire_or_renew_current_term_for_test(&incumbent, 0)
+        .await
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let proof = lease.proof();
+    let transition = assignment_drain_transition(&incumbent, proof.clone());
+    let first = match record_commit(&store, &proof, &transition.predecessor, 1, 1).await {
+        RecordOutcomeResult::Created(outcome) => outcome.committed_checkpoint.unwrap(),
+        outcome => panic!("unexpected first checkpoint result: {outcome:?}"),
+    };
+    assert!(matches!(
+        record_commit(&store, &proof, &transition.predecessor, 2, 2).await,
+        RecordOutcomeResult::Created(_)
+    ));
+    let decision = AssignmentDrainDecision::commit(&transition, proof.clone(), first).unwrap();
+    assert!(matches!(
+        store
+            .record_assignment_drain_decision(&proof, decision)
+            .await,
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(_)
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn handoff_pin_rejects_stale_commits_and_releases_on_a_target_commit() {
+    let store = store(1_000);
+    let incumbent = owner(1, 1, 1);
+    let LeaseOutcome::Acquired(lease) = store
+        .acquire_or_renew_current_term_for_test(&incumbent, 0)
+        .await
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let proof = lease.proof();
+    let transition = assignment_drain_transition(&incumbent, proof.clone());
+    let handoff = match record_commit(&store, &proof, &transition.predecessor, 1, 1).await {
+        RecordOutcomeResult::Created(outcome) => outcome.committed_checkpoint.unwrap(),
+        outcome => panic!("unexpected handoff checkpoint result: {outcome:?}"),
+    };
+    let decision =
+        AssignmentDrainDecision::commit(&transition, proof.clone(), handoff.clone()).unwrap();
+    assert!(matches!(
+        store
+            .record_assignment_drain_decision(&proof, decision)
+            .await
+            .unwrap(),
+        RecordAssignmentDrainDecisionResult::Created(_)
+    ));
+    assert_eq!(
+        store
+            .assignment_handoff_checkpoint(&transition.target)
+            .await
+            .unwrap()
+            .as_ref(),
+        Some(&handoff)
+    );
+
+    assert!(matches!(
+        try_record_commit(&store, &proof, &transition.predecessor, 2, 2).await,
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(_)
+        ))
+    ));
+
+    let target = match record_commit(&store, &proof, &transition.target, 3, 3).await {
+        RecordOutcomeResult::Created(outcome) => outcome.committed_checkpoint.unwrap(),
+        outcome => panic!("unexpected target checkpoint result: {outcome:?}"),
+    };
+    assert_eq!(
+        store
+            .assignment_handoff_checkpoint(&transition.target)
+            .await
+            .unwrap(),
+        None
+    );
+    let cleanup = store
+        .begin_cluster_artifact_cleanup(&proof, target, accept_recovery_artifacts)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cleanup.current, handoff);
 }
 
 #[tokio::test]

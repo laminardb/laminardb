@@ -1715,6 +1715,9 @@ impl CheckpointCoordinator {
                         warn!("cluster checkpoint retention has no cluster controller");
                         return;
                     };
+                    if controller.checkpoint_drain_transition().is_some() {
+                        return;
+                    }
                     let authority = match controller.checkpoint_authority() {
                         Ok(authority) => authority,
                         Err(error) => {
@@ -1764,6 +1767,9 @@ impl CheckpointCoordinator {
             return Err(DbError::Checkpoint(
                 "cluster checkpoint retention leader proof is no longer live".into(),
             ));
+        }
+        if controller.checkpoint_drain_transition().is_some() {
+            return Ok(());
         }
         let authority = controller.checkpoint_authority().map_err(|error| {
             DbError::Checkpoint(format!("cluster checkpoint retention authority: {error}"))
