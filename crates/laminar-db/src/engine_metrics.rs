@@ -93,18 +93,6 @@ pub struct EngineMetrics {
     /// Cluster-shuffle pause after local capture while waiting for the global Aligned release.
     /// Embedded and single-node runtimes do not observe this metric.
     pub checkpoint_aligned_resume_wait: Histogram,
-    /// Time the leader's restorable gate spends polling for vnode
-    /// partials (failed gates that burn the timeout are observed too).
-    /// When this dominates restorable latency at production cadence,
-    /// the push-driven upload-completion-ack follow-up is worth
-    /// building.
-    pub checkpoint_restorable_gate_wait: Histogram,
-    /// Vnode partials written as references to an unchanged base
-    /// instead of re-uploading state.
-    pub checkpoint_unchanged_vnodes: IntCounter,
-    /// Sealed-but-not-yet-externally-committed epochs for coordinated sinks
-    /// (designated-committer lag). Rising = the committer can't keep up.
-    pub coordinated_committer_lag_epochs: IntGauge,
     /// Sink pre-commit round-trip (2PC phase 1).
     pub sink_precommit_duration: Histogram,
     /// On-demand lookup cache hits (served without a source fetch). Label: `table`.
@@ -340,25 +328,6 @@ impl EngineMetrics {
                 .buckets(prometheus::exponential_buckets(0.001, 2.0, 16).unwrap()),
             )
             .unwrap()),
-            // Gate timeout default 10s. 0.001 * 2^14 = 16.38s.
-            checkpoint_restorable_gate_wait: reg!(Histogram::with_opts(
-                HistogramOpts::new(
-                    "checkpoint_restorable_gate_wait_seconds",
-                    "Restorable-gate poll wait per epoch (vnode-partial presence)",
-                )
-                .buckets(prometheus::exponential_buckets(0.001, 2.0, 15).unwrap()),
-            )
-            .unwrap()),
-            coordinated_committer_lag_epochs: reg!(IntGauge::new(
-                "coordinated_committer_lag_epochs",
-                "Sealed epochs not yet externally committed by the designated committer",
-            )
-            .unwrap()),
-            checkpoint_unchanged_vnodes: reg!(IntCounter::new(
-                "checkpoint_unchanged_vnodes_total",
-                "Vnode partials written as unchanged-base references"
-            )
-            .unwrap()),
             // The one attempt deadline defaults to 120s. 0.005 * 2^15 = 163.84s.
             sink_precommit_duration: reg!(Histogram::with_opts(
                 HistogramOpts::new("sink_precommit_duration_seconds", "Sink pre-commit latency")
@@ -402,7 +371,7 @@ impl EngineMetrics {
             .unwrap()),
             placement_blast_radius_ratio: reg!(Gauge::new(
                 "placement_blast_radius_ratio",
-                "Largest single domain's share of all vnodes (0-1); state that goes Restoring if it fails"
+                "Largest single domain's share of all vnodes (0-1); state affected if it fails"
             )
             .unwrap()),
             pipeline_faults_total: reg!(IntCounter::new(

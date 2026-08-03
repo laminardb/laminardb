@@ -1071,7 +1071,6 @@ fn test_coordinator(
         manual_active: None,
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
-        coordinated_commit_admission: None,
         public_generation: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
@@ -1186,101 +1185,6 @@ async fn configured_source_channel_exhaustion_is_a_fault() {
             if reason.contains("all configured source tasks exited unexpectedly")),
         "configured-source exhaustion was reported as a clean stop: {exit:?}"
     );
-}
-
-#[tokio::test]
-async fn shutdown_drain_wakes_committer_and_waits_for_zero_exact_lag() {
-    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(8);
-    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
-    let mut coordinator = test_coordinator(
-        rx,
-        control_rx,
-        Arc::new(tokio::sync::Notify::new()),
-        DeliveryGuarantee::ExactlyOnce,
-        Some(Duration::from_secs(1)),
-    );
-    let pending = Arc::new(AtomicU64::new(1));
-    let known = Arc::new(AtomicBool::new(true));
-    let admission = crate::checkpoint_coordinator::CoordinatedCommitAdmission::for_test(
-        Arc::clone(&pending),
-        known,
-        4,
-    );
-    let wake = admission.committer_wakeup_for_test();
-    let progress = admission.progress_notify();
-    coordinator.coordinated_commit_admission = Some(admission);
-
-    let worker = tokio::spawn(async move {
-        wake.notified().await;
-        pending.store(0, Ordering::Release);
-        progress.notify_one();
-    });
-    tokio::time::timeout(
-        Duration::from_millis(250),
-        coordinator.drain_coordinated_commits(),
-    )
-    .await
-    .expect("shutdown drain should be event-driven")
-    .expect("zero exact lag should complete the drain");
-    worker.await.unwrap();
-}
-
-#[tokio::test]
-async fn external_commit_hard_bound_backpressures_source_consumption() {
-    let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(8);
-    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
-    let mut coordinator = test_coordinator(
-        rx,
-        control_rx,
-        Arc::clone(&shutdown),
-        DeliveryGuarantee::ExactlyOnce,
-        None,
-    );
-    let pending = Arc::new(AtomicU64::new(1));
-    let known = Arc::new(AtomicBool::new(true));
-    let admission = crate::checkpoint_coordinator::CoordinatedCommitAdmission::for_test(
-        Arc::clone(&pending),
-        known,
-        1,
-    );
-    let progress = admission.progress_notify();
-    coordinator.coordinated_commit_admission = Some(admission);
-
-    let callback = MockCallback::new();
-    let written_rows = Arc::clone(&callback.written_rows);
-    let join = tokio::spawn(async move { coordinator.run(callback).await });
-    tx.send(SourceMsg::Batch {
-        source_idx: 0,
-        batch: int_batch(7),
-        checkpoint: checkpoint_at(1),
-    })
-    .await
-    .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(
-        written_rows.load(Ordering::Acquire),
-        0,
-        "source data must remain queued while the external hard bound is closed"
-    );
-
-    pending.store(0, Ordering::Release);
-    progress.notify_one();
-    tokio::time::timeout(Duration::from_millis(500), async {
-        while written_rows.load(Ordering::Acquire) == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("source consumption should resume on exact external progress");
-
-    shutdown.notify_one();
-    let exit = tokio::time::timeout(Duration::from_secs(1), join)
-        .await
-        .expect("coordinator must shut down")
-        .unwrap();
-    assert!(matches!(exit, ExitReason::Shutdown));
 }
 
 #[tokio::test]
@@ -1436,41 +1340,6 @@ async fn intake_gate_close_after_receive_parks_fifo_message_until_reopen() {
 
     shutdown.notify_one();
     assert!(matches!(run.await.unwrap(), ExitReason::Shutdown));
-}
-
-#[tokio::test]
-async fn source_fault_bypasses_external_commit_data_backpressure() {
-    let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(8);
-    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
-    let mut coordinator = test_coordinator(
-        rx,
-        control_rx,
-        Arc::new(tokio::sync::Notify::new()),
-        DeliveryGuarantee::ExactlyOnce,
-        None,
-    );
-    let pending = Arc::new(AtomicU64::new(1));
-    coordinator.coordinated_commit_admission = Some(
-        crate::checkpoint_coordinator::CoordinatedCommitAdmission::for_test(
-            pending,
-            Arc::new(AtomicBool::new(true)),
-            1,
-        ),
-    );
-    let (fault_tx, fault_rx) = tokio::sync::mpsc::unbounded_channel();
-    coordinator.source_fault_rx = fault_rx;
-
-    fault_tx
-        .send(SourceFault {
-            source: Arc::from("faulted-source"),
-            error: "injected control-plane fault".into(),
-        })
-        .unwrap();
-    let exit = tokio::time::timeout(Duration::from_secs(1), coordinator.run(MockCallback::new()))
-        .await
-        .expect("source fault was hidden behind external-commit backpressure");
-    assert!(matches!(exit, ExitReason::Fault(ref reason)
-            if reason.contains("injected control-plane fault")));
 }
 
 fn checkpoint_source_handle(
@@ -2174,45 +2043,6 @@ async fn sourced_pipeline_without_output_streams_has_one_periodic_barrier_path()
     assert_eq!(callback.control_checkpoint_calls, 0);
     assert_eq!(callback.reserve_calls, 1);
     assert!(callback.barrier_captures.is_empty());
-    assert_eq!(
-        poll.poll(),
-        Some(CheckpointBarrier::new(
-            reserved.checkpoint_id,
-            reserved.epoch
-        ))
-    );
-}
-
-#[tokio::test]
-async fn coordinated_external_bound_defers_before_attempt_reservation() {
-    let (source, poll) = checkpoint_source_handle("input-only");
-    let mut coordinator = admission_coordinator(vec![source]);
-    let pending = Arc::new(AtomicU64::new(0));
-    let known = Arc::new(AtomicBool::new(false));
-    coordinator.coordinated_commit_admission = Some(
-        crate::checkpoint_coordinator::CoordinatedCommitAdmission::for_test(
-            Arc::clone(&pending),
-            Arc::clone(&known),
-            2,
-        ),
-    );
-    let mut callback = MockCallback::new();
-    let reserved = CheckpointAttempt::canonical(10_001);
-    callback.attempt_to_reserve = reserved;
-
-    coordinator.maybe_checkpoint(&mut callback).await;
-    assert_eq!(callback.reserve_calls, 0, "unknown cursor state must gate");
-    assert_eq!(poll.poll(), None);
-
-    known.store(true, Ordering::Release);
-    pending.store(2, Ordering::Release);
-    coordinator.maybe_checkpoint(&mut callback).await;
-    assert_eq!(callback.reserve_calls, 0, "the exact cap must gate");
-    assert_eq!(poll.poll(), None);
-
-    pending.store(1, Ordering::Release);
-    coordinator.maybe_checkpoint(&mut callback).await;
-    assert_eq!(callback.reserve_calls, 1);
     assert_eq!(
         poll.poll(),
         Some(CheckpointBarrier::new(
@@ -7324,7 +7154,6 @@ async fn test_coordinator_direct_channel() {
         manual_active: None,
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
-        coordinated_commit_admission: None,
         public_generation: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
@@ -7777,7 +7606,6 @@ async fn shutdown_does_not_synthesize_final_checkpoint() {
         manual_active: None,
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
-        coordinated_commit_admission: None,
         public_generation: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
@@ -8063,7 +7891,6 @@ async fn test_barrier_excludes_post_barrier_data() {
         manual_active: None,
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
-        coordinated_commit_admission: None,
         public_generation: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
@@ -8254,7 +8081,6 @@ async fn test_settle_pending_offsets_holds_failed_source() {
         manual_active: None,
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
-        coordinated_commit_admission: None,
         public_generation: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
@@ -8543,7 +8369,6 @@ async fn test_drain_skip_under_backpressure() {
         manual_active: None,
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
-        coordinated_commit_admission: None,
         public_generation: None,
         #[cfg(feature = "cluster")]
         process_authority: None,

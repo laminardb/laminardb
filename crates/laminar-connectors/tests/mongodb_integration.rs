@@ -480,7 +480,7 @@ async fn checkpoint_resume_covers_empty_anchor_and_exact_emitted_token() {
             SourceStart::new(
                 connector_config.clone(),
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
                     checkpoint: empty_checkpoint,
                 },
                 DeliveryGuarantee::AtLeastOnce,
@@ -519,7 +519,7 @@ async fn checkpoint_resume_covers_empty_anchor_and_exact_emitted_token() {
             SourceStart::new(
                 connector_config,
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::canonical(2),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(2),
                     checkpoint,
                 },
                 DeliveryGuarantee::AtLeastOnce,
@@ -577,7 +577,7 @@ async fn checkpoint_resume_rejects_a_tampered_deployment_identity() {
             SourceStart::new(
                 connector_config,
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::canonical(2),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(2),
                     checkpoint,
                 },
                 DeliveryGuarantee::AtLeastOnce,
@@ -663,7 +663,7 @@ async fn invalidate_checkpoint_rejects_recreated_collection() {
             SourceStart::new(
                 connector_config,
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::canonical(3),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(3),
                     checkpoint: invalidate_checkpoint,
                 },
                 DeliveryGuarantee::AtLeastOnce,
@@ -735,7 +735,7 @@ async fn resume_token_can_cut_between_events_from_one_mongodb_transaction() {
             SourceStart::new(
                 connector_config,
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::canonical(4),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(4),
                     checkpoint: first_checkpoint,
                 },
                 DeliveryGuarantee::AtLeastOnce,

@@ -417,7 +417,7 @@ mod tests {
                 crate::connector::SourceStart::new(
                     ConnectorConfig::new("mock"),
                     crate::connector::SourcePosition::Resume {
-                        attempt: laminar_core::state::CheckpointAttempt::new(5, 5),
+                        attempt: laminar_core::checkpoint::CheckpointAttempt::new(5, 5),
                         checkpoint,
                     },
                     crate::connector::DeliveryGuarantee::AtLeastOnce,

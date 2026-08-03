@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use laminar_core::state::{KeyGroupCount, StateBackendDurability, DEFAULT_KEY_GROUP_COUNT};
+use laminar_core::checkpoint::object_store_builder::CheckpointStorageScope;
+use laminar_core::state::{KeyGroupCount, DEFAULT_KEY_GROUP_COUNT};
 use laminar_db::DeliveryGuarantee;
 use regex::Regex;
 use serde::Deserialize;
@@ -349,8 +350,8 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
                 config.checkpoint.interval,
             ));
         }
-        let checkpoint_scope = StateBackendDurability::for_storage_url(&config.checkpoint.url);
-        if !checkpoint_scope.satisfies(StateBackendDurability::ClusterShared) {
+        let checkpoint_scope = CheckpointStorageScope::for_url(&config.checkpoint.url);
+        if checkpoint_scope != CheckpointStorageScope::ClusterShared {
             errors.push(format!(
                 "mode = \"cluster\" requires ClusterShared [checkpoint] storage for manifests \
                  and decisions; configured scope is {checkpoint_scope:?}. Use s3://, gs://, or \
@@ -366,16 +367,16 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
                     .to_string(),
             );
         }
-        let checkpoint_scope = StateBackendDurability::for_storage_url(&config.checkpoint.url);
-        if !checkpoint_scope.satisfies(StateBackendDurability::NodeDurable) {
+        let checkpoint_scope = CheckpointStorageScope::for_url(&config.checkpoint.url);
+        if checkpoint_scope == CheckpointStorageScope::Volatile {
             errors.push(format!(
                 "exactly-once delivery requires at least NodeDurable [checkpoint] storage; \
                  configured scope is {checkpoint_scope:?}"
             ));
         }
     } else if config.server.delivery == DeliveryGuarantee::AtLeastOnce {
-        let checkpoint_scope = StateBackendDurability::for_storage_url(&config.checkpoint.url);
-        if !checkpoint_scope.satisfies(StateBackendDurability::NodeDurable) {
+        let checkpoint_scope = CheckpointStorageScope::for_url(&config.checkpoint.url);
+        if checkpoint_scope == CheckpointStorageScope::Volatile {
             errors.push(format!(
                 "at-least-once delivery requires at least NodeDurable [checkpoint] storage \
                  before source acknowledgements can advance; configured scope is \
@@ -390,8 +391,8 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     if config.checkpoint.timeout.is_zero() {
         errors.push("checkpoint.timeout must be > 0".to_string());
     }
-    if config.checkpoint.max_staged_bytes == Some(0) {
-        errors.push("checkpoint.max_staged_bytes must be > 0".to_string());
+    if config.checkpoint.max_node_data_bytes == Some(0) {
+        errors.push("checkpoint.max_node_data_bytes must be > 0".to_string());
     }
     if config.checkpoint.max_retained == 0 {
         errors.push("checkpoint.max_retained must be > 0".to_string());
@@ -643,7 +644,6 @@ pub struct CheckpointSection {
     #[serde(default = "default_checkpoint_timeout", with = "humantime_serde")]
     pub timeout: Duration,
     /// Number of predecessor checkpoints retained alongside the current recovery cut.
-    /// Predecessors keep reference/delta chains resolvable.
     #[serde(default = "default_max_retained")]
     pub max_retained: usize,
     /// Cloud storage credentials/config (e.g., `aws_access_key_id`).
@@ -652,7 +652,7 @@ pub struct CheckpointSection {
     /// Cap on captured-state bytes held by in-flight epochs awaiting
     /// upload; admission pauses at the cap. Default 512 MiB.
     #[serde(default)]
-    pub max_staged_bytes: Option<u64>,
+    pub max_node_data_bytes: Option<u64>,
 }
 
 impl Default for CheckpointSection {
@@ -663,7 +663,7 @@ impl Default for CheckpointSection {
             timeout: default_checkpoint_timeout(),
             max_retained: default_max_retained(),
             storage: std::collections::HashMap::new(),
-            max_staged_bytes: None,
+            max_node_data_bytes: None,
         }
     }
 }
@@ -684,7 +684,7 @@ impl std::fmt::Debug for CheckpointSection {
                     .map(|k| (k, "[REDACTED]"))
                     .collect::<Vec<_>>(),
             )
-            .field("max_staged_bytes", &self.max_staged_bytes)
+            .field("max_node_data_bytes", &self.max_node_data_bytes)
             .finish()
     }
 }
@@ -1523,8 +1523,8 @@ connector = "kafka"
         assert_eq!(config.server.delivery, DeliveryGuarantee::AtLeastOnce);
         assert_eq!(config.server.resolved_key_groups().get(), 256);
         assert_eq!(
-            StateBackendDurability::for_storage_url(&config.checkpoint.url),
-            StateBackendDurability::ClusterShared
+            CheckpointStorageScope::for_url(&config.checkpoint.url),
+            CheckpointStorageScope::ClusterShared
         );
         assert!(config.discovery.is_some());
 
@@ -1539,7 +1539,7 @@ connector = "kafka"
     }
 
     #[test]
-    fn test_runtime_durability_scope_is_fail_closed() {
+    fn checkpoint_storage_scope_is_fail_closed() {
         let local_exact: ServerConfig =
             toml::from_str("[server]\ndelivery = \"exactly_once\"\n").unwrap();
         validate_config(&local_exact)
@@ -2450,24 +2450,6 @@ incremental_emit = false
         .unwrap();
 
         assert!(!config.server.incremental_emit);
-    }
-
-    #[test]
-    fn checkpoint_rejects_removed_mechanism_knobs() {
-        for option in [
-            r#"snapshot_strategy = "incremental""#,
-            "delta_chain_max = 2",
-        ] {
-            let input = format!(
-                r#"
-[checkpoint]
-{option}
-"#,
-            );
-            let error = toml::from_str::<ServerConfig>(&input)
-                .expect_err("removed checkpoint knobs must not be silently ignored");
-            assert!(error.to_string().contains("unknown field"), "{error}");
-        }
     }
 
     #[test]

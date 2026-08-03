@@ -1027,7 +1027,7 @@ impl MvStore {
     }
 }
 
-/// Prefix for MV entries in the `operator_states` checkpoint map.
+/// Prefix for materialized-view checkpoint frame identifiers.
 pub(crate) const CHECKPOINT_KEY_PREFIX: &str = "mv:";
 
 #[cfg(test)]
@@ -2133,7 +2133,7 @@ mod tests {
     }
 
     #[test]
-    fn multiset_restore_rejects_legacy_expanded_snapshot_atomically() {
+    fn multiset_restore_rejects_expanded_snapshot_atomically() {
         let mut store = MvStore::new();
         store
             .create_mv("m", one_col_schema(), MvStorageMode::Multiset)
@@ -2142,8 +2142,8 @@ mod tests {
         let before = multiset_values(&store, "m");
         let before_bytes = store.total_bytes();
 
-        let legacy = plain_one_col_batch(&[20, 20]);
-        let bytes = batches_to_ipc(&legacy.schema(), std::iter::once(&legacy)).unwrap();
+        let expanded = plain_one_col_batch(&[20, 20]);
+        let bytes = batches_to_ipc(&expanded.schema(), std::iter::once(&expanded)).unwrap();
         let error = store.restore_from_ipc("m", &bytes).unwrap_err();
         assert!(error.to_string().contains("schema or format mismatch"));
         assert_eq!(multiset_values(&store, "m"), before);

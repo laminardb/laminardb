@@ -17,12 +17,9 @@ use super::leader::leader_of;
 use super::snapshot::AssignmentSnapshotStore;
 use crate::checkpoint::{
     AssignmentDrainId, AssignmentDrainTransition, CheckpointAssignmentAdoption,
-    CheckpointAssignmentFence, CheckpointParticipant, LeaderProof, PreparedCheckpointWitness,
-    MAX_CHECKPOINT_PARTICIPANTS, MAX_PREPARED_CHECKPOINT_WITNESSES,
+    CheckpointAssignmentFence, CheckpointParticipant, LeaderProof, MAX_CHECKPOINT_PARTICIPANTS,
 };
 use crate::cluster::discovery::{assignable_node_ids, NodeId, NodeInfo, NodeState};
-#[cfg(test)]
-use crate::state::CheckpointAttempt;
 use crate::state::Locality;
 
 const RECOVERY_INCARNATION_KEY: &str = "control:recovery-incarnation";
@@ -33,9 +30,9 @@ const RELEASE_READY_ACK_KEY: &str = "control:recovery-release-ready";
 const RELEASE_READY_PROTOCOL_VERSION: u16 = 2;
 const RECOVERY_STOPPED_REPORT_KEY: &str = "control:recovery-stopped";
 /// Current wire version for a recovery stopped report.
-const RECOVERY_STOPPED_REPORT_PROTOCOL_VERSION: u16 = 3;
+const RECOVERY_STOPPED_REPORT_PROTOCOL_VERSION: u16 = 4;
 /// Maximum encoded size of one recovery stopped report.
-const MAX_RECOVERY_STOPPED_REPORT_BYTES: usize = 32 * 1_024;
+const MAX_RECOVERY_STOPPED_REPORT_BYTES: usize = 1_024;
 /// Shared ceiling for mutable recovery intents and immutable release terminals.
 pub(super) const MAX_RECOVERY_ANNOUNCEMENT_BYTES: usize = 256 * 1_024;
 const RECOVERY_CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -482,10 +479,7 @@ pub struct LocalProcessAuthorityEvidence {
     pub adopted_assignment: CheckpointAssignmentAdoption,
 }
 
-/// Boot-bound phase-one acknowledgement and unresolved prepared-checkpoint inventory.
-///
-/// The report is recovery evidence, not a checkpoint outcome. Its exact round and publisher bind
-/// it to one frozen process quorum; every prepared witness still requires an immutable outcome.
+/// Boot-bound acknowledgement that one process quiesced for a frozen recovery round.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryStoppedReport {
@@ -497,27 +491,19 @@ pub struct RecoveryStoppedReport {
     round_sha256: String,
     /// Stable node slot and boot incarnation that published this report.
     publisher: CheckpointParticipant,
-    /// Canonically ordered unresolved prepared-checkpoint evidence visible to the publisher.
-    prepared_witnesses: Vec<PreparedCheckpointWitness>,
 }
 
 impl RecoveryStoppedReport {
     /// Construct a canonical stopped report.
     ///
     /// # Errors
-    /// Returns an error when the round, publisher, inventory ordering, count, or encoded size is
-    /// invalid.
-    pub fn new(
-        round: &RecoveryRound,
-        publisher: CheckpointParticipant,
-        prepared_witnesses: Vec<PreparedCheckpointWitness>,
-    ) -> Result<Self, String> {
+    /// Returns an error when the round, publisher, or encoded size is invalid.
+    pub fn new(round: &RecoveryRound, publisher: CheckpointParticipant) -> Result<Self, String> {
         let report = Self {
             protocol_version: RECOVERY_STOPPED_REPORT_PROTOCOL_VERSION,
             round_id: round.id,
             round_sha256: recovery_round_sha256(round)?,
             publisher,
-            prepared_witnesses,
         };
         report.validate(round)?;
         Ok(report)
@@ -533,12 +519,6 @@ impl RecoveryStoppedReport {
     #[must_use]
     pub const fn publisher(&self) -> CheckpointParticipant {
         self.publisher
-    }
-
-    /// Canonically ordered unresolved prepared-checkpoint evidence.
-    #[must_use]
-    pub fn prepared_witnesses(&self) -> &[PreparedCheckpointWitness] {
-        &self.prepared_witnesses
     }
 
     /// Validate all semantic and encoded-size invariants of this report.
@@ -570,31 +550,6 @@ impl RecoveryStoppedReport {
         }
         if self.publisher.node_id == 0 || self.publisher.boot_incarnation.is_nil() {
             return Err("recovery stopped report publisher is not canonical".into());
-        }
-        if self.prepared_witnesses.len() > MAX_PREPARED_CHECKPOINT_WITNESSES {
-            return Err(format!(
-                "recovery stopped report has {} prepared witnesses; maximum is {MAX_PREPARED_CHECKPOINT_WITNESSES}",
-                self.prepared_witnesses.len()
-            ));
-        }
-        for witness in &self.prepared_witnesses {
-            witness.validate()?;
-            if witness.participant_id != self.publisher.node_id {
-                return Err(format!(
-                    "prepared checkpoint witness participant {} does not match report publisher {}",
-                    witness.participant_id, self.publisher.node_id
-                ));
-            }
-        }
-        if self
-            .prepared_witnesses
-            .windows(2)
-            .any(|pair| pair[0].ordering_key() >= pair[1].ordering_key())
-        {
-            return Err(
-                "recovery stopped report witnesses must be uniquely sorted by epoch, checkpoint ID, and participant"
-                    .into(),
-            );
         }
         Ok(())
     }
@@ -1078,7 +1033,7 @@ pub struct ClusterController {
     /// Per-process request identity; shared authority assigns the cluster-visible fault sequence.
     recovery_fault_request_sequence: AtomicU64,
     /// Recovery-safe cluster watermark installed after an immutable Commit outcome or from a
-    /// validated recovery capsule. `i64::MIN` = uninitialised.
+    /// validated committed checkpoint. `i64::MIN` = uninitialised.
     cluster_min_watermark: Arc<AtomicI64>,
     /// While draining, the node excludes itself from [`Self::assignable_instances`] so the
     /// next rotation sheds its vnodes before it exits.
@@ -1249,7 +1204,7 @@ impl ClusterController {
     }
 
     /// Latest recovery-safe cluster watermark installed from an immutable Commit outcome or a
-    /// validated recovery capsule.
+    /// validated committed checkpoint.
     #[must_use]
     pub fn cluster_min_watermark(&self) -> Option<i64> {
         let v = self.cluster_min_watermark.load(Ordering::Acquire);
@@ -4204,11 +4159,7 @@ impl ClusterController {
     ///
     /// # Errors
     /// Returns an error for invalid state or when this node is outside the stopped roster.
-    pub async fn announce_stopped(
-        &self,
-        round: &RecoveryRound,
-        prepared_witnesses: Vec<PreparedCheckpointWitness>,
-    ) -> Result<(), String> {
+    pub async fn announce_stopped(&self, round: &RecoveryRound) -> Result<(), String> {
         round.validate()?;
         if !round.contains_stopped_participant(self.instance_id) {
             return Err("node outside recovery stopped roster cannot acknowledge Prepare".into());
@@ -4225,7 +4176,6 @@ impl ClusterController {
                 node_id: self.instance_id.0,
                 boot_incarnation: self.recovery_incarnation,
             },
-            prepared_witnesses,
         )?;
         let encoded = encode_recovery_stopped_report(&report, round)?;
         self.write_recovery_value_exact(RECOVERY_STOPPED_REPORT_KEY, encoded)

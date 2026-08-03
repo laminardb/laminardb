@@ -761,7 +761,7 @@ mod tests {
         0xb9, 0x7a, 0xe0, 0x88, 0x2c, 0x69, 0x03, 0x3d, 0x10, 0x8b, 0xc8, 0x2d, 0x77, 0xaa, 0x00,
         0x97, 0x2f,
     ];
-    const CAPSULE: [u8; 32] = [9; 32];
+    const COMMITTED_INDEX_DIGEST: [u8; 32] = [9; 32];
     const TOPOLOGY: [u8; 32] = [10; 32];
     const BOOT: [u8; 16] = [11; 16];
     const INTERVAL_A: [u8; 16] = [12; 16];
@@ -837,7 +837,7 @@ mod tests {
                     identity,
                     epoch: 61,
                     checkpoint_id: 61,
-                    capsule_sha256: &CAPSULE,
+                    committed_index_sha256: &COMMITTED_INDEX_DIGEST,
                     base_assignment_version: 7,
                     base_assignment_certificate_sha256: &ASSIGNMENT_7,
                 },

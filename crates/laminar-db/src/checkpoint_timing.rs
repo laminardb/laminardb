@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use laminar_core::checkpoint::CheckpointAttempt;
 use laminar_core::cluster::control::LocalProcessAuthorityIdentity;
-use laminar_core::state::CheckpointAttempt;
 
 /// Process-lifetime barrier observations retained before incremental collection must run.
 pub const CHECKPOINT_BARRIER_TIMING_CAPACITY: usize = 1_024;

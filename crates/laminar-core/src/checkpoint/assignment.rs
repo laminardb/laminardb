@@ -9,7 +9,7 @@ use crate::state::{KeyGroupCount, PARTITIONING_ABI_VERSION};
 ///
 /// Every receiver admits one persistent stream from each of the other 128 participants; the
 /// receiver itself does not consume an inbound peer stream. Assignment certificates above this
-/// bound cannot seal a cluster-wide shuffle barrier and therefore fail admission.
+/// bound cannot establish a cluster-wide shuffle barrier and therefore fail admission.
 pub const MAX_CHECKPOINT_PARTICIPANTS: usize = 128 + 1;
 
 /// One exact process participating in a checkpoint cut.

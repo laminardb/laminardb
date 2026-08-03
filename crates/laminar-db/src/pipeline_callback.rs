@@ -11,11 +11,9 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::SinkContract;
-use laminar_core::checkpoint::CheckpointWatermark;
-use laminar_core::state::CheckpointAttempt;
 #[cfg(feature = "cluster")]
-use laminar_core::state::CheckpointAttemptRelation;
-use laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint;
+use laminar_core::checkpoint::CheckpointAttemptRelation;
+use laminar_core::checkpoint::{CheckpointAttempt, CheckpointWatermark, ConnectorCheckpoint};
 use rustc_hash::FxHashMap;
 
 use crate::db::{filter_late_rows, SourceWatermarkState};
@@ -149,8 +147,6 @@ struct LeaderTail {
     operator_state: Option<CapturedOperatorState>,
     operator_state_encoded_budget: u64,
     mutable_operator_capture_guard: Option<MutableCheckpointCaptureGuard>,
-    #[allow(clippy::disallowed_types)]
-    vnode_states: crate::checkpoint_coordinator::StagedVnodeStates,
     fan_out: FxHashMap<String, SourceCheckpoint>,
     local_watermark: CheckpointWatermark,
     attempt: CheckpointAttempt,
@@ -167,8 +163,7 @@ struct LeaderTail {
     leader_proof: Option<laminar_core::cluster::control::LeaderProof>,
     #[cfg(feature = "cluster")]
     quorum_timeout: Duration,
-    #[cfg(feature = "cluster")]
-    delta_rebase_needed: Arc<std::sync::atomic::AtomicBool>,
+    full_vnode_capture_needed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn checkpoint_failure_requires_pipeline_fault(
@@ -176,14 +171,6 @@ fn checkpoint_failure_requires_pipeline_fault(
     fault_on_retryable_failure: bool,
 ) -> bool {
     result.requires_recovery() || fault_on_retryable_failure
-}
-
-#[cfg(feature = "cluster")]
-fn vnode_capture_requires_full_rebase(previous_epoch: Option<u64>, epoch: u64) -> bool {
-    match previous_epoch {
-        Some(previous) => previous.checked_add(1) != Some(epoch),
-        None => true,
-    }
 }
 
 /// Captured follower state and the runtime handles that own its decision-led durable tail.
@@ -195,7 +182,7 @@ struct FollowerDurableTail {
     state: Arc<FollowerTailState>,
     complete_tx: crossfire::MAsyncTx<crossfire::mpsc::Array<CheckpointCompletion>>,
     controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
-    delta_rebase_needed: Arc<std::sync::atomic::AtomicBool>,
+    full_vnode_capture_needed: Arc<std::sync::atomic::AtomicBool>,
     checkpoint_fault: Arc<parking_lot::Mutex<Option<String>>>,
     request: crate::checkpoint_coordinator::CheckpointRequest,
     operator_state: Option<CapturedOperatorState>,
@@ -203,7 +190,6 @@ struct FollowerDurableTail {
     mutable_operator_capture_guard: Option<MutableCheckpointCaptureGuard>,
     assignment_fence: laminar_core::cluster::control::CheckpointAssignmentFence,
     identity: CertifiedCheckpointAttempt,
-    vnode_states: crate::checkpoint_coordinator::StagedVnodeStates,
     fan_out: FxHashMap<String, SourceCheckpoint>,
     local_watermark: CheckpointWatermark,
     attempt: CheckpointAttempt,
@@ -417,8 +403,7 @@ async fn fail_reserved_leader_attempt(
     if tail.fault_on_failure {
         set_checkpoint_fault(&tail.checkpoint_fault, terminal_error.clone());
     }
-    #[cfg(feature = "cluster")]
-    tail.delta_rebase_needed
+    tail.full_vnode_capture_needed
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
     let cleanup_deadline = tokio::time::Instant::now() + tail.checkpoint_cleanup_timeout;
@@ -459,37 +444,27 @@ async fn fail_reserved_leader_attempt(
     }
 }
 
-fn combine_operator_checkpoint_states<I>(
-    graph_state: Option<bytes::Bytes>,
-    mv_states: I,
-) -> std::collections::HashMap<String, bytes::Bytes>
-where
-    I: IntoIterator<Item = (String, bytes::Bytes)>,
-{
-    let mut states = std::collections::HashMap::with_capacity(2);
-    if let Some(bytes) = graph_state {
-        states.insert("operator_graph".to_string(), bytes);
-    }
-    states.extend(mv_states);
-    states
-}
-
 const GRAPH_CHECKPOINT_CAPTURE_OVERHEAD: u64 = 256;
 const GRAPH_CHECKPOINT_ENTRY_OVERHEAD: u64 = 128;
 
 fn graph_checkpoint_capture_estimated_bytes(
-    checkpoint: Option<&crate::operator_graph::GraphCheckpoint>,
+    checkpoint: &crate::operator_graph::GraphStateCapture,
 ) -> Result<u64, DbError> {
-    let Some(checkpoint) = checkpoint else {
-        return Ok(0);
-    };
-    checkpoint.operators.iter().try_fold(
-        GRAPH_CHECKPOINT_CAPTURE_OVERHEAD,
-        |total, (name, data)| {
+    checkpoint
+        .whole
+        .iter()
+        .map(|state| (state.operator_id.as_str(), Some(&state.state)))
+        .chain(
+            checkpoint
+                .vnodes
+                .iter()
+                .map(|(name, state)| (name.as_str(), state.state.as_ref())),
+        )
+        .try_fold(GRAPH_CHECKPOINT_CAPTURE_OVERHEAD, |total, (name, data)| {
             let name_bytes = u64::try_from(name.len()).map_err(|_| {
                 DbError::Checkpoint("operator checkpoint name size does not fit u64".into())
             })?;
-            let data_bytes = u64::try_from(data.len()).map_err(|_| {
+            let data_bytes = u64::try_from(data.map_or(0, bytes::Bytes::len)).map_err(|_| {
                 DbError::Checkpoint("operator checkpoint state size does not fit u64".into())
             })?;
             total
@@ -499,12 +474,11 @@ fn graph_checkpoint_capture_estimated_bytes(
                 .ok_or_else(|| {
                     DbError::Checkpoint("operator checkpoint capture size overflowed u64".into())
                 })
-        },
-    )
+        })
 }
 
 struct OperatorStateCapture {
-    graph: Option<crate::operator_graph::GraphCheckpoint>,
+    graph: crate::operator_graph::GraphStateCapture,
     materialized_views: crate::mv_store::MvCheckpointCapture,
     reference_tables: Option<crate::table_store::ReferenceTableCheckpointCapture>,
     serialization_permit: tokio::sync::OwnedSemaphorePermit,
@@ -514,7 +488,7 @@ impl OperatorStateCapture {
     fn encode(
         self,
         max_encoded_bytes: u64,
-    ) -> Result<std::collections::HashMap<String, bytes::Bytes>, DbError> {
+    ) -> Result<Vec<crate::checkpoint_coordinator::CapturedStateFrame>, DbError> {
         let Self {
             graph,
             materialized_views,
@@ -523,28 +497,41 @@ impl OperatorStateCapture {
         } = self;
         let mut remaining = max_encoded_bytes;
 
-        let graph = graph
-            .as_ref()
-            .map(|checkpoint| {
-                crate::operator_graph::OperatorGraph::serialize_checkpoint_bounded(
-                    checkpoint, remaining,
-                )
-            })
-            .transpose()?
-            .map(|state| {
-                let retained = u64::try_from(state.capacity()).map_err(|_| {
-                    DbError::Checkpoint(
-                        "operator graph checkpoint capacity does not fit u64".into(),
-                    )
-                })?;
-                remaining = remaining.checked_sub(retained).ok_or_else(|| {
-                    DbError::Checkpoint(
-                        "operator graph checkpoint exceeded its staged-state budget".into(),
-                    )
-                })?;
-                Ok::<_, DbError>(bytes::Bytes::from(state))
-            })
-            .transpose()?;
+        let mut frames = Vec::with_capacity(graph.whole.len() + graph.vnodes.len() + 1);
+        for state in graph.whole {
+            let retained = u64::try_from(state.state.len()).unwrap_or(u64::MAX);
+            remaining = remaining.checked_sub(retained).ok_or_else(|| {
+                DbError::Checkpoint("operator frames exceeded their staged-state budget".into())
+            })?;
+            frames.push(crate::checkpoint_coordinator::CapturedStateFrame {
+                key: laminar_core::checkpoint::StateFrameKey::OperatorWhole {
+                    operator_id: format!("graph:{}", state.operator_id),
+                },
+                state: Some(state.state),
+            });
+        }
+        for (operator_id, captured) in graph.vnodes {
+            let vnode = u16::try_from(captured.vnode).map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "operator '{operator_id}' captured vnode {} outside the checkpoint ABI",
+                    captured.vnode
+                ))
+            })?;
+            let retained = captured
+                .state
+                .as_ref()
+                .map_or(0, |state| u64::try_from(state.len()).unwrap_or(u64::MAX));
+            remaining = remaining.checked_sub(retained).ok_or_else(|| {
+                DbError::Checkpoint("vnode frames exceeded their staged-state budget".into())
+            })?;
+            frames.push(crate::checkpoint_coordinator::CapturedStateFrame {
+                key: laminar_core::checkpoint::StateFrameKey::Vnode {
+                    operator_id: format!("graph:{operator_id}"),
+                    vnode,
+                },
+                state: captured.state,
+            });
+        }
 
         let (materialized_views, mv_retained_bytes) =
             materialized_views.encode(remaining)?.into_parts();
@@ -555,25 +542,32 @@ impl OperatorStateCapture {
         let reference_tables = reference_tables
             .map(|capture| capture.encode(remaining))
             .transpose()?;
-        let mut states = combine_operator_checkpoint_states(graph, materialized_views);
-        if let Some(reference_tables) = reference_tables {
-            if states
-                .insert(
-                    crate::table_store::REFERENCE_TABLE_CHECKPOINT_KEY.to_string(),
-                    reference_tables,
-                )
-                .is_some()
-            {
-                return Err(DbError::Checkpoint(
-                    "reserved reference-table checkpoint key collision".into(),
-                ));
+        frames.extend(materialized_views.into_iter().map(|(operator_id, state)| {
+            crate::checkpoint_coordinator::CapturedStateFrame {
+                key: laminar_core::checkpoint::StateFrameKey::OperatorWhole { operator_id },
+                state: Some(state),
             }
+        }));
+        if let Some(reference_tables) = reference_tables {
+            frames.push(crate::checkpoint_coordinator::CapturedStateFrame {
+                key: laminar_core::checkpoint::StateFrameKey::OperatorWhole {
+                    operator_id: crate::table_store::REFERENCE_TABLE_CHECKPOINT_KEY.to_string(),
+                },
+                state: Some(reference_tables),
+            });
+        }
+
+        frames.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+        if frames.windows(2).any(|pair| pair[0].key == pair[1].key) {
+            return Err(DbError::Checkpoint(
+                "checkpoint capture produced a duplicate logical state frame".into(),
+            ));
         }
 
         // The permit is deliberately owned by the non-abortable worker. If its async waiter times
         // out, another checkpoint cannot capture a second image until this worker actually exits.
         drop(serialization_permit);
-        Ok(states)
+        Ok(frames)
     }
 }
 
@@ -586,17 +580,17 @@ struct CapturedOperatorState {
 }
 
 struct SerializedOperatorState {
-    states: std::collections::HashMap<String, bytes::Bytes>,
+    frames: Vec<crate::checkpoint_coordinator::CapturedStateFrame>,
     mutable_capture_guard: Option<MutableCheckpointCaptureGuard>,
 }
 
 impl SerializedOperatorState {
     #[cfg(test)]
-    fn accept_for_test(mut self) -> std::collections::HashMap<String, bytes::Bytes> {
+    fn accept_for_test(mut self) -> Vec<crate::checkpoint_coordinator::CapturedStateFrame> {
         if let Some(guard) = self.mutable_capture_guard.as_mut() {
             guard.disarm();
         }
-        self.states
+        self.frames
     }
 }
 
@@ -619,7 +613,7 @@ impl CapturedOperatorState {
         let serialization_deadline =
             attempt_deadline.min(tokio::time::Instant::now() + serialization_timeout);
         let worker = tokio::task::spawn_blocking(move || image.encode(max_encoded_bytes));
-        let states = match tokio::time::timeout_at(serialization_deadline, worker).await {
+        let frames = match tokio::time::timeout_at(serialization_deadline, worker).await {
             Err(_) => {
                 let error = format!(
                     "[LDB-6017] checkpoint state serialization timed out ({serialization_timeout:?})"
@@ -646,55 +640,18 @@ impl CapturedOperatorState {
             Ok(Ok(Ok(states))) => states,
         };
         Ok(SerializedOperatorState {
-            states,
+            frames,
             mutable_capture_guard,
         })
     }
 }
 
-/// Bytes held in memory by a pending checkpoint (operator states + per-vnode slices).
-#[allow(clippy::disallowed_types)]
-fn staged_request_bytes(
-    request: &crate::checkpoint_coordinator::CheckpointRequest,
-    vnode_states: &crate::checkpoint_coordinator::StagedVnodeStates,
-) -> u64 {
-    let ops = request
-        .operator_states
-        .values()
-        .fold(0_u64, |total, bytes| {
-            total.saturating_add(bytes.len() as u64)
-        });
-    let vnodes = vnode_states
-        .values()
-        .flat_map(|m| m.values())
-        .fold(0_u64, |total, slice| {
-            let slice_bytes = match slice {
-                crate::checkpoint_coordinator::StagedSlice::Bytes(b) => b.len() as u64,
-                crate::checkpoint_coordinator::StagedSlice::Delta(changed) => changed.len() as u64,
-            };
-            total.saturating_add(slice_bytes)
-        });
-    ops.saturating_add(vnodes)
-}
-
-fn staged_vnode_bytes(vnode_states: &crate::checkpoint_coordinator::StagedVnodeStates) -> u64 {
-    staged_request_bytes(
-        &crate::checkpoint_coordinator::CheckpointRequest::default(),
-        vnode_states,
-    )
-}
-
-fn encoded_operator_state_budget(
-    staged_cap_bytes: u64,
-    capture_bytes: u64,
-    vnode_bytes: u64,
-) -> Result<u64, String> {
+fn encoded_operator_state_budget(staged_cap_bytes: u64, capture_bytes: u64) -> Result<u64, String> {
     staged_cap_bytes
         .checked_sub(capture_bytes)
-        .and_then(|remaining| remaining.checked_sub(vnode_bytes))
         .ok_or_else(|| {
             format!(
-                "checkpoint immutable capture ({capture_bytes} operator bytes and {vnode_bytes} vnode bytes) exceeds the staged-state cap of {staged_cap_bytes} bytes"
+                "checkpoint immutable capture ({capture_bytes} bytes) exceeds the staged-state cap of {staged_cap_bytes} bytes"
             )
         })
 }
@@ -1041,10 +998,6 @@ pub(crate) struct ConnectorPipelineCallback {
     /// `None` only outside a clustered vnode runtime.
     #[cfg(feature = "cluster")]
     pub(crate) vnode_registry: Option<Arc<laminar_core::state::VnodeRegistry>>,
-    /// Assignment version that last installed an exact source recovery cut.
-    /// Carry-only assignment publications must not rewind live watermark state.
-    #[cfg(feature = "cluster")]
-    pub(crate) reconciled_source_handoff_version: Option<u64>,
     /// Bounded exact-identity bindings and overlapping durable tails for follower admission.
     #[cfg(feature = "cluster")]
     pub(crate) follower_tail: Arc<FollowerTailState>,
@@ -1066,14 +1019,9 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) checkpoint_tail_tasks: tokio::task::JoinSet<()>,
     /// In-flight epoch count; the coordinator serializes durable checkpoint tails.
     pub(crate) checkpoint_in_flight: Arc<std::sync::atomic::AtomicU64>,
-    /// Set by a checkpoint tail on epoch failure; the next capture consumes it to force a FULL
-    /// re-base. Serialized checkpoint tails ensure the flag is observed before the next capture.
-    #[cfg(feature = "cluster")]
-    pub(crate) delta_rebase_needed: Arc<std::sync::atomic::AtomicBool>,
-    /// Last epoch whose vnode snapshot completed in this callback. Leader high-watermark adoption
-    /// can jump epochs without a local failure, which must force a FULL before delta capture.
-    #[cfg(feature = "cluster")]
-    pub(crate) last_vnode_capture_epoch: Option<u64>,
+    /// Set when a captured image is not committed. The next capture must include every owned
+    /// vnode because dirty flags were consumed by the abandoned attempt.
+    pub(crate) full_vnode_capture_needed: Arc<std::sync::atomic::AtomicBool>,
     /// Lock-free id allocator shared with the coordinator so barrier admission doesn't
     /// queue behind an earlier epoch's durable tail holding the coordinator mutex.
     pub(crate) epoch_allocator: Option<Arc<crate::checkpoint_coordinator::EpochAllocator>>,
@@ -1166,122 +1114,6 @@ impl ConnectorPipelineCallback {
             assignment_version: assignment_fence.assignment_version,
             assignment_digest: assignment_fence.digest(),
         })
-    }
-
-    #[cfg(feature = "cluster")]
-    fn reconcile_source_handoff_watermarks(&mut self) -> Result<(), String> {
-        let Some(registry) = self.vnode_registry.as_ref() else {
-            return Ok(());
-        };
-        let published = registry.versioned_snapshot();
-        let Some(installed_version) = published.source_handoff_installed_version() else {
-            return Ok(());
-        };
-        if self
-            .reconciled_source_handoff_version
-            .is_some_and(|reconciled| reconciled >= installed_version)
-        {
-            return Ok(());
-        }
-        let handoff = published.committed_source_handoff().ok_or_else(|| {
-            format!(
-                "assignment {installed_version} names an installed source handoff without its committed cut"
-            )
-        })?;
-
-        for (source_name, _) in handoff.sources() {
-            if !self.source_entries_for_wm.contains_key(source_name) {
-                return Err(format!(
-                    "committed checkpoint {:?} names unknown source '{source_name}'",
-                    handoff.attempt()
-                ));
-            }
-        }
-
-        let combined_watermark = handoff.recovery_watermark_frontier();
-
-        let mut tracker_watermarks = self.tracker.as_ref().map(|tracker| {
-            (0..tracker.num_sources())
-                .map(|source_id| {
-                    tracker
-                        .source_watermark(source_id)
-                        .filter(|watermark| *watermark != i64::MIN)
-                })
-                .collect::<Vec<_>>()
-        });
-        let mut tracker_idle = self.tracker.as_ref().map(|tracker| {
-            (0..tracker.num_sources())
-                .map(|source_id| tracker.is_idle(source_id))
-                .collect::<Vec<_>>()
-        });
-        if let (Some(watermarks), Some(idle)) = (tracker_watermarks.as_mut(), tracker_idle.as_mut())
-        {
-            for source_id in 0..watermarks.len() {
-                let source_name = self.source_name_arcs.get(&source_id).ok_or_else(|| {
-                    format!("watermark tracker source {source_id} has no canonical source name")
-                })?;
-                let recovered = handoff.source(source_name).ok_or_else(|| {
-                    format!(
-                        "committed checkpoint {:?} has no watermark state for tracked source '{}'",
-                        handoff.attempt(),
-                        source_name
-                    )
-                })?;
-                // A missing per-source value represents an idle source in an
-                // otherwise initialized cut. The committed cluster frontier is
-                // still a durable lower bound when that source reactivates.
-                watermarks[source_id] = recovered.watermark().or(combined_watermark);
-                idle[source_id] = handoff.cluster_watermark() == CheckpointWatermark::Idle;
-            }
-        }
-        if let Some(tracker) = self.tracker.as_mut() {
-            tracker
-                .restore_for_recovery(
-                    tracker_watermarks
-                        .as_deref()
-                        .expect("tracker recovery watermarks were constructed"),
-                    tracker_idle
-                        .as_deref()
-                        .expect("tracker recovery idle states were constructed"),
-                    combined_watermark,
-                )
-                .map_err(|error| error.to_string())?;
-        } else if handoff.cluster_watermark() != CheckpointWatermark::Idle {
-            return Err(format!(
-                "committed checkpoint {:?} has {:?} watermark state but the pipeline tracks no event-time sources",
-                handoff.attempt(),
-                handoff.cluster_watermark()
-            ));
-        }
-
-        for (source_name, recovered) in handoff.sources() {
-            let watermark = recovered
-                .watermark()
-                .or(combined_watermark)
-                .unwrap_or(i64::MIN);
-            self.source_entries_for_wm
-                .get(source_name)
-                .expect("source handoff names were validated above")
-                .source
-                .restore_watermark_for_recovery(watermark);
-            if let Some(state) = self.watermark_states.get_mut(source_name) {
-                state.generator.restore_watermark_for_recovery(watermark);
-            }
-        }
-        self.pipeline_watermark.store(
-            combined_watermark.unwrap_or(i64::MIN),
-            std::sync::atomic::Ordering::Release,
-        );
-        self.reconciled_source_handoff_version = Some(installed_version);
-        tracing::info!(
-            assignment_version = published.version(),
-            handoff_installed_version = installed_version,
-            attempt = ?handoff.attempt(),
-            sources = handoff.source_count(),
-            watermark = ?handoff.cluster_watermark(),
-            "installed committed source watermark handoff before intake"
-        );
-        Ok(())
     }
 
     fn reap_checkpoint_tail_tasks(&mut self) {
@@ -1655,7 +1487,7 @@ impl ConnectorPipelineCallback {
                 return;
             }
         };
-        tail.request.operator_states = serialized_operator_state.states;
+        tail.request.state_frames = serialized_operator_state.frames;
         tail.mutable_operator_capture_guard = serialized_operator_state.mutable_capture_guard;
 
         let source_offsets =
@@ -1691,7 +1523,6 @@ impl ConnectorPipelineCallback {
             fail_reserved_leader_attempt(&tail, error.clone(), error).await;
             return;
         };
-        coordinator.set_pending_vnode_states(std::mem::take(&mut tail.vnode_states));
         coordinator.set_local_watermark(tail.local_watermark);
         let result = coordinator
             .checkpoint_preallocated_started(
@@ -1718,8 +1549,7 @@ impl ConnectorPipelineCallback {
                 Self::complete_successful_leader_tail(tail, result, deadline).await;
             }
             Ok(result) => {
-                #[cfg(feature = "cluster")]
-                tail.delta_rebase_needed
+                tail.full_vnode_capture_needed
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 tracing::warn!(
                     epoch = result.epoch,
@@ -1747,8 +1577,7 @@ impl ConnectorPipelineCallback {
                 .await;
             }
             Err(error) => {
-                #[cfg(feature = "cluster")]
-                tail.delta_rebase_needed
+                tail.full_vnode_capture_needed
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 tracing::warn!(%error, "Barrier-aligned checkpoint error");
                 let terminal_error = error.to_string();
@@ -1819,7 +1648,6 @@ impl ConnectorPipelineCallback {
         &mut self,
         request: crate::checkpoint_coordinator::CheckpointRequest,
         operator_state: CapturedOperatorState,
-        vnode_states: crate::checkpoint_coordinator::StagedVnodeStates,
         identity: CertifiedCheckpointAttempt,
         fan_out: FxHashMap<String, SourceCheckpoint>,
         attempt_started: std::time::Instant,
@@ -1844,7 +1672,6 @@ impl ConnectorPipelineCallback {
         let operator_state_encoded_budget = encoded_operator_state_budget(
             self.checkpoint_state_cap_bytes,
             operator_state.estimated_bytes(),
-            staged_vnode_bytes(&vnode_states),
         )?;
         let local_watermark = self.checkpoint_watermark();
         let attempt = identity.attempt;
@@ -1866,7 +1693,7 @@ impl ConnectorPipelineCallback {
             state: Arc::clone(&self.follower_tail),
             complete_tx: self.checkpoint_complete_tx.clone(),
             controller: self.cluster_controller.clone(),
-            delta_rebase_needed: Arc::clone(&self.delta_rebase_needed),
+            full_vnode_capture_needed: Arc::clone(&self.full_vnode_capture_needed),
             checkpoint_fault: Arc::clone(&self.checkpoint_fault),
             request,
             operator_state: Some(operator_state),
@@ -1874,7 +1701,6 @@ impl ConnectorPipelineCallback {
             mutable_operator_capture_guard: None,
             assignment_fence,
             identity,
-            vnode_states,
             fan_out,
             local_watermark,
             attempt,
@@ -1892,10 +1718,6 @@ impl ConnectorPipelineCallback {
             .saturating_sub(tail.attempt_started.elapsed());
         let deadline = tokio::time::Instant::now() + remaining;
 
-        // The immutable source snapshot is already captured, so this acknowledgement may release
-        // `Aligned`. The leader's exact-attempt restorable gate still requires this participant's
-        // partial before a decision and therefore fences the materialization/prepare tail below.
-        Self::acknowledge_follower_capture(&tail, deadline).await;
         let Some(operator_state) = tail.operator_state.take() else {
             Self::fail_follower_tail_before_prepare(
                 &tail,
@@ -1922,7 +1744,7 @@ impl ConnectorPipelineCallback {
                 return;
             }
         };
-        tail.request.operator_states = serialized_operator_state.states;
+        tail.request.state_frames = serialized_operator_state.frames;
         tail.mutable_operator_capture_guard = serialized_operator_state.mutable_capture_guard;
 
         let source_offsets = match materialize_source_checkpoints_until(
@@ -1940,7 +1762,10 @@ impl ConnectorPipelineCallback {
         };
         tail.request.source_offset_overrides = source_offsets;
 
-        let prepared = Self::prepare_follower_tail_until(&mut tail, deadline).await;
+        let prepared = match Self::prepare_follower_tail_until(&mut tail, deadline).await {
+            Ok(()) => Self::acknowledge_follower_prepared(&tail, deadline).await,
+            Err(error) => Err(error),
+        };
         // Decision observation deliberately happens outside the coordinator mutex so a successor
         // epoch can prepare without queuing behind this attempt's control-plane wait.
         let outcome = Self::apply_follower_decision_until(&tail, prepared, deadline).await;
@@ -1967,19 +1792,19 @@ impl ConnectorPipelineCallback {
                 set_checkpoint_fault(&tail.checkpoint_fault, finish_error);
             }
         }
-        tail.delta_rebase_needed
+        tail.full_vnode_capture_needed
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(feature = "cluster")]
-    async fn acknowledge_follower_capture(
+    async fn acknowledge_follower_prepared(
         tail: &FollowerDurableTail,
         deadline: tokio::time::Instant,
-    ) {
-        let Some(controller) = tail.controller.as_ref() else {
-            return;
-        };
-        let _ = tokio::time::timeout_at(
+    ) -> Result<(), DbError> {
+        let controller = tail.controller.as_ref().ok_or_else(|| {
+            DbError::Checkpoint("follower prepared without a cluster controller".into())
+        })?;
+        tokio::time::timeout_at(
             deadline,
             controller.ack_barrier(&laminar_core::cluster::control::BarrierAck {
                 epoch: tail.attempt.epoch,
@@ -1990,7 +1815,11 @@ impl ConnectorPipelineCallback {
                 watermark: tail.local_watermark,
             }),
         )
-        .await;
+        .await
+        .map_err(|_| DbError::Checkpoint("follower prepared acknowledgement timed out".into()))?
+        .map_err(|error| {
+            DbError::Checkpoint(format!("follower prepared acknowledgement failed: {error}"))
+        })
     }
 
     #[cfg(feature = "cluster")]
@@ -1999,7 +1828,6 @@ impl ConnectorPipelineCallback {
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
         let request = std::mem::take(&mut tail.request);
-        let vnode_states = std::mem::take(&mut tail.vnode_states);
         let attempt = tail.attempt;
         let result = tokio::time::timeout_at(deadline, async {
             let mut guard = tail.coordinator.lock().await;
@@ -2008,7 +1836,6 @@ impl ConnectorPipelineCallback {
                     "[LDB-6045] checkpoint coordinator disappeared before follower prepare".into(),
                 )
             })?;
-            coordinator.set_pending_vnode_states(vnode_states);
             coordinator.set_local_watermark(tail.local_watermark);
             coordinator
                 .follower_prepare_acked_until(
@@ -2139,16 +1966,14 @@ impl ConnectorPipelineCallback {
         }
         if !committed {
             // Follower capture is destructive; every uncommitted outcome must re-base FULL next.
-            tail.delta_rebase_needed
+            tail.full_vnode_capture_needed
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
     /// Reject a follower capture or pre-prepare step under the attempt deadline.
     ///
-    /// When capture readiness was already acknowledged, the negative acknowledgement retracts it.
-    /// If quorum raced ahead, the exact-attempt restorable gate still refuses to seal without this
-    /// participant's partial.
+    /// A negative acknowledgement prevents the leader from admitting this participant.
     #[cfg(feature = "cluster")]
     async fn reject_follower_capture(
         controller: Option<&laminar_core::cluster::control::ClusterController>,
@@ -2724,21 +2549,6 @@ impl ConnectorPipelineCallback {
                 fence.assignment_version
             ));
         }
-        if self.vnode_registry.as_ref().is_some_and(|registry| {
-            let publication = registry.versioned_snapshot();
-            publication.version() == fence.assignment_version
-                && publication
-                    .source_handoff_installed_version()
-                    .is_some_and(|installed| {
-                        self.reconciled_source_handoff_version
-                            .is_none_or(|reconciled| reconciled < installed)
-                    })
-        }) {
-            return Some(format!(
-                "[LDB-6055] follower assignment {} source handoff is not installed",
-                fence.assignment_version
-            ));
-        }
         if !fence.contains(controller.instance_id().0) {
             return Some(
                 "[LDB-6055] follower is absent from the certified checkpoint roster".into(),
@@ -3126,19 +2936,12 @@ impl ConnectorPipelineCallback {
             return self.fail_pending_follower_control(attempt, error).await;
         }
 
-        // Vnode partials cover only explicitly sharded operators. The common builder captures
-        // aggregate channel replay and every non-vnode operator for both follower entry paths.
+        // Capture the complete local node image after shuffle alignment so follower entry paths
+        // cannot omit channel replay or non-keyed operator state.
         let (request, operator_state) = match self
             .build_follower_checkpoint_request_until(assignment_fence, attempt_deadline)
         {
             Ok(request) => request,
-            Err(error) => {
-                drop(checkpoint_rotation_guard);
-                return self.fail_pending_follower_control(attempt, error).await;
-            }
-        };
-        let vnode_states = match self.capture_vnode_states(attempt.epoch) {
-            Ok(states) => states,
             Err(error) => {
                 drop(checkpoint_rotation_guard);
                 return self.fail_pending_follower_control(attempt, error).await;
@@ -3162,7 +2965,6 @@ impl ConnectorPipelineCallback {
         let tail = match self.follower_tail_future(
             request,
             operator_state,
-            vnode_states,
             identity.clone(),
             source_offsets,
             attempt_started,
@@ -3329,13 +3131,6 @@ impl ConnectorPipelineCallback {
                 return BarrierOutcome::Failed;
             }
         };
-        let vnode_states = match self.capture_vnode_states(attempt.epoch) {
-            Ok(states) => states,
-            Err(error) => {
-                tracing::warn!(%error, "follower deferred vnode-state capture failed");
-                return BarrierOutcome::Failed;
-            }
-        };
         if let Err(error) = self.validate_checkpoint_assignment(Some(assignment_fence)) {
             let error = format!(
                 "deferred follower assignment changed during mutable state capture: {error}"
@@ -3355,7 +3150,6 @@ impl ConnectorPipelineCallback {
         let tail = match self.follower_tail_future(
             request,
             operator_state,
-            vnode_states,
             identity.clone(),
             source_checkpoints,
             attempt_started,
@@ -3445,7 +3239,7 @@ impl ConnectorPipelineCallback {
             );
         }
         let operator_state = self.capture_operator_state_until(deadline)?;
-        let mut request = self.build_checkpoint_request();
+        let mut request = self.build_checkpoint_request()?;
         request.assignment_fence = Some(assignment_fence.clone());
         Ok((request, operator_state))
     }
@@ -3614,19 +3408,6 @@ impl ConnectorPipelineCallback {
                         registry.assignment_version()
                     ));
                 }
-                let publication = registry.versioned_snapshot();
-                if publication
-                    .source_handoff_installed_version()
-                    .is_some_and(|installed| {
-                        self.reconciled_source_handoff_version
-                            .is_none_or(|reconciled| reconciled < installed)
-                    })
-                {
-                    return Err(format!(
-                        "[LDB-6055] assignment {} source handoff was not installed before checkpoint capture",
-                        admitted.assignment_version
-                    ));
-                }
                 let current = controller
                     .checkpoint_assignment_fence(admitted.assignment_version)
                     .ok_or_else(|| {
@@ -3710,29 +3491,37 @@ impl ConnectorPipelineCallback {
     ///
     /// Source offset overrides remain empty here. The immutable source snapshot is already owned
     /// by the durable tail, which materializes it on a blocking worker after the pipeline resumes.
-    fn build_checkpoint_request(&self) -> crate::checkpoint_coordinator::CheckpointRequest {
-        let recovery_watermark_frontier = self.effective_pipeline_watermark();
-        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
-        for (name, wm_state) in &self.watermark_states {
-            let wm = wm_state.generator.current_watermark();
-            if wm > i64::MIN {
-                per_source_watermarks.insert(name.clone(), wm);
+    fn build_checkpoint_request(
+        &self,
+    ) -> Result<crate::checkpoint_coordinator::CheckpointRequest, String> {
+        let mut channel_progress = Vec::new();
+        if let Some(tracker) = self.tracker.as_ref() {
+            channel_progress.reserve(tracker.num_sources());
+            for source_id in 0..tracker.num_sources() {
+                let channel_id = self.source_name_arcs.get(&source_id).ok_or_else(|| {
+                    format!(
+                        "watermark tracker source {source_id} has no stable checkpoint channel identity"
+                    )
+                })?;
+                channel_progress.push(laminar_core::checkpoint::ChannelProgress {
+                    // The checkpoint coordinator binds the participant when it packs the
+                    // node-local manifest. Capture remains deployment-neutral.
+                    participant_id: 0,
+                    channel_id: channel_id.to_string(),
+                    watermark: tracker
+                        .source_watermark(source_id)
+                        .filter(|watermark| *watermark != i64::MIN),
+                    idle: tracker.is_idle(source_id),
+                });
             }
+            channel_progress.sort_unstable_by(|left, right| left.channel_id.cmp(&right.channel_id));
         }
-        crate::checkpoint_coordinator::CheckpointRequest {
+        Ok(crate::checkpoint_coordinator::CheckpointRequest {
             assignment_fence: None,
-            operator_states: std::collections::HashMap::new(),
-            // Numeric recovery progress is distinct from Active/Idle status. In particular, an
-            // idle cut retains the last initialized frontier instead of erasing it on restart.
-            watermark: (recovery_watermark_frontier != i64::MIN)
-                .then_some(recovery_watermark_frontier),
-            table_store_checkpoint_path: None,
-            // Reference-table rows are not yet part of the atomic state snapshot. Persisting a
-            // source cursor without those rows can skip the startup snapshot after recovery.
-            extra_table_offsets: HashMap::new(),
-            source_watermarks: per_source_watermarks,
+            state_frames: Vec::new(),
+            channel_progress,
             source_offset_overrides: HashMap::new(),
-        }
+        })
     }
 
     fn checkpoint_watermark(&self) -> CheckpointWatermark {
@@ -3779,19 +3568,26 @@ impl ConnectorPipelineCallback {
                 }
             })?;
 
-        let graph = match self.graph.snapshot_state() {
+        if self
+            .full_vnode_capture_needed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.graph.force_full_vnode_capture();
+        }
+        let graph = match self.graph.capture_state() {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
+                self.full_vnode_capture_needed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 let error = format!("snapshot failed: {error}");
                 return Err(self.fault_mutable_checkpoint_capture("operator state", &error));
             }
         };
-        let mut mutable_capture_guard = graph
-            .as_ref()
-            .map(|_| MutableCheckpointCaptureGuard::new(Arc::clone(&self.checkpoint_fault)));
+        let mut mutable_capture_guard = (!graph.whole.is_empty() || !graph.vnodes.is_empty())
+            .then(|| MutableCheckpointCaptureGuard::new(Arc::clone(&self.checkpoint_fault)));
 
         let capture = (|| -> Result<(OperatorStateCapture, u64), DbError> {
-            let graph_estimate = graph_checkpoint_capture_estimated_bytes(graph.as_ref())?;
+            let graph_estimate = graph_checkpoint_capture_estimated_bytes(&graph)?;
             let mv_budget = self
                 .checkpoint_state_cap_bytes
                 .checked_sub(graph_estimate)
@@ -3843,6 +3639,8 @@ impl ConnectorPipelineCallback {
         let (image, estimated_bytes) = match capture {
             Ok(capture) => capture,
             Err(error) => {
+                self.full_vnode_capture_needed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 let error = format!("checkpoint image capture failed: {error}");
                 return Err(fail_after_mutable_capture(
                     &mut mutable_capture_guard,
@@ -3860,52 +3658,17 @@ impl ConnectorPipelineCallback {
     #[cfg(test)]
     async fn capture_and_serialize_operator_state(
         &mut self,
-    ) -> Result<std::collections::HashMap<String, bytes::Bytes>, String> {
+    ) -> Result<Vec<crate::checkpoint_coordinator::CapturedStateFrame>, String> {
         let deadline = tokio::time::Instant::now() + self.serialization_timeout;
         let capture = self.capture_operator_state_until(deadline)?;
         let encoded_budget = encoded_operator_state_budget(
             self.checkpoint_state_cap_bytes,
             capture.estimated_bytes(),
-            0,
         )?;
         capture
             .serialize_until(encoded_budget, self.serialization_timeout, deadline)
             .await
             .map(SerializedOperatorState::accept_for_test)
-    }
-
-    /// Capture per-vnode operator state for the in-flight checkpoint.
-    ///
-    /// Empty outside cluster mode. A cluster capture failure faults the runtime because an empty
-    /// map is a valid stateless snapshot and cannot encode partially consumed live state.
-    #[cfg(feature = "cluster")]
-    fn capture_vnode_states(
-        &mut self,
-        epoch: u64,
-    ) -> Result<crate::checkpoint_coordinator::StagedVnodeStates, String> {
-        // This proactive re-base avoids sacrificing an attempt after an allocator jump. The
-        // coordinator separately requires a sealed, immediately preceding parent before it
-        // persists any delta manifest or marker.
-        let failed_capture = self
-            .delta_rebase_needed
-            .swap(false, std::sync::atomic::Ordering::SeqCst);
-        if failed_capture
-            || vnode_capture_requires_full_rebase(self.last_vnode_capture_epoch, epoch)
-        {
-            self.graph.force_full_rebase();
-        }
-        match self.graph.snapshot_state_by_vnode() {
-            Ok(states) => {
-                self.last_vnode_capture_epoch = Some(epoch);
-                Ok(states)
-            }
-            Err(error) => {
-                self.delta_rebase_needed
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                let error = format!("per-vnode state snapshot failed: {error}");
-                Err(self.fault_mutable_checkpoint_capture("per-vnode state", &error))
-            }
-        }
     }
 
     /// Sync all sinks and drain their events; `sink_timed_out` is current after this returns.
@@ -4519,20 +4282,10 @@ impl ConnectorPipelineCallback {
 
     fn capture_leader_checkpoint_state(
         &mut self,
-        attempt: CheckpointAttempt,
+        _attempt: CheckpointAttempt,
         attempt_deadline: tokio::time::Instant,
-    ) -> Result<
-        (
-            CapturedOperatorState,
-            crate::checkpoint_coordinator::StagedVnodeStates,
-            u64,
-        ),
-        crate::pipeline::BarrierOutcome,
-    > {
+    ) -> Result<(CapturedOperatorState, u64), crate::pipeline::BarrierOutcome> {
         use crate::pipeline::BarrierOutcome;
-
-        #[cfg(not(feature = "cluster"))]
-        let _ = attempt;
 
         let operator_state = match self.capture_operator_state_until(attempt_deadline) {
             Ok(capture) => capture,
@@ -4550,26 +4303,9 @@ impl ConnectorPipelineCallback {
             return Err(BarrierOutcome::Failed);
         }
 
-        #[cfg(feature = "cluster")]
-        let vnode_states = match self.capture_vnode_states(attempt.epoch) {
-            Ok(states) => states,
-            Err(error) => {
-                tracing::warn!(
-                    checkpoint_id = attempt.checkpoint_id,
-                    epoch = attempt.epoch,
-                    error = %error,
-                    "barrier checkpoint vnode capture failed"
-                );
-                return Err(BarrierOutcome::Failed);
-            }
-        };
-        #[cfg(not(feature = "cluster"))]
-        let vnode_states = std::collections::HashMap::new();
-
         let encoded_budget = match encoded_operator_state_budget(
             self.checkpoint_state_cap_bytes,
             operator_state.estimated_bytes(),
-            staged_vnode_bytes(&vnode_states),
         ) {
             Ok(budget) => budget,
             Err(error) => {
@@ -4577,7 +4313,7 @@ impl ConnectorPipelineCallback {
                 return Err(BarrierOutcome::Failed);
             }
         };
-        Ok((operator_state, vnode_states, encoded_budget))
+        Ok((operator_state, encoded_budget))
     }
 
     #[cfg(feature = "cluster")]
@@ -4613,8 +4349,6 @@ impl ConnectorPipelineCallback {
 
 impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     fn prepare_source_intake(&mut self) -> Result<(), String> {
-        #[cfg(feature = "cluster")]
-        self.reconcile_source_handoff_watermarks()?;
         Ok(())
     }
 
@@ -5443,9 +5177,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     ) -> crate::pipeline::CheckpointAssignmentAdmission {
         use crate::pipeline::CheckpointAssignmentAdmission;
 
-        if let Err(error) = self.reconcile_source_handoff_watermarks() {
-            return CheckpointAssignmentAdmission::Fault(error);
-        }
         let Some(controller) = self.cluster_controller.as_ref() else {
             return CheckpointAssignmentAdmission::Ready(None);
         };
@@ -5458,18 +5189,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             );
         };
         let publication = registry.versioned_snapshot();
-        if publication
-            .source_handoff_installed_version()
-            .is_some_and(|installed| {
-                self.reconciled_source_handoff_version
-                    .is_none_or(|reconciled| reconciled < installed)
-            })
-        {
-            return CheckpointAssignmentAdmission::Deferred(format!(
-                "assignment {} source handoff is not installed",
-                publication.version()
-            ));
-        }
         // The snapshot watcher performs the gossip scan off the hot path. Retain the exact
         // certificate so later capture/quorum/durable phases cannot silently switch generations.
         let Some(fence) = controller.checkpoint_assignment_fence(publication.version()) else {
@@ -5479,10 +5198,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             ));
         };
         let verified = registry.versioned_snapshot();
-        if verified.version() != publication.version()
-            || verified.source_handoff_installed_version()
-                != publication.source_handoff_installed_version()
-        {
+        if verified.version() != publication.version() {
             return CheckpointAssignmentAdmission::Deferred(
                 "assignment changed while checkpoint admission was being certified".into(),
             );
@@ -5563,15 +5279,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             if let Err(error) = self.require_process_authority("follower checkpoint control") {
                 return crate::pipeline::CheckpointControlOutcome::AdmissionFailed {
                     error: error.to_string(),
-                };
-            }
-            if let Err(error) = self.reconcile_source_handoff_watermarks() {
-                set_checkpoint_fault(
-                    &self.checkpoint_fault,
-                    format!("follower source handoff reconciliation failed: {error}"),
-                );
-                return crate::pipeline::CheckpointControlOutcome::AdmissionFailed {
-                    error: format!("follower source handoff reconciliation failed: {error}"),
                 };
             }
             if let Err(error) = self.reconcile_terminal_shuffle_barriers(cc.as_ref()).await {
@@ -5701,7 +5408,15 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return BarrierOutcome::Failed;
         }
 
-        let (operator_state, vnode_states, operator_state_encoded_budget) =
+        let mut request = match self.build_checkpoint_request() {
+            Ok(request) => request,
+            Err(error) => {
+                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+                tracing::warn!(%error, "checkpoint channel-state capture failed");
+                return BarrierOutcome::Failed;
+            }
+        };
+        let (operator_state, operator_state_encoded_budget) =
             match self.capture_leader_checkpoint_state(attempt, attempt_deadline) {
                 Ok(capture) => capture,
                 Err(outcome) => return outcome,
@@ -5721,7 +5436,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             Ok(proof) => proof,
             Err(outcome) => return outcome,
         };
-        let mut request = self.build_checkpoint_request();
         #[cfg(feature = "cluster")]
         let resume_certificate =
             assignment_fence
@@ -5748,7 +5462,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             operator_state: Some(operator_state),
             operator_state_encoded_budget,
             mutable_operator_capture_guard: None,
-            vnode_states,
             fan_out: source_checkpoints.clone(),
             local_watermark: self.checkpoint_watermark(),
             attempt,
@@ -5765,8 +5478,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             leader_proof,
             #[cfg(feature = "cluster")]
             quorum_timeout: self.quorum_timeout,
-            #[cfg(feature = "cluster")]
-            delta_rebase_needed: Arc::clone(&self.delta_rebase_needed),
+            full_vnode_capture_needed: Arc::clone(&self.full_vnode_capture_needed),
         };
         #[cfg(feature = "cluster")]
         if let Some(timing) = barrier_timing.as_mut() {

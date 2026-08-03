@@ -671,30 +671,20 @@ async fn local_checkpoint_barrier_timings_fixture_with_auth(
     ));
     let checkpoint_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
-    let state_store: Arc<dyn object_store::ObjectStore> =
-        Arc::new(object_store::memory::InMemory::new());
     let namespaces = prove_shared_object_store_namespaces(
         participant,
         &[participant],
         proof_control,
         checkpoint_store,
-        state_store,
         std::time::Duration::from_secs(1),
     )
     .await
     .unwrap();
     let vnode_count = u32::from(laminar_core::state::DEFAULT_KEY_GROUP_COUNT);
-    let state_backend: Arc<dyn laminar_core::state::StateBackend> =
-        Arc::new(laminar_core::state::ObjectStoreBackend::cluster_shared(
-            namespaces.state_store(),
-            "http-timing-test",
-            vnode_count,
-        ));
     let db = laminar_db::LaminarDbBuilder::new()
         .profile(laminar_db::Profile::Cluster)
         .cluster_controller(Arc::clone(&fixture.controller))
         .verified_cluster_namespaces(namespaces)
-        .state_backend(state_backend)
         .vnode_registry(Arc::new(laminar_core::state::VnodeRegistry::new(
             vnode_count,
         )))
@@ -3237,7 +3227,7 @@ fn maximum_checkpoint_barrier_timing_envelope_fits_the_response_cap() {
         .map(|sequence| CheckpointBarrierTimingRecord {
             sequence: u64::try_from(sequence).unwrap(),
             process,
-            attempt: laminar_core::state::CheckpointAttempt::canonical(u64::MAX),
+            attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(u64::MAX),
             role: CheckpointBarrierRole::Follower,
             assignment_version: u64::MAX,
             assignment_digest: [u8::MAX; 32],

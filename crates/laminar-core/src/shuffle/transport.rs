@@ -6,7 +6,7 @@
 
 use super::message::ShuffleMessage;
 #[cfg(feature = "cluster")]
-use crate::state::CheckpointAttempt;
+use crate::checkpoint::CheckpointAttempt;
 
 /// Secondary queue and holdover item bound; byte semaphores are the primary
 /// admission control in cluster mode.

@@ -1,7 +1,6 @@
 use super::*;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
-use laminar_core::state::InProcessBackend;
 use object_store::memory::InMemory;
 use object_store::{ObjectStore, ObjectStoreExt};
 
@@ -105,15 +104,16 @@ async fn install_running_test_vnode_state(
     );
 
     let checkpoint_dir = tempfile::tempdir().unwrap();
+    let checkpoint_store: Arc<dyn ObjectStore> = Arc::new(
+        object_store::local::LocalFileSystem::new_with_prefix(checkpoint_dir.path()).unwrap(),
+    );
     let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
         crate::checkpoint_coordinator::CheckpointConfig::default(),
-        Box::new(
-            laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
-                checkpoint_dir.path(),
-            ),
-        ),
+        Box::new(laminar_core::checkpoint::ObjectStoreCheckpointStore::new(
+            checkpoint_store,
+            "",
+        )),
     )
-    .await
     .unwrap();
     coordinator
         .bind_pipeline_identity(pipeline_identity)
@@ -253,45 +253,6 @@ fn snapshot(vnodes: BTreeMap<u32, NodeId>) -> AssignmentSnapshot {
     AssignmentSnapshot::empty()
         .next_for_participants(vnodes, participants)
         .unwrap()
-}
-
-fn synthetic_pending_boot_transition(
-    assignment_version: u64,
-    owners: &[NodeId],
-    participant: CheckpointParticipant,
-    attempt: laminar_core::state::CheckpointAttempt,
-    chains: HashMap<u32, Vec<bytes::Bytes>>,
-) -> Arc<crate::vnode_transition_staging::PendingVnodeTransition> {
-    let owner_ids: Vec<u64> = owners.iter().map(|owner| owner.0).collect();
-    let target = CheckpointAssignmentFence::from_owner_map(
-        assignment_version,
-        &owner_ids,
-        vec![participant],
-    )
-    .unwrap();
-    let identity = laminar_core::checkpoint::PipelineIdentity::empty();
-    let restore_cut =
-        crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut::synthetic_for_transition_test(
-            attempt,
-            identity.clone(),
-            target.clone(),
-            &owner_ids,
-        )
-        .unwrap();
-    Arc::new(
-        crate::vnode_transition_staging::PendingVnodeTransition::boot_recovery(
-            target,
-            owners,
-            participant,
-            identity,
-            restore_cut.into_transition_binding().unwrap(),
-            crate::recovery_manager::vnode_chains::LoadedVnodeChains::from_chains_for_test(
-                Some(attempt),
-                chains,
-            ),
-        )
-        .unwrap(),
-    )
 }
 
 fn draining_snapshot(
@@ -468,7 +429,6 @@ async fn predecessor_failure_fixture(
             self_process.boot_incarnation,
         )))
         .shuffle_receiver(shuffle_receiver)
-        .state_backend(Arc::new(InProcessBackend::new(vnode_count)))
         .vnode_registry(Arc::clone(&registry))
         .assignment_snapshot_store(Arc::clone(&durable))
         .build()
@@ -515,328 +475,6 @@ fn successor_checkpoint_roster_contains_only_successor_owners() {
     let owners = [NodeId(3), NodeId(1), NodeId(3), NodeId(1)];
     assert_eq!(successor_participant_ids(&owners), [1, 3]);
     assert!(!successor_participant_ids(&owners).contains(&2));
-}
-
-#[tokio::test]
-async fn recovery_suspension_is_deferred_for_pending_vnode_transition() {
-    let self_id = NodeId(1);
-    let controller = test_cluster_controller(self_id, uuid::Uuid::from_u128(11), None);
-    let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
-    let db = LaminarDB::builder()
-        .cluster_controller(Arc::clone(&controller))
-        .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .state_backend(Arc::new(InProcessBackend::new(1)))
-        .vnode_registry(Arc::clone(&registry))
-        .build()
-        .await
-        .unwrap();
-    db.set_source_gate(false);
-    let pending = synthetic_pending_boot_transition(
-        registry.assignment_version(),
-        &[self_id],
-        CheckpointParticipant {
-            node_id: self_id.0,
-            boot_incarnation: controller.recovery_incarnation(),
-        },
-        laminar_core::state::CheckpointAttempt::canonical(7),
-        HashMap::from([(0, vec![bytes::Bytes::from_static(b"pending")])]),
-    );
-    *db.pending_vnode_transition.lock() = Some(Arc::clone(&pending));
-    registry.mark_restoring(pending.acquired_vnodes());
-    let authority_revision = db
-        .assignment_authority_revision
-        .load(std::sync::atomic::Ordering::Acquire);
-
-    let suspended = try_suspend_recovery_assignment_authority(
-        &db,
-        &controller,
-        &registry,
-        tokio::time::Instant::now() + Duration::from_secs(1),
-    )
-    .await
-    .unwrap();
-
-    assert!(!suspended);
-    assert!(!db.cluster_intake_fenced());
-    assert_eq!(
-        db.assignment_authority_revision
-            .load(std::sync::atomic::Ordering::Acquire),
-        authority_revision
-    );
-    let retained = db
-        .pending_vnode_transition
-        .lock()
-        .clone()
-        .expect("suspension must retain pending work");
-    assert!(Arc::ptr_eq(&pending, &retained));
-    assert!(registry.is_restoring(0));
-
-    let removed = db
-        .pending_vnode_transition
-        .lock()
-        .take()
-        .expect("test transition must still be installed");
-    assert!(Arc::ptr_eq(&pending, &removed));
-    registry.mark_active(&[0]);
-    let suspended = try_suspend_recovery_assignment_authority(
-        &db,
-        &controller,
-        &registry,
-        tokio::time::Instant::now() + Duration::from_secs(1),
-    )
-    .await
-    .unwrap();
-
-    assert!(suspended);
-    assert!(db.cluster_intake_fenced());
-    assert!(
-        db.assignment_authority_revision
-            .load(std::sync::atomic::Ordering::Acquire)
-            > authority_revision
-    );
-}
-
-struct PendingPredecessorAuthorityFixture {
-    watcher: SnapshotWatcher,
-    db: Arc<LaminarDB>,
-    controller: Arc<ClusterController>,
-    registry: Arc<VnodeRegistry>,
-    sender: Arc<laminar_core::shuffle::ShuffleSender>,
-    receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
-    _leader_lease: tokio::sync::watch::Sender<Option<laminar_core::cluster::control::LeaderLease>>,
-    pending_transition: Arc<crate::vnode_transition_staging::PendingVnodeTransition>,
-    audited_successor: AuditedAssignmentAuthority,
-    current: AssignmentSnapshot,
-    successor: AssignmentSnapshot,
-}
-
-async fn pending_predecessor_authority_fixture(
-    recovering: bool,
-) -> PendingPredecessorAuthorityFixture {
-    let self_id = NodeId(1);
-    let boot = uuid::Uuid::from_u128(1);
-    let durable = Arc::new(store());
-    let current = snapshot(BTreeMap::from([(0, self_id)]));
-    durable.save_if_absent(&current).await.unwrap();
-
-    let controller = test_cluster_controller(self_id, boot, Some(Arc::clone(&durable)));
-    install_test_process_authority(&controller, &current.participants).await;
-    let leader_lease = grant_test_leadership(&controller).await;
-    let leader_proof = controller.capture_leader_proof().unwrap();
-    let draining = current
-        .next_draining(
-            current.vnodes.clone(),
-            current.participants.clone(),
-            leader_proof.clone(),
-        )
-        .unwrap();
-    let successor = draining.committed_target().unwrap();
-    durable
-        .save_if_version(&draining, current.version)
-        .await
-        .unwrap();
-    let decision = AssignmentDrainDecision::new(
-        draining.drain_transition.as_ref().unwrap(),
-        leader_proof.clone(),
-        AssignmentDrainVerdict::Commit,
-    )
-    .unwrap();
-    controller
-        .checkpoint_authority()
-        .unwrap()
-        .record_assignment_drain_decision(&leader_proof, decision)
-        .await
-        .unwrap();
-    durable.finalize_drain(&draining, &successor).await.unwrap();
-    let audited_successor = audit_assignment_snapshot_authority_outcome(
-        &durable,
-        Some(controller.as_ref()),
-        &successor,
-    )
-    .await
-    .unwrap();
-    controller.set_active(true);
-    controller.set_recovering(recovering);
-    let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
-    let receiver = Arc::new(
-        laminar_core::shuffle::ShuffleReceiver::bind(
-            self_id.0,
-            "127.0.0.1:0".parse().unwrap(),
-            boot,
-        )
-        .await
-        .unwrap(),
-    );
-    let sender = Arc::new(laminar_core::shuffle::ShuffleSender::new(self_id.0, boot));
-    let db = LaminarDB::builder()
-        .cluster_controller(Arc::clone(&controller))
-        .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .state_backend(Arc::new(InProcessBackend::new(1)))
-        .vnode_registry(Arc::clone(&registry))
-        .shuffle_sender(Arc::clone(&sender))
-        .shuffle_receiver(Arc::clone(&receiver))
-        .build()
-        .await
-        .unwrap();
-    db.set_source_gate(true);
-    let current_owners = current.to_vnode_vec(1).unwrap();
-    let pending_transition = synthetic_pending_boot_transition(
-        current.version,
-        &current_owners,
-        current.participants[0],
-        laminar_core::state::CheckpointAttempt::canonical(7),
-        HashMap::from([(
-            0,
-            vec![bytes::Bytes::from_static(b"pending-current-assignment")],
-        )]),
-    );
-    *db.pending_vnode_transition.lock() = Some(Arc::clone(&pending_transition));
-    registry.mark_restoring(pending_transition.acquired_vnodes());
-    let watcher = SnapshotWatcher::new(
-        Arc::clone(&db),
-        durable,
-        Arc::clone(&registry),
-        CancellationToken::new(),
-        RebalanceConfig::test_defaults(),
-        Some(Arc::clone(&controller)),
-    );
-    PendingPredecessorAuthorityFixture {
-        watcher,
-        db,
-        controller,
-        registry,
-        sender,
-        receiver,
-        _leader_lease: leader_lease,
-        pending_transition,
-        audited_successor,
-        current,
-        successor,
-    }
-}
-
-async fn assert_pending_predecessor_authority_is_repaired(recovering: bool) {
-    let mut fixture = pending_predecessor_authority_fixture(recovering).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    let error = fixture
-        .db
-        .adopt_assignment_snapshot(fixture.successor.clone(), deadline)
-        .await
-        .expect_err("the successor must wait for staged predecessor state");
-    assert!(error.is_shuffle_not_ready(), "{error}");
-    assert!(fixture.watcher.durable_snapshot.is_none());
-
-    fixture
-        .watcher
-        .ensure_current_assignment_authority_cached(&fixture.audited_successor, deadline)
-        .await
-        .expect("the exact predecessor must be recoverable from durable history");
-    assert_eq!(
-        fixture
-            .watcher
-            .durable_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.version),
-        Some(fixture.current.version)
-    );
-    assert_eq!(
-        fixture.registry.assignment_version(),
-        fixture.current.version
-    );
-
-    let authority_revision = fixture
-        .db
-        .assignment_authority_revision
-        .load(std::sync::atomic::Ordering::Acquire);
-    fixture
-        .watcher
-        .publish_authority(authority_revision, deadline)
-        .await;
-
-    assert_eq!(fixture.sender.assignment_version(), fixture.current.version);
-    assert_eq!(
-        fixture.receiver.assignment_version(),
-        fixture.current.version
-    );
-    assert_eq!(
-        fixture
-            .controller
-            .checkpoint_assignment_fence(fixture.current.version)
-            .map(|fence| fence.assignment_version),
-        Some(fixture.current.version)
-    );
-    assert_eq!(fixture.db.cluster_intake_fenced(), recovering);
-    let retained = fixture
-        .db
-        .pending_vnode_transition
-        .lock()
-        .clone()
-        .expect("predecessor repair must retain pending work");
-    assert!(Arc::ptr_eq(&fixture.pending_transition, &retained));
-    assert!(fixture.registry.is_restoring(0));
-}
-
-#[tokio::test]
-async fn watcher_repairs_uncached_predecessor_authority_before_successor_adoption() {
-    assert_pending_predecessor_authority_is_repaired(false).await;
-}
-
-#[tokio::test]
-async fn recovering_watcher_repairs_uncached_predecessor_without_opening_intake() {
-    assert_pending_predecessor_authority_is_repaired(true).await;
-}
-
-#[tokio::test]
-async fn watcher_republishes_ready_after_a_direct_readiness_withdrawal() {
-    let mut fixture = pending_predecessor_authority_fixture(false).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    fixture
-        .watcher
-        .ensure_current_assignment_authority_cached(&fixture.audited_successor, deadline)
-        .await
-        .unwrap();
-    fixture.db.pending_vnode_transition.lock().take();
-    fixture.registry.mark_active(&[0]);
-    let _checkpoint_dir = install_running_test_vnode_state(&fixture.db, &fixture.current).await;
-    let authority_revision = fixture
-        .db
-        .assignment_authority_revision
-        .load(std::sync::atomic::Ordering::Acquire);
-
-    fixture
-        .watcher
-        .publish_authority(authority_revision, deadline)
-        .await;
-    assert!(
-        fixture.controller.read_adopted_assignments().await.unwrap()[0]
-            .1
-            .vnode_state_ready
-    );
-
-    fixture
-        .db
-        .publish_local_vnode_state_report(
-            &fixture.controller,
-            &fixture.registry.versioned_snapshot(),
-            false,
-        )
-        .await
-        .unwrap();
-    assert!(
-        !fixture.controller.read_adopted_assignments().await.unwrap()[0]
-            .1
-            .vnode_state_ready
-    );
-
-    fixture
-        .watcher
-        .publish_authority(authority_revision, deadline)
-        .await;
-    assert!(
-        fixture.controller.read_adopted_assignments().await.unwrap()[0]
-            .1
-            .vnode_state_ready
-    );
 }
 
 #[tokio::test]
@@ -1028,7 +666,6 @@ async fn at_least_once_live_rotation_uses_the_global_drain_protocol() {
         .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .state_backend(Arc::new(InProcessBackend::new(vnode_count)))
         .vnode_registry(Arc::clone(&registry))
         .assignment_snapshot_store(Arc::clone(&durable))
         .build()
@@ -1071,25 +708,6 @@ async fn at_least_once_live_rotation_uses_the_global_drain_protocol() {
         .is_none());
 
     controller.publish_checkpoint_assignment_fence(Some(current.assignment_fence().unwrap()));
-    registry.mark_restoring(&[0]);
-    let deferred = try_rebalance(
-        &db,
-        &controller,
-        &durable,
-        &registry,
-        &[self_id, peer_id],
-        config,
-    )
-    .await
-    .expect("restoring vnode work should defer rather than fail rotation");
-    assert_eq!(deferred, None);
-    assert_eq!(durable.load().await.unwrap(), Some(current.clone()));
-    assert!(durable
-        .load_version(current.version + 1)
-        .await
-        .unwrap()
-        .is_none());
-    registry.mark_active(&[0]);
     db.publish_local_vnode_state_report(&controller, &registry.versioned_snapshot(), true)
         .await
         .unwrap();
@@ -1567,7 +1185,6 @@ async fn assignment_closure_cancels_shuffle_before_waiting_for_execution_drain()
     let db = LaminarDB::builder()
         .cluster_controller(controller)
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(registry)
         .shuffle_sender(Arc::clone(&sender))
         .shuffle_receiver(receiver)
@@ -1653,7 +1270,6 @@ async fn assignment_suspension_reasserts_closure_after_serialization_race() {
     let db = LaminarDB::builder()
         .cluster_controller(controller)
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(registry)
         .shuffle_sender(Arc::clone(&sender))
         .shuffle_receiver(receiver)
@@ -2151,7 +1767,6 @@ async fn watcher_resumes_exact_authority_after_transient_audit_gaps() {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(Arc::clone(&object_store))
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(Arc::clone(&registry))
         .assignment_snapshot_store(Arc::clone(&durable))
         .shuffle_sender(Arc::clone(&sender))
@@ -2393,7 +2008,6 @@ async fn unassigned_restarted_process_authorizes_successor_before_boot_adoption(
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .state_backend(Arc::new(InProcessBackend::new(2)))
         .vnode_registry(Arc::clone(&registry))
         .assignment_snapshot_store(Arc::clone(&durable))
         .build()
@@ -2478,7 +2092,6 @@ async fn restart_after_durable_drain_retains_abort_until_recovery() {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(Arc::clone(&registry))
         .assignment_snapshot_store(Arc::clone(&durable))
         .build()
@@ -2559,7 +2172,6 @@ async fn recovery_settles_drain_before_reusing_process_local_source_cuts() {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(Arc::clone(&registry))
         .assignment_snapshot_store(Arc::clone(&durable))
         .build()
@@ -2641,7 +2253,6 @@ async fn recovery_release_reapplies_a_committed_drain_to_replacement_sources() {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(Arc::clone(&registry))
         .assignment_snapshot_store(Arc::clone(&durable))
         .build()
@@ -2829,7 +2440,6 @@ async fn draining_head_with_dead_predecessor_owner_uses_retained_roster() {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(Arc::clone(&registry))
         .assignment_snapshot_store(Arc::clone(&durable))
         .build()
@@ -2983,7 +2593,6 @@ async fn replacement_process_aborts_drain_through_the_same_authority_sequence() 
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(Arc::clone(&registry))
         .assignment_snapshot_store(Arc::clone(&durable))
         .build()
@@ -3148,7 +2757,6 @@ async fn takeover_materializes_decision_written_before_snapshot_cas() {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(Arc::clone(&registry))
         .assignment_snapshot_store(Arc::clone(&durable))
         .build()

@@ -17,7 +17,7 @@ use laminar_connectors::connector::{
 use laminar_connectors::postgres::{
     Lsn, PostgresCdcConfig, PostgresCdcSource, PostgresLookupSource, PostgresLookupSourceConfig,
 };
-use laminar_core::state::CheckpointAttempt;
+use laminar_core::checkpoint::CheckpointAttempt;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use testcontainers::core::WaitFor;

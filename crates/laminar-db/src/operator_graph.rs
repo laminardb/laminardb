@@ -11,15 +11,14 @@ use datafusion::prelude::SessionContext;
 use laminar_core::state::{KeyGroupCount, DEFAULT_KEY_GROUP_COUNT};
 use laminar_sql::datafusion::live_source::{LiveSourceHandle, LiveSourceProvider};
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::{Deserialize, Serialize};
 
 use crate::config::BackpressurePolicy;
 use crate::db::exact_table_reference;
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
 #[cfg(feature = "cluster")]
-use crate::operator::capability::{ClusterExecutionStatus, OperatorStateClass};
-use crate::operator::capability::{OperatorCapability, OperatorImplementation};
+use crate::operator::capability::ClusterExecutionStatus;
+use crate::operator::capability::{OperatorCapability, OperatorImplementation, OperatorStateClass};
 #[cfg(feature = "cluster")]
 use crate::operator::RetainedBatch;
 use crate::sql_analysis::{
@@ -44,6 +43,17 @@ pub(crate) struct ManagedStateAccountingSnapshot {
     pub(crate) live: usize,
     pub(crate) prepared: usize,
     pub(crate) retired: usize,
+}
+
+/// One vnode slot captured at an aligned checkpoint cut.
+///
+/// `None` means the slot is unchanged from the preceding committed checkpoint. The checkpoint
+/// coordinator resolves it to that manifest's direct frame reference; operators never persist
+/// ancestry or backend-specific metadata.
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedVnodeState {
+    pub(crate) vnode: u32,
+    pub(crate) state: Option<bytes::Bytes>,
 }
 
 impl ManagedStateAccountingSnapshot {
@@ -144,18 +154,26 @@ pub(crate) trait GraphOperator: Send {
         )))
     }
 
-    /// Per-vnode state snapshot for cross-node rehydration. `None` for operators
-    /// that don't key state by vnode (they recover from the whole-node manifest).
-    #[cfg(feature = "cluster")]
-    fn checkpoint_by_vnode(
+    /// Capture the requested vnode slots in canonical order. `None` is reserved for operators
+    /// without vnode-managed state.
+    fn checkpoint_vnodes(
         &mut self,
         _required_vnodes: &[u32],
         _vnode_count: u32,
-    ) -> Result<
-        Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
-        DbError,
-    > {
+    ) -> Result<Option<Vec<CapturedVnodeState>>, DbError> {
         Ok(None)
+    }
+
+    /// Restore one full vnode frame during startup before the graph accepts input.
+    fn restore_vnode(
+        &mut self,
+        vnode: u32,
+        _vnode_count: u32,
+        _state: &[u8],
+    ) -> Result<(), DbError> {
+        Err(DbError::Checkpoint(format!(
+            "operator does not accept vnode checkpoint state for vnode {vnode}"
+        )))
     }
 
     /// Prepare this operator's exact revoke/restore batch without mutating live state.
@@ -191,19 +209,6 @@ pub(crate) trait GraphOperator: Send {
     #[cfg(feature = "cluster")]
     fn finish_vnode_transition(&mut self) {}
 
-    /// Test-only adapter for fault-containment probes that deliberately mutate live state.
-    #[cfg(all(feature = "cluster", test))]
-    fn apply_vnode_chain(
-        &mut self,
-        vnode: u32,
-        _base: &[u8],
-        _deltas: &[&[u8]],
-    ) -> Result<(), DbError> {
-        Err(DbError::Checkpoint(format!(
-            "test operator does not accept vnode checkpoint state for vnode {vnode}"
-        )))
-    }
-
     /// Test-only revocation adapter for fault-containment probes that mutate live state.
     #[cfg(all(feature = "cluster", test))]
     fn drop_owned_vnodes(&mut self, _revoked: &FxHashSet<u32>) -> Result<(), DbError> {
@@ -212,18 +217,16 @@ pub(crate) trait GraphOperator: Send {
         ))
     }
 
-    /// Force the next delta capture to re-base FULL after a failed epoch (destructive capture
-    /// cleared the dirty sets before durability). Default no-op; only delta aggregates act.
-    #[cfg(feature = "cluster")]
-    fn force_full_rebase(&mut self) {}
+    /// Force the next capture to include full bytes for every requested vnode. This is required
+    /// after a destructive dirty capture fails before the checkpoint commits.
+    fn force_full_vnode_capture(&mut self) {}
 }
 
-/// One authoritative FULL base and ordered delta chain prepared for a managed operator.
+/// One authoritative full vnode image prepared for a managed operator.
 #[cfg(feature = "cluster")]
 pub(crate) struct ManagedVnodeRestore<'a> {
     pub(crate) vnode: u32,
-    pub(crate) base: &'a [u8],
-    pub(crate) deltas: &'a [crate::vnode_restore_input::VnodeRestoreArchive<'a>],
+    pub(crate) state: &'a [u8],
 }
 
 /// Exact operator-local projection of one graph vnode transition.
@@ -271,11 +274,7 @@ fn publish_cluster_execution_poison(
         installed_vnode_state.lock().take();
     }
     if let Some((handle, expected)) = pending_vnode_transition {
-        if expected.has_restore_input_reservation() {
-            crate::vnode_transition_staging::retire_exact_pending_vnode_transition(
-                handle, expected,
-            );
-        }
+        crate::vnode_transition_staging::retire_exact_pending_vnode_transition(handle, expected);
     }
     poisoned.store(true, Ordering::Release);
 }
@@ -322,17 +321,19 @@ impl Drop for GraphExecutionAttemptGuard {
 
 const STATS_SAMPLE_INTERVAL: u64 = 32;
 
-// std HashMap: rkyv supports HashMap<K,V> natively but not FxHashMap; checkpoint path only.
-#[allow(clippy::disallowed_types)]
-pub(crate) type OperatorStateMap = std::collections::HashMap<String, Vec<u8>>;
+/// Logical ABI for independently checksummed operator and vnode frames.
+pub(crate) const STATE_FRAME_ABI_VERSION: u32 = 1;
 
-/// Persisted operator-graph state ABI.
-pub(crate) const GRAPH_CHECKPOINT_VERSION: u32 = 5;
+#[derive(Debug)]
+pub(crate) struct CapturedWholeState {
+    pub(crate) operator_id: String,
+    pub(crate) state: bytes::Bytes,
+}
 
-#[derive(Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub(crate) struct GraphCheckpoint {
-    pub version: u32,
-    pub operators: OperatorStateMap,
+#[derive(Debug, Default)]
+pub(crate) struct GraphStateCapture {
+    pub(crate) whole: Vec<CapturedWholeState>,
+    pub(crate) vnodes: Vec<(String, CapturedVnodeState)>,
 }
 
 struct GraphNode {
@@ -655,17 +656,10 @@ pub(crate) struct OperatorGraph {
     cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
     #[cfg(feature = "cluster")]
     last_execution_assignment_version: Option<u64>,
-    // `Some(chain_bound)` enables incremental delta checkpoints on aggregate operators; the delta
-    // chain then becomes the PRIMARY agg checkpoint (skip the whole-node manifest, recover from the chain).
-    #[cfg(feature = "cluster")]
-    delta_chain_bound: Option<u32>,
-    // Set from the shuffle registry in cluster mode.
-    #[cfg(feature = "cluster")]
-    vnode_count: Option<u32>,
     // Logical pipeline/state ABI bound into every managed vnode transition.
     #[cfg(feature = "cluster")]
     pipeline_identity: Option<laminar_core::checkpoint::PipelineIdentity>,
-    // One immutable revoke/restore transition, consumed only after complete lifecycle success.
+    // One immutable revocation transition, consumed only after complete lifecycle success.
     #[cfg(feature = "cluster")]
     pending_vnode_transition: Option<crate::vnode_transition_staging::PendingVnodeTransitionHandle>,
     // Success-only binding for the exact vnode state installed in this graph generation.
@@ -717,10 +711,6 @@ impl OperatorGraph {
             cluster_shuffle: None,
             #[cfg(feature = "cluster")]
             last_execution_assignment_version: None,
-            #[cfg(feature = "cluster")]
-            delta_chain_bound: None,
-            #[cfg(feature = "cluster")]
-            vnode_count: None,
             #[cfg(feature = "cluster")]
             pipeline_identity: None,
             #[cfg(feature = "cluster")]
@@ -912,9 +902,8 @@ impl OperatorGraph {
     fn checkpoint_transition_is_applied(&self) -> bool {
         !self.has_pending_vnode_transition()
             && self.cluster_shuffle.as_ref().is_none_or(|shuffle| {
-                !shuffle.registry.any_restoring()
-                    && self.last_execution_assignment_version
-                        == Some(shuffle.registry.assignment_version())
+                self.last_execution_assignment_version
+                    == Some(shuffle.registry.assignment_version())
             })
     }
 
@@ -985,14 +974,7 @@ impl OperatorGraph {
             )));
             return;
         }
-        self.vnode_count = Some(vnode_count);
         self.cluster_shuffle = Some(config);
-    }
-
-    /// Enable incremental delta checkpoints on aggregate operators with the given re-base bound.
-    #[cfg(feature = "cluster")]
-    pub fn set_delta_chain_bound(&mut self, chain_bound: u32) {
-        self.delta_chain_bound = Some(chain_bound);
     }
 
     /// Cluster shuffle config, if installed; reused by the pipeline callback for subscriptions.
@@ -1003,7 +985,6 @@ impl OperatorGraph {
         self.cluster_shuffle.as_ref()
     }
 
-    #[cfg(feature = "cluster")]
     fn required_vnodes_for_capability(
         capability: OperatorCapability,
         owned_vnodes: &[u32],
@@ -1024,7 +1005,6 @@ impl OperatorGraph {
         }
     }
 
-    #[cfg(feature = "cluster")]
     fn owned_vnodes_for_managed_state(&self) -> Result<Vec<u32>, DbError> {
         let has_participants = self
             .nodes
@@ -1033,9 +1013,12 @@ impl OperatorGraph {
         if !has_participants {
             return Ok(Vec::new());
         }
+        #[cfg(feature = "cluster")]
         if let Some(config) = &self.cluster_shuffle {
             let assignment = config.registry.versioned_snapshot();
-            if u32::try_from(assignment.owners().len()).ok() != self.vnode_count {
+            if u32::try_from(assignment.owners().len()).ok()
+                != Some(u32::from(self.key_group_count))
+            {
                 return Err(DbError::Checkpoint(
                     "managed-state capture vnode count does not match the active assignment".into(),
                 ));
@@ -1048,60 +1031,11 @@ impl OperatorGraph {
                 .map(|(vnode, _)| u32::try_from(vnode).expect("vnode count is represented by u32"))
                 .collect());
         }
-        #[cfg(test)]
+        #[cfg(all(test, feature = "cluster"))]
         if let Some(vnodes) = &self.test_owned_vnodes {
             return Ok(vnodes.clone());
         }
-        Err(DbError::Checkpoint(
-            "managed-state capture has no cluster ownership authority".into(),
-        ))
-    }
-
-    #[cfg(feature = "cluster")]
-    pub(super) fn managed_vnode_participants(
-        &self,
-        vnode: u32,
-    ) -> Result<Vec<(usize, &str)>, DbError> {
-        if self.vnode_count.is_none_or(|count| vnode >= count) {
-            return Err(DbError::Checkpoint(format!(
-                "managed-state roster requested out-of-range vnode {vnode}"
-            )));
-        }
-        let mut participants = Vec::new();
-        let mut names = std::collections::BTreeSet::new();
-        for (node_idx, node) in self.nodes.iter().enumerate() {
-            if node.removed || node.capability.managed_state.is_none() {
-                continue;
-            }
-            let participates = match node.capability.state_class {
-                OperatorStateClass::GlobalSingleton => vnode == 0,
-                OperatorStateClass::VnodeKeyed => true,
-                state_class => {
-                    return Err(DbError::Checkpoint(format!(
-                        "managed operator '{}' has unsupported placement {state_class:?}",
-                        node.name
-                    )));
-                }
-            };
-            if participates {
-                if !names.insert(node.name.as_ref()) {
-                    return Err(DbError::Checkpoint(format!(
-                        "managed vnode roster repeats operator name '{}'",
-                        node.name
-                    )));
-                }
-                participants.push((node_idx, node.name.as_ref()));
-            }
-        }
-        participants
-            .sort_unstable_by(|left, right| left.1.cmp(right.1).then_with(|| left.0.cmp(&right.0)));
-        Ok(participants)
-    }
-
-    #[cfg(feature = "cluster")]
-    #[cfg(test)]
-    pub(crate) const fn last_execution_assignment_version(&self) -> Option<u64> {
-        self.last_execution_assignment_version
+        Ok((0..u32::from(self.key_group_count)).collect())
     }
 
     /// Bind the graph to the logical pipeline and recovery-state ABI.
@@ -2091,11 +2025,6 @@ impl OperatorGraph {
         if let Some(ref cfg) = self.cluster_shuffle {
             debug_assert_eq!(cfg.registry.vnode_count(), u32::from(self.key_group_count));
             op.attach_cluster_shuffle(cfg.clone());
-            // Delta checkpoints are a cluster (per-vnode) capability — only wire when sharded.
-            // Enabling delta also makes the chain the primary agg checkpoint.
-            if let Some(chain_bound) = self.delta_chain_bound {
-                op.enable_delta_checkpoints(chain_bound);
-            }
         }
         Box::new(op)
     }
@@ -2539,16 +2468,12 @@ impl OperatorGraph {
         .await
     }
 
-    /// Complete only staged vnode revoke/restore work, without stepping operators on source or
+    /// Complete only staged vnode revocation, without stepping operators on source or
     /// buffered graph input. This lets a fenced recovery drain the predecessor transition before
     /// adopting a newer assignment without reopening source intake.
     #[cfg(feature = "cluster")]
     pub(crate) async fn complete_pending_vnode_transition(&mut self) -> Result<bool, DbError> {
-        let pending = self.has_pending_vnode_transition()
-            || self
-                .cluster_shuffle
-                .as_ref()
-                .is_some_and(|config| config.registry.any_restoring());
+        let pending = self.has_pending_vnode_transition();
         if !pending {
             return Ok(false);
         }
@@ -2624,12 +2549,7 @@ impl OperatorGraph {
         #[cfg(feature = "cluster")]
         let _rotation_guard = match self.rotation_execution_fence.as_ref() {
             Some(fence) => Some(Arc::clone(fence).read_owned().await),
-            None if self.has_pending_vnode_transition()
-                || self
-                    .cluster_shuffle
-                    .as_ref()
-                    .is_some_and(|config| config.registry.any_restoring()) =>
-            {
+            None if self.has_pending_vnode_transition() => {
                 return Err(DbError::Checkpoint(
                     "[LDB-6051] staged vnode execution requires the rotation execution fence"
                         .into(),
@@ -3208,16 +3128,20 @@ impl OperatorGraph {
 
     #[cfg(feature = "cluster")]
     fn compare_shuffle_attempts(
-        expected: laminar_core::state::CheckpointAttempt,
-        observed: laminar_core::state::CheckpointAttempt,
+        expected: laminar_core::checkpoint::CheckpointAttempt,
+        observed: laminar_core::checkpoint::CheckpointAttempt,
     ) -> Result<std::cmp::Ordering, DbError> {
         match observed.relation_to(expected) {
-            laminar_core::state::CheckpointAttemptRelation::Exact => Ok(std::cmp::Ordering::Equal),
-            laminar_core::state::CheckpointAttemptRelation::Newer => {
+            laminar_core::checkpoint::CheckpointAttemptRelation::Exact => {
+                Ok(std::cmp::Ordering::Equal)
+            }
+            laminar_core::checkpoint::CheckpointAttemptRelation::Newer => {
                 Ok(std::cmp::Ordering::Greater)
             }
-            laminar_core::state::CheckpointAttemptRelation::Older => Ok(std::cmp::Ordering::Less),
-            laminar_core::state::CheckpointAttemptRelation::Conflict => {
+            laminar_core::checkpoint::CheckpointAttemptRelation::Older => {
+                Ok(std::cmp::Ordering::Less)
+            }
+            laminar_core::checkpoint::CheckpointAttemptRelation::Conflict => {
                 Err(DbError::Pipeline(format!(
                 "shuffle barrier attempt mismatch: expected {expected:?}, received {observed:?}"
             )))
@@ -3227,7 +3151,7 @@ impl OperatorGraph {
 
     #[cfg(feature = "cluster")]
     fn is_shuffle_alignment_terminal_hint(
-        attempt: laminar_core::state::CheckpointAttempt,
+        attempt: laminar_core::checkpoint::CheckpointAttempt,
         announcement: &laminar_core::cluster::control::BarrierAnnouncement,
         ignored: Option<(u64, u64, laminar_core::cluster::control::Phase)>,
     ) -> bool {
@@ -3243,20 +3167,20 @@ impl OperatorGraph {
         {
             return false;
         }
-        let announced = laminar_core::state::CheckpointAttempt::new(
+        let announced = laminar_core::checkpoint::CheckpointAttempt::new(
             announcement.epoch,
             announcement.checkpoint_id,
         );
         !matches!(
             announced.relation_to(attempt),
-            laminar_core::state::CheckpointAttemptRelation::Older
+            laminar_core::checkpoint::CheckpointAttemptRelation::Older
         )
     }
 
     #[cfg(feature = "cluster")]
     async fn wait_for_shuffle_alignment_terminal_hint(
         controller: Option<&laminar_core::cluster::control::ClusterController>,
-        attempt: laminar_core::state::CheckpointAttempt,
+        attempt: laminar_core::checkpoint::CheckpointAttempt,
         ignored: Option<(u64, u64, laminar_core::cluster::control::Phase)>,
         deadline: tokio::time::Instant,
     ) -> Result<Option<laminar_core::cluster::control::BarrierAnnouncement>, DbError> {
@@ -3282,7 +3206,7 @@ impl OperatorGraph {
     #[cfg(feature = "cluster")]
     async fn audit_shuffle_alignment_settlement(
         controller: Option<&laminar_core::cluster::control::ClusterController>,
-        attempt: laminar_core::state::CheckpointAttempt,
+        attempt: laminar_core::checkpoint::CheckpointAttempt,
         assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
     ) -> Result<Option<ShuffleAlignmentOutcome>, DbError> {
         let Some(controller) = controller else {
@@ -3313,9 +3237,9 @@ impl OperatorGraph {
             )));
         }
         let durable_attempt =
-            laminar_core::state::CheckpointAttempt::new(durable.epoch, durable.checkpoint_id);
+            laminar_core::checkpoint::CheckpointAttempt::new(durable.epoch, durable.checkpoint_id);
         match durable_attempt.relation_to(attempt) {
-            laminar_core::state::CheckpointAttemptRelation::Exact => {
+            laminar_core::checkpoint::CheckpointAttemptRelation::Exact => {
                 if durable.assignment_fence.as_ref() != Some(assignment_fence) {
                     return Err(DbError::Pipeline(format!(
                         "shuffle barrier terminal outcome for checkpoint {} epoch {} has a different assignment certificate",
@@ -3332,7 +3256,7 @@ impl OperatorGraph {
                 }
                 Ok(Some(ShuffleAlignmentOutcome::Aborted))
             }
-            laminar_core::state::CheckpointAttemptRelation::Newer => Err(DbError::Pipeline(
+            laminar_core::checkpoint::CheckpointAttemptRelation::Newer => Err(DbError::Pipeline(
                 format!(
                     "checkpoint {} epoch {} was superseded by durable terminal checkpoint {} epoch {} ({:?})",
                     attempt.checkpoint_id,
@@ -3342,8 +3266,8 @@ impl OperatorGraph {
                     durable.verdict
                 ),
             )),
-            laminar_core::state::CheckpointAttemptRelation::Older
-            | laminar_core::state::CheckpointAttemptRelation::Conflict => {
+            laminar_core::checkpoint::CheckpointAttemptRelation::Older
+            | laminar_core::checkpoint::CheckpointAttemptRelation::Conflict => {
                 Err(DbError::Pipeline(format!(
                     "shuffle barrier authority returned invalid settlement {durable_attempt:?} for pending attempt {attempt:?}"
                 )))
@@ -3368,7 +3292,7 @@ impl OperatorGraph {
     async fn wait_for_remaining_shuffle_barriers(
         &mut self,
         cfg: &crate::operator::sql_query::ClusterShuffleConfig,
-        attempt: laminar_core::state::CheckpointAttempt,
+        attempt: laminar_core::checkpoint::CheckpointAttempt,
         watermark: i64,
         assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
         deadline: tokio::time::Instant,
@@ -3434,7 +3358,7 @@ impl OperatorGraph {
                             received.peer()
                         )));
                     }
-                    let observed = laminar_core::state::CheckpointAttempt::new(
+                    let observed = laminar_core::checkpoint::CheckpointAttempt::new(
                         barrier.epoch,
                         barrier.checkpoint_id,
                     );
@@ -3547,7 +3471,7 @@ impl OperatorGraph {
     #[cfg(feature = "cluster")]
     pub(crate) async fn align_shuffle_barriers(
         &mut self,
-        attempt: laminar_core::state::CheckpointAttempt,
+        attempt: laminar_core::checkpoint::CheckpointAttempt,
         watermark: i64,
         assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
         deadline: tokio::time::Instant,
@@ -3639,7 +3563,7 @@ impl OperatorGraph {
                         "non-barrier frame entered shuffle barrier holdover".into(),
                     ));
                 };
-                let observed = laminar_core::state::CheckpointAttempt::new(
+                let observed = laminar_core::checkpoint::CheckpointAttempt::new(
                     barrier.epoch,
                     barrier.checkpoint_id,
                 );
@@ -3784,200 +3708,217 @@ impl OperatorGraph {
         );
         self.key_group_count = KeyGroupCount::try_from(vnode_count)
             .expect("test vnode count must fit the checkpoint key-group ABI");
-        self.vnode_count = Some(vnode_count);
         self.test_owned_vnodes = Some(owned_vnodes);
     }
 
-    pub fn snapshot_state(&mut self) -> Result<Option<GraphCheckpoint>, DbError> {
+    pub(crate) fn capture_state(&mut self) -> Result<GraphStateCapture, DbError> {
         self.ensure_execution_not_poisoned()?;
         #[cfg(feature = "cluster")]
         self.ensure_checkpoint_transition_is_applied()?;
-        let mut operators = OperatorStateMap::new();
+
+        let vnode_count = u32::from(self.key_group_count);
+        let owned_vnodes = self.owned_vnodes_for_managed_state()?;
+        let mut capture = GraphStateCapture::default();
+        let mut names = std::collections::BTreeSet::new();
+
         for node in &mut self.nodes {
             if node.removed {
                 continue;
             }
-            if let Some(cp) = node.operator.checkpoint()? {
-                operators.insert(node.name.to_string(), cp.data);
+            let name = node.name.to_string();
+            if !names.insert(name.clone()) {
+                return Err(DbError::Checkpoint(format!(
+                    "checkpoint capture repeats operator name '{name}'"
+                )));
             }
-        }
-        if operators.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(GraphCheckpoint {
-            version: GRAPH_CHECKPOINT_VERSION,
-            operators,
-        }))
-    }
 
-    /// Per-vnode state snapshot (`vnode → operator → bytes`) for cross-node rehydration.
-    #[cfg(feature = "cluster")]
-    #[allow(clippy::disallowed_types)] // std HashMap matches the trait/CheckpointRequest shape
-    pub fn snapshot_state_by_vnode(
-        &mut self,
-    ) -> Result<crate::checkpoint_coordinator::StagedVnodeStates, DbError> {
-        self.ensure_execution_not_poisoned()?;
-        self.ensure_checkpoint_transition_is_applied()?;
-        let Some(vnode_count) = self.vnode_count else {
-            return Ok(std::collections::HashMap::new());
-        };
-        let owned_vnodes = self.owned_vnodes_for_managed_state()?;
-        let mut participant_names = std::collections::BTreeSet::new();
-        let mut participants = Vec::new();
-        for (node_idx, node) in self.nodes.iter().enumerate() {
-            if node.removed || node.capability.managed_state.is_none() {
+            if let Some(checkpoint) = node.operator.checkpoint()? {
+                capture.whole.push(CapturedWholeState {
+                    operator_id: name.clone(),
+                    state: bytes::Bytes::from(checkpoint.data),
+                });
+            }
+
+            if node.capability.managed_state.is_none() {
                 continue;
             }
-            if !participant_names.insert(node.name.to_string()) {
-                return Err(DbError::Checkpoint(format!(
-                    "managed-state capture repeats operator name '{}'",
-                    node.name
-                )));
+            let required = Self::required_vnodes_for_capability(node.capability, &owned_vnodes)?;
+            if required.is_empty() {
+                continue;
             }
-            participants.push((
-                node_idx,
-                node.name.to_string(),
-                Self::required_vnodes_for_capability(node.capability, &owned_vnodes)?,
-            ));
-        }
-        if participants.len()
-            > usize::try_from(laminar_core::checkpoint::MAX_VNODE_OPERATOR_ENTRIES)
-                .unwrap_or(usize::MAX)
-        {
-            return Err(DbError::Checkpoint(format!(
-                "managed-state graph has {} operator entries; maximum is {}",
-                participants.len(),
-                laminar_core::checkpoint::MAX_VNODE_OPERATOR_ENTRIES
-            )));
-        }
-        let mut out: crate::checkpoint_coordinator::StagedVnodeStates =
-            std::collections::HashMap::new();
-        for (node_idx, name, required_vnodes) in participants {
-            let captured = self.nodes[node_idx]
+            let states = node
                 .operator
-                .checkpoint_by_vnode(&required_vnodes, vnode_count)?
-                .unwrap_or_default();
-            let mut captured_vnodes: Vec<u32> = captured.keys().copied().collect();
-            captured_vnodes.sort_unstable();
-            if captured_vnodes != required_vnodes {
+                .checkpoint_vnodes(&required, vnode_count)?
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "managed operator '{name}' did not capture its required vnode state"
+                    ))
+                })?;
+            if states.len() != required.len()
+                || states
+                    .iter()
+                    .zip(&required)
+                    .any(|(captured, expected)| captured.vnode != *expected)
+            {
+                let actual = states.iter().map(|state| state.vnode).collect::<Vec<_>>();
                 return Err(DbError::Checkpoint(format!(
-                    "managed operator '{name}' captured vnode roster {captured_vnodes:?}; expected {required_vnodes:?}"
+                    "managed operator '{name}' captured vnode roster {actual:?}; expected {required:?}"
                 )));
             }
-            for (vnode, bytes) in captured {
-                if out
-                    .entry(vnode)
-                    .or_default()
-                    .insert(name.clone(), bytes)
-                    .is_some()
-                {
-                    return Err(DbError::Checkpoint(format!(
-                        "managed-state capture repeated operator '{name}' for vnode {vnode}"
-                    )));
-                }
-            }
+            capture
+                .vnodes
+                .extend(states.into_iter().map(|state| (name.clone(), state)));
         }
-        Ok(out)
+
+        capture
+            .whole
+            .sort_unstable_by(|left, right| left.operator_id.cmp(&right.operator_id));
+        capture.vnodes.sort_unstable_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.vnode.cmp(&right.1.vnode))
+        });
+        Ok(capture)
     }
 
-    /// Force every operator's next delta capture to re-base FULL after a failed epoch, so no chain
-    /// outruns the coordinator's parent link.
-    #[cfg(feature = "cluster")]
-    pub(crate) fn force_full_rebase(&mut self) {
+    pub(crate) fn force_full_vnode_capture(&mut self) {
         for node in &mut self.nodes {
             if !node.removed {
-                node.operator.force_full_rebase();
+                node.operator.force_full_vnode_capture();
             }
         }
     }
 
-    /// Restore a newly built graph. The graph is consumed so any late operator failure drops the
-    /// partially restored image instead of returning it to the caller.
-    pub fn restore_state(mut self, checkpoint: &GraphCheckpoint) -> Result<(Self, usize), DbError> {
+    /// Restore independently checksummed whole-operator and vnode frames into a newly built graph.
+    /// The graph is consumed so a late operator failure drops the partial image.
+    pub(crate) fn restore_state_frames(
+        mut self,
+        whole: &[(String, bytes::Bytes)],
+        vnodes: &[(String, u32, bytes::Bytes)],
+        vnode_count: u32,
+    ) -> Result<(Self, usize), DbError> {
         if !self.whole_restore_open {
             return Err(DbError::Checkpoint(
                 "[LDB-6029] operator graph restore is only valid before the first execution cycle"
                     .into(),
             ));
         }
-        if checkpoint.version != GRAPH_CHECKPOINT_VERSION {
+        if vnode_count != u32::from(self.key_group_count) {
             return Err(DbError::Checkpoint(format!(
-                "[LDB-6043] unsupported operator graph checkpoint version {}; expected {}",
-                checkpoint.version, GRAPH_CHECKPOINT_VERSION
+                "[LDB-6043] checkpoint vnode domain {vnode_count} does not match graph domain {}",
+                u32::from(self.key_group_count)
             )));
         }
-        let mut missing: Vec<&str> = checkpoint
-            .operators
-            .keys()
-            .map(String::as_str)
-            .filter(|operator| {
-                !self
-                    .nodes
-                    .iter()
-                    .any(|node| !node.removed && &*node.name == *operator)
-            })
-            .collect();
-        if !missing.is_empty() {
-            missing.sort_unstable();
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6029] operator graph checkpoint requires missing operator(s): {}",
-                missing.join(", ")
-            )));
+
+        let mut whole_names = std::collections::BTreeSet::new();
+        for (name, _) in whole {
+            if !whole_names.insert(name.as_str()) {
+                return Err(DbError::Checkpoint(format!(
+                    "checkpoint repeats whole state for operator '{name}'"
+                )));
+            }
+            if !self
+                .nodes
+                .iter()
+                .any(|node| !node.removed && &*node.name == name)
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6029] checkpoint requires missing operator '{name}'"
+                )));
+            }
         }
-        let mut restored = 0;
-        for node_id in 0..self.nodes.len() {
-            let node = &mut self.nodes[node_id];
-            if node.removed {
+
+        let owned_vnodes = self.owned_vnodes_for_managed_state()?;
+        let mut actual_vnodes: FxHashMap<&str, Vec<u32>> = FxHashMap::default();
+        for (name, vnode, _) in vnodes {
+            let node = self
+                .nodes
+                .iter()
+                .find(|node| !node.removed && &*node.name == name)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6029] checkpoint requires missing operator '{name}'"
+                    ))
+                })?;
+            if node.capability.managed_state.is_none() {
+                return Err(DbError::Checkpoint(format!(
+                    "checkpoint supplies vnode {vnode} for unmanaged operator '{name}'"
+                )));
+            }
+            actual_vnodes.entry(name).or_default().push(*vnode);
+        }
+        for vnodes in actual_vnodes.values_mut() {
+            vnodes.sort_unstable();
+            if vnodes.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(DbError::Checkpoint(
+                    "checkpoint repeats a logical operator vnode frame".into(),
+                ));
+            }
+        }
+        for node in self.nodes.iter().filter(|node| !node.removed) {
+            if node.capability.managed_state.is_none() {
                 continue;
             }
-            if let Some(bytes) = checkpoint.operators.get(&*node.name) {
-                node.operator
-                    .restore(OperatorCheckpoint {
-                        data: bytes.clone(),
-                    })
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "[LDB-6029] operator '{}' restore failed: {error}",
-                            node.name
-                        ))
-                    })?;
-                #[cfg(feature = "cluster")]
+            let required = Self::required_vnodes_for_capability(node.capability, &owned_vnodes)?;
+            let actual = actual_vnodes
+                .get(&*node.name)
+                .map_or(&[][..], Vec::as_slice);
+            if actual != required {
+                return Err(DbError::Checkpoint(format!(
+                    "managed operator '{}' restore has vnode roster {actual:?}; expected {required:?}",
+                    node.name
+                )));
+            }
+        }
+
+        let mut restored = 0;
+        for (name, bytes) in whole {
+            let node_id = self
+                .nodes
+                .iter()
+                .position(|node| !node.removed && &*node.name == name)
+                .expect("whole-frame names were validated");
+            let node = &mut self.nodes[node_id];
+            node.operator
+                .restore(OperatorCheckpoint {
+                    data: bytes.to_vec(),
+                })
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6029] operator '{}' restore failed: {error}",
+                        node.name
+                    ))
+                })?;
+            restored += 1;
+        }
+        for (name, vnode, bytes) in vnodes {
+            let node_id = self
+                .nodes
+                .iter()
+                .position(|node| !node.removed && &*node.name == name)
+                .expect("vnode-frame names were validated");
+            let node = &mut self.nodes[node_id];
+            node.operator
+                .restore_vnode(*vnode, vnode_count, bytes)
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6029] operator '{}' vnode {vnode} restore failed: {error}",
+                        node.name
+                    ))
+                })?;
+            restored += 1;
+        }
+        #[cfg(feature = "cluster")]
+        for (node_id, node) in self.nodes.iter_mut().enumerate() {
+            if !node.removed {
                 if let Some(watermark) = node.operator.restored_output_watermark() {
                     self.output_watermarks[node_id] = watermark;
                 }
-                restored += 1;
             }
         }
         self.validate_managed_state_budget("whole-graph restore")?;
         self.whole_restore_open = false;
         Ok((self, restored))
-    }
-
-    pub fn serialize_checkpoint_bounded(
-        cp: &GraphCheckpoint,
-        max_bytes: u64,
-    ) -> Result<Vec<u8>, DbError> {
-        let max_bytes = usize::try_from(max_bytes).map_err(|_| {
-            DbError::Checkpoint("operator graph checkpoint budget does not fit usize".into())
-        })?;
-        let writer = rkyv::ser::writer::IoWriter::new(
-            laminar_core::serialization::BoundedBytesWriter::new(max_bytes),
-        );
-        rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(cp, writer)
-            .map(|writer| writer.into_inner().into_vec())
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "operator graph checkpoint serialization exceeded its {max_bytes}-byte budget: {error}"
-                ))
-            })
-    }
-
-    pub fn restore_from_bytes(self, bytes: &[u8]) -> Result<(Self, usize), DbError> {
-        let checkpoint: GraphCheckpoint =
-            rkyv::from_bytes::<GraphCheckpoint, rkyv::rancor::Error>(bytes).map_err(|e| {
-                DbError::Checkpoint(format!("operator graph checkpoint deserialization: {e}"))
-            })?;
-        self.restore_state(&checkpoint)
     }
 }
 

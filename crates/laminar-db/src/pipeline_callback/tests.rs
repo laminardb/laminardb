@@ -1,5 +1,13 @@
 use super::*;
 
+#[cfg(feature = "cluster")]
+fn memory_checkpoint_store() -> Box<dyn laminar_core::checkpoint::CheckpointStore> {
+    Box::new(laminar_core::checkpoint::ObjectStoreCheckpointStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        "",
+    ))
+}
+
 struct DrainingCaptureFailureOperator {
     live_rows: Arc<std::sync::atomic::AtomicUsize>,
     fail_whole_capture: Arc<std::sync::atomic::AtomicBool>,
@@ -36,14 +44,11 @@ impl crate::operator_graph::GraphOperator for DrainingCaptureFailureOperator {
     }
 
     #[cfg(feature = "cluster")]
-    fn checkpoint_by_vnode(
+    fn checkpoint_vnodes(
         &mut self,
         required_vnodes: &[u32],
         _vnode_count: u32,
-    ) -> Result<
-        Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
-        DbError,
-    > {
+    ) -> Result<Option<Vec<crate::operator_graph::CapturedVnodeState>>, DbError> {
         if self
             .fail_vnode_capture
             .load(std::sync::atomic::Ordering::Acquire)
@@ -57,13 +62,9 @@ impl crate::operator_graph::GraphOperator for DrainingCaptureFailureOperator {
         Ok(Some(
             required_vnodes
                 .iter()
-                .map(|vnode| {
-                    (
-                        *vnode,
-                        crate::checkpoint_coordinator::StagedSlice::Bytes(
-                            bytes::Bytes::from_static(b"test-vnode-state"),
-                        ),
-                    )
+                .map(|vnode| crate::operator_graph::CapturedVnodeState {
+                    vnode: *vnode,
+                    state: Some(bytes::Bytes::from_static(b"test-vnode-state")),
                 })
                 .collect(),
         ))
@@ -180,14 +181,11 @@ impl crate::operator_graph::GraphOperator for CheckpointRotationFenceAuditOperat
         Ok(None)
     }
 
-    fn checkpoint_by_vnode(
+    fn checkpoint_vnodes(
         &mut self,
         required_vnodes: &[u32],
         _vnode_count: u32,
-    ) -> Result<
-        Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
-        DbError,
-    > {
+    ) -> Result<Option<Vec<crate::operator_graph::CapturedVnodeState>>, DbError> {
         if Arc::clone(&self.fence).try_write_owned().is_ok() {
             return Err(DbError::Checkpoint(
                 "vnode-state capture escaped the assignment rotation fence".into(),
@@ -198,13 +196,9 @@ impl crate::operator_graph::GraphOperator for CheckpointRotationFenceAuditOperat
         Ok(Some(
             required_vnodes
                 .iter()
-                .map(|vnode| {
-                    (
-                        *vnode,
-                        crate::checkpoint_coordinator::StagedSlice::Bytes(
-                            bytes::Bytes::from_static(b"fence-audit-state"),
-                        ),
-                    )
+                .map(|vnode| crate::operator_graph::CapturedVnodeState {
+                    vnode: *vnode,
+                    state: Some(bytes::Bytes::from_static(b"fence-audit-state")),
                 })
                 .collect(),
         ))
@@ -337,8 +331,6 @@ fn empty_callback_fixture() -> ConnectorPipelineCallback {
         #[cfg(feature = "cluster")]
         vnode_registry: None,
         #[cfg(feature = "cluster")]
-        reconciled_source_handoff_version: None,
-        #[cfg(feature = "cluster")]
         follower_tail: Arc::default(),
         #[cfg(feature = "cluster")]
         barrier_injectors: Vec::new(),
@@ -351,10 +343,7 @@ fn empty_callback_fixture() -> ConnectorPipelineCallback {
         checkpoint_complete_tx,
         checkpoint_tail_tasks: tokio::task::JoinSet::new(),
         checkpoint_in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        #[cfg(feature = "cluster")]
-        delta_rebase_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        #[cfg(feature = "cluster")]
-        last_vnode_capture_epoch: None,
+        full_vnode_capture_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         epoch_allocator: None,
         #[cfg(feature = "cluster")]
         quorum_timeout: Duration::from_secs(1),
@@ -443,7 +432,6 @@ async fn zero_cycle_barrier_is_not_suppressed_by_process_metrics() {
 #[cfg(feature = "cluster")]
 struct ClusterCallbackFixture {
     callback: ConnectorPipelineCallback,
-    source: Arc<crate::catalog::SourceEntry>,
 }
 
 #[cfg(feature = "cluster")]
@@ -1010,7 +998,7 @@ async fn retained_follower_capture_keeps_ownership_after_promotion() {
     let registry = Arc::new(VnodeRegistry::single_owner(1, NodeId(1)));
     let fence = local_assignment_fence(&controller, registry.assignment_version());
     controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
-    let mut fixture = cluster_callback_fixture(registry, Arc::clone(&controller), None, None);
+    let mut fixture = cluster_callback_fixture(registry, Arc::clone(&controller), None);
     fixture.callback.checkpoint_committable_sinks = true;
     let (rotation_fence, whole_capture_observed, vnode_capture_observed) =
         install_checkpoint_rotation_fence_audit(&mut fixture.callback);
@@ -1155,15 +1143,10 @@ async fn reserve_attempt_uses_durable_order_after_unannounced_leader_crash() {
     }
     let restarted =
         Arc::new(laminar_core::checkpoint_decision::CheckpointDecisionStore::new(object_store));
-    let dir = tempfile::tempdir().unwrap();
-    let store = Box::new(
-        laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(dir.path()),
-    );
     let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
         crate::checkpoint_coordinator::CheckpointConfig::default(),
-        store,
+        memory_checkpoint_store(),
     )
-    .await
     .unwrap();
     coordinator
         .bind_durable_decision_store(restarted)
@@ -1585,10 +1568,10 @@ async fn follower_capture_request_includes_whole_operator_graph_state() {
         )
         .unwrap();
     assert!(
-        request.operator_states.is_empty(),
+        request.state_frames.is_empty(),
         "aligned capture must defer serialization to the durable tail"
     );
-    request.operator_states = operator_state
+    request.state_frames = operator_state
         .serialize_until(
             callback.checkpoint_state_cap_bytes,
             callback.serialization_timeout,
@@ -1599,18 +1582,18 @@ async fn follower_capture_request_includes_whole_operator_graph_state() {
         .accept_for_test();
 
     assert_eq!(request.assignment_fence.as_ref(), Some(&assignment_fence));
-    let bytes = request
-        .operator_states
-        .get("operator_graph")
-        .expect("whole operator graph must be present in the follower request");
-    let graph_checkpoint =
-        rkyv::from_bytes::<crate::operator_graph::GraphCheckpoint, rkyv::rancor::Error>(bytes)
-            .unwrap();
+    let frame = request
+        .state_frames
+        .iter()
+        .find(|frame| {
+            frame.key
+                == laminar_core::checkpoint::StateFrameKey::OperatorWhole {
+                    operator_id: "follower-checkpoint-evidence".into(),
+                }
+        })
+        .expect("the operator frame must be present in the follower request");
     assert_eq!(
-        graph_checkpoint
-            .operators
-            .get("follower-checkpoint-evidence")
-            .map(Vec::as_slice),
+        frame.state.as_deref(),
         Some(b"follower-whole-operator-state".as_slice())
     );
 }
@@ -1637,58 +1620,9 @@ async fn follower_capture_request_rejects_an_expired_deadline() {
 }
 
 #[cfg(feature = "cluster")]
-fn committed_source_handoff(
-    assignment_fence: laminar_core::checkpoint::CheckpointAssignmentFence,
-    source_watermark: Option<i64>,
-    cluster_watermark: CheckpointWatermark,
-    recovery_watermark_frontier: Option<i64>,
-) -> Arc<laminar_core::checkpoint::CommittedSourceHandoff> {
-    use std::collections::BTreeMap;
-
-    use laminar_core::checkpoint::{
-        ClusterRecoveryCapsule, ParticipantRecoveryRef, PipelineIdentity,
-        CLUSTER_RECOVERY_CAPSULE_VERSION, PIPELINE_IDENTITY_VERSION,
-    };
-
-    let source_watermarks = source_watermark
-        .map(|watermark| BTreeMap::from([("orders".to_string(), watermark)]))
-        .unwrap_or_default();
-    let portable_state_sha256 = digest(6);
-    let capsule = ClusterRecoveryCapsule {
-        version: CLUSTER_RECOVERY_CAPSULE_VERSION,
-        attempt: CheckpointAttempt::canonical(7),
-        deployment_id: "00000000-0000-0000-0000-000000000007".into(),
-        pipeline_identity: PipelineIdentity {
-            canonical_version: PIPELINE_IDENTITY_VERSION,
-            sha256: digest(1),
-        },
-        vnode_restore_contract: crate::cluster_recovery_capsule::vnode_restore_contract_for_test(
-            assignment_fence.vnode_count,
-        ),
-        participants: vec![ParticipantRecoveryRef {
-            participant_id: 1,
-            readiness_sha256: digest(3),
-            manifest_sha256: digest(4),
-            portable_state_sha256: portable_state_sha256.clone(),
-        }],
-        assignment_fence,
-        seal_inventory_sha256: digest(2),
-        source_offsets: BTreeMap::from([("orders".into(), BTreeMap::new())]),
-        source_metadata: BTreeMap::from([("orders".into(), BTreeMap::new())]),
-        source_assignment_versions: BTreeMap::new(),
-        source_watermarks,
-        cluster_watermark,
-        recovery_watermark_frontier,
-        portable_state_sha256,
-    };
-    Arc::new(laminar_core::checkpoint::CommittedSourceHandoff::try_from(&capsule).unwrap())
-}
-
-#[cfg(feature = "cluster")]
 fn cluster_callback_fixture(
     registry: Arc<laminar_core::state::VnodeRegistry>,
     controller: Arc<laminar_core::cluster::control::ClusterController>,
-    reconciled_source_handoff_version: Option<u64>,
     startup_watermark: Option<i64>,
 ) -> ClusterCallbackFixture {
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -1791,7 +1725,6 @@ fn cluster_callback_fixture(
             shuffle_recovered_delivery_loss_incidents: None,
             shuffle_delivery_loss_incidents_seen: 0,
             vnode_registry: Some(registry),
-            reconciled_source_handoff_version,
             follower_tail: Arc::default(),
             barrier_injectors: Vec::new(),
             pending_follower_checkpoint: None,
@@ -1801,14 +1734,12 @@ fn cluster_callback_fixture(
             checkpoint_complete_tx,
             checkpoint_tail_tasks: tokio::task::JoinSet::new(),
             checkpoint_in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            delta_rebase_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_vnode_capture_epoch: None,
+            full_vnode_capture_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             epoch_allocator: None,
             quorum_timeout: Duration::from_secs(1),
             checkpoint_committable_sinks: false,
             intake_gate: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         },
-        source,
     }
 }
 
@@ -1834,296 +1765,6 @@ async fn follower_checkpoint_control_exposes_expired_process_authority() {
         panic!("expired follower authority must be an explicit admission failure");
     };
     assert!(error.contains("cluster process lease expired"), "{error}");
-}
-
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn follower_checkpoint_control_exposes_handoff_reconciliation_failure() {
-    use laminar_core::cluster::control::LeaseDeadline;
-    use laminar_core::state::{NodeId, VnodeRegistry};
-
-    let controller = local_controller();
-    controller
-        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
-        .unwrap();
-    let registry = Arc::new(VnodeRegistry::new_unassigned(1));
-    let fence = local_assignment_fence(&controller, 1);
-    registry.set_assignment_and_version_with_source_handoff(
-        vec![NodeId(1)].into(),
-        1,
-        committed_source_handoff(
-            fence.clone(),
-            Some(1_000),
-            CheckpointWatermark::Active(1_000),
-            Some(1_000),
-        ),
-    );
-    controller.publish_checkpoint_assignment_fence(Some(fence));
-    let mut fixture = cluster_callback_fixture(registry, controller, None, Some(1_000));
-    fixture
-        .callback
-        .source_name_arcs
-        .insert(0, Arc::from("missing"));
-
-    let outcome = crate::pipeline::PipelineCallback::service_checkpoint_control(
-        &mut fixture.callback,
-        FxHashMap::default(),
-    )
-    .await;
-
-    let crate::pipeline::CheckpointControlOutcome::AdmissionFailed { error } = outcome else {
-        panic!("handoff reconciliation failure must not be reported as idle");
-    };
-    assert!(error.contains("no watermark state"), "{error}");
-}
-
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn rebuilt_callback_does_not_replay_a_carried_old_source_handoff() {
-    use laminar_core::state::{NodeId, VnodeRegistry};
-
-    let controller = local_controller();
-    let registry = Arc::new(VnodeRegistry::new_unassigned(1));
-    let version_one_fence = local_assignment_fence(&controller, 1);
-    registry.set_assignment_and_version_with_source_handoff(
-        vec![NodeId(1)].into(),
-        1,
-        committed_source_handoff(
-            version_one_fence,
-            Some(1_000),
-            CheckpointWatermark::Active(1_000),
-            Some(1_000),
-        ),
-    );
-    registry.set_assignment_and_version_carrying_source_handoff(vec![NodeId(1)].into(), 2);
-
-    let version_two_fence = local_assignment_fence(&controller, 2);
-    controller.publish_checkpoint_assignment_fence(Some(version_two_fence));
-    let mut fixture = cluster_callback_fixture(
-        Arc::clone(&registry),
-        Arc::clone(&controller),
-        Some(1),
-        Some(2_000),
-    );
-
-    fixture
-        .callback
-        .reconcile_source_handoff_watermarks()
-        .unwrap();
-
-    assert_eq!(fixture.callback.reconciled_source_handoff_version, Some(1));
-    assert_eq!(
-        fixture
-            .callback
-            .tracker
-            .as_ref()
-            .unwrap()
-            .source_watermark(0),
-        Some(2_000)
-    );
-    assert_eq!(
-        fixture.callback.watermark_states["orders"]
-            .generator
-            .current_watermark(),
-        2_000
-    );
-    assert_eq!(fixture.source.source.current_watermark(), 2_000);
-    assert_eq!(
-        fixture
-            .callback
-            .pipeline_watermark
-            .load(std::sync::atomic::Ordering::Acquire),
-        2_000
-    );
-
-    let version_three_fence = local_assignment_fence(&controller, 3);
-    registry.set_assignment_and_version_with_source_handoff(
-        vec![NodeId(1)].into(),
-        3,
-        committed_source_handoff(
-            version_three_fence.clone(),
-            Some(2_500),
-            CheckpointWatermark::Active(2_500),
-            Some(2_500),
-        ),
-    );
-    controller.publish_checkpoint_assignment_fence(Some(version_three_fence));
-
-    fixture
-        .callback
-        .reconcile_source_handoff_watermarks()
-        .unwrap();
-
-    assert_eq!(fixture.callback.reconciled_source_handoff_version, Some(3));
-    assert_eq!(
-        fixture
-            .callback
-            .tracker
-            .as_ref()
-            .unwrap()
-            .source_watermark(0),
-        Some(2_500)
-    );
-    assert_eq!(
-        fixture.callback.watermark_states["orders"]
-            .generator
-            .current_watermark(),
-        2_500
-    );
-    assert_eq!(fixture.source.source.current_watermark(), 2_500);
-    assert_eq!(
-        fixture
-            .callback
-            .pipeline_watermark
-            .load(std::sync::atomic::Ordering::Acquire),
-        2_500
-    );
-}
-
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn active_handoff_frontier_fills_a_missing_source_watermark() {
-    use arrow_array::TimestampMillisecondArray;
-    use arrow_schema::{DataType, Field, Schema, TimeUnit};
-    use laminar_core::state::{NodeId, VnodeRegistry};
-
-    let controller = local_controller();
-    controller.publish_cluster_min_watermark(1_500);
-    let registry = Arc::new(VnodeRegistry::new_unassigned(1));
-    let fence = local_assignment_fence(&controller, 1);
-    registry.set_assignment_and_version_with_source_handoff(
-        vec![NodeId(1)].into(),
-        1,
-        committed_source_handoff(
-            fence.clone(),
-            None,
-            CheckpointWatermark::Active(1_500),
-            Some(1_500),
-        ),
-    );
-    controller.publish_checkpoint_assignment_fence(Some(fence));
-    let mut fixture =
-        cluster_callback_fixture(registry, Arc::clone(&controller), None, Some(2_000));
-
-    fixture
-        .callback
-        .reconcile_source_handoff_watermarks()
-        .unwrap();
-
-    let tracker = fixture.callback.tracker.as_ref().unwrap();
-    assert_eq!(tracker.source_watermark(0), Some(1_500));
-    assert_eq!(tracker.current_watermark().unwrap().timestamp(), 1_500);
-    assert_eq!(
-        fixture.callback.watermark_states["orders"]
-            .generator
-            .current_watermark(),
-        1_500
-    );
-    assert_eq!(fixture.source.source.current_watermark(), 1_500);
-    assert_eq!(
-        fixture
-            .callback
-            .pipeline_watermark
-            .load(std::sync::atomic::Ordering::Acquire),
-        1_500
-    );
-
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new(
-            "ts",
-            DataType::Timestamp(TimeUnit::Millisecond, None),
-            false,
-        )])),
-        vec![Arc::new(TimestampMillisecondArray::from(vec![
-            1_400, 1_700,
-        ]))],
-    )
-    .unwrap();
-    let retained =
-        crate::pipeline::PipelineCallback::filter_late_rows(&fixture.callback, "orders", &batch)
-            .expect("the post-frontier row must survive");
-    assert_eq!(retained.num_rows(), 1);
-}
-
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn idle_handoff_restores_its_retained_frontier_on_a_fresh_controller() {
-    use laminar_core::state::{NodeId, VnodeRegistry};
-
-    let controller = local_controller();
-    assert_eq!(controller.cluster_min_watermark(), None);
-    let registry = Arc::new(VnodeRegistry::new_unassigned(1));
-    let fence = local_assignment_fence(&controller, 1);
-    registry.set_assignment_and_version_with_source_handoff(
-        vec![NodeId(1)].into(),
-        1,
-        committed_source_handoff(fence.clone(), None, CheckpointWatermark::Idle, Some(1_500)),
-    );
-    controller.publish_checkpoint_assignment_fence(Some(fence));
-    let mut fixture =
-        cluster_callback_fixture(registry, Arc::clone(&controller), None, Some(2_000));
-
-    fixture
-        .callback
-        .reconcile_source_handoff_watermarks()
-        .unwrap();
-
-    let tracker = fixture.callback.tracker.as_ref().unwrap();
-    assert_eq!(tracker.source_watermark(0), Some(1_500));
-    assert_eq!(tracker.current_watermark().unwrap().timestamp(), 1_500);
-    assert!(tracker.is_idle(0));
-    assert_eq!(
-        fixture.callback.watermark_states["orders"]
-            .generator
-            .current_watermark(),
-        1_500
-    );
-    assert_eq!(fixture.source.source.current_watermark(), 1_500);
-    assert_eq!(
-        fixture
-            .callback
-            .pipeline_watermark
-            .load(std::sync::atomic::Ordering::Acquire),
-        1_500
-    );
-    assert_eq!(
-        controller.cluster_min_watermark(),
-        None,
-        "reconciliation must use the durable handoff frontier, not controller residue"
-    );
-}
-
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn checkpoint_capture_rejects_an_installed_unreconciled_source_handoff() {
-    use laminar_core::state::{NodeId, VnodeRegistry};
-
-    let controller = local_controller();
-    let registry = Arc::new(VnodeRegistry::new_unassigned(1));
-    let fence = local_assignment_fence(&controller, 1);
-    registry.set_assignment_and_version_with_source_handoff(
-        vec![NodeId(1)].into(),
-        1,
-        committed_source_handoff(
-            fence.clone(),
-            Some(1_500),
-            CheckpointWatermark::Active(1_500),
-            Some(1_500),
-        ),
-    );
-    controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
-    let fixture = cluster_callback_fixture(registry, controller, None, None);
-
-    let error = fixture
-        .callback
-        .validate_checkpoint_assignment(Some(&fence))
-        .unwrap_err();
-
-    assert!(error.contains("[LDB-6055]"), "unexpected error: {error}");
-    assert!(
-        error.contains("source handoff was not installed before checkpoint capture"),
-        "unexpected error: {error}"
-    );
 }
 
 #[test]
@@ -2179,15 +1820,6 @@ fn leader_proof(fencing_token: u64) -> laminar_core::cluster::control::LeaderPro
         },
         fencing_token,
     }
-}
-
-#[cfg(feature = "cluster")]
-#[test]
-fn allocator_epoch_jump_requires_full_vnode_capture() {
-    assert!(vnode_capture_requires_full_rebase(None, 1));
-    assert!(!vnode_capture_requires_full_rebase(Some(7), 8));
-    assert!(vnode_capture_requires_full_rebase(Some(7), 1_000));
-    assert!(vnode_capture_requires_full_rebase(Some(u64::MAX), 0));
 }
 
 #[tokio::test]
@@ -2341,7 +1973,6 @@ async fn dropping_serialized_destructive_image_before_commit_faults_runtime() {
     let budget = encoded_operator_state_budget(
         callback.checkpoint_state_cap_bytes,
         capture.estimated_bytes(),
-        0,
     )
     .unwrap();
     let serialized = capture
@@ -2371,7 +2002,10 @@ fn destructive_vnode_capture_failure_faults_runtime() {
         }),
     );
 
-    let error = callback.capture_vnode_states(41).unwrap_err();
+    let error = callback
+        .capture_operator_state_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .err()
+        .expect("vnode capture failure must reject the checkpoint");
 
     assert_eq!(live_rows.load(std::sync::atomic::Ordering::Acquire), 0);
     assert!(error.contains("recovery from the last committed checkpoint is required"));
@@ -2483,16 +2117,6 @@ async fn source_checkpoint_materialization_rejects_expired_deadline() {
     };
     assert!(error.contains("checkpoint 7 epoch 7"));
     assert!(error.contains("before source-offset materialization"));
-}
-
-#[test]
-fn mv_state_is_retained_when_graph_has_no_snapshot() {
-    let mv_bytes = bytes::Bytes::from_static(b"materialized-view-state");
-    let states =
-        combine_operator_checkpoint_states(None, [("mv:test_view".to_string(), mv_bytes.clone())]);
-
-    assert_eq!(states.get("mv:test_view"), Some(&mv_bytes));
-    assert!(!states.contains_key("operator_graph"));
 }
 
 #[tokio::test]
@@ -3491,17 +3115,10 @@ async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement() {
     stage_callback_shuffle_barrier(&sender, &receiver, &fence, attempt).await;
     let control = install_pending_follower_attempt(&mut follower_callback, announcement.clone());
 
-    let checkpoint_dir = tempfile::tempdir().unwrap();
-    let store = Box::new(
-        laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
-            checkpoint_dir.path(),
-        ),
-    );
     let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
         crate::checkpoint_coordinator::CheckpointConfig::default(),
-        store,
+        memory_checkpoint_store(),
     )
-    .await
     .unwrap();
     coordinator
         .bind_durable_decision_store(Arc::clone(&decision_store))
@@ -3523,7 +3140,6 @@ async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement() {
         operator_state: None,
         operator_state_encoded_budget: 0,
         mutable_operator_capture_guard: None,
-        vnode_states: Default::default(),
         fan_out: FxHashMap::default(),
         local_watermark: CheckpointWatermark::Uninitialized,
         attempt,
@@ -3536,7 +3152,7 @@ async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement() {
         controller: Some(Arc::clone(&leader)),
         leader_proof: Some(leader_proof),
         quorum_timeout: Duration::from_secs(1),
-        delta_rebase_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        full_vnode_capture_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     leader
@@ -3914,46 +3530,53 @@ async fn mismatched_observed_assignment_sends_exact_negative_prepare_ack() {
 }
 
 #[cfg(feature = "cluster")]
-async fn gate_recovery_capsule(
+async fn gate_committed_checkpoint(
     decision_store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
     attempt: CheckpointAttempt,
     fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
-) -> laminar_core::checkpoint::RecoveryCapsuleRef {
+) -> laminar_core::checkpoint::CommittedCheckpointRef {
     use laminar_core::checkpoint::{
-        ClusterRecoveryCapsule, ParticipantRecoveryRef, PipelineIdentity,
-        CLUSTER_RECOVERY_CAPSULE_VERSION,
+        ChannelProgress, CheckpointScope, CommittedCheckpointIndex, CommittedParticipantRef,
+        PipelineIdentity, COMMITTED_CHECKPOINT_INDEX_VERSION,
     };
 
-    let capsule = ClusterRecoveryCapsule {
-        version: CLUSTER_RECOVERY_CAPSULE_VERSION,
-        attempt,
+    let participants = fence
+        .participant_ids()
+        .into_iter()
+        .map(|participant_id| CommittedParticipantRef {
+            participant_id,
+            manifest_len: 1,
+            manifest_sha256: digest(3),
+            node_data_len: 0,
+            node_data_sha256: digest(4),
+        })
+        .collect::<Vec<_>>();
+    let channel_progress = participants
+        .iter()
+        .map(|participant| ChannelProgress {
+            participant_id: participant.participant_id,
+            channel_id: format!("participant-{}", participant.participant_id),
+            watermark: Some(42),
+            idle: false,
+        })
+        .collect();
+    let index = CommittedCheckpointIndex {
+        version: COMMITTED_CHECKPOINT_INDEX_VERSION,
         deployment_id: decision_store.load_or_create_deployment_id().await.unwrap(),
         pipeline_identity: PipelineIdentity::empty(),
-        assignment_fence: fence.clone(),
-        seal_inventory_sha256: digest(1),
-        vnode_restore_contract: crate::cluster_recovery_capsule::vnode_restore_contract_for_test(
-            fence.vnode_count,
-        ),
-        participants: fence
-            .participant_ids()
-            .into_iter()
-            .map(|participant_id| ParticipantRecoveryRef {
-                participant_id,
-                readiness_sha256: digest(2),
-                manifest_sha256: digest(3),
-                portable_state_sha256: digest(4),
-            })
-            .collect(),
+        epoch: attempt.epoch,
+        checkpoint_id: attempt.checkpoint_id,
+        scope: CheckpointScope::Cluster,
+        vnode_count: u16::try_from(fence.vnode_count).unwrap(),
+        assignment_fence: Some(fence.clone()),
+        predecessor: None,
+        participants,
         source_offsets: Default::default(),
-        source_metadata: Default::default(),
-        source_assignment_versions: Default::default(),
-        source_watermarks: Default::default(),
-        cluster_watermark: CheckpointWatermark::Active(42),
-        recovery_watermark_frontier: Some(42),
-        portable_state_sha256: digest(4),
+        channel_progress,
+        checkpoint_watermark: Some(42),
     };
     decision_store
-        .create_recovery_capsule(&capsule)
+        .create_committed_checkpoint(&index)
         .await
         .unwrap()
 }
@@ -3965,7 +3588,7 @@ async fn record_gate_commit(
     attempt: CheckpointAttempt,
     fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
 ) {
-    let recovery_capsule = gate_recovery_capsule(decision_store, attempt, fence).await;
+    let committed_checkpoint = gate_committed_checkpoint(decision_store, attempt, fence).await;
     let authority = controller.checkpoint_authority().unwrap();
     let proof = authority.load().await.unwrap().unwrap().proof();
     authority
@@ -3975,7 +3598,7 @@ async fn record_gate_commit(
             attempt.checkpoint_id,
             fence.clone(),
             laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
-            Some(recovery_capsule),
+            Some(committed_checkpoint),
         )
         .await
         .unwrap();
@@ -4060,7 +3683,7 @@ async fn exact_commit_resume_gate_publishes_the_recovery_safe_watermark() {
     assert_eq!(
         controller.cluster_min_watermark(),
         Some(42),
-        "the immutable capsule owns the recovery-safe watermark"
+        "the committed checkpoint owns the recovery-safe watermark"
     );
 }
 

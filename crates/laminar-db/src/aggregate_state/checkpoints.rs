@@ -6,7 +6,6 @@
 use arrow::datatypes::Schema;
 use xxhash_rust::xxh3::Xxh3;
 
-#[cfg(feature = "cluster")]
 use crate::error::DbError;
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -35,7 +34,6 @@ pub(crate) struct EmittedCheckpoint {
 }
 
 /// Query-plan limits for borrowed aggregate archive validation.
-#[cfg(feature = "cluster")]
 #[derive(Clone, Copy)]
 pub(crate) struct AggStateArchiveRestoreProfile {
     fingerprint: u64,
@@ -46,20 +44,11 @@ pub(crate) struct AggStateArchiveRestoreProfile {
 }
 
 /// A checked archive retained in borrowed form until the complete roster passes.
-#[cfg(feature = "cluster")]
 pub(crate) struct PreflightedAggStateArchive<'a> {
     archived: &'a ArchivedAggStateCheckpoint,
     group_count: usize,
 }
 
-#[cfg(all(feature = "cluster", test))]
-thread_local! {
-    static OWNED_RESTORE_DECODE_COUNT: std::cell::Cell<usize> = const {
-        std::cell::Cell::new(0)
-    };
-}
-
-#[cfg(feature = "cluster")]
 impl AggStateArchiveRestoreProfile {
     pub(super) const fn new(
         fingerprint: u64,
@@ -156,7 +145,6 @@ impl AggStateArchiveRestoreProfile {
     }
 }
 
-#[cfg(feature = "cluster")]
 impl PreflightedAggStateArchive<'_> {
     pub(crate) const fn group_count(&self) -> usize {
         self.group_count
@@ -166,8 +154,6 @@ impl PreflightedAggStateArchive<'_> {
         self,
         context: std::fmt::Arguments<'_>,
     ) -> Result<AggStateCheckpoint, DbError> {
-        #[cfg(test)]
-        OWNED_RESTORE_DECODE_COUNT.with(|count| count.set(count.get().saturating_add(1)));
         rkyv::deserialize::<AggStateCheckpoint, rkyv::rancor::Error>(self.archived).map_err(
             |error| {
                 DbError::Pipeline(format!(
@@ -176,16 +162,6 @@ impl PreflightedAggStateArchive<'_> {
             },
         )
     }
-}
-
-#[cfg(all(feature = "cluster", test))]
-pub(crate) fn reset_owned_restore_decode_count_for_test() {
-    OWNED_RESTORE_DECODE_COUNT.with(|count| count.set(0));
-}
-
-#[cfg(all(feature = "cluster", test))]
-pub(crate) fn owned_restore_decode_count_for_test() -> usize {
-    OWNED_RESTORE_DECODE_COUNT.with(std::cell::Cell::get)
 }
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]

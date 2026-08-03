@@ -11,7 +11,7 @@ use laminar_connectors::connector::{
     ConnectorCancellationPolicy, DeliveryGuarantee, SinkConnector, SinkConsistency, SinkContract,
     SinkTopology, SourceConsistency, SourceContract, SourceInputMode, SourceTopology,
 };
-use laminar_core::state::StateBackendDurability;
+use laminar_core::checkpoint::object_store_builder::CheckpointStorageScope;
 use rustc_hash::FxHashMap;
 
 use crate::catalog::schema_has_reserved_mutation_columns;
@@ -22,51 +22,16 @@ use crate::db::{exact_table_reference, DbState, LaminarDB, RuntimeMode, SourceWa
 use crate::error::DbError;
 use crate::pipeline::streaming_coordinator::{admit_append_only_source, TrackedSourceRegistration};
 
-/// Bound recovery amplification while keeping every delta parent strictly inside the retained
-/// predecessor window. A single retained predecessor cannot support a delta chain, so it stays on
-/// full per-vnode snapshots.
-#[cfg(feature = "cluster")]
-const fn cluster_delta_chain_bound(max_retained: usize) -> Option<u32> {
-    match max_retained {
-        0 | 1 => None,
-        2 => Some(1),
-        3 => Some(2),
-        4 => Some(3),
-        _ => Some(4),
-    }
-}
-
-/// Maximum number of physical partial artifacts a writer-conformant vnode restore may fetch.
-/// One FULL is always required; retention of two or more cuts permits one direct REFERENCE edge,
-/// and the remaining edges are the independently bounded consecutive DELTAs.
-#[cfg(feature = "cluster")]
-pub(crate) const fn max_artifacts_per_cluster_vnode_chain(max_retained: usize) -> usize {
-    let reference_edge = if max_retained >= 2 { 1 } else { 0 };
-    let delta_edges = match cluster_delta_chain_bound(max_retained) {
-        Some(bound) => bound as usize,
-        None => 0,
-    };
-    1 + reference_edge + delta_edges
-}
-
-/// Absolute reader limit across every currently accepted retention setting. The local
-/// `max_retained` value is not yet part of cluster identity, so using its narrower limit could
-/// strand a valid checkpoint produced by a differently configured participant.
-#[cfg(feature = "cluster")]
-#[cfg(test)]
-pub(crate) const MAX_ARTIFACTS_PER_CLUSTER_VNODE_CHAIN: usize =
-    max_artifacts_per_cluster_vnode_chain(usize::MAX);
-
-const fn required_recovery_scope(runtime: RuntimeMode) -> StateBackendDurability {
+const fn required_recovery_scope(runtime: RuntimeMode) -> CheckpointStorageScope {
     match runtime {
-        RuntimeMode::Local => StateBackendDurability::NodeDurable,
-        RuntimeMode::Cluster => StateBackendDurability::ClusterShared,
+        RuntimeMode::Local => CheckpointStorageScope::NodeDurable,
+        RuntimeMode::Cluster => CheckpointStorageScope::ClusterShared,
     }
 }
 
 const EXACT_SINK_PROTOCOL: &str =
     "exactly-once external sinks require checkpoint-committable consistency, coordinated phase \
-     1, participant-complete sealed markers, and a namespaced exact external cursor";
+     1, an immutable committed checkpoint index, and a namespaced exact external cursor";
 const CLUSTER_BEST_EFFORT: &str =
     "cluster mode requires at_least_once delivery; best_effort has no defined \
      rebalance/state-loss contract";
@@ -286,7 +251,7 @@ fn admit_source_contract(
 fn validate_source_recovery_assignment(
     source: &str,
     assignment_scoped: bool,
-    checkpoint: Option<&laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint>,
+    checkpoint: Option<&laminar_core::checkpoint::ConnectorCheckpoint>,
     expected_assignment: Option<std::num::NonZeroU64>,
 ) -> Result<(), DbError> {
     let captured = checkpoint.and_then(|checkpoint| checkpoint.source_assignment_version);
@@ -382,7 +347,7 @@ struct SinkAdmissionContext<'a> {
     runtime: RuntimeMode,
     carries_changelog: bool,
     checkpointing_enabled: bool,
-    state_backend_scope: StateBackendDurability,
+    checkpoint_storage_scope: CheckpointStorageScope,
 }
 
 struct PreparedSink {
@@ -409,9 +374,6 @@ type PipelineSink = (
 struct PipelineSinkSetup {
     sinks: Vec<PipelineSink>,
     sink_event_rx: laminar_core::streaming::AsyncConsumer<crate::sink_task::SinkEvent>,
-    coordinated_committer: Option<crate::coordinated_committer::CoordinatedCommitter>,
-    committer_poll: std::time::Duration,
-    committer_notify: Arc<tokio::sync::Notify>,
     #[cfg(feature = "cluster")]
     callback_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
 }
@@ -420,11 +382,8 @@ struct PipelineRecoveryState {
     graph: crate::operator_graph::OperatorGraph,
     recovered_mv_store: crate::mv_store::MvStore,
     recovered_source_wms: rustc_hash::FxHashMap<String, i64>,
+    recovered_source_idle: rustc_hash::FxHashMap<String, bool>,
     recovered_watermark_frontier: Option<i64>,
-    recovered_all_sources_idle: bool,
-    source_watermark_recovery_selected: bool,
-    #[cfg(feature = "cluster")]
-    reconciled_source_handoff_version: Option<u64>,
     restored_reference_tables: bool,
 }
 
@@ -444,7 +403,6 @@ struct PipelineRuntimeSetup {
     checkpoint_complete_rx:
         crossfire::AsyncRx<crossfire::mpsc::Array<crate::pipeline::CheckpointCompletion>>,
     checkpoint_in_flight: Arc<std::sync::atomic::AtomicU64>,
-    coordinated_commit_admission: Option<crate::checkpoint_coordinator::CoordinatedCommitAdmission>,
     #[cfg(feature = "cluster")]
     source_process_authority: Option<Arc<laminar_core::cluster::control::ClusterController>>,
     runtime_mode: RuntimeMode,
@@ -452,9 +410,6 @@ struct PipelineRuntimeSetup {
 
 struct PreparedPipelineRuntime {
     runtime: PipelineRuntimeSetup,
-    coordinated_committer: Option<crate::coordinated_committer::CoordinatedCommitter>,
-    committer_poll: std::time::Duration,
-    committer_notify: Arc<tokio::sync::Notify>,
 }
 
 type ReferenceTableRuntimeSource = (
@@ -592,7 +547,7 @@ fn admit_sink(
         runtime,
         carries_changelog,
         checkpointing_enabled,
-        state_backend_scope,
+        checkpoint_storage_scope,
     } = context;
     let contract = sink.contract(config).map_err(|e| {
         DbError::Config(format!(
@@ -623,11 +578,11 @@ fn admit_sink(
             )));
         }
         let required_scope = required_recovery_scope(runtime);
-        if !state_backend_scope.satisfies(required_scope) {
+        if !checkpoint_storage_scope.satisfies(required_scope) {
             return Err(DbError::Config(format!(
-                "[LDB-5035] sink '{name}' cannot run exactly-once: prepared participant markers \
-                 require {required_scope:?} state, but the configured backend is \
-                 {state_backend_scope:?}"
+                "[LDB-5035] sink '{name}' cannot run exactly-once: committed checkpoints require \
+                 {required_scope:?} storage, but the configured checkpoint store is \
+                 {checkpoint_storage_scope:?}"
             )));
         }
         if sink.as_coordinated_committer().is_none() {
@@ -1334,8 +1289,8 @@ impl Drop for StartupDriverGuard {
     }
 }
 
-/// Retire only the transition handed to a graph generation that never launches. Vnodes remain
-/// `Restoring`; a later generation must reload the durable cut before source intake can open.
+/// Retire only the transition handed to a graph generation that never launches. A later
+/// generation must reload the durable cut before source intake can open.
 #[cfg(feature = "cluster")]
 struct PendingVnodeTransitionLaunchGuard {
     handle: crate::vnode_transition_staging::PendingVnodeTransitionHandle,
@@ -1401,62 +1356,11 @@ fn publish_runtime_fault_state(state: &std::sync::atomic::AtomicU8) -> bool {
 
 impl LaminarDB {
     #[cfg(feature = "cluster")]
-    fn validate_boot_vnode_recovery_target(
-        &self,
-        recovered_attempt: laminar_core::state::CheckpointAttempt,
-        recovered_assignment_version: u64,
-    ) -> Result<Option<u64>, DbError> {
-        let registry = self
-            .vnode_registry
-            .lock()
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| {
-                DbError::Checkpoint("[LDB-6031] cluster recovery has no vnode registry".into())
-            })?;
-        let assignment = registry.versioned_snapshot();
-        let Some(handoff_attempt) = assignment.source_handoff_attempt() else {
-            return Ok(None);
-        };
-        let matches_installed_handoff = handoff_attempt == recovered_attempt
-            && assignment.source_handoff_assignment_version() == Some(recovered_assignment_version);
-        // The registry handoff records the cut used to acquire this assignment; it is not a
-        // moving latest-checkpoint pointer. A later committed checkpoint may therefore supersede
-        // it without changing ownership. Its fence must be no older than the handoff publication
-        // and no newer than the registry generation this process is rebuilding.
-        let supersedes_installed_handoff = recovered_attempt.relation_to(handoff_attempt)
-            == laminar_core::state::CheckpointAttemptRelation::Newer
-            && assignment
-                .source_handoff_installed_version()
-                .is_some_and(|installed| installed <= recovered_assignment_version)
-            && recovered_assignment_version <= assignment.version();
-        if !matches_installed_handoff && !supersedes_installed_handoff {
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6031] recovered vnode attempt {recovered_attempt:?} at assignment \
-                 {recovered_assignment_version} does not match installed source handoff \
-                 {handoff_attempt:?} at assignment {:?}",
-                assignment.source_handoff_assignment_version()
-            )));
-        }
-        Ok(assignment.source_handoff_installed_version())
-    }
-
-    #[cfg(feature = "cluster")]
     fn validate_fresh_cluster_vnode_start(&self) -> Result<(), DbError> {
-        let registry = self
-            .vnode_registry
-            .lock()
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| {
-                DbError::Checkpoint("[LDB-6031] cluster recovery has no vnode registry".into())
-            })?;
-        if self.has_unapplied_vnode_transition(&registry)
-            || registry.versioned_snapshot().has_committed_handoff()
-        {
+        if self.has_unapplied_vnode_transition() {
             return Err(DbError::Checkpoint(
-                "[LDB-6031] cluster startup found committed or staged vnode state but no exact \
-                 recovered checkpoint; refusing a fresh graph"
+                "[LDB-6031] cluster startup found staged vnode state but no exact recovered \
+                 checkpoint; refusing a fresh graph"
                     .into(),
             ));
         }
@@ -1477,7 +1381,7 @@ impl LaminarDB {
             )
         })?;
         let assignment = registry.versioned_snapshot();
-        if assignment.version() == 0 || self.has_unapplied_vnode_transition(&registry) {
+        if assignment.version() == 0 || self.has_unapplied_vnode_transition() {
             return Ok(None);
         }
 
@@ -1566,7 +1470,7 @@ impl LaminarDB {
         let current = registry.versioned_snapshot();
         if current.version() != assignment.version()
             || current.owners() != assignment.owners()
-            || self.has_unapplied_vnode_transition(&registry)
+            || self.has_unapplied_vnode_transition()
         {
             return Err(DbError::Checkpoint(format!(
                 "assignment {} changed or gained vnode work before graph-ready publication",
@@ -1581,70 +1485,12 @@ impl LaminarDB {
         ))
     }
 
-    #[cfg(feature = "cluster")]
-    async fn publish_boot_vnode_restore_transition(
-        &self,
-        registry: &laminar_core::state::VnodeRegistry,
-        target_assignment: &laminar_core::state::VnodeAssignmentSnapshot,
-        target_fence: laminar_core::checkpoint::CheckpointAssignmentFence,
-        participant: laminar_core::checkpoint::CheckpointParticipant,
-        restore_binding: crate::checkpoint_coordinator::ValidatedClusterVnodeTransitionBinding,
-        loaded: crate::recovery_manager::vnode_chains::LoadedVnodeChains,
-    ) -> Result<(), DbError> {
-        // Pin the registry publication through staging. The startup assignment lock prevents a
-        // competing adopter from beginning, while this read guard also makes the helper itself
-        // reject a target that changed during the backend read.
-        let current_assignment = registry.read_assignment();
-        if current_assignment.version() != target_assignment.version()
-            || current_assignment.owners() != target_assignment.owners()
-        {
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6031] boot vnode recovery target assignment {} changed to {} before \
-                 staging",
-                target_assignment.version(),
-                current_assignment.version()
-            )));
-        }
-        let local_node_id = participant.node_id;
-        let transition = Arc::new(
-            crate::vnode_transition_staging::PendingVnodeTransition::boot_recovery(
-                target_fence,
-                target_assignment.owners(),
-                participant,
-                restore_binding.pipeline_identity().clone(),
-                restore_binding,
-                loaded,
-            )?,
-        );
-        let target_owned = transition.acquired_vnodes().to_vec();
-        let stale_unowned: Vec<u32> = registry
-            .restoring_vnodes()
-            .into_iter()
-            .filter(|vnode| {
-                current_assignment.owners().get(*vnode as usize).copied()
-                    != Some(laminar_core::state::NodeId(local_node_id))
-            })
-            .collect();
-        drop(current_assignment);
-
-        // The caller owns the startup assignment and generation fences. Publish lifecycle and
-        // the complete immutable replacement while the exact target assignment remains pinned.
-        // Reserve the new owned roster before exposing its transition so hot-path readiness can
-        // observe a conservative false positive, never a false Active state. Only lifecycle
-        // entries proven unowned by this exact target may be released from stale boot work.
-        let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
-            DbError::Checkpoint("[LDB-6031] boot vnode staging has no cluster controller".into())
-        })?;
-        self.publish_local_vnode_state_report(&controller, target_assignment, false)
-            .await?;
-        let mut pending = self.pending_vnode_transition.lock();
-        registry.mark_restoring(&target_owned);
-        *pending = Some(transition);
-        registry.mark_active(&stale_unowned);
-        Ok(())
+    /// Returns `true` if the database has been shut down.
+    pub fn is_closed(&self) -> bool {
+        self.shutdown.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Fence new work and wake the running pipeline without waiting for teardown.
+    /// Fence new work and wake the runtime so it can shut down.
     pub fn close(&self) {
         let runtime_shutdown = self.runtime_shutdown.write();
         self.shutdown
@@ -1653,229 +1499,6 @@ impl LaminarDB {
         self.assignment_restore_shutdown.cancel();
         runtime_shutdown.cancel();
         self.shutdown_signal.notify_one();
-    }
-
-    /// Prepare each boot-owned vnode's chain at the exact committed cut the sources resume from.
-    #[cfg(feature = "cluster")]
-    async fn prepare_boot_vnode_restore_transition(
-        &self,
-        restore_cut: crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut,
-    ) -> Result<(), DbError> {
-        let timeout = self
-            .config
-            .checkpoint
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.timeout_ms)
-            .map_or_else(
-                || crate::checkpoint_coordinator::CheckpointConfig::default().checkpoint_timeout,
-                std::time::Duration::from_millis,
-            );
-        let deadline = tokio::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| {
-                DbError::Checkpoint("[LDB-6050] boot vnode restore deadline overflow".into())
-            })?;
-        let cancel = self.runtime_shutdown.read().clone();
-        let prepare =
-            self.prepare_boot_vnode_restore_transition_until(restore_cut, deadline, &cancel);
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => Err(crate::vnode_restore_input::restore_cancelled()),
-            result = tokio::time::timeout_at(deadline, prepare) => {
-                result.unwrap_or_else(|_| Err(crate::vnode_restore_input::restore_timed_out()))
-            }
-        }
-    }
-
-    #[cfg(feature = "cluster")]
-    async fn prepare_boot_vnode_restore_transition_until(
-        &self,
-        restore_cut: crate::checkpoint_coordinator::ValidatedClusterVnodeRestoreCut,
-        deadline: tokio::time::Instant,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<(), DbError> {
-        let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
-            DbError::Checkpoint("[LDB-6031] cluster recovery has no live cluster controller".into())
-        })?;
-        let self_id = controller.instance_id();
-        let registry = match self.vnode_registry.lock().as_ref() {
-            Some(registry) => Arc::clone(registry),
-            None => {
-                return Err(DbError::Checkpoint(
-                    "[LDB-6031] cluster recovery has no vnode registry".into(),
-                ));
-            }
-        };
-        let target_assignment = registry.versioned_snapshot();
-        let owned = laminar_core::state::owned_vnodes(&registry, self_id);
-        if target_assignment.version() == 0 {
-            let has_pending_transition = self.pending_vnode_transition.lock().is_some();
-            let has_installed_state = self.installed_vnode_state.lock().is_some();
-            if !owned.is_empty()
-                || target_assignment
-                    .owners()
-                    .iter()
-                    .any(|owner| *owner != laminar_core::state::NodeId::UNASSIGNED)
-                || has_pending_transition
-                || has_installed_state
-                || registry.any_restoring()
-                || target_assignment.has_committed_handoff()
-            {
-                return Err(DbError::Checkpoint(
-                    "[LDB-6031] unassigned cluster boot has retained vnode lifecycle state".into(),
-                ));
-            }
-            // Existing clusters intentionally construct replacement processes unassigned. Source
-            // intake remains fenced while the audited durable assignment is adopted after the
-            // graph and coordinator start; that adoption loads the exact committed vnode cut.
-            // Do not invent assignment-zero authority or mark any vnode active here.
-            tracing::info!(
-                epoch = restore_cut.attempt().epoch,
-                checkpoint_id = restore_cut.attempt().checkpoint_id,
-                "cluster recovery: deferring vnode restore until durable assignment adoption"
-            );
-            return Ok(());
-        }
-        let assignment_store = self
-            .assignment_snapshot_store
-            .lock()
-            .clone()
-            .ok_or_else(|| {
-                DbError::Checkpoint(
-                    "[LDB-6031] boot vnode recovery has no durable assignment history".into(),
-                )
-            })?;
-        let target_snapshot = assignment_store
-            .load_version(target_assignment.version())
-            .await
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "[LDB-6031] load boot assignment {}: {error}",
-                    target_assignment.version()
-                ))
-            })?
-            .ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "[LDB-6031] boot assignment {} is unavailable",
-                    target_assignment.version()
-                ))
-            })?;
-        crate::rebalance::audit_assignment_snapshot_authority(
-            &assignment_store,
-            Some(controller.as_ref()),
-            &target_snapshot,
-        )
-        .await
-        .map_err(|error| {
-            DbError::Checkpoint(format!(
-                "[LDB-6031] boot assignment {} authority audit failed: {error}",
-                target_assignment.version()
-            ))
-        })?;
-        let target_owners = target_snapshot
-            .to_vnode_vec(registry.vnode_count())
-            .map_err(|error| DbError::Checkpoint(error.to_string()))?;
-        if target_snapshot.version != target_assignment.version()
-            || target_owners.as_slice() != target_assignment.owners()
-        {
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6031] boot assignment {} does not match the installed owner map",
-                target_assignment.version()
-            )));
-        }
-        let target_fence = target_snapshot
-            .assignment_fence()
-            .map_err(|error| DbError::Checkpoint(error.to_string()))?;
-        let attempt = restore_cut.attempt();
-        tracing::info!(
-            owned = owned.len(),
-            epoch = attempt.epoch,
-            checkpoint_id = attempt.checkpoint_id,
-            "cluster recovery: rehydrating boot-owned vnodes from chains"
-        );
-        if owned.is_empty() {
-            // The audited target proves that this replacement graph owns no vnode state. Retire
-            // any prior graph's exact transition only after pinning that target; preparation
-            // failures above deliberately leave the prior Arc and lifecycle untouched.
-            let current_assignment = registry.read_assignment();
-            if current_assignment.version() != target_assignment.version()
-                || current_assignment.owners() != target_assignment.owners()
-            {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6031] boot vnode recovery target assignment {} changed to {} before empty-state publication",
-                    target_assignment.version(),
-                    current_assignment.version()
-                )));
-            }
-            let stale_unowned: Vec<u32> = registry
-                .restoring_vnodes()
-                .into_iter()
-                .filter(|vnode| {
-                    current_assignment.owners().get(*vnode as usize).copied()
-                        != Some(laminar_core::state::NodeId(self_id.0))
-                })
-                .collect();
-            let mut pending = self.pending_vnode_transition.lock();
-            let mut installed = self.installed_vnode_state.lock();
-            pending.take();
-            installed.take();
-            registry.mark_active(&stale_unowned);
-            return Ok(());
-        }
-        let Some(backend) = self.state_backend.lock().clone() else {
-            return Err(DbError::Checkpoint(
-                "[LDB-6031] cluster recovery requires a durable state backend but none is \
-                 wired — refusing to start with staged source offsets and empty aggregate state"
-                    .to_string(),
-            ));
-        };
-        let restore_head = restore_cut.restore_head();
-        let budget = self.vnode_restore_input_budget(restore_head)?;
-        let reader =
-            crate::recovery_manager::vnode_chains::SealedVnodeChainReader::from_committed_head(
-                backend.as_ref(),
-                restore_head,
-            )?;
-        // A replacement graph cannot reuse an earlier graph's staged bytes. Retire only the exact
-        // observed transition after all durable target/reader validation, then reload while the
-        // vnode lifecycle remains `Restoring` and source intake remains fenced.
-        let displaced = self.pending_vnode_transition.lock().clone();
-        if let Some(displaced) = displaced {
-            crate::vnode_transition_staging::retire_exact_pending_vnode_transition(
-                &self.pending_vnode_transition,
-                &displaced,
-            );
-            drop(displaced);
-        }
-        let loaded = reader
-            .load_at_reserved(&owned, attempt, &budget, deadline, cancel)
-            .await?;
-        drop(reader);
-        let restore_binding = restore_cut.into_transition_binding()?;
-        self.publish_boot_vnode_restore_transition(
-            &registry,
-            &target_assignment,
-            target_fence,
-            laminar_core::checkpoint::CheckpointParticipant {
-                node_id: self_id.0,
-                boot_incarnation: controller.recovery_incarnation(),
-            },
-            restore_binding,
-            loaded,
-        )
-        .await?;
-        tracing::info!(
-            staged = owned.len(),
-            epoch = attempt.epoch,
-            checkpoint_id = attempt.checkpoint_id,
-            "cluster recovery: staged boot-owned vnodes for operator recovery"
-        );
-        Ok(())
-    }
-
-    /// Returns `true` if the database has been shut down.
-    pub fn is_closed(&self) -> bool {
-        self.shutdown.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Enable auto-restart from the last checkpoint on a fault. Without it, a fault parks
@@ -2415,7 +2038,6 @@ impl LaminarDB {
     async fn cleanup_failed_start(&self) -> Result<(), DbError> {
         const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
-        self.quiesce_committer_until(deadline).await?;
         self.quiesce_checkpoint_decision_until(deadline).await?;
         {
             let mut coordinator = tokio::time::timeout_at(deadline, self.coordinator.lock())
@@ -2427,11 +2049,7 @@ impl LaminarDB {
                     )
             })?;
             if let Some(coordinator) = coordinator.as_mut() {
-                let expected_sinks = coordinator.committable_sink_names()?;
-                coordinator
-                    .audit_sink_open_witness_topology(expected_sinks)
-                    .await?;
-                tokio::time::timeout_at(deadline, coordinator.reconcile_prepared_on_init())
+                tokio::time::timeout_at(deadline, coordinator.reconcile_sink_open_witness())
                     .await
                     .map_err(|_| {
                         DbError::Checkpoint(format!(
@@ -2466,31 +2084,6 @@ impl LaminarDB {
             Err(_) => Err(DbError::Pipeline(format!(
                 "{operation} could not observe terminal startup before its deadline; startup remains fenced"
             ))),
-        }
-    }
-
-    async fn quiesce_committer_until(&self, deadline: tokio::time::Instant) -> Result<(), DbError> {
-        let mut owned = tokio::time::timeout_at(deadline, self.committer_handle.lock())
-            .await
-            .map_err(|_| {
-                DbError::Checkpoint(
-                    "teardown could not acquire coordinated-committer ownership; deployment fences remain held"
-                        .into(),
-                )
-            })?;
-        let Some(handle) = owned.as_mut() else {
-            return Ok(());
-        };
-        handle.abort();
-        match tokio::time::timeout_at(deadline, handle).await {
-            Ok(_) => {
-                owned.take();
-                Ok(())
-            }
-            Err(_) => Err(DbError::Checkpoint(
-                "coordinated committer did not terminate before the teardown deadline; deployment fences remain held"
-                    .into(),
-            )),
         }
     }
 
@@ -2895,17 +2488,6 @@ impl LaminarDB {
         let generation_quiesce_deadline =
             tokio::time::Instant::now() + FAULT_RESTART_QUIESCE_TIMEOUT;
         if let Err(error) = self
-            .quiesce_committer_until(generation_quiesce_deadline)
-            .await
-        {
-            if starting_from_fault {
-                DbState::Faulted.store(&self.state);
-            } else {
-                DbState::Created.store(&self.state);
-            }
-            return Err(error);
-        }
-        if let Err(error) = self
             .quiesce_connector_generation_until(generation_quiesce_deadline)
             .await
         {
@@ -3013,13 +2595,7 @@ impl LaminarDB {
     fn validate_startup_durability(
         &self,
         startup_runtime: RuntimeMode,
-    ) -> Result<
-        (
-            Option<Arc<dyn object_store::ObjectStore>>,
-            StateBackendDurability,
-        ),
-        DbError,
-    > {
+    ) -> Result<Option<Arc<dyn object_store::ObjectStore>>, DbError> {
         #[cfg(feature = "cluster")]
         if startup_runtime == RuntimeMode::Cluster
             && (!self.mv_registry.lock().is_empty() || !self.mv_store.read().is_empty())
@@ -3064,12 +2640,11 @@ impl LaminarDB {
             // survives a same-node process restart. Explicit URLs are classified fail-closed;
             // notably memory:// cannot own source acknowledgements under a replay guarantee.
             let checkpoint_scope = if injected_cluster_checkpoint_store.is_some() {
-                StateBackendDurability::ClusterShared
+                CheckpointStorageScope::ClusterShared
             } else {
                 match self.config.object_store_url.as_deref() {
-                    Some(url) if url.starts_with("file://") => StateBackendDurability::NodeDurable,
-                    Some(url) => StateBackendDurability::for_storage_url(url),
-                    None => StateBackendDurability::NodeDurable,
+                    Some(url) => CheckpointStorageScope::for_url(url),
+                    None => CheckpointStorageScope::NodeDurable,
                 }
             };
             let required = required_recovery_scope(startup_runtime);
@@ -3084,29 +2659,7 @@ impl LaminarDB {
             }
         }
 
-        let state_backend_scope = self
-            .state_backend
-            .lock()
-            .as_ref()
-            .map_or(StateBackendDurability::Volatile, |backend| {
-                backend.durability_scope()
-            });
-        match startup_runtime {
-            // A cluster peer must be able to recover a failed node's vnodes.
-            RuntimeMode::Cluster
-                if !state_backend_scope.satisfies(StateBackendDurability::ClusterShared) =>
-            {
-                return Err(DbError::Config(format!(
-                    "[LDB-0011] cluster mode requires ClusterShared state so a peer can \
-                         recover a failed node's vnodes; the configured backend is \
-                         {state_backend_scope:?}. Use shared cloud storage (s3://, gs://, or \
-                         az://); in-process, local paths, and file:// storage are not \
-                         cluster-shared."
-                )));
-            }
-            _ => {}
-        }
-        Ok((injected_cluster_checkpoint_store, state_backend_scope))
+        Ok(injected_cluster_checkpoint_store)
     }
 
     async fn initialize_checkpointing(
@@ -3117,11 +2670,7 @@ impl LaminarDB {
         table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
         startup_runtime: RuntimeMode,
         injected_cluster_checkpoint_store: Option<Arc<dyn object_store::ObjectStore>>,
-        state_backend_scope: StateBackendDurability,
     ) -> Result<Option<laminar_core::checkpoint::PipelineIdentity>, DbError> {
-        #[cfg(not(feature = "cluster"))]
-        let _ = state_backend_scope;
-
         let participant = self.checkpoint_participant();
         let bound_pipeline_identity =
             if self.config.checkpoint.is_some() || startup_runtime == RuntimeMode::Cluster {
@@ -3137,7 +2686,6 @@ impl LaminarDB {
                     &self.connector_registry,
                     identity_registrations,
                     self.checkpoint_key_groups().get(),
-                    participant.is_some(),
                 );
                 Some(crate::pipeline_identity::compute(&identity_context)?)
             } else {
@@ -3154,9 +2702,9 @@ impl LaminarDB {
                     "checkpoint.max_retained must be greater than zero".into(),
                 ));
             }
-            let max_staged_bytes = cp_config.max_staged_bytes.ok_or_else(|| {
+            let max_node_data_bytes = cp_config.max_node_data_bytes.ok_or_else(|| {
                 DbError::Config(
-                    "checkpoint.max_staged_bytes was not resolved at construction".into(),
+                    "checkpoint.max_node_data_bytes was not resolved at construction".into(),
                 )
             })?;
             if cp_config.interval_ms == Some(0) {
@@ -3183,7 +2731,7 @@ impl LaminarDB {
                 .as_deref()
                 .filter(|url| url.starts_with("file://"))
                 .map(|url| {
-                    laminar_core::storage::object_store_builder::file_url_path(url)
+                    laminar_core::checkpoint::object_store_builder::file_url_path(url)
                         .map_err(|error| DbError::Config(format!("object store: {error}")))
                 })
                 .transpose()?;
@@ -3225,71 +2773,47 @@ impl LaminarDB {
                 })?;
                 *self.checkpoint_namespace_lock.lock() = Some(lock);
             }
-            let participant_id = participant.unwrap_or(0);
+            let participant_id = participant.unwrap_or(laminar_core::state::LOCAL_NODE_ID.0);
             let pipeline_identity = bound_pipeline_identity.clone().ok_or_else(|| {
                 DbError::Checkpoint(
                     "checkpoint startup did not derive the pipeline identity".into(),
                 )
             })?;
 
-            let (store, decision_backing): (
-                Box<dyn laminar_core::storage::CheckpointStore>,
-                Option<Arc<dyn object_store::ObjectStore>>,
-            ) = if let Some(obj) = injected_cluster_checkpoint_store.as_ref() {
-                let cs = laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
-                    Arc::clone(obj),
-                    participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
+            let checkpoint_backing = self
+                .checkpoint_object_store()?
+                .ok_or_else(|| DbError::Checkpoint("checkpoint object store is disabled".into()))?;
+            let probe_timeout = std::time::Duration::from_secs(10);
+            let probe = if startup_runtime == RuntimeMode::Cluster {
+                laminar_core::checkpoint::probe_object_store_conditional_update(
+                    checkpoint_backing.as_ref(),
+                    "",
+                    probe_timeout,
                 )
-                .with_max_state_data_bytes(max_staged_bytes)?
-                .with_key_group_count(key_group_count)
-                .with_participant_id(participant_id);
-                (Box::new(cs), Some(Arc::clone(obj)))
-            } else if let Some(file_root) = explicit_file_checkpoint_root.as_ref() {
-                laminar_core::durable_fs::ensure_durable_directory(file_root).map_err(|error| {
-                    DbError::Config(format!(
-                        "create file checkpoint directory {}: {error}",
-                        file_root.display()
-                    ))
-                })?;
-                let checkpoint_dir = participant.map_or(file_root.clone(), |id| {
-                    file_root.join("nodes").join(id.to_string())
-                });
-                let cs = laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
-                    checkpoint_dir,
-                )
-                .with_max_state_data_bytes(max_staged_bytes)?
-                .with_key_group_count(key_group_count)
-                .with_participant_id(participant_id);
-                (Box::new(cs), None)
-            } else if let Some(ref url) = self.config.object_store_url {
-                let obj = laminar_core::storage::object_store_builder::build_object_store(
-                    url,
-                    &self.config.object_store_options,
-                )
-                .map_err(|e| DbError::Config(format!("object store: {e}")))?;
-                let cs = laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
-                    Arc::clone(&obj),
-                    participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
-                )
-                .with_max_state_data_bytes(max_staged_bytes)?
-                .with_key_group_count(key_group_count)
-                .with_participant_id(participant_id);
-                (Box::new(cs), Some(obj))
+                .await
             } else {
-                laminar_core::durable_fs::ensure_durable_directory(&data_dir).map_err(|e| {
-                    DbError::Config(format!("data dir {}: {e}", data_dir.display()))
-                })?;
-                let checkpoint_dir = participant.map_or(data_dir.clone(), |id| {
-                    data_dir.join("nodes").join(id.to_string())
-                });
-                let cs = laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
-                    checkpoint_dir,
+                laminar_core::checkpoint::probe_object_store_conditional_create(
+                    checkpoint_backing.as_ref(),
+                    "",
+                    probe_timeout,
                 )
-                .with_max_state_data_bytes(max_staged_bytes)?
-                .with_key_group_count(key_group_count)
-                .with_participant_id(participant_id);
-                (Box::new(cs), None)
+                .await
             };
+            probe.map_err(|error| {
+                DbError::Config(format!(
+                    "checkpoint object store does not provide required conditional writes: {error}"
+                ))
+            })?;
+            let store: Box<dyn laminar_core::checkpoint::CheckpointStore> = Box::new(
+                laminar_core::checkpoint::ObjectStoreCheckpointStore::new(
+                    Arc::clone(&checkpoint_backing),
+                    "",
+                )
+                .with_max_node_data_bytes(max_node_data_bytes)?
+                .with_key_group_count(key_group_count)
+                .with_participant_id(participant_id),
+            );
+            let decision_backing = (!uses_local_checkpoint_store).then_some(checkpoint_backing);
 
             let defaults = CkpConfig::default();
             let config = CkpConfig {
@@ -3298,17 +2822,10 @@ impl LaminarDB {
                     defaults.checkpoint_timeout,
                     std::time::Duration::from_millis,
                 ),
-                max_staged_bytes,
+                max_node_data_bytes,
                 ..defaults
             };
-            let mut coord = CheckpointCoordinator::new(config, store).await?;
-            #[cfg(feature = "cluster")]
-            if startup_runtime == RuntimeMode::Cluster
-                && state_backend_scope.satisfies(StateBackendDurability::ClusterShared)
-            {
-                let delta_chain_bound = cluster_delta_chain_bound(max_retained);
-                coord.configure_state_ancestry(delta_chain_bound);
-            }
+            let mut coord = CheckpointCoordinator::new(config, store)?;
             coord.bind_pipeline_identity(pipeline_identity.clone())?;
             if let Some(ref prom) = *self.engine_metrics.lock() {
                 coord.set_metrics(Arc::clone(prom));
@@ -3381,17 +2898,8 @@ impl LaminarDB {
             coord.set_decision_store(ds)?;
             coord.bind_deployment_id(deployment_id.clone())?;
 
-            let state_backend = self.state_backend.lock().clone();
             let vnode_registry = self.vnode_registry.lock().clone();
-            if let (Some(backend), Some(registry)) = (state_backend, vnode_registry) {
-                backend
-                    .bind_state_namespace(&deployment_id, &pipeline_identity)
-                    .await
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "bind state backend namespace before recovery: {error}"
-                        ))
-                    })?;
+            if let Some(registry) = vnode_registry {
                 let owner = {
                     #[cfg(feature = "cluster")]
                     {
@@ -3408,12 +2916,9 @@ impl LaminarDB {
                     }
                 };
                 let version = registry.assignment_version();
-                backend.set_authoritative_version(version);
-                coord.set_state_backend(backend)?;
                 coord.set_assignment_version(version);
                 if startup_runtime == RuntimeMode::Cluster {
                     coord.set_vnode_set(laminar_core::state::owned_vnodes(&registry, owner));
-                    coord.set_gate_vnode_set((0..registry.vnode_count()).collect());
                 }
             }
 
@@ -3449,7 +2954,7 @@ impl LaminarDB {
 
         let startup_runtime = self.runtime_mode();
 
-        let (injected_cluster_checkpoint_store, state_backend_scope) =
+        let injected_cluster_checkpoint_store =
             self.validate_startup_durability(startup_runtime)?;
 
         let pipeline_identity = self
@@ -3460,44 +2965,8 @@ impl LaminarDB {
                 &table_regs,
                 startup_runtime,
                 injected_cluster_checkpoint_store,
-                state_backend_scope,
             )
             .await?;
-
-        #[cfg(feature = "cluster")]
-        if startup_runtime == RuntimeMode::Cluster {
-            let prepared_witnesses = {
-                let coordinator = self.coordinator.lock().await;
-                match coordinator.as_ref() {
-                    Some(coordinator) => coordinator.prepared_checkpoint_witnesses().await?,
-                    None => Vec::new(),
-                }
-            };
-            if !prepared_witnesses.is_empty() {
-                let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
-                    DbError::Checkpoint(
-                        "cluster Prepared recovery requires an installed controller".into(),
-                    )
-                })?;
-                self.fence_coordinated_recovery_lifecycle();
-                controller.set_recovering(true);
-                crate::coordinated_recovery::request_local_fault(
-                    &controller,
-                    &self.pending_recovery_fault,
-                )
-                    .await
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "could not request coordinated recovery for Prepared checkpoint inventory: {error}"
-                        ))
-                    })?;
-                tracing::warn!(
-                    prepared_attempts = prepared_witnesses.len(),
-                    "connector startup deferred until coordinated recovery settles Prepared checkpoints"
-                );
-                return Ok(());
-            }
-        }
 
         if has_external || !stream_regs.is_empty() {
             tracing::info!(
@@ -3661,18 +3130,6 @@ impl LaminarDB {
                 ));
                 graph.set_installed_vnode_state_handle(Arc::clone(&self.installed_vnode_state));
                 graph.set_rotation_execution_fence(Arc::clone(&self.rotation_execution_fence));
-                if let Some(chain_bound) = self
-                    .config
-                    .checkpoint
-                    .as_ref()
-                    .and_then(|cp| cluster_delta_chain_bound(cp.max_retained.unwrap_or(3)))
-                {
-                    graph.set_delta_chain_bound(chain_bound);
-                    tracing::info!(
-                        delta_chain_bound = chain_bound,
-                        "bounded incremental vnode checkpoints enabled"
-                    );
-                }
             }
         }
 
@@ -4069,13 +3526,20 @@ impl LaminarDB {
             );
 
             let carries_changelog = changelog_carrying.contains(&reg.input);
-            let state_backend_scope = self
-                .state_backend
-                .lock()
-                .as_ref()
-                .map_or(StateBackendDurability::Volatile, |backend| {
-                    backend.durability_scope()
-                });
+            #[cfg(feature = "cluster")]
+            let injected_shared_store = self.cluster_checkpoint_object_store().is_some();
+            #[cfg(not(feature = "cluster"))]
+            let injected_shared_store = false;
+            let checkpoint_storage_scope = if self.config.checkpoint.is_none() {
+                CheckpointStorageScope::Volatile
+            } else if injected_shared_store {
+                CheckpointStorageScope::ClusterShared
+            } else {
+                self.config.object_store_url.as_deref().map_or(
+                    CheckpointStorageScope::NodeDurable,
+                    CheckpointStorageScope::for_url,
+                )
+            };
             let (contract, configured_timeout) = admit_sink(
                 sink.as_ref(),
                 SinkAdmissionContext {
@@ -4086,7 +3550,7 @@ impl LaminarDB {
                     runtime: runtime_mode,
                     carries_changelog,
                     checkpointing_enabled,
-                    state_backend_scope,
+                    checkpoint_storage_scope,
                 },
             )?;
             let write_timeout = configured_timeout.map_or(
@@ -4142,20 +3606,6 @@ impl LaminarDB {
         } else {
             None
         };
-
-        let expected_committable_sinks = prepared_sinks
-            .iter()
-            .filter(|sink| sink.contract.is_checkpoint_committable())
-            .map(|sink| sink.name.clone())
-            .collect();
-        {
-            let coordinator = self.coordinator.lock().await;
-            if let Some(coordinator) = coordinator.as_ref() {
-                coordinator
-                    .audit_sink_open_witness_topology(expected_committable_sinks)
-                    .await?;
-            }
-        }
 
         // Opening is one atomic startup stage: a slow connector consumes the remaining shared
         // checkpoint-derived budget rather than receiving a fresh timeout of its own. Cluster
@@ -4215,7 +3665,7 @@ impl LaminarDB {
         }
         drop(sink_event_tx);
 
-        let (coordinated_committer, committer_poll, committer_notify) = {
+        {
             let mut guard = self.coordinator.lock().await;
             if let Some(coord) = guard.as_mut() {
                 coord.set_assignment_scoped_sources(
@@ -4227,28 +3677,16 @@ impl LaminarDB {
                 for (name, handle, _, _, _) in &sinks {
                     coord.register_sink(name.clone(), handle.clone());
                 }
-                (
-                    coord.coordinated_committer()?,
-                    crate::checkpoint_coordinator::CheckpointCoordinator::committer_poll_interval(),
-                    coord.committer_notify(),
-                )
-            } else {
-                (
-                    None,
-                    std::time::Duration::from_secs(1),
-                    Arc::new(tokio::sync::Notify::new()),
-                )
             }
-        };
+        }
 
         #[cfg(feature = "cluster")]
         {
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
-                // Stopped-quorum recovery records Abort before recovery-owned Start. Reconcile
-                // that terminal decision before selecting the coordinated cut.
+                // Resolve any interrupted sink epoch before coordinated recovery opens connectors.
                 if runtime_mode == RuntimeMode::Cluster {
-                    coord.reconcile_prepared_on_init().await?;
+                    coord.reconcile_sink_open_witness().await?;
                 }
             }
         }
@@ -4256,39 +3694,20 @@ impl LaminarDB {
         Ok(PipelineSinkSetup {
             sinks,
             sink_event_rx,
-            coordinated_committer,
-            committer_poll,
-            committer_notify,
             #[cfg(feature = "cluster")]
             callback_controller,
         })
     }
     fn restore_reference_table_checkpoint(
         &self,
-        recovered: &crate::recovery_manager::RecoveredState,
+        checkpoint_id: u64,
+        checkpoint: Option<&bytes::Bytes>,
     ) -> Result<bool, DbError> {
-        let checkpoint = recovered
-            .manifest
-            .operator_states
-            .get(crate::table_store::REFERENCE_TABLE_CHECKPOINT_KEY);
         let has_reference_tables = !self.table_store.read().table_names().is_empty();
 
         match (has_reference_tables, checkpoint) {
             (true, Some(state)) => {
-                let bytes = state
-                    .try_decode_inline()
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "reference-table checkpoint is corrupt: {error}"
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        DbError::Checkpoint(
-                            "reference-table checkpoint is not inline after sidecar resolution"
-                                .into(),
-                        )
-                    })?;
-                let restored = self.table_store.write().restore_checkpoint(&bytes)?;
+                let restored = self.table_store.write().restore_checkpoint(state)?;
                 if !restored {
                     return Err(DbError::Checkpoint(
                         "reference-table checkpoint did not cover the complete catalog".into(),
@@ -4297,8 +3716,7 @@ impl LaminarDB {
                 Ok(true)
             }
             (true, None) => Err(DbError::Checkpoint(format!(
-                "recovered checkpoint {} has no atomic reference-table state",
-                recovered.manifest.checkpoint_id
+                "recovered checkpoint {checkpoint_id} has no atomic reference-table state"
             ))),
             (false, Some(_)) => Err(DbError::Checkpoint(
                 "recovered checkpoint contains reference-table state but the catalog has no tables"
@@ -4306,6 +3724,90 @@ impl LaminarDB {
             )),
             (false, None) => Ok(false),
         }
+    }
+
+    fn restore_recovered_state_frames(
+        &self,
+        graph: crate::operator_graph::OperatorGraph,
+        recovered: &crate::recovery_manager::RecoveredState,
+        participant_id: u64,
+    ) -> Result<
+        (
+            crate::operator_graph::OperatorGraph,
+            crate::mv_store::MvStore,
+            bool,
+        ),
+        DbError,
+    > {
+        use laminar_core::checkpoint::StateFrameKey;
+
+        let mut graph_whole = Vec::new();
+        let mut graph_vnodes = Vec::new();
+        let mut mv_states = HashMap::new();
+        let mut reference_tables = None;
+
+        for frame in recovered
+            .state_frames
+            .iter()
+            .filter(|frame| frame.participant_id == participant_id)
+        {
+            match &frame.key {
+                StateFrameKey::OperatorWhole { operator_id } => {
+                    if let Some(name) = operator_id.strip_prefix("graph:") {
+                        graph_whole.push((name.to_owned(), frame.payload.clone()));
+                    } else if operator_id == crate::table_store::REFERENCE_TABLE_CHECKPOINT_KEY {
+                        if reference_tables.replace(frame.payload.clone()).is_some() {
+                            return Err(DbError::Checkpoint(
+                                "checkpoint repeats reference-table state".into(),
+                            ));
+                        }
+                    } else if let Some(name) =
+                        operator_id.strip_prefix(crate::mv_store::CHECKPOINT_KEY_PREFIX)
+                    {
+                        if mv_states
+                            .insert(name.to_owned(), frame.payload.to_vec())
+                            .is_some()
+                        {
+                            return Err(DbError::Checkpoint(format!(
+                                "checkpoint repeats materialized-view state '{name}'"
+                            )));
+                        }
+                    } else {
+                        return Err(DbError::Checkpoint(format!(
+                            "checkpoint contains unknown state frame '{operator_id}'"
+                        )));
+                    }
+                }
+                StateFrameKey::Vnode { operator_id, vnode } => {
+                    let name = operator_id.strip_prefix("graph:").ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "checkpoint contains unknown vnode state frame '{operator_id}'"
+                        ))
+                    })?;
+                    graph_vnodes.push((name.to_owned(), u32::from(*vnode), frame.payload.clone()));
+                }
+            }
+        }
+
+        graph_whole.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        graph_vnodes.sort_unstable_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+        });
+        let (graph, restored_graph_frames) = graph.restore_state_frames(
+            &graph_whole,
+            &graph_vnodes,
+            u32::from(recovered.committed.vnode_count),
+        )?;
+        let recovered_mv_store = self.mv_store.read().recovery_image(&mv_states)?;
+        let restored_reference_tables =
+            self.restore_reference_table_checkpoint(recovered.epoch(), reference_tables.as_ref())?;
+        tracing::info!(
+            checkpoint_id = recovered.committed.checkpoint_id,
+            graph_frames = restored_graph_frames,
+            materialized_views = mv_states.len(),
+            "restored checkpoint state frames"
+        );
+        Ok((graph, recovered_mv_store, restored_reference_tables))
     }
 
     async fn recover_pipeline_state(
@@ -4359,24 +3861,15 @@ impl LaminarDB {
         let mut recovered_mv_store = self.mv_store.read().fresh_image()?;
         let mut recovered_source_wms: rustc_hash::FxHashMap<String, i64> =
             rustc_hash::FxHashMap::default();
+        let mut recovered_source_idle: rustc_hash::FxHashMap<String, bool> =
+            rustc_hash::FxHashMap::default();
         let mut recovered_watermark_frontier = None;
-        #[cfg(feature = "cluster")]
-        let mut recovered_all_sources_idle = false;
-        #[cfg(not(feature = "cluster"))]
-        let recovered_all_sources_idle = false;
-        // A generation with no coordinator is also a fresh recovery image; reset any watermark
-        // retained by the previous in-process generation before accepting new rows.
-        let mut source_watermark_recovery_selected = true;
-        #[cfg(feature = "cluster")]
-        let mut startup_reconciled_source_handoff_version = None;
         let mut restored_reference_tables = false;
         {
             let mut guard = self.coordinator.lock().await;
             #[cfg(feature = "cluster")]
             if runtime_mode == RuntimeMode::Cluster && guard.is_none() {
-                // Validate before any boot transition can be staged. Once exact restore input is
-                // published below, recovery must return without another await or fallible check so
-                // the caller can immediately install its failed-launch ownership guard.
+                // A checkpoint-free cluster start cannot acquire state owned by another node.
                 self.validate_fresh_cluster_vnode_start()?;
             }
             if let Some(ref mut coord) = *guard {
@@ -4391,11 +3884,9 @@ impl LaminarDB {
                 };
                 #[cfg(not(feature = "cluster"))]
                 let recovery = coord.recover().await;
-                // Local RecoveryManager first closes every valid, outcome-less Prepared witness
-                // with a create-once Abort. Reconciliation can then safely finalize or roll back
-                // the exact terminal winner without maintaining a second settlement protocol.
+                // Resolve any interrupted sink epoch before opening its successor.
                 if runtime_mode == RuntimeMode::Local && recovery.is_ok() {
-                    coord.reconcile_prepared_on_init().await?;
+                    coord.reconcile_sink_open_witness().await?;
                 }
                 #[cfg(feature = "cluster")]
                 {
@@ -4416,23 +3907,23 @@ impl LaminarDB {
                 match recovery {
                     Ok(Some(recovered)) => {
                         #[cfg(feature = "cluster")]
-                        let mut recovered = recovered;
-                        #[cfg(feature = "cluster")]
                         let recovered_assignment = if runtime_mode == RuntimeMode::Cluster {
-                            let capsule = recovered.cluster_capsule().ok_or_else(|| {
-                                DbError::Checkpoint(format!(
-                                    "[LDB-6041] cluster recovery selected checkpoint {} without its recovery capsule",
-                                    recovered.manifest.checkpoint_id
-                                ))
-                            })?;
                             Some(
                                 std::num::NonZeroU64::new(
-                                    capsule.assignment_fence.assignment_version,
+                                    recovered
+                                        .committed
+                                        .assignment_fence
+                                        .as_ref()
+                                        .ok_or_else(|| {
+                                            DbError::Checkpoint(
+                                                "cluster checkpoint has no assignment fence".into(),
+                                            )
+                                        })?
+                                        .assignment_version,
                                 )
                                 .ok_or_else(|| {
                                     DbError::Checkpoint(
-                                        "[LDB-6055] recovered cluster assignment fence is zero"
-                                            .into(),
+                                        "recovered cluster assignment fence is zero".into(),
                                     )
                                 })?,
                             )
@@ -4441,193 +3932,62 @@ impl LaminarDB {
                         };
                         #[cfg(not(feature = "cluster"))]
                         let recovered_assignment = None;
+
                         for source in sources.iter() {
                             validate_source_recovery_assignment(
                                 &source.name,
                                 source.assignment_scoped,
-                                recovered.manifest.source_offsets.get(&source.name),
+                                recovered.source_offsets().get(&source.name),
                                 recovered_assignment,
                             )?;
                         }
 
-                        source_watermark_recovery_selected = true;
-                        recovered_watermark_frontier = recovered.manifest.watermark;
-                        #[cfg(feature = "cluster")]
-                        {
-                            recovered_all_sources_idle =
-                                recovered.cluster_capsule().is_some_and(|capsule| {
-                                    capsule.cluster_watermark
-                                        == laminar_core::checkpoint::CheckpointWatermark::Idle
-                                });
-                        }
-                        recovered_source_wms = recovered
-                            .manifest
-                            .source_watermarks
+                        recovered_watermark_frontier = recovered.checkpoint_watermark();
+                        let participant_id = coord.store().participant_id();
+                        for channel in recovered
+                            .channel_progress()
                             .iter()
-                            .filter(|(_, &wm)| wm != i64::MIN)
-                            .map(|(name, &wm)| (name.clone(), wm))
-                            .collect();
-                        let recovered_attempt = laminar_core::state::CheckpointAttempt::new(
-                            recovered.manifest.epoch,
-                            recovered.manifest.checkpoint_id,
-                        );
+                            .filter(|channel| channel.participant_id == participant_id)
+                        {
+                            if let Some(watermark) = channel.watermark {
+                                recovered_source_wms.insert(channel.channel_id.clone(), watermark);
+                            }
+                            recovered_source_idle.insert(channel.channel_id.clone(), channel.idle);
+                        }
+
+                        let recovered_attempt =
+                            laminar_core::checkpoint::CheckpointAttempt::canonical(
+                                recovered.epoch(),
+                            );
                         for src in sources.iter_mut() {
                             if !src.contract().supports_replay() {
                                 continue;
                             }
-                            let manifest_cp = recovered.manifest.source_offsets.get(&src.name);
-                            let restored = manifest_cp
-                                .map(crate::checkpoint_coordinator::connector_to_source_checkpoint);
-                            if let Some(restored) = restored {
-                                tracing::info!(
-                                    source = %src.name,
-                                    "attaching checkpoint offsets for source recovery"
-                                );
-                                src.position =
-                                    laminar_connectors::connector::SourcePosition::Resume {
-                                        attempt: recovered_attempt,
-                                        checkpoint: restored,
-                                    };
-                            } else {
-                                return Err(DbError::Checkpoint(format!(
-                                    "[LDB-6042] recovered checkpoint {} has no restorable \
-                                     offset for replayable source '{}'",
-                                    recovered.manifest.checkpoint_id, src.name
-                                )));
-                            }
-                        }
-                        let op_keys: Vec<&String> =
-                            recovered.manifest.operator_states.keys().collect();
-                        let instance_hint = {
-                            #[cfg(feature = "cluster")]
-                            {
-                                self.cluster_controller
-                                    .lock()
-                                    .as_ref()
-                                    .map_or(0, |c| c.instance_id().0)
-                            }
-                            #[cfg(not(feature = "cluster"))]
-                            {
-                                0u64
-                            }
-                        };
-                        tracing::info!(
-                            instance = instance_hint,
-                            count = op_keys.len(),
-                            keys = ?op_keys,
-                            "manifest operator_states summary"
-                        );
-                        restored_reference_tables =
-                            self.restore_reference_table_checkpoint(&recovered)?;
-                        for key in recovered.manifest.operator_states.keys() {
-                            if key != "operator_graph"
-                                && key != crate::table_store::REFERENCE_TABLE_CHECKPOINT_KEY
-                                && !key.starts_with(crate::mv_store::CHECKPOINT_KEY_PREFIX)
-                            {
-                                return Err(DbError::Checkpoint(format!(
-                                    "[LDB-6029] checkpoint contains unknown operator state '{key}'"
-                                )));
-                            }
-                        }
-                        if let Some(op) = recovered.manifest.operator_states.get("operator_graph") {
-                            let bytes = op
-                                .try_decode_inline()
-                                .map_err(|error| {
-                                    DbError::Checkpoint(format!(
-                                        "[LDB-6029] operator graph checkpoint is corrupt: {error}"
-                                    ))
-                                })?
-                                .ok_or_else(|| {
-                                    DbError::Checkpoint(
-                                        "[LDB-6029] operator graph checkpoint is not inline after \
-                                     sidecar resolution"
-                                            .to_string(),
-                                    )
-                                })?;
-                            match graph.restore_from_bytes(&bytes) {
-                                Ok((restored_graph, n)) => {
-                                    graph = restored_graph;
-                                    tracing::info!(
-                                        queries = n,
-                                        "Restored operator graph state from checkpoint"
-                                    );
-                                }
-                                Err(e) => {
-                                    return Err(DbError::Checkpoint(format!(
-                                        "[LDB-6029] operator graph restore failed: \
-                                         {e} — refusing to start with checkpointed \
-                                         source offsets and empty operator state"
-                                    )));
-                                }
-                            }
-                        }
-
-                        let mut mv_states = HashMap::new();
-                        for (key, state) in &recovered.manifest.operator_states {
-                            let Some(name) =
-                                key.strip_prefix(crate::mv_store::CHECKPOINT_KEY_PREFIX)
-                            else {
-                                continue;
+                            let checkpoint = recovered.source_offsets().get(&src.name).ok_or_else(|| {
+                                DbError::Checkpoint(format!(
+                                    "recovered checkpoint {} has no offset for replayable source '{}'",
+                                    recovered.epoch(), src.name
+                                ))
+                            })?;
+                            src.position = laminar_connectors::connector::SourcePosition::Resume {
+                                attempt: recovered_attempt,
+                                checkpoint:
+                                    crate::checkpoint_coordinator::connector_to_source_checkpoint(
+                                        checkpoint,
+                                    ),
                             };
-                            let bytes = state.try_decode_inline().map_err(|error| {
-                                DbError::Checkpoint(format!(
-                                    "MV checkpoint '{name}' is corrupt: {error}"
-                                ))
-                            })?;
-                            let bytes = bytes.ok_or_else(|| {
-                                DbError::Checkpoint(format!(
-                                    "MV checkpoint '{name}' is not inline after sidecar resolution"
-                                ))
-                            })?;
-                            mv_states.insert(name.to_string(), bytes);
-                        }
-                        recovered_mv_store = {
-                            let live = self.mv_store.read();
-                            live.recovery_image(&mv_states)
-                        }?;
-
-                        // Rebuild aggregates from each boot-owned vnode's chain at the recovered
-                        // cut — the same epoch the source offsets resume from.
-                        #[cfg(feature = "cluster")]
-                        if runtime_mode == RuntimeMode::Cluster {
-                            let recovered_assignment_version = recovered_assignment
-                                .ok_or_else(|| {
-                                    DbError::Checkpoint(
-                                        "[LDB-6031] cluster checkpoint has no assignment version"
-                                            .into(),
-                                    )
-                                })?
-                                .get();
-                            let reconciled_source_handoff_version = self
-                                .validate_boot_vnode_recovery_target(
-                                    recovered_attempt,
-                                    recovered_assignment_version,
-                                )?;
-                            let restore_cut = recovered.take_vnode_restore_cut().ok_or_else(|| {
-                                DbError::Checkpoint(format!(
-                                    "[LDB-6041] recovered checkpoint {} has no validated vnode-state seal",
-                                    recovered.manifest.checkpoint_id
-                                ))
-                            })?;
-                            // This is deliberately the final suspend/failure boundary in recovered
-                            // cluster startup. The caller captures the exact staged Arc as soon as
-                            // this function returns.
-                            self.prepare_boot_vnode_restore_transition(restore_cut)
-                                .await?;
-                            startup_reconciled_source_handoff_version =
-                                reconciled_source_handoff_version;
                         }
 
-                        if !mv_states.is_empty() {
-                            tracing::info!(
-                                mvs = mv_states.len(),
-                                "Restored MV state from checkpoint"
-                            );
-                        }
+                        let (restored_graph, restored_mvs, restored_tables) =
+                            self.restore_recovered_state_frames(graph, &recovered, participant_id)?;
+                        graph = restored_graph;
+                        recovered_mv_store = restored_mvs;
+                        restored_reference_tables = restored_tables;
+
                         tracing::info!(
-                            checkpoint_id = recovered.manifest.checkpoint_id,
+                            checkpoint_id = recovered.committed.checkpoint_id,
                             epoch = recovered.epoch(),
-                            "Recovered from unified checkpoint"
+                            "recovered committed checkpoint"
                         );
                     }
                     Ok(None) => {
@@ -4635,7 +3995,6 @@ impl LaminarDB {
                         if runtime_mode == RuntimeMode::Cluster {
                             self.validate_fresh_cluster_vnode_start()?;
                         }
-                        source_watermark_recovery_selected = true;
                         tracing::info!("No checkpoint found, starting fresh");
                     }
                     Err(e) => {
@@ -4649,11 +4008,8 @@ impl LaminarDB {
             graph,
             recovered_mv_store,
             recovered_source_wms,
+            recovered_source_idle,
             recovered_watermark_frontier,
-            recovered_all_sources_idle,
-            source_watermark_recovery_selected,
-            #[cfg(feature = "cluster")]
-            reconciled_source_handoff_version: startup_reconciled_source_handoff_version,
             restored_reference_tables,
         })
     }
@@ -4799,9 +4155,8 @@ impl LaminarDB {
         &self,
         stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
         recovered_source_wms: &FxHashMap<String, i64>,
+        recovered_source_idle: &FxHashMap<String, bool>,
         recovered_watermark_frontier: Option<i64>,
-        recovered_all_sources_idle: bool,
-        source_watermark_recovery_selected: bool,
     ) -> Result<PipelineWatermarks, DbError> {
         let stream_entries: Vec<_> = self
             .catalog
@@ -4821,7 +4176,7 @@ impl LaminarDB {
             })
             .collect::<Result<_, _>>()?;
 
-        // `LAMINAR_MAX_FUTURE_SKEW_MS=0` disables the future-skew ceiling (legacy unbounded).
+        // A zero value explicitly disables the future-skew ceiling.
         let future_skew_ms = match std::env::var("LAMINAR_MAX_FUTURE_SKEW_MS") {
             Ok(v) => v.parse::<i64>().unwrap_or_else(|_| {
                 tracing::warn!(
@@ -4963,44 +4318,39 @@ impl LaminarDB {
             );
         }
 
-        if source_watermark_recovery_selected {
-            let mut tracker_watermarks = vec![None; source_ids.len()];
-            for (name, &source_id) in &source_ids {
-                let recovered = recovered_source_wms
-                    .get(name)
-                    .copied()
-                    .or(recovered_watermark_frontier);
-                tracker_watermarks[source_id] = recovered;
-                if let (Some(state), Some(watermark)) = (watermark_states.get_mut(name), recovered)
-                {
-                    state.generator.restore_watermark_for_recovery(watermark);
-                }
+        let mut tracker_watermarks = vec![None; source_ids.len()];
+        let mut idle_sources = vec![false; source_ids.len()];
+        for (name, &source_id) in &source_ids {
+            let recovered = recovered_source_wms.get(name).copied();
+            tracker_watermarks[source_id] = recovered;
+            idle_sources[source_id] = recovered_source_idle.get(name).copied().unwrap_or(false);
+            if let (Some(state), Some(watermark)) = (watermark_states.get_mut(name), recovered) {
+                state.generator.restore_watermark_for_recovery(watermark);
             }
-            if let Some(tracker) = tracker.as_mut() {
-                let idle_sources = vec![recovered_all_sources_idle; source_ids.len()];
-                tracker
-                    .restore_for_recovery(
-                        &tracker_watermarks,
-                        &idle_sources,
-                        recovered_watermark_frontier,
-                    )
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "failed to restore the committed watermark tracker: {error}"
-                        ))
-                    })?;
-            }
-            self.pipeline_watermark.store(
-                recovered_watermark_frontier.unwrap_or(i64::MIN),
-                std::sync::atomic::Ordering::Release,
-            );
-            tracing::info!(
-                sources = tracker_watermarks.len(),
-                pipeline_watermark = ?recovered_watermark_frontier,
-                all_sources_idle = recovered_all_sources_idle,
-                "restored exact watermark frontier from checkpoint"
-            );
         }
+        if let Some(tracker) = tracker.as_mut() {
+            tracker
+                .restore_for_recovery(
+                    &tracker_watermarks,
+                    &idle_sources,
+                    recovered_watermark_frontier,
+                )
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "failed to restore the committed watermark tracker: {error}"
+                    ))
+                })?;
+        }
+        self.pipeline_watermark.store(
+            recovered_watermark_frontier.unwrap_or(i64::MIN),
+            std::sync::atomic::Ordering::Release,
+        );
+        tracing::info!(
+            sources = tracker_watermarks.len(),
+            pipeline_watermark = ?recovered_watermark_frontier,
+            idle_sources = idle_sources.iter().filter(|idle| **idle).count(),
+            "restored checkpoint watermark state"
+        );
 
         Ok(PipelineWatermarks {
             stream_entries,
@@ -5019,14 +4369,10 @@ impl LaminarDB {
         watermarks: PipelineWatermarks,
         config: crate::pipeline::PipelineConfig,
         runtime_mode: RuntimeMode,
-        #[cfg(feature = "cluster")] reconciled_source_handoff_version: Option<u64>,
     ) -> Result<PreparedPipelineRuntime, DbError> {
         let PipelineSinkSetup {
             sinks,
             sink_event_rx,
-            coordinated_committer,
-            committer_poll,
-            committer_notify,
             #[cfg(feature = "cluster")]
             callback_controller,
         } = sink_setup;
@@ -5082,8 +4428,7 @@ impl LaminarDB {
             quorum_timeout,
             checkpoint_timeout,
             checkpoint_cleanup_timeout,
-            max_staged_bytes,
-            coordinated_commit_admission,
+            max_node_data_bytes,
         ) = {
             let coordinator = self.coordinator.lock().await;
             match coordinator.as_ref() {
@@ -5094,8 +4439,7 @@ impl LaminarDB {
                         checkpoint.quorum_timeout,
                         checkpoint.checkpoint_timeout,
                         checkpoint.cleanup_timeout,
-                        checkpoint.max_staged_bytes,
-                        coordinator.coordinated_commit_admission(),
+                        checkpoint.max_node_data_bytes,
                     )
                 }
                 None => (
@@ -5104,7 +4448,6 @@ impl LaminarDB {
                     std::time::Duration::from_secs(120),
                     crate::checkpoint_coordinator::CheckpointConfig::default().cleanup_timeout,
                     u64::MAX,
-                    None,
                 ),
             }
         };
@@ -5157,7 +4500,7 @@ impl LaminarDB {
             pending_sink_filter_compiles,
             delivery_guarantee: config.delivery_guarantee,
             serialization_timeout: checkpoint_timeout,
-            checkpoint_state_cap_bytes: max_staged_bytes,
+            checkpoint_state_cap_bytes: max_node_data_bytes,
             checkpoint_serialization_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             checkpoint_timeout,
             checkpoint_cleanup_timeout,
@@ -5170,8 +4513,6 @@ impl LaminarDB {
             shutdown_signal: Arc::clone(&self.shutdown_signal),
             #[cfg(feature = "cluster")]
             vnode_registry,
-            #[cfg(feature = "cluster")]
-            reconciled_source_handoff_version,
             #[cfg(feature = "cluster")]
             cluster_controller: callback_controller,
             #[cfg(feature = "cluster")]
@@ -5193,10 +4534,7 @@ impl LaminarDB {
             checkpoint_complete_tx,
             checkpoint_tail_tasks: tokio::task::JoinSet::new(),
             checkpoint_in_flight: Arc::clone(&checkpoint_in_flight),
-            #[cfg(feature = "cluster")]
-            delta_rebase_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            #[cfg(feature = "cluster")]
-            last_vnode_capture_epoch: None,
+            full_vnode_capture_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             epoch_allocator,
             #[cfg(feature = "cluster")]
             quorum_timeout,
@@ -5215,14 +4553,10 @@ impl LaminarDB {
                 force_checkpoint_rx,
                 checkpoint_complete_rx,
                 checkpoint_in_flight,
-                coordinated_commit_admission,
                 #[cfg(feature = "cluster")]
                 source_process_authority,
                 runtime_mode,
             },
-            coordinated_committer,
-            committer_poll,
-            committer_notify,
         })
     }
 
@@ -5242,7 +4576,6 @@ impl LaminarDB {
             force_checkpoint_rx: force_ckpt_rx,
             checkpoint_complete_rx,
             checkpoint_in_flight,
-            coordinated_commit_admission,
             #[cfg(feature = "cluster")]
             source_process_authority,
             runtime_mode,
@@ -5270,8 +4603,7 @@ impl LaminarDB {
         .with_terminal_shutdown(runtime_shutdown.clone())
         .with_force_checkpoint_rx(force_ckpt_rx)
         .with_checkpoint_complete_rx(checkpoint_complete_rx)
-        .with_checkpoint_admission(checkpoint_in_flight)
-        .with_coordinated_commit_admission(coordinated_commit_admission);
+        .with_checkpoint_admission(checkpoint_in_flight);
 
         let (done_tx, done_rx) = crossfire::oneshot::oneshot::<crate::pipeline::ExitReason>();
         let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();
@@ -5514,55 +4846,6 @@ impl LaminarDB {
         Ok(())
     }
 
-    async fn start_coordinated_committer(
-        &self,
-        committer: Option<crate::coordinated_committer::CoordinatedCommitter>,
-        poll_interval: std::time::Duration,
-        notify: Arc<tokio::sync::Notify>,
-    ) -> Result<(), DbError> {
-        let Some(mut committer) = committer else {
-            return Ok(());
-        };
-
-        let state = Arc::clone(&self.state);
-        let handle = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(poll_interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            tick.tick().await;
-
-            if let Err(error) = committer.commit_ready().await {
-                tracing::warn!(%error, "initial coordinated committer pass failed; will retry");
-            }
-            loop {
-                tokio::select! {
-                    () = notify.notified() => {}
-                    _ = tick.tick() => {}
-                }
-                if matches!(
-                    DbState::load(&state),
-                    DbState::Stopped | DbState::Faulted | DbState::Created
-                ) {
-                    break;
-                }
-                if let Err(error) = committer.commit_ready().await {
-                    tracing::warn!(%error, "coordinated committer pass failed; will retry");
-                }
-            }
-        });
-
-        let mut owned_handle = self.committer_handle.lock().await;
-        if owned_handle.is_some() {
-            handle.abort();
-            let _ = handle.await;
-            return Err(DbError::Checkpoint(
-                "cannot start a coordinated committer while a prior generation is still owned"
-                    .into(),
-            ));
-        }
-        *owned_handle = Some(handle);
-        Ok(())
-    }
-
     async fn start_connector_pipeline(
         &self,
         source_regs: HashMap<String, crate::connector_manager::SourceRegistration>,
@@ -5693,11 +4976,8 @@ impl LaminarDB {
             graph,
             recovered_mv_store,
             recovered_source_wms,
+            recovered_source_idle,
             recovered_watermark_frontier,
-            recovered_all_sources_idle,
-            source_watermark_recovery_selected,
-            #[cfg(feature = "cluster")]
-                reconciled_source_handoff_version: startup_reconciled_source_handoff_version,
             restored_reference_tables,
         } = recovery;
         let previous_mv_store = {
@@ -5706,17 +4986,14 @@ impl LaminarDB {
         };
         drop(previous_mv_store);
 
-        if source_watermark_recovery_selected {
-            for source_name in self.catalog.list_sources() {
-                if let Some(entry) = self.catalog.get_source(&source_name) {
-                    entry.source.restore_watermark_for_recovery(
-                        recovered_source_wms
-                            .get(&source_name)
-                            .copied()
-                            .or(recovered_watermark_frontier)
-                            .unwrap_or(i64::MIN),
-                    );
-                }
+        for source_name in self.catalog.list_sources() {
+            if let Some(entry) = self.catalog.get_source(&source_name) {
+                entry.source.restore_watermark_for_recovery(
+                    recovered_source_wms
+                        .get(&source_name)
+                        .copied()
+                        .unwrap_or(i64::MIN),
+                );
             }
         }
 
@@ -5725,9 +5002,8 @@ impl LaminarDB {
         let watermarks = self.prepare_pipeline_watermarks(
             &stream_regs,
             &recovered_source_wms,
+            &recovered_source_idle,
             recovered_watermark_frontier,
-            recovered_all_sources_idle,
-            source_watermark_recovery_selected,
         )?;
         let max_poll = self.config.default_buffer_size.min(1024);
         tracing::info!(
@@ -5770,12 +5046,7 @@ impl LaminarDB {
             max_replay_buffer_bytes: 256 * 1024 * 1024,
         };
 
-        let PreparedPipelineRuntime {
-            runtime,
-            coordinated_committer,
-            committer_poll,
-            committer_notify,
-        } = self
+        let PreparedPipelineRuntime { runtime } = self
             .prepare_pipeline_runtime(
                 sources,
                 graph,
@@ -5783,8 +5054,6 @@ impl LaminarDB {
                 watermarks,
                 pipeline_config,
                 runtime_mode,
-                #[cfg(feature = "cluster")]
-                startup_reconciled_source_handoff_version,
             )
             .await?;
 
@@ -5830,14 +5099,13 @@ impl LaminarDB {
         #[cfg(feature = "cluster")]
         drop(startup_assignment_guard);
 
-        self.start_coordinated_committer(coordinated_committer, committer_poll, committer_notify)
-            .await
+        Ok(())
     }
     async fn quiesce_checkpoint_decision_until(
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
-        let mut coordinator = tokio::time::timeout_at(deadline, self.coordinator.lock())
+        let _coordinator = tokio::time::timeout_at(deadline, self.coordinator.lock())
             .await
             .map_err(|_| {
                 DbError::Checkpoint(
@@ -5845,25 +5113,7 @@ impl LaminarDB {
                         .into(),
                 )
             })?;
-        if let Some(coordinator) = coordinator.as_mut() {
-            coordinator
-                .quiesce_pending_decision_write_until(deadline)
-                .await?;
-        }
         Ok(())
-    }
-
-    #[cfg(feature = "cluster")]
-    fn retire_pending_restore_input_after_runtime_exit(&self) {
-        let expected = self.pending_vnode_transition.lock().clone();
-        let Some(expected) = expected.filter(|pending| pending.has_restore_input_reservation())
-        else {
-            return;
-        };
-        crate::vnode_transition_staging::retire_exact_pending_vnode_transition(
-            &self.pending_vnode_transition,
-            &expected,
-        );
     }
 
     async fn reconcile_sink_open_witness_until(
@@ -5913,8 +5163,6 @@ impl LaminarDB {
                     match DbState::load(&self.state) {
                         DbState::Stopped => {
                             drop(owned);
-                            #[cfg(feature = "cluster")]
-                            self.retire_pending_restore_input_after_runtime_exit();
                             return Ok(());
                         }
                         DbState::Starting => {
@@ -5994,8 +5242,6 @@ impl LaminarDB {
             }
         }
         drop(runtime_handle);
-        #[cfg(feature = "cluster")]
-        self.retire_pending_restore_input_after_runtime_exit();
         if watcher_error.is_none() {
             if let Some(fault) = self.last_fault.lock().clone() {
                 watcher_error = Some(DbError::Pipeline(format!(
@@ -6009,7 +5255,6 @@ impl LaminarDB {
         // Compute has stopped producing new checkpoint work. Keep every deployment/state fence
         // until an already-issued remote decision create reaches a terminal client-side state.
         self.quiesce_checkpoint_decision_until(deadline).await?;
-        self.quiesce_committer_until(deadline).await?;
         self.reconcile_sink_open_witness_until(deadline).await?;
         self.quiesce_connector_generation_until(deadline).await?;
 
@@ -6058,8 +5303,6 @@ impl LaminarDB {
                             if self.is_cluster_runtime() {
                                 self.installed_vnode_state.lock().take();
                             }
-                            #[cfg(feature = "cluster")]
-                            self.retire_pending_restore_input_after_runtime_exit();
                             return Ok(());
                         }
                         DbState::Starting => {
@@ -6161,13 +5404,10 @@ impl LaminarDB {
             }
         }
         drop(runtime_handle);
-        #[cfg(feature = "cluster")]
-        self.retire_pending_restore_input_after_runtime_exit();
 
         // Do not announce Created or release the exclusive deployment lock while a timed-out
         // decision create can still mutate the recovery frontier. A later stop retry resumes here.
         self.quiesce_checkpoint_decision_until(deadline).await?;
-        self.quiesce_committer_until(deadline).await?;
         self.reconcile_sink_open_witness_until(deadline).await?;
         self.quiesce_connector_generation_until(deadline).await?;
 
@@ -6200,9 +5440,6 @@ mod mv_recovery_lifecycle_tests;
 
 #[cfg(all(test, feature = "cluster"))]
 mod cluster_fault_watcher_tests;
-
-#[cfg(all(test, feature = "cluster"))]
-mod boot_vnode_recovery_tests;
 
 #[cfg(test)]
 mod reference_table_recovery_tests;

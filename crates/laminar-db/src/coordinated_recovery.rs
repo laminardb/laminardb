@@ -14,10 +14,8 @@ use futures::FutureExt as _;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::runtime::Handle;
 
-use laminar_core::checkpoint::PreparedCheckpointWitness;
-use laminar_core::checkpoint_decision::{
-    CheckpointOutcome, CheckpointScope, CheckpointVerdict, RecordOutcomeResult,
-};
+use laminar_core::checkpoint::CommittedCheckpointIndex;
+use laminar_core::checkpoint_decision::{CheckpointOutcome, CheckpointScope};
 use laminar_core::cluster::control::controller::{
     RecoveryAnnouncement, RecoveryFault, RecoveryFaultInventory, RecoveryRound,
     RecoveryStoppedReport,
@@ -27,7 +25,6 @@ use laminar_core::cluster::control::{
     ReleaseCommitStatus,
 };
 use laminar_core::cluster::discovery::NodeId;
-use laminar_core::state::{CheckpointAttempt, CheckpointAttemptRelation};
 
 use crate::LaminarDB;
 
@@ -40,9 +37,6 @@ const STOP_QUORUM_TIMEOUT: Duration = Duration::from_secs(90);
 const RESTORE_QUORUM_TIMEOUT: Duration = Duration::from_secs(90);
 const RELEASE_PROTOCOL_TIMEOUT: Duration = Duration::from_secs(60);
 const DECISION_IO_TIMEOUT: Duration = Duration::from_secs(15);
-const DECISION_AMBIGUITY_AUDIT_RESERVE: Duration = Duration::from_secs(3);
-const DECISION_AUDIT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
-const DECISION_AUDIT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const RECOVERY_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(60);
 const STOP_QUORUM_INITIAL_POLL: Duration = Duration::from_millis(100);
 const STOP_QUORUM_MAX_POLL: Duration = Duration::from_secs(1);
@@ -726,17 +720,14 @@ impl RecoveryMonitor {
         }
         controller.set_recovering(true);
         db.set_source_gate(true);
-        let Some(prepared_witnesses) = stop_and_collect_prepared(db).await else {
+        if !stop_for_recovery(db).await {
             tracing::error!(
                 gen,
-                "recovery prepare could not quiesce and inventory this node; withholding stopped acknowledgement"
+                "recovery prepare could not quiesce this node; withholding stopped acknowledgement"
             );
             return;
-        };
-        if let Err(error) = controller
-            .announce_stopped(&round, prepared_witnesses)
-            .await
-        {
+        }
+        if let Err(error) = controller.announce_stopped(&round).await {
             tracing::error!(gen, %error, "could not acknowledge recovery Prepare");
             return;
         }
@@ -888,24 +879,10 @@ impl RecoveryMonitor {
             return false;
         }
 
-        // A non-owner is outside the restore quorum, but it can still hold participant-local
-        // Prepared evidence or a connector generation stopped for this round. Quiesce it before
-        // accepting the terminal that tombstoned its covered fault. Settlement makes a reported
-        // Prepared inventory empty; a remaining witness means this boot was omitted from the
-        // round and must request another evidence-bearing round instead of silently accepting the
-        // Release.
-        let Some(prepared_witnesses) = stop_and_collect_prepared(db).await else {
-            return false;
-        };
-        if !prepared_witnesses.is_empty() {
-            tracing::error!(
-                gen = release.round.id.generation,
-                prepared_attempts = prepared_witnesses.len(),
-                "ownerless process retains unresolved Prepared evidence after recovery Release"
-            );
-            if !self.request_fresh_fault(db, controller).await {
-                self.fault_audit_unknown = true;
-            }
+        // A non-owner is outside the restore quorum, but it can still hold a connector generation
+        // stopped for this round. Quiesce it before accepting the terminal that tombstoned its
+        // covered fault.
+        if !stop_for_recovery(db).await {
             return false;
         }
 
@@ -1206,7 +1183,7 @@ impl RecoveryMonitor {
     ) {
         // Precheck readability before stopping anything — a transient decision-store error
         // must defer the round (faults stay pending), not flap a stop-the-world cycle.
-        if read_committed_cut_bounded(db).await.is_err() {
+        if read_committed_target_bounded(db).await.is_err() {
             tracing::warn!("coordinated recovery: decision store unreadable; deferring round");
             return;
         }
@@ -1306,46 +1283,42 @@ impl RecoveryMonitor {
             return;
         }
         tracing::warn!(gen = gen_id, "leader announced recovery prepare");
-        let Some(prepared_witnesses) = stop_and_collect_prepared(db).await else {
+        if !stop_for_recovery(db).await {
             tracing::error!(
                 gen = gen_id,
-                "leader could not quiesce and inventory its decision writer; abandoning recovery round"
+                "leader could not quiesce; abandoning recovery round"
             );
             self.abandon_round(db, controller, &round).await;
             return;
-        };
-        if let Err(error) = controller
-            .announce_stopped(&round, prepared_witnesses)
-            .await
-        {
+        }
+        if let Err(error) = controller.announce_stopped(&round).await {
             tracing::error!(gen = gen_id, %error, "could not acknowledge recovery Prepare");
             self.abandon_round(db, controller, &round).await;
             return;
         }
-        let stopped_reports =
-            match wait_stopped_quorum(controller, &round, STOP_QUORUM_TIMEOUT).await {
-                StoppedQuorum::Reached(reports) => reports,
-                StoppedQuorum::Superseded | StoppedQuorum::Conflicted => {
-                    tracing::warn!(
-                        gen = gen_id,
-                        "recovery Prepare superseded; yielding old driver"
-                    );
-                    let _ = controller.clear_recover(&round).await;
-                    hold_intake_and_request_retry(db, controller, gen_id, false).await;
-                    return;
-                }
-                StoppedQuorum::ParticipantsChanged | StoppedQuorum::TimedOut => {
-                    // A straggler can still publish an ambiguous decision/state write, so selecting a
-                    // recovery cut without every round participant stopped would violate the exact-cut
-                    // premise and could resurrect a live timeline.
-                    tracing::error!(
-                        gen = gen_id,
-                        "stop quorum timed out; abandoning recovery round"
-                    );
-                    self.abandon_round(db, controller, &round).await;
-                    return;
-                }
-            };
+        match wait_stopped_quorum(controller, &round, STOP_QUORUM_TIMEOUT).await {
+            StoppedQuorum::Reached(_) => {}
+            StoppedQuorum::Superseded | StoppedQuorum::Conflicted => {
+                tracing::warn!(
+                    gen = gen_id,
+                    "recovery Prepare superseded; yielding old driver"
+                );
+                let _ = controller.clear_recover(&round).await;
+                hold_intake_and_request_retry(db, controller, gen_id, false).await;
+                return;
+            }
+            StoppedQuorum::ParticipantsChanged | StoppedQuorum::TimedOut => {
+                // A straggler can still publish an ambiguous decision/state write, so selecting a
+                // recovery cut without every round participant stopped would violate the exact-cut
+                // premise and could resurrect a live timeline.
+                tracing::error!(
+                    gen = gen_id,
+                    "stop quorum timed out; abandoning recovery round"
+                );
+                self.abandon_round(db, controller, &round).await;
+                return;
+            }
+        }
 
         if !driver_owns_prepare(db, controller, &round).await {
             tracing::warn!(
@@ -1357,29 +1330,19 @@ impl RecoveryMonitor {
             return;
         }
 
-        if let Err(error) =
-            settle_stopped_prepared_witnesses(db, controller, &round, &stopped_reports).await
-        {
-            tracing::error!(
-                gen = gen_id,
-                %error,
-                "prepared checkpoint settlement failed; abandoning recovery round"
-            );
-            self.abandon_round(db, controller, &round).await;
-            return;
-        }
-
-        // The world is stopped and every reported prepare is terminally resolved: the decision
-        // store is quiescent, so this read IS the cut — no
-        // seal fallback and no probe. No committed epoch means a fresh start.
-        let target = match read_committed_cut_bounded(db).await {
-            Ok(cut) => cut.unwrap_or(GENESIS),
+        // The world is stopped, so the greatest Commit and its immutable global index form the
+        // exact recovery cut. No committed checkpoint means a fresh start.
+        let selected = match read_committed_target_bounded(db).await {
+            Ok(target) => target,
             Err(e) => {
                 tracing::error!(error = %e, gen = gen_id, "target read failed; abandoning round");
                 self.abandon_round(db, controller, &round).await;
                 return;
             }
         };
+        let target = selected
+            .as_ref()
+            .map_or(GENESIS, |(outcome, _)| outcome.epoch);
         if !driver_owns_prepare(db, controller, &round).await {
             tracing::warn!(
                 gen = gen_id,
@@ -1389,8 +1352,6 @@ impl RecoveryMonitor {
             hold_intake_and_request_retry(db, controller, gen_id, false).await;
             return;
         }
-        // Every advancing Prepared attempt now has an immutable outcome. Namespaced artifacts can
-        // be retained until normal decision-bound cleanup without affecting the selected cut.
         db.purge_shuffle_receiver_buffers();
         if let Err(error) = controller.announce_recover_start(&round, target).await {
             tracing::error!(gen = gen_id, %error, "could not transition recovery to Start");
@@ -1403,6 +1364,12 @@ impl RecoveryMonitor {
         };
         tracing::warn!(
             target_epoch = target,
+            checkpoint_id = selected
+                .as_ref()
+                .map_or(GENESIS, |(outcome, _)| outcome.checkpoint_id),
+            participants = selected
+                .as_ref()
+                .map_or(0, |(_, index)| index.participants.len()),
             gen = gen_id,
             "leader announced recovery start"
         );
@@ -2098,34 +2065,10 @@ async fn stop_and_purge(db: &Arc<LaminarDB>) -> bool {
     .await
 }
 
-/// Quiesce every local writer, then capture the exact participant-local Prepared inventory while
-/// public restart remains recovery-fenced. Failure withholds the stopped report.
-async fn stop_and_collect_prepared(db: &Arc<LaminarDB>) -> Option<Vec<PreparedCheckpointWitness>> {
+/// Quiesce every local writer while public restart remains recovery-fenced.
+async fn stop_for_recovery(db: &Arc<LaminarDB>) -> bool {
     db.fence_coordinated_recovery_lifecycle();
-    if !stop_and_purge(db).await {
-        return None;
-    }
-    let inventory = async {
-        let coordinator = db.coordinator.lock().await;
-        match coordinator.as_ref() {
-            Some(coordinator) => coordinator.prepared_checkpoint_witnesses().await,
-            None => Ok(Vec::new()),
-        }
-    };
-    match tokio::time::timeout(DECISION_IO_TIMEOUT, inventory).await {
-        Ok(Ok(witnesses)) => Some(witnesses),
-        Ok(Err(error)) => {
-            tracing::error!(%error, "could not validate local Prepared checkpoint inventory");
-            None
-        }
-        Err(_) => {
-            tracing::error!(
-                timeout = ?DECISION_IO_TIMEOUT,
-                "local Prepared checkpoint inventory timed out"
-            );
-            None
-        }
-    }
+    stop_and_purge(db).await
 }
 
 async fn install_recovery_start_assignment(
@@ -2556,10 +2499,11 @@ fn log_release_diagnostic(
     );
 }
 
-/// Highest epoch committed cluster-wide per the immutable outcome store — the only sound rewind
-/// target (the durable seal is node-local durability, not a cluster commit). `Ok(None)`
-/// means nothing ever committed; `Err` means the store is unreadable right now.
-async fn read_committed_cut(db: &LaminarDB) -> Result<Option<u64>, String> {
+/// Greatest cluster Commit together with its exact immutable global recovery index.
+/// `Ok(None)` means nothing ever committed; `Err` means authority is unreadable or inconsistent.
+async fn read_committed_target(
+    db: &LaminarDB,
+) -> Result<Option<(CheckpointOutcome, CommittedCheckpointIndex)>, String> {
     // Bind the clone before awaiting — an if-let scrutinee would hold the lock guard across it.
     let controller = db
         .cluster_controller
@@ -2569,15 +2513,48 @@ async fn read_committed_cut(db: &LaminarDB) -> Result<Option<u64>, String> {
     let authority = controller
         .checkpoint_authority()
         .map_err(|error| error.to_string())?;
-    authority
+    let Some(head) = authority
         .highest_cluster_committed_outcome()
         .await
-        .map(|outcome| outcome.map(|outcome| outcome.epoch))
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let Some((outcome, committed)) = authority
+        .cluster_outcome_with_committed_checkpoint(head.epoch)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Err(format!(
+            "selected cluster Commit epoch {} disappeared during exact lookup",
+            head.epoch
+        ));
+    };
+    if outcome != head {
+        return Err(format!(
+            "selected cluster Commit epoch {} changed during exact lookup",
+            head.epoch
+        ));
+    }
+    let committed = committed.ok_or_else(|| {
+        format!(
+            "selected cluster Commit epoch {} has no committed checkpoint index",
+            outcome.epoch
+        )
+    })?;
+    if outcome.scope != CheckpointScope::Cluster || committed.scope != CheckpointScope::Cluster {
+        return Err(format!(
+            "selected checkpoint epoch {} is not cluster-scoped",
+            outcome.epoch
+        ));
+    }
+    Ok(Some((outcome, committed)))
 }
 
-async fn read_committed_cut_bounded(db: &LaminarDB) -> Result<Option<u64>, String> {
-    tokio::time::timeout(DECISION_IO_TIMEOUT, read_committed_cut(db))
+async fn read_committed_target_bounded(
+    db: &LaminarDB,
+) -> Result<Option<(CheckpointOutcome, CommittedCheckpointIndex)>, String> {
+    tokio::time::timeout(DECISION_IO_TIMEOUT, read_committed_target(db))
         .await
         .map_err(|_| {
             format!("decision-store recovery read timed out after {DECISION_IO_TIMEOUT:?}")
@@ -2593,30 +2570,6 @@ async fn read_recovery_gen(controller: &ClusterController) -> Result<u64, String
 /// report a backend error, so verification is the acknowledgement boundary.
 async fn replicate_recovery_gen(controller: &ClusterController, gen_id: u64) -> Result<(), String> {
     controller.adopt_recovery_generation(gen_id).await
-}
-
-async fn driver_owns_prepare_until(
-    db: &Arc<LaminarDB>,
-    controller: &ClusterController,
-    round: &RecoveryRound,
-    deadline: tokio::time::Instant,
-) -> bool {
-    let audit = async {
-        let local_certificate_is_exact = controller
-            .checkpoint_assignment_fence(round.assignment_fence.assignment_version)
-            .as_ref()
-            == Some(&round.assignment_fence);
-        if !local_certificate_is_exact
-            && !matches!(
-                recovery_round_assignment_is_restorable(db, controller, round, deadline).await,
-                Ok(true)
-            )
-        {
-            return false;
-        }
-        driver_controls_prepare(controller, round).await
-    };
-    matches!(tokio::time::timeout_at(deadline, audit).await, Ok(true))
 }
 
 async fn driver_controls_prepare(controller: &ClusterController, round: &RecoveryRound) -> bool {
@@ -2653,256 +2606,6 @@ async fn driver_owns_prepare(
         driver_controls_prepare(controller, round).await
     };
     matches!(tokio::time::timeout_at(deadline, audit).await, Ok(true))
-}
-
-async fn audit_cluster_outcome_until(
-    authority: &laminar_core::cluster::control::LeaderLeaseStore,
-    attempt: CheckpointAttempt,
-    deadline: tokio::time::Instant,
-) -> Result<CheckpointOutcome, String> {
-    let mut last_failure = None;
-    loop {
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let attempt_deadline = std::cmp::min(now + DECISION_AUDIT_ATTEMPT_TIMEOUT, deadline);
-        match tokio::time::timeout_at(
-            attempt_deadline,
-            authority.cluster_attempt_settlement(attempt),
-        )
-        .await
-        {
-            Ok(Ok(Some(outcome))) => return Ok(outcome),
-            Ok(Ok(None)) => last_failure = None,
-            Ok(Err(error)) => last_failure = Some(error.to_string()),
-            Err(_) => last_failure = Some("read attempt timed out".into()),
-        }
-        let wake = std::cmp::min(
-            tokio::time::Instant::now() + DECISION_AUDIT_RETRY_INTERVAL,
-            deadline,
-        );
-        tokio::time::sleep_until(wake).await;
-    }
-    match last_failure {
-        Some(error) => Err(format!(
-            "checkpoint settlement ambiguity audit for epoch {} checkpoint {} exhausted: {error}",
-            attempt.epoch, attempt.checkpoint_id
-        )),
-        None => Err(format!(
-            "checkpoint settlement ambiguity audit found no immutable outcome for epoch {} checkpoint {}",
-            attempt.epoch, attempt.checkpoint_id
-        )),
-    }
-}
-
-fn validate_cluster_attempt_settlement(
-    outcome: &CheckpointOutcome,
-    attempt: CheckpointAttempt,
-    deployment_id: &str,
-) -> Result<(), String> {
-    if outcome.deployment_id != deployment_id || outcome.scope != CheckpointScope::Cluster {
-        return Err(format!(
-            "checkpoint settlement for epoch {} checkpoint {} has foreign provenance",
-            attempt.epoch, attempt.checkpoint_id
-        ));
-    }
-    let settled = CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id);
-    match settled.relation_to(attempt) {
-        CheckpointAttemptRelation::Exact | CheckpointAttemptRelation::Newer => Ok(()),
-        CheckpointAttemptRelation::Older => Err(format!(
-            "checkpoint settlement for epoch {} checkpoint {} returned older outcome epoch {} checkpoint {}",
-            attempt.epoch, attempt.checkpoint_id, outcome.epoch, outcome.checkpoint_id
-        )),
-        CheckpointAttemptRelation::Conflict => Err(format!(
-            "checkpoint settlement for epoch {} checkpoint {} conflicts with outcome epoch {} checkpoint {}",
-            attempt.epoch, attempt.checkpoint_id, outcome.epoch, outcome.checkpoint_id
-        )),
-    }
-}
-
-/// Resolve the complete stopped-quorum union before selecting a recovery cut. Existing immutable
-/// outcomes always win; genuinely unresolved advancing attempts receive a create-once Abort under
-/// the exact recovery-round leader proof. Older gaps dominated by retained terminal authority do
-/// not need an impossible non-advancing backfill.
-async fn settle_stopped_prepared_witnesses(
-    db: &Arc<LaminarDB>,
-    controller: &ClusterController,
-    round: &RecoveryRound,
-    reports: &[RecoveryStoppedReport],
-) -> Result<(), String> {
-    let mut witnesses = Vec::new();
-    for report in reports {
-        report.validate(round)?;
-        if !round.contains_stopped_participant(NodeId(report.publisher().node_id)) {
-            return Err("stopped report does not belong to the exact recovery round".into());
-        }
-        witnesses.extend(report.prepared_witnesses().iter().cloned());
-    }
-    if witnesses.is_empty() {
-        return Ok(());
-    }
-    let deadline = tokio::time::Instant::now() + DECISION_IO_TIMEOUT;
-    let write_deadline = deadline
-        .checked_sub(DECISION_AMBIGUITY_AUDIT_RESERVE)
-        .expect("ambiguity reserve is shorter than the settlement budget");
-    {
-        let coordinator = tokio::time::timeout_at(write_deadline, db.coordinator.lock())
-            .await
-            .map_err(|_| "checkpoint settlement coordinator lock timed out".to_string())?;
-        let coordinator = coordinator.as_ref().ok_or_else(|| {
-            "recovery stopped reports contain checkpoint evidence but no coordinator is installed"
-                .to_string()
-        })?;
-        for report in reports {
-            coordinator
-                .validate_prepared_checkpoint_witnesses(report.prepared_witnesses())
-                .map_err(|error| error.to_string())?;
-        }
-    }
-    witnesses.sort_unstable_by_key(|witness| {
-        (
-            witness.attempt.epoch,
-            witness.attempt.checkpoint_id,
-            witness.participant_id,
-        )
-    });
-    let mut attempts = witnesses
-        .into_iter()
-        .map(|witness| {
-            (
-                witness.attempt,
-                witness.deployment_id,
-                witness.pipeline_identity,
-            )
-        })
-        .collect::<Vec<_>>();
-    attempts.dedup();
-    if attempts.windows(2).any(|pair| {
-        pair[0].0.epoch >= pair[1].0.epoch || pair[0].0.checkpoint_id >= pair[1].0.checkpoint_id
-    }) {
-        return Err(
-            "stopped Prepared witnesses contain conflicting epoch/checkpoint dimensions".into(),
-        );
-    }
-    if !driver_owns_prepare_until(db, controller, round, write_deadline).await {
-        return Err("recovery driver lost Prepare authority before checkpoint settlement".into());
-    }
-
-    let authority = controller
-        .checkpoint_authority()
-        .map_err(|error| format!("checkpoint settlement authority is unavailable: {error}"))?;
-    let inventory = tokio::time::timeout_at(write_deadline, authority.cluster_outcome_inventory())
-        .await
-        .map_err(|_| "checkpoint settlement outcome inventory timed out".to_string())?
-        .map_err(|error| format!("checkpoint settlement outcome inventory is invalid: {error}"))?;
-    let boundary = inventory.retention_boundary;
-    let mut outcomes = inventory.outcomes;
-
-    for (attempt, deployment_id, _) in attempts {
-        if let Some(outcome) = outcomes
-            .iter()
-            .find(|outcome| outcome.epoch == attempt.epoch)
-        {
-            if outcome.checkpoint_id != attempt.checkpoint_id
-                || outcome.deployment_id != deployment_id
-                || outcome.scope != CheckpointScope::Cluster
-            {
-                return Err(format!(
-                    "Prepared checkpoint {} epoch {} conflicts with its immutable outcome",
-                    attempt.checkpoint_id, attempt.epoch
-                ));
-            }
-            continue;
-        }
-        if outcomes
-            .iter()
-            .any(|outcome| outcome.checkpoint_id == attempt.checkpoint_id)
-        {
-            return Err(format!(
-                "Prepared checkpoint {} is bound to another durable epoch",
-                attempt.checkpoint_id
-            ));
-        }
-        if let Some(outcome) = outcomes.last().filter(|outcome| {
-            outcome.epoch > attempt.epoch && outcome.checkpoint_id > attempt.checkpoint_id
-        }) {
-            if outcome.deployment_id != deployment_id || outcome.scope != CheckpointScope::Cluster {
-                return Err("dominant checkpoint outcome has foreign provenance".into());
-            }
-            continue;
-        }
-        if attempt.epoch < boundary.terminal_before_epoch {
-            let anchor = boundary.terminal_anchor.as_ref().ok_or_else(|| {
-                "checkpoint outcome floor has no terminal continuity anchor".to_string()
-            })?;
-            if anchor.deployment_id != deployment_id || anchor.scope != CheckpointScope::Cluster {
-                return Err(format!(
-                    "Prepared checkpoint {} epoch {} is below an incompatible outcome floor",
-                    attempt.checkpoint_id, attempt.epoch
-                ));
-            }
-            if anchor.epoch > attempt.epoch && anchor.checkpoint_id > attempt.checkpoint_id {
-                continue;
-            }
-            return Err(format!(
-                "Prepared checkpoint {} epoch {} is below the outcome floor but is not strictly dominated by its terminal anchor",
-                attempt.checkpoint_id, attempt.epoch
-            ));
-        }
-
-        let write = tokio::time::timeout_at(
-            write_deadline,
-            authority.record_cluster_outcome(
-                &round.leader_proof,
-                attempt.epoch,
-                attempt.checkpoint_id,
-                round.assignment_fence.clone(),
-                CheckpointVerdict::Abort,
-                None,
-            ),
-        )
-        .await;
-        let outcome = match write {
-            Ok(Ok(
-                RecordOutcomeResult::Created(outcome)
-                | RecordOutcomeResult::Unchanged(outcome),
-            )) => outcome,
-            Ok(Ok(RecordOutcomeResult::Conflict { winner })) => winner,
-            Ok(Err(write_error)) => {
-                tracing::warn!(
-                    epoch = attempt.epoch,
-                    checkpoint_id = attempt.checkpoint_id,
-                    %write_error,
-                    "recovery Abort write failed; auditing the create-once winner"
-                );
-                audit_cluster_outcome_until(authority.as_ref(), attempt, deadline)
-                    .await
-                    .map_err(|audit_error| {
-                        format!(
-                            "Prepared checkpoint {} epoch {} remains unresolved after write failure ({write_error}): {audit_error}",
-                            attempt.checkpoint_id, attempt.epoch
-                        )
-                    })?
-            }
-            Err(_) => audit_cluster_outcome_until(authority.as_ref(), attempt, deadline)
-                .await
-                .map_err(|audit_error| {
-                    format!(
-                        "Prepared checkpoint {} epoch {} remains unresolved after a timed-out write: {audit_error}",
-                        attempt.checkpoint_id, attempt.epoch
-                    )
-                })?,
-        };
-        validate_cluster_attempt_settlement(&outcome, attempt, &deployment_id)?;
-        outcomes.push(outcome);
-        outcomes.sort_unstable_by_key(|outcome| (outcome.epoch, outcome.checkpoint_id));
-    }
-
-    if !driver_owns_prepare_until(db, controller, round, deadline).await {
-        return Err("recovery driver lost Prepare authority during checkpoint settlement".into());
-    }
-    Ok(())
 }
 
 fn frozen_pending<T>(

@@ -5,11 +5,6 @@ use super::{
     ConnectorTaskFenceRegistration, DbError, PreparedSink, RuntimeMode, SinkAdmissionContext,
     TrackedSourceRegistration, CLUSTER_BEST_EFFORT, EXACT_SINK_PROTOCOL, KEYED_SOURCE_PRIMARY_KEY,
 };
-#[cfg(feature = "cluster")]
-use super::{
-    cluster_delta_chain_bound, max_artifacts_per_cluster_vnode_chain,
-    MAX_ARTIFACTS_PER_CLUSTER_VNODE_CHAIN,
-};
 use crate::db::DbState;
 use crate::pipeline::streaming_coordinator::MUTATION_SOURCE_NOT_ADMITTED;
 use crate::pipeline::PipelineConfig;
@@ -26,33 +21,12 @@ use laminar_connectors::connector::{
     SourceTopology, WriteResult,
 };
 use laminar_connectors::error::ConnectorError;
-use laminar_core::state::StateBackendDurability;
-use laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint;
+use laminar_core::checkpoint::object_store_builder::CheckpointStorageScope;
+use laminar_core::checkpoint::ConnectorCheckpoint;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-
-#[cfg(feature = "cluster")]
-#[test]
-fn cluster_vnode_lineage_limits_are_derived_from_retention() {
-    assert_eq!(cluster_delta_chain_bound(0), None);
-    assert_eq!(cluster_delta_chain_bound(1), None);
-    assert_eq!(cluster_delta_chain_bound(2), Some(1));
-    assert_eq!(cluster_delta_chain_bound(3), Some(2));
-    assert_eq!(cluster_delta_chain_bound(4), Some(3));
-    assert_eq!(cluster_delta_chain_bound(5), Some(4));
-    assert_eq!(cluster_delta_chain_bound(usize::MAX), Some(4));
-
-    assert_eq!(max_artifacts_per_cluster_vnode_chain(0), 1);
-    assert_eq!(max_artifacts_per_cluster_vnode_chain(1), 1);
-    assert_eq!(max_artifacts_per_cluster_vnode_chain(2), 3);
-    assert_eq!(max_artifacts_per_cluster_vnode_chain(3), 4);
-    assert_eq!(max_artifacts_per_cluster_vnode_chain(4), 5);
-    assert_eq!(max_artifacts_per_cluster_vnode_chain(5), 6);
-    assert_eq!(max_artifacts_per_cluster_vnode_chain(usize::MAX), 6);
-    assert_eq!(MAX_ARTIFACTS_PER_CLUSTER_VNODE_CHAIN, 6);
-}
 
 struct RetiringQuiesceSink {
     schema: SchemaRef,
@@ -610,7 +584,6 @@ async fn cluster_without_checkpoint_config_still_derives_graph_identity() {
             &HashMap::new(),
             RuntimeMode::Cluster,
             db.cluster_checkpoint_object_store(),
-            StateBackendDurability::ClusterShared,
         )
         .await
         .unwrap();
@@ -1237,7 +1210,7 @@ fn sink_admission_failure_retains_captured_generation_fence() {
                 runtime: RuntimeMode::Local,
                 carries_changelog: false,
                 checkpointing_enabled: true,
-                state_backend_scope: StateBackendDurability::NodeDurable,
+                checkpoint_storage_scope: CheckpointStorageScope::NodeDurable,
             },
         )?;
         Ok(())
@@ -1627,7 +1600,7 @@ fn coordinated_commit_is_rejected_under_at_least_once_before_open() {
             runtime: RuntimeMode::Local,
             carries_changelog: false,
             checkpointing_enabled: true,
-            state_backend_scope: StateBackendDurability::Volatile,
+            checkpoint_storage_scope: CheckpointStorageScope::Volatile,
         },
     )
     .expect_err("the exact descriptor/cursor path must not activate under ALO");
@@ -1714,7 +1687,7 @@ fn complete_exact_protocol_is_admitted_without_opening() {
             runtime: RuntimeMode::Local,
             carries_changelog: false,
             checkpointing_enabled: true,
-            state_backend_scope: StateBackendDurability::NodeDurable,
+            checkpoint_storage_scope: CheckpointStorageScope::NodeDurable,
         },
     )
     .unwrap();
@@ -1746,7 +1719,7 @@ fn checkpoint_committable_contract_without_committer_is_rejected_before_open() {
             runtime: RuntimeMode::Local,
             carries_changelog: false,
             checkpointing_enabled: true,
-            state_backend_scope: StateBackendDurability::NodeDurable,
+            checkpoint_storage_scope: CheckpointStorageScope::NodeDurable,
         },
     )
     .unwrap_err();
@@ -1758,20 +1731,20 @@ fn checkpoint_committable_contract_without_committer_is_rejected_before_open() {
 #[test]
 fn exact_state_scope_is_runtime_aware_and_checked_before_open() {
     let cases = [
-        (RuntimeMode::Local, StateBackendDurability::Volatile, false),
+        (RuntimeMode::Local, CheckpointStorageScope::Volatile, false),
         (
             RuntimeMode::Local,
-            StateBackendDurability::NodeDurable,
+            CheckpointStorageScope::NodeDurable,
             true,
         ),
         (
             RuntimeMode::Cluster,
-            StateBackendDurability::NodeDurable,
+            CheckpointStorageScope::NodeDurable,
             false,
         ),
         (
             RuntimeMode::Cluster,
-            StateBackendDurability::ClusterShared,
+            CheckpointStorageScope::ClusterShared,
             false,
         ),
     ];
@@ -1800,7 +1773,7 @@ fn exact_state_scope_is_runtime_aware_and_checked_before_open() {
                 runtime,
                 carries_changelog: false,
                 checkpointing_enabled: true,
-                state_backend_scope: scope,
+                checkpoint_storage_scope: scope,
             },
         );
 
@@ -1837,7 +1810,7 @@ fn exact_rejection_precedes_open_for_non_committable_contract() {
             runtime: RuntimeMode::Local,
             carries_changelog: false,
             checkpointing_enabled: true,
-            state_backend_scope: StateBackendDurability::NodeDurable,
+            checkpoint_storage_scope: CheckpointStorageScope::NodeDurable,
         },
     )
     .unwrap_err();

@@ -529,7 +529,6 @@ mod tests {
         );
         inspection_runtime.block_on(async {
             assert!(db.runtime_handle.lock().await.is_none());
-            assert!(db.committer_handle.lock().await.is_none());
         });
         assert!(db.owned_source_tasks.lock().is_empty());
         assert!(db.owned_sink_handles.lock().is_empty());

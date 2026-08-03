@@ -13,7 +13,6 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 
 /// Errors from object store construction.
@@ -31,6 +30,40 @@ pub enum ObjectStoreBuilderError {
 impl From<object_store::Error> for ObjectStoreBuilderError {
     fn from(e: object_store::Error) -> Self {
         Self::Build(e.to_string())
+    }
+}
+
+/// Failure domain of a checkpoint object-store URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CheckpointStorageScope {
+    /// No durable checkpoint namespace can be proven from the URL.
+    Volatile,
+    /// A local filesystem namespace survives process restart on one node.
+    NodeDurable,
+    /// A remote object-store namespace is shared by cluster participants.
+    ClusterShared,
+}
+
+impl CheckpointStorageScope {
+    /// Classify only URL schemes accepted by the object-store builder.
+    #[must_use]
+    pub fn for_url(url: &str) -> Self {
+        if is_absolute_local_file_url(url) {
+            return Self::NodeDurable;
+        }
+        let Ok(parsed) = url::Url::parse(url) else {
+            return Self::Volatile;
+        };
+        match parsed.scheme() {
+            "s3" | "s3a" | "gs" | "az" | "abfs" | "abfss" => Self::ClusterShared,
+            _ => Self::Volatile,
+        }
+    }
+
+    /// Whether this failure domain is at least as durable as the requirement.
+    #[must_use]
+    pub const fn satisfies(self, required: Self) -> bool {
+        self as u8 >= required as u8
     }
 }
 
@@ -95,6 +128,19 @@ pub fn build_object_store(
             store, prefix,
         )))
     }
+}
+
+/// Open the crash-durable local object store used by checkpoint data and metadata.
+///
+/// # Errors
+///
+/// Returns an object-store error when the root cannot be created, synchronized, or opened.
+pub fn durable_local_object_store(
+    root: impl AsRef<std::path::Path>,
+) -> object_store::Result<Arc<dyn ObjectStore>> {
+    Ok(Arc::new(
+        crate::durable_local_store::DurableLocalObjectStore::new(root)?,
+    ))
 }
 
 fn provider_environment_key(scheme: &str, key: &str) -> bool {
@@ -219,20 +265,10 @@ fn parse_absolute_local_file_url(url: &str) -> Result<url::Url, ObjectStoreBuild
     Ok(parsed)
 }
 
-/// Extract the local path from a `file://` URL and create a `LocalFileSystem`.
+/// Extract the local path from a `file://` URL and create a crash-durable local store.
 fn build_local_file_system(url: &str) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
     let path = file_url_path(url)?;
-
-    // Ensure the directory exists — LocalFileSystem doesn't create it.
-    std::fs::create_dir_all(&path).map_err(|e| {
-        ObjectStoreBuilderError::InvalidUrl(format!(
-            "failed to create directory '{}': {e}",
-            path.display()
-        ))
-    })?;
-
-    let fs = LocalFileSystem::new_with_prefix(&path)?;
-    Ok(Arc::new(fs))
+    durable_local_object_store(path).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -240,11 +276,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_file_scheme_creates_local_fs() {
+    fn test_file_scheme_creates_durable_local_store() {
         let dir = tempfile::tempdir().unwrap();
         let url = url::Url::from_directory_path(dir.path()).unwrap();
-        let store = build_object_store(url.as_str(), &HashMap::new());
-        assert!(store.is_ok(), "file:// should succeed: {store:?}");
+        let store = build_object_store(url.as_str(), &HashMap::new()).unwrap();
+        assert!(store.to_string().starts_with("DurableLocalObjectStore("));
     }
 
     #[test]
@@ -275,6 +311,33 @@ mod tests {
         assert!(!is_absolute_local_file_url("FILE:///tmp/path"));
         assert!(!is_absolute_local_file_url("file:///tmp/path?version=1"));
         assert!(!is_absolute_local_file_url("file:///tmp/path#fragment"));
+    }
+
+    #[test]
+    fn checkpoint_storage_scope_matches_supported_schemes() {
+        assert_eq!(
+            CheckpointStorageScope::for_url("file:///tmp/checkpoints"),
+            CheckpointStorageScope::NodeDurable
+        );
+        for url in [
+            "s3://bucket/prefix",
+            "s3a://bucket/prefix",
+            "gs://bucket/prefix",
+            "az://container/prefix",
+            "abfs://container/prefix",
+            "abfss://container/prefix",
+        ] {
+            assert_eq!(
+                CheckpointStorageScope::for_url(url),
+                CheckpointStorageScope::ClusterShared
+            );
+        }
+        for url in ["memory://", "file://relative", "gcs://bucket", "ftp://host"] {
+            assert_eq!(
+                CheckpointStorageScope::for_url(url),
+                CheckpointStorageScope::Volatile
+            );
+        }
     }
 
     #[test]

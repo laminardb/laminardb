@@ -86,7 +86,7 @@ conn.close()
 |------|-----|
 | Embedded | `cargo add laminar-db`. Runs in-process. |
 | Standalone | `laminardb` binary. TOML config, REST API, Postgres wire protocol, Prometheus metrics, hot reload. |
-| Cluster | Multi-node deployment. Static or gossip discovery, lease-fenced control paths, dynamic partition/vnode rebalance, and distributed checkpoints. |
+| Cluster | Multi-node deployment. Static or gossip discovery, lease-fenced control paths, assignment-fenced vnodes, and distributed checkpoints. Stateful vnode acquisition currently fails closed. |
 
 ### Prebuilt binaries
 
@@ -142,18 +142,17 @@ runtimes own all configured vnodes in process; clusters distribute the same topo
 
 * **Membership & Discovery**: Nodes discover one another using either a gossip-based protocol (Chitchat peer-to-peer membership over a configured `gossip_port`) or a static seeds list.
 * **Coordination**: Membership selects a leader candidate, while a renewable shared-store lease fences leader-only control paths. Vnode assignments are CAS-published through `AssignmentSnapshotStore`; there is no embedded Raft service.
-* **Dynamic Rebalancing**: Stable key groups (256 by default) are dynamically distributed across active cluster nodes. When a new node joins or an existing node departs (or fails), the leader automatically rebalances the assignments. When shutting down gracefully, a node announces a `Draining` state, letting the leader reallocate its key groups before the node terminates.
-* **Distributed Checkpoints**: The current coordinator seals shared checkpoint artifacts. Its accepted replacement packs one dirty-vnode object per node with manifest-indexed byte ranges; that cutover is still in progress.
-* **Checkpoint Store**: Cluster execution requires a shared `object_store` URL. Single-node replay-capable delivery currently remains fenced to the local filesystem path.
+* **VNode Assignments**: Stable key groups (256 by default) are distributed across active cluster nodes. Exact-fenced revoke-only changes are supported. A live assignment that would acquire state fails before publication until direct v7 range transfer is complete.
+* **Distributed Checkpoints**: Each participant writes one immutable node-data object with manifest-indexed state-frame ranges and digests. One committed index binds the complete cluster cut.
+* **Checkpoint Store**: Cluster execution requires a shared `object_store` URL. Local and remote stores must pass the bounded conditional-write probe used by checkpoint publication.
 
 > [!IMPORTANT]
 > Cluster exactly-once is admitted only for exact-certified sources and a cluster-certified,
 > checkpoint-committable sink. The current admitted path is Kafka input to direct S3/S3A
 > append-mode Delta Lake. Kafka output remains at-least-once. Other exact combinations fail closed with `[LDB-5035]`
-> before connector I/O. The four-mode production soak matrix is still pending.
+> before connector I/O.
 > The accepted state design is authoritative in-memory `FxHashMap` state per vnode with
-> object-store-only checkpoint durability. Public backend selection is removed, but the internal
-> checkpoint-artifact cutover and four-mode production soak matrix remain pending.
+> object-store-only checkpoint durability. The four-mode production soak matrix remains pending.
 > Cluster SQL admits stateless pipelines, supported non-windowed keyed aggregates, and one bounded
 > join stage over direct append-only, watermarked sources. The join supports `INNER`, `LEFT`,
 > `RIGHT`, `FULL`, `LEFT/RIGHT SEMI`, and `LEFT/RIGHT ANTI` with ordered `VARCHAR`/`BIGINT`
@@ -464,266 +463,8 @@ LaminarDB standalone server supports environment variable interpolation inside t
 
 ---
 
-LaminarDB supports multiple deployment profiles (In-Process, Embedded, Standalone Server, and Cluster Mode) to match different operational requirements:
-
-### 1. In-Process Mode (BareMetal Profile)
-Runs entirely in-memory within the host application process. Since it does not persist state to disk, it has zero I/O overhead and starts up instantly. Ideal for stateless streaming transformations, unit testing, or ephemeral sidecars.
-
-```mermaid
-graph TD
-    classDef hostClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
-    classDef appClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
-    classDef coordClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
-    classDef stateClass fill:#06b6d4,fill-opacity:0.15,stroke:#06b6d4,stroke-width:1px;
-
-    subgraph HostApp["Host Application Process (Rust/Python/C)"]
-        App["Application Logic"]:::appClass
-        subgraph Engine["LaminarDB Engine (In-Process / BareMetal)"]
-            Coord["Streaming Coordinator<br/>('laminar-compute' thread)"]:::coordClass
-            InMemState["Per-Vnode In-Memory State<br/>(FxHashMap)"]:::stateClass
-            Coord <--> InMemState
-        end
-        App -->|"Push RecordBatches<br/>via Direct API"| Coord
-        Coord -->|"Pull Results<br/>via Subscription"| App
-    end
-
-    style HostApp fill:#3b82f6,fill-opacity:0.05,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 5 5
-    style Engine fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
-```
-
-### 2. Embedded Mode (Embedded / Durable Profiles)
-Runs inside the host application process with the same vnode state used by a cluster. Checkpoints
-use a local `file://` URL or a remote object-store URL. After a crash, the recovery manager restores
-the latest committed checkpoint and replays sources from its stored offsets.
-
-```mermaid
-graph TD
-    classDef appClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
-    classDef coordClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
-    classDef stateClass fill:#06b6d4,fill-opacity:0.15,stroke:#06b6d4,stroke-width:1px;
-    classDef recoveryClass fill:#10b981,fill-opacity:0.15,stroke:#10b981,stroke-width:1px;
-    classDef storageClass fill:#f97316,fill-opacity:0.15,stroke:#f97316,stroke-width:1px;
-
-    subgraph HostApp["Host Application Process (Rust/Python/C)"]
-        direction TB
-        App["Application Logic"]:::appClass
-        subgraph Engine["LaminarDB Engine (Embedded Profile)"]
-            Coord["Streaming Coordinator<br/>('laminar-compute' thread)"]:::coordClass
-            InMemState["Per-Vnode In-Memory State<br/>(FxHashMap)"]:::stateClass
-            Checkpoint["Checkpoint Coordinator"]:::recoveryClass
-            Recovery["Recovery Manager"]:::recoveryClass
-            
-            Coord <--> InMemState
-            Checkpoint -.->|"Snapshot State"| InMemState
-            Recovery -.->|"Restore State"| InMemState
-        end
-        App -->|"Push RecordBatches"| Coord
-        Coord -->|"Pull Results"| App
-    end
-    Checkpoint -->|"Write Checkpoint"| Storage["Checkpoint Storage"]:::storageClass
-    Storage -->|"Restore Manifest<br/>and Operator State"| Recovery
-    
-    style HostApp fill:#3b82f6,fill-opacity:0.05,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 5 5
-    style Engine fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
-```
-
-### 3. Standalone Server Mode
-Runs as a dedicated native daemon binary (`laminar-server`). It wraps the embedded engine and exposes standard client protocols (PostgreSQL pgwire, REST HTTP API, WebSockets) so external processes can run DDL/DML queries or stream ingest/consume data.
-
-```mermaid
-graph TD
-    classDef clientClass fill:#10b981,fill-opacity:0.15,stroke:#10b981,stroke-width:1px;
-    classDef portClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
-    classDef coordClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
-    classDef stateClass fill:#06b6d4,fill-opacity:0.15,stroke:#06b6d4,stroke-width:1px;
-    classDef checkpointClass fill:#78716c,fill-opacity:0.15,stroke:#78716c,stroke-width:1px;
-    classDef storageClass fill:#f97316,fill-opacity:0.15,stroke:#f97316,stroke-width:1px;
-
-    Client1["PostgreSQL Clients (pgwire)"]:::clientClass
-    Client2["REST API Clients (HTTP)"]:::clientClass
-    Client3["WebSocket Clients (Subscriptions)"]:::clientClass
-    
-    subgraph Server["LaminarDB Standalone Server (laminar-server)"]
-        direction TB
-        subgraph Ports["Interface Listeners"]
-            REST["Axum HTTP REST Listener"]:::portClass
-            WS["WebSocket Listener"]:::portClass
-            PgWire["Postgres Wire Listener"]:::portClass
-        end
-        
-        subgraph Engine["LaminarDB Engine (Embedded Library)"]
-            Coord["Streaming Coordinator<br/>('laminar-compute')"]:::coordClass
-            State["Per-Vnode In-Memory State<br/>(FxHashMap)"]:::stateClass
-            Checkpoint["Checkpoint Coordinator"]:::checkpointClass
-            Coord <--> State
-            Checkpoint -.-> State
-        end
-        
-        REST -->|"Push Events, DDL,<br/>and Admin"| Coord
-        WS -->|"Streaming Subscription<br/>Batches"| Coord
-        PgWire -->|"SQL DDL and<br/>DML Execution"| Coord
-    end
-    
-    Client1 -->|"Port 5432"| PgWire
-    Client2 -->|"Port 8000"| REST
-    Client3 -->|"Port 8000 /ws"| WS
-    Checkpoint -->|"Write Checkpoints"| Storage["Durable Storage (Local Disk / S3)"]:::storageClass
-
-    style Server fill:#6b7280,fill-opacity:0.05,stroke:#4b5563,stroke-width:1.5px
-    style Ports fill:#3b82f6,fill-opacity:0.05,stroke:#3b82f6,stroke-width:1.5px
-    style Engine fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
-```
-
-### 4. Cluster Mode (Distributed Deployment)
-Runs as a distributed cluster of cooperative nodes. Nodes use static membership or **Chitchat Gossip**, fence leader-only work with a renewable shared-store lease, publish VNode assignments through create/CAS operations, exchange partition streams via high-performance **gRPC & Arrow-Flight** shuffles, and persist coordinated checkpoints to shared object storage.
-
-```mermaid
-graph TD
-    classDef clientClass fill:#10b981,fill-opacity:0.15,stroke:#10b981,stroke-width:1px;
-    classDef engineClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
-    classDef controlClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
-    classDef gossipClass fill:#06b6d4,fill-opacity:0.15,stroke:#06b6d4,stroke-width:1px;
-    classDef vnodeClass fill:#78716c,fill-opacity:0.15,stroke:#78716c,stroke-width:1px;
-    classDef storageClass fill:#f97316,fill-opacity:0.15,stroke:#f97316,stroke-width:1px;
-
-    Client["Clients / Load Balancer"]:::clientClass
-    
-    subgraph Node1["LaminarDB Node 1 (Coordinator Leader)"]
-        direction TB
-        E1["Streaming Engine"]:::engineClass
-        Control1["Lease-Fenced<br/>Control Plane"]:::controlClass
-        Gossip1["Chitchat Gossip"]:::gossipClass
-        VNodes1["Owned Key Groups<br/>(Dynamic Subset)"]:::vnodeClass
-        E1 <--> VNodes1
-    end
-
-    subgraph Node2["LaminarDB Node 2 (Follower)"]
-        direction TB
-        E2["Streaming Engine"]:::engineClass
-        Control2["Cluster Control<br/>Follower"]:::controlClass
-        Gossip2["Chitchat Gossip"]:::gossipClass
-        VNodes2["Owned Key Groups<br/>(Dynamic Subset)"]:::vnodeClass
-        E2 <--> VNodes2
-    end
-
-    %% Client Operations
-    Client -->|"REST / pgwire"| Node1
-    Client -->|"REST / pgwire"| Node2
-
-    %% Node Communication
-    Gossip1 ---|"Peer Discovery"| Gossip2
-    E1 ---|"gRPC and Arrow-Flight<br/>Data Shuffle"| E2
-
-    %% Distributed Durability
-    Control1 -->|"Leader Lease and<br/>Assignment CAS"| SharedStore["Shared Object Store"]:::storageClass
-    Control2 -->|"Read Shared<br/>Control State"| SharedStore
-    Node1 -->|"Coordinated 2-Phase<br/>Commit Checkpoints"| SharedStore
-    Node2 -->|"Coordinated 2-Phase<br/>Commit Checkpoints"| SharedStore:::storageClass
-
-    style Node1 fill:#6b7280,fill-opacity:0.05,stroke:#4b5563,stroke-width:1.5px
-    style Node2 fill:#6b7280,fill-opacity:0.05,stroke:#4b5563,stroke-width:1.5px
-```
-
-### 5. Internal Threading Model (Within a Single Node)
-Within each engine node, a dedicated execution thread isolates CPU-bound stream processing from
-connector I/O. This reduces scheduling interference; production latency remains workload-dependent
-and subject to the soak gate.
-
-```mermaid
-graph TB
-    classDef computeClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:1px;
-    classDef mainClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
-    classDef blockingClass fill:#f97316,fill-opacity:0.15,stroke:#f97316,stroke-width:1px;
-    
-    classDef sourceClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
-    classDef sinkClass fill:#10b981,fill-opacity:0.15,stroke:#10b981,stroke-width:1px;
-    classDef serviceClass fill:#78716c,fill-opacity:0.15,stroke:#78716c,stroke-width:1px;
-    classDef coordClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
-
-    subgraph ComputeRuntime["Dedicated 'laminar-compute' Thread (Single-Threaded Runtime)"]
-        subgraph Coord["Streaming Coordinator (Hot Path)"]
-            direction LR
-            Proj["Projections & Filters"]:::computeClass
-            Window["Window Operators"]:::computeClass
-            Join["Join Operators"]:::computeClass
-            LocalState["Per-Vnode State (FxHashMap)"]:::computeClass
-            
-            Proj --> Window --> Join
-            Window <--> LocalState
-            Join <--> LocalState
-        end
-    end
-
-    subgraph MainRuntime["Main Tokio Runtime (Multi-Threaded)"]
-        subgraph Sources["Source Connectors (Tokio Tasks)"]
-            S1["Kafka Source"]:::sourceClass
-            S2["Postgres CDC"]:::sourceClass
-            S3["WebSocket Source"]:::sourceClass
-        end
-        
-        subgraph Sinks["Sink Connectors (Tokio Tasks)"]
-            SinkIO["Sinks (Kafka, Delta Lake, PG)"]:::sinkClass
-        end
-        
-        subgraph CoreServices["Background Services"]
-            API["REST & WebSockets API (Axum)"]:::serviceClass
-            CheckpointCoord["Checkpoint Coordinator"]:::serviceClass
-            Metrics["Prometheus Metrics"]:::serviceClass
-        end
-    end
-
-    subgraph BlockingPool["Tokio Blocking Thread Pool"]
-        Serial["State Serialization (rkyv to bytes)"]:::blockingClass
-    end
-
-    %% Data and Control Paths
-    Sources -->|"tokio::sync::mpsc<br/>(Arrow RecordBatches)"| Proj
-    Join -->|"Output Batches"| SinkIO
-    CheckpointCoord -.->|"Trigger Checkpoint<br/>Barrier"| Sources
-    CheckpointCoord -.->|"Offload Serialization"| Serial
-
-    style ComputeRuntime fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
-    style MainRuntime fill:#3b82f6,fill-opacity:0.05,stroke:#3b82f6,stroke-width:1.5px
-    style BlockingPool fill:#f97316,fill-opacity:0.05,stroke:#f97316,stroke-width:1.5px
-    style Coord fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
-```
-
-* **Streaming coordinator.** Single tokio task on a dedicated single-threaded runtime (the `laminar-compute` thread), isolating CPU-bound event processing from I/O on the main runtime. Source connectors push batches in via `tokio::sync::mpsc`; the coordinator runs compiled projections or cached logical plans, routes results to sinks, and manages checkpoint barriers. Compiled single-source projections are sub-microsecond; incremental aggregations and cached-plan queries are microseconds; complex queries fall back to DataFusion.
-* **Background I/O.** Source connectors, sink writers, and the checkpoint coordinator all run on the main tokio work-stealing runtime.
-* **Admin.** HTTP REST API (Axum), Prometheus metrics, ad-hoc SQL, hot reload, manual checkpoints. No built-in auth on the HTTP API; put it behind a reverse proxy. The Postgres-wire listener has MD5 + TLS + mTLS auth (see above).
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
-
-### Checkpointing and Recovery
-
-1. **Coordinated snapshots.** Chandy-Lamport barriers injected at sources; operators with multiple inputs align before snapshotting.
-2. **External commit.** In admitted exactly-once pipelines, checkpoint-committable sinks stage output and publish it only after the durable checkpoint decision.
-3. **Durable decision.** Prepared and finalized manifests bind the deployment, pipeline, exact attempt, state seals, connector positions, and participants. Filesystem/object-store writes use create/CAS boundaries appropriate to the backend.
-4. **Recovery.** `RecoveryManager` accepts the latest finalized identity-matching manifest, restores state and source positions, and reconciles coordinated sinks from their exact external cursor.
-
-```rust
-// Note: StreamCheckpointConfig is from laminar-core (add as a dependency)
-let db = LaminarDB::builder()
-    .storage_dir("./data")
-    .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
-        interval_ms: Some(30_000),
-        ..Default::default()
-    })
-    .build()
-    .await?;
-```
-
-Recovery resumes from the latest finalized checkpoint. Replayable sources may resend records after
-that cut under at-least-once delivery; an admitted exactly-once pipeline suppresses duplicate
-external visibility through coordinated sink commits. Non-replayable sources are admitted only
-under `best_effort`, where failure can lose accepted events. Shorter checkpoint intervals reduce
-replay work but increase storage and coordination I/O.
-
-### Compiled Query Execution
-
-Non-aggregate single-source queries are compiled to `PhysicalExpr` projections on first execution, eliminating per-cycle SQL parsing overhead. Complex queries cache their optimized logical plans to skip repeated planning.
-
----
+Runtime, checkpoint, and deployment internals are kept in [Architecture](docs/ARCHITECTURE.md)
+and [Distributed State](docs/DISTRIBUTED_STATE.md).
 
 ## Benchmarks
 

@@ -1,168 +1,159 @@
 #![allow(clippy::disallowed_types)]
-//! Recovery-storage benchmark: measures checkpoint manifest and sidecar load time.
-//!
-//! This covers storage I/O and deserialization, not full connector or operator restoration.
-//!
-//! Run with: `cargo bench --bench recovery_bench -p laminar-db`
+//! Exact-manifest and range-read checkpoint benchmarks.
 
 use std::collections::HashMap;
 use std::hint::black_box;
+use std::sync::Arc;
 
+use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-
-use laminar_core::storage::checkpoint_manifest::{
-    CheckpointManifest, ConnectorCheckpoint, OperatorCheckpoint,
+use laminar_core::checkpoint::{
+    checkpoint_sha256, ByteRange, ChannelProgress, CheckpointManifest, CheckpointStore,
+    ConnectorCheckpoint, ObjectStoreCheckpointStore, StateFrame, StateFrameKey,
 };
-use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
+use laminar_core::state::KeyGroupCount;
 
-/// Creates synthetic operator state of the given byte size.
-fn synthetic_state(size_bytes: usize) -> Vec<u8> {
-    // Repeating pattern that compresses poorly (realistic for serialized state).
-    let mut data = Vec::with_capacity(size_bytes);
-    let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_BABE;
-    while data.len() < size_bytes {
-        // Simple xorshift64 — fast, low-compression-ratio output.
-        rng_state ^= rng_state << 13;
-        rng_state ^= rng_state >> 7;
-        rng_state ^= rng_state << 17;
-        data.extend_from_slice(&rng_state.to_le_bytes());
+fn synthetic_state(size: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(size);
+    let mut value = 0xDEAD_BEEF_CAFE_BABE_u64;
+    while data.len() < size {
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        data.extend_from_slice(&value.to_le_bytes());
     }
-    data.truncate(size_bytes);
+    data.truncate(size);
     data
 }
 
-/// Creates a manifest with realistic source offsets and topology metadata.
-fn realistic_manifest(id: u64, num_sources: usize, num_operators: usize) -> CheckpointManifest {
-    let mut m = CheckpointManifest::new(id, id);
-    m.watermark = Some(1_000_000);
+fn checkpoint_payload(state_bytes: usize) -> Bytes {
+    Bytes::from(synthetic_state(state_bytes))
+}
 
-    for i in 0..num_sources {
-        let name = format!("source_{i}");
-        m.source_offsets.insert(
+fn checkpoint_manifest(id: u64, sources: usize, payload: &[u8]) -> CheckpointManifest {
+    let key_groups = KeyGroupCount::try_from(1_u16).unwrap();
+    let mut manifest = CheckpointManifest::new_with_key_group_count(id, id, key_groups);
+    manifest.deployment_id = uuid::Uuid::from_u128(1).to_string();
+
+    for source in 0..sources {
+        let name = format!("source_{source:03}");
+        manifest.source_names.push(name.clone());
+        manifest.source_offsets.insert(
             name.clone(),
             ConnectorCheckpoint::with_offsets(HashMap::from([
-                ("events:0".into(), format!("{}", 1000 * id)),
-                ("events:1".into(), format!("{}", 2000 * id)),
-                ("events:2".into(), format!("{}", 3000 * id)),
+                ("events:0".into(), (1_000 * id).to_string()),
+                ("events:1".into(), (2_000 * id).to_string()),
             ])),
         );
-        m.source_watermarks.insert(name, 500_000 + i as i64);
-        m.source_names.push(format!("source_{i}"));
-    }
-
-    for i in 0..num_operators {
-        // Small inline operator states (a few KB each).
-        let state = synthetic_state(4096);
-        m.operator_states
-            .insert(format!("operator_{i}"), OperatorCheckpoint::inline(&state));
-    }
-
-    m.sink_names = vec!["pg_sink".into(), "kafka_sink".into()];
-    m
-}
-
-/// Benchmark: load manifest only (no sidecar state).
-///
-/// This measures JSON deserialization of the manifest, which is the fast
-/// path when operator state is small enough to be stored inline.
-fn bench_recovery_manifest_only(c: &mut Criterion) {
-    let mut group = c.benchmark_group("recovery_manifest_only");
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
-    for &(sources, operators) in &[(2, 2), (10, 10), (50, 20)] {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path());
-
-        let manifest = realistic_manifest(1, sources, operators);
-        rt.block_on(store.save(&manifest)).unwrap();
-
-        let label = format!("{sources}src_{operators}op");
-        group.bench_function(BenchmarkId::new("load_latest", &label), |b| {
-            b.iter(|| {
-                let loaded = rt.block_on(store.load_latest()).unwrap().unwrap();
-                black_box(&loaded);
-            })
+        manifest.channel_progress.push(ChannelProgress {
+            participant_id: manifest.participant_id,
+            channel_id: name,
+            watermark: Some(500_000 + source as i64),
+            idle: false,
         });
     }
+    manifest.checkpoint_watermark = (!manifest.channel_progress.is_empty()).then_some(500_000);
 
-    group.finish();
+    manifest.node_data.object_length = payload.len() as u64;
+    manifest.node_data.sha256 = checkpoint_sha256(payload);
+    manifest.state_frames.push(StateFrame {
+        key: StateFrameKey::OperatorWhole {
+            operator_id: "aggregate".into(),
+        },
+        chunk: manifest.node_data.chunk,
+        range: ByteRange {
+            offset: 0,
+            length: payload.len() as u64,
+        },
+        sha256: checkpoint_sha256(payload),
+    });
+    manifest
 }
 
-/// Benchmark: load manifest + sidecar state data.
-///
-/// This measures the storage-read portion of recovery when operator state
-/// is large enough to be stored in a sidecar file (state.bin).
-fn bench_recovery_with_sidecar(c: &mut Criterion) {
-    let mut group = c.benchmark_group("recovery_with_sidecar");
-    group.sample_size(10); // Fewer samples for large state sizes.
-    let rt = tokio::runtime::Runtime::new().unwrap();
+fn store(directory: &std::path::Path) -> ObjectStoreCheckpointStore {
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new_with_prefix(directory).unwrap());
+    ObjectStoreCheckpointStore::new(backing, "")
+        .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap())
+}
 
-    // Sizes: 1KB, 1MB, 10MB, 100MB.
-    for &size_bytes in &[1_024, 1_048_576, 10_485_760, 104_857_600] {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path());
+fn bench_exact_manifest_load(c: &mut Criterion) {
+    let mut group = c.benchmark_group("checkpoint_exact_manifest_load");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
 
-        let manifest = realistic_manifest(1, 5, 3);
-        let state = synthetic_state(size_bytes);
-        let chunks = [bytes::Bytes::from(state)];
-        rt.block_on(store.save_with_state(&manifest, Some(&chunks)))
+    for &(sources, state_bytes) in &[(2, 4_096), (10, 4_096), (50, 4_096)] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(directory.path());
+        let payload = checkpoint_payload(state_bytes);
+        let manifest = checkpoint_manifest(1, sources, &payload);
+        runtime
+            .block_on(store.save_checkpoint(&manifest, std::slice::from_ref(&payload)))
             .unwrap();
 
-        let label = humanize_bytes(size_bytes);
-        group.throughput(Throughput::Bytes(size_bytes as u64));
-        group.bench_function(BenchmarkId::new("load_manifest_and_state", &label), |b| {
-            b.iter(|| {
-                let loaded = rt.block_on(store.load_latest()).unwrap().unwrap();
-                let state_data = rt
-                    .block_on(store.load_state_data(loaded.checkpoint_id))
-                    .unwrap();
-                black_box(&loaded);
-                black_box(&state_data);
-            })
+        group.bench_function(BenchmarkId::new("load", sources), |bencher| {
+            bencher.iter(|| black_box(runtime.block_on(store.load_manifest(1)).unwrap().unwrap()))
         });
     }
-
     group.finish();
 }
 
-/// Benchmark: save checkpoint with sidecar (write path).
-///
-/// Measures atomic write performance for the checkpoint persistence path.
-fn bench_checkpoint_save(c: &mut Criterion) {
-    let mut group = c.benchmark_group("checkpoint_save");
+fn bench_verified_state_range_read(c: &mut Criterion) {
+    let mut group = c.benchmark_group("checkpoint_verified_state_range_read");
     group.sample_size(10);
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
 
-    for &size_bytes in &[1_024, 1_048_576, 10_485_760] {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path());
+    for state_bytes in [1_024, 1_048_576, 10_485_760] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(directory.path());
+        let payload = checkpoint_payload(state_bytes);
+        let manifest = checkpoint_manifest(1, 5, &payload);
+        runtime
+            .block_on(store.save_checkpoint(&manifest, std::slice::from_ref(&payload)))
+            .unwrap();
+        let frame = manifest.state_frames[1].clone();
 
-        let state = synthetic_state(size_bytes);
-        // Wrap once; cloning a Bytes is an Arc-bump so reusing this
-        // across iterations gives a fair measurement of the write path
-        // rather than the allocation of the test buffer.
-        let state_chunks = [bytes::Bytes::from(state)];
-
-        let label = humanize_bytes(size_bytes);
-        group.throughput(Throughput::Bytes(size_bytes as u64));
-        let mut id = 1_u64;
-        group.bench_function(BenchmarkId::new("save_with_state", &label), |b| {
-            b.iter(|| {
-                let manifest = realistic_manifest(id, 5, 3);
-                rt.block_on(store.save_with_state(&manifest, Some(&state_chunks)))
-                    .unwrap();
-                id += 1;
-            })
-        });
+        group.throughput(Throughput::Bytes(state_bytes as u64));
+        group.bench_function(
+            BenchmarkId::new("load", humanize_bytes(state_bytes)),
+            |bencher| {
+                bencher
+                    .iter(|| black_box(runtime.block_on(store.load_state_frame(&frame)).unwrap()))
+            },
+        );
     }
+    group.finish();
+}
 
+fn bench_checkpoint_save(c: &mut Criterion) {
+    let mut group = c.benchmark_group("checkpoint_one_node_object_save");
+    group.sample_size(10);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    for state_bytes in [1_024, 1_048_576, 10_485_760] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(directory.path());
+        let payload = checkpoint_payload(state_bytes);
+        let mut id = 1_u64;
+
+        group.throughput(Throughput::Bytes(state_bytes as u64));
+        group.bench_function(
+            BenchmarkId::new("save", humanize_bytes(state_bytes)),
+            |bencher| {
+                bencher.iter(|| {
+                    let manifest = checkpoint_manifest(id, 5, &payload);
+                    runtime
+                        .block_on(store.save_checkpoint(&manifest, std::slice::from_ref(&payload)))
+                        .unwrap();
+                    id += 1;
+                })
+            },
+        );
+    }
     group.finish();
 }
 
 fn humanize_bytes(bytes: usize) -> String {
-    if bytes >= 1_073_741_824 {
-        format!("{}GB", bytes / 1_073_741_824)
-    } else if bytes >= 1_048_576 {
+    if bytes >= 1_048_576 {
         format!("{}MB", bytes / 1_048_576)
     } else if bytes >= 1_024 {
         format!("{}KB", bytes / 1_024)
@@ -173,8 +164,8 @@ fn humanize_bytes(bytes: usize) -> String {
 
 criterion_group!(
     benches,
-    bench_recovery_manifest_only,
-    bench_recovery_with_sidecar,
+    bench_exact_manifest_load,
+    bench_verified_state_range_read,
     bench_checkpoint_save,
 );
 criterion_main!(benches);

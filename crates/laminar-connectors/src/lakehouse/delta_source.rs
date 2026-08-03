@@ -782,7 +782,7 @@ mod tests {
                 SourceStart::new(
                     ConnectorConfig::new("delta-lake"),
                     SourcePosition::Resume {
-                        attempt: laminar_core::state::CheckpointAttempt::canonical(11),
+                        attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(11),
                         checkpoint: SourceCheckpoint::new(),
                     },
                     crate::connector::DeliveryGuarantee::BestEffort,

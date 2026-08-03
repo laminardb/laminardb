@@ -399,7 +399,7 @@ mod tests {
     ) -> crate::checkpoint_timing::CheckpointBarrierTimingObservation {
         crate::checkpoint_timing::CheckpointBarrierTimingObservation {
             process,
-            attempt: laminar_core::state::CheckpointAttempt::canonical(checkpoint_id),
+            attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(checkpoint_id),
             role: crate::checkpoint_timing::CheckpointBarrierRole::Follower,
             assignment_version: 3,
             assignment_digest: [9; 32],

@@ -2856,28 +2856,13 @@ async fn supersede_test_process_lease(
     successor
 }
 
-fn prepared_witness(checkpoint_id: u64, participant_id: u64) -> PreparedCheckpointWitness {
-    PreparedCheckpointWitness::new(
-        CheckpointAttempt::canonical(checkpoint_id),
-        participant_id,
-        Uuid::from_u128(500).to_string(),
-        crate::checkpoint::PipelineIdentity::empty(),
-    )
-    .unwrap()
-}
-
-fn stopped_report(
-    controller: &ClusterController,
-    round: &RecoveryRound,
-    prepared_witnesses: Vec<PreparedCheckpointWitness>,
-) -> RecoveryStoppedReport {
+fn stopped_report(controller: &ClusterController, round: &RecoveryRound) -> RecoveryStoppedReport {
     RecoveryStoppedReport::new(
         round,
         CheckpointParticipant {
             node_id: controller.instance_id().0,
             boot_incarnation: controller.recovery_incarnation(),
         },
-        prepared_witnesses,
     )
     .unwrap()
 }
@@ -4102,10 +4087,7 @@ async fn stopped_report_point_reads_ignore_outsiders_and_admit_evidence_publishe
         boot_incarnation: controller.recovery_incarnation(),
     };
     let round = recovery_round_with_evidence(&controller, 41, &proof, &[1], vec![evidence]);
-    controller
-        .announce_stopped(&round, vec![prepared_witness(42, evidence_node.0)])
-        .await
-        .unwrap();
+    controller.announce_stopped(&round).await.unwrap();
     kv.seed(
         NodeId(99),
         RECOVERY_STOPPED_REPORT_KEY,
@@ -4139,7 +4121,7 @@ async fn stopped_report_point_reads_ignore_outsiders_and_admit_evidence_publishe
 }
 
 #[tokio::test]
-async fn stopped_report_announcement_reads_back_exact_publisher_and_inventory() {
+async fn stopped_report_announcement_reads_back_exact_publisher() {
     let node = NodeId(1);
     let kv = Arc::new(InMemoryKv::new(node));
     let (_members_tx, members_rx) = watch::channel(Vec::new());
@@ -4147,18 +4129,13 @@ async fn stopped_report_announcement_reads_back_exact_publisher_and_inventory() 
     controller.publish_recovery_incarnation().await.unwrap();
     let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
     let round = recovery_round(&controller, 41, &proof, &[1]);
-    let witnesses = vec![prepared_witness(42, 1)];
-
-    controller
-        .announce_stopped(&round, witnesses.clone())
-        .await
-        .unwrap();
+    controller.announce_stopped(&round).await.unwrap();
     assert_eq!(
         controller
             .read_stopped(&round, &round.stopped_participants())
             .await
             .unwrap(),
-        vec![stopped_report(&controller, &round, witnesses)]
+        vec![stopped_report(&controller, &round)]
     );
 }
 
@@ -4173,7 +4150,7 @@ async fn stopped_report_point_reads_require_an_adopted_newer_generation() {
     let current_round = recovery_round(&controller, 41, &proof, &[1]);
     let newer_round = recovery_round(&controller, 42, &proof, &[1]);
 
-    let old = stopped_report(&controller, &old_round, Vec::new());
+    let old = stopped_report(&controller, &old_round);
     kv.seed(
         node,
         RECOVERY_STOPPED_REPORT_KEY,
@@ -4185,7 +4162,7 @@ async fn stopped_report_point_reads_require_an_adopted_newer_generation() {
         .unwrap()
         .is_empty());
 
-    let newer = stopped_report(&controller, &newer_round, Vec::new());
+    let newer = stopped_report(&controller, &newer_round);
     kv.seed(
         node,
         RECOVERY_STOPPED_REPORT_KEY,
@@ -4211,21 +4188,21 @@ async fn stopped_report_point_reads_require_an_adopted_newer_generation() {
 }
 
 #[test]
-fn stopped_report_wire_round_trips_empty_and_bounded_inventory() {
+fn stopped_report_wire_round_trips_compact_round_identity() {
     let controller = ctl(1, Vec::new());
     let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
     let round = recovery_round(&controller, 41, &proof, &[1]);
 
-    let empty = stopped_report(&controller, &round, Vec::new());
-    let raw = encode_recovery_stopped_report(&empty, &round).unwrap();
+    let report = stopped_report(&controller, &round);
+    let raw = encode_recovery_stopped_report(&report, &round).unwrap();
     assert!(
         raw.len() < 512,
-        "compact empty stopped report was {} bytes",
+        "compact stopped report was {} bytes",
         raw.len()
     );
     assert_eq!(
         parse_recovery_stopped_report(&raw, NodeId(1), &round).unwrap(),
-        empty
+        report
     );
     let mut divergent_round = round.clone();
     divergent_round.faults[0].sequence += 1;
@@ -4233,19 +4210,10 @@ fn stopped_report_wire_round_trips_empty_and_bounded_inventory() {
     let error = parse_recovery_stopped_report(&raw, NodeId(1), &divergent_round).unwrap_err();
     assert!(error.contains("exact frozen round"), "{error}");
 
-    let witnesses = (1..=MAX_PREPARED_CHECKPOINT_WITNESSES as u64)
-        .map(|attempt| prepared_witness(attempt, 1))
-        .collect();
-    let full = stopped_report(&controller, &round, witnesses);
-    let raw = encode_recovery_stopped_report(&full, &round).unwrap();
     assert!(raw.len() <= MAX_RECOVERY_STOPPED_REPORT_BYTES);
     assert!(!raw.contains("assignment_fence"));
     assert!(!raw.contains("evidence_participants"));
     assert!(!raw.contains("faults"));
-    assert_eq!(
-        parse_recovery_stopped_report(&raw, NodeId(1), &round).unwrap(),
-        full
-    );
 }
 
 #[test]
@@ -4253,7 +4221,7 @@ fn stopped_report_rejects_stale_boot_and_wrong_slot_publisher() {
     let controller = ctl(1, Vec::new());
     let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
     let round = recovery_round(&controller, 41, &proof, &[1]);
-    let report = stopped_report(&controller, &round, Vec::new());
+    let report = stopped_report(&controller, &round);
 
     let raw = encode_recovery_stopped_report(&report, &round).unwrap();
     let error = parse_recovery_stopped_report(&raw, NodeId(2), &round).unwrap_err();
@@ -4267,66 +4235,11 @@ fn stopped_report_rejects_stale_boot_and_wrong_slot_publisher() {
 }
 
 #[test]
-fn stopped_report_rejects_unsorted_duplicate_and_excess_inventory() {
-    let controller = ctl(1, Vec::new());
-    let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
-    let round = recovery_round(&controller, 41, &proof, &[1]);
-
-    let error = RecoveryStoppedReport::new(
-        &round,
-        CheckpointParticipant {
-            node_id: 1,
-            boot_incarnation: controller.recovery_incarnation(),
-        },
-        vec![prepared_witness(1, 2)],
-    )
-    .unwrap_err();
-    assert!(error.contains("does not match report publisher"), "{error}");
-
-    let error = RecoveryStoppedReport::new(
-        &round,
-        CheckpointParticipant {
-            node_id: 1,
-            boot_incarnation: controller.recovery_incarnation(),
-        },
-        vec![prepared_witness(2, 1), prepared_witness(1, 1)],
-    )
-    .unwrap_err();
-    assert!(error.contains("uniquely sorted"), "{error}");
-
-    let duplicate = prepared_witness(1, 1);
-    let error = RecoveryStoppedReport::new(
-        &round,
-        CheckpointParticipant {
-            node_id: 1,
-            boot_incarnation: controller.recovery_incarnation(),
-        },
-        vec![duplicate.clone(), duplicate],
-    )
-    .unwrap_err();
-    assert!(error.contains("uniquely sorted"), "{error}");
-
-    let witnesses = (1..=(MAX_PREPARED_CHECKPOINT_WITNESSES + 1) as u64)
-        .map(|attempt| prepared_witness(attempt, 1))
-        .collect();
-    let error = RecoveryStoppedReport::new(
-        &round,
-        CheckpointParticipant {
-            node_id: 1,
-            boot_incarnation: controller.recovery_incarnation(),
-        },
-        witnesses,
-    )
-    .unwrap_err();
-    assert!(error.contains("prepared witnesses; maximum"), "{error}");
-}
-
-#[test]
 fn stopped_report_wire_rejects_oversize_and_unknown_fields() {
     let controller = ctl(1, Vec::new());
     let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
     let round = recovery_round(&controller, 41, &proof, &[1]);
-    let report = stopped_report(&controller, &round, Vec::new());
+    let report = stopped_report(&controller, &round);
     let raw = encode_recovery_stopped_report(&report, &round).unwrap();
 
     let oversize = format!(
@@ -4343,7 +4256,7 @@ fn stopped_report_wire_rejects_oversize_and_unknown_fields() {
     assert!(error.contains("unknown field"), "{error}");
 
     let unsupported_round = recovery_round(&controller, 42, &proof, &[1]);
-    let mut unsupported = stopped_report(&controller, &unsupported_round, Vec::new());
+    let mut unsupported = stopped_report(&controller, &unsupported_round);
     unsupported.protocol_version = RECOVERY_STOPPED_REPORT_PROTOCOL_VERSION + 1;
     let raw = serde_json::to_string(&unsupported).unwrap();
     let error = parse_recovery_stopped_report(&raw, NodeId(1), &unsupported_round).unwrap_err();
@@ -4367,9 +4280,6 @@ async fn superseded_same_id_process_cannot_ack_an_old_round() {
     let replacement = ClusterController::new(node, kv, None, new_rx);
     replacement.publish_recovery_incarnation().await.unwrap();
 
-    let error = old
-        .announce_stopped(&old_round, Vec::new())
-        .await
-        .unwrap_err();
+    let error = old.announce_stopped(&old_round).await.unwrap_err();
     assert!(error.contains("superseded local process"), "{error}");
 }

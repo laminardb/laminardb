@@ -27,10 +27,10 @@ use laminar_connectors::error::ConnectorError;
 use laminar_core::checkpoint::{
     AssignmentDrainId, AssignmentDrainTransition, CheckpointParticipant,
 };
+use laminar_core::checkpoint::{CheckpointAttempt, CheckpointAttemptRelation};
 use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 #[cfg(feature = "cluster")]
 use laminar_core::cluster::control::ClusterController;
-use laminar_core::state::{CheckpointAttempt, CheckpointAttemptRelation};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::callback::{
@@ -1148,8 +1148,6 @@ pub struct StreamingCoordinator {
     /// Last durable completion published to sources/subscribers in this runtime. This is a
     /// defense-in-depth monotonic fence in addition to serialized tail admission.
     last_published_checkpoint: Option<CheckpointAttempt>,
-    /// Shared exact external-commit bound, checked before ID reservation/barrier injection.
-    coordinated_commit_admission: Option<crate::checkpoint_coordinator::CoordinatedCommitAdmission>,
     #[cfg(feature = "cluster")]
     process_authority: Option<Arc<SourceProcessAuthority>>,
     public_generation: Option<StreamingCoordinatorGeneration>,
@@ -1157,7 +1155,6 @@ pub struct StreamingCoordinator {
 
 struct CoordinatorRunState {
     batch_window: Duration,
-    coordinated_commit_progress: Option<Arc<tokio::sync::Notify>>,
     checkpoint_control_wake: Option<CheckpointControlWake>,
     checkpoint_control_poll_at: tokio::time::Instant,
     checkpoint_control_pending: bool,
@@ -1178,7 +1175,6 @@ struct CoordinatorWake {
 #[derive(Default)]
 struct CoordinatorGates {
     intake_paused: bool,
-    external_commit_paused: bool,
 }
 
 enum CoordinatorWaitAction {
@@ -1372,23 +1368,6 @@ const SHUTDOWN_COMPLETION_TICK: Duration = Duration::from_millis(10);
 /// tasks are cancelled before sources or sinks are torn down; exact attempt namespaces leave any
 /// ambiguous remote write safe for recovery.
 const SHUTDOWN_CHECKPOINT_TAIL_TIMEOUT: Duration = Duration::from_secs(8);
-
-/// Graceful stop gives already-sealed checkpoints one bounded opportunity to
-/// reach coordinated external sinks. Timeout leaves durable markers for replay.
-const COORDINATED_COMMIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-
-fn warn_external_commit_cap_throttled(known: bool, pending: u64, cap: u64) {
-    static THROTTLE: crate::log_throttle::LogThrottle =
-        crate::log_throttle::LogThrottle::every(Duration::from_secs(10));
-    if THROTTLE.allow() {
-        tracing::warn!(
-            lag_known = known,
-            pending_external_checkpoints = pending,
-            cap,
-            "checkpoint admission paused at coordinated external-commit bound"
-        );
-    }
-}
 
 fn try_source_checkpoint(
     connector: &dyn SourceConnector,
@@ -4216,7 +4195,6 @@ impl StreamingCoordinator {
             manual_active: None,
             checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
             last_published_checkpoint: None,
-            coordinated_commit_admission: None,
             public_generation: None,
             #[cfg(feature = "cluster")]
             process_authority: source_process_authority,
@@ -4226,14 +4204,6 @@ impl StreamingCoordinator {
     /// Wire in the callback's admission counter so the coordinator gates new barriers.
     pub(crate) fn with_checkpoint_admission(mut self, in_flight: Arc<AtomicU64>) -> Self {
         self.checkpoint_in_flight = in_flight;
-        self
-    }
-
-    pub(crate) fn with_coordinated_commit_admission(
-        mut self,
-        admission: Option<crate::checkpoint_coordinator::CoordinatedCommitAdmission>,
-    ) -> Self {
-        self.coordinated_commit_admission = admission;
         self
     }
 
@@ -4623,15 +4593,9 @@ impl StreamingCoordinator {
         if intake_paused || self.replay_pending {
             let _ = callback.is_recovering();
         }
-        let external_commit_paused = self
-            .coordinated_commit_admission
-            .as_ref()
-            .is_some_and(|admission| !admission.can_admit());
-        let replay_ready = self.replay_pending && !external_commit_paused && !intake_paused;
-        let parked_ready = !self.replay_pending
-            && !external_commit_paused
-            && !intake_paused
-            && self.parked_source_msg.is_some();
+        let replay_ready = self.replay_pending && !intake_paused;
+        let parked_ready =
+            !self.replay_pending && !intake_paused && self.parked_source_msg.is_some();
         let mut retrying_replay = false;
         let mut checkpoint_control_due = false;
 
@@ -4705,16 +4669,9 @@ impl StreamingCoordinator {
                 retrying_replay = true;
                 None
             },
-            () = async {
-                if let Some(notify) = state.coordinated_commit_progress.as_ref() {
-                    notify.notified().await;
-                } else {
-                    futures::future::pending::<()>().await;
-                }
-            } => None,
             () = std::future::ready(()), if parked_ready => self.parked_source_msg.take(),
             msg = self.rx.recv(),
-                if state.source_channel_expected && !external_commit_paused && !intake_paused =>
+                if state.source_channel_expected && !intake_paused =>
             {
                 if let Ok(message) = msg {
                     if !state.batch_window.is_zero() {
@@ -4755,10 +4712,7 @@ impl StreamingCoordinator {
             message,
             retrying_replay,
             checkpoint_control_due,
-            gates: CoordinatorGates {
-                intake_paused,
-                external_commit_paused,
-            },
+            gates: CoordinatorGates { intake_paused },
         })
     }
 
@@ -4915,10 +4869,6 @@ impl StreamingCoordinator {
 
         let mut state = CoordinatorRunState {
             batch_window: self.config.batch_window,
-            coordinated_commit_progress: self
-                .coordinated_commit_admission
-                .as_ref()
-                .map(crate::checkpoint_coordinator::CoordinatedCommitAdmission::progress_notify),
             checkpoint_control_wake: callback.checkpoint_control_wake(),
             checkpoint_control_poll_at: tokio::time::Instant::now(),
             checkpoint_control_pending: false,
@@ -4942,17 +4892,8 @@ impl StreamingCoordinator {
                 message: msg,
                 retrying_replay,
                 checkpoint_control_due,
-                gates:
-                    CoordinatorGates {
-                        intake_paused,
-                        external_commit_paused,
-                    },
+                gates: CoordinatorGates { intake_paused },
             } = wait.wake;
-            // A progress wake is edge-triggered; recompute the gate on the next loop before
-            // touching deferred/open-epoch data. Completion branches above already `continue`.
-            if external_commit_paused && msg.is_none() {
-                continue;
-            }
             // Recheck after the await: recovery may have closed the gate after this loop removed
             // a message from the source FIFO. Keep that message ahead of later FIFO entries so a
             // transient close/reopen cannot silently lose it. A fenced shutdown still discards
@@ -5390,20 +5331,6 @@ impl StreamingCoordinator {
             }
         }
 
-        // Captured tails are settled and no more checkpoints can be admitted. Keep sink actors
-        // open while the designated committer publishes every already-sealed exact cut. Open-
-        // epoch rows above are intentionally excluded and replay after restart.
-        if fault.is_none() {
-            if let Err(error) = self.drain_coordinated_commits().await {
-                if callback.fault_on_cycle_error() {
-                    fault = Some(error);
-                } else {
-                    callback.note_cycle_error();
-                    tracing::warn!(%error, "coordinated commit drain failed during shutdown");
-                }
-            }
-        }
-
         // Resolve the durable open-epoch witness before close terminates the actor that owns its
         // rollback. On failure, keep actors live: lifecycle teardown retains their stable handles
         // and retries settlement before issuing close.
@@ -5454,42 +5381,6 @@ impl StreamingCoordinator {
         callback.invalidate_subscriptions(reason);
         exit
     }
-    async fn drain_coordinated_commits(&mut self) -> Result<(), String> {
-        let Some(admission) = self.coordinated_commit_admission.as_ref() else {
-            return Ok(());
-        };
-        let deadline = Instant::now() + COORDINATED_COMMIT_SHUTDOWN_TIMEOUT;
-        loop {
-            let (known, pending, _) = admission.state();
-            if known && pending == 0 {
-                return Ok(());
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(format!(
-                    "coordinated external commit drain timed out after \
-                     {COORDINATED_COMMIT_SHUTDOWN_TIMEOUT:?} (lag_known={known}, \
-                     pending={pending}); durable markers remain for recovery"
-                ));
-            }
-            let progress = admission.progress_notify();
-            let notified = progress.notified();
-            tokio::pin!(notified);
-            admission.wake_committer();
-            if tokio::time::timeout(remaining, &mut notified)
-                .await
-                .is_err()
-            {
-                let (known, pending, _) = admission.state();
-                return Err(format!(
-                    "coordinated external commit drain timed out after \
-                     {COORDINATED_COMMIT_SHUTDOWN_TIMEOUT:?} (lag_known={known}, \
-                     pending={pending}); durable markers remain for recovery"
-                ));
-            }
-        }
-    }
-
     fn stage_batch(
         &mut self,
         source_idx: usize,
@@ -6112,13 +6003,6 @@ impl StreamingCoordinator {
         };
         if !self.checkpoint_capacity_available() {
             return None;
-        }
-        if let Some(admission) = &self.coordinated_commit_admission {
-            if !admission.can_admit() {
-                let (known, pending, cap) = admission.state();
-                warn_external_commit_cap_throttled(known, pending, cap);
-                return None;
-            }
         }
         Some(CheckpointAdmission {
             manual,

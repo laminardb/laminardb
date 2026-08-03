@@ -8,7 +8,9 @@
 
 LaminarDB keeps authoritative working state in concrete per-vnode `FxHashMap` layouts. Vnodes are
 the unit of routing, ownership, checkpointing, restore, and rescale for joins, aggregations,
-windows, sessions, timers, temporal history, and materialized views.
+windows, sessions, timers, temporal history, and materialized views. Keyed aggregates and supported
+interval joins implement this layout now. Remaining whole-node materialized-view and reference
+frames must be converted before their cluster plans can be admitted.
 
 Embedded and single-node deployments use one node that owns every vnode and routes shuffles over
 local channels. Cluster deployments run the same stateful operators with vnodes spread across nodes.
@@ -18,17 +20,21 @@ tier, or runtime selector.
 The only durability mechanism is a checkpoint written through the `object_store` crate. Each node
 concatenates its dirty-vnode chunks into one checkpoint data object. The manifest indexes every
 vnode by byte range and records the state required for exact recovery: window panes and open
-windows, sessions, aggregate accumulators, join buffers and ASOF history, channel watermarks, idle
-flags, timers, and source offsets.
+windows, sessions, aggregate accumulators, bounded join buffers, versioned reference-table history,
+channel watermarks, idle flags, timers, and source offsets. Any future ASOF execution must use the
+same vnode frames and include its retained history.
 
-Recovery restores the latest committed checkpoint and replays sources from its offsets. Range GETs
-load only the vnodes assigned to the recovering node. Chunk reference counts in committed manifests
-drive garbage collection; object listing is never used to infer references.
+Node data is created before its immutable manifest; the manifest is created last as the participant
+readiness marker. Recovery restores the latest committed checkpoint and replays sources from its
+offsets. Range GETs load only the vnodes assigned to the recovering node. The retained live prefix
+is bounded, while current garbage collection follows predecessor indices to genesis to enumerate
+expired cuts. Validated manifest chunk counts and frame references drive deletion; object listing
+is never used to infer references.
 
 Checkpoint configuration is a provider-neutral URL. S3, GCS, Azure Blob, S3-compatible R2 and
 MinIO, and local filesystem storage use the same `object_store` path. LaminarDB does not add
-provider-specific retry, backoff, multipart, or CAS implementations. Manifest publication uses a
-conditional put, and startup fails unless a capability probe proves that the configured store
+provider-specific retry, backoff, multipart, or CAS implementations. Manifest-last publication uses
+a conditional create, and startup fails unless a capability probe proves that the configured store
 honors it.
 
 At-least-once and exactly-once use identical operator state. Their difference is the composition of
@@ -52,6 +58,7 @@ source replay, checkpoint publication, and sink commit contracts.
 - Record-path state lookup remains an in-memory hash lookup with no storage I/O.
 - Object-store PUT count scales with node count and checkpoint frequency, not vnode count.
 - One vnode representation serves local execution, cluster execution, and rescaling.
+- Operators that have not adopted vnode ownership remain unavailable in cluster mode.
 - State larger than available memory is an explicit admission or capacity failure, not a silent
   spill or alternate execution mode.
 - A committed checkpoint plus replayable source offsets is the complete recovery authority.

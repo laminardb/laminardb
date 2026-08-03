@@ -327,7 +327,7 @@ async fn checkpoint_restore(brokers: &str) {
             SourceStart::new(
                 connector_cfg.clone(),
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
                     checkpoint: before_first_record,
                 },
                 DeliveryGuarantee::AtLeastOnce,
@@ -354,7 +354,7 @@ async fn checkpoint_restore(brokers: &str) {
             SourceStart::new(
                 connector_cfg,
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
                     checkpoint: checkpoint.clone(),
                 },
                 DeliveryGuarantee::AtLeastOnce,
@@ -387,7 +387,7 @@ async fn checkpoint_restore(brokers: &str) {
             SourceStart::new(
                 ConnectorConfig::new("kafka"),
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
                     checkpoint,
                 },
                 DeliveryGuarantee::AtLeastOnce,

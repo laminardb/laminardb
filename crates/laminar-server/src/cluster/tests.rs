@@ -503,16 +503,10 @@ async fn dropping_cluster_handle_fences_authority_and_aborts_owned_tasks() {
         &[participant],
         Arc::clone(&control),
         Arc::clone(&store),
-        Arc::clone(&store),
         std::time::Duration::from_secs(1),
     )
     .await
     .unwrap();
-    let state_backend = cluster_state_backend(
-        verified_namespaces.state_store(),
-        node,
-        laminar_core::state::KeyGroupCount::try_from(1_u16).unwrap(),
-    );
     let vnode_registry = Arc::new(laminar_core::state::VnodeRegistry::new(1));
     let (_members_tx, members_rx) = watch::channel(Vec::new());
     let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
@@ -530,7 +524,6 @@ async fn dropping_cluster_handle_fences_authority_and_aborts_owned_tasks() {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .verified_cluster_namespaces(verified_namespaces)
-        .state_backend(state_backend)
         .vnode_registry(vnode_registry)
         .build()
         .await
@@ -664,16 +657,10 @@ async fn process_lease_loss_revokes_http_controller_and_database_authority() {
         &[participant],
         Arc::clone(&control),
         Arc::clone(&store),
-        Arc::clone(&store),
         std::time::Duration::from_secs(1),
     )
     .await
     .unwrap();
-    let state_backend = cluster_state_backend(
-        verified_namespaces.state_store(),
-        node,
-        laminar_core::state::KeyGroupCount::try_from(1_u16).unwrap(),
-    );
     let vnode_registry = Arc::new(laminar_core::state::VnodeRegistry::new(1));
     let (_members_tx, members_rx) = watch::channel(Vec::new());
     let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
@@ -702,7 +689,6 @@ async fn process_lease_loss_revokes_http_controller_and_database_authority() {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .verified_cluster_namespaces(verified_namespaces)
-        .state_backend(state_backend)
         .vnode_registry(vnode_registry)
         .build()
         .await
@@ -816,43 +802,6 @@ async fn occupied_http_port_fails_before_local_cluster_activation() {
     };
     assert!(matches!(error, ClusterStartupError::HttpStartup(_)));
     assert!(!controller.live_instances().contains(&node));
-}
-
-#[tokio::test]
-async fn cluster_state_seal_records_runtime_node_id() {
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-    let node_id = NodeId(73);
-    let backend = cluster_state_backend(
-        Arc::clone(&store),
-        node_id,
-        laminar_core::state::KeyGroupCount::try_from(1_u16).unwrap(),
-    );
-    let attempt = laminar_core::state::CheckpointAttempt::canonical(17);
-    let payload = bytes::Bytes::from_static(b"state");
-
-    backend
-        .write_partial(
-            attempt,
-            0,
-            0,
-            laminar_core::state::VnodePartialLineage::root(payload.len() as u64),
-            payload,
-        )
-        .await
-        .unwrap();
-    assert!(backend
-        .seal_checkpoint(attempt, None, &[0], &[])
-        .await
-        .unwrap());
-
-    let path = object_store::path::Path::from(format!(
-        "state-v2/epoch={}/checkpoint={}/_SEAL",
-        attempt.epoch, attempt.checkpoint_id
-    ));
-    let bytes = store.get(&path).await.unwrap().bytes().await.unwrap();
-    let seal: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let expected = node_id.to_string();
-    assert_eq!(seal["instance_id"].as_str(), Some(expected.as_str()));
 }
 
 #[tokio::test]

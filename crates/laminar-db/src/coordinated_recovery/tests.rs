@@ -656,7 +656,7 @@ async fn fault_after_release_commit_is_preserved_for_the_next_round() {
 
 #[tokio::test]
 async fn evidence_only_worker_consumes_tombstoned_release_after_stopped_quorum() {
-    use laminar_core::state::{NodeId as StateNodeId, ObjectStoreBackend, VnodeRegistry};
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
 
     let self_id = NodeId(2);
     let kv = Arc::new(InMemoryKv::new(self_id));
@@ -721,11 +721,6 @@ async fn evidence_only_worker_consumes_tombstoned_release_after_stopped_quorum()
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
-        .state_backend(Arc::new(ObjectStoreBackend::cluster_shared(
-            Arc::new(object_store::memory::InMemory::new()),
-            "idle-worker",
-            1,
-        )))
         .vnode_registry(registry)
         .build()
         .await
@@ -774,7 +769,7 @@ async fn evidence_only_worker_consumes_tombstoned_release_after_stopped_quorum()
         controller.recovery_incarnation().to_string(),
     );
     driver.announce_recover_prepare(&round).await.unwrap();
-    driver.announce_stopped(&round, Vec::new()).await.unwrap();
+    driver.announce_stopped(&round).await.unwrap();
     let prepare = RecoveryAnnouncement {
         round: round.clone(),
         phase: RecoverPhase::Prepare,
@@ -807,8 +802,7 @@ async fn evidence_only_worker_consumes_tombstoned_release_after_stopped_quorum()
         &[idle_fault]
     );
 
-    let evidence_stopped =
-        RecoveryStoppedReport::new(&round, evidence_participant, Vec::new()).unwrap();
+    let evidence_stopped = RecoveryStoppedReport::new(&round, evidence_participant).unwrap();
     driver_kv.seed(
         self_id,
         "control:recovery-stopped",
@@ -992,7 +986,7 @@ async fn coordinated_restart_requires_a_committed_assignment_head() {
 
 #[tokio::test]
 async fn recovery_assignment_admission_requires_the_exact_committed_head() {
-    use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
 
     let (controller, _members_tx, kv) = controller(vec![info(2)]).await;
     let controller = Arc::new(controller);
@@ -1008,7 +1002,6 @@ async fn recovery_assignment_admission_requires_the_exact_committed_head() {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
-        .state_backend(Arc::new(InProcessBackend::new(2)))
         .vnode_registry(registry)
         .assignment_snapshot_store(Arc::clone(&assignments))
         .build()
@@ -1138,7 +1131,7 @@ async fn recovery_assignment_admission_requires_the_exact_committed_head() {
 #[tokio::test]
 async fn recovery_start_repairs_suspended_shuffle_authority_without_opening_intake() {
     use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
-    use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
 
     let (controller, _members_tx, kv) = controller(Vec::new()).await;
     let controller = Arc::new(controller);
@@ -1157,7 +1150,6 @@ async fn recovery_start_repairs_suspended_shuffle_authority_without_opening_inta
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(registry)
         .assignment_snapshot_store(Arc::clone(&assignments))
         .shuffle_sender(Arc::clone(&sender))
@@ -1257,7 +1249,7 @@ async fn recovery_start_repairs_suspended_shuffle_authority_without_opening_inta
 
 #[tokio::test]
 async fn suspended_leader_retains_prepare_from_the_exact_durable_head() {
-    use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
 
     let (controller, _members_tx, kv) = controller(Vec::new()).await;
     let controller = Arc::new(controller);
@@ -1268,7 +1260,6 @@ async fn suspended_leader_retains_prepare_from_the_exact_durable_head() {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, StateNodeId(1))))
         .assignment_snapshot_store(assignments)
         .build()
@@ -1288,7 +1279,7 @@ async fn suspended_leader_retains_prepare_from_the_exact_durable_head() {
 
 #[tokio::test]
 async fn rejected_committed_release_does_not_starve_a_successor_prepare() {
-    use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
 
     let backing: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
@@ -1355,7 +1346,6 @@ async fn rejected_committed_release_does_not_starve_a_successor_prepare() {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(Arc::clone(&backing))
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(registry)
         .assignment_snapshot_store(assignments)
         .build()
@@ -1475,7 +1465,7 @@ async fn different_start_target_never_satisfies_restore_quorum() {
 
 #[tokio::test]
 async fn an_exact_active_start_is_not_misclassified_as_an_orphan() {
-    use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
 
     let (controller, _members_tx, kv) = controller(Vec::new()).await;
     let controller = Arc::new(controller);
@@ -1487,7 +1477,6 @@ async fn an_exact_active_start_is_not_misclassified_as_an_orphan() {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(registry)
         .build()
         .await
@@ -1538,10 +1527,7 @@ async fn prepare_quorum_fails_when_its_assignment_certificate_changes() {
     let round = round_for_current_faults(&controller, 7, &[1, 2]).await;
     publish_round_roster(&controller, &kv, &round).await;
     controller.announce_recover_prepare(&round).await.unwrap();
-    controller
-        .announce_stopped(&round, Vec::new())
-        .await
-        .unwrap();
+    controller.announce_stopped(&round).await.unwrap();
     members_tx.send(Vec::new()).unwrap();
 
     let outcome = wait_stopped_quorum(&controller, &round, Duration::from_secs(1)).await;
@@ -1556,10 +1542,7 @@ async fn prepare_quorum_rejects_a_divergent_published_assignment() {
     let round = round_for_current_faults(&controller, 7, &[1]).await;
     publish_round_roster(&controller, &kv, &round).await;
     controller.announce_recover_prepare(&round).await.unwrap();
-    controller
-        .announce_stopped(&round, Vec::new())
-        .await
-        .unwrap();
+    controller.announce_stopped(&round).await.unwrap();
     let divergent = CheckpointAssignmentFence::from_owner_map(
         round.assignment_fence.assignment_version + 1,
         &[1],
@@ -1580,10 +1563,7 @@ async fn missing_prepare_participant_obeys_the_hard_quorum_deadline() {
     let round = round_for_current_faults(&controller, 7, &[1, 2]).await;
     publish_round_roster(&controller, &kv, &round).await;
     controller.announce_recover_prepare(&round).await.unwrap();
-    controller
-        .announce_stopped(&round, Vec::new())
-        .await
-        .unwrap();
+    controller.announce_stopped(&round).await.unwrap();
 
     let started = std::time::Instant::now();
     let outcome = wait_stopped_quorum(&controller, &round, Duration::from_millis(25)).await;
@@ -1627,11 +1607,8 @@ async fn stopped_quorum_includes_non_owner_evidence_reporters() {
         evidence.boot_incarnation.to_string(),
     );
     controller.announce_recover_prepare(&round).await.unwrap();
-    controller
-        .announce_stopped(&round, Vec::new())
-        .await
-        .unwrap();
-    let peer = RecoveryStoppedReport::new(&round, evidence, Vec::new()).unwrap();
+    controller.announce_stopped(&round).await.unwrap();
+    let peer = RecoveryStoppedReport::new(&round, evidence).unwrap();
     kv.seed(
         NodeId(2),
         "control:recovery-stopped",
@@ -1688,155 +1665,79 @@ async fn prepare_rejects_an_omitted_available_evidence_reporter() {
 }
 
 #[tokio::test]
-async fn checkpoint_disabled_empty_stopped_inventory_needs_no_coordinator() {
-    let (controller, _members_tx, kv) = controller(Vec::new()).await;
-    report_test_fault(&controller).await;
-    let round = round_for_current_faults(&controller, 8, &[1]).await;
-    publish_round_roster(&controller, &kv, &round).await;
-    controller.announce_recover_prepare(&round).await.unwrap();
-    let report = RecoveryStoppedReport::new(
-        &round,
-        CheckpointParticipant {
+async fn recovery_target_is_the_exact_commit_and_global_index() {
+    use laminar_core::checkpoint::{
+        CheckpointScope, CommittedCheckpointIndex, CommittedParticipantRef, PipelineIdentity,
+        COMMITTED_CHECKPOINT_INDEX_VERSION,
+    };
+    use laminar_core::checkpoint_decision::{
+        CheckpointDecisionStore, CheckpointVerdict, RecordOutcomeResult,
+    };
+
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let decisions = CheckpointDecisionStore::new(Arc::clone(&backing));
+    let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+    let (controller, _members_tx, _kv) = controller_on(Vec::new(), backing).await;
+    let controller = Arc::new(controller);
+    let fence = CheckpointAssignmentFence::from_owner_map(
+        7,
+        &[1],
+        vec![CheckpointParticipant {
             node_id: 1,
             boot_incarnation: controller.recovery_incarnation(),
-        },
-        Vec::new(),
+        }],
     )
     .unwrap();
-    let db = Arc::new(LaminarDB::open().unwrap());
-    assert!(db.coordinator.lock().await.is_none());
-
-    settle_stopped_prepared_witnesses(&db, &controller, &round, &[report])
+    controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
+    let committed = CommittedCheckpointIndex {
+        version: COMMITTED_CHECKPOINT_INDEX_VERSION,
+        deployment_id,
+        pipeline_identity: PipelineIdentity::empty(),
+        epoch: 1,
+        checkpoint_id: 1,
+        scope: CheckpointScope::Cluster,
+        vnode_count: 1,
+        assignment_fence: Some(fence.clone()),
+        predecessor: None,
+        participants: vec![CommittedParticipantRef {
+            participant_id: 1,
+            manifest_len: 1,
+            manifest_sha256: "0".repeat(64),
+            node_data_len: 1,
+            node_data_sha256: "1".repeat(64),
+        }],
+        source_offsets: Default::default(),
+        channel_progress: Vec::new(),
+        checkpoint_watermark: None,
+    };
+    let authority = controller.checkpoint_authority().unwrap();
+    let reference = authority
+        .create_committed_checkpoint(&committed)
         .await
         .unwrap();
-}
-
-#[tokio::test]
-async fn ambiguity_audit_finds_an_outcome_that_becomes_visible_after_the_write_returns() {
-    let (controller, _members_tx, kv) = controller(Vec::new()).await;
-    report_test_fault(&controller).await;
-    let round = round_for_current_faults(&controller, 8, &[1]).await;
-    publish_round_roster(&controller, &kv, &round).await;
-    let authority = controller.checkpoint_authority().unwrap();
-    let attempt = CheckpointAttempt::new(60, 60);
-    let writer = {
-        let authority = Arc::clone(&authority);
-        let proof = round.leader_proof.clone();
-        let fence = round.assignment_fence.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            authority
-                .record_cluster_outcome(&proof, 60, 60, fence, CheckpointVerdict::Abort, None)
-                .await
-                .unwrap()
-        })
-    };
-
-    let outcome = audit_cluster_outcome_until(
-        authority.as_ref(),
-        attempt,
-        tokio::time::Instant::now() + Duration::from_millis(250),
-    )
-    .await
-    .unwrap();
-    assert_eq!(outcome.checkpoint_id, 60);
-    assert_eq!(outcome.verdict, CheckpointVerdict::Abort);
-    let durable = match writer.await.unwrap() {
-        RecordOutcomeResult::Created(outcome) | RecordOutcomeResult::Unchanged(outcome) => outcome,
-        RecordOutcomeResult::Conflict { winner } => winner,
-    };
-    validate_cluster_attempt_settlement(&outcome, attempt, &durable.deployment_id).unwrap();
-
-    let mut conflicting = outcome.clone();
-    conflicting.checkpoint_id += 1;
-    assert!(
-        validate_cluster_attempt_settlement(&conflicting, attempt, &durable.deployment_id)
-            .unwrap_err()
-            .contains("conflicts")
-    );
-
-    let mut foreign = outcome;
-    foreign.deployment_id.push_str("-foreign");
-    assert!(
-        validate_cluster_attempt_settlement(&foreign, attempt, &durable.deployment_id)
-            .unwrap_err()
-            .contains("foreign provenance")
-    );
-}
-
-#[tokio::test]
-async fn ambiguity_audit_fails_when_no_immutable_winner_appears() {
-    let (controller, _members_tx, _kv) = controller(Vec::new()).await;
-    let authority = controller.checkpoint_authority().unwrap();
-
-    let error = audit_cluster_outcome_until(
-        authority.as_ref(),
-        CheckpointAttempt::new(990, 990),
-        tokio::time::Instant::now() + Duration::from_millis(25),
-    )
-    .await
-    .unwrap_err();
-    assert!(error.contains("found no immutable outcome"), "{error}");
-}
-
-#[tokio::test]
-async fn ambiguity_audit_accepts_a_newer_dominator_after_exact_abort_compaction() {
-    let (controller, _members_tx, kv) = controller(Vec::new()).await;
-    report_test_fault(&controller).await;
-    let round = round_for_current_faults(&controller, 8, &[1]).await;
-    publish_round_roster(&controller, &kv, &round).await;
-    let authority = controller.checkpoint_authority().unwrap();
-    let attempt = CheckpointAttempt::new(10, 10);
-
-    // Model a create-once Abort whose successful write response was lost. Enough newer
-    // terminals then arrive to compact its exact record before reconciliation begins.
-    let first = authority
+    let durable = authority
         .record_cluster_outcome(
-            &round.leader_proof,
-            attempt.epoch,
-            attempt.checkpoint_id,
-            round.assignment_fence.clone(),
-            CheckpointVerdict::Abort,
-            None,
+            &controller.capture_leader_proof().unwrap(),
+            1,
+            1,
+            fence,
+            CheckpointVerdict::Commit,
+            Some(reference),
         )
         .await
         .unwrap();
-    let first = match first {
+    let durable = match durable {
         RecordOutcomeResult::Created(outcome) | RecordOutcomeResult::Unchanged(outcome) => outcome,
         RecordOutcomeResult::Conflict { winner } => winner,
     };
-    for sequence in 2..=80 {
-        let checkpoint_id = sequence * 10;
-        authority
-            .record_cluster_outcome(
-                &round.leader_proof,
-                checkpoint_id,
-                checkpoint_id,
-                round.assignment_fence.clone(),
-                CheckpointVerdict::Abort,
-                None,
-            )
-            .await
-            .unwrap();
-    }
-    assert!(authority
-        .cluster_outcome(attempt.epoch)
-        .await
-        .unwrap()
-        .is_none());
 
-    let settlement = audit_cluster_outcome_until(
-        authority.as_ref(),
-        attempt,
-        tokio::time::Instant::now() + Duration::from_millis(250),
-    )
-    .await
-    .unwrap();
-    validate_cluster_attempt_settlement(&settlement, attempt, &first.deployment_id).unwrap();
-    assert_eq!(
-        CheckpointAttempt::new(settlement.epoch, settlement.checkpoint_id).relation_to(attempt),
-        CheckpointAttemptRelation::Newer
-    );
+    let db = LaminarDB::open().unwrap();
+    *db.cluster_controller.lock() = Some(controller);
+    let (selected_outcome, selected_index) = read_committed_target(&db).await.unwrap().unwrap();
+
+    assert_eq!(selected_outcome, durable);
+    assert_eq!(selected_index, committed);
 }
 
 #[tokio::test]
@@ -1846,10 +1747,7 @@ async fn restarted_same_id_process_invalidates_persisted_stop_ack() {
     let round = round_for_current_faults(&controller, 9, &[1]).await;
     publish_round_roster(&controller, &kv, &round).await;
     controller.announce_recover_prepare(&round).await.unwrap();
-    controller
-        .announce_stopped(&round, Vec::new())
-        .await
-        .unwrap();
+    controller.announce_stopped(&round).await.unwrap();
 
     let (_replacement_tx, replacement_rx) = watch::channel(Vec::new());
     let replacement = ClusterController::new(NodeId(1), kv, None, replacement_rx);
@@ -1857,219 +1755,6 @@ async fn restarted_same_id_process_invalidates_persisted_stop_ack() {
 
     let outcome = wait_stopped_quorum(&controller, &round, Duration::from_secs(1)).await;
     assert_eq!(outcome, StoppedQuorum::ParticipantsChanged);
-}
-
-#[tokio::test]
-async fn takeover_settles_peer_only_prepare_and_fences_predecessor_commit() {
-    use crate::checkpoint_coordinator::{CheckpointConfig, CheckpointCoordinator};
-    use laminar_core::checkpoint::{PipelineIdentity, PreparedCheckpointWitness};
-    use laminar_core::checkpoint_decision::{
-        CheckpointDecisionStore, CheckpointVerdict, RecordOutcomeResult,
-    };
-    use laminar_core::cluster::control::ClusterCheckpointAuthorityError;
-    use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
-
-    let backing: Arc<dyn object_store::ObjectStore> =
-        Arc::new(object_store::memory::InMemory::new());
-    let decisions = Arc::new(CheckpointDecisionStore::new(Arc::clone(&backing)));
-    let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
-    let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&backing), 1));
-
-    let predecessor_boot = uuid::Uuid::from_u128(20);
-    let process_authority =
-        ProcessLeaseAuthority::new(Arc::clone(&backing), Duration::from_secs(60)).unwrap();
-    let ProcessLeaseOutcome::Acquired(predecessor_process_lease) = process_authority
-        .store_for(NodeId(2))
-        .try_acquire(predecessor_boot, 0)
-        .await
-        .unwrap()
-    else {
-        panic!("predecessor process must acquire its stable-node term");
-    };
-    let predecessor_owner = LeaderLeaseOwner {
-        node: NodeId(2),
-        boot: predecessor_boot,
-        process_term: predecessor_process_lease.term,
-    };
-    let LeaseOutcome::Acquired(predecessor_lease) = authority
-        .begin_new_term(&predecessor_owner, 0)
-        .await
-        .unwrap()
-    else {
-        panic!("predecessor must acquire the first term");
-    };
-
-    let self_id = NodeId(1);
-    let kv = Arc::new(InMemoryKv::new(self_id));
-    let (_members_tx, members_rx) = watch::channel(vec![info(2)]);
-    let controller = Arc::new(ClusterController::new(
-        self_id,
-        kv.clone(),
-        None,
-        members_rx,
-    ));
-    install_test_process_deadline(&controller);
-    let successor_process_term =
-        install_test_process_authority(&controller, Arc::clone(&backing)).await;
-    let successor_owner = LeaderLeaseOwner {
-        node: self_id,
-        boot: controller.recovery_incarnation(),
-        process_term: successor_process_term,
-    };
-    let observation = authority
-        .observe_rival(&successor_owner, &predecessor_lease)
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(2)).await;
-    let LeaseOutcome::Acquired(successor_lease) = authority
-        .try_takeover(
-            &successor_owner,
-            &observation,
-            predecessor_lease.expires_at_ms + 1,
-        )
-        .await
-        .unwrap()
-    else {
-        panic!("successor must acquire the expired predecessor term");
-    };
-    let (_lease_tx, lease_rx) = watch::channel(Some(successor_lease.clone()));
-    controller
-        .set_leader_lease_watch(
-            lease_rx,
-            successor_owner,
-            Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))),
-        )
-        .unwrap();
-    controller.set_leader_lease_store(Arc::clone(&authority));
-    controller.set_active(true);
-
-    let participants = vec![
-        CheckpointParticipant {
-            node_id: self_id.0,
-            boot_incarnation: controller.recovery_incarnation(),
-        },
-        CheckpointParticipant {
-            node_id: 2,
-            boot_incarnation: predecessor_boot,
-        },
-    ];
-    let fence = CheckpointAssignmentFence::from_owner_map(7, &[1, 2], participants).unwrap();
-    report_test_fault(&controller).await;
-    let inventory = controller.read_recovery_fault_inventory().await.unwrap();
-    let round = RecoveryRound::new(
-        9,
-        successor_lease.proof(),
-        fence.clone(),
-        Vec::new(),
-        inventory.revision(),
-        inventory.faults().to_vec(),
-    )
-    .unwrap();
-    controller.publish_recovery_incarnation().await.unwrap();
-    kv.seed(
-        NodeId(2),
-        "control:recovery-incarnation",
-        predecessor_boot.to_string(),
-    );
-    controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
-    controller.announce_recover_prepare(&round).await.unwrap();
-
-    let checkpoint_dir = tempfile::tempdir().unwrap();
-    let store =
-        Box::new(FileSystemCheckpointStore::new(checkpoint_dir.path()).with_participant_id(1));
-    let mut coordinator = CheckpointCoordinator::new(CheckpointConfig::default(), store)
-        .await
-        .unwrap();
-    coordinator
-        .bind_pipeline_identity(PipelineIdentity::empty())
-        .unwrap();
-    coordinator
-        .set_decision_store(Arc::clone(&decisions))
-        .unwrap();
-    coordinator
-        .bind_deployment_id(deployment_id.clone())
-        .unwrap();
-    coordinator.set_cluster_controller(Arc::clone(&controller));
-
-    let db = Arc::new(LaminarDB::open().unwrap());
-    *db.coordinator.lock().await = Some(coordinator);
-    assert!(
-        db.coordinator
-            .lock()
-            .await
-            .as_ref()
-            .unwrap()
-            .prepared_checkpoint_witnesses()
-            .await
-            .unwrap()
-            .is_empty(),
-        "the promoted driver must not rely on leader-local Prepared state"
-    );
-    let local = RecoveryStoppedReport::new(
-        &round,
-        CheckpointParticipant {
-            node_id: 1,
-            boot_incarnation: controller.recovery_incarnation(),
-        },
-        Vec::new(),
-    )
-    .unwrap();
-    let witness = PreparedCheckpointWitness::new(
-        laminar_core::state::CheckpointAttempt::new(60, 60),
-        2,
-        deployment_id,
-        PipelineIdentity::empty(),
-    )
-    .unwrap();
-    let peer = RecoveryStoppedReport::new(
-        &round,
-        CheckpointParticipant {
-            node_id: 2,
-            boot_incarnation: predecessor_boot,
-        },
-        vec![witness],
-    )
-    .unwrap();
-
-    settle_stopped_prepared_witnesses(&db, controller.as_ref(), &round, &[local, peer])
-        .await
-        .unwrap();
-
-    let outcome = authority.cluster_outcome(60).await.unwrap().unwrap();
-    assert_eq!(outcome.checkpoint_id, 60);
-    assert_eq!(outcome.verdict, CheckpointVerdict::Abort);
-    assert_eq!(
-        outcome.leader_proof.as_ref(),
-        Some(&successor_lease.proof())
-    );
-
-    let delayed = authority
-        .record_cluster_outcome(
-            &predecessor_lease.proof(),
-            60,
-            60,
-            fence,
-            CheckpointVerdict::Commit,
-            None,
-        )
-        .await;
-    assert!(matches!(
-        delayed,
-        Err(ClusterCheckpointAuthorityError::Fenced)
-    ));
-    assert!(matches!(
-        authority
-            .record_cluster_outcome(
-                &successor_lease.proof(),
-                60,
-                60,
-                round.assignment_fence,
-                CheckpointVerdict::Abort,
-                None,
-            )
-            .await
-            .unwrap(),
-        RecordOutcomeResult::Unchanged(_)
-    ));
 }
 
 #[tokio::test]
@@ -2113,7 +1798,7 @@ async fn release_commit_rejects_a_post_ready_fault() {
 #[tokio::test]
 async fn shuffle_cutoff_failure_never_publishes_release_readiness() {
     use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
-    use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
 
     let (controller, _members_tx, kv) = controller(Vec::new()).await;
     let controller = Arc::new(controller);
@@ -2145,7 +1830,6 @@ async fn shuffle_cutoff_failure_never_publishes_release_readiness() {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(registry)
         .shuffle_sender(Arc::new(ShuffleSender::new(
             controller.instance_id().0,
@@ -2184,7 +1868,7 @@ async fn shuffle_cutoff_failure_never_publishes_release_readiness() {
 
 #[tokio::test]
 async fn active_assignment_drain_blocks_recovery_release_readiness() {
-    use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
 
     let (controller, _members_tx, kv) = controller(Vec::new()).await;
     let controller = Arc::new(controller);
@@ -2224,7 +1908,6 @@ async fn active_assignment_drain_blocks_recovery_release_readiness() {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(registry)
         .assignment_snapshot_store(assignments)
         .build()
@@ -2252,7 +1935,7 @@ async fn active_assignment_drain_blocks_recovery_release_readiness() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assignment_closure_wins_while_recovery_release_waits_to_open_intake() {
     use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
-    use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
 
     let (controller, _members_tx, kv) = controller(Vec::new()).await;
     let controller = Arc::new(controller);
@@ -2283,7 +1966,6 @@ async fn assignment_closure_wins_while_recovery_release_waits_to_open_intake() {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(registry)
         .assignment_snapshot_store(assignments)
         .shuffle_sender(sender)

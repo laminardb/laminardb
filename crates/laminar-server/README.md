@@ -9,7 +9,6 @@ Standalone server binary for LaminarDB. Reads a TOML configuration file, constru
 - **Postgres wire protocol** (optional) for `SUBSCRIBE` streaming via `psql` and any libpq client
 - **Prometheus metrics** at `/metrics`
 - **Hot reload**: edit the TOML file and changes are applied automatically (file watcher with debounce), or `POST /api/v1/reload`
-- **Checkpoint validation**: `--validate-checkpoints` flag validates all stored checkpoints and exits
 - **Platform allocators**: jemalloc on Linux, mimalloc on Windows MSVC (see [Tuning the Allocator](#tuning-the-allocator-malloc_conf) for `MALLOC_CONF` recommendations)
 - **Docker and Helm** deployment with multi-arch images
 
@@ -22,7 +21,6 @@ Options:
   --config <FILE>         Configuration file [default: laminardb.toml]
   --log-level <LEVEL>     Logging level: trace, debug, info, warn, error [default: info]
   --admin-bind <ADDR>     Override HTTP bind address from config
-  --validate-checkpoints  Validate stored checkpoints and exit
   -h, --help              Print help
   -V, --version           Print version
 ```

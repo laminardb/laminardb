@@ -187,7 +187,7 @@ async fn start_normalizes_a_programmatic_filter_before_checkpoint_identity() {
         SourceStart::new(
             ConnectorConfig::new("postgres-cdc"),
             SourcePosition::Resume {
-                attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
                 checkpoint,
             },
             crate::connector::DeliveryGuarantee::AtLeastOnce,
@@ -889,7 +889,7 @@ async fn test_resume_installs_exact_engine_lsn() {
             SourceStart::new(
                 ConnectorConfig::new("postgres-cdc"),
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
                     checkpoint: cp,
                 },
                 crate::connector::DeliveryGuarantee::AtLeastOnce,
@@ -917,7 +917,7 @@ async fn test_resume_invalid_lsn_fails_before_replication() {
             SourceStart::new(
                 ConnectorConfig::new("postgres-cdc"),
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
                     checkpoint: cp,
                 },
                 crate::connector::DeliveryGuarantee::AtLeastOnce,
@@ -941,7 +941,7 @@ async fn old_checkpoint_version_fails_without_installing_runtime_state() {
             SourceStart::new(
                 ConnectorConfig::new("postgres-cdc"),
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
                     checkpoint,
                 },
                 crate::connector::DeliveryGuarantee::AtLeastOnce,
@@ -1894,7 +1894,7 @@ async fn test_resume_rejects_slot_identity_mismatch() {
             SourceStart::new(
                 ConnectorConfig::new("postgres-cdc"),
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
                     checkpoint: cp,
                 },
                 crate::connector::DeliveryGuarantee::AtLeastOnce,

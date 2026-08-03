@@ -21,8 +21,8 @@
       { "label": "sha256:fixture-topology-a", "hex": "1212121212121212121212121212121212121212121212121212121212121212" },
       { "label": "sha256:assignment-7", "hex": "1313131313131313131313131313131313131313131313131313131313131313" },
       { "label": "sha256:assignment-8", "hex": "1414141414141414141414141414141414141414141414141414141414141414" },
-      { "label": "sha256:capsule-44", "hex": "1515151515151515151515151515151515151515151515151515151515151515" },
-      { "label": "sha256:capsule-45", "hex": "1616161616161616161616161616161616161616161616161616161616161616" },
+      { "label": "sha256:committed-index-44", "hex": "1515151515151515151515151515151515151515151515151515151515151515" },
+      { "label": "sha256:committed-index-45", "hex": "1616161616161616161616161616161616161616161616161616161616161616" },
       { "label": "fixture/alpha/count/1", "hex": "67dd09edb9652a7fafa9c95b5c2e16ab3921c938fb4afb4e25d6efa2c7d87550" },
       { "label": "fixture/alpha/count/2", "hex": "b1c9ac34cf3d728ae9ee5a8968bc689dfe2070da790cb731fab9be5bdbda1b26" },
       { "label": "fixture/alpha/count/3", "hex": "eeb912faa02c02c5ed4f9368a090549db356bdb3508fd3a9a8fbf70e1e34a648" },
@@ -116,7 +116,7 @@
           "epoch": 44,
           "terminal": "Commit",
           "purpose": "zero_input_bootstrap",
-          "capsule_digest": "sha256:capsule-44",
+          "committed_index_digest": "sha256:committed-index-44",
           "base_assignment": { "version": 7, "digest": "sha256:assignment-7" },
           "sealed_source_cut": [
             { "topic": "fixture-input", "partition": 0, "exclusive_end": 0 },
@@ -138,7 +138,7 @@
           "epoch": 45,
           "terminal": "Commit",
           "purpose": "recovery_base",
-          "capsule_digest": "sha256:capsule-45",
+          "committed_index_digest": "sha256:committed-index-45",
           "base_assignment": { "version": 7, "digest": "sha256:assignment-7" },
           "sealed_source_cut": [
             { "topic": "fixture-input", "partition": 0, "exclusive_end": 1 },
@@ -230,7 +230,7 @@
           "recovery": {
             "checkpoint_id": "checkpoint-44",
             "checkpoint_epoch": 44,
-            "capsule_digest": "sha256:capsule-44",
+            "committed_index_digest": "sha256:committed-index-44",
             "base_assignment": { "version": 7, "digest": "sha256:assignment-7" }
           },
           "abi": {
@@ -262,7 +262,7 @@
           "recovery": {
             "checkpoint_id": "checkpoint-44",
             "checkpoint_epoch": 44,
-            "capsule_digest": "sha256:capsule-44",
+            "committed_index_digest": "sha256:committed-index-44",
             "base_assignment": { "version": 7, "digest": "sha256:assignment-7" }
           },
           "abi": {
@@ -294,7 +294,7 @@
           "recovery": {
             "checkpoint_id": "checkpoint-45",
             "checkpoint_epoch": 45,
-            "capsule_digest": "sha256:capsule-45",
+            "committed_index_digest": "sha256:committed-index-45",
             "base_assignment": { "version": 7, "digest": "sha256:assignment-7" }
           },
           "abi": {
@@ -326,7 +326,7 @@
           "recovery": {
             "checkpoint_id": "checkpoint-45",
             "checkpoint_epoch": 45,
-            "capsule_digest": "sha256:capsule-45",
+            "committed_index_digest": "sha256:committed-index-45",
             "base_assignment": { "version": 7, "digest": "sha256:assignment-7" }
           },
           "abi": {

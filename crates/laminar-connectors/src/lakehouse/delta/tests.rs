@@ -1034,8 +1034,8 @@ async fn coordinated_epoch_over_four_times_buffer_cap_commits_once() {
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
         CoordinatedCommitPayload, CoordinatedCommitter,
     };
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     let dir = tempfile::tempdir().unwrap();
     let table_dir = dir.path().join("coord_large_epoch");
@@ -1135,8 +1135,8 @@ async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
         CoordinatedCommitPayload, CoordinatedCommitter,
     };
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     let dir = tempfile::tempdir().unwrap();
     let table_dir = dir.path().join("coord_recover");
@@ -1218,8 +1218,8 @@ async fn coordinated_failover_overlap_does_not_duplicate_committed_attempt() {
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
         CoordinatedCommitPayload, CoordinatedCommitter,
     };
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     let dir = tempfile::tempdir().unwrap();
     let table_dir = dir.path().join("coord_failover_overlap");
@@ -1373,8 +1373,8 @@ async fn coordinated_unresolved_publication_allows_only_the_exact_batch_retry() 
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
         CoordinatedCommitPayload, CoordinatedCommitter,
     };
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     let dir = tempfile::tempdir().unwrap();
     let table_dir = dir.path().join("coord_reconcile");
@@ -1515,8 +1515,8 @@ async fn coordinated_catalog_commit_timeout_fences_later_work_until_cursor_read(
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
         CoordinatedCommitPayload, CoordinatedCommitter,
     };
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     let dir = tempfile::tempdir().unwrap();
     let table_dir = dir.path().join("coord_commit_timeout");

@@ -14,36 +14,28 @@ impl LaminarDB {
     ///
     /// # Errors
     ///
-    /// Returns [`DbError::Checkpoint`] if the metadata batch cannot be
-    /// assembled from the latest checkpoint.
+    /// Returns [`DbError::Checkpoint`] if the metadata batch cannot be assembled.
     pub async fn build_show_checkpoint_status(&self) -> Result<RecordBatch, DbError> {
-        let store = self.checkpoint_store()?;
-        let (latest, list) = match &store {
-            Some(s) => {
-                let latest = s.load_latest().await.map_err(|e| {
-                    DbError::Checkpoint(format!("failed to load latest checkpoint: {e}"))
-                })?;
-                let list = s
-                    .list()
-                    .await
-                    .map_err(|e| DbError::Checkpoint(format!("failed to list checkpoints: {e}")))?;
-                (latest, list)
-            }
-            None => (None, vec![]),
-        };
-
-        let (cp_id, epoch, ts_ms, sources, sinks, total_checkpoints) = if let Some(ref m) = latest {
-            (
-                m.checkpoint_id,
-                m.epoch,
-                m.timestamp_ms,
-                m.source_names.join(", "),
-                m.sink_names.join(", "),
-                list.len() as u64,
-            )
-        } else {
-            (0, 0, 0, String::new(), String::new(), 0)
-        };
+        let coordinator = self.coordinator.lock().await;
+        let (cp_id, epoch, ts_ms, sources, sinks, completed_this_runtime) =
+            if let Some(coordinator) = coordinator.as_ref() {
+                let completed = coordinator.stats().completed;
+                coordinator.last_committed_manifest().map_or_else(
+                    || (0, 0, 0, String::new(), String::new(), completed),
+                    |manifest| {
+                        (
+                            manifest.checkpoint_id,
+                            manifest.epoch,
+                            manifest.timestamp_ms,
+                            manifest.source_names.join(", "),
+                            manifest.sink_names.join(", "),
+                            completed,
+                        )
+                    },
+                )
+            } else {
+                (0, 0, 0, String::new(), String::new(), 0)
+            };
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("checkpoint_id", DataType::UInt64, false),
@@ -51,7 +43,7 @@ impl LaminarDB {
             Field::new("timestamp_ms", DataType::UInt64, false),
             Field::new("sources", DataType::Utf8, false),
             Field::new("sinks", DataType::Utf8, false),
-            Field::new("total_checkpoints", DataType::UInt64, false),
+            Field::new("completed_this_runtime", DataType::UInt64, false),
         ]));
 
         RecordBatch::try_new(
@@ -62,7 +54,7 @@ impl LaminarDB {
                 Arc::new(UInt64Array::from(vec![ts_ms])),
                 Arc::new(StringArray::from(vec![sources.as_str()])),
                 Arc::new(StringArray::from(vec![sinks.as_str()])),
-                Arc::new(UInt64Array::from(vec![total_checkpoints])),
+                Arc::new(UInt64Array::from(vec![completed_this_runtime])),
             ],
         )
         .map_err(|e| DbError::Checkpoint(format!("failed to build checkpoint status batch: {e}")))

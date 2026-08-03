@@ -1,10 +1,14 @@
 //! Durable checkpoint identity, ID allocation, and immutable terminal outcomes.
 
-#[cfg(feature = "cluster")]
-use std::collections::BinaryHeap;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
+use crate::checkpoint::CheckpointAttempt;
+pub use crate::checkpoint::CheckpointScope;
+use crate::checkpoint::{
+    CheckpointAssignmentFence, CommittedCheckpointIndex, CommittedCheckpointRef, LeaderProof,
+    PipelineIdentity, MAX_COMMITTED_CHECKPOINT_INDEX_BYTES,
+};
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use object_store::path::Path as OsPath;
@@ -12,14 +16,6 @@ use object_store::{
     GetOptions, GetRange, GetResult, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
     UpdateVersion,
 };
-#[cfg(feature = "cluster")]
-use sha2::{Digest, Sha256};
-
-use crate::checkpoint::{
-    CheckpointAssignmentFence, ClusterRecoveryCapsule, LeaderProof, PipelineIdentity,
-    RecoveryCapsuleRef,
-};
-use crate::state::CheckpointAttempt;
 
 /// Durable checkpoint metadata store.
 pub struct CheckpointDecisionStore {
@@ -97,16 +93,6 @@ pub enum DecisionError {
     InventoryChanged(String),
 }
 
-/// Runtime scope of a durable checkpoint outcome.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CheckpointScope {
-    /// Embedded or standalone recovery domain.
-    Local,
-    /// Multi-participant cluster recovery domain.
-    Cluster,
-}
-
 /// Irrevocable terminal verdict for one concrete checkpoint attempt.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -135,8 +121,8 @@ pub struct CheckpointOutcome {
     pub assignment_fence: Option<CheckpointAssignmentFence>,
     /// Exact leader authority that selected a cluster outcome.
     pub leader_proof: Option<LeaderProof>,
-    /// Exact global recovery image selected by a cluster Commit.
-    pub recovery_capsule: Option<RecoveryCapsuleRef>,
+    /// Exact global recovery index selected by a Commit.
+    pub committed_checkpoint: Option<CommittedCheckpointRef>,
     /// Create-once terminal verdict.
     pub verdict: CheckpointVerdict,
 }
@@ -169,13 +155,9 @@ pub struct OutcomeRetentionBoundary {
     pub highest_closed_epoch: Option<u64>,
 }
 
-const CHECKPOINT_OUTCOME_VERSION: u32 = 2;
+const CHECKPOINT_OUTCOME_VERSION: u32 = 3;
 const CHECKPOINT_OUTCOME_MAX_BYTES: u64 = 64 * 1_024;
 const OUTCOME_GC_FLOOR_MAX_BYTES: u64 = 256 * 1_024;
-#[cfg(feature = "cluster")]
-const RECOVERY_CAPSULE_GC_BATCH_SIZE: usize = 64;
-#[cfg(feature = "cluster")]
-const RECOVERY_CAPSULE_GC_CURSOR_MAX_BYTES: u64 = 1_024;
 
 impl CheckpointOutcome {
     pub(crate) fn validate_shape(&self, path_epoch: u64) -> Result<(), DecisionError> {
@@ -256,31 +238,30 @@ impl CheckpointOutcome {
             }
         }
 
-        match (self.scope, &self.verdict, self.recovery_capsule.as_ref()) {
-            (CheckpointScope::Local, _, None)
-            | (CheckpointScope::Cluster, CheckpointVerdict::Abort, None) => {}
-            (CheckpointScope::Cluster, CheckpointVerdict::Commit, Some(reference)) => {
+        match (&self.verdict, self.committed_checkpoint.as_ref()) {
+            (CheckpointVerdict::Commit, Some(reference)) => {
                 reference.validate().map_err(|error| {
                     DecisionError::Conflict(format!(
-                        "cluster commit outcome for epoch {path_epoch} has an invalid recovery capsule reference: {error}"
+                        "commit outcome for epoch {path_epoch} has an invalid committed checkpoint reference: {error}"
                     ))
                 })?;
+                if reference.epoch != self.epoch || reference.checkpoint_id != self.checkpoint_id {
+                    return Err(DecisionError::Conflict(format!(
+                        "commit outcome for epoch {path_epoch} names a different committed checkpoint"
+                    )));
+                }
             }
-            (CheckpointScope::Local, _, Some(_)) => {
+            (CheckpointVerdict::Commit, None) => {
                 return Err(DecisionError::Conflict(format!(
-                    "local outcome for epoch {path_epoch} cannot carry a recovery capsule"
+                    "commit outcome for epoch {path_epoch} requires a committed checkpoint reference"
                 )));
             }
-            (CheckpointScope::Cluster, CheckpointVerdict::Commit, None) => {
+            (CheckpointVerdict::Abort, Some(_)) => {
                 return Err(DecisionError::Conflict(format!(
-                    "cluster commit outcome for epoch {path_epoch} requires a recovery capsule"
+                    "abort outcome for epoch {path_epoch} cannot carry a committed checkpoint reference"
                 )));
             }
-            (CheckpointScope::Cluster, CheckpointVerdict::Abort, Some(_)) => {
-                return Err(DecisionError::Conflict(format!(
-                    "cluster abort outcome for epoch {path_epoch} cannot carry a recovery capsule"
-                )));
-            }
+            (CheckpointVerdict::Abort, None) => {}
         }
         Ok(())
     }
@@ -430,96 +411,6 @@ const OUTCOME_GC_FLOOR_VERSION: u32 = 4;
 struct VersionedOutcomeGcFloor {
     floor: OutcomeGcFloor,
     update_version: UpdateVersion,
-}
-
-#[cfg(feature = "cluster")]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct RecoveryCapsuleGcCursor {
-    version: u32,
-    deployment_id: String,
-    /// Last path examined in the current pass. `None` starts a new pass from the prefix root.
-    offset: Option<String>,
-}
-
-#[cfg(feature = "cluster")]
-const RECOVERY_CAPSULE_GC_CURSOR_VERSION: u32 = 1;
-
-#[cfg(feature = "cluster")]
-#[derive(Debug)]
-struct RecoveryCapsuleListCandidate {
-    location: String,
-    meta: object_store::ObjectMeta,
-}
-
-#[cfg(feature = "cluster")]
-enum RecoveryCapsuleObjectWork {
-    Retained,
-    Deleted,
-    Quarantined,
-    Failed,
-}
-
-#[cfg(feature = "cluster")]
-impl PartialEq for RecoveryCapsuleListCandidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.location == other.location
-    }
-}
-
-#[cfg(feature = "cluster")]
-impl Eq for RecoveryCapsuleListCandidate {}
-
-#[cfg(feature = "cluster")]
-impl PartialOrd for RecoveryCapsuleListCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[cfg(feature = "cluster")]
-impl Ord for RecoveryCapsuleListCandidate {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.location.cmp(&other.location)
-    }
-}
-
-#[cfg(feature = "cluster")]
-fn retain_lexically_oldest_recovery_capsule(
-    oldest: &mut BinaryHeap<RecoveryCapsuleListCandidate>,
-    meta: object_store::ObjectMeta,
-) {
-    let candidate = RecoveryCapsuleListCandidate {
-        location: meta.location.to_string(),
-        meta,
-    };
-    if oldest.len() < RECOVERY_CAPSULE_GC_BATCH_SIZE {
-        oldest.push(candidate);
-    } else if oldest.peek().is_some_and(|largest| &candidate < largest) {
-        oldest.pop();
-        oldest.push(candidate);
-    }
-}
-
-#[cfg(feature = "cluster")]
-#[derive(Debug)]
-struct VersionedRecoveryCapsuleGcCursor {
-    cursor: RecoveryCapsuleGcCursor,
-    update_version: UpdateVersion,
-}
-
-/// Result of one bounded cluster recovery-capsule maintenance step.
-#[cfg(feature = "cluster")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecoveryCapsuleGcStep {
-    /// Number of active-prefix entries selected and processed in this step.
-    pub examined: usize,
-    /// Number of old unreferenced capsules deleted.
-    pub deleted: usize,
-    /// Number of malformed or corrupt objects moved out of the active prefix.
-    pub quarantined: usize,
-    /// Whether an existing floor requires periodic rescans for delayed or previously failed work.
-    pub pending: bool,
 }
 
 impl CheckpointDecisionStore {
@@ -673,10 +564,8 @@ impl CheckpointDecisionStore {
     /// Returns an I/O error when the directory cannot be created, synchronized, or opened.
     pub fn local_filesystem(root: impl AsRef<FsPath>) -> Result<Self, DecisionError> {
         let root = root.as_ref();
-        let store: Arc<dyn ObjectStore> = Arc::new(
-            crate::durable_local_store::DurableLocalObjectStore::new(root)
-                .map_err(|error| DecisionError::Io(error.to_string()))?,
-        );
+        let store = crate::checkpoint::object_store_builder::durable_local_object_store(root)
+            .map_err(|error| DecisionError::Io(error.to_string()))?;
         let canonical_root =
             std::fs::canonicalize(root).map_err(|error| DecisionError::Io(error.to_string()))?;
         let lock =
@@ -716,45 +605,10 @@ impl CheckpointDecisionStore {
         OsPath::from(format!("checkpoint-outcomes/epoch={epoch}/outcome"))
     }
 
-    fn recovery_capsule_path(reference: &RecoveryCapsuleRef) -> OsPath {
+    fn committed_checkpoint_path(reference: &CommittedCheckpointRef) -> OsPath {
         OsPath::from(format!(
-            "checkpoint-recovery-capsules/epoch={:020}/checkpoint={:020}/sha256={}",
+            "committed-checkpoints/epoch={:020}/checkpoint={:020}/sha256={}",
             reference.epoch, reference.checkpoint_id, reference.sha256
-        ))
-    }
-
-    #[cfg(feature = "cluster")]
-    fn recovery_capsule_root() -> OsPath {
-        OsPath::from("checkpoint-recovery-capsules/")
-    }
-
-    #[cfg(feature = "cluster")]
-    fn recovery_capsule_coordinates_from_path(location: &str) -> Option<(u64, u64, &str)> {
-        let suffix = location.strip_prefix("checkpoint-recovery-capsules/epoch=")?;
-        let (epoch, suffix) = suffix.split_once("/checkpoint=")?;
-        let (checkpoint_id, digest) = suffix.split_once("/sha256=")?;
-        if epoch.len() != 20
-            || checkpoint_id.len() != 20
-            || digest.len() != 64
-            || digest.contains('/')
-        {
-            return None;
-        }
-        Some((epoch.parse().ok()?, checkpoint_id.parse().ok()?, digest))
-    }
-
-    #[cfg(feature = "cluster")]
-    fn recovery_capsule_gc_cursor_path(deployment_id: &str) -> OsPath {
-        OsPath::from(format!(
-            "checkpoint-recovery-capsule-gc/deployment={deployment_id}/cursor"
-        ))
-    }
-
-    #[cfg(feature = "cluster")]
-    fn recovery_capsule_quarantine_path(location: &str) -> OsPath {
-        let digest = format!("{:x}", Sha256::digest(location.as_bytes()));
-        OsPath::from(format!(
-            "checkpoint-recovery-capsule-quarantine/path-sha256={digest}"
         ))
     }
 
@@ -780,122 +634,29 @@ impl CheckpointDecisionStore {
         OsPath::from("checkpoint-sink-open-witness/witness.json")
     }
 
-    #[cfg(feature = "cluster")]
-    async fn read_recovery_capsule_gc_cursor(
-        &self,
-        deployment_id: &str,
-    ) -> Result<Option<VersionedRecoveryCapsuleGcCursor>, DecisionError> {
-        let path = Self::recovery_capsule_gc_cursor_path(deployment_id);
-        let Some(result) = self
-            .get_control_record(
-                &path,
-                "recovery capsule GC cursor",
-                RECOVERY_CAPSULE_GC_CURSOR_MAX_BYTES,
-            )
-            .await?
-        else {
-            return Ok(None);
-        };
-        let update_version = UpdateVersion {
-            e_tag: result.meta.e_tag.clone(),
-            version: result.meta.version.clone(),
-        };
-        self.require_native_cas_token("recovery capsule GC cursor", &update_version)?;
-        let bytes = Self::read_control_record_bytes(
-            result,
-            "recovery capsule GC cursor",
-            RECOVERY_CAPSULE_GC_CURSOR_MAX_BYTES,
-            None,
-        )
-        .await?;
-        let cursor: RecoveryCapsuleGcCursor = serde_json::from_slice(&bytes).map_err(|error| {
-            DecisionError::Conflict(format!("recovery capsule GC cursor: {error}"))
-        })?;
-        if cursor.version != RECOVERY_CAPSULE_GC_CURSOR_VERSION
-            || cursor.deployment_id != deployment_id
-            || cursor.offset.as_ref().is_some_and(|offset| {
-                !offset.starts_with("checkpoint-recovery-capsules/")
-                    || OsPath::parse(offset).is_err()
-            })
-        {
-            return Err(DecisionError::Conflict(
-                "recovery capsule GC cursor does not match its path, deployment, or progress"
-                    .into(),
-            ));
-        }
-        let canonical = serde_json::to_vec(&cursor)
-            .map_err(|error| DecisionError::Conflict(error.to_string()))?;
-        if canonical.as_slice() != bytes.as_ref() {
-            return Err(DecisionError::Conflict(
-                "recovery capsule GC cursor does not use its canonical body".into(),
-            ));
-        }
-        Ok(Some(VersionedRecoveryCapsuleGcCursor {
-            cursor,
-            update_version,
-        }))
-    }
-
-    #[cfg(feature = "cluster")]
-    async fn compare_and_swap_recovery_capsule_gc_cursor(
-        &self,
-        cursor: &RecoveryCapsuleGcCursor,
-        expected: Option<UpdateVersion>,
-    ) -> Result<bool, DecisionError> {
-        let path = Self::recovery_capsule_gc_cursor_path(&cursor.deployment_id);
-        let payload = Self::encode_control_record(
-            "recovery capsule GC cursor",
-            cursor,
-            RECOVERY_CAPSULE_GC_CURSOR_MAX_BYTES,
-        )?;
-        let options = PutOptions {
-            mode: expected.map_or(PutMode::Create, PutMode::Update),
-            ..PutOptions::default()
-        };
-        match self
-            .store
-            .put_opts(&path, PutPayload::from(payload), options)
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(
-                object_store::Error::Precondition { .. }
-                | object_store::Error::AlreadyExists { .. }
-                | object_store::Error::NotFound { .. },
-            ) => Ok(false),
-            Err(error) => match self
-                .read_recovery_capsule_gc_cursor(&cursor.deployment_id)
-                .await?
-            {
-                Some(current) if current.cursor == *cursor => Ok(true),
-                _ => Err(DecisionError::Io(error.to_string())),
-            },
-        }
-    }
-
-    /// Create the canonical content-addressed body for a cluster recovery capsule.
+    /// Create the canonical content-addressed body for a committed checkpoint index.
     ///
     /// Identical retries converge on the existing immutable body. The returned reference is safe
     /// to publish only after this method succeeds.
     ///
     /// # Errors
-    /// Object-store I/O, malformed capsule content, deployment mismatch, or a conflicting body.
-    pub async fn create_recovery_capsule(
+    /// Object-store I/O, malformed index content, deployment mismatch, or a conflicting body.
+    pub async fn create_committed_checkpoint(
         &self,
-        capsule: &ClusterRecoveryCapsule,
-    ) -> Result<RecoveryCapsuleRef, DecisionError> {
-        let (encoded, reference) = capsule
+        index: &CommittedCheckpointIndex,
+    ) -> Result<CommittedCheckpointRef, DecisionError> {
+        let (encoded, reference) = index
             .encode_and_reference()
             .map_err(DecisionError::Conflict)?;
         let deployment_id = self.load_or_create_deployment_id().await?;
-        if capsule.deployment_id != deployment_id {
+        if index.deployment_id != deployment_id {
             return Err(DecisionError::Conflict(format!(
-                "recovery capsule belongs to deployment {}, current deployment is {deployment_id}",
-                capsule.deployment_id
+                "committed checkpoint belongs to deployment {}, current deployment is {deployment_id}",
+                index.deployment_id
             )));
         }
 
-        let path = Self::recovery_capsule_path(&reference);
+        let path = Self::committed_checkpoint_path(&reference);
         let options = PutOptions {
             mode: PutMode::Create,
             ..PutOptions::default()
@@ -906,93 +667,97 @@ impl CheckpointDecisionStore {
             .await
         {
             Ok(_) => Ok(reference),
-            Err(put_error) => match self.load_recovery_capsule(&reference).await {
-                Ok(stored) if stored == *capsule => Ok(reference),
+            Err(put_error) => match self.load_committed_checkpoint(&reference).await {
+                Ok(stored) if stored == *index => Ok(reference),
                 Ok(_) => Err(DecisionError::Conflict(format!(
-                    "recovery capsule '{}' differs from the proposed content",
+                    "committed checkpoint '{}' differs from the proposed content",
                     reference.sha256
                 ))),
                 Err(reconcile_error) => Err(DecisionError::Io(format!(
-                    "recovery capsule write failed ({put_error}); reconciliation failed ({reconcile_error})"
+                    "committed checkpoint write failed ({put_error}); reconciliation failed ({reconcile_error})"
                 ))),
             },
         }
     }
 
-    /// Load and verify one exact content-addressed recovery capsule.
+    /// Load and verify one exact content-addressed committed checkpoint index.
     ///
     /// Verification covers the object path, recorded and observed lengths, canonical JSON body,
-    /// SHA-256 reference, deployment identity, and capsule-internal invariants.
+    /// SHA-256 reference, deployment identity, and committed-index invariants.
     ///
     /// # Errors
     /// Object-store I/O, a missing object, malformed content, or any reference mismatch.
-    pub async fn load_recovery_capsule(
+    pub async fn load_committed_checkpoint(
         &self,
-        reference: &RecoveryCapsuleRef,
-    ) -> Result<ClusterRecoveryCapsule, DecisionError> {
+        reference: &CommittedCheckpointRef,
+    ) -> Result<CommittedCheckpointIndex, DecisionError> {
         reference.validate().map_err(DecisionError::Conflict)?;
-        let record = format!("recovery capsule '{}'", reference.sha256);
+        let record = format!("committed checkpoint '{}'", reference.sha256);
         let result = self
             .get_control_record(
-                &Self::recovery_capsule_path(reference),
+                &Self::committed_checkpoint_path(reference),
                 &record,
-                u64::try_from(crate::checkpoint::MAX_RECOVERY_CAPSULE_BYTES).unwrap_or(u64::MAX),
+                u64::try_from(MAX_COMMITTED_CHECKPOINT_INDEX_BYTES).unwrap_or(u64::MAX),
             )
             .await?
             .ok_or_else(|| {
                 DecisionError::Conflict(format!(
-                    "recovery capsule '{}' is missing",
+                    "committed checkpoint '{}' is missing",
                     reference.sha256
                 ))
             })?;
         let bytes = Self::read_control_record_bytes(
             result,
             &record,
-            u64::try_from(crate::checkpoint::MAX_RECOVERY_CAPSULE_BYTES).unwrap_or(u64::MAX),
+            u64::try_from(MAX_COMMITTED_CHECKPOINT_INDEX_BYTES).unwrap_or(u64::MAX),
             Some(reference.len),
         )
         .await?;
-        let capsule: ClusterRecoveryCapsule = serde_json::from_slice(&bytes).map_err(|error| {
-            DecisionError::Conflict(format!("recovery capsule '{}': {error}", reference.sha256))
+        let index: CommittedCheckpointIndex = serde_json::from_slice(&bytes).map_err(|error| {
+            DecisionError::Conflict(format!(
+                "committed checkpoint '{}': {error}",
+                reference.sha256
+            ))
         })?;
-        let (canonical, actual_reference) = capsule
+        let (canonical, actual_reference) = index
             .encode_and_reference()
             .map_err(DecisionError::Conflict)?;
         if actual_reference != *reference || canonical.as_slice() != bytes.as_ref() {
             return Err(DecisionError::Conflict(format!(
-                "recovery capsule '{}' does not match its content-addressed reference",
+                "committed checkpoint '{}' does not match its content-addressed reference",
                 reference.sha256
             )));
         }
         let deployment_id = self.load_or_create_deployment_id().await?;
-        if capsule.deployment_id != deployment_id {
+        if index.deployment_id != deployment_id {
             return Err(DecisionError::Conflict(format!(
-                "recovery capsule belongs to deployment {}, current deployment is {deployment_id}",
-                capsule.deployment_id
+                "committed checkpoint belongs to deployment {}, current deployment is {deployment_id}",
+                index.deployment_id
             )));
         }
-        Ok(capsule)
+        Ok(index)
     }
 
-    pub(crate) async fn validate_recovery_capsule_for_outcome(
+    pub(crate) async fn validate_committed_checkpoint_for_outcome(
         &self,
         outcome: &CheckpointOutcome,
     ) -> Result<(), DecisionError> {
         outcome.validate_shape(outcome.epoch)?;
-        let reference = outcome.recovery_capsule.as_ref().ok_or_else(|| {
+        let reference = outcome.committed_checkpoint.as_ref().ok_or_else(|| {
             DecisionError::Conflict(format!(
-                "cluster commit outcome for epoch {} requires a recovery capsule",
+                "commit outcome for epoch {} requires a committed checkpoint",
                 outcome.epoch
             ))
         })?;
-        let capsule = self.load_recovery_capsule(reference).await?;
-        if capsule.attempt.epoch != outcome.epoch
-            || capsule.attempt.checkpoint_id != outcome.checkpoint_id
-            || Some(&capsule.assignment_fence) != outcome.assignment_fence.as_ref()
-            || capsule.deployment_id != outcome.deployment_id
+        let index = self.load_committed_checkpoint(reference).await?;
+        if index.epoch != outcome.epoch
+            || index.checkpoint_id != outcome.checkpoint_id
+            || index.scope != outcome.scope
+            || index.assignment_fence.as_ref() != outcome.assignment_fence.as_ref()
+            || index.deployment_id != outcome.deployment_id
         {
             return Err(DecisionError::Conflict(format!(
-                "cluster commit outcome for epoch {} does not match recovery capsule '{}'",
+                "commit outcome for epoch {} does not match committed checkpoint '{}'",
                 outcome.epoch, reference.sha256
             )));
         }
@@ -1964,7 +1729,7 @@ impl CheckpointDecisionStore {
         assignment_fence: Option<CheckpointAssignmentFence>,
         leader_proof: Option<LeaderProof>,
         verdict: CheckpointVerdict,
-        recovery_capsule: Option<RecoveryCapsuleRef>,
+        committed_checkpoint: Option<CommittedCheckpointRef>,
     ) -> Result<CheckpointOutcome, DecisionError> {
         let outcome = CheckpointOutcome {
             version: CHECKPOINT_OUTCOME_VERSION,
@@ -1974,13 +1739,13 @@ impl CheckpointDecisionStore {
             deployment_id: self.load_or_create_deployment_id().await?,
             assignment_fence,
             leader_proof,
-            recovery_capsule,
+            committed_checkpoint,
             verdict,
         };
-        if outcome.recovery_capsule.is_some() {
-            self.validate_recovery_capsule_for_outcome(&outcome).await?;
-        } else {
-            outcome.validate_shape(epoch)?;
+        outcome.validate_shape(epoch)?;
+        if outcome.is_commit() {
+            self.validate_committed_checkpoint_for_outcome(&outcome)
+                .await?;
         }
         Ok(outcome)
     }
@@ -2049,8 +1814,7 @@ impl CheckpointDecisionStore {
         };
 
         // A failed create response may be ambiguous: read the create-once key before deciding
-        // whether the call failed. Recovery will not proceed past a valid Prepared witness until
-        // this exact epoch has a terminal winner.
+        // whether the call failed. This epoch is not terminal until the exact outcome is visible.
         if let Some(winner) = self.read_outcome_record(&path, candidate.epoch).await? {
             return if winner == candidate {
                 Ok(RecordOutcomeResult::Unchanged(winner))
@@ -2268,7 +2032,7 @@ impl CheckpointDecisionStore {
     /// Create or read the one local terminal outcome allowed for an epoch.
     ///
     /// Identical retries return [`RecordOutcomeResult::Unchanged`]. A different checkpoint,
-    /// authority, assignment, recovery image, or verdict returns the durable winner in
+    /// authority, assignment, committed index, or verdict returns the durable winner in
     /// [`RecordOutcomeResult::Conflict`]; it never overwrites that winner.
     ///
     /// # Errors
@@ -2281,7 +2045,7 @@ impl CheckpointDecisionStore {
         assignment_fence: Option<CheckpointAssignmentFence>,
         leader_proof: Option<LeaderProof>,
         verdict: CheckpointVerdict,
-        recovery_capsule: Option<RecoveryCapsuleRef>,
+        committed_checkpoint: Option<CommittedCheckpointRef>,
     ) -> Result<RecordOutcomeResult, DecisionError> {
         if scope == CheckpointScope::Cluster {
             return Err(DecisionError::Conflict(
@@ -2296,7 +2060,7 @@ impl CheckpointDecisionStore {
                 assignment_fence,
                 leader_proof,
                 verdict,
-                recovery_capsule,
+                committed_checkpoint,
             )
             .await?;
         self.ensure_outcome_not_tombstoned(&candidate).await?;
@@ -2520,210 +2284,6 @@ impl CheckpointDecisionStore {
         ))
     }
 
-    #[cfg(feature = "cluster")]
-    async fn quarantine_recovery_capsule_object(
-        &self,
-        location: &OsPath,
-    ) -> Result<(), DecisionError> {
-        let quarantine = Self::recovery_capsule_quarantine_path(location.as_ref());
-        match self.store.rename(location, &quarantine).await {
-            Ok(()) => Ok(()),
-            Err(error) => match self.store.head(location).await {
-                Err(object_store::Error::NotFound { .. }) => Ok(()),
-                Ok(_) => Err(DecisionError::Io(format!(
-                    "failed to quarantine recovery capsule '{location}': {error}"
-                ))),
-                Err(head_error) => Err(DecisionError::Io(format!(
-                    "failed to quarantine recovery capsule '{location}' ({error}); reconciliation failed ({head_error})"
-                ))),
-            },
-        }
-    }
-
-    /// Perform one bounded-memory cleanup step for capsule epochs below a durable cluster floor.
-    ///
-    /// Each step full-scans the unordered listing and processes the lexically oldest bounded batch
-    /// after the cursor. The cursor wraps so delayed creates and failed paths are retried.
-    #[cfg(feature = "cluster")]
-    pub(crate) async fn sweep_recovery_capsules_step(
-        &self,
-        before_epoch: u64,
-        known_live_digests: &std::collections::BTreeSet<String>,
-    ) -> Result<RecoveryCapsuleGcStep, DecisionError> {
-        if before_epoch <= 1 {
-            return Ok(RecoveryCapsuleGcStep {
-                examined: 0,
-                deleted: 0,
-                quarantined: 0,
-                pending: false,
-            });
-        }
-
-        let deployment_id = self.load_or_create_deployment_id().await?;
-        let observed = self.read_recovery_capsule_gc_cursor(&deployment_id).await?;
-        let (cursor, update_version) = observed.map_or_else(
-            || {
-                (
-                    RecoveryCapsuleGcCursor {
-                        version: RECOVERY_CAPSULE_GC_CURSOR_VERSION,
-                        deployment_id: deployment_id.clone(),
-                        offset: None,
-                    },
-                    None,
-                )
-            },
-            |observed| (observed.cursor, Some(observed.update_version)),
-        );
-
-        let root = Self::recovery_capsule_root();
-        let mut listed = self.store.list(Some(&root));
-        let mut oldest = BinaryHeap::with_capacity(RECOVERY_CAPSULE_GC_BATCH_SIZE);
-        let mut eligible = 0usize;
-        while let Some(entry) = listed.next().await {
-            let entry = entry.map_err(|error| DecisionError::Io(error.to_string()))?;
-            if cursor
-                .offset
-                .as_deref()
-                .is_some_and(|offset| entry.location.as_ref() <= offset)
-            {
-                continue;
-            }
-            eligible = eligible.saturating_add(1);
-            retain_lexically_oldest_recovery_capsule(&mut oldest, entry);
-        }
-        let list_exhausted = eligible <= RECOVERY_CAPSULE_GC_BATCH_SIZE;
-        let entries = oldest
-            .into_sorted_vec()
-            .into_iter()
-            .map(|candidate| candidate.meta)
-            .collect::<Vec<_>>();
-        let examined = entries.len();
-
-        let work = futures::stream::iter(entries.iter().cloned())
-            .map(|entry| async move {
-                let Some((epoch, checkpoint_id, digest)) =
-                    Self::recovery_capsule_coordinates_from_path(entry.location.as_ref())
-                else {
-                    return match self
-                        .quarantine_recovery_capsule_object(&entry.location)
-                        .await
-                    {
-                        Ok(()) => RecoveryCapsuleObjectWork::Quarantined,
-                        Err(error) => {
-                            tracing::warn!(path = %entry.location, %error, "recovery capsule quarantine failed; retrying on the next scan pass");
-                            RecoveryCapsuleObjectWork::Failed
-                        }
-                    };
-                };
-                if epoch >= before_epoch {
-                    return RecoveryCapsuleObjectWork::Retained;
-                }
-                let reference = RecoveryCapsuleRef {
-                    epoch,
-                    checkpoint_id,
-                    sha256: digest.to_owned(),
-                    len: entry.size,
-                };
-                if reference.validate().is_err() {
-                    return match self
-                        .quarantine_recovery_capsule_object(&entry.location)
-                        .await
-                    {
-                        Ok(()) => RecoveryCapsuleObjectWork::Quarantined,
-                        Err(error) => {
-                            tracing::warn!(path = %entry.location, %error, "recovery capsule quarantine failed; retrying on the next scan pass");
-                            RecoveryCapsuleObjectWork::Failed
-                        }
-                    };
-                }
-                if known_live_digests.contains(&reference.sha256) {
-                    return RecoveryCapsuleObjectWork::Retained;
-                }
-                match self.load_recovery_capsule(&reference).await {
-                    Ok(_) => match self.store.delete(&entry.location).await {
-                        Ok(()) | Err(object_store::Error::NotFound { .. }) => {
-                            RecoveryCapsuleObjectWork::Deleted
-                        }
-                        Err(error) => {
-                            tracing::warn!(epoch, checkpoint_id, %error, "recovery capsule delete failed; retrying on the next scan pass");
-                            RecoveryCapsuleObjectWork::Failed
-                        }
-                    },
-                    Err(DecisionError::Conflict(error)) => {
-                        if matches!(
-                            self.store.head(&entry.location).await,
-                            Err(object_store::Error::NotFound { .. })
-                        ) {
-                            return RecoveryCapsuleObjectWork::Deleted;
-                        }
-                        match self
-                            .quarantine_recovery_capsule_object(&entry.location)
-                            .await
-                        {
-                            Ok(()) => {
-                                tracing::warn!(path = %entry.location, %error, "corrupt recovery capsule quarantined");
-                                RecoveryCapsuleObjectWork::Quarantined
-                            }
-                            Err(quarantine_error) => {
-                                tracing::warn!(path = %entry.location, %error, %quarantine_error, "corrupt recovery capsule quarantine failed; retrying on the next scan pass");
-                                RecoveryCapsuleObjectWork::Failed
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(path = %entry.location, %error, "recovery capsule read failed; retrying on the next scan pass");
-                        RecoveryCapsuleObjectWork::Failed
-                    }
-                }
-            })
-            .buffer_unordered(4)
-            .collect::<Vec<_>>()
-            .await;
-
-        let deleted = work
-            .iter()
-            .filter(|result| matches!(result, RecoveryCapsuleObjectWork::Deleted))
-            .count();
-        let quarantined = work
-            .iter()
-            .filter(|result| matches!(result, RecoveryCapsuleObjectWork::Quarantined))
-            .count();
-
-        let mut updated = cursor.clone();
-        updated.offset = if list_exhausted {
-            None
-        } else {
-            entries.iter().map(|entry| entry.location.to_string()).max()
-        };
-        let cursor_was_absent = update_version.is_none();
-        if updated != cursor
-            && !self
-                .compare_and_swap_recovery_capsule_gc_cursor(&updated, update_version)
-                .await?
-        {
-            return Ok(RecoveryCapsuleGcStep {
-                examined,
-                deleted,
-                quarantined,
-                pending: true,
-            });
-        }
-        if cursor_was_absent && updated == cursor {
-            let _ = self
-                .compare_and_swap_recovery_capsule_gc_cursor(&updated, None)
-                .await?;
-        }
-
-        Ok(RecoveryCapsuleGcStep {
-            examined,
-            deleted,
-            quarantined,
-            // Maintenance intentionally keeps cycling while a floor exists so delayed creates
-            // and previously failed paths cannot be stranded after a quiet pass.
-            pending: true,
-        })
-    }
-
     /// Advance the outcome GC floor for `epoch < before`, then best-effort delete raw
     /// tombstoned outcomes.
     ///
@@ -2751,7 +2311,7 @@ impl CheckpointDecisionStore {
                 .is_some_and(|versioned| versioned.floor.before_epoch >= before)
             {
                 // The floor may have become durable immediately before its publisher crashed.
-                // Re-enter the idempotent sweep so retries repair any raw outcomes or capsules
+                // Re-enter the idempotent sweep so retries repair any raw outcomes or indexes
                 // left behind by that incomplete retention pass.
                 break;
             }

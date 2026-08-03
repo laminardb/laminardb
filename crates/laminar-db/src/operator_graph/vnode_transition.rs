@@ -1,22 +1,17 @@
-//! Managed vnode revoke/restore transition phases for [`OperatorGraph`].
+//! Managed vnode revocation at an assignment boundary.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use rustc_hash::FxHashSet;
 
-use super::{
-    publish_cluster_execution_poison, ManagedVnodeRestore, ManagedVnodeTransition, OperatorGraph,
-};
+use super::{publish_cluster_execution_poison, ManagedVnodeTransition, OperatorGraph};
 use crate::error::DbError;
 use crate::operator::capability::{ManagedStateContract, OperatorStateClass};
 use crate::operator::sql_query::ClusterShuffleConfig;
-use crate::vnode_partial::{ValidatedVnodePartial, VnodePartial};
-use crate::vnode_restore_input::{VnodeRestoreAlignmentCopyReservation, VnodeRestoreArchive};
 use crate::vnode_transition_staging::{
-    InstalledVnodeStateBinding, InstalledVnodeStateHandle, PendingVnodeRestore,
-    PendingVnodeTransition, PendingVnodeTransitionHandle, VnodeTransitionKind,
-    VnodeTransitionOrigin,
+    InstalledVnodeStateBinding, InstalledVnodeStateHandle, PendingVnodeTransition,
+    PendingVnodeTransitionHandle, VnodeTransitionKind,
 };
 
 struct VnodeTransitionAuthoritySnapshot {
@@ -58,8 +53,7 @@ impl VnodeTransitionAuthoritySnapshot {
             }
             _ => {
                 return Err(DbError::ShuffleNotReady(
-                    "[LDB-6051] vnode transition requires matching active sender and receiver \
-                     assignment certificates"
+                    "[LDB-6051] vnode transition requires matching active sender and receiver assignment certificates"
                         .into(),
                 ));
             }
@@ -82,22 +76,14 @@ impl VnodeTransitionAuthoritySnapshot {
         self.assignment.owners().get(vnode as usize).is_some()
     }
 
-    fn restoring_vnodes_by_ownership(&self) -> (Vec<u32>, Vec<u32>) {
-        self.registry
-            .restoring_vnodes()
-            .into_iter()
-            .partition(|vnode| self.owns(*vnode))
-    }
-
-    fn revalidate_for_publication(&self, expected_vnodes: &[u32]) -> Result<(), DbError> {
+    fn revalidate_for_publication(&self) -> Result<(), DbError> {
         if self.sender.assignment_version() != self.assignment.version()
             || self.receiver.assignment_version() != self.assignment.version()
             || self.sender.active_assignment_digest() != Some(self.transport_digest)
             || self.receiver.active_assignment_digest() != Some(self.transport_digest)
         {
             return Err(DbError::ShuffleNotReady(
-                "[LDB-6051] shuffle assignment certificate changed before vnode-state \
-                 publication"
+                "[LDB-6051] shuffle assignment certificate changed before vnode-state publication"
                     .into(),
             ));
         }
@@ -108,13 +94,6 @@ impl VnodeTransitionAuthoritySnapshot {
             return Err(DbError::ShuffleNotReady(format!(
                 "[LDB-6051] vnode assignment changed from {} before vnode-state publication",
                 self.assignment.version()
-            )));
-        }
-        let current_expected = self.registry.restoring_vnodes();
-        if current_expected != expected_vnodes {
-            return Err(DbError::ShuffleNotReady(format!(
-                "[LDB-6051] restoring vnode roster changed from {expected_vnodes:?} to \
-                 {current_expected:?} before vnode-state publication"
             )));
         }
         Ok(())
@@ -168,8 +147,7 @@ impl FinalOwnerExitAuthoritySnapshot {
             || config.receiver.incarnation() != predecessor_incarnation
         {
             return Err(DbError::Checkpoint(
-                "[LDB-6051] final-owner-exit predecessor process identity does not match the \
-                 local shuffle endpoints"
+                "[LDB-6051] final-owner-exit predecessor process identity does not match local shuffle endpoints"
                     .into(),
             ));
         }
@@ -191,8 +169,7 @@ impl FinalOwnerExitAuthoritySnapshot {
             })
         {
             return Err(DbError::Checkpoint(
-                "[LDB-6051] final-owner-exit revoke roster is empty, out of range, or still \
-                 target-owned"
+                "[LDB-6051] final-owner-exit revoke roster is empty, out of range, or still target-owned"
                     .into(),
             ));
         }
@@ -227,14 +204,7 @@ impl FinalOwnerExitAuthoritySnapshot {
         }
         if current.owners().contains(&self.self_id) {
             return Err(DbError::ShuffleNotReady(
-                "[LDB-6051] final-owner-exit target acquired local ownership before publication"
-                    .into(),
-            ));
-        }
-        if self.registry.any_restoring() {
-            return Err(DbError::ShuffleNotReady(
-                "[LDB-6051] vnode restore lifecycle appeared before final-owner-exit publication"
-                    .into(),
+                "[LDB-6051] final-owner-exit target regained ownership".into(),
             ));
         }
         Ok(())
@@ -246,7 +216,6 @@ struct PreparedVnodeTransition {
     pending_handle: PendingVnodeTransitionHandle,
     pending: Arc<PendingVnodeTransition>,
     revoked: FxHashSet<u32>,
-    expected_vnodes: Vec<u32>,
     installed_state: InstalledVnodeStateHandle,
     installed_binding: InstalledVnodeStateBinding,
 }
@@ -259,40 +228,10 @@ struct PreparedFinalOwnerExit {
     installed_state: InstalledVnodeStateHandle,
 }
 
-struct DecodedVnode<'a> {
-    vnode: u32,
-    chain: Vec<ValidatedVnodePartial<'a>>,
-    operators: Vec<(usize, &'a str)>,
-}
-
-struct ResolvedOperator<'a> {
-    node_idx: usize,
-    #[cfg(test)]
-    name: &'a str,
-    base: VnodeRestoreArchive<'a>,
-    deltas: Vec<VnodeRestoreArchive<'a>>,
-}
-
-type BorrowedOpChain<'a> = (&'a [u8], Vec<VnodeRestoreArchive<'a>>);
-
-struct NormalizedResolvedVnodes<'a> {
-    // Field order keeps the copy charge until every aligned owner has been dropped.
-    vnodes: Vec<ResolvedVnode<'a>>,
-    _alignment_copy_reservation: Option<VnodeRestoreAlignmentCopyReservation>,
-}
-
-struct ResolvedVnode<'a> {
-    vnode: u32,
-    operators: Vec<ResolvedOperator<'a>>,
-}
-
 struct PreparedManagedOperators {
     node_indices: Vec<usize>,
 }
 
-/// Scope panic cleanup to the rare transition path instead of retaining checkpoint bodies or
-/// locking the transition slot for every steady-state graph cycle. Callers disarm ordinary
-/// validation/authority errors; publication arms only after every fallible check passes.
 struct VnodeTransitionUnwindGuard {
     poisoned: Arc<AtomicBool>,
     installed_state: InstalledVnodeStateHandle,
@@ -302,29 +241,19 @@ struct VnodeTransitionUnwindGuard {
 }
 
 impl VnodeTransitionUnwindGuard {
-    fn new(
-        poisoned: Arc<AtomicBool>,
-        installed_state: InstalledVnodeStateHandle,
-        pending_handle: PendingVnodeTransitionHandle,
-        pending: Arc<PendingVnodeTransition>,
-        armed: bool,
-    ) -> Self {
-        Self {
-            poisoned,
-            installed_state,
-            pending_handle,
-            pending,
-            armed,
-        }
-    }
-
     fn armed(
         poisoned: Arc<AtomicBool>,
         installed_state: InstalledVnodeStateHandle,
         pending_handle: PendingVnodeTransitionHandle,
         pending: Arc<PendingVnodeTransition>,
     ) -> Self {
-        Self::new(poisoned, installed_state, pending_handle, pending, true)
+        Self {
+            poisoned,
+            installed_state,
+            pending_handle,
+            pending,
+            armed: true,
+        }
     }
 
     fn disarmed(
@@ -333,7 +262,13 @@ impl VnodeTransitionUnwindGuard {
         pending_handle: PendingVnodeTransitionHandle,
         pending: Arc<PendingVnodeTransition>,
     ) -> Self {
-        Self::new(poisoned, installed_state, pending_handle, pending, false)
+        Self {
+            poisoned,
+            installed_state,
+            pending_handle,
+            pending,
+            armed: false,
+        }
     }
 
     fn arm(&mut self) {
@@ -420,126 +355,80 @@ impl OperatorGraph {
             .is_some_and(|handle| handle.lock().is_some())
     }
 
-    /// Complete one caller-staged revoke/rehydration batch at the top of a graph cycle.
-    ///
-    /// Structural validation covers the exact owned/restoring vnode roster and every operator
-    /// chain before any live state changes. Production managed operators prepare complete private
-    /// replacements first. Any preparation or authority failure aborts those replacements without
-    /// poisoning this graph generation. Publication is synchronous and infallible; only an unwind
-    /// after publication begins has an indeterminate outcome.
     pub(super) fn apply_pending_vnode_transition(&mut self) -> Result<(), DbError> {
         let Some(transition) = self.prepare_pending_vnode_transition()? else {
             return Ok(());
         };
-        let mut transition_unwind = VnodeTransitionUnwindGuard::armed(
+        let mut unwind = VnodeTransitionUnwindGuard::armed(
             Arc::clone(&self.execution_poisoned),
             Arc::clone(&transition.installed_state),
             Arc::clone(&transition.pending_handle),
             Arc::clone(&transition.pending),
         );
-        let restore_binding = transition.pending.restore_binding();
-        let attempt = restore_binding
-            .map(crate::checkpoint_coordinator::ValidatedClusterVnodeTransitionBinding::attempt);
-        let restore_profile = restore_binding.map(
-            crate::checkpoint_coordinator::ValidatedClusterVnodeTransitionBinding::restore_profile,
-        );
-        let decoded = match self.preflight_decoded_vnodes(
-            transition.pending.restores(),
-            attempt,
-            restore_profile,
-        ) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                transition_unwind.complete();
-                return Err(error);
-            }
-        };
-        let resolved = match self.resolve_decoded_vnodes(&decoded) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                transition_unwind.complete();
-                return Err(error);
-            }
-        };
-        let resolved = match Self::normalize_inner_archives(resolved, &transition.pending) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                transition_unwind.complete();
-                return Err(error);
-            }
-        };
-        let prepared = match self.prepare_managed_operators(
-            transition.pending.target(),
-            &transition.revoked,
-            &resolved.vnodes,
-        ) {
+        let prepared = match self
+            .prepare_managed_operators(transition.pending.target(), &transition.revoked)
+        {
             Ok(prepared) => prepared,
             Err(error) => {
-                transition_unwind.complete();
+                unwind.complete();
                 return Err(error);
             }
         };
         #[cfg(test)]
-        let test_callbacks_mutated_state = match self.run_test_vnode_transition_callbacks(
+        let callbacks_mutated_state = match self.run_test_vnode_revoke_callbacks(
             &transition.installed_state,
             &transition.pending_handle,
             &transition.pending,
             &transition.revoked,
-            &resolved.vnodes,
         ) {
             Ok(callbacks_run) => callbacks_run,
             Err(error) => {
                 self.abort_and_finish_managed_operators(&prepared);
-                transition_unwind.complete();
+                unwind.complete();
                 return Err(error);
             }
         };
         #[cfg(not(test))]
-        let test_callbacks_mutated_state = false;
-        drop(resolved);
-        drop(decoded);
-        transition_unwind.complete();
-        self.publish_vnode_transition(transition, &prepared, test_callbacks_mutated_state)
+        let callbacks_mutated_state = false;
+        unwind.complete();
+        self.publish_vnode_transition(transition, &prepared, callbacks_mutated_state)
     }
 
     pub(super) fn apply_committed_final_owner_exit(&mut self) -> Result<(), DbError> {
         let transition = self.prepare_final_owner_exit()?;
-        let mut transition_unwind = VnodeTransitionUnwindGuard::armed(
+        let mut unwind = VnodeTransitionUnwindGuard::armed(
             Arc::clone(&self.execution_poisoned),
             Arc::clone(&transition.installed_state),
             Arc::clone(&transition.pending_handle),
             Arc::clone(&transition.pending),
         );
-        let prepared = match self.prepare_managed_operators(
-            transition.pending.target(),
-            &transition.revoked,
-            &[],
-        ) {
+        let prepared = match self
+            .prepare_managed_operators(transition.pending.target(), &transition.revoked)
+        {
             Ok(prepared) => prepared,
             Err(error) => {
-                transition_unwind.complete();
+                unwind.complete();
                 return Err(error);
             }
         };
         #[cfg(test)]
-        let test_callbacks_mutated_state = match self.run_test_vnode_transition_callbacks(
+        let callbacks_mutated_state = match self.run_test_vnode_revoke_callbacks(
             &transition.installed_state,
             &transition.pending_handle,
             &transition.pending,
             &transition.revoked,
-            &[],
         ) {
             Ok(callbacks_run) => callbacks_run,
             Err(error) => {
                 self.abort_and_finish_managed_operators(&prepared);
-                transition_unwind.complete();
+                unwind.complete();
                 return Err(error);
             }
         };
         #[cfg(not(test))]
-        let test_callbacks_mutated_state = false;
-        transition_unwind.complete();
-        self.publish_final_owner_exit(&transition, &prepared, test_callbacks_mutated_state)
+        let callbacks_mutated_state = false;
+        unwind.complete();
+        self.publish_final_owner_exit(&transition, &prepared, callbacks_mutated_state)
     }
 
     fn pending_transition_snapshot(
@@ -563,6 +452,33 @@ impl OperatorGraph {
         Ok(())
     }
 
+    fn installed_state_handle(&self) -> Result<InstalledVnodeStateHandle, DbError> {
+        self.installed_vnode_state
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                DbError::Checkpoint(
+                    "[LDB-6051] pending vnode transition has no installed-state publication handle"
+                        .into(),
+                )
+            })
+    }
+
+    fn validate_installed_predecessor(
+        pending: &PendingVnodeTransition,
+        installed_state: &InstalledVnodeStateHandle,
+    ) -> Result<(), DbError> {
+        if !installed_state.lock().as_ref().is_some_and(|installed| {
+            installed.matches(pending.predecessor(), pending.pipeline_identity())
+        }) {
+            return Err(DbError::Checkpoint(
+                "[LDB-6051] graph does not have the exact predecessor assignment state installed"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn prepare_final_owner_exit(&self) -> Result<PreparedFinalOwnerExit, DbError> {
         let (pending_handle, pending) = self.pending_transition_snapshot().ok_or_else(|| {
             DbError::Checkpoint(
@@ -572,29 +488,16 @@ impl OperatorGraph {
         self.validate_pending_pipeline_identity(&pending)?;
         let transition = match pending.kind() {
             VnodeTransitionKind::CommittedFinalOwnerExit(transition) => transition.clone(),
-            VnodeTransitionKind::OwnershipChange => {
+            VnodeTransitionKind::Revoke => {
                 return Err(DbError::Checkpoint(
-                    "[LDB-6051] control-only vnode transition has no committed final-owner-exit authority"
+                    "[LDB-6051] revoke transition has no committed final-owner-exit authority"
                         .into(),
                 ));
             }
         };
-        match pending.origin() {
-            VnodeTransitionOrigin::AssignmentChange { predecessor }
-                if *predecessor == transition.predecessor => {}
-            _ => {
-                return Err(DbError::Checkpoint(
-                    "[LDB-6051] final-owner-exit transition has invalid predecessor authority"
-                        .into(),
-                ));
-            }
-        }
-        if !pending.acquired_vnodes().is_empty()
-            || !pending.restores().is_empty()
-            || pending.restore_binding().is_some()
-        {
+        if *pending.predecessor() != transition.predecessor {
             return Err(DbError::Checkpoint(
-                "[LDB-6051] final-owner-exit cleanup cannot include vnode restore state".into(),
+                "[LDB-6051] final-owner-exit transition has invalid predecessor authority".into(),
             ));
         }
         let revoked: FxHashSet<u32> = pending.revoked_vnodes().iter().copied().collect();
@@ -603,21 +506,8 @@ impl OperatorGraph {
                 "[LDB-6051] final-owner-exit cleanup has no cluster ownership scope".into(),
             )
         })?;
-        if config.registry.any_restoring() {
-            return Err(DbError::Checkpoint(
-                "[LDB-6051] final-owner-exit cleanup cannot include restoring vnodes".into(),
-            ));
-        }
-        let installed_state = self
-            .installed_vnode_state
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| {
-                DbError::Checkpoint(
-                    "[LDB-6051] final-owner-exit cleanup has no installed-state publication handle"
-                        .into(),
-                )
-            })?;
+        let installed_state = self.installed_state_handle()?;
+        Self::validate_installed_predecessor(&pending, &installed_state)?;
         let authority = FinalOwnerExitAuthoritySnapshot::capture(config, &transition, &revoked)?;
         Ok(PreparedFinalOwnerExit {
             authority,
@@ -629,50 +519,24 @@ impl OperatorGraph {
     }
 
     fn prepare_pending_vnode_transition(&self) -> Result<Option<PreparedVnodeTransition>, DbError> {
-        let pending_snapshot = self.pending_transition_snapshot();
-        if pending_snapshot.is_none() {
-            if self
-                .cluster_shuffle
-                .as_ref()
-                .is_some_and(|config| config.registry.any_restoring())
-            {
-                return Err(DbError::Checkpoint(
-                    "[LDB-6051] vnode lifecycle has restoring slots but no pending transition"
-                        .into(),
-                ));
-            }
+        let Some((pending_handle, pending)) = self.pending_transition_snapshot() else {
             return Ok(None);
-        }
-        let (pending_handle, pending) = pending_snapshot.expect("checked above");
-        if matches!(
-            pending.kind(),
-            VnodeTransitionKind::CommittedFinalOwnerExit(_)
-        ) {
+        };
+        if !matches!(pending.kind(), VnodeTransitionKind::Revoke) {
             return Err(DbError::ShuffleNotReady(
-                "[LDB-6051] committed final-owner-exit cleanup requires the fenced control-only execution path"
+                "[LDB-6051] committed final-owner-exit cleanup requires the fenced control path"
                     .into(),
             ));
         }
         self.validate_pending_pipeline_identity(&pending)?;
-        match pending.origin() {
-            VnodeTransitionOrigin::BootRecovery => {
-                if pending.restore_binding().is_none() || !pending.revoked_vnodes().is_empty() {
-                    return Err(DbError::Checkpoint(
-                        "[LDB-6051] boot recovery transition has invalid restore/revoke authority"
-                            .into(),
-                    ));
-                }
-            }
-            VnodeTransitionOrigin::AssignmentChange { predecessor }
-                if predecessor.assignment_version.checked_add(1)
-                    == Some(pending.target().assignment_version) => {}
-            VnodeTransitionOrigin::AssignmentChange { predecessor } => {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6051] pending assignment transition is not adjacent: {} -> {}",
-                    predecessor.assignment_version,
-                    pending.target().assignment_version
-                )));
-            }
+        if pending.predecessor().assignment_version.checked_add(1)
+            != Some(pending.target().assignment_version)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6051] pending assignment transition is not adjacent: {} -> {}",
+                pending.predecessor().assignment_version,
+                pending.target().assignment_version
+            )));
         }
         let config = self.cluster_shuffle.as_ref().ok_or_else(|| {
             DbError::Checkpoint(
@@ -680,58 +544,25 @@ impl OperatorGraph {
             )
         })?;
         let authority = VnodeTransitionAuthoritySnapshot::capture(config, pending.target())?;
-        let (expected_vnodes, unowned_restoring_vnodes) = authority.restoring_vnodes_by_ownership();
-        if !unowned_restoring_vnodes.is_empty() {
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6051] unowned vnodes remain in restoring state: {unowned_restoring_vnodes:?}"
-            )));
-        }
-        if pending.acquired_vnodes() != expected_vnodes {
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6051] pending acquired roster {:?} does not match the exact owned/restoring roster {expected_vnodes:?}",
-                pending.acquired_vnodes()
-            )));
-        }
         let revoked: FxHashSet<u32> = pending.revoked_vnodes().iter().copied().collect();
-        let mut invalid_revokes: Vec<u32> = revoked
-            .iter()
-            .copied()
-            .filter(|vnode| !authority.contains_vnode(*vnode))
-            .collect();
-        invalid_revokes.sort_unstable();
-        if !invalid_revokes.is_empty() {
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6051] revoked vnode ids {invalid_revokes:?} are outside the target assignment cardinality"
-            )));
-        }
-        let mut owned_revokes_without_restore: Vec<u32> = revoked
-            .iter()
-            .copied()
-            .filter(|vnode| {
-                authority.owns(*vnode) && pending.acquired_vnodes().binary_search(vnode).is_err()
-            })
-            .collect();
-        owned_revokes_without_restore.sort_unstable();
-        if !owned_revokes_without_restore.is_empty() {
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6051] target-owned revoked vnodes {owned_revokes_without_restore:?} have no matching restore"
-            )));
-        }
-        if revoked.is_empty() && pending.restores().is_empty() {
+        if revoked.is_empty() {
             return Err(DbError::Checkpoint(
                 "[LDB-6051] pending vnode transition contains no graph work".into(),
             ));
         }
-        let installed_state = self
-            .installed_vnode_state
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| {
-                DbError::Checkpoint(
-                    "[LDB-6051] pending vnode transition has no installed-state publication handle"
-                        .into(),
-                )
-            })?;
+        let mut invalid: Vec<u32> = revoked
+            .iter()
+            .copied()
+            .filter(|vnode| !authority.contains_vnode(*vnode) || authority.owns(*vnode))
+            .collect();
+        invalid.sort_unstable();
+        if !invalid.is_empty() {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6051] revoked vnodes {invalid:?} are outside the target or remain locally owned"
+            )));
+        }
+        let installed_state = self.installed_state_handle()?;
+        Self::validate_installed_predecessor(&pending, &installed_state)?;
         let installed_binding = InstalledVnodeStateBinding::new(
             pending.target().clone(),
             pending.pipeline_identity().clone(),
@@ -741,259 +572,9 @@ impl OperatorGraph {
             pending_handle,
             pending,
             revoked,
-            expected_vnodes,
             installed_state,
             installed_binding,
         }))
-    }
-
-    fn preflight_decoded_vnodes<'body>(
-        &self,
-        staged: &'body [PendingVnodeRestore],
-        attempt: Option<laminar_core::state::CheckpointAttempt>,
-        restore_profile: Option<laminar_core::checkpoint::VnodeRestoreLimitProfile>,
-    ) -> Result<Vec<DecodedVnode<'body>>, DbError> {
-        // Decode and bind every participant before the first revoke or restore callback.
-        let allocation_error = |context: &str, error: std::collections::TryReserveError| {
-            DbError::Checkpoint(format!(
-                "[LDB-6051] {context} allocation failed during vnode restore preflight: {error}"
-            ))
-        };
-        let mut decoded = Vec::new();
-        decoded
-            .try_reserve_exact(staged.len())
-            .map_err(|error| allocation_error("decoded vnode roster", error))?;
-        for rehydrated in staged {
-            let vnode = rehydrated.vnode();
-            let Some(_attempt) = attempt else {
-                return Err(DbError::Checkpoint(
-                    "[LDB-6051] pending vnode restore has no exact committed attempt".into(),
-                ));
-            };
-            let Some(restore_profile) = restore_profile else {
-                return Err(DbError::Checkpoint(
-                    "[LDB-6051] pending vnode restore has no committed restore profile".into(),
-                ));
-            };
-            if rehydrated.chain().is_empty() {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6051] vnode {vnode} rehydration chain has no links"
-                )));
-            }
-            let expected = self.managed_vnode_participants(vnode)?;
-            let mut chain = Vec::new();
-            chain
-                .try_reserve_exact(rehydrated.chain().len())
-                .map_err(|error| allocation_error("borrowed outer chain", error))?;
-            for (link, bytes) in rehydrated.chain().iter().enumerate() {
-                let validated = VnodePartial::validate_for_restore(bytes, restore_profile);
-                chain.push(validated.map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6051] vnode {vnode} rehydration chain link {link} is corrupt: \
-                         {error}"
-                    ))
-                })?);
-            }
-
-            let mut artifact_names = Vec::new();
-            artifact_names
-                .try_reserve_exact(expected.len())
-                .map_err(|error| allocation_error("artifact operator roster", error))?;
-            for (link, partial) in chain.iter().copied().enumerate() {
-                let mut link_names = Vec::new();
-                link_names
-                    .try_reserve_exact(partial.entry_count())
-                    .map_err(|error| allocation_error("outer-link operator roster", error))?;
-                for (name, _) in partial.operators().chain(partial.deltas()) {
-                    if name.is_empty() {
-                        return Err(DbError::Checkpoint(format!(
-                            "[LDB-6051] vnode {vnode} rehydration chain link {link} has an empty \
-                             operator name"
-                        )));
-                    }
-                    if link_names.contains(&name) {
-                        return Err(DbError::Checkpoint(format!(
-                            "[LDB-6051] vnode {vnode} rehydration chain link {link} repeats \
-                             operator '{name}'"
-                        )));
-                    }
-                    link_names.push(name);
-                    if !artifact_names.contains(&name) {
-                        artifact_names
-                            .try_reserve(1)
-                            .map_err(|error| allocation_error("artifact operator roster", error))?;
-                        artifact_names.push(name);
-                    }
-                }
-            }
-            artifact_names.sort_unstable();
-
-            let mut missing = Vec::new();
-            missing
-                .try_reserve_exact(expected.len())
-                .map_err(|error| allocation_error("missing operator roster", error))?;
-            for (_, name) in &expected {
-                if !artifact_names.contains(name) {
-                    missing.push(*name);
-                }
-            }
-            let mut unexpected = Vec::new();
-            unexpected
-                .try_reserve_exact(artifact_names.len())
-                .map_err(|error| allocation_error("unexpected operator roster", error))?;
-            for name in &artifact_names {
-                if !expected.iter().any(|(_, expected)| expected == name) {
-                    unexpected.push(*name);
-                }
-            }
-            if !missing.is_empty() || !unexpected.is_empty() {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6051] vnode {vnode} managed-state roster mismatch: missing={missing:?}, unexpected={unexpected:?}"
-                )));
-            }
-
-            let mut operators = Vec::new();
-            operators
-                .try_reserve_exact(expected.len())
-                .map_err(|error| allocation_error("operator binding roster", error))?;
-            for (node_idx, expected_name) in expected {
-                let archived_name = artifact_names
-                    .iter()
-                    .copied()
-                    .find(|name| *name == expected_name)
-                    .expect("complete roster validation established every expected name");
-                operators.push((node_idx, archived_name));
-            }
-            decoded.push(DecodedVnode {
-                vnode,
-                chain,
-                operators,
-            });
-        }
-        Ok(decoded)
-    }
-
-    fn resolve_borrowed_op_chain<'body>(
-        chain: &[ValidatedVnodePartial<'body>],
-        op: &str,
-    ) -> Result<Option<BorrowedOpChain<'body>>, DbError> {
-        let Some(base_idx) = chain
-            .iter()
-            .rposition(|partial| partial.operators().any(|(name, _)| name == op))
-        else {
-            return Ok(None);
-        };
-        let base = chain[base_idx]
-            .operators()
-            .find(|(name, _)| *name == op)
-            .map(|(_, bytes)| bytes)
-            .expect("base index was selected from the same checked operator directory");
-        let delta_count = chain[base_idx + 1..]
-            .iter()
-            .filter(|partial| partial.deltas().any(|(name, _)| name == op))
-            .count();
-        let mut deltas = Vec::new();
-        deltas.try_reserve_exact(delta_count).map_err(|error| {
-            DbError::Checkpoint(format!(
-                "[LDB-6051] resolved delta roster allocation failed: {error}"
-            ))
-        })?;
-        for partial in &chain[base_idx + 1..] {
-            if let Some((_, delta)) = partial.deltas().find(|(name, _)| *name == op) {
-                deltas.push(VnodeRestoreArchive::Borrowed(delta));
-            }
-        }
-        Ok(Some((base, deltas)))
-    }
-
-    fn resolve_decoded_vnodes<'body>(
-        &self,
-        decoded: &[DecodedVnode<'body>],
-    ) -> Result<Vec<ResolvedVnode<'body>>, DbError> {
-        let mut resolved = Vec::new();
-        resolved.try_reserve_exact(decoded.len()).map_err(|error| {
-            DbError::Checkpoint(format!(
-                "[LDB-6051] resolved vnode roster allocation failed: {error}"
-            ))
-        })?;
-        for vnode in decoded {
-            let mut operators = Vec::new();
-            operators
-                .try_reserve_exact(vnode.operators.len())
-                .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6051] resolved operator roster allocation failed: {error}"
-                    ))
-                })?;
-            for (node_idx, name) in &vnode.operators {
-                let (base, deltas) = Self::resolve_borrowed_op_chain(&vnode.chain, name)?
-                    .ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "[LDB-6051] vnode {} rehydration chain has no FULL base \
-                             for operator '{name}'",
-                            vnode.vnode
-                        ))
-                    })?;
-                operators.push(ResolvedOperator {
-                    node_idx: *node_idx,
-                    #[cfg(test)]
-                    name,
-                    base: VnodeRestoreArchive::Borrowed(base),
-                    deltas,
-                });
-            }
-            resolved.push(ResolvedVnode {
-                vnode: vnode.vnode,
-                operators,
-            });
-        }
-        Ok(resolved)
-    }
-
-    fn normalize_inner_archives<'decoded>(
-        mut resolved: Vec<ResolvedVnode<'decoded>>,
-        pending: &PendingVnodeTransition,
-    ) -> Result<NormalizedResolvedVnodes<'decoded>, DbError> {
-        let copy_bytes = resolved
-            .iter()
-            .flat_map(|vnode| vnode.operators.iter())
-            .try_fold(0_u64, |total, operator| {
-                std::iter::once(&operator.base)
-                    .chain(operator.deltas.iter())
-                    .try_fold(total, |total, archive| {
-                        let bytes =
-                            u64::try_from(archive.alignment_copy_bytes()).map_err(|_| {
-                                DbError::Checkpoint(
-                                    "[LDB-6050] inner archive alignment-copy size does not fit u64"
-                                        .into(),
-                                )
-                            })?;
-                        total.checked_add(bytes).ok_or_else(|| {
-                            DbError::Checkpoint(
-                                "[LDB-6050] inner archive alignment-copy accounting overflow"
-                                    .into(),
-                            )
-                        })
-                    })
-            })?;
-        let alignment_copy_reservation = if copy_bytes == 0 {
-            None
-        } else {
-            Some(pending.reserve_inner_alignment_copy(copy_bytes)?)
-        };
-
-        for archive in resolved
-            .iter_mut()
-            .flat_map(|vnode| vnode.operators.iter_mut())
-            .flat_map(|operator| std::iter::once(&mut operator.base).chain(&mut operator.deltas))
-        {
-            archive.normalize_alignment()?;
-        }
-
-        Ok(NormalizedResolvedVnodes {
-            vnodes: resolved,
-            _alignment_copy_reservation: alignment_copy_reservation,
-        })
     }
 
     fn relevant_revoked_vnodes(
@@ -1010,8 +591,7 @@ impl OperatorGraph {
             }),
             OperatorStateClass::VnodeKeyed => Ok(revoked.clone()),
             state_class => Err(DbError::Checkpoint(format!(
-                "[LDB-6051] managed operator '{}' has unsupported revoke placement \
-                 {state_class:?}",
+                "[LDB-6051] managed operator '{}' has unsupported revoke placement {state_class:?}",
                 node.name
             ))),
         }
@@ -1038,7 +618,6 @@ impl OperatorGraph {
         &mut self,
         target: &laminar_core::checkpoint::CheckpointAssignmentFence,
         revoked: &FxHashSet<u32>,
-        resolved: &[ResolvedVnode<'_>],
     ) -> Result<PreparedManagedOperators, DbError> {
         let mut attempted = Vec::new();
         for node_idx in self.canonical_managed_operator_indices() {
@@ -1053,7 +632,6 @@ impl OperatorGraph {
                 #[cfg(test)]
                 ManagedStateContract::TestVnodeStateV1 => continue,
             }
-
             let relevant_revoked = match self.relevant_revoked_vnodes(node_idx, revoked) {
                 Ok(relevant) => relevant,
                 Err(error) => {
@@ -1064,31 +642,14 @@ impl OperatorGraph {
                     return Err(error);
                 }
             };
-            let restores: Vec<ManagedVnodeRestore<'_>> = resolved
-                .iter()
-                .filter_map(|vnode| {
-                    vnode
-                        .operators
-                        .iter()
-                        .find(|operator| operator.node_idx == node_idx)
-                        .map(|operator| ManagedVnodeRestore {
-                            vnode: vnode.vnode,
-                            base: operator.base.as_slice(),
-                            deltas: &operator.deltas,
-                        })
-                })
-                .collect();
-            if relevant_revoked.is_empty() && restores.is_empty() {
+            if relevant_revoked.is_empty() {
                 continue;
             }
-
-            // Include the current participant in abort-all even if its prepare method stages a
-            // private value and then discovers a later validation error.
             attempted.push(node_idx);
             let input = ManagedVnodeTransition {
                 target,
                 revoked: &relevant_revoked,
-                restores: &restores,
+                restores: &[],
             };
             if let Err(error) = self.nodes[node_idx]
                 .operator
@@ -1100,8 +661,7 @@ impl OperatorGraph {
                 };
                 self.abort_and_finish_managed_operators(&prepared);
                 return Err(DbError::Checkpoint(format!(
-                    "[LDB-6051] vnode transition preparation for operator '{name}' failed: \
-                     {error}"
+                    "[LDB-6051] vnode revocation preparation for operator '{name}' failed: {error}"
                 )));
             }
         }
@@ -1109,7 +669,7 @@ impl OperatorGraph {
             node_indices: attempted,
         };
         self.observe_managed_state_accounting(&prepared.node_indices);
-        if let Err(error) = self.validate_managed_state_budget("vnode transition preparation") {
+        if let Err(error) = self.validate_managed_state_budget("vnode revocation preparation") {
             self.abort_and_finish_managed_operators(&prepared);
             return Err(error);
         }
@@ -1141,85 +701,46 @@ impl OperatorGraph {
     }
 
     #[cfg(test)]
-    fn run_test_vnode_transition_callbacks(
+    fn run_test_vnode_revoke_callbacks(
         &mut self,
         installed_state: &InstalledVnodeStateHandle,
         pending_handle: &PendingVnodeTransitionHandle,
         pending: &Arc<PendingVnodeTransition>,
         revoked: &FxHashSet<u32>,
-        resolved: &[ResolvedVnode<'_>],
     ) -> Result<bool, DbError> {
-        let mut callbacks_run = false;
-        if !revoked.is_empty() {
-            let mut revoke_callbacks: Vec<(usize, FxHashSet<u32>)> = self
-                .nodes
-                .iter()
-                .enumerate()
-                .filter(|(_, node)| {
-                    !node.removed
-                        && node.capability.managed_state
-                            == Some(ManagedStateContract::TestVnodeStateV1)
-                })
-                .map(|(index, _)| {
-                    self.relevant_revoked_vnodes(index, revoked)
-                        .map(|relevant| (index, relevant))
-                })
-                .collect::<Result<_, DbError>>()?;
-            revoke_callbacks.retain(|(_, relevant)| !relevant.is_empty());
-            revoke_callbacks.sort_unstable_by(|(left, _), (right, _)| {
-                self.nodes[*left]
-                    .name
-                    .cmp(&self.nodes[*right].name)
-                    .then_with(|| left.cmp(right))
-            });
-            for (node_idx, relevant) in revoke_callbacks {
-                callbacks_run = true;
-                let node = &mut self.nodes[node_idx];
-                if let Err(error) = node.operator.drop_owned_vnodes(&relevant) {
-                    let phase = format!("revoke callback for operator '{}'", node.name);
-                    return Err(callback_error(
-                        &self.execution_poisoned,
-                        installed_state,
-                        pending_handle,
-                        pending,
-                        &phase,
-                        error,
-                    ));
-                }
-            }
-        }
-
-        for vnode in resolved {
-            for operator in &vnode.operators {
-                if self.nodes[operator.node_idx].capability.managed_state
-                    != Some(ManagedStateContract::TestVnodeStateV1)
-                {
-                    continue;
-                }
-                callbacks_run = true;
-                let deltas: Vec<&[u8]> = operator
-                    .deltas
-                    .iter()
-                    .map(VnodeRestoreArchive::as_slice)
-                    .collect();
-                if let Err(error) = self.nodes[operator.node_idx].operator.apply_vnode_chain(
-                    vnode.vnode,
-                    operator.base.as_slice(),
-                    &deltas,
-                ) {
-                    let phase = format!(
-                        "restore callback for vnode {} operator '{}'",
-                        vnode.vnode, operator.name
-                    );
-                    return Err(callback_error(
-                        &self.execution_poisoned,
-                        installed_state,
-                        pending_handle,
-                        pending,
-                        &phase,
-                        error,
-                    ));
-                }
+        let mut callbacks: Vec<(usize, FxHashSet<u32>)> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                !node.removed
+                    && node.capability.managed_state == Some(ManagedStateContract::TestVnodeStateV1)
+            })
+            .map(|(index, _)| {
+                self.relevant_revoked_vnodes(index, revoked)
+                    .map(|relevant| (index, relevant))
+            })
+            .collect::<Result<_, DbError>>()?;
+        callbacks.retain(|(_, relevant)| !relevant.is_empty());
+        callbacks.sort_unstable_by(|(left, _), (right, _)| {
+            self.nodes[*left]
+                .name
+                .cmp(&self.nodes[*right].name)
+                .then_with(|| left.cmp(right))
+        });
+        let callbacks_run = !callbacks.is_empty();
+        for (node_idx, relevant) in callbacks {
+            let node = &mut self.nodes[node_idx];
+            if let Err(error) = node.operator.drop_owned_vnodes(&relevant) {
+                let phase = format!("revoke callback for operator '{}'", node.name);
+                return Err(callback_error(
+                    &self.execution_poisoned,
+                    installed_state,
+                    pending_handle,
+                    pending,
+                    &phase,
+                    error,
+                ));
             }
         }
         Ok(callbacks_run)
@@ -1231,19 +752,18 @@ impl OperatorGraph {
         installed_state: &InstalledVnodeStateHandle,
         pending_handle: &PendingVnodeTransitionHandle,
         pending: &Arc<PendingVnodeTransition>,
-        test_callbacks_mutated_state: bool,
+        callbacks_mutated_state: bool,
         error: DbError,
     ) -> DbError {
         self.abort_and_finish_managed_operators(prepared);
-        if test_callbacks_mutated_state {
+        if callbacks_mutated_state {
             publish_cluster_execution_poison(
                 &self.execution_poisoned,
                 Some(installed_state),
                 Some((pending_handle, pending)),
             );
             DbError::StatefulOperatorPartialApply(format!(
-                "[LDB-6051] test vnode callback mutated live state before publication failed: \
-                 {error}"
+                "[LDB-6051] test vnode callback mutated live state before publication failed: {error}"
             ))
         } else {
             error
@@ -1254,71 +774,73 @@ impl OperatorGraph {
         &mut self,
         transition: PreparedVnodeTransition,
         prepared: &PreparedManagedOperators,
-        test_callbacks_mutated_state: bool,
+        callbacks_mutated_state: bool,
     ) -> Result<(), DbError> {
         let PreparedVnodeTransition {
             authority,
             pending_handle,
             pending,
             revoked,
-            expected_vnodes,
             installed_state,
             installed_binding,
         } = transition;
-        // Declare the unwind guard before both mutex guards. On a publication panic, Rust drops
-        // those guards before exact pending cleanup attempts to lock either handle.
         let mut publication = VnodeTransitionUnwindGuard::disarmed(
             Arc::clone(&self.execution_poisoned),
             Arc::clone(&installed_state),
             Arc::clone(&pending_handle),
             Arc::clone(&pending),
         );
-        let pending_slot =
-            exact_pending_slot(&pending_handle, &pending, "vnode lifecycle callbacks");
-        let mut pending_slot = match pending_slot {
-            Ok(slot) => slot,
-            Err(error) => {
-                return Err(self.abort_prepublication(
-                    prepared,
-                    &installed_state,
-                    &pending_handle,
-                    &pending,
-                    test_callbacks_mutated_state,
-                    error,
-                ));
-            }
+        let mut pending_slot =
+            match exact_pending_slot(&pending_handle, &pending, "vnode lifecycle callbacks") {
+                Ok(slot) => slot,
+                Err(error) => {
+                    return Err(self.abort_prepublication(
+                        prepared,
+                        &installed_state,
+                        &pending_handle,
+                        &pending,
+                        callbacks_mutated_state,
+                        error,
+                    ));
+                }
+            };
+        let mut installed = installed_state.lock();
+        let validation = if installed.as_ref().is_some_and(|binding| {
+            binding.matches(pending.predecessor(), pending.pipeline_identity())
+        }) {
+            authority.revalidate_for_publication()
+        } else {
+            Err(DbError::Checkpoint(
+                "[LDB-6051] installed predecessor binding changed before vnode publication".into(),
+            ))
         };
-        let mut installed_state_guard = installed_state.lock();
-        if let Err(error) = authority.revalidate_for_publication(&expected_vnodes) {
-            drop(installed_state_guard);
+        if let Err(error) = validation {
+            drop(installed);
             drop(pending_slot);
             return Err(self.abort_prepublication(
                 prepared,
                 &installed_state,
                 &pending_handle,
                 &pending,
-                test_callbacks_mutated_state,
+                callbacks_mutated_state,
                 error,
             ));
         }
 
         publication.arm();
         self.publish_managed_operators(prepared);
-        authority.registry.mark_active(&expected_vnodes);
-        let retired_installed_binding = installed_state_guard.replace(installed_binding);
+        let retired = installed.replace(installed_binding);
         *pending_slot = None;
-        drop(installed_state_guard);
+        drop(installed);
         drop(pending_slot);
         self.observe_managed_state_accounting(&prepared.node_indices);
         self.finish_managed_operators(prepared);
-        drop(retired_installed_binding);
+        drop(retired);
         publication.complete();
-
         tracing::info!(
             assignment_version = authority.assignment.version(),
             revoked_vnodes = revoked.len(),
-            restored_vnodes = pending.restores().len(),
-            "completed staged vnode transition"
+            "completed staged vnode revocation"
         );
         Ok(())
     }
@@ -1327,7 +849,7 @@ impl OperatorGraph {
         &mut self,
         transition: &PreparedFinalOwnerExit,
         prepared: &PreparedManagedOperators,
-        test_callbacks_mutated_state: bool,
+        callbacks_mutated_state: bool,
     ) -> Result<(), DbError> {
         let mut publication = VnodeTransitionUnwindGuard::disarmed(
             Arc::clone(&self.execution_poisoned),
@@ -1335,12 +857,11 @@ impl OperatorGraph {
             Arc::clone(&transition.pending_handle),
             Arc::clone(&transition.pending),
         );
-        let pending_slot = exact_pending_slot(
+        let mut pending_slot = match exact_pending_slot(
             &transition.pending_handle,
             &transition.pending,
             "final-owner-exit callbacks",
-        );
-        let mut pending_slot = match pending_slot {
+        ) {
             Ok(slot) => slot,
             Err(error) => {
                 return Err(self.abort_prepublication(
@@ -1348,34 +869,47 @@ impl OperatorGraph {
                     &transition.installed_state,
                     &transition.pending_handle,
                     &transition.pending,
-                    test_callbacks_mutated_state,
+                    callbacks_mutated_state,
                     error,
                 ));
             }
         };
-        let mut installed_state = transition.installed_state.lock();
-        if let Err(error) = transition.authority.revalidate_for_publication() {
-            drop(installed_state);
+        let mut installed = transition.installed_state.lock();
+        let validation = if installed.as_ref().is_some_and(|binding| {
+            binding.matches(
+                transition.pending.predecessor(),
+                transition.pending.pipeline_identity(),
+            )
+        }) {
+            transition.authority.revalidate_for_publication()
+        } else {
+            Err(DbError::Checkpoint(
+                "[LDB-6051] installed predecessor binding changed before final-owner publication"
+                    .into(),
+            ))
+        };
+        if let Err(error) = validation {
+            drop(installed);
             drop(pending_slot);
             return Err(self.abort_prepublication(
                 prepared,
                 &transition.installed_state,
                 &transition.pending_handle,
                 &transition.pending,
-                test_callbacks_mutated_state,
+                callbacks_mutated_state,
                 error,
             ));
         }
 
         publication.arm();
         self.publish_managed_operators(prepared);
-        let retired_installed_binding = installed_state.take();
+        let retired = installed.take();
         *pending_slot = None;
-        drop(installed_state);
+        drop(installed);
         drop(pending_slot);
         self.observe_managed_state_accounting(&prepared.node_indices);
         self.finish_managed_operators(prepared);
-        drop(retired_installed_binding);
+        drop(retired);
         publication.complete();
         tracing::info!(
             assignment_version = transition.authority.assignment.version(),

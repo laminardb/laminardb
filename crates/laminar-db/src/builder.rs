@@ -61,7 +61,6 @@ pub struct LaminarDbBuilder {
     verified_cluster_namespaces: Option<laminar_core::cluster::control::VerifiedClusterNamespaces>,
     #[cfg(all(feature = "cluster", test))]
     unchecked_cluster_checkpoint_store: Option<Arc<dyn object_store::ObjectStore>>,
-    state_backend: Option<std::sync::Arc<dyn laminar_core::state::StateBackend>>,
     vnode_registry: Option<std::sync::Arc<laminar_core::state::VnodeRegistry>>,
     key_groups: Option<laminar_core::state::KeyGroupCount>,
     physical_optimizer_rules: Vec<
@@ -102,7 +101,6 @@ impl LaminarDbBuilder {
             verified_cluster_namespaces: None,
             #[cfg(all(feature = "cluster", test))]
             unchecked_cluster_checkpoint_store: None,
-            state_backend: None,
             vnode_registry: None,
             key_groups: None,
             physical_optimizer_rules: Vec::new(),
@@ -137,17 +135,7 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Install a state backend; must be paired with [`Self::vnode_registry`].
-    #[must_use]
-    pub fn state_backend(
-        mut self,
-        backend: std::sync::Arc<dyn laminar_core::state::StateBackend>,
-    ) -> Self {
-        self.state_backend = Some(backend);
-        self
-    }
-
-    /// Install a vnode registry. A legacy state backend, when supplied, must use the same count.
+    /// Install the vnode topology and ownership registry.
     #[must_use]
     pub fn vnode_registry(
         mut self,
@@ -497,7 +485,7 @@ impl LaminarDbBuilder {
             .as_deref()
             .filter(|url| url.starts_with("file://"))
         {
-            laminar_core::storage::object_store_builder::file_url_path(url)
+            laminar_core::checkpoint::object_store_builder::file_url_path(url)
                 .map_err(|error| DbError::Config(format!("checkpoint storage URL: {error}")))?;
         }
 
@@ -528,7 +516,7 @@ impl LaminarDbBuilder {
             }
             if !self.has_cluster_checkpoint_store() {
                 return Err(DbError::Config(
-                    "[LDB-0011] cluster runtime requires VerifiedClusterNamespaces from the shared checkpoint/state namespace proof"
+                    "[LDB-0011] cluster runtime requires VerifiedClusterNamespaces from the shared checkpoint namespace proof"
                         .into(),
                 ));
             }
@@ -549,25 +537,6 @@ impl LaminarDbBuilder {
                         expected.node_id,
                         expected.boot_incarnation,
                     )));
-                }
-                let state_backend = self.state_backend.as_ref().ok_or_else(|| {
-                    DbError::Config(
-                        "[LDB-0011] cluster runtime requires a ClusterShared state_backend built from the verified state namespace"
-                            .into(),
-                    )
-                })?;
-                let durability = state_backend.durability_scope();
-                if durability != laminar_core::state::StateBackendDurability::ClusterShared {
-                    return Err(DbError::Config(format!(
-                        "[LDB-0011] cluster state_backend must be ClusterShared, but is {durability:?}"
-                    )));
-                }
-                let verified_state_store = namespaces.state_store();
-                if !state_backend.uses_exact_object_store(&verified_state_store) {
-                    return Err(DbError::Config(
-                        "[LDB-0011] cluster state_backend does not use the exact object-store handle admitted by the namespace proof"
-                            .into(),
-                    ));
                 }
             }
         }
@@ -598,7 +567,7 @@ impl LaminarDbBuilder {
         }
 
         Self::validate_backpressure(&self.config)?;
-        self.validate_state_topology(runtime_mode)?;
+        self.validate_vnode_topology(runtime_mode)?;
         if let Some(key_groups) = self
             .key_groups
             .filter(|_| runtime_mode == RuntimeMode::Local && self.vnode_registry.is_none())
@@ -669,24 +638,13 @@ impl LaminarDbBuilder {
         if let Some(store) = self.catalog_manifest_store {
             db.set_catalog_manifest_store(store);
         }
-        if let Some(backend) = self.state_backend {
-            db.set_state_backend(backend);
-        }
         if let Some(registry) = self.vnode_registry {
             db.set_vnode_registry(registry);
         }
         Ok(Arc::new(db))
     }
 
-    fn validate_state_topology(&self, runtime_mode: RuntimeMode) -> Result<(), DbError> {
-        match (&self.state_backend, &self.vnode_registry) {
-            (Some(_), None) => {
-                return Err(DbError::Config(
-                    "state_backend is set but vnode_registry is missing".into(),
-                ));
-            }
-            _ => {}
-        }
+    fn validate_vnode_topology(&self, runtime_mode: RuntimeMode) -> Result<(), DbError> {
         let registry_key_groups = self
             .vnode_registry
             .as_ref()
@@ -723,23 +681,6 @@ impl LaminarDbBuilder {
             if configured != registry {
                 return Err(DbError::Config(format!(
                     "configured key-group count {configured} does not match vnode_registry count {registry}"
-                )));
-            }
-        }
-        if let Some(backend) = self.state_backend.as_ref() {
-            let backend_capacity = backend.key_group_capacity();
-            let backend_key_groups =
-                laminar_core::state::KeyGroupCount::try_from(backend_capacity).map_err(|_| {
-                    DbError::Config(format!(
-                        "state_backend key-group capacity must be between 1 and {}, got {backend_capacity}",
-                        laminar_core::state::MAX_KEY_GROUP_COUNT
-                    ))
-                })?;
-            let registry_key_groups = registry_key_groups
-                .expect("state backend without a vnode registry was rejected above");
-            if backend_key_groups != registry_key_groups {
-                return Err(DbError::Config(format!(
-                    "state_backend key-group capacity {backend_key_groups} does not match vnode_registry count {registry_key_groups}"
                 )));
             }
         }
@@ -1011,29 +952,10 @@ mod tests {
             &[participant],
             control,
             checkpoint_store,
-            test_cluster_checkpoint_store(),
             std::time::Duration::from_secs(1),
         )
         .await
         .unwrap()
-    }
-
-    #[cfg(feature = "cluster")]
-    fn test_verified_state_topology(
-        namespaces: &laminar_core::cluster::control::VerifiedClusterNamespaces,
-    ) -> (
-        Arc<dyn laminar_core::state::StateBackend>,
-        Arc<laminar_core::state::VnodeRegistry>,
-    ) {
-        let vnode_count = u32::from(laminar_core::state::DEFAULT_KEY_GROUP_COUNT);
-        (
-            Arc::new(laminar_core::state::ObjectStoreBackend::cluster_shared(
-                namespaces.state_store(),
-                "test-node",
-                vnode_count,
-            )),
-            Arc::new(laminar_core::state::VnodeRegistry::new(vnode_count)),
-        )
     }
 
     #[tokio::test]
@@ -1109,13 +1031,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_state_budget_is_resolved_and_propagated_to_status_stores() {
-        for max_staged_bytes in [17, isize::MAX as u64] {
+    async fn checkpoint_node_data_budget_is_resolved() {
+        for max_node_data_bytes in [17, isize::MAX as u64] {
             let directory = tempfile::tempdir().unwrap();
             let db = LaminarDbBuilder::new()
                 .storage_dir(directory.path())
                 .checkpoint(StreamCheckpointConfig {
-                    max_staged_bytes: Some(max_staged_bytes),
+                    max_node_data_bytes: Some(max_node_data_bytes),
                     ..StreamCheckpointConfig::default()
                 })
                 .build()
@@ -1126,21 +1048,14 @@ mod tests {
                 db.config
                     .checkpoint
                     .as_ref()
-                    .and_then(|checkpoint| checkpoint.max_staged_bytes),
-                Some(max_staged_bytes)
-            );
-            assert_eq!(
-                db.checkpoint_store()
-                    .unwrap()
-                    .unwrap()
-                    .max_state_data_bytes(),
-                max_staged_bytes
+                    .and_then(|checkpoint| checkpoint.max_node_data_bytes),
+                Some(max_node_data_bytes)
             );
         }
     }
 
     #[tokio::test]
-    async fn checkpoint_state_budget_defaults_to_the_core_storage_limit() {
+    async fn checkpoint_node_data_budget_uses_the_core_default() {
         let directory = tempfile::tempdir().unwrap();
         let db = LaminarDbBuilder::new()
             .storage_dir(directory.path())
@@ -1148,35 +1063,29 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let expected = laminar_core::storage::checkpoint_store::DEFAULT_MAX_CHECKPOINT_STATE_BYTES;
+        let expected =
+            laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES;
 
         assert_eq!(
             db.config
                 .checkpoint
                 .as_ref()
-                .and_then(|checkpoint| checkpoint.max_staged_bytes),
+                .and_then(|checkpoint| checkpoint.max_node_data_bytes),
             Some(expected)
-        );
-        assert_eq!(
-            db.checkpoint_store()
-                .unwrap()
-                .unwrap()
-                .max_state_data_bytes(),
-            expected
         );
     }
 
     #[tokio::test]
-    async fn checkpoint_state_budget_rejects_an_unaddressable_limit_at_build() {
+    async fn checkpoint_node_data_budget_rejects_an_unaddressable_limit() {
         let unaddressable = (isize::MAX as u64) + 1;
         let error = LaminarDbBuilder::new()
             .checkpoint(StreamCheckpointConfig {
-                max_staged_bytes: Some(unaddressable),
+                max_node_data_bytes: Some(unaddressable),
                 ..StreamCheckpointConfig::default()
             })
             .build()
             .await
-            .expect_err("checkpoint recovery must not accept an unaddressable sidecar limit");
+            .expect_err("checkpoint recovery must not accept an unaddressable node-data limit");
 
         assert!(
             error
@@ -1246,13 +1155,9 @@ mod tests {
         let verified_namespaces =
             test_verified_cluster_namespaces(controller.as_ref(), Arc::clone(&checkpoint_store))
                 .await;
-        let verified_state_store = verified_namespaces.state_store();
-        let (state_backend, vnode_registry) = test_verified_state_topology(&verified_namespaces);
         let db = LaminarDbBuilder::new()
             .cluster_controller(controller)
             .verified_cluster_namespaces(verified_namespaces)
-            .state_backend(state_backend)
-            .vnode_registry(vnode_registry)
             .build()
             .await
             .unwrap();
@@ -1262,12 +1167,6 @@ mod tests {
             &db.cluster_checkpoint_object_store().unwrap(),
             &checkpoint_store
         ));
-        assert!(db
-            .state_backend
-            .lock()
-            .as_ref()
-            .unwrap()
-            .uses_exact_object_store(&verified_state_store));
         assert_eq!(
             db.config.delivery_guarantee,
             laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce
@@ -1288,64 +1187,6 @@ mod tests {
             .await
             .expect_err("two checkpoint authorities must be rejected");
         assert!(error.to_string().contains("conflict"), "{error}");
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test]
-    async fn checkpoint_status_reads_the_injected_participant_store() {
-        use arrow::array::UInt64Array;
-        use laminar_core::checkpoint::checkpoint_manifest::DurableCheckpointPhase;
-        use laminar_core::storage::CheckpointStore;
-
-        let controller = test_cluster_controller();
-        let participant_id = controller.instance_id().0;
-        let object_store = test_cluster_checkpoint_store();
-        let max_staged_bytes = 97;
-        let db = LaminarDbBuilder::new()
-            .cluster_controller(controller)
-            .cluster_checkpoint_object_store(Arc::clone(&object_store))
-            .checkpoint(StreamCheckpointConfig {
-                max_staged_bytes: Some(max_staged_bytes),
-                ..StreamCheckpointConfig::default()
-            })
-            .build()
-            .await
-            .unwrap();
-        let status_store = db.checkpoint_store().unwrap().unwrap();
-        assert_eq!(status_store.participant_id(), participant_id);
-        assert_eq!(status_store.max_state_data_bytes(), max_staged_bytes);
-        let participant_store =
-            laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
-                object_store,
-                format!("nodes/{participant_id}/"),
-            )
-            .with_max_state_data_bytes(max_staged_bytes)
-            .unwrap()
-            .with_key_group_count(db.checkpoint_key_groups())
-            .with_participant_id(participant_id);
-        let mut manifest = laminar_core::checkpoint::CheckpointManifest::new_with_key_group_count(
-            7,
-            7,
-            db.checkpoint_key_groups(),
-        );
-        manifest.participant_id = participant_id;
-        manifest.deployment_id = uuid::Uuid::from_u128(1).to_string();
-        manifest.durable_phase = DurableCheckpointPhase::Finalized;
-        participant_store.save(&manifest).await.unwrap();
-
-        let status = db.build_show_checkpoint_status().await.unwrap();
-        let checkpoint_ids = status
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        let total = status
-            .column(5)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        assert_eq!(checkpoint_ids.value(0), 7);
-        assert_eq!(total.value(0), 1);
     }
 
     #[cfg(feature = "cluster")]
@@ -1454,7 +1295,6 @@ mod tests {
             db.checkpoint_key_groups(),
             laminar_core::state::DEFAULT_KEY_GROUP_COUNT
         );
-        assert!(db.state_backend.lock().is_none());
         assert!(db.vnode_registry.lock().is_none());
     }
 
@@ -1495,13 +1335,10 @@ mod tests {
         let verified_namespaces =
             test_verified_cluster_namespaces(controller.as_ref(), test_cluster_checkpoint_store())
                 .await;
-        let (state_backend, vnode_registry) = test_verified_state_topology(&verified_namespaces);
         let db = LaminarDbBuilder::new()
             .profile(Profile::Cluster)
             .cluster_controller(controller)
             .verified_cluster_namespaces(verified_namespaces)
-            .state_backend(state_backend)
-            .vnode_registry(vnode_registry)
             .build()
             .await
             .unwrap();
@@ -1573,53 +1410,6 @@ mod tests {
             .expect_err("a namespace proof must remain bound to its process incarnation");
         assert!(error.to_string().contains("[LDB-0011]"), "{error}");
         assert!(error.to_string().contains("belong to node"), "{error}");
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test]
-    async fn cluster_runtime_rejects_in_process_state_backend() {
-        let controller = test_cluster_controller();
-        let verified_namespaces =
-            test_verified_cluster_namespaces(controller.as_ref(), test_cluster_checkpoint_store())
-                .await;
-        let error = LaminarDbBuilder::new()
-            .cluster_controller(controller)
-            .verified_cluster_namespaces(verified_namespaces)
-            .state_backend(Arc::new(laminar_core::state::InProcessBackend::new(1)))
-            .vnode_registry(Arc::new(laminar_core::state::VnodeRegistry::new(1)))
-            .build()
-            .await
-            .expect_err("volatile state must not enter cluster runtime");
-        assert!(error.to_string().contains("[LDB-0011]"), "{error}");
-        assert!(error.to_string().contains("ClusterShared"), "{error}");
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test]
-    async fn cluster_runtime_rejects_different_state_object_store() {
-        let controller = test_cluster_controller();
-        let verified_namespaces =
-            test_verified_cluster_namespaces(controller.as_ref(), test_cluster_checkpoint_store())
-                .await;
-        let wrong_backend: Arc<dyn laminar_core::state::StateBackend> =
-            Arc::new(laminar_core::state::ObjectStoreBackend::cluster_shared(
-                test_cluster_checkpoint_store(),
-                "wrong-state-store",
-                1,
-            ));
-        let error = LaminarDbBuilder::new()
-            .cluster_controller(controller)
-            .verified_cluster_namespaces(verified_namespaces)
-            .state_backend(wrong_backend)
-            .vnode_registry(Arc::new(laminar_core::state::VnodeRegistry::new(1)))
-            .build()
-            .await
-            .expect_err("a different ClusterShared handle must not bypass namespace proof");
-        assert!(error.to_string().contains("[LDB-0011]"), "{error}");
-        assert!(
-            error.to_string().contains("exact object-store handle"),
-            "{error}"
-        );
     }
 
     #[cfg(feature = "cluster")]
@@ -1714,7 +1504,6 @@ mod tests {
     async fn injected_vnode_registry_must_fit_checkpoint_abi() {
         let vnode_count = laminar_core::state::MAX_KEY_GROUP_COUNT + 1;
         let error = LaminarDbBuilder::new()
-            .state_backend(Arc::new(laminar_core::state::InProcessBackend::new(1)))
             .vnode_registry(Arc::new(laminar_core::state::VnodeRegistry::new(
                 vnode_count,
             )))
@@ -1725,38 +1514,6 @@ mod tests {
             error
                 .to_string()
                 .contains("vnode_registry count must be between 1"),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn injected_state_backend_capacity_must_fit_checkpoint_abi() {
-        let error = LaminarDbBuilder::new()
-            .state_backend(Arc::new(laminar_core::state::InProcessBackend::new(0)))
-            .vnode_registry(Arc::new(laminar_core::state::VnodeRegistry::new(1)))
-            .build()
-            .await
-            .expect_err("invalid backend topology must be rejected at admission");
-        assert!(
-            error
-                .to_string()
-                .contains("state_backend key-group capacity must be between 1"),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn state_backend_capacity_must_match_registry() {
-        let error = LaminarDbBuilder::new()
-            .state_backend(Arc::new(laminar_core::state::InProcessBackend::new(2)))
-            .vnode_registry(Arc::new(laminar_core::state::VnodeRegistry::new(1)))
-            .build()
-            .await
-            .expect_err("backend and registry must describe one topology");
-        assert!(
-            error.to_string().contains(
-                "state_backend key-group capacity 2 does not match vnode_registry count 1"
-            ),
             "{error}"
         );
     }

@@ -269,9 +269,6 @@ pub struct LaminarDB {
     /// Kept inside an async mutex while joined. A cancelled stop future drops only the guard,
     /// never the sole watcher handle, so a retry cannot publish a false terminal state.
     pub(crate) runtime_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Decoupled coordinated-commit committer task. Awaited in place so cancellation cannot lose
-    /// the sole handle while an issued external commit is still completing.
-    pub(crate) committer_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// OS-released exclusive lock for a local checkpoint namespace. Deployment
     /// identity prevents reuse after reset; this lock prevents two live processes from writing
     /// divergent cuts into the same deployment.
@@ -355,9 +352,6 @@ pub struct LaminarDB {
     /// Serializes source/shuffle authority grants with terminal revocation.
     #[cfg(feature = "cluster")]
     pub(crate) cluster_authority_transition: parking_lot::Mutex<()>,
-    /// Paired with `vnode_registry`; the coordinator gates commits when both are installed.
-    pub(crate) state_backend:
-        parking_lot::Mutex<Option<Arc<dyn laminar_core::state::StateBackend>>>,
     pub(crate) vnode_registry: parking_lot::Mutex<Option<Arc<laminar_core::state::VnodeRegistry>>>,
     pub(crate) physical_optimizer_rules:
         Arc<[Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>]>,
@@ -382,28 +376,22 @@ pub struct LaminarDB {
     /// Pre-built shared checkpoint namespace installed during cluster construction.
     #[cfg(feature = "cluster")]
     cluster_checkpoint_object_store: Option<Arc<dyn object_store::ObjectStore>>,
-    /// One immutable assignment-bound vnode revoke/restore batch shared with `OperatorGraph`.
+    /// One immutable assignment-bound vnode revocation batch shared with `OperatorGraph`.
     #[cfg(feature = "cluster")]
     pub(crate) pending_vnode_transition:
         crate::vnode_transition_staging::PendingVnodeTransitionHandle,
-    /// Worker-wide raw checkpoint-body budget shared by current and replacement transitions.
-    #[cfg(feature = "cluster")]
-    vnode_restore_input_budget:
-        parking_lot::Mutex<Option<Arc<crate::vnode_restore_input::VnodeRestoreInputBudget>>>,
     /// Exact assignment and state ABI installed in the current graph generation.
     #[cfg(feature = "cluster")]
     pub(crate) installed_vnode_state: crate::vnode_transition_staging::InstalledVnodeStateHandle,
-    /// Serializes successor preparation with assignment-certificate publication. Remote state
-    /// reads do not hold the compute-cycle fence, but an old certificate must never be re-opened
-    /// while a newer audited assignment is being prepared.
+    /// Serializes successor preparation with assignment-certificate publication.
     #[cfg(feature = "cluster")]
     pub(crate) assignment_adoption_lock: tokio::sync::Mutex<()>,
     /// Changes whenever local assignment authority is suspended or invalidated. The snapshot
     /// watcher uses it to reject a certificate computed from a head read before that closure.
     #[cfg(feature = "cluster")]
     pub(crate) assignment_authority_revision: std::sync::atomic::AtomicU64,
-    /// Linearizes assignment publication with compute-cycle entry so staged
-    /// revoke/rehydration state is applied before any row observes new ownership.
+    /// Linearizes assignment publication with compute-cycle entry so staged revocation is applied
+    /// before any row observes the successor assignment.
     #[cfg(feature = "cluster")]
     pub(crate) rotation_execution_fence: Arc<tokio::sync::RwLock<()>>,
     /// Routes `db.checkpoint()` requests to the streaming coordinator for exact-attempt
@@ -831,15 +819,6 @@ pub struct SnapshotAdoption {
     pub adopted: bool,
     /// The snapshot version considered.
     pub version: u64,
-    /// Vnodes whose committed state had to be installed for this rotation.
-    ///
-    /// This can include retained ownership when the current process cannot prove that its graph
-    /// has the exact predecessor assignment and pipeline state installed.
-    pub vnodes_requiring_restore: Vec<u32>,
-    /// Number of required vnodes whose committed state was read back.
-    pub restored_vnode_count: usize,
-    /// Committed epoch used for vnode restore, if any.
-    pub restore_epoch: Option<u64>,
 }
 
 /// Result of certifying a clustered process at startup.
@@ -931,63 +910,11 @@ impl LaminarDB {
             .map_or(0, |transition| transition.revoked_vnodes().len())
     }
 
-    /// Vnodes whose committed state is waiting for graph-level semantic installation.
-    #[cfg(all(feature = "cluster", test))]
-    #[must_use]
-    pub(crate) fn pending_restore_vnode_count(&self) -> usize {
-        self.pending_vnode_transition
-            .lock()
-            .as_ref()
-            .map_or(0, |transition| transition.acquired_vnodes().len())
-    }
-
+    /// Whether operator execution has not yet completed the prior assignment's vnode transition.
+    /// Lock order matches assignment publication and graph checkpoint inspection.
     #[cfg(feature = "cluster")]
-    pub(crate) fn vnode_restore_input_budget(
-        &self,
-        head: &crate::checkpoint_coordinator::ValidatedVnodeRestoreHead,
-    ) -> Result<Arc<crate::vnode_restore_input::VnodeRestoreInputBudget>, DbError> {
-        let read_envelope = self
-            .state_backend
-            .lock()
-            .as_ref()
-            .and_then(|backend| backend.sealed_partial_read_envelope())
-            .ok_or_else(|| {
-                DbError::Checkpoint(
-                    "[LDB-6050] installed checkpoint backend does not declare a sealed-partial read resource envelope"
-                        .into(),
-                )
-            })?;
-        let limits = &head.contract().limits;
-        let expected = crate::vnode_restore_input::VnodeRestoreInputLimits {
-            max_lineage_bytes: limits.max_cluster_lineage_payload_bytes,
-            max_lineage_artifacts: limits.max_cluster_lineage_artifacts,
-        };
-        let mut installed = self.vnode_restore_input_budget.lock();
-        if let Some(current) = installed.as_ref() {
-            if current.limits() != expected || current.read_envelope() != read_envelope {
-                return Err(DbError::Checkpoint(
-                    "[LDB-6050] committed vnode restore limits or checkpoint-backend read envelope changed within one graph generation; reset or a new checkpoint namespace is required"
-                        .into(),
-                ));
-            }
-            return Ok(Arc::clone(current));
-        }
-        let budget = Arc::new(crate::vnode_restore_input::VnodeRestoreInputBudget::new(
-            expected,
-            read_envelope,
-        )?);
-        *installed = Some(Arc::clone(&budget));
-        Ok(budget)
-    }
-
-    /// Whether operator execution has not yet completed the prior assignment's vnode lifecycle
-    /// work. Lock order matches assignment publication and graph checkpoint inspection.
-    #[cfg(feature = "cluster")]
-    pub(crate) fn has_unapplied_vnode_transition(
-        &self,
-        registry: &laminar_core::state::VnodeRegistry,
-    ) -> bool {
-        self.pending_vnode_transition.lock().is_some() || registry.any_restoring()
+    pub(crate) fn has_unapplied_vnode_transition(&self) -> bool {
+        self.pending_vnode_transition.lock().is_some()
     }
 
     /// Whether the current graph has completely installed this assignment's managed vnode state.
@@ -1011,7 +938,7 @@ impl LaminarDB {
         {
             return Ok(false);
         }
-        if self.has_unapplied_vnode_transition(registry) {
+        if self.has_unapplied_vnode_transition() {
             return Ok(false);
         }
         let pipeline_identity = self
@@ -1060,7 +987,7 @@ impl LaminarDB {
     }
 
     /// Durably publish a local vnode-state report. A `false` report is the withdrawal that must
-    /// precede exposing new pending/restoring work for an already-reported assignment.
+    /// precede exposing a new pending transition for an already-reported assignment.
     #[cfg(feature = "cluster")]
     pub(crate) async fn publish_local_vnode_state_report(
         &self,
@@ -1156,14 +1083,14 @@ impl LaminarDB {
             Some(max_retractable_extremum_checkpoint_bytes);
 
         if let Some(checkpoint) = config.checkpoint.as_mut() {
-            let max_state_data_bytes = checkpoint.max_staged_bytes.unwrap_or(
-                laminar_core::storage::checkpoint_store::DEFAULT_MAX_CHECKPOINT_STATE_BYTES,
+            let max_node_data_bytes = checkpoint.max_node_data_bytes.unwrap_or(
+                laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES,
             );
-            laminar_core::storage::checkpoint_store::validate_max_checkpoint_state_bytes(
-                max_state_data_bytes,
+            laminar_core::checkpoint::checkpoint_store::validate_max_checkpoint_node_data_bytes(
+                max_node_data_bytes,
             )
-            .map_err(|error| DbError::Config(format!("checkpoint.max_staged_bytes: {error}")))?;
-            checkpoint.max_staged_bytes = Some(max_state_data_bytes);
+            .map_err(|error| DbError::Config(format!("checkpoint.max_node_data_bytes: {error}")))?;
+            checkpoint.max_node_data_bytes = Some(max_node_data_bytes);
         }
 
         // One-time crossfire backoff tuning; idempotent, only helps single-core VMs.
@@ -1240,7 +1167,6 @@ impl LaminarDB {
             #[cfg(all(test, feature = "cluster"))]
             catalog_seal_gate: parking_lot::Mutex::new(None),
             runtime_handle: tokio::sync::Mutex::new(None),
-            committer_handle: tokio::sync::Mutex::new(None),
             checkpoint_namespace_lock: parking_lot::Mutex::new(None),
             owned_sink_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),
             owned_source_tasks: Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -1285,7 +1211,6 @@ impl LaminarDB {
             cluster_authority_revoked: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "cluster")]
             cluster_authority_transition: parking_lot::Mutex::new(()),
-            state_backend: parking_lot::Mutex::new(None),
             vnode_registry: parking_lot::Mutex::new((runtime_mode == RuntimeMode::Local).then(
                 || {
                     Arc::new(laminar_core::state::VnodeRegistry::single_owner(
@@ -1310,8 +1235,6 @@ impl LaminarDB {
             cluster_checkpoint_object_store: None,
             #[cfg(feature = "cluster")]
             pending_vnode_transition: Arc::new(parking_lot::Mutex::new(None)),
-            #[cfg(feature = "cluster")]
-            vnode_restore_input_budget: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
             installed_vnode_state: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "cluster")]
@@ -2276,17 +2199,12 @@ impl LaminarDB {
         Ok(Some(manifest))
     }
 
-    /// Atomically adopt a new vnode assignment across the registry, state-backend
-    /// fence, and coordinator, then rehydrate committed state for newly-acquired
-    /// vnodes. Idempotent for versions ≤ the current registry version.
-    ///
-    /// Rehydration runs after the coordinator lock is released so a slow
-    /// object-store read can't stall the checkpoint cadence.
+    /// Adopt one authority-audited assignment. Live vnode acquisition fails closed until direct
+    /// committed-frame transfer is available; startup recovery restores before graph launch.
     ///
     /// # Errors
-    /// Returns a checkpoint error when the end-to-end deadline expires or source-offset handoff
-    /// or vnode-state rehydration fails. The assignment is not published in that case, so the
-    /// same snapshot remains retryable.
+    /// Returns a checkpoint error when the deadline expires or the assignment would acquire live
+    /// state. The assignment is not published in that case.
     #[cfg(feature = "cluster")]
     pub async fn adopt_assignment_snapshot(
         &self,
@@ -2343,7 +2261,7 @@ impl LaminarDB {
         // A successor cannot reinterpret transition bytes staged for the current assignment.
         // Reject this local condition before any durable-authority I/O; publication checks it
         // again under the execution fence to close the preparation race.
-        if self.has_unapplied_vnode_transition(&registry) {
+        if self.has_unapplied_vnode_transition() {
             return Err(DbError::ShuffleNotReady(format!(
                 "[LDB-6053] assignment {} cannot overtake an unapplied vnode transition for \
                  assignment {}; retry after graph execution completes it or an explicitly fenced \
@@ -2411,10 +2329,8 @@ impl LaminarDB {
                 .owners()
                 .iter()
                 .all(|owner| *owner == laminar_core::state::NodeId::UNASSIGNED)
-                && !observed_assignment.has_committed_handoff()
                 && self.pending_vnode_transition.lock().is_none()
-                && self.installed_vnode_state.lock().is_none()
-                && !registry.any_restoring();
+                && self.installed_vnode_state.lock().is_none();
             if !pristine_boot {
                 return Err(DbError::Checkpoint(
                     "[LDB-6053] assignment-zero bootstrap contains retained vnode lifecycle state"
@@ -2587,117 +2503,29 @@ impl LaminarDB {
         let old_owned = effective_predecessor_owned;
         let old_set: rustc_hash::FxHashSet<u32> = old_owned.iter().copied().collect();
         let new_owned = preflight_new_owned;
-        // Compute from the new assignment before publishing it, so the Restoring marks
-        // below land before the ownership flip.
+        // Compute from the new assignment before publishing it so unsupported acquisition is
+        // rejected before the ownership flip.
         let vnodes_requiring_restore: Vec<u32> = (0..vnode_count)
             .filter(|&v| {
                 new_assignment.get(v as usize).copied() == Some(self_id)
                     && (force_local_restore || !old_set.contains(&v))
             })
             .collect();
-        let source_handoff_required = !vnodes_requiring_restore.is_empty();
-
-        // Snapshot immutable recovery handles at the epoch boundary, then release the coordinator
-        // mutex before decision-store, seal, readiness, and vnode reads. Remote object-store
-        // latency must not stall checkpoint admission.
-        let handoff_reader = if !source_handoff_required {
-            None
-        } else if let Some(coord) = guard.as_ref() {
-            Some(coord.cluster_handoff_reader()?.ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "[LDB-6052] assignment {} requires an active cluster recovery namespace",
-                    snapshot.version
-                ))
-            })?)
-        } else {
+        // Startup installs the exact committed assignment before the lifecycle restores its
+        // complete graph. A live graph, however, must not acquire even one vnode until direct v7
+        // committed-frame transfer is available. Reject before publishing ownership and never
+        // reinterpret a missing frame as empty state.
+        let startup_restore_deferred = observed_version == 0
+            && DbState::load(&self.state) != DbState::Running
+            && predecessor_snapshot.is_none();
+        if !vnodes_requiring_restore.is_empty() && !startup_restore_deferred {
             return Err(DbError::Checkpoint(format!(
-                "[LDB-6052] cannot acquire {} vnodes for assignment {} without a live checkpoint coordinator",
-                vnodes_requiring_restore.len(), snapshot.version
+                "[LDB-6050] v7 committed-frame vnode reassignment is not implemented; refusing assignment {} before acquiring vnodes {:?}",
+                snapshot.version, vnodes_requiring_restore
             )));
-        };
+        }
 
         drop(guard);
-        // Stage the sealed source offsets and read all newly-owned state before publishing the
-        // assignment. Any failure leaves the current version intact and retryable.
-        let source_handoff = if let Some(reader) = handoff_reader.as_ref() {
-            reader.acquired_source_handoff().await.map_err(|e| {
-                DbError::Checkpoint(format!(
-                    "[LDB-6052] source-offset handoff read failed for assignment {}: {e}",
-                    snapshot.version
-                ))
-            })?
-        } else {
-            None
-        };
-        let prepared_outcome = source_handoff
-            .as_ref()
-            .map(|handoff| handoff.vnode_restore_cut.outcome().clone());
-        if let Some(outcome) = prepared_outcome.as_ref() {
-            let outcome_fence = outcome.assignment_fence.as_ref().ok_or_else(|| {
-                DbError::Checkpoint(
-                    "[LDB-6054] cluster source handoff Commit outcome has no assignment certificate"
-                        .into(),
-                )
-            })?;
-            if outcome_fence.assignment_version > snapshot.version {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6054] assignment {} is older than durable checkpoint fence {}; refresh the assignment snapshot before adoption",
-                    snapshot.version, outcome_fence.assignment_version
-                )));
-            }
-            if predecessor_fence
-                .as_ref()
-                .is_some_and(|predecessor| outcome_fence != predecessor)
-            {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6054] live assignment {} restore cut does not match the exact predecessor certificate; coordinated recovery must rewind the whole graph",
-                    snapshot.version
-                )));
-            }
-        }
-        let loaded_chains = if let Some(handoff) = source_handoff
-            .as_ref()
-            .filter(|_| !vnodes_requiring_restore.is_empty())
-        {
-            let backend = self.state_backend.lock().clone().ok_or_else(|| {
-                DbError::Checkpoint(
-                    "[LDB-6050] cluster assignment adoption requires a state backend".into(),
-                )
-            })?;
-            let attempt = handoff.vnode_restore_cut.attempt();
-            let restore_head = handoff.vnode_restore_cut.restore_head();
-            let budget = self.vnode_restore_input_budget(restore_head)?;
-            let cancel = self.assignment_restore_shutdown.clone();
-            let reader =
-                crate::recovery_manager::vnode_chains::SealedVnodeChainReader::from_committed_head(
-                    backend.as_ref(),
-                    restore_head,
-                )?;
-            reader
-                .load_at_reserved(
-                    &vnodes_requiring_restore,
-                    attempt,
-                    &budget,
-                    deadline,
-                    &cancel,
-                )
-                .await?
-        } else {
-            crate::recovery_manager::vnode_chains::LoadedVnodeChains::default()
-        };
-        let (source_handoff, restore_binding) = match source_handoff {
-            Some(handoff) => (
-                Some(handoff.sources),
-                Some(handoff.vnode_restore_cut.into_transition_binding()?),
-            ),
-            None => (None, None),
-        };
-
-        let observed_outcome = if let Some(reader) = handoff_reader.as_ref() {
-            reader.highest_commit_outcome().await?
-        } else {
-            None
-        };
 
         // Re-acquire the epoch boundary and discard the prepared adoption if another rotation won,
         // the coordinator namespace changed, or a newer durable cut appeared during the reads.
@@ -2735,92 +2563,13 @@ impl LaminarDB {
                 snapshot.version
             )));
         }
-        if source_handoff_required {
-            let current_reader = guard
-                .as_ref()
-                .ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6052] checkpoint coordinator disappeared while preparing assignment {}",
-                        snapshot.version
-                    ))
-                })?
-                .cluster_handoff_reader()?
-                .ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6052] cluster recovery namespace disappeared while preparing assignment {}",
-                        snapshot.version
-                    ))
-                })?;
-            let prepared_reader = handoff_reader.as_ref().ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "[LDB-6052] assignment {} lost its prepared cluster recovery namespace",
-                    snapshot.version
-                ))
-            })?;
-            if !prepared_reader.same_namespace(&current_reader) {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6053] checkpoint recovery namespace changed while preparing assignment {}; retrying the complete source/state handoff",
-                    snapshot.version
-                )));
-            }
-            if observed_outcome != prepared_outcome {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6053] durable checkpoint Commit outcome advanced while preparing assignment {}; retrying the complete source/state handoff",
-                    snapshot.version
-                )));
-            }
-        }
-        if let Some(handoff) = source_handoff.as_ref() {
-            let expected_attempt = restore_binding
-                .as_ref()
-                .expect("source handoff retains its vnode transition binding")
-                .attempt();
-            if handoff.attempt() != expected_attempt {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6054] committed source handoff {:?} does not match durable outcome {expected_attempt:?}",
-                    handoff.attempt()
-                )));
-            }
-            for (source_name, _) in handoff.sources() {
-                if self.catalog.get_source(source_name).is_none() {
-                    return Err(DbError::Checkpoint(format!(
-                        "[LDB-6054] committed source handoff names unknown catalog source '{source_name}'"
-                    )));
-                }
-            }
-            match (
-                controller.cluster_min_watermark(),
-                handoff.recovery_watermark_frontier(),
-            ) {
-                (Some(current), Some(recovered)) if current > recovered => {
-                    return Err(DbError::Checkpoint(format!(
-                        "[LDB-6054] live committed cluster watermark {current} is ahead of source handoff frontier {recovered}"
-                    )));
-                }
-                (Some(current), None) => {
-                    return Err(DbError::Checkpoint(format!(
-                        "[LDB-6054] {:?} source handoff without a numeric frontier cannot replace committed cluster watermark {current}",
-                        handoff.cluster_watermark()
-                    )));
-                }
-                _ => {}
-            }
-        }
         let new_set: rustc_hash::FxHashSet<u32> = new_owned.iter().copied().collect();
         let revoked: rustc_hash::FxHashSet<u32> = old_set.difference(&new_set).copied().collect();
-        let restore_attempt = loaded_chains.attempt;
-        let restored_vnode_count = loaded_chains.chain_count();
         let adoption = SnapshotAdoption {
             adopted: true,
             version: snapshot.version,
-            vnodes_requiring_restore: vnodes_requiring_restore.clone(),
-            restored_vnode_count,
-            restore_epoch: restore_attempt.map(|attempt| attempt.epoch),
         };
-        let initializes_genesis =
-            predecessor_snapshot.is_none() && source_handoff.is_none() && revoked.is_empty();
-        let has_local_transition =
-            (!vnodes_requiring_restore.is_empty() || !revoked.is_empty()) && !initializes_genesis;
+        let has_local_transition = !revoked.is_empty();
         let pending_transition = if has_local_transition {
             guard.as_ref().ok_or_else(|| {
                 DbError::Checkpoint(format!(
@@ -2834,8 +2583,7 @@ impl LaminarDB {
                     snapshot.version
                 ))
             })?;
-            let restore_binding = restore_binding.clone();
-            let transition = if predecessor_snapshot.is_some() {
+            let transition =
                 crate::vnode_transition_staging::PendingVnodeTransition::assignment_change(
                     predecessor_fence.clone().ok_or_else(|| {
                         DbError::Checkpoint(format!(
@@ -2848,31 +2596,11 @@ impl LaminarDB {
                     &new_assignment,
                     local_participant,
                     pipeline_identity,
-                    restore_binding,
-                    loaded_chains,
-                    force_local_restore,
                     final_owner_exit,
-                )?
-            } else {
-                let restore_binding = restore_binding.ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] initial assignment {} has vnode state to install but no committed restore cut",
-                        snapshot.version
-                    ))
-                })?;
-                crate::vnode_transition_staging::PendingVnodeTransition::boot_recovery(
-                    target_fence.clone(),
-                    &new_assignment,
-                    local_participant,
-                    pipeline_identity,
-                    restore_binding,
-                    loaded_chains,
-                )?
-            };
-            let transition_acquired = transition.acquired_vnodes();
+                )?;
             let transition_revoked: rustc_hash::FxHashSet<u32> =
                 transition.revoked_vnodes().iter().copied().collect();
-            if transition_acquired != vnodes_requiring_restore || transition_revoked != revoked {
+            if transition_revoked != revoked {
                 return Err(DbError::Checkpoint(format!(
                     "[LDB-6053] assignment {} transition rosters changed between preparation and publication",
                     snapshot.version
@@ -2882,19 +2610,20 @@ impl LaminarDB {
         } else {
             None
         };
-        let installed_after_publication = if pending_transition.is_none() {
-            current_pipeline_identity
-                .clone()
-                .map(|pipeline_identity| {
-                    crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
-                        target_fence.clone(),
-                        pipeline_identity,
-                    )
-                })
-                .transpose()?
-        } else {
-            None
-        };
+        let installed_after_publication =
+            if pending_transition.is_none() && vnodes_requiring_restore.is_empty() {
+                current_pipeline_identity
+                    .clone()
+                    .map(|pipeline_identity| {
+                        crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
+                            target_fence.clone(),
+                            pipeline_identity,
+                        )
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
 
         // Assignment zero is intentionally noncanonical and can never have published a readiness
         // report. Replacement processes therefore stage their first target restore without an
@@ -2920,7 +2649,7 @@ impl LaminarDB {
         // then publish ownership before releasing its slot. The next cycle therefore observes
         // either the old assignment or the exact target-bound transition, never split half-state.
         let mut pending_slot = self.pending_vnode_transition.lock();
-        if pending_slot.is_some() || registry.any_restoring() {
+        if pending_slot.is_some() {
             return Err(DbError::Checkpoint(format!(
                 "[LDB-6053] assignment {} reached publication while another vnode transition was pending",
                 snapshot.version
@@ -2940,40 +2669,10 @@ impl LaminarDB {
         if pending_slot.is_some() {
             installed_state.take();
         }
-        if pending_slot.is_some() && !vnodes_requiring_restore.is_empty() {
-            registry.mark_restoring(&vnodes_requiring_restore);
-        }
-
-        if let Some(watermark) = source_handoff
-            .as_ref()
-            .and_then(|handoff| handoff.recovery_watermark_frontier())
-        {
-            controller.publish_cluster_min_watermark(watermark);
-        }
-        if let Some(handoff) = source_handoff {
-            registry.set_assignment_and_version_with_source_handoff(
-                new_assignment,
-                snapshot.version,
-                handoff,
-            );
-        } else if source_handoff_required {
-            // Genesis has no committed cut. Keep that distinct from a committed
-            // empty cut so sources may use their start-captured numeric baseline.
-            registry.set_assignment_and_version(new_assignment, snapshot.version);
-            registry.mark_active(&vnodes_requiring_restore);
-        } else {
-            registry.set_assignment_and_version_carrying_source_handoff(
-                new_assignment,
-                snapshot.version,
-            );
-        }
-        if let Some(backend) = self.state_backend.lock().clone() {
-            backend.set_authoritative_version(snapshot.version);
-        }
+        registry.set_assignment_and_version(new_assignment, snapshot.version);
         if let Some(coord) = guard.as_mut() {
             coord.set_assignment_version(snapshot.version);
             coord.set_vnode_set(new_owned.clone());
-            coord.set_gate_vnode_set((0..vnode_count).collect());
         }
         if pending_slot.is_none() {
             *installed_state = installed_after_publication;
@@ -2982,13 +2681,7 @@ impl LaminarDB {
         drop(pending_slot);
         drop(guard);
 
-        tracing::info!(
-            version = snapshot.version,
-            vnodes_requiring_restore = adoption.vnodes_requiring_restore.len(),
-            restored_vnode_count = adoption.restored_vnode_count,
-            restore_epoch = ?adoption.restore_epoch,
-            "adopted assignment snapshot",
-        );
+        tracing::info!(version = snapshot.version, "adopted assignment snapshot",);
         Ok(adoption)
     }
 
@@ -3094,10 +2787,6 @@ impl LaminarDB {
                 "cluster controller replacement requires a new LaminarDB graph generation".into(),
             )),
         }
-    }
-
-    pub(crate) fn set_state_backend(&self, backend: Arc<dyn laminar_core::state::StateBackend>) {
-        *self.state_backend.lock() = Some(backend);
     }
 
     pub(crate) fn set_vnode_registry(&self, registry: Arc<laminar_core::state::VnodeRegistry>) {
@@ -4623,16 +4312,16 @@ impl LaminarDB {
         self.config.checkpoint.is_some()
     }
 
-    /// Stable participant identity used to namespace checkpoint manifests.
+    /// Stable node identity used by checkpoint metadata.
     ///
-    /// Local runtimes return `None` and keep the historical unprefixed layout. Cluster runtimes
-    /// use the controller's numeric instance id; decision markers intentionally do not use this
-    /// namespace because they are cluster-wide.
+    /// `None` identifies the local runtime; its checkpoint node id is
+    /// [`laminar_core::state::LOCAL_NODE_ID`]. Cluster runtimes use the controller's numeric
+    /// instance id.
     pub(crate) fn checkpoint_participant(&self) -> Option<u64> {
         checkpoint_participant_for_runtime(self)
     }
 
-    /// Stable logical partition count used by checkpoint and state identity.
+    /// Stable logical partition count used by checkpoint and routing identity.
     /// Uses the exact registry topology, or the common deployment default when no registry is
     /// installed.
     pub(crate) fn checkpoint_key_groups(&self) -> laminar_core::state::KeyGroupCount {
@@ -4645,84 +4334,34 @@ impl LaminarDB {
         )
     }
 
-    /// Return a checkpoint store for the resolved runtime configuration, if any.
-    pub(crate) fn checkpoint_store(
+    pub(crate) fn checkpoint_object_store(
         &self,
-    ) -> Result<Option<Box<dyn laminar_core::storage::CheckpointStore>>, DbError> {
+    ) -> Result<Option<Arc<dyn object_store::ObjectStore>>, DbError> {
         let Some(cp_config) = self.config.checkpoint.as_ref() else {
             return Ok(None);
         };
-        let key_group_count = self.checkpoint_key_groups();
-        let participant = self.checkpoint_participant();
-        let participant_id = participant.unwrap_or(0);
-        let max_state_data_bytes = cp_config.max_staged_bytes.ok_or_else(|| {
-            DbError::Config("checkpoint.max_staged_bytes was not resolved at construction".into())
-        })?;
-
         #[cfg(feature = "cluster")]
         if let Some(object_store) = self.cluster_checkpoint_object_store() {
-            return Ok(Some(Box::new(
-                laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
-                    object_store,
-                    participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
-                )
-                .with_max_state_data_bytes(max_state_data_bytes)?
-                .with_key_group_count(key_group_count)
-                .with_participant_id(participant_id),
-            )));
+            return Ok(Some(object_store));
         }
-
-        if let Some(url) = self
-            .config
-            .object_store_url
-            .as_deref()
-            .filter(|url| url.starts_with("file://"))
+        let object_store: Arc<dyn object_store::ObjectStore> = if let Some(ref url) =
+            self.config.object_store_url
         {
-            let root = laminar_core::storage::object_store_builder::file_url_path(url)
-                .map_err(|error| DbError::Checkpoint(format!("checkpoint storage URL: {error}")))?;
-            let checkpoint_dir =
-                participant.map_or(root.clone(), |id| root.join("nodes").join(id.to_string()));
-            Ok(Some(Box::new(
-                laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
-                    checkpoint_dir,
-                )
-                .with_max_state_data_bytes(max_state_data_bytes)?
-                .with_key_group_count(key_group_count)
-                .with_participant_id(participant_id),
-            )))
-        } else if let Some(ref url) = self.config.object_store_url {
-            let obj_store = laminar_core::storage::object_store_builder::build_object_store(
+            laminar_core::checkpoint::object_store_builder::build_object_store(
                 url,
                 &self.config.object_store_options,
             )
-            .map_err(|error| DbError::Checkpoint(format!("checkpoint object store: {error}")))?;
-            Ok(Some(Box::new(
-                laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
-                    obj_store,
-                    participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
-                )
-                .with_max_state_data_bytes(max_state_data_bytes)?
-                .with_key_group_count(key_group_count)
-                .with_participant_id(participant_id),
-            )))
+            .map_err(|error| DbError::Checkpoint(format!("checkpoint object store: {error}")))?
         } else {
             let data_dir = cp_config
                 .data_dir
                 .clone()
                 .or_else(|| self.config.storage_dir.clone())
                 .unwrap_or_else(|| std::path::PathBuf::from("./data"));
-            let checkpoint_dir = participant.map_or(data_dir.clone(), |id| {
-                data_dir.join("nodes").join(id.to_string())
-            });
-            Ok(Some(Box::new(
-                laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
-                    checkpoint_dir,
-                )
-                .with_max_state_data_bytes(max_state_data_bytes)?
-                .with_key_group_count(key_group_count)
-                .with_participant_id(participant_id),
-            )))
-        }
+            laminar_core::checkpoint::object_store_builder::durable_local_object_store(data_dir)
+                .map_err(|error| DbError::Checkpoint(format!("checkpoint object store: {error}")))?
+        };
+        Ok(Some(object_store))
     }
 
     /// Trigger a checkpoint that persists source offsets, sink positions, and operator state.

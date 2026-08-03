@@ -359,56 +359,57 @@ fn digest(byte: u8) -> String {
     format!("{byte:02x}").repeat(32)
 }
 
-fn recovery_capsule_path(reference: &RecoveryCapsuleRef) -> OsPath {
+fn committed_checkpoint_path(reference: &CommittedCheckpointRef) -> OsPath {
     OsPath::from(format!(
-        "checkpoint-recovery-capsules/epoch={:020}/checkpoint={:020}/sha256={}",
+        "committed-checkpoints/epoch={:020}/checkpoint={:020}/sha256={}",
         reference.epoch, reference.checkpoint_id, reference.sha256
     ))
 }
 
-async fn recovery_capsule(
+async fn committed_checkpoint(
     store: &LeaderLeaseStore,
     fence: &CheckpointAssignmentFence,
     epoch: u64,
     checkpoint_id: u64,
-) -> RecoveryCapsuleRef {
-    assert_eq!(epoch, checkpoint_id, "test capsule must be canonical");
-    recovery_capsule_variant(store, fence, checkpoint_id, 9).await
+) -> CommittedCheckpointRef {
+    assert_eq!(epoch, checkpoint_id, "test checkpoint must be canonical");
+    committed_checkpoint_variant(store, fence, checkpoint_id, 9).await
 }
 
-async fn recovery_capsule_variant(
+async fn committed_checkpoint_variant(
     store: &LeaderLeaseStore,
     fence: &CheckpointAssignmentFence,
     checkpoint_id: u64,
     variant: u8,
-) -> RecoveryCapsuleRef {
+) -> CommittedCheckpointRef {
     let decisions = CheckpointDecisionStore::new(Arc::clone(&store.store));
     let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
-    let portable_state_sha256 = digest(variant);
-    let capsule = crate::checkpoint::ClusterRecoveryCapsule {
-        version: crate::checkpoint::CLUSTER_RECOVERY_CAPSULE_VERSION,
-        attempt: crate::state::CheckpointAttempt::canonical(checkpoint_id),
+    let index = CommittedCheckpointIndex {
+        version: crate::checkpoint::COMMITTED_CHECKPOINT_INDEX_VERSION,
         deployment_id,
         pipeline_identity: crate::checkpoint::PipelineIdentity::empty(),
-        assignment_fence: fence.clone(),
-        seal_inventory_sha256: digest(2),
-        vnode_restore_contract:
-            crate::checkpoint::recovery_capsule::vnode_restore_contract_for_test(fence.vnode_count),
-        participants: vec![crate::checkpoint::ParticipantRecoveryRef {
-            participant_id: fence.participants[0].node_id,
-            readiness_sha256: digest(3),
-            manifest_sha256: digest(4),
-            portable_state_sha256: portable_state_sha256.clone(),
-        }],
+        epoch: checkpoint_id,
+        checkpoint_id,
+        scope: CheckpointScope::Cluster,
+        vnode_count: u16::try_from(fence.vnode_count).unwrap(),
+        assignment_fence: Some(fence.clone()),
+        predecessor: None,
+        participants: fence
+            .participants
+            .iter()
+            .map(|participant| crate::checkpoint::CommittedParticipantRef {
+                participant_id: participant.node_id,
+                manifest_len: 1,
+                manifest_sha256: digest(variant),
+                node_data_len: 0,
+                node_data_sha256: digest(variant.wrapping_add(1)),
+            })
+            .collect(),
         source_offsets: std::collections::BTreeMap::new(),
-        source_metadata: std::collections::BTreeMap::new(),
-        source_assignment_versions: std::collections::BTreeMap::new(),
-        source_watermarks: std::collections::BTreeMap::new(),
-        cluster_watermark: crate::checkpoint::CheckpointWatermark::Uninitialized,
-        recovery_watermark_frontier: None,
-        portable_state_sha256,
+        channel_progress: Vec::new(),
+        checkpoint_watermark: None,
     };
-    decisions.create_recovery_capsule(&capsule).await.unwrap()
+    decisions.create_committed_checkpoint(&index).await.unwrap()
 }
 
 async fn record_commit(
@@ -419,7 +420,7 @@ async fn record_commit(
     checkpoint_id: u64,
 ) -> RecordOutcomeResult {
     assert_eq!(epoch, checkpoint_id, "test outcome must be canonical");
-    let capsule = recovery_capsule(store, fence, epoch, checkpoint_id).await;
+    let committed_checkpoint = committed_checkpoint(store, fence, epoch, checkpoint_id).await;
     store
         .record_cluster_outcome(
             proof,
@@ -427,7 +428,7 @@ async fn record_commit(
             checkpoint_id,
             fence.clone(),
             CheckpointVerdict::Commit,
-            Some(capsule),
+            Some(committed_checkpoint),
         )
         .await
         .unwrap()
@@ -1913,10 +1914,6 @@ struct BlockingStore {
     get_counts: Arc<std::sync::Mutex<std::collections::BTreeMap<String, u64>>>,
     put_counts: Arc<std::sync::Mutex<std::collections::BTreeMap<(String, &'static str), u64>>>,
     list_count: std::sync::atomic::AtomicU64,
-    fail_delete_once: Arc<std::sync::Mutex<Option<OsPath>>>,
-    track_capsule_get_concurrency: std::sync::atomic::AtomicBool,
-    active_capsule_gets: std::sync::atomic::AtomicUsize,
-    max_capsule_gets: std::sync::atomic::AtomicUsize,
 }
 
 impl BlockingStore {
@@ -1961,26 +1958,6 @@ impl BlockingStore {
         self.put_counts.lock().unwrap().clear();
         self.list_count
             .store(0, std::sync::atomic::Ordering::Release);
-    }
-
-    fn fail_next_delete(&self, location: OsPath) {
-        *self.fail_delete_once.lock().unwrap() = Some(location);
-    }
-
-    fn begin_capsule_get_concurrency_probe(&self) {
-        self.active_capsule_gets
-            .store(0, std::sync::atomic::Ordering::Release);
-        self.max_capsule_gets
-            .store(0, std::sync::atomic::Ordering::Release);
-        self.track_capsule_get_concurrency
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    fn finish_capsule_get_concurrency_probe(&self) -> usize {
-        self.track_capsule_get_concurrency
-            .store(false, std::sync::atomic::Ordering::Release);
-        self.max_capsule_gets
-            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -2116,59 +2093,14 @@ impl ObjectStore for BlockingStore {
                 }
             }
         }
-        let track_concurrency = location
-            .as_ref()
-            .starts_with("checkpoint-recovery-capsules/")
-            && self
-                .track_capsule_get_concurrency
-                .load(std::sync::atomic::Ordering::Acquire);
-        if track_concurrency {
-            let active = self
-                .active_capsule_gets
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-                + 1;
-            self.max_capsule_gets
-                .fetch_max(active, std::sync::atomic::Ordering::AcqRel);
-            tokio::task::yield_now().await;
-        }
-        let result = self.inner.get_opts(location, options).await;
-        if track_concurrency {
-            self.active_capsule_gets
-                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        }
-        result
+        self.inner.get_opts(location, options).await
     }
 
     fn delete_stream(
         &self,
         locations: futures::stream::BoxStream<'static, object_store::Result<OsPath>>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<OsPath>> {
-        let inner = Arc::clone(&self.inner);
-        let fail_delete_once = Arc::clone(&self.fail_delete_once);
-        FuturesStreamExt::boxed(FuturesStreamExt::then(locations, move |location| {
-            let inner = Arc::clone(&inner);
-            let fail_delete_once = Arc::clone(&fail_delete_once);
-            async move {
-                let location = location?;
-                let inject_failure = {
-                    let mut fail = fail_delete_once.lock().unwrap();
-                    if fail.as_ref() == Some(&location) {
-                        fail.take();
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if inject_failure {
-                    return Err(object_store::Error::Generic {
-                        store: "BlockingStore",
-                        source: Box::new(std::io::Error::other("injected one-shot delete failure")),
-                    });
-                }
-                inner.delete(&location).await?;
-                Ok(location)
-            }
-        }))
+        self.inner.delete_stream(locations)
     }
 
     fn list(
@@ -2218,10 +2150,6 @@ fn blocking_store_at(
         get_counts: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         put_counts: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         list_count: std::sync::atomic::AtomicU64::new(0),
-        fail_delete_once: Arc::new(std::sync::Mutex::new(None)),
-        track_capsule_get_concurrency: std::sync::atomic::AtomicBool::new(false),
-        active_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
-        max_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
     });
     let object_store: Arc<dyn ObjectStore> = raw.clone();
     let authority = Arc::new(LeaderLeaseStore::new(object_store, ttl_ms));
@@ -2257,10 +2185,6 @@ fn blocking_get_once_with_inner(
         get_counts: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         put_counts: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         list_count: std::sync::atomic::AtomicU64::new(0),
-        fail_delete_once: Arc::new(std::sync::Mutex::new(None)),
-        track_capsule_get_concurrency: std::sync::atomic::AtomicBool::new(false),
-        active_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
-        max_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
     });
     let object_store: Arc<dyn ObjectStore> = raw.clone();
     let authority = Arc::new(LeaderLeaseStore::new(object_store, ttl_ms));
@@ -2292,10 +2216,6 @@ fn replacing_once_on_get(
         get_counts: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         put_counts: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         list_count: std::sync::atomic::AtomicU64::new(0),
-        fail_delete_once: Arc::new(std::sync::Mutex::new(None)),
-        track_capsule_get_concurrency: std::sync::atomic::AtomicBool::new(false),
-        active_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
-        max_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
     });
     let object_store: Arc<dyn ObjectStore> = raw.clone();
     let authority = Arc::new(LeaderLeaseStore::new(object_store, ttl_ms));
@@ -2323,10 +2243,6 @@ fn blocking_once_at(
         get_counts: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         put_counts: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         list_count: std::sync::atomic::AtomicU64::new(0),
-        fail_delete_once: Arc::new(std::sync::Mutex::new(None)),
-        track_capsule_get_concurrency: std::sync::atomic::AtomicBool::new(false),
-        active_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
-        max_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
     });
     let object_store: Arc<dyn ObjectStore> = raw.clone();
     let authority = Arc::new(LeaderLeaseStore::new(object_store, ttl_ms));
@@ -2370,10 +2286,6 @@ fn delayed_response_once_at_with_ambiguity(
         get_counts: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         put_counts: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         list_count: std::sync::atomic::AtomicU64::new(0),
-        fail_delete_once: Arc::new(std::sync::Mutex::new(None)),
-        track_capsule_get_concurrency: std::sync::atomic::AtomicBool::new(false),
-        active_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
-        max_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
     });
     let object_store: Arc<dyn ObjectStore> = raw.clone();
     let authority = Arc::new(LeaderLeaseStore::new(object_store, ttl_ms));
@@ -2401,10 +2313,6 @@ fn ambiguous_once_at(
         get_counts: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         put_counts: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         list_count: std::sync::atomic::AtomicU64::new(0),
-        fail_delete_once: Arc::new(std::sync::Mutex::new(None)),
-        track_capsule_get_concurrency: std::sync::atomic::AtomicBool::new(false),
-        active_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
-        max_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
     });
     let object_store: Arc<dyn ObjectStore> = raw.clone();
     let authority = Arc::new(LeaderLeaseStore::new(object_store, ttl_ms));
@@ -4518,20 +4426,20 @@ async fn exact_cluster_outcome_bounds_latest_future_and_older_reads() {
         .unwrap()
         .checkpoint_outcome
         .unwrap()
-        .recovery_capsule
+        .committed_checkpoint
         .unwrap();
     raw.clear_get_counts();
-    let (committed, capsule) = store
-        .cluster_outcome_with_recovery_capsule(5)
+    let (committed, checkpoint) = store
+        .cluster_outcome_with_committed_checkpoint(5)
         .await
         .unwrap()
         .unwrap();
     assert!(committed.is_commit());
-    assert_eq!(capsule.unwrap().attempt.epoch, 5);
+    assert_eq!(checkpoint.unwrap().epoch, 5);
     assert_eq!(raw.get_count(&lease_path(6)), 1);
     assert_eq!(raw.get_count(&deployment_path), 1);
     assert_eq!(
-        raw.get_count(&recovery_capsule_path(&recovery_reference)),
+        raw.get_count(&committed_checkpoint_path(&recovery_reference)),
         1
     );
 }
@@ -4708,25 +4616,25 @@ async fn cluster_attempt_settlement_returns_exact_or_newer_closure() {
         .unwrap();
 
     let exact = store
-        .cluster_attempt_settlement(crate::state::CheckpointAttempt::canonical(1))
+        .cluster_attempt_settlement(crate::checkpoint::CheckpointAttempt::canonical(1))
         .await
         .unwrap()
         .unwrap();
     assert_eq!((exact.epoch, exact.checkpoint_id), (1, 1));
     let newer_closure = store
-        .cluster_attempt_settlement(crate::state::CheckpointAttempt::canonical(2))
+        .cluster_attempt_settlement(crate::checkpoint::CheckpointAttempt::canonical(2))
         .await
         .unwrap()
         .unwrap();
     assert_eq!((newer_closure.epoch, newer_closure.checkpoint_id), (3, 3));
     assert!(store
-        .cluster_attempt_settlement(crate::state::CheckpointAttempt::canonical(4))
+        .cluster_attempt_settlement(crate::checkpoint::CheckpointAttempt::canonical(4))
         .await
         .unwrap()
         .is_none());
     assert!(matches!(
         store
-            .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(2, 35))
+            .cluster_attempt_settlement(crate::checkpoint::CheckpointAttempt::new(2, 35))
             .await,
         Err(ClusterCheckpointAuthorityError::Decision(
             DecisionError::Conflict(_)
@@ -4801,7 +4709,7 @@ async fn cluster_attempt_settlement_preserves_fences_across_outcome_compaction()
     );
 
     let exact_anchor = store
-        .cluster_attempt_settlement(crate::state::CheckpointAttempt::canonical(1))
+        .cluster_attempt_settlement(crate::checkpoint::CheckpointAttempt::canonical(1))
         .await
         .unwrap()
         .unwrap();
@@ -4822,7 +4730,7 @@ async fn cluster_attempt_settlement_preserves_fences_across_outcome_compaction()
     );
 
     let newer_closure = store
-        .cluster_attempt_settlement(crate::state::CheckpointAttempt::canonical(2))
+        .cluster_attempt_settlement(crate::checkpoint::CheckpointAttempt::canonical(2))
         .await
         .unwrap()
         .unwrap();
@@ -4879,7 +4787,7 @@ async fn cluster_outcome_audit_cache_reuses_unchanged_head_and_reaudits_changed_
     *store.outcome_audit_cache.lock() = None;
     raw.clear_get_counts();
     let exact = store
-        .cluster_attempt_settlement(crate::state::CheckpointAttempt::canonical(1))
+        .cluster_attempt_settlement(crate::checkpoint::CheckpointAttempt::canonical(1))
         .await
         .unwrap()
         .unwrap();
@@ -5151,7 +5059,7 @@ async fn all_abort_history_compacts_without_advancing_artifact_retention() {
     );
 
     let compacted_attempt = restarted
-        .cluster_attempt_settlement(crate::state::CheckpointAttempt::canonical(1))
+        .cluster_attempt_settlement(crate::checkpoint::CheckpointAttempt::canonical(1))
         .await
         .unwrap()
         .unwrap();
@@ -5160,7 +5068,7 @@ async fn all_abort_history_compacts_without_advancing_artifact_retention() {
         u64::try_from(OUTCOME_HISTORY_COMPACTION_TRIGGER + 1).unwrap()
     );
     let exact_anchor = restarted
-        .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(
+        .cluster_attempt_settlement(crate::checkpoint::CheckpointAttempt::new(
             terminal_anchor.epoch,
             terminal_anchor.checkpoint_id,
         ))
@@ -5517,7 +5425,7 @@ async fn next_commit_is_rejected_at_the_live_commit_capacity_before_sequence_cre
     disable_history_pruning_for_test(&store).await;
     let proof = first.proof();
     let fence = assignment_fence(&incumbent);
-    let first_capsule = recovery_capsule(&store, &fence, 1, 1).await;
+    let first_checkpoint = committed_checkpoint(&store, &fence, 1, 1).await;
     store
         .record_cluster_outcome(
             &proof,
@@ -5525,7 +5433,7 @@ async fn next_commit_is_rejected_at_the_live_commit_capacity_before_sequence_cre
             1,
             fence.clone(),
             CheckpointVerdict::Commit,
-            Some(first_capsule),
+            Some(first_checkpoint),
         )
         .await
         .unwrap();
@@ -5546,7 +5454,7 @@ async fn next_commit_is_rejected_at_the_live_commit_capacity_before_sequence_cre
         let mut outcome = template.clone();
         outcome.epoch = epoch;
         outcome.checkpoint_id = checkpoint_id;
-        let reference = outcome.recovery_capsule.as_mut().unwrap();
+        let reference = outcome.committed_checkpoint.as_mut().unwrap();
         reference.epoch = epoch;
         reference.checkpoint_id = checkpoint_id;
         let link = OutcomeLink {
@@ -5611,7 +5519,8 @@ async fn next_commit_is_rejected_at_the_live_commit_capacity_before_sequence_cre
 
     let next_epoch = maximum.checked_add(1).unwrap();
     let next_checkpoint_id = next_epoch;
-    let next_capsule = recovery_capsule(&store, &fence, next_epoch, next_checkpoint_id).await;
+    let next_checkpoint =
+        committed_checkpoint(&store, &fence, next_epoch, next_checkpoint_id).await;
     let error = store
         .record_cluster_outcome(
             &proof,
@@ -5619,7 +5528,7 @@ async fn next_commit_is_rejected_at_the_live_commit_capacity_before_sequence_cre
             next_checkpoint_id,
             fence,
             CheckpointVerdict::Commit,
-            Some(next_capsule),
+            Some(next_checkpoint),
         )
         .await
         .unwrap_err();
@@ -5761,7 +5670,7 @@ async fn restarted_authority_compacts_before_append_with_bounded_terminal_reads(
 }
 
 #[tokio::test]
-async fn corrupt_pending_commit_capsule_does_not_block_terminal_compaction() {
+async fn corrupt_pending_commit_index_does_not_block_terminal_compaction() {
     let store = store(1_000);
     let incumbent = owner(1, 1, 1);
     let LeaseOutcome::Acquired(first) = store
@@ -5774,7 +5683,7 @@ async fn corrupt_pending_commit_capsule_does_not_block_terminal_compaction() {
     disable_history_pruning_for_test(&store).await;
     let proof = first.proof();
     let fence = assignment_fence(&incumbent);
-    let capsule = recovery_capsule(&store, &fence, 1, 1).await;
+    let checkpoint = committed_checkpoint(&store, &fence, 1, 1).await;
     store
         .record_cluster_outcome(
             &proof,
@@ -5782,7 +5691,7 @@ async fn corrupt_pending_commit_capsule_does_not_block_terminal_compaction() {
             1,
             fence.clone(),
             CheckpointVerdict::Commit,
-            Some(capsule.clone()),
+            Some(checkpoint.clone()),
         )
         .await
         .unwrap();
@@ -5802,7 +5711,7 @@ async fn corrupt_pending_commit_capsule_does_not_block_terminal_compaction() {
     store
         .store
         .put(
-            &recovery_capsule_path(&capsule),
+            &committed_checkpoint_path(&checkpoint),
             PutPayload::from(Bytes::from_static(b"corrupt")),
         )
         .await
@@ -5825,7 +5734,7 @@ async fn corrupt_pending_commit_capsule_does_not_block_terminal_compaction() {
     assert_eq!(head.outcome_head.unwrap().epoch, next_epoch);
     assert_eq!(store.cluster_outcome(1).await.unwrap().unwrap().epoch, 1);
     assert!(matches!(
-        store.cluster_outcome_with_recovery_capsule(1).await,
+        store.cluster_outcome_with_committed_checkpoint(1).await,
         Err(ClusterCheckpointAuthorityError::Decision(_))
     ));
     assert!(matches!(
@@ -5834,101 +5743,6 @@ async fn corrupt_pending_commit_capsule_does_not_block_terminal_compaction() {
             .await,
         Err(ClusterCheckpointAuthorityError::Decision(_))
     ));
-}
-
-#[tokio::test]
-async fn obsolete_anchor_capsule_is_not_preflighted_and_is_garbage_collected() {
-    let store = store(1_000);
-    let incumbent = owner(1, 1, 1);
-    let LeaseOutcome::Acquired(first) = store
-        .acquire_or_renew_current_term_for_test(&incumbent, 0)
-        .await
-        .unwrap()
-    else {
-        unreachable!()
-    };
-    disable_history_pruning_for_test(&store).await;
-    let proof = first.proof();
-    let fence = assignment_fence(&incumbent);
-    let obsolete = recovery_capsule(&store, &fence, 1, 1).await;
-    let live = recovery_capsule(&store, &fence, 3, 3).await;
-    store
-        .record_cluster_outcome(
-            &proof,
-            1,
-            1,
-            fence.clone(),
-            CheckpointVerdict::Commit,
-            Some(obsolete.clone()),
-        )
-        .await
-        .unwrap();
-    store
-        .record_cluster_outcome(
-            &proof,
-            3,
-            3,
-            fence.clone(),
-            CheckpointVerdict::Commit,
-            Some(live),
-        )
-        .await
-        .unwrap();
-    store
-        .prune_cluster_outcomes_before(&proof, 3, accept_recovery_artifacts)
-        .await
-        .unwrap();
-
-    let obsolete_path = recovery_capsule_path(&obsolete);
-    store
-        .store
-        .put(
-            &obsolete_path,
-            PutPayload::from(Bytes::from_static(b"corrupt")),
-        )
-        .await
-        .unwrap();
-    let boundary = store
-        .audited_cluster_outcome_retention_boundary()
-        .await
-        .unwrap();
-    assert_eq!(boundary.artifact_before_epoch, 3);
-    assert_eq!(boundary.committed_anchor.unwrap().epoch, 1);
-
-    let last_epoch = u64::try_from(OUTCOME_HISTORY_COMPACTION_TRIGGER + 3).unwrap();
-    for epoch in 4..=last_epoch {
-        store
-            .record_cluster_outcome(
-                &proof,
-                epoch,
-                epoch,
-                fence.clone(),
-                CheckpointVerdict::Abort,
-                None,
-            )
-            .await
-            .unwrap();
-    }
-    let compacted = store
-        .audited_cluster_outcome_retention_boundary()
-        .await
-        .unwrap();
-    assert!(compacted.terminal_before_epoch > compacted.artifact_before_epoch);
-
-    let maintenance = store.maintain_cluster_recovery_capsules().await.unwrap();
-    assert!(maintenance.quarantined >= 1);
-    assert!(matches!(
-        store.store.head(&obsolete_path).await,
-        Err(object_store::Error::NotFound { .. })
-    ));
-    assert_eq!(
-        store
-            .audited_cluster_outcome_retention_boundary()
-            .await
-            .unwrap()
-            .artifact_before_epoch,
-        3
-    );
 }
 
 #[tokio::test]
@@ -5946,7 +5760,7 @@ async fn concurrent_artifact_floor_mutation_is_preserved_by_history_compaction()
     disable_history_pruning_for_test(&setup).await;
     let proof = first.proof();
     let fence = assignment_fence(&incumbent);
-    let capsule = recovery_capsule(&setup, &fence, 1, 1).await;
+    let checkpoint = committed_checkpoint(&setup, &fence, 1, 1).await;
     setup
         .record_cluster_outcome(
             &proof,
@@ -5954,7 +5768,7 @@ async fn concurrent_artifact_floor_mutation_is_preserved_by_history_compaction()
             1,
             fence.clone(),
             CheckpointVerdict::Commit,
-            Some(capsule.clone()),
+            Some(checkpoint.clone()),
         )
         .await
         .unwrap();
@@ -6063,7 +5877,7 @@ async fn older_concurrent_outcome_audit_cannot_replace_a_newer_cache_entry() {
     let old_store = Arc::clone(&store);
     let old_audit = tokio::spawn(async move {
         old_store
-            .cluster_attempt_settlement(crate::state::CheckpointAttempt::canonical(1))
+            .cluster_attempt_settlement(crate::checkpoint::CheckpointAttempt::canonical(1))
             .await
     });
     raw.entered.acquire().await.unwrap().forget();
@@ -6409,11 +6223,11 @@ async fn assert_invalid_selected_cut_blocks_prune(corrupt: bool) {
     };
     let proof = first.proof();
     let fence = assignment_fence(&incumbent);
-    let first_capsule = recovery_capsule(&store, &fence, 1, 1).await;
-    let selected_capsule = recovery_capsule(&store, &fence, 2, 2).await;
-    for (epoch, checkpoint_id, capsule) in [
-        (1, 1, first_capsule.clone()),
-        (2, 2, selected_capsule.clone()),
+    let first_checkpoint = committed_checkpoint(&store, &fence, 1, 1).await;
+    let selected_checkpoint = committed_checkpoint(&store, &fence, 2, 2).await;
+    for (epoch, checkpoint_id, checkpoint) in [
+        (1, 1, first_checkpoint.clone()),
+        (2, 2, selected_checkpoint.clone()),
     ] {
         assert!(matches!(
             store
@@ -6423,16 +6237,16 @@ async fn assert_invalid_selected_cut_blocks_prune(corrupt: bool) {
                     checkpoint_id,
                     fence.clone(),
                     CheckpointVerdict::Commit,
-                    Some(capsule),
+                    Some(checkpoint),
                 )
                 .await
                 .unwrap(),
             RecordOutcomeResult::Created(_)
         ));
     }
-    let old_orphan = recovery_capsule_variant(&store, &fence, 1, 11).await;
-    let old_orphan_path = recovery_capsule_path(&old_orphan);
-    let selected_path = recovery_capsule_path(&selected_capsule);
+    let old_orphan = committed_checkpoint_variant(&store, &fence, 1, 11).await;
+    let old_orphan_path = committed_checkpoint_path(&old_orphan);
+    let selected_path = committed_checkpoint_path(&selected_checkpoint);
     if corrupt {
         store
             .store
@@ -6469,7 +6283,7 @@ async fn assert_invalid_selected_cut_blocks_prune(corrupt: bool) {
         .expect("failed cut validation must prevent orphan pruning");
     store
         .store
-        .head(&recovery_capsule_path(&first_capsule))
+        .head(&committed_checkpoint_path(&first_checkpoint))
         .await
         .expect("failed cut validation must prevent authority-history pruning");
 }
@@ -6732,11 +6546,11 @@ async fn ambiguous_floor_create_revalidates_the_winner_cut() {
     };
     let proof = first.proof();
     let fence = assignment_fence(&incumbent);
-    let first_capsule = recovery_capsule(store.as_ref(), &fence, 1, 1).await;
-    let selected_capsule = recovery_capsule(store.as_ref(), &fence, 2, 2).await;
-    for (epoch, checkpoint_id, capsule) in [
-        (1, 1, first_capsule.clone()),
-        (2, 2, selected_capsule.clone()),
+    let first_checkpoint = committed_checkpoint(store.as_ref(), &fence, 1, 1).await;
+    let selected_checkpoint = committed_checkpoint(store.as_ref(), &fence, 2, 2).await;
+    for (epoch, checkpoint_id, checkpoint) in [
+        (1, 1, first_checkpoint.clone()),
+        (2, 2, selected_checkpoint.clone()),
     ] {
         assert!(matches!(
             store
@@ -6746,7 +6560,7 @@ async fn ambiguous_floor_create_revalidates_the_winner_cut() {
                     checkpoint_id,
                     fence.clone(),
                     CheckpointVerdict::Commit,
-                    Some(capsule),
+                    Some(checkpoint),
                 )
                 .await
                 .unwrap(),
@@ -6765,180 +6579,14 @@ async fn ambiguous_floor_create_revalidates_the_winner_cut() {
     assert!(raw
         .did_return_ambiguous
         .load(std::sync::atomic::Ordering::Acquire));
-    assert_eq!(raw.get_count(&recovery_capsule_path(&first_capsule)), 0);
-    assert_eq!(raw.get_count(&recovery_capsule_path(&selected_capsule)), 2);
-}
-
-#[tokio::test]
-async fn capsule_cleanup_is_bounded_retryable_and_independent_of_floor_publication() {
-    let (raw, store) = blocking_once_at(1_000, OsPath::from("control/never-block-capsule-sweep"));
-    let incumbent = owner(1, 1, 1);
-    let LeaseOutcome::Acquired(first) = store
-        .acquire_or_renew_current_term_for_test(&incumbent, 0)
-        .await
-        .unwrap()
-    else {
-        panic!("empty authority must be acquired");
-    };
-    let proof = first.proof();
-    let fence = assignment_fence(&incumbent);
-
-    let first_capsule = recovery_capsule(store.as_ref(), &fence, 1, 1).await;
-    let second_capsule = recovery_capsule(store.as_ref(), &fence, 2, 2).await;
-    let third_capsule = recovery_capsule(store.as_ref(), &fence, 3, 3).await;
-    for (epoch, checkpoint_id, capsule) in [
-        (1, 1, first_capsule.clone()),
-        (2, 2, second_capsule.clone()),
-        (3, 3, third_capsule.clone()),
-    ] {
-        assert!(matches!(
-            store
-                .record_cluster_outcome(
-                    &proof,
-                    epoch,
-                    checkpoint_id,
-                    fence.clone(),
-                    CheckpointVerdict::Commit,
-                    Some(capsule),
-                )
-                .await
-                .unwrap(),
-            RecordOutcomeResult::Created(_)
-        ));
-    }
-
-    let old_orphan = recovery_capsule_variant(store.as_ref(), &fence, 1, 11).await;
-    let deletable_old_orphan = recovery_capsule_variant(store.as_ref(), &fence, 1, 12).await;
-    let another_old_orphan = recovery_capsule_variant(store.as_ref(), &fence, 1, 14).await;
-    let corrupt_old_orphan = recovery_capsule_variant(store.as_ref(), &fence, 1, 13).await;
-    let at_floor_unpublished = recovery_capsule_variant(store.as_ref(), &fence, 2, 21).await;
-    let above_floor_unpublished = recovery_capsule_variant(store.as_ref(), &fence, 4, 41).await;
-    let old_orphan_path = recovery_capsule_path(&old_orphan);
-    let deletable_old_orphan_path = recovery_capsule_path(&deletable_old_orphan);
-    let another_old_orphan_path = recovery_capsule_path(&another_old_orphan);
-    let corrupt_old_orphan_path = recovery_capsule_path(&corrupt_old_orphan);
-    let at_floor_path = recovery_capsule_path(&at_floor_unpublished);
-    let above_floor_path = recovery_capsule_path(&above_floor_unpublished);
-    let malformed_path =
-        OsPath::from("checkpoint-recovery-capsules/epoch=00000000000000000001/malformed-junk");
-    let known_paths = [
-        recovery_capsule_path(&first_capsule),
-        recovery_capsule_path(&second_capsule),
-        recovery_capsule_path(&third_capsule),
-    ];
-    raw.inner
-        .put(
-            &corrupt_old_orphan_path,
-            PutPayload::from(Bytes::from_static(b"corrupt")),
-        )
-        .await
-        .unwrap();
-    raw.inner
-        .put(
-            &malformed_path,
-            PutPayload::from(Bytes::from_static(b"junk")),
-        )
-        .await
-        .unwrap();
-
-    raw.clear_get_counts();
-    raw.fail_next_delete(old_orphan_path.clone());
-    raw.begin_capsule_get_concurrency_probe();
     assert_eq!(
-        store
-            .prune_cluster_outcomes_before(&proof, 2, accept_recovery_artifacts)
-            .await
-            .unwrap(),
+        raw.get_count(&committed_checkpoint_path(&first_checkpoint)),
+        0
+    );
+    assert_eq!(
+        raw.get_count(&committed_checkpoint_path(&selected_checkpoint)),
         2
     );
-    raw.inner
-        .head(&old_orphan_path)
-        .await
-        .expect("floor publication must not perform capsule cleanup inline");
-    let first_step = store.maintain_cluster_recovery_capsules().await.unwrap();
-    assert!(first_step.pending, "failed delete must remain retryable");
-    assert!(raw.finish_capsule_get_concurrency_probe() <= 4);
-
-    assert_eq!(raw.get_count(&known_paths[0]), 1);
-    assert_eq!(raw.get_count(&known_paths[1]), 0);
-    assert_eq!(
-        raw.get_count(&known_paths[2]),
-        1,
-        "the highest retained commit capsule must be fully validated"
-    );
-    assert_eq!(raw.get_count(&old_orphan_path), 1);
-    assert_eq!(raw.get_count(&deletable_old_orphan_path), 1);
-    assert_eq!(raw.get_count(&another_old_orphan_path), 1);
-    assert!(raw.get_count(&corrupt_old_orphan_path) >= 1);
-    assert_eq!(raw.get_count(&at_floor_path), 0);
-    assert_eq!(raw.get_count(&above_floor_path), 0);
-    assert_eq!(raw.get_count(&malformed_path), 0);
-    assert!(matches!(
-        raw.inner.head(&known_paths[0]).await,
-        Err(object_store::Error::NotFound { .. })
-    ));
-    raw.inner
-        .head(&old_orphan_path)
-        .await
-        .expect("a failed best-effort delete remains retryable");
-    assert!(matches!(
-        raw.inner.head(&deletable_old_orphan_path).await,
-        Err(object_store::Error::NotFound { .. })
-    ));
-    assert!(matches!(
-        raw.inner.head(&another_old_orphan_path).await,
-        Err(object_store::Error::NotFound { .. })
-    ));
-    assert!(matches!(
-        raw.inner.head(&corrupt_old_orphan_path).await,
-        Err(object_store::Error::NotFound { .. })
-    ));
-    assert!(matches!(
-        raw.inner.head(&malformed_path).await,
-        Err(object_store::Error::NotFound { .. })
-    ));
-    raw.inner
-        .head(&at_floor_path)
-        .await
-        .expect("an unpublished capsule at the floor must be retained");
-    raw.inner
-        .head(&above_floor_path)
-        .await
-        .expect("an unpublished capsule above the floor must be retained");
-
-    raw.clear_get_counts();
-    let retry = store.maintain_cluster_recovery_capsules().await.unwrap();
-    assert!(retry.pending);
-    assert_eq!(raw.get_count(&old_orphan_path), 1);
-    assert_eq!(raw.get_count(&deletable_old_orphan_path), 0);
-    assert_eq!(raw.get_count(&another_old_orphan_path), 0);
-    assert_eq!(raw.get_count(&corrupt_old_orphan_path), 0);
-    assert_eq!(raw.get_count(&at_floor_path), 0);
-    assert_eq!(raw.get_count(&above_floor_path), 0);
-    assert_eq!(raw.get_count(&malformed_path), 0);
-    assert!(matches!(
-        raw.inner.head(&old_orphan_path).await,
-        Err(object_store::Error::NotFound { .. })
-    ));
-    raw.inner
-        .head(&at_floor_path)
-        .await
-        .expect("an unpublished capsule at the floor must survive retries");
-    raw.inner
-        .head(&above_floor_path)
-        .await
-        .expect("an unpublished capsule above the floor must survive retries");
-
-    raw.clear_get_counts();
-    assert!(
-        store
-            .maintain_cluster_recovery_capsules()
-            .await
-            .unwrap()
-            .pending
-    );
-    assert_eq!(raw.get_count(&malformed_path), 0);
-    assert_eq!(raw.get_count(&corrupt_old_orphan_path), 0);
 }
 
 #[tokio::test]
@@ -6956,13 +6604,13 @@ async fn renewal_catalog_seal_and_takeover_preserve_outcome_head_and_floor() {
     let proof = first.proof();
     let fence = assignment_fence(&incumbent);
     let decisions = CheckpointDecisionStore::new(Arc::clone(&store.store));
-    let first_capsule = recovery_capsule(&store, &fence, 1, 1).await;
-    let second_capsule = recovery_capsule(&store, &fence, 2, 2).await;
-    let third_capsule = recovery_capsule(&store, &fence, 3, 3).await;
-    for (epoch, checkpoint_id, capsule) in [
-        (1, 1, first_capsule.clone()),
-        (2, 2, second_capsule.clone()),
-        (3, 3, third_capsule.clone()),
+    let first_checkpoint = committed_checkpoint(&store, &fence, 1, 1).await;
+    let second_checkpoint = committed_checkpoint(&store, &fence, 2, 2).await;
+    let third_checkpoint = committed_checkpoint(&store, &fence, 3, 3).await;
+    for (epoch, checkpoint_id, checkpoint) in [
+        (1, 1, first_checkpoint.clone()),
+        (2, 2, second_checkpoint.clone()),
+        (3, 3, third_checkpoint.clone()),
     ] {
         assert!(matches!(
             store
@@ -6972,7 +6620,7 @@ async fn renewal_catalog_seal_and_takeover_preserve_outcome_head_and_floor() {
                     checkpoint_id,
                     fence.clone(),
                     CheckpointVerdict::Commit,
-                    Some(capsule),
+                    Some(checkpoint),
                 )
                 .await
                 .unwrap(),
@@ -7034,23 +6682,15 @@ async fn renewal_catalog_seal_and_takeover_preserve_outcome_head_and_floor() {
     ));
     assert_eq!(takeover.token, first.token + 1);
     decisions
-        .load_recovery_capsule(&first_capsule)
+        .load_committed_checkpoint(&first_checkpoint)
         .await
         .unwrap();
-    let maintenance = store.maintain_cluster_recovery_capsules().await.unwrap();
-    assert_eq!(maintenance.deleted, 2);
-    assert_eq!(maintenance.quarantined, 0);
-    assert!(maintenance.pending);
-    assert!(decisions
-        .load_recovery_capsule(&first_capsule)
-        .await
-        .is_err());
-    assert!(decisions
-        .load_recovery_capsule(&second_capsule)
-        .await
-        .is_err());
     decisions
-        .load_recovery_capsule(&third_capsule)
+        .load_committed_checkpoint(&second_checkpoint)
+        .await
+        .unwrap();
+    decisions
+        .load_committed_checkpoint(&third_checkpoint)
         .await
         .unwrap();
 }

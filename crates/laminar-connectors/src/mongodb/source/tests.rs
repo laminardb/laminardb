@@ -704,7 +704,7 @@ async fn invalid_resume_checkpoint_fails_before_network_io() {
             SourceStart::new(
                 ConnectorConfig::new("mongodb-cdc"),
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::canonical(11),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(11),
                     checkpoint: SourceCheckpoint::new(),
                 },
                 crate::connector::DeliveryGuarantee::BestEffort,
@@ -1270,7 +1270,7 @@ async fn failed_reader_admission_preserves_state_and_allows_same_instance_retry(
             SourceStart::new(
                 candidate.clone(),
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::canonical(11),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(11),
                     checkpoint,
                 },
                 crate::connector::DeliveryGuarantee::BestEffort,

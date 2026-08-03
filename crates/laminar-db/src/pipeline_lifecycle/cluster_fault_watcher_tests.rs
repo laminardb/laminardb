@@ -11,7 +11,6 @@ use laminar_connectors::connector::{
     SourceTopology,
 };
 use laminar_connectors::error::ConnectorError;
-use laminar_core::checkpoint_decision::{CheckpointVerdict, RecordOutcomeResult};
 use laminar_core::cluster::control::controller::{
     RecoveryAnnouncement, RecoveryFault, RecoveryRound,
 };
@@ -22,12 +21,7 @@ use laminar_core::cluster::control::{
     ProcessLeaseAuthority, ProcessLeaseOutcome, RecoverPhase,
 };
 use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
-use laminar_core::state::{
-    InProcessBackend, KeyGroupCount, NodeId as StateNodeId, ObjectStoreBackend, VnodeRegistry,
-};
-use laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase;
-use laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore;
-use laminar_core::storage::CheckpointStore;
+use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -237,7 +231,6 @@ async fn startup_db() -> (
             interval_ms: Some(3_600_000),
             ..laminar_core::streaming::StreamCheckpointConfig::default()
         })
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(registry)
         .register_connector(|registry| {
             registry.register_source(
@@ -386,7 +379,6 @@ async fn zero_vnode_worker_finishes_startup_idle_and_data_plane_fenced() {
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(Arc::clone(&objects))
         .assignment_snapshot_store(assignment_store)
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, owner)))
         .shuffle_sender(Arc::clone(&sender))
         .shuffle_receiver(receiver)
@@ -397,12 +389,17 @@ async fn zero_vnode_worker_finishes_startup_idle_and_data_plane_fenced() {
     let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
         crate::checkpoint_coordinator::CheckpointConfig::default(),
         Box::new(
-            laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
-                checkpoint_dir.path(),
-            ),
+            laminar_core::checkpoint::ObjectStoreCheckpointStore::new(
+                Arc::new(
+                    object_store::local::LocalFileSystem::new_with_prefix(checkpoint_dir.path())
+                        .unwrap(),
+                ),
+                "",
+            )
+            .with_key_group_count(laminar_core::state::KeyGroupCount::try_from(1_u16).unwrap())
+            .with_participant_id(local.0),
         ),
     )
-    .await
     .unwrap();
     coordinator
         .bind_pipeline_identity(laminar_core::checkpoint::PipelineIdentity::empty())
@@ -439,13 +436,6 @@ async fn zero_vnode_worker_finishes_startup_idle_and_data_plane_fenced() {
 async fn splittable_source_without_assignment_hook_fails_before_start() {
     REJECTING_SPLITTABLE_STARTED.store(false, Ordering::Release);
     let (db, _controller, _kv, _members, _round, manifest_store, proof) = startup_db().await;
-    let state_store: Arc<dyn object_store::ObjectStore> =
-        Arc::new(object_store::memory::InMemory::new());
-    *db.state_backend.lock() = Some(Arc::new(ObjectStoreBackend::cluster_shared(
-        state_store,
-        "node-7",
-        1,
-    )));
     manifest_store
         .seal(
             &CatalogManifest::new(vec![
@@ -487,13 +477,6 @@ async fn splittable_source_without_assignment_hook_fails_before_start() {
 async fn cluster_source_start_failure_does_not_leave_graph_ready_vnode_state() {
     FAILING_CLUSTER_SOURCE_STARTED.store(false, Ordering::Release);
     let (db, _controller, _kv, _members, _round, manifest_store, proof) = startup_db().await;
-    let state_store: Arc<dyn object_store::ObjectStore> =
-        Arc::new(object_store::memory::InMemory::new());
-    *db.state_backend.lock() = Some(Arc::new(ObjectStoreBackend::cluster_shared(
-        state_store,
-        "node-7",
-        1,
-    )));
     manifest_store
         .seal(
             &CatalogManifest::new(vec![
@@ -616,119 +599,6 @@ async fn assignment_closure_wins_while_startup_waits_to_open_intake() {
     );
     assert!(db.cluster_intake_fenced());
     assert_eq!(controller.checkpoint_assignment_fence(1), None);
-}
-
-#[tokio::test]
-async fn cluster_startup_defers_source_actor_until_prepared_outcome_is_terminal() {
-    let (db, controller, _kv, _members, round, manifest_store, proof) = startup_db().await;
-    let state_store: Arc<dyn object_store::ObjectStore> =
-        Arc::new(object_store::memory::InMemory::new());
-    *db.state_backend.lock() = Some(Arc::new(ObjectStoreBackend::cluster_shared(
-        state_store,
-        "node-7",
-        1,
-    )));
-    manifest_store
-        .seal(
-            &CatalogManifest::new(vec![
-                CatalogManifestEntry {
-                    canonical_name: "trades".into(),
-                    kind: CatalogObjectKind::Source,
-                    ddl: "CREATE SOURCE trades (id BIGINT) FROM \"idle-cluster-test\"".into(),
-                },
-                CatalogManifestEntry {
-                    canonical_name: "out".into(),
-                    kind: CatalogObjectKind::Stream,
-                    ddl: "CREATE STREAM out AS SELECT id FROM trades".into(),
-                },
-            ])
-            .unwrap(),
-            &proof,
-        )
-        .await
-        .unwrap();
-
-    db.start().await.unwrap();
-    let registry = db.vnode_registry.lock().clone().unwrap();
-    assert!(db
-        .local_vnode_state_is_ready(&registry, &round.assignment_fence)
-        .await
-        .unwrap());
-    assert_eq!(
-        db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(2))
-            .await
-            .unwrap(),
-        ClusterStartupDisposition::Serving
-    );
-    let committed = db.checkpoint().await.unwrap_or_else(|error| {
-        panic!(
-            "initial cluster checkpoint failed: {error}; runtime fault: {:?}",
-            db.last_fault()
-        )
-    });
-    assert!(committed.success, "{:?}", committed.error);
-    db.stop_pipeline().await.unwrap();
-    assert!(db.owned_source_tasks.lock().is_empty());
-
-    let participant_store = ObjectStoreCheckpointStore::new(
-        db.cluster_checkpoint_object_store().unwrap(),
-        "nodes/7/".into(),
-    )
-    .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap())
-    .with_participant_id(7);
-    let mut prepared = participant_store
-        .load_by_id(committed.checkpoint_id)
-        .await
-        .unwrap()
-        .unwrap();
-    prepared.checkpoint_id = committed.checkpoint_id + 1;
-    prepared.epoch = committed.epoch + 1;
-    prepared.durable_phase = DurableCheckpointPhase::Prepared;
-    participant_store.save(&prepared).await.unwrap();
-
-    db.start().await.unwrap();
-    assert_eq!(DbState::load(&db.state), DbState::Running);
-    assert!(db.owned_source_tasks.lock().is_empty());
-    assert!(db.runtime_handle.lock().await.is_none());
-    assert!(db.coordinated_recovery_in_progress());
-    assert!(db.cluster_intake_fenced());
-    assert!(controller.is_recovering());
-    assert!(controller
-        .read_local_fault_report()
-        .await
-        .unwrap()
-        .is_some());
-
-    let authority = controller.checkpoint_authority().unwrap();
-    assert!(authority
-        .cluster_outcome(prepared.epoch)
-        .await
-        .unwrap()
-        .is_none());
-    assert!(matches!(
-        authority
-            .record_cluster_outcome(
-                &proof,
-                prepared.epoch,
-                prepared.checkpoint_id,
-                round.assignment_fence,
-                CheckpointVerdict::Abort,
-                None,
-            )
-            .await
-            .unwrap(),
-        RecordOutcomeResult::Created(_)
-    ));
-
-    db.stop_pipeline_for_coordinated_recovery().await.unwrap();
-    db.start_for_coordinated_recovery().await.unwrap();
-    assert!(!db.owned_source_tasks.lock().is_empty());
-    assert!(db.runtime_handle.lock().await.is_some());
-    assert!(db.cluster_intake_fenced());
-
-    db.release_coordinated_recovery_lifecycle();
-    controller.set_recovering(false);
-    db.shutdown().await.unwrap();
 }
 
 #[tokio::test]

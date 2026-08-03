@@ -19,11 +19,10 @@ service BarrierSync {
   // never returned by this RPC.
   rpc ConfirmLeaderProof(LeaderProofChallenge) returns (LeaderProofAck);
 
-  // Phase 1. Align + capture state locally, then report readiness.
+  // Phase 1. Align, capture, and durably prepare state locally, then report readiness.
   // The follower returns its local watermark so the leader can fold a
-  // cluster-wide minimum for the durable recovery capsule. The durable
-  // tail (sink pre-commit, manifest, state uploads) runs after the ack
-  // — the ack means "captured", not "durable".
+  // cluster-wide minimum for the committed checkpoint index. The durable
+  // tail (sink pre-commit, manifest, state uploads) completes before the ack.
   rpc Prepare(PrepareRequest) returns (Ack);
 
   // Intermediate (success). Every node has aligned the shuffle and

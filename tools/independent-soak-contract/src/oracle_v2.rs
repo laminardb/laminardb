@@ -168,7 +168,7 @@ struct CheckpointEvidence {
     epoch: u64,
     terminal: String,
     purpose: String,
-    capsule_digest: String,
+    committed_index_digest: String,
     base_assignment: AssignmentRef,
     sealed_source_cut: Vec<PartitionCut>,
 }
@@ -267,7 +267,7 @@ struct WriterIdentity {
 struct RecoveryReference {
     checkpoint_id: String,
     checkpoint_epoch: u64,
-    capsule_digest: String,
+    committed_index_digest: String,
     base_assignment: AssignmentRef,
 }
 
@@ -589,7 +589,7 @@ fn validate_wire_id_map(fixture: &Fixture) -> Result<WireIdLookup, CheckErrors> 
 
             required_32.insert(marker.provenance.pipeline_identity.as_str());
             required_32.insert(marker.current_assignment.digest.as_str());
-            required_32.insert(marker.recovery.capsule_digest.as_str());
+            required_32.insert(marker.recovery.committed_index_digest.as_str());
             required_32.insert(marker.recovery.base_assignment.digest.as_str());
             required_32.insert(marker.abi.topology_digest.as_str());
 
@@ -1023,8 +1023,8 @@ fn evaluate_wire_envelopes(
             &mut diagnostics,
         );
         compare_wire_id_32(
-            decoded.capsule_sha256,
-            &marker.recovery.capsule_digest,
+            decoded.committed_index_sha256,
+            &marker.recovery.committed_index_digest,
             wire_ids,
             &mut diagnostics,
         );
@@ -1352,7 +1352,7 @@ fn evaluate_case(
             continue;
         };
         if checkpoint.checkpoint_id.is_empty()
-            || checkpoint.capsule_digest.is_empty()
+            || checkpoint.committed_index_digest.is_empty()
             || checkpoint.base_assignment.version == 0
             || checkpoint.base_assignment.digest.is_empty()
         {
@@ -1687,7 +1687,7 @@ fn evaluate_output(
         let checkpoint = checkpoint_views
             .get(&checkpoint_key)
             .expect("missing marker checkpoint was classified invalid");
-        if marker.recovery.capsule_digest != checkpoint.evidence.capsule_digest
+        if marker.recovery.committed_index_digest != checkpoint.evidence.committed_index_digest
             || marker.recovery.base_assignment != checkpoint.evidence.base_assignment
         {
             product.insert("marker_recovery_mismatch".to_owned());
@@ -2222,9 +2222,9 @@ mod tests {
                 .u64_values
                 .get(&marker.recovery.checkpoint_id)
                 .unwrap(),
-            capsule_sha256: wire_ids
+            committed_index_sha256: wire_ids
                 .ids_32
-                .get(&marker.recovery.capsule_digest)
+                .get(&marker.recovery.committed_index_digest)
                 .unwrap(),
             recovery_base_assignment_version: marker.recovery.base_assignment.version,
             recovery_base_assignment_sha256: wire_ids
@@ -2974,7 +2974,7 @@ mod tests {
             Classification::RunInvalid,
             "checkpoint_evidence_incomplete",
             |value| {
-                value["cases"][0]["checkpoint_evidence"][1]["capsule_digest"] =
+                value["cases"][0]["checkpoint_evidence"][1]["committed_index_digest"] =
                     Value::String(String::new());
             },
         );
@@ -3059,7 +3059,7 @@ mod tests {
             Classification::ProductFail,
             "marker_recovery_mismatch",
             |value| {
-                value["cases"][0]["interval_markers"][2]["recovery"]["capsule_digest"] =
+                value["cases"][0]["interval_markers"][2]["recovery"]["committed_index_digest"] =
                     Value::String("sha256:wrong".to_owned());
             },
         );
@@ -3169,7 +3169,8 @@ mod tests {
                 let marker = &mut value["cases"][0]["interval_markers"][0]["recovery"];
                 marker["checkpoint_id"] = Value::String("checkpoint-45".to_owned());
                 marker["checkpoint_epoch"] = Value::from(45);
-                marker["capsule_digest"] = Value::String("sha256:capsule-45".to_owned());
+                marker["committed_index_digest"] =
+                    Value::String("sha256:committed-index-45".to_owned());
             },
         );
         assert_diagnostic(

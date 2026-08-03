@@ -21,10 +21,6 @@ pub(super) struct AggregateVnodeState {
     pub(super) emit_dirty_keys: FxHashSet<arrow::row::OwnedRow>,
     pub(super) checkpoint_dirty_keys: FxHashSet<arrow::row::OwnedRow>,
     pub(super) last_emitted_dirty_keys: FxHashSet<arrow::row::OwnedRow>,
-    #[cfg(feature = "cluster")]
-    pub(super) delta_chain_len: Option<u32>,
-    #[cfg(feature = "cluster")]
-    pub(super) force_full_rebase: bool,
     usage: AggregateStateUsage,
 }
 
@@ -44,10 +40,6 @@ impl Default for AggregateVnodeState {
             emit_dirty_keys: FxHashSet::default(),
             checkpoint_dirty_keys: FxHashSet::default(),
             last_emitted_dirty_keys: FxHashSet::default(),
-            #[cfg(feature = "cluster")]
-            delta_chain_len: None,
-            #[cfg(feature = "cluster")]
-            force_full_rebase: false,
             usage: vnode_inline_usage::<AggregateVnodeState>(1),
         }
     }
@@ -84,12 +76,10 @@ impl AggregateVnodeState {
             .saturating_add(self.collection_spare_usage());
     }
 
-    #[cfg(feature = "cluster")]
     pub(super) fn try_from_recovered(
         groups: FxHashMap<arrow::row::OwnedRow, GroupEntry>,
         last_emitted: FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
         mark_emit_dirty: bool,
-        mark_checkpoint_dirty: bool,
     ) -> Result<Self, (&'static str, std::collections::TryReserveError)> {
         let mut state = Self {
             groups,
@@ -102,15 +92,6 @@ impl AggregateVnodeState {
                 .try_reserve(state.groups.len())
                 .map_err(|error| ("changelog dirty keys", error))?;
             state.emit_dirty_keys.extend(state.groups.keys().cloned());
-        }
-        if mark_checkpoint_dirty {
-            state
-                .checkpoint_dirty_keys
-                .try_reserve(state.groups.len())
-                .map_err(|error| ("checkpoint dirty keys", error))?;
-            state
-                .checkpoint_dirty_keys
-                .extend(state.groups.keys().cloned());
         }
         // Reconcile once, after all fallible reservations and retained collections are complete.
         state.refresh_usage();
@@ -176,7 +157,6 @@ impl AggregateVnodeState {
         self.reconcile_collection_spare_usage(previous_spare);
     }
 
-    #[cfg(feature = "cluster")]
     pub(super) fn clear_checkpoint_dirty_keys(&mut self) {
         let previous_spare = self.collection_spare_usage();
         let released = self
@@ -190,7 +170,6 @@ impl AggregateVnodeState {
         self.reconcile_collection_spare_usage(previous_spare);
     }
 
-    #[cfg(feature = "cluster")]
     pub(super) fn clear_last_emitted_dirty_keys(&mut self) {
         let previous_spare = self.collection_spare_usage();
         let released = self
@@ -390,7 +369,6 @@ impl AggregateVnodeSlots {
     }
 
     #[inline]
-    #[cfg(feature = "cluster")]
     pub(super) fn set_resident_group_count(&mut self, count: usize) {
         self.resident_group_count = count;
     }
@@ -423,49 +401,27 @@ impl AggregateVnodeSlots {
         })
     }
 
-    pub(super) fn refresh_all_usage(&mut self) {
-        for (_, state) in self.iter_mut() {
-            state.refresh_usage();
-        }
-    }
-
     #[cfg(test)]
     pub(super) fn cached_usage_matches_structural_recompute(&self) -> bool {
         self.iter()
             .all(|(_, state)| state.cached_usage_matches_structural_recompute())
     }
 
-    #[cfg(feature = "cluster")]
     pub(super) fn active_vnodes(&self) -> &[u32] {
         &self.active_vnodes
     }
 
-    #[cfg(feature = "cluster")]
     pub(super) fn swap_active_vnodes(&mut self, replacement: &mut Vec<u32>) {
         std::mem::swap(&mut self.active_vnodes, replacement);
     }
 
     #[inline]
-    #[cfg(feature = "cluster")]
     pub(super) fn replace_for_publication(
         &mut self,
         vnode: u32,
         replacement: Option<Box<AggregateVnodeState>>,
     ) -> Option<Box<AggregateVnodeState>> {
         std::mem::replace(&mut self.slots[vnode as usize], replacement)
-    }
-
-    #[cfg(all(feature = "cluster", test))]
-    pub(super) fn remove(&mut self, vnode: u32) -> Option<Box<AggregateVnodeState>> {
-        let removed = self.slots[vnode as usize].take();
-        if removed.is_some() {
-            let roster_index = self
-                .active_vnodes
-                .binary_search(&vnode)
-                .expect("a resident aggregate slot must be in the active roster");
-            self.active_vnodes.remove(roster_index);
-        }
-        removed
     }
 
     #[cfg(test)]

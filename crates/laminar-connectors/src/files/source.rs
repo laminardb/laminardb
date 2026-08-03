@@ -740,7 +740,7 @@ fn append_metadata_column(
 mod tests {
     use super::*;
     use crate::connector::{DeliveryGuarantee, SourcePosition, SourceStart};
-    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::checkpoint::CheckpointAttempt;
     use std::collections::BTreeMap;
     use tokio::sync::Notify;
 

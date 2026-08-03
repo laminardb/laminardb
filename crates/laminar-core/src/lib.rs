@@ -33,8 +33,6 @@ pub mod checkpoint;
 /// Crash-durable same-directory file publication primitives.
 pub mod durable_fs;
 mod durable_local_store;
-/// Compatibility alias for checkpoint storage
-pub use checkpoint as storage;
 /// Structured error code registry (`LDB-NNNN`) and Ring 0 hot path error type.
 pub mod error_codes;
 /// Lookup table types and predicate pushdown.
@@ -45,7 +43,7 @@ pub mod operator;
 pub mod serialization;
 /// Cross-instance shuffle: message codec, credit flow, wire protocol.
 pub mod shuffle;
-/// Pluggable state backend (`StateBackend` trait + impls).
+/// Partition-key encoding and virtual-node routing.
 pub mod state;
 pub mod streaming;
 pub mod time;

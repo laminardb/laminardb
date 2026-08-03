@@ -8,6 +8,7 @@ use object_store::ObjectStoreExt;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
+use laminar_core::checkpoint::object_store_builder::CheckpointStorageScope;
 use laminar_core::cluster::discovery::{
     Discovery, DiscoveryError, GossipDiscovery, GossipDiscoveryConfig, NodeId, NodeInfo,
     NodeMetadata, NodeState, StaticDiscovery, StaticDiscoveryConfig,
@@ -1099,8 +1100,8 @@ pub async fn start_cluster(
 
     // Claim the stable node identity before discovery can publish a duplicate member. The
     // durable recovery authority is deliberately not published until the database runtime exists.
-    if !laminar_core::state::StateBackendDurability::for_storage_url(&config.checkpoint.url)
-        .satisfies(laminar_core::state::StateBackendDurability::ClusterShared)
+    if CheckpointStorageScope::for_url(&config.checkpoint.url)
+        != CheckpointStorageScope::ClusterShared
     {
         return Err(ClusterStartupError::EngineConstruction(
             "cluster mode requires ClusterShared checkpoint storage".into(),
@@ -1428,7 +1429,7 @@ pub async fn start_cluster(
     if !process_lease.is_live() {
         let _ = discovery.stop().await;
         return Err(ClusterStartupError::EngineConstruction(
-            "stable node identity lease was lost before shared-namespace proof".into(),
+            "stable node identity lease was lost before shared checkpoint namespace proof".into(),
         ));
     }
     let namespace_proof = tokio::select! {
@@ -1438,7 +1439,6 @@ pub async fn start_cluster(
             local_participant,
             &startup_participants,
             namespace_control,
-            Arc::clone(&control_store),
             Arc::clone(&control_store),
             cluster_cfg.formation_timeout,
         ) => Some(result),
@@ -1452,16 +1452,15 @@ pub async fn start_cluster(
         None => {
             let _ = discovery.stop().await;
             return Err(ClusterStartupError::AuthorityLost(
-                "stable node identity lease was lost during shared-namespace proof".into(),
+                "stable node identity lease was lost during shared checkpoint namespace proof"
+                    .into(),
             ));
         }
     };
-    let state_backend =
-        cluster_state_backend(verified_namespaces.state_store(), node_id, key_groups);
     if !process_lease.is_live() {
         let _ = discovery.stop().await;
         return Err(ClusterStartupError::EngineConstruction(
-            "stable node identity lease was lost during shared-namespace proof".into(),
+            "stable node identity lease was lost during shared checkpoint namespace proof".into(),
         ));
     }
     info!(
@@ -1519,12 +1518,9 @@ pub async fn start_cluster(
         ClusterStartupError::EngineConstruction(format!("checkpoint storage: {error}"))
     })?;
 
-    builder = builder
-        .state_backend(Arc::clone(&state_backend))
-        .vnode_registry(Arc::clone(&vnode_registry));
+    builder = builder.vnode_registry(Arc::clone(&vnode_registry));
 
-    // Durable cluster 2PC decision store, on the shared control-plane bucket
-    // (not the per-node state path) so commit decisions are cluster-wide.
+    // Durable cluster 2PC decisions use a cluster-wide prefix in the shared checkpoint store.
     // Without this the leader's `Commit` announcement is the only commit
     // signal — ephemeral, so a mid-2PC leader crash produces split state.
     let decision_store = Arc::new(
@@ -2327,18 +2323,6 @@ pub async fn start_cluster(
     })
 }
 
-fn cluster_state_backend(
-    store: Arc<dyn object_store::ObjectStore>,
-    node_id: NodeId,
-    key_groups: laminar_core::state::KeyGroupCount,
-) -> Arc<dyn laminar_core::state::StateBackend> {
-    Arc::new(laminar_core::state::ObjectStoreBackend::cluster_shared(
-        store,
-        node_id.to_string(),
-        u32::from(key_groups),
-    ))
-}
-
 const STARTUP_ASSIGNMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const STARTUP_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const STARTUP_LEADER_AUTHORITY_MIN_BACKOFF: std::time::Duration =
@@ -2751,7 +2735,7 @@ async fn resolve_vnode_assignment(
 fn build_control_store(
     config: &ServerConfig,
 ) -> Result<Arc<dyn object_store::ObjectStore>, ClusterStartupError> {
-    laminar_core::storage::object_store_builder::build_object_store(
+    laminar_core::checkpoint::object_store_builder::build_object_store(
         &config.checkpoint.url,
         &config.checkpoint.storage,
     )

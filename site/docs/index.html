@@ -578,7 +578,6 @@ docker run -d -p 8080:8080 laminardb/laminardb-server:latest
           <tr><td class="field-name">--config &lt;FILE&gt;</td><td class="field-default">laminardb.toml</td><td>TOML configuration file path</td></tr>
           <tr><td class="field-name">--log-level &lt;LEVEL&gt;</td><td class="field-default">info</td><td>trace, debug, info, warn, error</td></tr>
           <tr><td class="field-name">--admin-bind &lt;ADDR&gt;</td><td></td><td>Override HTTP bind address from config</td></tr>
-          <tr><td class="field-name">--validate-checkpoints</td><td></td><td>Validate all stored checkpoints and exit</td></tr>
         </tbody>
       </table>
 
@@ -791,7 +790,7 @@ seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]</code></pre>
             <td class="field-name">url</td>
             <td class="field-type">String</td>
             <td class="field-default">OS temp/laminardb</td>
-            <td>Checkpoint storage URL: <code>file://</code>, <code>s3://</code>, <code>gs://</code>, or <code>az://</code>/<code>abfs://</code>. Use an explicit durable location in production.</td>
+            <td>Checkpoint storage URL: <code>file://</code>, <code>s3://</code>, <code>gs://</code>, or <code>az://</code>/<code>abfs://</code>/<code>abfss://</code>. R2 and MinIO use <code>s3://</code> with an endpoint option. Use an explicit durable location in production.</td>
           </tr>
           <tr>
             <td class="field-name">interval</td>
@@ -809,7 +808,7 @@ seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]</code></pre>
             <td class="field-name">max_retained</td>
             <td class="field-type">usize</td>
             <td class="field-default">10</td>
-            <td>Number of finalized checkpoints retained for recovery and fallback.</td>
+            <td>Number of finalized checkpoints retained for exact recovery.</td>
           </tr>
           <tr>
             <td class="field-name">storage</td>
@@ -818,7 +817,7 @@ seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]</code></pre>
             <td>Cloud storage credentials. Keys: aws_access_key_id, aws_region, etc.</td>
           </tr>
           <tr>
-            <td class="field-name">max_staged_bytes</td>
+            <td class="field-name">max_node_data_bytes</td>
             <td class="field-type">u64</td>
             <td class="field-default">none</td>
             <td>Bound on captured state bytes awaiting durable upload (runtime default 512 MiB).</td>
@@ -1638,7 +1637,7 @@ max_out_of_orderness = "5s"</code></pre>
 
       <h2 id="joins" style="font-size: 1.5rem;">Join Semantics</h2>
       <p>
-        Bounded <code>INNER</code> interval join is the stateful stream-stream join.
+        Bounded interval joins are the stateful stream-stream joins.
         Temporal and lookup joins are local dimension enrichments; cluster admission
         rejects unsupported join shapes before execution.
       </p>
@@ -1678,7 +1677,7 @@ max_out_of_orderness = "5s"</code></pre>
         watermark advances past the bound.
       </p>
 
-      <p><strong>Supported type:</strong> INNER</p>
+      <p><strong>Supported types:</strong> INNER, LEFT, RIGHT, FULL, LEFT/RIGHT SEMI, LEFT/RIGHT ANTI</p>
 
       <div class="toml-block">
         <div class="toml-header">Interval join — match orders to payments within 1 hour</div>

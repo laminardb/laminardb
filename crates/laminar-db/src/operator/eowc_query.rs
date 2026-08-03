@@ -316,7 +316,7 @@ impl EowcQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
-    fn preflight_managed_base<'a>(
+    fn preflight_managed_restore<'a>(
         window: &CoreWindowState,
         bytes: &'a [u8],
     ) -> Result<crate::core_window_state::PreflightedCoreWindowArchive<'a>, DbError> {
@@ -406,6 +406,9 @@ impl GraphOperator for EowcQueryOperator {
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        if self.capability.managed_state == Some(ManagedStateContract::CoreWindowV1) {
+            return Ok(None);
+        }
         if self.state.is_none() {
             let Some(checkpoint) = self.pending_restore.as_ref() else {
                 return Ok(None);
@@ -443,35 +446,34 @@ impl GraphOperator for EowcQueryOperator {
         Ok(())
     }
 
-    #[cfg(feature = "cluster")]
-    fn checkpoint_by_vnode(
+    fn checkpoint_vnodes(
         &mut self,
         required_vnodes: &[u32],
         vnode_count: u32,
-    ) -> Result<
-        Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
-        DbError,
-    > {
-        let scope = self.cluster_scope.as_ref().ok_or_else(|| {
-            DbError::Checkpoint(format!(
-                "managed CoreWindow '{}' has no cluster assignment scope",
-                self.op_name
-            ))
-        })?;
-        let assignment = scope.registry.versioned_snapshot();
-        let expected = if assignment.owners()[0] == scope.self_id {
-            &[0_u32][..]
-        } else {
-            &[][..]
-        };
-        if vnode_count != scope.registry.vnode_count()
-            || required_vnodes != expected
+    ) -> Result<Option<Vec<crate::operator_graph::CapturedVnodeState>>, DbError> {
+        if vnode_count == 0
             || required_vnodes.windows(2).any(|pair| pair[0] >= pair[1])
+            || required_vnodes.iter().any(|vnode| *vnode != 0)
         {
             return Err(DbError::Checkpoint(format!(
-                "managed CoreWindow '{}' capture roster {required_vnodes:?} does not match vnode-zero ownership for vnode_count {vnode_count}",
+                "managed CoreWindow '{}' received invalid vnode roster {required_vnodes:?} for vnode_count {vnode_count}",
                 self.op_name
             )));
+        }
+        #[cfg(feature = "cluster")]
+        if let Some(scope) = self.cluster_scope.as_ref() {
+            let assignment = scope.registry.versioned_snapshot();
+            let expected = if assignment.owners()[0] == scope.self_id {
+                &[0_u32][..]
+            } else {
+                &[][..]
+            };
+            if vnode_count != scope.registry.vnode_count() || required_vnodes != expected {
+                return Err(DbError::Checkpoint(format!(
+                    "managed CoreWindow '{}' capture roster does not match vnode-zero ownership",
+                    self.op_name
+                )));
+            }
         }
         if required_vnodes.is_empty() {
             return Ok(None);
@@ -490,17 +492,22 @@ impl GraphOperator for EowcQueryOperator {
         };
         let checkpoint = window.checkpoint_windows()?;
         let bytes = Self::encode_checkpoint(&checkpoint, &self.op_name)?;
-        let mut captured = std::collections::HashMap::new();
-        captured.try_reserve(1).map_err(|error| {
-            DbError::Checkpoint(format!(
-                "managed CoreWindow capture roster reserve failed: {error}"
-            ))
-        })?;
-        captured.insert(
-            0,
-            crate::checkpoint_coordinator::StagedSlice::Bytes(bytes::Bytes::from(bytes)),
-        );
-        Ok(Some(captured))
+        Ok(Some(vec![crate::operator_graph::CapturedVnodeState {
+            vnode: 0,
+            state: Some(bytes::Bytes::from(bytes)),
+        }]))
+    }
+
+    fn restore_vnode(&mut self, vnode: u32, vnode_count: u32, state: &[u8]) -> Result<(), DbError> {
+        if vnode != 0 || vnode_count == 0 {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' cannot restore vnode {vnode} in domain {vnode_count}",
+                self.op_name
+            )));
+        }
+        self.restore(OperatorCheckpoint {
+            data: state.to_vec(),
+        })
     }
 
     #[cfg(feature = "cluster")]
@@ -546,17 +553,11 @@ impl GraphOperator for EowcQueryOperator {
             }
             let restore = transition.restores.first().ok_or_else(|| {
                 DbError::Checkpoint(format!(
-                    "managed CoreWindow '{}' acquisition is missing its vnode-zero FULL base",
+                    "managed CoreWindow '{}' acquisition is missing its complete vnode-zero state",
                     self.op_name
                 ))
             })?;
-            if !restore.deltas.is_empty() {
-                return Err(DbError::Checkpoint(format!(
-                    "managed CoreWindow '{}' accepts FULL vnode-zero images only",
-                    self.op_name
-                )));
-            }
-            let archive = Self::preflight_managed_base(window, restore.base)?;
+            let archive = Self::preflight_managed_restore(window, restore.state)?;
             window.prepare_managed_tumbling_restore(&archive)?
         } else {
             if !transition.restores.is_empty() || !transition.revoked.contains(&0) {
@@ -637,10 +638,6 @@ mod core_tests {
     use arrow::array::{Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
-    #[cfg(feature = "cluster")]
-    use laminar_core::cluster::control::LeaseDeadline;
-    #[cfg(feature = "cluster")]
-    use laminar_core::state::{NodeId, VnodeRegistry};
     use std::time::Duration;
 
     const AGG_SQL: &str = "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol";
@@ -703,201 +700,6 @@ mod core_tests {
 
     fn core_from_checkpoint(checkpoint: &OperatorCheckpoint) -> CoreWindowCheckpoint {
         rkyv::from_bytes::<CoreWindowCheckpoint, rkyv::rancor::Error>(&checkpoint.data).unwrap()
-    }
-
-    #[cfg(feature = "cluster")]
-    async fn single_owner_cluster_scope() -> (
-        ClusterShuffleConfig,
-        laminar_core::checkpoint::CheckpointAssignmentFence,
-    ) {
-        let self_id = NodeId(1);
-        let incarnation = uuid::Uuid::from_u128(1);
-        let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
-        let receiver = Arc::new(
-            laminar_core::shuffle::ShuffleReceiver::bind(
-                self_id.0,
-                "127.0.0.1:0".parse().unwrap(),
-                incarnation,
-            )
-            .await
-            .unwrap(),
-        );
-        let sender = Arc::new(laminar_core::shuffle::ShuffleSender::new(
-            self_id.0,
-            incarnation,
-        ));
-        let process_deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(60)));
-        receiver
-            .install_process_lease_deadline(Arc::clone(&process_deadline))
-            .unwrap();
-        sender
-            .install_process_lease_deadline(process_deadline)
-            .unwrap();
-        let owners = [self_id.0];
-        let target = laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
-            registry.assignment_version(),
-            &owners,
-            vec![laminar_core::checkpoint::CheckpointParticipant {
-                node_id: self_id.0,
-                boot_incarnation: incarnation,
-            }],
-        )
-        .unwrap();
-        sender.install_assignment_fence(&target, &owners).unwrap();
-        receiver.install_assignment_fence(&target, &owners).unwrap();
-        (
-            ClusterShuffleConfig {
-                registry,
-                sender,
-                receiver,
-                self_id,
-            },
-            target,
-        )
-    }
-
-    #[cfg(feature = "cluster")]
-    async fn managed_core_window_operator(
-        name: &str,
-        updates: usize,
-    ) -> (
-        EowcQueryOperator,
-        laminar_core::checkpoint::CheckpointAssignmentFence,
-    ) {
-        const SQL: &str = "SELECT SUM(price) AS total FROM trades";
-
-        let ctx = aggregate_context();
-        let mut operator = EowcQueryOperator::new(
-            name,
-            SQL,
-            Some(EmitClause::OnWindowClose),
-            Some(test_window_config()),
-            ctx,
-            None,
-        );
-        let (scope, target) = single_owner_cluster_scope().await;
-        operator.attach_cluster_scope(scope);
-        operator.initialize_managed_state().await.unwrap();
-        assert_eq!(
-            operator.cluster_capability().managed_state,
-            Some(ManagedStateContract::CoreWindowV1)
-        );
-        for _ in 0..updates {
-            operator
-                .process(&[vec![test_batch(vec![100])]], &[i64::MIN])
-                .await
-                .unwrap();
-        }
-        (operator, target)
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test]
-    async fn managed_core_window_transition_is_offside_and_accounted() {
-        let (mut donor, _) = managed_core_window_operator("managed_donor", 1).await;
-        let donor_slice = donor
-            .checkpoint_by_vnode(&[0], 1)
-            .unwrap()
-            .expect("the vnode-zero owner must capture a full image")
-            .remove(&0)
-            .expect("the capture must name vnode zero");
-        let crate::checkpoint_coordinator::StagedSlice::Bytes(donor_slice) = donor_slice else {
-            panic!("managed CoreWindow capture must be a full image");
-        };
-
-        let (mut subject, target) = managed_core_window_operator("managed_subject", 2).await;
-        let revoked = rustc_hash::FxHashSet::default();
-        let before = subject.checkpoint().unwrap().unwrap().data;
-
-        let mut corrupt = core_from_checkpoint(&OperatorCheckpoint {
-            data: donor_slice.to_vec(),
-        });
-        corrupt.fingerprint = corrupt.fingerprint.wrapping_add(1);
-        let corrupt = checkpoint_from_core(&corrupt);
-        let corrupt_restores = [crate::operator_graph::ManagedVnodeRestore {
-            vnode: 0,
-            base: &corrupt.data,
-            deltas: &[],
-        }];
-        let error = subject
-            .prepare_vnode_transition(ManagedVnodeTransition {
-                target: &target,
-                revoked: &revoked,
-                restores: &corrupt_restores,
-            })
-            .expect_err("borrowed fingerprint preflight must reject the image");
-        assert!(
-            error.to_string().contains("fingerprint mismatch"),
-            "{error}"
-        );
-        assert_eq!(subject.checkpoint().unwrap().unwrap().data, before);
-        assert_eq!(
-            subject.managed_state_accounting().unwrap().prepared,
-            0,
-            "rejected preflight must not retain an off-side image"
-        );
-
-        let restores = [crate::operator_graph::ManagedVnodeRestore {
-            vnode: 0,
-            base: donor_slice.as_ref(),
-            deltas: &[],
-        }];
-        let live_before = subject.managed_state_accounting().unwrap().live;
-        subject
-            .prepare_vnode_transition(ManagedVnodeTransition {
-                target: &target,
-                revoked: &revoked,
-                restores: &restores,
-            })
-            .unwrap();
-        let prepared = subject.managed_state_accounting().unwrap();
-        assert_eq!(prepared.live, live_before);
-        assert!(prepared.prepared > 0);
-        assert_eq!(prepared.retired, 0);
-
-        subject.abort_vnode_transition();
-        let aborted = subject.managed_state_accounting().unwrap();
-        assert_eq!(aborted.live, live_before);
-        assert!(aborted.prepared > 0);
-        assert_eq!(aborted.retired, 0);
-        subject.finish_vnode_transition();
-        assert_eq!(subject.checkpoint().unwrap().unwrap().data, before);
-        let live_before = subject.managed_state_accounting().unwrap().live;
-        assert_eq!(
-            subject.managed_state_accounting().unwrap(),
-            ManagedStateAccountingSnapshot {
-                live: live_before,
-                prepared: 0,
-                retired: 0,
-            }
-        );
-
-        subject
-            .prepare_vnode_transition(ManagedVnodeTransition {
-                target: &target,
-                revoked: &revoked,
-                restores: &restores,
-            })
-            .unwrap();
-        let prepared_bytes = subject.managed_state_accounting().unwrap().prepared;
-        subject.publish_vnode_transition();
-        let published = subject.managed_state_accounting().unwrap();
-        assert_eq!(published.live, prepared_bytes);
-        assert_eq!(published.prepared, 0);
-        assert_eq!(published.retired, live_before);
-        subject.finish_vnode_transition();
-        assert_eq!(subject.managed_state_accounting().unwrap().retired, 0);
-
-        let restored = subject
-            .checkpoint_by_vnode(&[0], 1)
-            .unwrap()
-            .unwrap()
-            .remove(&0)
-            .unwrap();
-        let crate::checkpoint_coordinator::StagedSlice::Bytes(restored) = restored else {
-            panic!("managed CoreWindow capture must remain full-only");
-        };
-        assert_eq!(restored, donor_slice);
     }
 
     async fn core_window_operator() -> EowcQueryOperator {

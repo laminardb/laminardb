@@ -820,7 +820,7 @@ async fn test_source_checkpoint_resume_is_rejected_until_delta_replay_is_certifi
             SourceStart::new(
                 connector_config,
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(2, 2),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(2, 2),
                     checkpoint: cp,
                 },
                 DeliveryGuarantee::AtLeastOnce,
@@ -1087,8 +1087,8 @@ async fn coordinated_batch_filters_overlap_only_after_refreshing_stale_handle() 
     use crate::connector::{
         CoordinatedCommitBatch, CoordinatedCommitNamespace, CoordinatedCommitPayload,
     };
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     let temp_dir = TempDir::new().unwrap();
     let table_path = temp_dir.path().to_str().unwrap();
@@ -1229,8 +1229,8 @@ async fn coordinated_late_exact_commit_and_higher_batch_cannot_both_win() {
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
         CoordinatedCommitPayload,
     };
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     let temp_dir = TempDir::new().unwrap();
     let table_path = temp_dir.path().to_str().unwrap();
@@ -1340,8 +1340,8 @@ async fn coordinated_empty_batch_commits_cursor_without_object_io() {
     use crate::connector::{
         CoordinatedCommitBatch, CoordinatedCommitNamespace, CoordinatedCommitPayload,
     };
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     let temp_dir = TempDir::new().unwrap();
     let table_path = temp_dir.path().to_str().unwrap();

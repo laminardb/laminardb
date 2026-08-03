@@ -23,10 +23,6 @@ use sqlparser::ast::{
     visit_expressions, Expr, GroupByExpr, Query, Select, SetExpr, Statement, TableFactor,
 };
 
-#[cfg(all(feature = "cluster", test))]
-use crate::aggregate_state::merge_serialized_agg_cps;
-#[cfg(all(feature = "cluster", test))]
-use crate::aggregate_state::validate_agg_checkpoint_slice;
 use crate::aggregate_state::{
     apply_compiled_having, AggStateCheckpoint, CompiledProjection, IncrementalAggState,
 };
@@ -42,12 +38,10 @@ use crate::operator::capability::{OperatorCapability, OperatorImplementation};
 #[cfg(feature = "cluster")]
 use crate::operator_graph::ManagedVnodeTransition;
 use crate::operator_graph::{
-    try_evaluate_compiled, GraphOperator, ManagedStateAccountingSnapshot, OperatorCheckpoint,
+    try_evaluate_compiled, CapturedVnodeState, GraphOperator, ManagedStateAccountingSnapshot,
+    OperatorCheckpoint,
 };
 use crate::sql_analysis::{extract_projection_filter, single_source_table};
-
-#[cfg(all(feature = "cluster", test))]
-use bytes::Bytes;
 
 // Resolved on first `process()` call by introspecting the SQL.
 enum QueryState {
@@ -63,16 +57,12 @@ enum QueryState {
 #[cfg(feature = "cluster")]
 struct PreparedSqlVnodeTransition {
     aggregate: PreparedAggVnodeTransition,
-    next_prev_owned: rustc_hash::FxHashSet<u32>,
 }
 
 #[cfg(feature = "cluster")]
 enum SqlVnodeTransitionCleanup {
     Aborted(PreparedSqlVnodeTransition),
-    Published {
-        aggregate: RetiredAggVnodeTransition,
-        prev_owned: rustc_hash::FxHashSet<u32>,
-    },
+    Published(RetiredAggVnodeTransition),
 }
 
 /// Pre-aggregate row-shuffle config for cluster mode.
@@ -96,14 +86,12 @@ impl std::fmt::Debug for ClusterShuffleConfig {
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct AggOpCheckpoint {
-    agg: Option<AggStateCheckpoint>,
     // Pre-barrier remote rows are channel state. They must be replayed after the cut rather than
     // folded into aggregate state before its corresponding output is emitted.
     aligned_replay: Vec<(u64, i64, Vec<u8>)>,
 }
 
-/// Serialize a per-vnode aggregate checkpoint slice (full or a delta's changed-groups) to bytes.
-#[cfg(feature = "cluster")]
+/// Serialize one authoritative aggregate vnode image.
 fn serialize_agg_cp(cp: &AggStateCheckpoint, op_name: &str) -> Result<Vec<u8>, DbError> {
     rkyv::to_bytes::<rkyv::rancor::Error>(cp)
         .map(|v| v.to_vec())
@@ -264,34 +252,11 @@ pub(crate) struct SqlQueryOperator {
     key_group_count: KeyGroupCount,
     prom: Option<Arc<EngineMetrics>>,
     max_retractable_extremum_checkpoint_bytes: usize,
-    pending_restore: Option<AggStateCheckpoint>,
-    // Validated vnode bases retained in their original serialized form while the SQL aggregate is
-    // still uninitialized. Lazy initialization merges the entire set once, avoiding a whole-state
-    // clone and IPC rewrite for every recovered vnode.
-    #[cfg(all(feature = "cluster", test))]
-    pending_restore_slices: Vec<Bytes>,
-    #[cfg(all(feature = "cluster", test))]
-    pending_restore_slice_fingerprint: Option<u64>,
     execution_path_logged: bool,
     having_cache: Option<super::HavingSqlCache>,
     emit_changelog: bool,
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<ClusterShuffleConfig>,
-    // Vnodes owned at the last capture; the diff vs the current owned-set yields the vnodes acquired
-    // since, whose delta chains must re-base FULL (`IncrementalAggState::reset_acquired_vnodes`).
-    #[cfg(feature = "cluster")]
-    prev_owned: rustc_hash::FxHashSet<u32>,
-    // `Some(chain_bound)` enables incremental delta checkpoints with that re-base bound.
-    #[cfg(feature = "cluster")]
-    delta_chain_bound: Option<u32>,
-    // Deltas seen during restart (state Uninit), replayed after `lazy_init` restores the base.
-    #[cfg(all(feature = "cluster", test))]
-    pending_restore_deltas: Vec<crate::aggregate_state::AggVnodeDelta>,
-    // Vnodes revoked while still Uninit: their groups sit in `pending_restore`/`pending_restore_deltas`
-    // and can't be dropped yet. Re-applied via `drop_vnodes` once `lazy_init` folds the restore so
-    // ownership loss is reflected before any output or later re-acquire.
-    #[cfg(all(feature = "cluster", test))]
-    deferred_revoke_vnodes: rustc_hash::FxHashSet<u32>,
     #[cfg(feature = "cluster")]
     aligned_replay: VecDeque<(u64, i64, crate::operator::RetainedBatch)>,
     #[cfg(feature = "cluster")]
@@ -353,24 +318,11 @@ impl SqlQueryOperator {
             prom,
             max_retractable_extremum_checkpoint_bytes:
                 crate::config::DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES,
-            pending_restore: None,
-            #[cfg(all(feature = "cluster", test))]
-            pending_restore_slices: Vec::new(),
-            #[cfg(all(feature = "cluster", test))]
-            pending_restore_slice_fingerprint: None,
             execution_path_logged: false,
             having_cache: None,
             emit_changelog,
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
-            #[cfg(feature = "cluster")]
-            prev_owned: rustc_hash::FxHashSet::default(),
-            #[cfg(feature = "cluster")]
-            delta_chain_bound: None,
-            #[cfg(all(feature = "cluster", test))]
-            pending_restore_deltas: Vec::new(),
-            #[cfg(all(feature = "cluster", test))]
-            deferred_revoke_vnodes: rustc_hash::FxHashSet::default(),
             #[cfg(feature = "cluster")]
             aligned_replay: VecDeque::new(),
             #[cfg(feature = "cluster")]
@@ -380,78 +332,13 @@ impl SqlQueryOperator {
         }
     }
 
-    /// Enable incremental delta checkpoints with `chain_bound` as the re-base bound.
     #[cfg(feature = "cluster")]
-    pub fn enable_delta_checkpoints(&mut self, chain_bound: u32) {
-        self.delta_chain_bound = Some(chain_bound);
-        if let QueryState::Agg(ref mut agg) = self.state {
-            agg.set_delta_enabled(true);
-        }
-    }
-
-    /// Cluster aggregate groups recover only from their assignment-scoped vnode partials. The
-    /// portable graph checkpoint may still carry aligned shuffle replay.
-    #[cfg(feature = "cluster")]
-    fn skip_whole_node_agg(&self) -> bool {
-        self.cluster_shuffle.is_some()
-    }
-
-    #[cfg(feature = "cluster")]
-    pub fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
-        self.key_group_count = KeyGroupCount::try_from(config.registry.vnode_count())
-            .expect("vnode registry count must fit the checkpoint key-group ABI");
-        self.cluster_shuffle = Some(config);
-    }
-
-    /// Vnodes owned now but not at the last capture; advances `prev_owned`. The agg re-bases their
-    /// delta chains FULL (a just-acquired vnode has no parent epoch on this node).
-    #[cfg(feature = "cluster")]
-    fn take_newly_acquired(&mut self, required_vnodes: &[u32]) -> rustc_hash::FxHashSet<u32> {
-        let owned: rustc_hash::FxHashSet<u32> = required_vnodes.iter().copied().collect();
-        let newly: rustc_hash::FxHashSet<u32> =
-            owned.difference(&self.prev_owned).copied().collect();
-        self.prev_owned = owned;
-        newly
-    }
-
-    #[cfg(all(feature = "cluster", not(test)))]
-    fn staged_pending_restore(&self) -> Option<AggStateCheckpoint> {
-        self.pending_restore.clone()
-    }
-
-    #[cfg(all(feature = "cluster", test))]
-    fn staged_pending_restore(&self) -> Result<Option<AggStateCheckpoint>, DbError> {
-        if self.pending_restore_slices.is_empty() {
-            return Ok(self.pending_restore.clone());
-        }
-        let mut slices = Vec::with_capacity(
-            self.pending_restore_slices
-                .len()
-                .saturating_add(usize::from(self.pending_restore.is_some())),
+    pub(crate) fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
+        debug_assert_eq!(
+            config.registry.vnode_count(),
+            u32::from(self.key_group_count)
         );
-        if let Some(checkpoint) = &self.pending_restore {
-            slices.push(Bytes::from(serialize_agg_cp(checkpoint, &self.op_name)?));
-        }
-        slices.extend(self.pending_restore_slices.iter().cloned());
-        let merged = merge_serialized_agg_cps(&slices).map_err(|error| {
-            DbError::Checkpoint(format!(
-                "aggregate '{}' vnode baseline merge failed: {error}",
-                self.op_name
-            ))
-        })?;
-        rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(&merged)
-            .map(Some)
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "aggregate '{}' merged vnode baseline decode failed: {error}",
-                    self.op_name
-                ))
-            })
-    }
-
-    #[cfg(not(feature = "cluster"))]
-    fn staged_pending_restore(&self) -> Option<AggStateCheckpoint> {
-        self.pending_restore.clone()
+        self.cluster_shuffle = Some(config);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -494,66 +381,6 @@ impl SqlQueryOperator {
                             self.capability.managed_state
                         )));
                     }
-                }
-                #[cfg(all(feature = "cluster", test))]
-                let staged_pending_restore = self.staged_pending_restore()?;
-                #[cfg(any(not(feature = "cluster"), all(feature = "cluster", not(test))))]
-                let staged_pending_restore = self.staged_pending_restore();
-                if let Some(ref cp) = staged_pending_restore {
-                    let restored = agg_state.restore_groups(cp).map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "aggregate '{}' baseline restore failed: {error}",
-                            self.op_name
-                        ))
-                    })?;
-                    tracing::info!(
-                        query = %self.op_name,
-                        groups = restored,
-                        "lazy_init fold: restored pending aggregate baseline"
-                    );
-                }
-                #[cfg(all(feature = "cluster", test))]
-                for delta in &self.pending_restore_deltas {
-                    agg_state.apply_delta(delta).map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "aggregate '{}' delta restore failed: {error}",
-                            self.op_name
-                        ))
-                    })?;
-                }
-                // Vnodes revoked while we were Uninit: drop them now that the restore is folded in,
-                // before any output or later re-acquire can expose state this node no longer owns.
-                #[cfg(all(feature = "cluster", test))]
-                if !self.deferred_revoke_vnodes.is_empty() {
-                    let vc = self
-                        .cluster_shuffle
-                        .as_ref()
-                        .map(|c| c.registry.vnode_count())
-                        .ok_or_else(|| {
-                            DbError::Checkpoint(format!(
-                                "aggregate '{}' cannot apply deferred vnode revocation without cluster ownership",
-                                self.op_name
-                            ))
-                        })?;
-                    tracing::info!(
-                        query = %self.op_name,
-                        vnodes = self.deferred_revoke_vnodes.len(),
-                        "lazy_init fold: dropping deferred-revoked vnodes"
-                    );
-                    agg_state.drop_vnodes(&self.deferred_revoke_vnodes, vc)?;
-                }
-
-                self.pending_restore = None;
-                #[cfg(all(feature = "cluster", test))]
-                {
-                    self.pending_restore_slices.clear();
-                    self.pending_restore_slice_fingerprint = None;
-                    self.pending_restore_deltas.clear();
-                    self.deferred_revoke_vnodes.clear();
-                }
-                #[cfg(feature = "cluster")]
-                if self.delta_chain_bound.is_some() {
-                    agg_state.set_delta_enabled(true);
                 }
                 self.log_execution_path(agg_state.compiled_projection().is_some());
                 self.state = QueryState::Agg(Box::new(agg_state));
@@ -880,9 +707,6 @@ impl SqlQueryOperator {
             ));
         };
 
-        #[cfg(feature = "cluster")]
-        let num_group_cols = agg_state.num_group_cols();
-
         let mut batches = agg_state.emit()?;
 
         let having_filter = agg_state.having_filter().cloned();
@@ -893,58 +717,7 @@ impl SqlQueryOperator {
             batches = self.apply_having_sql(&batches, having_sql).await?;
         }
 
-        #[cfg(feature = "cluster")]
-        return self.suppress_restoring_output(batches, num_group_cols);
-        #[cfg(not(feature = "cluster"))]
         Ok(batches)
-    }
-
-    // Drops rows for vnodes still restoring so downstream never sees a partial aggregate.
-    #[cfg(feature = "cluster")]
-    fn suppress_restoring_output(
-        &self,
-        batches: Vec<RecordBatch>,
-        num_group_cols: usize,
-    ) -> Result<Vec<RecordBatch>, DbError> {
-        let Some(ref cfg) = self.cluster_shuffle else {
-            return Ok(batches);
-        };
-        if !cfg.registry.any_restoring() {
-            return Ok(batches);
-        }
-        let vnode_count = cfg.registry.vnode_count();
-        let mut out = Vec::with_capacity(batches.len());
-        for batch in batches {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            let vnodes: Vec<u32> = if num_group_cols == 0 {
-                vec![0; batch.num_rows()]
-            } else {
-                let cols: Vec<usize> = (0..num_group_cols).collect();
-                laminar_core::shuffle::row_vnodes(&batch, &cols, vnode_count).map_err(|error| {
-                    crate::operator::shuffle_routing_error(
-                        &format!("aggregate [{}] restore filter", self.op_name),
-                        &error,
-                    )
-                })?
-            };
-            let keep: Vec<bool> = vnodes
-                .iter()
-                .map(|&v| !cfg.registry.is_restoring(v))
-                .collect();
-            let kept = keep.iter().filter(|&&k| k).count();
-            if kept == batch.num_rows() {
-                out.push(batch);
-            } else if kept > 0 {
-                let mask = arrow::array::BooleanArray::from(keep);
-                let filtered = arrow::compute::filter_record_batch(&batch, &mask).map_err(|e| {
-                    DbError::Pipeline(format!("restoring-vnode emission filter: {e}"))
-                })?;
-                out.push(filtered);
-            }
-        }
-        Ok(out)
     }
 
     async fn apply_having_sql(
@@ -1074,73 +847,6 @@ fn hash_rows_to_vnodes(
     laminar_core::shuffle::row_vnodes(batch, &columns, vnode_count)
 }
 
-#[cfg(feature = "cluster")]
-impl SqlQueryOperator {
-    #[cfg(test)]
-    fn stage_uninit_vnode_slice(
-        &mut self,
-        vnode: u32,
-        checkpoint: &AggStateCheckpoint,
-        bytes: &[u8],
-    ) -> Result<(), DbError> {
-        validate_agg_checkpoint_slice(checkpoint).map_err(|error| {
-            DbError::Pipeline(format!(
-                "per-vnode state validation for '{}' vnode {vnode}: {error}",
-                self.op_name
-            ))
-        })?;
-        let expected = self
-            .pending_restore
-            .as_ref()
-            .map(|pending| pending.fingerprint)
-            .or(self.pending_restore_slice_fingerprint);
-        if expected.is_some_and(|fingerprint| fingerprint != checkpoint.fingerprint) {
-            return Err(DbError::Pipeline(format!(
-                "per-vnode state fingerprint mismatch for '{}' vnode {vnode}: pending={}, incoming={}",
-                self.op_name,
-                expected.expect("checked Some"),
-                checkpoint.fingerprint
-            )));
-        }
-        self.pending_restore_slice_fingerprint = Some(checkpoint.fingerprint);
-        self.pending_restore_slices
-            .push(Bytes::copy_from_slice(bytes));
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn apply_vnode_state(&mut self, vnode: u32, bytes: &[u8]) -> Result<(), DbError> {
-        let cp: AggStateCheckpoint = rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(
-            bytes,
-        )
-        .map_err(|error| {
-            DbError::Pipeline(format!(
-                "per-vnode state deserialization for '{}' vnode {vnode}: {error}",
-                self.op_name
-            ))
-        })?;
-        match self.state {
-            QueryState::Agg(ref mut agg_state) => {
-                let merged = agg_state.merge_groups(&cp)?;
-                tracing::debug!(
-                    query = %self.op_name, vnode, groups = merged,
-                    "applied rehydrated vnode aggregate state"
-                );
-            }
-            QueryState::Uninit => {
-                self.stage_uninit_vnode_slice(vnode, &cp, bytes)?;
-            }
-            _ => {
-                return Err(DbError::Pipeline(format!(
-                    "per-vnode aggregate state for '{}' vnode {vnode} targeted a non-aggregate query",
-                    self.op_name
-                )));
-            }
-        }
-        Ok(())
-    }
-}
-
 #[async_trait]
 impl GraphOperator for SqlQueryOperator {
     fn cluster_capability(&self) -> OperatorCapability {
@@ -1156,8 +862,6 @@ impl GraphOperator for SqlQueryOperator {
             return None;
         };
 
-        // This is aggregate working-state ownership only. The small `prev_owned`/
-        // `next_prev_owned` authority sets are graph lifecycle metadata, not state-backend bytes.
         #[cfg(feature = "cluster")]
         let (prepared_bytes, retired_bytes) = {
             let staged = self
@@ -1169,7 +873,7 @@ impl GraphOperator for SqlQueryOperator {
                     staged.saturating_add(prepared.aggregate.accounted_state_bytes()),
                     0,
                 ),
-                Some(SqlVnodeTransitionCleanup::Published { aggregate, .. }) => {
+                Some(SqlVnodeTransitionCleanup::Published(aggregate)) => {
                     (staged, aggregate.accounted_state_bytes())
                 }
                 None => (staged, 0),
@@ -1281,32 +985,6 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
-        // When the delta chain is authoritative, aggregate groups are NOT captured into the
-        // whole-node manifest blob — they live in (and recover from) per-vnode partials.
-        #[cfg(feature = "cluster")]
-        let skip_whole_node_agg = self.skip_whole_node_agg();
-        #[cfg(not(feature = "cluster"))]
-        let skip_whole_node_agg = false;
-        let agg: Option<AggStateCheckpoint> = if skip_whole_node_agg {
-            None
-        } else {
-            match self.state {
-                QueryState::Uninit => {
-                    #[cfg(all(feature = "cluster", test))]
-                    {
-                        self.staged_pending_restore()?
-                    }
-                    #[cfg(any(not(feature = "cluster"), all(feature = "cluster", not(test))))]
-                    {
-                        self.staged_pending_restore()
-                    }
-                }
-                QueryState::Agg(ref mut agg_state) => Some(agg_state.checkpoint_groups()?),
-                QueryState::Compiled(_)
-                | QueryState::CachedPlan(_)
-                | QueryState::CachedPhysical(_) => None,
-            }
-        };
         #[cfg(feature = "cluster")]
         let aligned_replay = self
             .aligned_replay
@@ -1325,18 +1003,14 @@ impl GraphOperator for SqlQueryOperator {
         #[cfg(not(feature = "cluster"))]
         let aligned_replay = Vec::new();
 
-        if agg.is_none() && aligned_replay.is_empty() {
+        if aligned_replay.is_empty() {
             return Ok(None);
         }
-        let cp = AggOpCheckpoint {
-            agg,
-            aligned_replay,
-        };
-        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&cp)
-            .map(|v| v.to_vec())
-            .map_err(|e| {
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&AggOpCheckpoint { aligned_replay })
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| {
                 DbError::Pipeline(format!(
-                    "checkpoint serialization for '{}': {e}",
+                    "checkpoint serialization for '{}': {error}",
                     self.op_name
                 ))
             })?;
@@ -1344,23 +1018,16 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        let cp: AggOpCheckpoint = rkyv::from_bytes::<AggOpCheckpoint, rkyv::rancor::Error>(
-            &checkpoint.data,
-        )
-        .map_err(|e| {
-            DbError::Checkpoint(format!(
-                "checkpoint deserialization for '{}': {e}",
-                self.op_name
-            ))
-        })?;
-
-        let AggOpCheckpoint {
-            agg,
-            aligned_replay,
-        } = cp;
+        let checkpoint = rkyv::from_bytes::<AggOpCheckpoint, rkyv::rancor::Error>(&checkpoint.data)
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "checkpoint deserialization for '{}': {error}",
+                    self.op_name
+                ))
+            })?;
 
         #[cfg(not(feature = "cluster"))]
-        if !aligned_replay.is_empty() {
+        if !checkpoint.aligned_replay.is_empty() {
             return Err(DbError::Checkpoint(format!(
                 "aggregate '{}' checkpoint contains cluster shuffle replay without cluster support",
                 self.op_name
@@ -1368,77 +1035,36 @@ impl GraphOperator for SqlQueryOperator {
         }
 
         #[cfg(feature = "cluster")]
-        let decoded_aligned_replay = aligned_replay
-            .into_iter()
-            .map(|(assignment_version, watermark, blob)| {
-                laminar_core::serialization::deserialize_batch_stream(&blob)
-                    .map(|batch| {
-                        (
-                            assignment_version,
-                            watermark,
-                            crate::operator::RetainedBatch::local(batch),
-                        )
-                    })
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "aligned aggregate replay restore for '{}': {error}",
-                            self.op_name
-                        ))
-                    })
-            })
-            .collect::<Result<VecDeque<_>, DbError>>()?;
-        #[cfg(not(feature = "cluster"))]
-        let _ = aligned_replay;
-
-        #[cfg(feature = "cluster")]
-        if !self.aligned_replay.is_empty() && !decoded_aligned_replay.is_empty() {
-            return Err(DbError::Checkpoint(format!(
-                "aggregate '{}' aligned shuffle replay was applied more than once",
-                self.op_name
-            )));
-        }
-
-        match &mut self.state {
-            QueryState::Agg(agg_state) => {
-                if let Some(ref agg_checkpoint) = agg {
-                    agg_state.restore_groups(agg_checkpoint).map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "aggregate '{}' checkpoint restore failed: {error}",
-                            self.op_name
-                        ))
-                    })?;
-                }
-            }
-            QueryState::Uninit => {
-                if self.pending_restore.is_some() {
-                    return Err(DbError::Checkpoint(format!(
-                        "aggregate '{}' checkpoint restore was applied more than once",
-                        self.op_name
-                    )));
-                }
-                #[cfg(all(feature = "cluster", test))]
-                if let (Some(checkpoint), Some(fingerprint)) =
-                    (agg.as_ref(), self.pending_restore_slice_fingerprint)
-                {
-                    if checkpoint.fingerprint != fingerprint {
-                        return Err(DbError::Checkpoint(format!(
-                            "aggregate '{}' whole-node/vnode restore fingerprint mismatch: manifest={}, vnode={fingerprint}",
-                            self.op_name, checkpoint.fingerprint
-                        )));
-                    }
-                }
-                self.pending_restore = agg;
-            }
-            QueryState::Compiled(_) | QueryState::CachedPlan(_) | QueryState::CachedPhysical(_) => {
+        {
+            let decoded = checkpoint
+                .aligned_replay
+                .into_iter()
+                .map(|(assignment_version, watermark, blob)| {
+                    laminar_core::serialization::deserialize_batch_stream(&blob)
+                        .map(|batch| {
+                            (
+                                assignment_version,
+                                watermark,
+                                crate::operator::RetainedBatch::local(batch),
+                            )
+                        })
+                        .map_err(|error| {
+                            DbError::Checkpoint(format!(
+                                "aligned aggregate replay restore for '{}': {error}",
+                                self.op_name
+                            ))
+                        })
+                })
+                .collect::<Result<VecDeque<_>, DbError>>()?;
+            if !self.aligned_replay.is_empty() && !decoded.is_empty() {
                 return Err(DbError::Checkpoint(format!(
-                    "aggregate checkpoint cannot be restored into non-aggregate query '{}'",
+                    "aggregate '{}' aligned shuffle replay was applied more than once",
                     self.op_name
                 )));
             }
+            self.aligned_replay.extend(decoded);
         }
 
-        #[cfg(feature = "cluster")]
-        self.aligned_replay.extend(decoded_aligned_replay);
         Ok(())
     }
 
@@ -1496,100 +1122,54 @@ impl GraphOperator for SqlQueryOperator {
         Ok(())
     }
 
-    #[cfg(feature = "cluster")]
-    fn checkpoint_by_vnode(
+    fn checkpoint_vnodes(
         &mut self,
         required_vnodes: &[u32],
         vnode_count: u32,
-    ) -> Result<
-        Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
-        DbError,
-    > {
-        use crate::checkpoint_coordinator::StagedSlice;
-        if required_vnodes.windows(2).any(|pair| pair[0] >= pair[1])
-            || required_vnodes.iter().any(|vnode| *vnode >= vnode_count)
-        {
-            return Err(DbError::Checkpoint(format!(
-                "aggregate '{}' received a non-canonical required vnode roster {required_vnodes:?} for vnode_count {vnode_count}",
-                self.op_name
-            )));
-        }
-        if let QueryState::Agg(ref agg_state) = self.state {
-            agg_state.validate_vnode_count(vnode_count)?;
-        }
-        // Re-base the delta chain of any vnode acquired since the last capture (its parent epoch is
-        // gone), before deciding FULL-vs-DELTA below. Must run before the `agg_state` borrow.
-        let newly_acquired = self.take_newly_acquired(required_vnodes);
-        let QueryState::Agg(ref mut agg_state) = self.state else {
+    ) -> Result<Option<Vec<CapturedVnodeState>>, DbError> {
+        let QueryState::Agg(aggregate) = &mut self.state else {
             return Ok(None);
         };
-        agg_state.reset_acquired_vnodes(&newly_acquired);
+        let checkpoints = aggregate.checkpoint_vnodes(required_vnodes, vnode_count)?;
+        let mut captured = Vec::with_capacity(required_vnodes.len());
+        for (&vnode, checkpoint) in required_vnodes.iter().zip(checkpoints) {
+            let state = match checkpoint {
+                Some(checkpoint) => match serialize_agg_cp(&checkpoint, &self.op_name) {
+                    Ok(bytes) => Some(bytes::Bytes::from(bytes)),
+                    Err(error) => {
+                        aggregate.force_full_vnode_capture();
+                        return Err(error);
+                    }
+                },
+                None => None,
+            };
+            captured.push(CapturedVnodeState { vnode, state });
+        }
+        Ok(Some(captured))
+    }
 
-        // Incremental delta capture: each touched vnode emits a FULL re-base or a DELTA.
-        let mut out = if let Some(chain_bound) = self.delta_chain_bound {
-            if agg_state.delta_enabled() {
-                use crate::aggregate_state::VnodeCapture;
-                let captures = agg_state.checkpoint_delta_by_vnode(vnode_count, chain_bound)?;
-                let mut out = std::collections::HashMap::with_capacity(captures.len());
-                for (vnode, cap) in captures {
-                    let slice = match cap {
-                        VnodeCapture::Full(cp) => StagedSlice::Bytes(bytes::Bytes::from(
-                            serialize_agg_cp(&cp, &self.op_name)?,
-                        )),
-                        VnodeCapture::Delta(d) => StagedSlice::Delta(bytes::Bytes::from(
-                            serialize_agg_cp(&d.changed, &self.op_name)?,
-                        )),
-                    };
-                    out.insert(vnode, slice);
-                }
-                out
-            } else {
-                return Err(DbError::Checkpoint(format!(
-                    "aggregate '{}' has a delta chain bound without delta tracking enabled",
+    fn restore_vnode(&mut self, vnode: u32, vnode_count: u32, state: &[u8]) -> Result<(), DbError> {
+        let checkpoint = rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(state)
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "aggregate '{}' vnode {vnode} deserialization: {error}",
                     self.op_name
-                )));
-            }
-        } else {
-            let per_vnode = agg_state.checkpoint_groups_by_vnode(vnode_count)?;
-            let mut out = std::collections::HashMap::with_capacity(per_vnode.len());
-            for (vnode, cp) in per_vnode {
-                out.insert(
-                    vnode,
-                    StagedSlice::Bytes(bytes::Bytes::from(serialize_agg_cp(&cp, &self.op_name)?)),
-                );
-            }
-            out
-        };
-
-        let required: rustc_hash::FxHashSet<u32> = required_vnodes.iter().copied().collect();
-        let mut unexpected: Vec<u32> = out
-            .keys()
-            .copied()
-            .filter(|vnode| !required.contains(vnode))
-            .collect();
-        unexpected.sort_unstable();
-        if !unexpected.is_empty() {
+                ))
+            })?;
+        let QueryState::Agg(aggregate) = &mut self.state else {
             return Err(DbError::Checkpoint(format!(
-                "aggregate '{}' captured state for vnodes {unexpected:?} outside its required roster {required_vnodes:?}",
+                "aggregate '{}' vnode restore requires initialized managed state",
                 self.op_name
             )));
-        }
-
-        if out.len() != required_vnodes.len() {
-            let empty = StagedSlice::Bytes(bytes::Bytes::from(serialize_agg_cp(
-                &agg_state.empty_checkpoint(),
-                &self.op_name,
-            )?));
-            for vnode in required_vnodes {
-                out.entry(*vnode).or_insert_with(|| empty.clone());
-            }
-        }
-
-        if out.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(out))
-        }
+        };
+        aggregate
+            .restore_vnode(vnode, vnode_count, checkpoint)
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "aggregate '{}' vnode {vnode} restore: {error}",
+                    self.op_name
+                ))
+            })
     }
 
     #[cfg(feature = "cluster")]
@@ -1630,14 +1210,13 @@ impl GraphOperator for SqlQueryOperator {
             )));
         }
 
-        // Validate the complete borrowed roster before allocating any owned inner checkpoint.
         let archive_profile = aggregate.vnode_archive_restore_profile();
         let mut preflighted = Vec::new();
         preflighted
             .try_reserve_exact(transition.restores.len())
             .map_err(|_| {
                 DbError::Checkpoint(format!(
-                    "aggregate '{}' could not reserve inner archive preflight metadata",
+                    "aggregate '{}' could not reserve archive preflight metadata",
                     self.op_name
                 ))
             })?;
@@ -1651,96 +1230,35 @@ impl GraphOperator for SqlQueryOperator {
                 ))
             })?;
         for restore in transition.restores {
-            let base = archive_profile.preflight(
-                restore.base,
+            let state = archive_profile.preflight(
+                restore.state,
                 format_args!(
-                    "per-vnode base for '{}' vnode {}",
+                    "per-vnode state for '{}' vnode {}",
                     self.op_name, restore.vnode
                 ),
             )?;
-            let mut vnode_lower_bound = base.group_count();
-
-            let mut deltas = Vec::new();
-            deltas
-                .try_reserve_exact(restore.deltas.len())
-                .map_err(|_| {
-                    DbError::Checkpoint(format!(
-                        "aggregate '{}' could not reserve delta archive preflight metadata",
-                        self.op_name
-                    ))
-                })?;
-            for (link, changed) in restore.deltas.iter().enumerate() {
-                let delta = archive_profile.preflight(
-                    changed.as_slice(),
-                    format_args!(
-                        "per-vnode delta {link} for '{}' vnode {}",
-                        self.op_name, restore.vnode
-                    ),
-                )?;
-                vnode_lower_bound = vnode_lower_bound.max(delta.group_count());
-                deltas.push(delta);
-            }
-            restored_lower_bounds.push((restore.vnode, vnode_lower_bound));
-            preflighted.push((restore.vnode, base, deltas));
+            restored_lower_bounds.push((restore.vnode, state.group_count()));
+            preflighted.push((restore.vnode, state));
         }
         aggregate.preflight_vnode_transition_cardinality(
             transition.target.vnode_count,
             &restored_lower_bounds,
             transition.revoked,
         )?;
-        drop(restored_lower_bounds);
 
-        let mut next_prev_owned = rustc_hash::FxHashSet::default();
-        next_prev_owned
-            .try_reserve(self.prev_owned.len())
-            .map_err(|_| {
-                DbError::Checkpoint(format!(
-                    "aggregate '{}' could not reserve ownership transition metadata",
-                    self.op_name
-                ))
-            })?;
-        next_prev_owned.extend(self.prev_owned.iter().copied());
-        for vnode in transition.revoked {
-            next_prev_owned.remove(vnode);
-        }
-
-        // Deserialization stays lazy: aggregate preparation consumes and stages one vnode before
-        // asking this iterator for the next. The complete borrowed pass above has already
-        // validated every archive and the transition-wide cardinality lower bound.
-        let owned_restores = preflighted.into_iter().map(|(vnode, base, deltas)| {
-            let mut owned_deltas = Vec::new();
-            owned_deltas.try_reserve_exact(deltas.len()).map_err(|_| {
-                DbError::Checkpoint(format!(
-                    "aggregate '{}' could not reserve owned delta metadata for vnode {vnode}",
-                    self.op_name
-                ))
-            })?;
-            let base = base.deserialize(format_args!(
-                "per-vnode base for '{}' vnode {vnode}",
+        let owned_restores = preflighted.into_iter().map(|(vnode, state)| {
+            let state = state.deserialize(format_args!(
+                "per-vnode state for '{}' vnode {vnode}",
                 self.op_name
             ))?;
-            for (link, changed) in deltas.into_iter().enumerate() {
-                let changed = changed.deserialize(format_args!(
-                    "per-vnode delta {link} for '{}' vnode {vnode}",
-                    self.op_name
-                ))?;
-                owned_deltas.push(crate::aggregate_state::AggVnodeDelta { changed });
-            }
-            Ok(OwnedAggVnodeRestore {
-                vnode,
-                base,
-                deltas: owned_deltas,
-            })
+            Ok(OwnedAggVnodeRestore { vnode, state })
         });
         let aggregate = aggregate.prepare_owned_vnode_transition(
             transition.target.vnode_count,
             owned_restores,
             transition.revoked,
         )?;
-        self.prepared_vnode_transition = Some(PreparedSqlVnodeTransition {
-            aggregate,
-            next_prev_owned,
-        });
+        self.prepared_vnode_transition = Some(PreparedSqlVnodeTransition { aggregate });
         Ok(())
     }
 
@@ -1770,128 +1288,24 @@ impl GraphOperator for SqlQueryOperator {
             panic!("managed vnode transition publication targeted a non-aggregate query");
         };
         let retired_aggregate = aggregate.publish_prepared_vnode_transition(prepared.aggregate);
-        let retired_prev_owned = std::mem::replace(&mut self.prev_owned, prepared.next_prev_owned);
-        self.vnode_transition_cleanup = Some(SqlVnodeTransitionCleanup::Published {
-            aggregate: retired_aggregate,
-            prev_owned: retired_prev_owned,
-        });
+        self.vnode_transition_cleanup =
+            Some(SqlVnodeTransitionCleanup::Published(retired_aggregate));
     }
 
     #[cfg(feature = "cluster")]
     fn finish_vnode_transition(&mut self) {
         match self.vnode_transition_cleanup.take() {
             Some(SqlVnodeTransitionCleanup::Aborted(prepared)) => drop(prepared),
-            Some(SqlVnodeTransitionCleanup::Published {
-                aggregate,
-                prev_owned,
-            }) => {
+            Some(SqlVnodeTransitionCleanup::Published(aggregate)) => {
                 IncrementalAggState::finish_vnode_transition(aggregate);
-                drop(prev_owned);
             }
             None => {}
         }
     }
 
-    #[cfg(all(feature = "cluster", test))]
-    fn apply_vnode_chain(
-        &mut self,
-        vnode: u32,
-        base: &[u8],
-        deltas: &[&[u8]],
-    ) -> Result<(), DbError> {
-        // Deserialize the chain before touching `self.state` (avoids borrowing `self` twice).
-        let base_cp: AggStateCheckpoint =
-            rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(base).map_err(|e| {
-                DbError::Pipeline(format!(
-                    "per-vnode base deserialization for '{}' vnode {vnode}: {e}",
-                    self.op_name
-                ))
-            })?;
-        let delta_objs: Vec<crate::aggregate_state::AggVnodeDelta> = deltas
-            .iter()
-            .map(|changed| {
-                let cp: AggStateCheckpoint =
-                    rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(changed).map_err(
-                        |e| {
-                            DbError::Pipeline(format!(
-                                "per-vnode delta deserialization for '{}' vnode {vnode}: {e}",
-                                self.op_name
-                            ))
-                        },
-                    )?;
-                Ok(crate::aggregate_state::AggVnodeDelta { changed: cp })
-            })
-            .collect::<Result<_, DbError>>()?;
-        let vnode_count = self
-            .cluster_shuffle
-            .as_ref()
-            .map(|config| config.registry.vnode_count());
-
-        match self.state {
-            QueryState::Agg(ref mut agg_state) => {
-                let vnode_count = vnode_count.ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "aggregate '{}' cannot replace vnode state without cluster ownership",
-                        self.op_name
-                    ))
-                })?;
-                let merged =
-                    agg_state.replace_vnode_chain(vnode, vnode_count, &base_cp, &delta_objs)?;
-                tracing::debug!(
-                    query = %self.op_name, vnode, groups = merged, deltas = delta_objs.len(),
-                    "replaced vnode state from its authoritative recovery chain"
-                );
-            }
-            QueryState::Uninit => {
-                // Keep each base in its original serialized form; lazy_init validates disjointness
-                // and performs one columnar merge across the complete recovered set.
-                self.stage_uninit_vnode_slice(vnode, &base_cp, base)?;
-                self.pending_restore_deltas.extend(delta_objs);
-            }
-            _ => {
-                return Err(DbError::Pipeline(format!(
-                    "per-vnode aggregate chain for '{}' vnode {vnode} targeted a non-aggregate query",
-                    self.op_name
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(all(feature = "cluster", test))]
-    fn drop_owned_vnodes(&mut self, revoked: &rustc_hash::FxHashSet<u32>) -> Result<(), DbError> {
-        if revoked.is_empty() {
-            return Ok(());
-        }
-        let vnode_count = self
-            .cluster_shuffle
-            .as_ref()
-            .map(|c| c.registry.vnode_count());
-        match self.state {
-            QueryState::Agg(ref mut agg_state) => {
-                let vc = vnode_count.ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "aggregate '{}' cannot revoke vnode state without cluster ownership",
-                        self.op_name
-                    ))
-                })?;
-                agg_state.drop_vnodes(revoked, vc)?;
-            }
-            // Uninit: the revoked vnode's groups are still in `pending_restore`; defer the drop until
-            // `lazy_init` folds them in, else this node could expose state it no longer owns.
-            _ => self.deferred_revoke_vnodes.extend(revoked.iter().copied()),
-        }
-        // A later re-acquire must register in `take_newly_acquired` and force a FULL re-base.
-        for vnode in revoked {
-            self.prev_owned.remove(vnode);
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "cluster")]
-    fn force_full_rebase(&mut self) {
-        if let QueryState::Agg(ref mut agg_state) = self.state {
-            agg_state.force_full_rebase();
+    fn force_full_vnode_capture(&mut self) {
+        if let QueryState::Agg(aggregate) = &mut self.state {
+            aggregate.force_full_vnode_capture();
         }
     }
 }
@@ -2022,7 +1436,12 @@ mod checkpoint_tests {
         assert!(populated_accounting.live > empty_accounting.live);
         assert_eq!(populated_accounting.prepared, 0);
         assert_eq!(populated_accounting.retired, 0);
-        assert!(operator.checkpoint().unwrap().is_some());
+        assert!(operator.checkpoint().unwrap().is_none());
+        let captured = operator
+            .checkpoint_vnodes(&(0..8).collect::<Vec<_>>(), 8)
+            .unwrap()
+            .unwrap();
+        assert!(captured.iter().all(|frame| frame.state.is_some()));
     }
 
     #[tokio::test]
@@ -2074,66 +1493,6 @@ mod checkpoint_tests {
         )
         .unwrap();
         (context, batch)
-    }
-
-    #[tokio::test]
-    async fn aggregate_restore_mismatch_faults_during_lazy_init() {
-        let (context, batch) = context_and_batch();
-        let mut donor = SqlQueryOperator::new(
-            "sum",
-            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
-            context.clone(),
-            None,
-            false,
-        );
-        donor.process(&[vec![batch]], &[i64::MIN]).await.unwrap();
-        let checkpoint = donor.checkpoint().unwrap().unwrap();
-
-        let mut restored = SqlQueryOperator::new(
-            "count",
-            "SELECT key, COUNT(value) AS total FROM events GROUP BY key",
-            context,
-            None,
-            false,
-        );
-        restored.restore(checkpoint).unwrap();
-        let error = restored.lazy_init().await.unwrap_err();
-        assert!(matches!(error, DbError::Checkpoint(_)));
-        assert!(error.to_string().contains("fingerprint mismatch"));
-        assert!(matches!(restored.state, QueryState::Uninit));
-        assert!(restored.pending_restore.is_some());
-    }
-
-    #[tokio::test]
-    async fn aggregate_checkpoint_cannot_target_initialized_non_aggregate() {
-        let (context, batch) = context_and_batch();
-        let mut donor = SqlQueryOperator::new(
-            "sum",
-            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
-            context.clone(),
-            None,
-            false,
-        );
-        donor
-            .process(&[vec![batch.clone()]], &[i64::MIN])
-            .await
-            .unwrap();
-        let checkpoint = donor.checkpoint().unwrap().unwrap();
-
-        let mut projection = SqlQueryOperator::new(
-            "projection",
-            "SELECT key, value FROM events",
-            context,
-            None,
-            false,
-        );
-        projection
-            .process(&[vec![batch]], &[i64::MIN])
-            .await
-            .unwrap();
-        let error = projection.restore(checkpoint).unwrap_err();
-        assert!(matches!(error, DbError::Checkpoint(_)));
-        assert!(error.to_string().contains("non-aggregate"));
     }
 
     #[tokio::test]
@@ -2242,12 +1601,63 @@ mod checkpoint_tests {
         assert!(error.requires_pipeline_recovery());
     }
 
+    #[tokio::test]
+    async fn vnode_capture_is_incremental_and_restores_without_whole_state() {
+        let (context, batch) = context_and_batch();
+        let key_groups = KeyGroupCount::try_from(8_u16).unwrap();
+        let mut donor = SqlQueryOperator::new_with_key_groups(
+            "sum",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context.clone(),
+            None,
+            false,
+            key_groups,
+        );
+        donor.initialize_managed_state().await.unwrap();
+        donor.process(&[vec![batch]], &[100]).await.unwrap();
+        let owned = (0..8).collect::<Vec<_>>();
+        let baseline = donor.checkpoint_vnodes(&owned, 8).unwrap().unwrap();
+        assert!(baseline.iter().all(|frame| frame.state.is_some()));
+        assert!(donor
+            .checkpoint_vnodes(&owned, 8)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .all(|frame| frame.state.is_none()));
+
+        let mut restored = SqlQueryOperator::new_with_key_groups(
+            "sum",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            false,
+            key_groups,
+        );
+        restored.initialize_managed_state().await.unwrap();
+        for frame in baseline {
+            restored
+                .restore_vnode(frame.vnode, 8, frame.state.as_deref().unwrap())
+                .unwrap();
+        }
+        let QueryState::Agg(aggregate) = &mut restored.state else {
+            panic!("expected restored aggregate state");
+        };
+        assert_eq!(aggregate.logical_group_count_for_test(), 2);
+
+        donor.force_full_vnode_capture();
+        assert!(donor
+            .checkpoint_vnodes(&owned, 8)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .all(|frame| frame.state.is_some()));
+    }
+
     #[cfg(not(feature = "cluster"))]
     #[test]
     fn cluster_shuffle_checkpoint_is_rejected_without_support() {
         let (context, _) = context_and_batch();
         let checkpoint = AggOpCheckpoint {
-            agg: None,
             aligned_replay: vec![(3, i64::MIN, Vec::new())],
         };
         let data = rkyv::to_bytes::<rkyv::rancor::Error>(&checkpoint)
@@ -2263,1296 +1673,5 @@ mod checkpoint_tests {
         let error = operator.restore(OperatorCheckpoint { data }).unwrap_err();
         assert!(matches!(error, DbError::Checkpoint(_)));
         assert!(error.to_string().contains("cluster support"));
-    }
-}
-
-#[cfg(all(test, feature = "cluster"))]
-mod delta_primary_tests {
-    use super::*;
-    use arrow::array::{Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use laminar_core::cluster::control::LeaseDeadline;
-    use laminar_core::state::{NodeId, VnodeRegistry};
-
-    async fn single_owner_shuffle_for(vnode_count: u32) -> (ClusterShuffleConfig, u64) {
-        let self_id = NodeId(1);
-        let incarnation = uuid::Uuid::from_u128(1);
-        let registry = Arc::new(VnodeRegistry::single_owner(vnode_count, self_id));
-        let receiver = Arc::new(
-            laminar_core::shuffle::ShuffleReceiver::bind(
-                self_id.0,
-                "127.0.0.1:0".parse().unwrap(),
-                incarnation,
-            )
-            .await
-            .unwrap(),
-        );
-        let sender = Arc::new(laminar_core::shuffle::ShuffleSender::new(
-            self_id.0,
-            incarnation,
-        ));
-        let process_deadline =
-            Arc::new(LeaseDeadline::live_for(std::time::Duration::from_secs(60)));
-        receiver
-            .install_process_lease_deadline(Arc::clone(&process_deadline))
-            .unwrap();
-        sender
-            .install_process_lease_deadline(process_deadline)
-            .unwrap();
-        let version = registry.assignment_version();
-        let owners = vec![self_id.0; usize::try_from(vnode_count).unwrap()];
-        let fence = laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
-            version,
-            &owners,
-            vec![laminar_core::checkpoint::CheckpointParticipant {
-                node_id: self_id.0,
-                boot_incarnation: incarnation,
-            }],
-        )
-        .unwrap();
-        sender.install_assignment_fence(&fence, &owners).unwrap();
-        receiver.install_assignment_fence(&fence, &owners).unwrap();
-        (
-            ClusterShuffleConfig {
-                registry,
-                sender,
-                receiver,
-                self_id,
-            },
-            version,
-        )
-    }
-
-    async fn single_owner_shuffle() -> (ClusterShuffleConfig, u64) {
-        single_owner_shuffle_for(8).await
-    }
-
-    #[tokio::test]
-    async fn grouped_managed_aggregate_is_cluster_startup_admissible() {
-        use crate::operator::capability::{
-            ClusterExecutionStatus, ManagedStateContract, OperatorStateClass,
-        };
-
-        let (context, _) = super::checkpoint_tests::context_and_batch();
-        let mut operator = SqlQueryOperator::new(
-            "totals",
-            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
-            context,
-            None,
-            false,
-        );
-        assert_eq!(
-            operator.cluster_capability(),
-            OperatorCapability {
-                implementation: OperatorImplementation::SqlQuery,
-                state_class: OperatorStateClass::VnodeKeyed,
-                cluster_status: ClusterExecutionStatus::DdlGuarded,
-                managed_state: Some(ManagedStateContract::SqlAggregateV1),
-            }
-        );
-
-        let (shuffle, _) = single_owner_shuffle().await;
-        operator.attach_cluster_shuffle(shuffle);
-        operator.initialize_managed_state().await.unwrap();
-        assert!(matches!(operator.state, QueryState::Agg(_)));
-    }
-
-    #[tokio::test]
-    async fn pre_agg_shuffle_preserves_local_hints_and_marks_configless_batches_mixed() {
-        let (_, batch) = super::checkpoint_tests::context_and_batch();
-        let (configless, admitted) =
-            shuffle_pre_agg_batches(None, "totals", 1, vec![batch.clone()])
-                .await
-                .unwrap();
-        assert!(admitted.is_empty());
-        assert_eq!(configless.len(), 1);
-        assert_eq!(configless[0].1, None);
-
-        let (shuffle, _) = single_owner_shuffle().await;
-        let (routed, admitted) = shuffle_pre_agg_batches(Some(&shuffle), "totals", 1, vec![batch])
-            .await
-            .unwrap();
-        assert!(admitted.is_empty());
-        assert_eq!(
-            routed
-                .iter()
-                .map(|(batch, _)| batch.num_rows())
-                .sum::<usize>(),
-            2
-        );
-        for (batch, hint) in routed {
-            let vnode = hint.expect("a local route must retain its exact vnode");
-            assert!(
-                hash_rows_to_vnodes(&batch, 1, 8)
-                    .unwrap()
-                    .into_iter()
-                    .all(|derived| derived == vnode),
-                "a local route hint must describe every row in its batch",
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn cluster_aggregate_never_falls_back_to_node_local_execution() {
-        let (context, batch) = super::checkpoint_tests::context_and_batch();
-        let mut operator = SqlQueryOperator::new(
-            "ratio",
-            "SELECT SUM(value) / COUNT(value) AS ratio FROM events",
-            context,
-            None,
-            false,
-        );
-        let (shuffle, _) = single_owner_shuffle().await;
-        operator.attach_cluster_shuffle(shuffle);
-
-        let error = operator
-            .process(&[vec![batch]], &[i64::MIN])
-            .await
-            .expect_err("a derived aggregate must not execute against node-local input");
-        assert!(error.to_string().contains("LDB-4007"), "{error}");
-        assert!(
-            error
-                .to_string()
-                .contains("exact incremental execution path"),
-            "{error}"
-        );
-        assert!(matches!(operator.state, QueryState::Uninit));
-    }
-
-    #[tokio::test]
-    async fn cluster_aggregate_cannot_outgrow_its_immutable_managed_capability() {
-        let (context, batch) = super::checkpoint_tests::context_and_batch();
-        let mut operator = SqlQueryOperator::new(
-            "limited-count",
-            "SELECT COUNT(*) AS n FROM events LIMIT 1",
-            context,
-            None,
-            false,
-        );
-        assert_eq!(operator.capability.managed_state, None);
-        let (shuffle, _) = single_owner_shuffle().await;
-        operator.attach_cluster_shuffle(shuffle);
-
-        let error = operator
-            .process(&[vec![batch]], &[i64::MIN])
-            .await
-            .expect_err("an unmanaged classifier result must not become cluster aggregate state");
-
-        assert!(error.to_string().contains("LDB-4007"), "{error}");
-        assert!(
-            error.to_string().contains("immutable cluster capability"),
-            "{error}"
-        );
-        assert!(matches!(operator.state, QueryState::Uninit));
-    }
-
-    #[tokio::test]
-    async fn empty_aggregate_capture_names_every_required_vnode() {
-        for (sql, required) in [
-            (
-                "SELECT key, SUM(value) AS total FROM events GROUP BY key",
-                (0..8).collect::<Vec<_>>(),
-            ),
-            ("SELECT COUNT(*) AS total FROM events", vec![0]),
-        ] {
-            let (context, _) = super::checkpoint_tests::context_and_batch();
-            let mut operator = SqlQueryOperator::new("totals", sql, context, None, false);
-            let (shuffle, _) = single_owner_shuffle().await;
-            operator.attach_cluster_shuffle(shuffle);
-            operator.initialize_managed_state().await.unwrap();
-            let QueryState::Agg(ref aggregate) = operator.state else {
-                panic!("expected initialized aggregate state");
-            };
-            assert_eq!(
-                aggregate.key_group_count(),
-                KeyGroupCount::try_from(8_u32).unwrap()
-            );
-
-            let captured = operator
-                .checkpoint_by_vnode(&required, 8)
-                .unwrap()
-                .expect("a required semantic EMPTY must be explicit");
-
-            let mut actual: Vec<u32> = captured.keys().copied().collect();
-            actual.sort_unstable();
-            assert_eq!(actual, required);
-            for slice in captured.values() {
-                let crate::checkpoint_coordinator::StagedSlice::Bytes(bytes) = slice else {
-                    panic!("fresh empty aggregate must establish a FULL base")
-                };
-                let checkpoint =
-                    rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(bytes).unwrap();
-                assert!(checkpoint.keys_ipc.is_empty());
-                assert!(checkpoint.acc_state_ipc.is_empty());
-                assert!(checkpoint.last_updated_ms.is_empty());
-                assert!(checkpoint.last_emitted.is_empty());
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn checkpoint_count_mismatch_preserves_owned_baseline() {
-        let (context, _) = super::checkpoint_tests::context_and_batch();
-        let mut operator = SqlQueryOperator::new(
-            "total",
-            "SELECT COUNT(*) AS total FROM events",
-            context,
-            None,
-            false,
-        );
-        let (shuffle, _) = single_owner_shuffle().await;
-        operator.attach_cluster_shuffle(shuffle);
-        operator.initialize_managed_state().await.unwrap();
-
-        let error = operator
-            .checkpoint_by_vnode(&[0], 16)
-            .expect_err("capture must reject a count outside its immutable topology");
-        assert!(error.to_string().contains("state=8, requested=16"));
-        assert!(operator.prev_owned.is_empty());
-
-        assert!(operator.checkpoint_by_vnode(&[0], 8).unwrap().is_some());
-        assert_eq!(
-            operator.prev_owned,
-            [0].into_iter().collect::<rustc_hash::FxHashSet<_>>()
-        );
-    }
-
-    #[tokio::test]
-    async fn global_semantic_empty_replaces_groups_and_emission_history() {
-        let (context, batch) = super::checkpoint_tests::context_and_batch();
-        let mut operator = SqlQueryOperator::new(
-            "total",
-            "SELECT SUM(value) AS total FROM events",
-            context,
-            None,
-            true,
-        );
-        let (shuffle, _) = single_owner_shuffle().await;
-        operator.attach_cluster_shuffle(shuffle);
-
-        let initial_rows: usize = operator
-            .process(&[vec![batch.clone()]], &[i64::MIN])
-            .await
-            .unwrap()
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum();
-        assert_eq!(initial_rows, 1);
-
-        let empty = match &operator.state {
-            QueryState::Agg(aggregate) => aggregate.empty_checkpoint(),
-            _ => panic!("expected initialized aggregate state"),
-        };
-        let empty = serialize_agg_cp(&empty, &operator.op_name).unwrap();
-        operator.apply_vnode_chain(0, &empty, &[]).unwrap();
-
-        let emitted = operator.process(&[vec![batch]], &[i64::MIN]).await.unwrap();
-        assert_eq!(emitted.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
-        let weights = emitted[0]
-            .column_by_name(laminar_core::changelog::WEIGHT_COLUMN)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(weights.values(), &[1]);
-    }
-
-    #[tokio::test]
-    async fn prepared_global_restore_aborts_cleanly_then_publishes_exact_image() {
-        fn current_state_bytes(operator: &mut SqlQueryOperator) -> Vec<u8> {
-            let QueryState::Agg(ref mut aggregate) = operator.state else {
-                panic!("expected initialized aggregate state");
-            };
-            serialize_agg_cp(&aggregate.checkpoint_groups().unwrap(), &operator.op_name).unwrap()
-        }
-
-        let (context, batch) = super::checkpoint_tests::context_and_batch();
-        let sql = "SELECT SUM(value) AS total FROM events";
-        let (donor_shuffle, version) = single_owner_shuffle().await;
-        let mut donor = SqlQueryOperator::new("total", sql, context.clone(), None, false);
-        donor.attach_cluster_shuffle(donor_shuffle);
-        donor
-            .process(&[vec![batch.clone()]], &[i64::MIN])
-            .await
-            .unwrap();
-        let donor_slice = donor
-            .checkpoint_by_vnode(&[0], 8)
-            .unwrap()
-            .expect("global vnode must emit an explicit image")
-            .remove(&0)
-            .expect("global vnode zero image");
-        let crate::checkpoint_coordinator::StagedSlice::Bytes(donor_slice) = donor_slice else {
-            panic!("global aggregate capture must be materialized bytes");
-        };
-
-        let (subject_shuffle, subject_version) = single_owner_shuffle().await;
-        assert_eq!(subject_version, version);
-        let mut subject = SqlQueryOperator::new("total", sql, context, None, false);
-        subject.attach_cluster_shuffle(subject_shuffle);
-        subject
-            .process(&[vec![batch.clone()]], &[i64::MIN])
-            .await
-            .unwrap();
-        subject.process(&[vec![batch]], &[i64::MIN]).await.unwrap();
-        let before = current_state_bytes(&mut subject);
-        let target = laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
-            version,
-            &[1; 8],
-            vec![laminar_core::checkpoint::CheckpointParticipant {
-                node_id: 1,
-                boot_incarnation: uuid::Uuid::from_u128(1),
-            }],
-        )
-        .unwrap();
-        let restores = [crate::operator_graph::ManagedVnodeRestore {
-            vnode: 0,
-            base: &donor_slice,
-            deltas: &[],
-        }];
-        let revoked = rustc_hash::FxHashSet::default();
-
-        subject
-            .prepare_vnode_transition(ManagedVnodeTransition {
-                target: &target,
-                revoked: &revoked,
-                restores: &restores,
-            })
-            .unwrap();
-        assert_eq!(current_state_bytes(&mut subject), before);
-        subject.abort_vnode_transition();
-        subject.finish_vnode_transition();
-        assert_eq!(current_state_bytes(&mut subject), before);
-
-        subject
-            .prepare_vnode_transition(ManagedVnodeTransition {
-                target: &target,
-                revoked: &revoked,
-                restores: &restores,
-            })
-            .unwrap();
-        subject.publish_vnode_transition();
-        subject.finish_vnode_transition();
-        assert_eq!(current_state_bytes(&mut subject), donor_slice.as_ref());
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test]
-    async fn complete_inner_roster_preflight_precedes_owned_and_arrow_decode() {
-        let (context, _) = super::checkpoint_tests::context_and_batch();
-        let sql = "SELECT key, SUM(value) AS total FROM events GROUP BY key";
-        let (shuffle, version) = single_owner_shuffle().await;
-        let mut operator = SqlQueryOperator::new("totals", sql, context, None, false);
-        operator.attach_cluster_shuffle(shuffle);
-        operator.initialize_managed_state().await.unwrap();
-
-        let (empty_archive, invalid_ipc_archive, late_invalid_archive) = {
-            let QueryState::Agg(ref mut aggregate) = operator.state else {
-                panic!("expected initialized aggregate state");
-            };
-            aggregate.set_max_groups_for_test(1);
-            let mut checkpoint = aggregate.empty_checkpoint();
-            let empty = serialize_agg_cp(&checkpoint, &operator.op_name).unwrap();
-            checkpoint.keys_ipc = vec![0xff];
-            checkpoint.acc_state_ipc = vec![vec![0xff]];
-            checkpoint.last_updated_ms = vec![i64::MIN];
-            let invalid_ipc = serialize_agg_cp(&checkpoint, &operator.op_name).unwrap();
-            checkpoint.fingerprint = checkpoint.fingerprint.wrapping_add(1);
-            let late_invalid = serialize_agg_cp(&checkpoint, &operator.op_name).unwrap();
-            (empty, invalid_ipc, late_invalid)
-        };
-        let target = laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
-            version,
-            &[1; 8],
-            vec![laminar_core::checkpoint::CheckpointParticipant {
-                node_id: 1,
-                boot_incarnation: uuid::Uuid::from_u128(1),
-            }],
-        )
-        .unwrap();
-        let over_limit_restores = [
-            crate::operator_graph::ManagedVnodeRestore {
-                vnode: 0,
-                base: &invalid_ipc_archive,
-                deltas: &[],
-            },
-            crate::operator_graph::ManagedVnodeRestore {
-                vnode: 1,
-                base: &invalid_ipc_archive,
-                deltas: &[],
-            },
-        ];
-        let revoked = rustc_hash::FxHashSet::default();
-
-        let late_invalid_restores = [
-            crate::operator_graph::ManagedVnodeRestore {
-                vnode: 0,
-                base: &invalid_ipc_archive,
-                deltas: &[],
-            },
-            crate::operator_graph::ManagedVnodeRestore {
-                vnode: 1,
-                base: &late_invalid_archive,
-                deltas: &[],
-            },
-        ];
-        let late_invalid_delta = [crate::vnode_restore_input::VnodeRestoreArchive::Borrowed(
-            late_invalid_archive.as_slice(),
-        )];
-        let late_invalid_delta_restore = [crate::operator_graph::ManagedVnodeRestore {
-            vnode: 0,
-            base: &invalid_ipc_archive,
-            deltas: &late_invalid_delta,
-        }];
-        for restores in [
-            late_invalid_restores.as_slice(),
-            late_invalid_delta_restore.as_slice(),
-        ] {
-            crate::aggregate_state::reset_owned_restore_decode_count_for_test();
-            let error = operator
-                .prepare_vnode_transition(ManagedVnodeTransition {
-                    target: &target,
-                    revoked: &revoked,
-                    restores,
-                })
-                .expect_err("the late fingerprint mismatch must fail the borrowed pass");
-            assert!(
-                error.to_string().contains("fingerprint mismatch"),
-                "{error}"
-            );
-            assert_eq!(
-                crate::aggregate_state::owned_restore_decode_count_for_test(),
-                0,
-                "a late archive error must prevent every owned inner decode"
-            );
-        }
-
-        crate::aggregate_state::reset_owned_restore_decode_count_for_test();
-        let error = operator
-            .prepare_vnode_transition(ManagedVnodeTransition {
-                target: &target,
-                revoked: &revoked,
-                restores: &over_limit_restores,
-            })
-            .expect_err("two one-row vnode bases must exceed the one-group lower bound");
-        assert!(
-            error.to_string().contains("replacement_lower_bound=2"),
-            "{error}"
-        );
-        assert_eq!(
-            crate::aggregate_state::owned_restore_decode_count_for_test(),
-            0,
-            "complete cardinality preflight must run before the first owned inner decode"
-        );
-        assert!(operator.prepared_vnode_transition.is_none());
-        assert!(operator.vnode_transition_cleanup.is_none());
-        let QueryState::Agg(ref aggregate) = operator.state else {
-            panic!("expected aggregate state after rejected preflight");
-        };
-        assert_eq!(aggregate.logical_group_count_for_test(), 0);
-
-        // Active negative control: both vnodes pass the complete borrowed/cardinality pass. Arrow
-        // rejects the first vnode, so lazy preparation must not deserialize the later EMPTY vnode.
-        let arrow_failure_restores = [
-            crate::operator_graph::ManagedVnodeRestore {
-                vnode: 0,
-                base: &invalid_ipc_archive,
-                deltas: &[],
-            },
-            crate::operator_graph::ManagedVnodeRestore {
-                vnode: 1,
-                base: &empty_archive,
-                deltas: &[],
-            },
-        ];
-        crate::aggregate_state::reset_owned_restore_decode_count_for_test();
-        let error = operator
-            .prepare_vnode_transition(ManagedVnodeTransition {
-                target: &target,
-                revoked: &revoked,
-                restores: &arrow_failure_restores,
-            })
-            .expect_err("the malformed key IPC must fail after roster preflight");
-        assert!(error.to_string().contains("keys IPC decode"), "{error}");
-        assert_eq!(
-            crate::aggregate_state::owned_restore_decode_count_for_test(),
-            1,
-            "an earlier Arrow failure must prevent the later vnode's owned decode"
-        );
-        assert!(operator.prepared_vnode_transition.is_none());
-        assert!(operator.vnode_transition_cleanup.is_none());
-        let QueryState::Agg(ref aggregate) = operator.state else {
-            panic!("expected aggregate state after Arrow rejection");
-        };
-        assert_eq!(aggregate.logical_group_count_for_test(), 0);
-    }
-
-    async fn aggregate_state_checkpoint() -> (SessionContext, AggStateCheckpoint) {
-        let (context, batch) = super::checkpoint_tests::context_and_batch();
-        let mut operator = SqlQueryOperator::new(
-            "totals",
-            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
-            context.clone(),
-            None,
-            false,
-        );
-        operator.process(&[vec![batch]], &[i64::MIN]).await.unwrap();
-        let QueryState::Agg(ref mut aggregate) = operator.state else {
-            panic!("expected aggregate state");
-        };
-        (context, aggregate.checkpoint_groups().unwrap())
-    }
-
-    #[tokio::test]
-    async fn checkpointed_aligned_replay_emits_once_after_restore() {
-        let (context, batch) = super::checkpoint_tests::context_and_batch();
-        let (donor_shuffle, version) = single_owner_shuffle().await;
-        let mut donor = SqlQueryOperator::new(
-            "totals",
-            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
-            context.clone(),
-            None,
-            true,
-        );
-        donor.attach_cluster_shuffle(donor_shuffle);
-        donor.lazy_init().await.unwrap();
-        donor
-            .aligned_replay
-            .push_back((version, 42, crate::operator::RetainedBatch::local(batch)));
-        let checkpoint = donor.checkpoint().unwrap().unwrap();
-
-        let (restored_shuffle, restored_version) = single_owner_shuffle().await;
-        assert_eq!(restored_version, version);
-        let mut restored = SqlQueryOperator::new(
-            "totals",
-            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
-            context,
-            None,
-            true,
-        );
-        restored.attach_cluster_shuffle(restored_shuffle);
-        restored.restore(checkpoint).unwrap();
-        assert!(!restored.wants_input());
-        assert_eq!(restored.watermark_hold(), Some(42));
-        assert_eq!(restored.restored_output_watermark(), Some(42));
-
-        let output = restored.process(&[Vec::new()], &[100]).await.unwrap();
-        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
-        assert!(restored.aligned_replay.is_empty());
-        assert!(restored.wants_input());
-        assert_eq!(restored.watermark_hold(), None);
-
-        let second = restored.process(&[Vec::new()], &[100]).await.unwrap();
-        assert!(
-            second.is_empty(),
-            "aligned replay must not be applied twice"
-        );
-    }
-
-    #[tokio::test]
-    async fn aligned_replay_processes_one_logical_batch_per_cycle() {
-        let (context, batch) = super::checkpoint_tests::context_and_batch();
-        let (shuffle, version) = single_owner_shuffle().await;
-        let mut operator = SqlQueryOperator::new(
-            "totals",
-            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
-            context,
-            None,
-            true,
-        );
-        operator.attach_cluster_shuffle(shuffle);
-        operator.lazy_init().await.unwrap();
-        operator.aligned_replay.push_back((
-            version,
-            41,
-            crate::operator::RetainedBatch::local(batch.clone()),
-        ));
-        operator.aligned_replay.push_back((
-            version,
-            42,
-            crate::operator::RetainedBatch::local(batch),
-        ));
-
-        let first = operator.process(&[Vec::new()], &[100]).await.unwrap();
-        assert_eq!(first.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
-        assert_eq!(operator.aligned_replay.len(), 1);
-        assert_eq!(operator.watermark_hold(), Some(42));
-        assert!(!operator.wants_input());
-
-        let second = operator.process(&[Vec::new()], &[100]).await.unwrap();
-        assert!(!second.is_empty());
-        assert!(operator.aligned_replay.is_empty());
-        assert!(operator.wants_input());
-
-        let after_drain = operator.process(&[Vec::new()], &[100]).await.unwrap();
-        assert!(after_drain.is_empty(), "drained replay must not run again");
-    }
-
-    #[tokio::test]
-    async fn failed_aligned_replay_remains_queued_for_checkpoint_recovery() {
-        let (context, _) = super::checkpoint_tests::context_and_batch();
-        let (shuffle, version) = single_owner_shuffle().await;
-        let mut operator = SqlQueryOperator::new(
-            "totals",
-            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
-            context,
-            None,
-            true,
-        );
-        operator.attach_cluster_shuffle(shuffle);
-        operator.lazy_init().await.unwrap();
-        let invalid = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("key", DataType::Int64, false),
-                Field::new("value", DataType::Int64, false),
-            ])),
-            vec![
-                Arc::new(Int64Array::from(vec![1])),
-                Arc::new(Int64Array::from(vec![10])),
-            ],
-        )
-        .unwrap();
-        operator.aligned_replay.push_back((
-            version,
-            41,
-            crate::operator::RetainedBatch::local(invalid),
-        ));
-
-        let error = operator
-            .process(&[Vec::new()], &[100])
-            .await
-            .expect_err("schema-incompatible replay must fail closed");
-        assert!(matches!(error, DbError::Checkpoint(_)));
-        assert!(error.requires_pipeline_recovery());
-        assert_eq!(operator.aligned_replay.len(), 1);
-        assert!(!operator.wants_input());
-    }
-
-    #[tokio::test]
-    async fn aligned_replay_applies_retained_vnode_hint_before_mutation() {
-        let (context, batch) = super::checkpoint_tests::context_and_batch();
-        let (shuffle, version) = single_owner_shuffle().await;
-        let mut operator = SqlQueryOperator::new(
-            "totals",
-            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
-            context,
-            None,
-            true,
-        );
-        operator.attach_cluster_shuffle(shuffle);
-        operator.lazy_init().await.unwrap();
-        operator.aligned_replay.push_back((
-            version,
-            41,
-            crate::operator::RetainedBatch {
-                batch,
-                _admissions: Arc::from([]),
-                assignment_version: Some(version),
-                uniform_vnode: Some(8),
-            },
-        ));
-
-        let error = operator
-            .process(&[Vec::new()], &[100])
-            .await
-            .expect_err("an out-of-range retained vnode hint must fail before state mutation");
-        assert!(matches!(error, DbError::Checkpoint(_)));
-        assert!(error.to_string().contains("outside key-group count 8"));
-        assert_eq!(operator.aligned_replay.len(), 1);
-        let QueryState::Agg(ref aggregate) = operator.state else {
-            panic!("expected initialized aggregate state");
-        };
-        assert_eq!(aggregate.logical_group_count_for_test(), 0);
-    }
-
-    #[tokio::test]
-    async fn lazy_delta_restore_failure_requires_checkpoint_recovery() {
-        let (context, base) = aggregate_state_checkpoint().await;
-        let mut invalid_delta = base.clone();
-        invalid_delta.fingerprint ^= 1;
-        let mut operator = SqlQueryOperator::new(
-            "totals",
-            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
-            context,
-            None,
-            false,
-        );
-        operator.pending_restore = Some(base);
-        operator
-            .pending_restore_deltas
-            .push(crate::aggregate_state::AggVnodeDelta {
-                changed: invalid_delta,
-            });
-
-        let error = operator.lazy_init().await.unwrap_err();
-        assert!(matches!(error, DbError::Checkpoint(_)));
-        assert!(error.to_string().contains("delta fingerprint mismatch"));
-        assert!(error.requires_pipeline_recovery());
-        assert!(matches!(operator.state, QueryState::Uninit));
-        assert!(
-            operator.pending_restore.is_some(),
-            "a rejected delta must retain the baseline it depends on"
-        );
-        assert_eq!(operator.pending_restore_deltas.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn rehydrated_vnode_fingerprint_mismatch_is_not_dropped() {
-        let (context, checkpoint) = aggregate_state_checkpoint().await;
-        let first = serialize_agg_cp(&checkpoint, "totals").unwrap();
-        let mut mismatched = checkpoint;
-        mismatched.fingerprint ^= 1;
-        let second = serialize_agg_cp(&mismatched, "totals").unwrap();
-        let mut operator = SqlQueryOperator::new(
-            "totals",
-            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
-            context,
-            None,
-            false,
-        );
-
-        operator.apply_vnode_state(1, &first).unwrap();
-        let error = operator.apply_vnode_state(2, &second).unwrap_err();
-        assert!(matches!(error, DbError::Pipeline(_)));
-        assert!(error.to_string().contains("fingerprint mismatch"));
-        assert_eq!(operator.pending_restore_slices.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn uninit_vnode_bases_are_retained_raw_and_bulk_merged_once() {
-        let (context, _) = super::checkpoint_tests::context_and_batch();
-        let sql = "SELECT key, SUM(value) AS total FROM events GROUP BY key";
-        let names = (0..128)
-            .map(|index| format!("key-{index}"))
-            .collect::<Vec<_>>();
-        let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
-        let batch = RecordBatch::try_new(
-            Arc::new(arrow::datatypes::Schema::new(vec![
-                arrow::datatypes::Field::new("key", arrow::datatypes::DataType::Utf8, false),
-                arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
-            ])),
-            vec![
-                Arc::new(StringArray::from(name_refs)),
-                Arc::new(Int64Array::from(vec![1_i64; 128])),
-            ],
-        )
-        .unwrap();
-        let mut donor = SqlQueryOperator::new("totals", sql, context.clone(), None, false);
-        let (donor_shuffle, _) = single_owner_shuffle_for(64).await;
-        donor.attach_cluster_shuffle(donor_shuffle);
-        donor.process(&[vec![batch]], &[i64::MIN]).await.unwrap();
-        let QueryState::Agg(ref mut aggregate) = donor.state else {
-            panic!("expected aggregate state");
-        };
-        let slices = aggregate.checkpoint_groups_by_vnode(64).unwrap();
-        assert!(
-            slices.len() > 16,
-            "test needs many independently recovered vnodes"
-        );
-
-        let mut restored = SqlQueryOperator::new("totals", sql, context, None, false);
-        let (restored_shuffle, _) = single_owner_shuffle_for(64).await;
-        restored.attach_cluster_shuffle(restored_shuffle);
-        for (vnode, checkpoint) in &slices {
-            let bytes = serialize_agg_cp(checkpoint, "totals").unwrap();
-            restored.apply_vnode_state(*vnode, &bytes).unwrap();
-        }
-        assert!(restored.pending_restore.is_none());
-        assert_eq!(restored.pending_restore_slices.len(), slices.len());
-
-        restored.lazy_init().await.unwrap();
-        assert!(restored.pending_restore_slices.is_empty());
-        let QueryState::Agg(ref mut aggregate) = restored.state else {
-            panic!("expected restored aggregate state");
-        };
-        assert_eq!(
-            aggregate.checkpoint_groups().unwrap().last_updated_ms.len(),
-            128
-        );
-    }
-
-    #[tokio::test]
-    async fn deferred_vnode_revoke_without_ownership_faults_restore() {
-        let (context, base) = aggregate_state_checkpoint().await;
-        let mut operator = SqlQueryOperator::new(
-            "totals",
-            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
-            context,
-            None,
-            false,
-        );
-        operator.pending_restore = Some(base);
-        operator.deferred_revoke_vnodes.insert(3);
-
-        let error = operator.lazy_init().await.unwrap_err();
-        assert!(matches!(error, DbError::Checkpoint(_)));
-        assert!(error.to_string().contains("without cluster ownership"));
-        assert!(operator.pending_restore.is_some());
-        assert!(operator.deferred_revoke_vnodes.contains(&3));
-        assert!(matches!(operator.state, QueryState::Uninit));
-    }
-
-    // A cluster-scoped aggregate never captures groups into the portable whole-node manifest;
-    // assignment-scoped vnode partials remain authoritative with or without delta encoding.
-    #[tokio::test]
-    async fn cluster_scope_skips_whole_node_agg_capture() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("val", DataType::Int64, false),
-        ]));
-        let batch = |keys: &[&str], vals: &[i64]| {
-            RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(StringArray::from(keys.to_vec())),
-                    Arc::new(Int64Array::from(vals.to_vec())),
-                ],
-            )
-            .unwrap()
-        };
-
-        let ctx = laminar_sql::create_session_context();
-        let mem = datafusion::datasource::MemTable::try_new(
-            Arc::clone(&schema),
-            vec![vec![batch(&["seed"], &[0])]],
-        )
-        .unwrap();
-        ctx.register_table("events", Arc::new(mem)).unwrap();
-
-        let mut op = SqlQueryOperator::new(
-            "out",
-            "SELECT key, SUM(val) AS total FROM events GROUP BY key",
-            ctx,
-            None,
-            false,
-        );
-
-        let registry = Arc::new(VnodeRegistry::new(8));
-        registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
-        let receiver = Arc::new(
-            laminar_core::shuffle::ShuffleReceiver::bind(
-                1,
-                "127.0.0.1:0".parse().unwrap(),
-                uuid::Uuid::from_u128(1),
-            )
-            .await
-            .unwrap(),
-        );
-        op.attach_cluster_shuffle(ClusterShuffleConfig {
-            registry,
-            sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(
-                1,
-                uuid::Uuid::from_u128(1),
-            )),
-            receiver,
-            self_id: NodeId(1),
-        });
-        op.process(&[vec![batch(&["a", "b"], &[1, 2])]], &[i64::MIN])
-            .await
-            .unwrap();
-
-        assert!(
-            op.checkpoint().unwrap().is_none(),
-            "cluster aggregate groups must live only in vnode partials"
-        );
-
-        op.enable_delta_checkpoints(4);
-        assert!(
-            op.checkpoint().unwrap().is_none(),
-            "delta encoding must keep vnode partials authoritative"
-        );
-    }
-
-    // A FULL vnode image is authoritative and repeat delivery is idempotent. Revocation still has
-    // to remove the vnode immediately so this node does not expose state it no longer owns.
-    #[allow(clippy::too_many_lines)]
-    #[tokio::test]
-    async fn authoritative_full_vnode_restore_replaces_stale_keys_and_restores_revoked_state() {
-        async fn populated_op() -> SqlQueryOperator {
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("key", DataType::Utf8, false),
-                Field::new("val", DataType::Int64, false),
-            ]));
-            let seed = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(StringArray::from(vec!["seed"])),
-                    Arc::new(Int64Array::from(vec![0_i64])),
-                ],
-            )
-            .unwrap();
-            let ctx = laminar_sql::create_session_context();
-            let mem =
-                datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![seed]])
-                    .unwrap();
-            ctx.register_table("events", Arc::new(mem)).unwrap();
-            let mut op = SqlQueryOperator::new(
-                "out",
-                "SELECT key, SUM(val) AS total FROM events GROUP BY key",
-                ctx,
-                None,
-                false,
-            );
-            let registry = Arc::new(VnodeRegistry::new(8));
-            registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
-            let receiver = Arc::new(
-                laminar_core::shuffle::ShuffleReceiver::bind(
-                    1,
-                    "127.0.0.1:0".parse().unwrap(),
-                    uuid::Uuid::from_u128(1),
-                )
-                .await
-                .unwrap(),
-            );
-            op.attach_cluster_shuffle(ClusterShuffleConfig {
-                registry,
-                sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(
-                    1,
-                    uuid::Uuid::from_u128(1),
-                )),
-                receiver,
-                self_id: NodeId(1),
-            });
-            op
-        }
-
-        fn total_sum(op: &mut SqlQueryOperator) -> i64 {
-            let QueryState::Agg(ref mut agg) = op.state else {
-                panic!("expected aggregate state");
-            };
-            let batches = agg.emit().unwrap();
-            let mut sum = 0;
-            for b in &batches {
-                let total = b
-                    .column(b.schema().index_of("total").unwrap())
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap();
-                for i in 0..b.num_rows() {
-                    sum += total.value(i);
-                }
-            }
-            sum
-        }
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("val", DataType::Int64, false),
-        ]));
-        let batch = move |keys: &[&str], vals: &[i64]| {
-            RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(StringArray::from(keys.to_vec())),
-                    Arc::new(Int64Array::from(vals.to_vec())),
-                ],
-            )
-            .unwrap()
-        };
-
-        // The durable per-vnode slice for some owned vnode `v`, captured from {a:1, b:2}.
-        let mut donor = populated_op().await;
-        donor
-            .process(&[vec![batch(&["a", "b"], &[1, 2])]], &[i64::MIN])
-            .await
-            .unwrap();
-        let slices = donor
-            .checkpoint_by_vnode(&(0..8).collect::<Vec<_>>(), 8)
-            .unwrap()
-            .expect("per-vnode slices");
-        let (v, slice_bytes) = slices
-            .iter()
-            .find_map(|(v, s)| match s {
-                crate::checkpoint_coordinator::StagedSlice::Bytes(b) => {
-                    let checkpoint =
-                        rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(b).unwrap();
-                    (!checkpoint.last_updated_ms.is_empty()).then(|| (*v, b.clone()))
-                }
-                _ => None,
-            })
-            .expect("at least one full vnode slice");
-
-        // Replaying an already-applied FULL slice, including retry after a lost ack, is idempotent.
-        let mut control = populated_op().await;
-        control
-            .process(&[vec![batch(&["a", "b"], &[1, 2])]], &[i64::MIN])
-            .await
-            .unwrap();
-        control.apply_vnode_state(v, &slice_bytes).unwrap();
-        control.apply_vnode_state(v, &slice_bytes).unwrap();
-        assert_eq!(total_sum(&mut control), 3);
-
-        // Revocation removes the vnode immediately; a later authoritative FULL restores it.
-        let mut fixed = populated_op().await;
-        fixed
-            .process(&[vec![batch(&["a", "b"], &[1, 2])]], &[i64::MIN])
-            .await
-            .unwrap();
-        let revoked: rustc_hash::FxHashSet<u32> = [v].into_iter().collect();
-        fixed.drop_owned_vnodes(&revoked).unwrap();
-        let remaining_after_revoke = total_sum(&mut fixed);
-        assert!(remaining_after_revoke < 3);
-        fixed.apply_vnode_state(v, &slice_bytes).unwrap();
-        assert_eq!(
-            total_sum(&mut fixed),
-            3,
-            "re-acquiring the vnode restores the committed aggregate"
-        );
-
-        // The graph callback consumes an authoritative chain, not a merge patch. A key written
-        // after the durable cut must disappear even when ownership of the vnode was retained.
-        let extra_key = (0..1_024)
-            .map(|candidate| format!("post-cut-{candidate}"))
-            .find(|candidate| {
-                let candidate_batch = batch(&[candidate.as_str()], &[100]);
-                hash_rows_to_vnodes(&candidate_batch, 1, 8).unwrap()[0] == v
-            })
-            .expect("one candidate key must hash to the restored vnode");
-        let mut replaced = populated_op().await;
-        replaced
-            .process(&[vec![batch(&["a", "b"], &[1, 2])]], &[i64::MIN])
-            .await
-            .unwrap();
-        replaced
-            .process(&[vec![batch(&[extra_key.as_str()], &[100])]], &[i64::MIN])
-            .await
-            .unwrap();
-        assert!(total_sum(&mut replaced) > 3);
-        replaced.apply_vnode_chain(v, &slice_bytes, &[]).unwrap();
-        assert_eq!(
-            total_sum(&mut replaced),
-            3,
-            "authoritative restore must remove keys absent from the committed vnode image"
-        );
-
-        let empty = match &replaced.state {
-            QueryState::Agg(aggregate) => aggregate.empty_checkpoint(),
-            _ => panic!("expected initialized aggregate state"),
-        };
-        let empty = serialize_agg_cp(&empty, &replaced.op_name).unwrap();
-        replaced.apply_vnode_chain(v, &empty, &[]).unwrap();
-        assert_eq!(
-            total_sum(&mut replaced),
-            remaining_after_revoke,
-            "semantic EMPTY must remove every group in its authoritative vnode"
-        );
-    }
-
-    // A chain applied while Uninit preserves its last-emitted baseline. Physical ownership
-    // movement emits nothing; the next real update replaces the prior logical row exactly once.
-    #[tokio::test]
-    async fn uninit_chain_restore_is_silent_until_real_change() {
-        async fn changelog_op() -> SqlQueryOperator {
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("key", DataType::Utf8, false),
-                Field::new("val", DataType::Int64, false),
-            ]));
-            let seed = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(StringArray::from(vec!["seed"])),
-                    Arc::new(Int64Array::from(vec![0_i64])),
-                ],
-            )
-            .unwrap();
-            let ctx = laminar_sql::create_session_context();
-            let mem =
-                datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![seed]])
-                    .unwrap();
-            ctx.register_table("events", Arc::new(mem)).unwrap();
-            let mut op = SqlQueryOperator::new(
-                "out",
-                "SELECT key, SUM(val) AS total FROM events GROUP BY key",
-                ctx,
-                None,
-                true, // changelog: emission is dirty-gated + last_emitted-deduped
-            );
-            let registry = Arc::new(VnodeRegistry::new(8));
-            registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
-            let receiver = Arc::new(
-                laminar_core::shuffle::ShuffleReceiver::bind(
-                    1,
-                    "127.0.0.1:0".parse().unwrap(),
-                    uuid::Uuid::from_u128(1),
-                )
-                .await
-                .unwrap(),
-            );
-            op.attach_cluster_shuffle(ClusterShuffleConfig {
-                registry,
-                sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(
-                    1,
-                    uuid::Uuid::from_u128(1),
-                )),
-                receiver,
-                self_id: NodeId(1),
-            });
-            op
-        }
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("val", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(StringArray::from(vec!["a", "b"])),
-                Arc::new(Int64Array::from(vec![1_i64, 2])),
-            ],
-        )
-        .unwrap();
-
-        // Donor: process emits {a,b} (populates last_emitted), then capture every full vnode slice.
-        let mut donor = changelog_op().await;
-        let emitted: usize = donor
-            .process(&[vec![batch]], &[i64::MIN])
-            .await
-            .unwrap()
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum();
-        assert_eq!(emitted, 2);
-        let slices = donor
-            .checkpoint_by_vnode(&(0..8).collect::<Vec<_>>(), 8)
-            .unwrap()
-            .expect("per-vnode slices");
-
-        // Apply the chains while Uninit (the boot-staging shape), then initialize without input.
-        let mut subject = changelog_op().await;
-        for (v, s) in &slices {
-            if let crate::checkpoint_coordinator::StagedSlice::Bytes(b) = s {
-                subject.apply_vnode_chain(*v, b, &[]).unwrap();
-            }
-        }
-        assert!(subject.process(&[], &[i64::MIN]).await.unwrap().is_empty());
-        let update = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(StringArray::from(vec!["a"])),
-                Arc::new(Int64Array::from(vec![3_i64])),
-            ],
-        )
-        .unwrap();
-        let changed = subject.process(&[vec![update]], &[i64::MIN]).await.unwrap();
-        assert_eq!(changed.len(), 1);
-        let totals = changed[0]
-            .column_by_name("total")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let weights = changed[0]
-            .column_by_name(laminar_core::changelog::WEIGHT_COLUMN)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(totals.values(), &[1, 4]);
-        assert_eq!(weights.values(), &[-1, 1]);
-    }
-
-    // The soak signature: chains for MANY vnodes applied while Uninit fold into ONE concatenated
-    // pending baseline; every donor group must survive the fold (partial folds = one-burst loss).
-    #[tokio::test]
-    async fn uninit_chain_fold_restores_every_vnode_group() {
-        async fn changelog_op() -> SqlQueryOperator {
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("key", DataType::Utf8, false),
-                Field::new("val", DataType::Int64, false),
-            ]));
-            let seed = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(StringArray::from(vec!["seed"])),
-                    Arc::new(Int64Array::from(vec![0_i64])),
-                ],
-            )
-            .unwrap();
-            let ctx = laminar_sql::create_session_context();
-            let mem =
-                datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![seed]])
-                    .unwrap();
-            ctx.register_table("events", Arc::new(mem)).unwrap();
-            let mut op = SqlQueryOperator::new(
-                "out",
-                "SELECT key, SUM(val) AS total FROM events GROUP BY key",
-                ctx,
-                None,
-                true,
-            );
-            let registry = Arc::new(VnodeRegistry::new(8));
-            registry.set_assignment((0..8).map(|_| NodeId(1)).collect::<Vec<_>>().into());
-            let receiver = Arc::new(
-                laminar_core::shuffle::ShuffleReceiver::bind(
-                    1,
-                    "127.0.0.1:0".parse().unwrap(),
-                    uuid::Uuid::from_u128(1),
-                )
-                .await
-                .unwrap(),
-            );
-            op.attach_cluster_shuffle(ClusterShuffleConfig {
-                registry,
-                sender: Arc::new(laminar_core::shuffle::ShuffleSender::new(
-                    1,
-                    uuid::Uuid::from_u128(1),
-                )),
-                receiver,
-                self_id: NodeId(1),
-            });
-            op
-        }
-        const GROUPS: usize = 500;
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("val", DataType::Int64, false),
-        ]));
-        let keys: Vec<String> = (0..GROUPS).map(|k| format!("k{k}")).collect();
-        let vals: Vec<i64> = (0_i64..500).collect();
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(StringArray::from(
-                    keys.iter().map(String::as_str).collect::<Vec<_>>(),
-                )),
-                Arc::new(Int64Array::from(vals)),
-            ],
-        )
-        .unwrap();
-
-        let mut donor = changelog_op().await;
-        let emitted: usize = donor
-            .process(&[vec![batch]], &[i64::MIN])
-            .await
-            .unwrap()
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum();
-        assert_eq!(emitted, GROUPS);
-        let slices = donor
-            .checkpoint_by_vnode(&(0..8).collect::<Vec<_>>(), 8)
-            .unwrap()
-            .expect("per-vnode slices");
-
-        let mut subject = changelog_op().await;
-        let mut applied = 0usize;
-        for (v, s) in &slices {
-            if let crate::checkpoint_coordinator::StagedSlice::Bytes(b) = s {
-                subject.apply_vnode_chain(*v, b, &[]).unwrap();
-                applied += 1;
-            }
-        }
-        assert!(
-            applied >= 7,
-            "expected slices for ~all 8 vnodes, got {applied}"
-        );
-        assert!(subject.process(&[], &[i64::MIN]).await.unwrap().is_empty());
-        let QueryState::Agg(ref mut aggregate) = subject.state else {
-            panic!("expected restored aggregate state");
-        };
-        assert_eq!(
-            aggregate.checkpoint_groups().unwrap().last_updated_ms.len(),
-            GROUPS,
-            "the Uninit fold must restore every donor group across all vnodes without emitting"
-        );
     }
 }

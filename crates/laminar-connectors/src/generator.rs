@@ -253,7 +253,7 @@ pub fn register_generator_source(registry: &ConnectorRegistry) -> Result<(), Con
 mod tests {
     use super::*;
     use crate::connector::{DeliveryGuarantee, SourcePosition, SourceStart};
-    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     fn start_request(config: ConnectorConfig, position: SourcePosition) -> SourceStart {
         SourceStart::new(config, position, DeliveryGuarantee::AtLeastOnce).unwrap()

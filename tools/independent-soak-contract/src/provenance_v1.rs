@@ -126,7 +126,7 @@ pub(super) struct RecoveryCheckpointView<'a> {
     pub identity: PipelineIdentityRef<'a>,
     pub epoch: u64,
     pub checkpoint_id: u64,
-    pub capsule_sha256: &'a [u8; 32],
+    pub committed_index_sha256: &'a [u8; 32],
     pub base_assignment_version: u64,
     pub base_assignment_certificate_sha256: &'a [u8; 32],
 }
@@ -191,7 +191,7 @@ impl PreparedOutputAuthorityV1<'_> {
             durable_process_term: self.current_process.durable_process_term,
             recovery_epoch: self.recovery.epoch,
             recovery_checkpoint_id: self.recovery.checkpoint_id,
-            capsule_sha256: self.recovery.capsule_sha256,
+            committed_index_sha256: self.recovery.committed_index_sha256,
             recovery_base_assignment_version: self.recovery.base_assignment_version,
             recovery_base_assignment_sha256: self.recovery.base_assignment_certificate_sha256,
             topology_sha256: self.topology_sha256,
@@ -430,7 +430,7 @@ fn validate_recovery(
     {
         return Err(ProvenanceError::InvalidRecoveryAttempt);
     }
-    require_nonzero(recovery.capsule_sha256, "recovery_capsule_sha256")?;
+    require_nonzero(recovery.committed_index_sha256, "committed_index_sha256")?;
     if recovery.base_assignment_version == 0 {
         return Err(ProvenanceError::ZeroField(
             "recovery_base_assignment_version",
@@ -545,7 +545,7 @@ mod tests {
         0x27, 0x41, 0x5c, 0x0e, 0x7a, 0x1f, 0x39, 0xc8, 0x9f, 0x53, 0x18, 0x54, 0xc2, 0x6f, 0x12,
         0xec, 0x0c,
     ];
-    const CAPSULE: [u8; 32] = [9; 32];
+    const COMMITTED_INDEX_DIGEST: [u8; 32] = [9; 32];
     const TOPOLOGY: [u8; 32] = [10; 32];
     const BOOT_A: [u8; 16] = [11; 16];
     const BOOT_B: [u8; 16] = [12; 16];
@@ -691,7 +691,7 @@ mod tests {
             identity: identity(),
             epoch: 61,
             checkpoint_id: 61,
-            capsule_sha256: &CAPSULE,
+            committed_index_sha256: &COMMITTED_INDEX_DIGEST,
             base_assignment_version: 7,
             base_assignment_certificate_sha256: &ASSIGNMENT_7,
         }
@@ -995,7 +995,7 @@ mod tests {
         assert_eq!(marker.durable_process_term, 51);
         assert_eq!(marker.recovery_epoch, 61);
         assert_eq!(marker.recovery_checkpoint_id, 61);
-        assert_eq!(marker.capsule_sha256, &CAPSULE);
+        assert_eq!(marker.committed_index_sha256, &COMMITTED_INDEX_DIGEST);
         assert_eq!(marker.recovery_base_assignment_version, 7);
         assert_eq!(marker.recovery_base_assignment_sha256, &ASSIGNMENT_7);
         assert_eq!(marker.topology_sha256, &TOPOLOGY);

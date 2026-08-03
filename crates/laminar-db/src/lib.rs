@@ -70,12 +70,9 @@ pub mod checkpoint_coordinator;
 /// Bounded process-local evidence for cluster checkpoint barrier pauses.
 #[cfg(feature = "cluster")]
 pub mod checkpoint_timing;
-#[cfg(feature = "cluster")]
-mod cluster_recovery_capsule;
 mod config;
 mod connector_manager;
 mod connector_task_fence;
-mod coordinated_committer;
 #[cfg(feature = "cluster")]
 mod coordinated_recovery;
 mod core_window_state;
@@ -125,14 +122,9 @@ mod sql_analysis;
 mod sql_utils;
 /// External named-subscription substrate: byte-bounded shared logs and cursor portals.
 pub mod subscription;
-mod table_backend;
 mod table_provider;
+mod table_rows;
 mod table_store;
-mod vnode_partial;
-#[cfg(any(feature = "cluster", test))]
-mod vnode_restore_input;
-#[cfg(any(feature = "cluster", test))]
-mod vnode_restore_lineage;
 #[cfg(feature = "cluster")]
 mod vnode_transition_staging;
 
@@ -175,7 +167,7 @@ pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use profile::{Profile, ProfileError};
 pub use recovery_manager::{RecoveredState, RecoveryManager};
 
-/// Rebalance-driven state-rehydration types (cluster mode).
+/// Cluster assignment lifecycle results.
 #[cfg(feature = "cluster")]
 pub use db::{ClusterStartupDisposition, SnapshotAdoption};
 

@@ -47,7 +47,7 @@ const WRITER_BOOT_UUID_OFFSET: usize = 152;
 const DURABLE_PROCESS_TERM_OFFSET: usize = 168;
 const RECOVERY_EPOCH_OFFSET: usize = 176;
 const RECOVERY_CHECKPOINT_ID_OFFSET: usize = 184;
-const CAPSULE_SHA256_OFFSET: usize = 192;
+const COMMITTED_INDEX_SHA256_OFFSET: usize = 192;
 const RECOVERY_BASE_ASSIGNMENT_VERSION_OFFSET: usize = 224;
 const RECOVERY_BASE_ASSIGNMENT_SHA256_OFFSET: usize = 232;
 const TOPOLOGY_SHA256_OFFSET: usize = 264;
@@ -128,7 +128,7 @@ pub struct MarkerRef<'a> {
     pub durable_process_term: u64,
     pub recovery_epoch: u64,
     pub recovery_checkpoint_id: u64,
-    pub capsule_sha256: &'a [u8; 32],
+    pub committed_index_sha256: &'a [u8; 32],
     pub recovery_base_assignment_version: u64,
     pub recovery_base_assignment_sha256: &'a [u8; 32],
     pub topology_sha256: &'a [u8; 32],
@@ -333,7 +333,11 @@ pub fn encode_marker_into(
         RECOVERY_CHECKPOINT_ID_OFFSET,
         &marker.recovery_checkpoint_id.to_be_bytes(),
     );
-    copy_body(output, CAPSULE_SHA256_OFFSET, marker.capsule_sha256);
+    copy_body(
+        output,
+        COMMITTED_INDEX_SHA256_OFFSET,
+        marker.committed_index_sha256,
+    );
     copy_body(
         output,
         RECOVERY_BASE_ASSIGNMENT_VERSION_OFFSET,
@@ -381,7 +385,7 @@ pub fn decode_marker(bytes: &[u8]) -> Result<MarkerRef<'_>, WireError> {
     let durable_process_term = u64_at(body, DURABLE_PROCESS_TERM_OFFSET)?;
     let recovery_epoch = u64_at(body, RECOVERY_EPOCH_OFFSET)?;
     let recovery_checkpoint_id = u64_at(body, RECOVERY_CHECKPOINT_ID_OFFSET)?;
-    let capsule_sha256 = array_at::<32>(body, CAPSULE_SHA256_OFFSET)?;
+    let committed_index_sha256 = array_at::<32>(body, COMMITTED_INDEX_SHA256_OFFSET)?;
     let recovery_base_assignment_version = u64_at(body, RECOVERY_BASE_ASSIGNMENT_VERSION_OFFSET)?;
     let recovery_base_assignment_sha256 =
         array_at::<32>(body, RECOVERY_BASE_ASSIGNMENT_SHA256_OFFSET)?;
@@ -429,7 +433,7 @@ pub fn decode_marker(bytes: &[u8]) -> Result<MarkerRef<'_>, WireError> {
     if recovery_checkpoint_id != recovery_epoch {
         return Err(WireError::InvalidField("recovery_checkpoint_id"));
     }
-    require_nonzero(capsule_sha256, "capsule_sha256")?;
+    require_nonzero(committed_index_sha256, "committed_index_sha256")?;
     require_nonzero_u64(
         recovery_base_assignment_version,
         "recovery_base_assignment_version",
@@ -473,7 +477,7 @@ pub fn decode_marker(bytes: &[u8]) -> Result<MarkerRef<'_>, WireError> {
         durable_process_term,
         recovery_epoch,
         recovery_checkpoint_id,
-        capsule_sha256,
+        committed_index_sha256,
         recovery_base_assignment_version,
         recovery_base_assignment_sha256,
         topology_sha256,
@@ -553,7 +557,7 @@ fn validate_marker(marker: &MarkerRef<'_>) -> Result<(), WireError> {
     if marker.recovery_checkpoint_id != marker.recovery_epoch {
         return Err(WireError::InvalidField("recovery_checkpoint_id"));
     }
-    require_nonzero(marker.capsule_sha256, "capsule_sha256")?;
+    require_nonzero(marker.committed_index_sha256, "committed_index_sha256")?;
     require_nonzero_u64(
         marker.recovery_base_assignment_version,
         "recovery_base_assignment_version",
@@ -752,7 +756,7 @@ mod tests {
     const PIPELINE_DIGEST: [u8; 32] = [0x44; 32];
     const ASSIGNMENT_DIGEST: [u8; 32] = [0x55; 32];
     const WRITER_BOOT: [u8; 16] = [0x66; 16];
-    const CAPSULE_DIGEST: [u8; 32] = [0x77; 32];
+    const COMMITTED_INDEX_DIGEST: [u8; 32] = [0x77; 32];
     const BASE_ASSIGNMENT_DIGEST: [u8; 32] = [0x88; 32];
     const TOPOLOGY_DIGEST: [u8; 32] = [0x99; 32];
     const FOUR_VNODES: [u8; 1] = [0x0f];
@@ -812,7 +816,7 @@ mod tests {
             durable_process_term: 0x2122_2324_2526_2728,
             recovery_epoch: 0x3132_3334_3536_3738,
             recovery_checkpoint_id: 0x3132_3334_3536_3738,
-            capsule_sha256: &CAPSULE_DIGEST,
+            committed_index_sha256: &COMMITTED_INDEX_DIGEST,
             recovery_base_assignment_version: 0x5152_5354_5556_5758,
             recovery_base_assignment_sha256: &BASE_ASSIGNMENT_DIGEST,
             topology_sha256: &TOPOLOGY_DIGEST,
@@ -1008,7 +1012,7 @@ mod tests {
             (DURABLE_PROCESS_TERM_OFFSET, 8),
             (RECOVERY_EPOCH_OFFSET, 8),
             (RECOVERY_CHECKPOINT_ID_OFFSET, 8),
-            (CAPSULE_SHA256_OFFSET, 32),
+            (COMMITTED_INDEX_SHA256_OFFSET, 32),
             (RECOVERY_BASE_ASSIGNMENT_VERSION_OFFSET, 8),
             (RECOVERY_BASE_ASSIGNMENT_SHA256_OFFSET, 32),
             (TOPOLOGY_SHA256_OFFSET, 32),

@@ -28,7 +28,8 @@ use laminar_connectors::connector::{
 use laminar_connectors::kafka::testing::partition_vnodes;
 use laminar_connectors::kafka::{KafkaSource, KafkaSourceConfig, StartupMode, TopicSubscription};
 use laminar_core::checkpoint::AssignmentDrainId;
-use laminar_core::state::{CheckpointAttempt, NodeId, VnodeRegistry};
+use laminar_core::checkpoint::CheckpointAttempt;
+use laminar_core::state::{NodeId, VnodeRegistry};
 
 const DEFAULT_BROKERS: &str = "127.0.0.1:19092";
 

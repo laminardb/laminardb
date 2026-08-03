@@ -18,11 +18,13 @@ use crate::connector_manager::{
     SourceRegistration, StreamRegistration, TableRegistration,
 };
 use crate::error::DbError;
-use laminar_core::storage::checkpoint_manifest::{PipelineIdentity, PIPELINE_IDENTITY_VERSION};
+use laminar_core::checkpoint::checkpoint_manifest::{PipelineIdentity, PIPELINE_IDENTITY_VERSION};
 
 /// Recovery-state serialization contract. Bump when persisted operator/vnode bytes become
 /// incompatible even if the logical pipeline is unchanged.
-const STATE_ABI_VERSION: u32 = crate::operator_graph::GRAPH_CHECKPOINT_VERSION;
+const STATE_ABI_VERSION: u32 = crate::operator_graph::STATE_FRAME_ABI_VERSION;
+const STATE_LAYOUT: &str = "vnode";
+
 #[derive(Serialize)]
 struct CanonicalPipeline {
     canonical_version: u16,
@@ -132,7 +134,6 @@ pub(crate) struct PipelineIdentityContext<'a> {
     connector_registry: &'a ConnectorRegistry,
     registrations: PipelineRegistrations<'a>,
     vnode_count: u16,
-    clustered: bool,
 }
 
 impl<'a> PipelineIdentityContext<'a> {
@@ -143,7 +144,6 @@ impl<'a> PipelineIdentityContext<'a> {
         connector_registry: &'a ConnectorRegistry,
         registrations: PipelineRegistrations<'a>,
         vnode_count: u16,
-        clustered: bool,
     ) -> Self {
         Self {
             config,
@@ -151,18 +151,17 @@ impl<'a> PipelineIdentityContext<'a> {
             connector_registry,
             registrations,
             vnode_count,
-            clustered,
         }
     }
 }
 
-/// Compute the checkpoint compatibility identity before recovery starts.
+/// Compute the exact checkpoint recovery identity.
 pub(crate) fn compute(context: &PipelineIdentityContext<'_>) -> Result<PipelineIdentity, DbError> {
     let payload = CanonicalPipeline {
         canonical_version: PIPELINE_IDENTITY_VERSION,
         state_abi_version: STATE_ABI_VERSION,
         partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
-        state_layout: state_layout(context.clustered),
+        state_layout: STATE_LAYOUT,
         vnode_count: context.vnode_count,
         delivery_guarantee: context.config.delivery_guarantee.to_string(),
         sources: canonical_sources(
@@ -181,14 +180,6 @@ pub(crate) fn compute(context: &PipelineIdentityContext<'_>) -> Result<PipelineI
         canonical_version: PIPELINE_IDENTITY_VERSION,
         sha256: format!("{digest:x}"),
     })
-}
-
-const fn state_layout(clustered: bool) -> &'static str {
-    if clustered {
-        "partitioned-vnode"
-    } else {
-        "local"
-    }
 }
 
 fn canonical_sources(
@@ -421,7 +412,7 @@ mod tests {
             canonical_version: PIPELINE_IDENTITY_VERSION,
             state_abi_version: STATE_ABI_VERSION,
             partitioning_abi_version,
-            state_layout: "local",
+            state_layout: STATE_LAYOUT,
             vnode_count: 1,
             delivery_guarantee: "best_effort".into(),
             sources: Vec::new(),
@@ -447,7 +438,7 @@ mod tests {
                 canonical_version: PIPELINE_IDENTITY_VERSION,
                 state_abi_version: STATE_ABI_VERSION,
                 partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
-                state_layout: "local",
+                state_layout: STATE_LAYOUT,
                 vnode_count: 1,
                 delivery_guarantee: "at-least-once".into(),
                 sources: vec![CanonicalSource {
@@ -567,7 +558,6 @@ mod tests {
                 &connector_registry,
                 registrations,
                 1,
-                false,
             ))
             .unwrap()
         };

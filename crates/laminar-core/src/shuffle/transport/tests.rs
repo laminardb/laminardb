@@ -5,9 +5,9 @@ use arrow_array::Int64Array;
 use arrow_schema::{DataType, Field, Schema};
 
 use super::*;
+use crate::checkpoint::CheckpointAttempt;
 use crate::checkpoint::{CheckpointAssignmentFence, CheckpointBarrier, CheckpointParticipant};
 use crate::cluster::control::LeaseDeadline;
-use crate::state::CheckpointAttempt;
 use uuid::Uuid;
 
 fn assignment_owners(nodes: &[ShufflePeerId]) -> Vec<ShufflePeerId> {

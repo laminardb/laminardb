@@ -11,11 +11,11 @@ use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
+use crate::checkpoint::CheckpointAttempt;
 use crate::checkpoint::CheckpointWatermark;
 use crate::cluster::discovery::NodeId;
 #[cfg(feature = "cluster")]
 use crate::cluster::discovery::{NodeInfo, NodeState};
-use crate::state::CheckpointAttempt;
 #[cfg(feature = "cluster")]
 use tokio::sync::watch;
 
@@ -196,7 +196,7 @@ const PREPARE_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     /// Align the shuffle, capture state locally, ack. The durable tail
-    /// (sink pre-commit, manifest, uploads) runs after the ack.
+    /// (sink pre-commit, manifest, uploads) completes before the ack.
     Prepare,
     /// Every node has aligned + captured this epoch (full-membership
     /// capture quorum). Pipelines may resume the next epoch; the epoch

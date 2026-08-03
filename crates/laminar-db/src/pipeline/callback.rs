@@ -11,9 +11,9 @@ use arrow_array::RecordBatch;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{SourceConnector, SourcePosition};
+use laminar_core::checkpoint::{CheckpointAttempt, CheckpointAttemptRelation};
 use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 use laminar_core::cluster::control::CheckpointAssignmentFence;
-use laminar_core::state::{CheckpointAttempt, CheckpointAttemptRelation};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 #[cfg(feature = "cluster")]

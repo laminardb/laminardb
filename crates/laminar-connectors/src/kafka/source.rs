@@ -3,7 +3,6 @@
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use laminar_core::checkpoint::CommittedSourceHandoff;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::error::KafkaError;
 use rdkafka::message::Message;
@@ -567,11 +566,10 @@ fn kafka_bootstrap_is_unassigned(
         super::vnode_routing::validate_owner_map(published.owners(), self_id)?;
         return Ok(false);
     }
-    if published.has_committed_handoff()
-        || !published
-            .owners()
-            .iter()
-            .all(laminar_core::state::NodeId::is_unassigned)
+    if !published
+        .owners()
+        .iter()
+        .all(laminar_core::state::NodeId::is_unassigned)
     {
         return Err(ConnectorError::ConfigurationError(
             "Kafka vnode assignment version 0 must be the fully unassigned bootstrap publication"
@@ -822,39 +820,6 @@ async fn resolve_kafka_reader_drain(
         validate_kafka_partition_results("drain target resume", &assignment)?;
     }
     Ok(())
-}
-
-fn decode_committed_kafka_handoff(
-    handoff: &CommittedSourceHandoff,
-    source: &str,
-) -> Result<(OffsetTracker, KafkaPartitionBaselines), ConnectorError> {
-    let source_state = handoff.source(source).ok_or_else(|| {
-        ConnectorError::ConfigurationError(format!(
-            "committed checkpoint {:?} has no handoff state for Kafka source '{source}'",
-            handoff.attempt()
-        ))
-    })?;
-    let checkpoint = source_state.checkpoint();
-    let assignment_version = checkpoint.source_assignment_version.ok_or_else(|| {
-        ConnectorError::ConfigurationError(format!(
-            "Kafka source '{source}' handoff is missing its source assignment version"
-        ))
-    })?;
-    let checkpoint_assignment_version = NonZeroU64::new(handoff.checkpoint_assignment_version())
-        .ok_or_else(|| {
-            ConnectorError::ConfigurationError(format!(
-                "Kafka source '{source}' handoff has a zero checkpoint assignment version"
-            ))
-        })?;
-    if assignment_version != checkpoint_assignment_version {
-        return Err(ConnectorError::ConfigurationError(format!(
-            "Kafka source '{source}' handoff assignment version {assignment_version} does not match checkpoint fence {checkpoint_assignment_version}",
-        )));
-    }
-
-    let offsets = OffsetTracker::try_from_connector_checkpoint(checkpoint)?;
-    let baselines = decode_partition_baselines_from_offsets(&checkpoint.offsets)?;
-    Ok((offsets, baselines))
 }
 
 #[derive(Clone, Default)]
@@ -1436,7 +1401,7 @@ impl KafkaSource {
                         // A source can miss an intermediate self→other→self publication while
                         // fenced (for example consecutive dead-node shedding). The latest owner
                         // set then matches the live Kafka assignment even though the partition
-                        // must be unassigned and re-seeked to the latest durable handoff.
+                        // must be unassigned and re-seeked to its durable checkpoint position.
                         let current_set = match kafka_partition_set(&current) {
                             Ok(current) => current,
                             Err(error) => {
@@ -1475,29 +1440,6 @@ impl KafkaSource {
                         }
 
                         let offsets = lock_or_recover(&reassign_snapshot).clone();
-                        let (resume, resume_baselines) = if let Some(handoff) =
-                            published.committed_source_handoff()
-                        {
-                            match decode_committed_kafka_handoff(handoff, source_name.as_ref()) {
-                                Ok(state) => state,
-                                Err(error) => {
-                                    warn!(
-                                        version,
-                                        source = source_name.as_ref(),
-                                        error = %error,
-                                        "Kafka source rejected durable checkpoint handoff"
-                                    );
-                                    publish_reader_fault(
-                                        &reader_fault,
-                                        &data_ready,
-                                        format!("invalid durable checkpoint handoff: {error}"),
-                                    );
-                                    return;
-                                }
-                            }
-                        } else {
-                            (OffsetTracker::new(), KafkaPartitionBaselines::new())
-                        };
                         let mut to_add = TopicPartitionList::new();
                         let mut acquired_positions = KafkaPartitionBaselines::new();
                         for (topic, partition) in owned_set
@@ -1506,13 +1448,10 @@ impl KafkaSource {
                         {
                             let p = *partition;
                             let offset = if let Some(next) = match acquired_numeric_position(
-                                &resume,
-                                &resume_baselines,
                                 &offsets,
                                 &reassign_baselines,
                                 topic.as_str(),
                                 p,
-                                !require_durable_baselines || !published.has_committed_handoff(),
                             ) {
                                 Ok(position) => position,
                                 Err(error) => {
@@ -1520,12 +1459,12 @@ impl KafkaSource {
                                         topic = topic.as_str(),
                                         partition = p,
                                         %error,
-                                        "Kafka source rejected an invalid handoff position"
+                                    "Kafka source rejected an invalid checkpoint position"
                                     );
                                     publish_reader_fault(
                                         &reader_fault,
                                         &data_ready,
-                                        format!("invalid handoff position: {error}"),
+                                        format!("invalid checkpoint position: {error}"),
                                     );
                                     return;
                                 }
@@ -1569,7 +1508,7 @@ impl KafkaSource {
                                 warn!(
                                     topic = topic.as_str(),
                                     partition = p,
-                                    "acquired partition has no handoff or local offset; \
+                                    "acquired partition has no checkpoint or local offset; \
                                          falling back to the startup default"
                                 );
                                 reassign_default_offset
@@ -1594,7 +1533,7 @@ impl KafkaSource {
 
                         let owned_set = Arc::new(owned_set);
 
-                        // Registry ownership is already committed. Publish the handoff cut before
+                        // Registry ownership is already committed. Publish the assignment cut before
                         // the first await so a concurrent checkpoint cannot resurrect a stale
                         // position from this node's earlier ownership stint.
                         {
@@ -1628,7 +1567,7 @@ impl KafkaSource {
                                     warn!(
                                         version,
                                         %error,
-                                        "Kafka source could not validate acquired handoff positions; rotation will retry"
+                                        "Kafka source could not validate acquired positions; rotation will retry"
                                     );
                                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                                     continue;
@@ -1643,12 +1582,12 @@ impl KafkaSource {
                                 warn!(
                                     version,
                                     %error,
-                                    "Kafka source rejected an expired handoff position"
+                                    "Kafka source rejected an expired checkpoint position"
                                 );
                                 publish_reader_fault(
                                     &reader_fault,
                                     &data_ready,
-                                    format!("expired handoff position: {error}"),
+                                    format!("expired checkpoint position: {error}"),
                                 );
                                 return;
                             }
@@ -2533,20 +2472,13 @@ fn tpl_of<'a>(parts: impl Iterator<Item = &'a (Arc<str>, i32)>) -> TopicPartitio
 /// Partition list for the initial `start()` assignment of a vnode-assigned source.
 /// Owned partitions start at their checkpointed offset + 1, otherwise at
 /// `default_offset`. Rotations rebind incrementally in the reader loop.
-#[derive(Clone, Copy)]
-struct VnodeResumeCursors<'a> {
-    local_offsets: &'a OffsetTracker,
-    handoff_offsets: &'a OffsetTracker,
-    local_baselines: &'a KafkaPartitionBaselines,
-    handoff_baselines: &'a KafkaPartitionBaselines,
-}
-
 fn build_vnode_assignment_tpl(
     source_identity: &str,
     assignment: &[laminar_core::state::NodeId],
     self_id: laminar_core::state::NodeId,
     topic_meta: &[(Arc<str>, i32)],
-    cursors: VnodeResumeCursors<'_>,
+    offsets: &OffsetTracker,
+    baselines: &KafkaPartitionBaselines,
     default_offset: rdkafka::Offset,
 ) -> Result<TopicPartitionList, ConnectorError> {
     let mut tpl = TopicPartitionList::new();
@@ -2558,13 +2490,7 @@ fn build_vnode_assignment_tpl(
             assignment,
             self_id,
         )? {
-            let offset = match cursors
-                .local_offsets
-                .get(topic.as_ref(), partition)
-                // No local offset → handed to us in a rotation; fall back to the
-                // previous owner's staged position, not auto.offset.reset.
-                .or_else(|| cursors.handoff_offsets.get(topic.as_ref(), partition))
-            {
+            let offset = match offsets.get(topic.as_ref(), partition) {
                 Some(offset) => {
                     rdkafka::Offset::Offset(offset.checked_add(1).ok_or_else(|| {
                         ConnectorError::ConfigurationError(format!(
@@ -2572,10 +2498,8 @@ fn build_vnode_assignment_tpl(
                         ))
                     })?)
                 }
-                None => cursors
-                    .handoff_baselines
+                None => baselines
                     .get(&(topic.to_string(), partition))
-                    .or_else(|| cursors.local_baselines.get(&(topic.to_string(), partition)))
                     .map_or(default_offset, |next| rdkafka::Offset::Offset(*next)),
             };
             tpl.add_partition_offset(topic.as_ref(), partition, offset)
@@ -2589,42 +2513,23 @@ fn build_vnode_assignment_tpl(
     Ok(tpl)
 }
 
-/// Resolves the numeric next-to-read position for an acquired vnode partition.
-/// Durable handoff state always outranks a stale cursor from this node's prior
-/// ownership stint. Guaranteed delivery never falls back to that local cursor.
+/// Resolves the numeric next-to-read position for an acquired vnode partition from this
+/// process's durable checkpoint state.
 fn acquired_numeric_position(
-    handoff: &OffsetTracker,
-    handoff_baselines: &KafkaPartitionBaselines,
     local: &OffsetTracker,
     local_baselines: &KafkaPartitionBaselines,
     topic: &str,
     partition: i32,
-    allow_local: bool,
 ) -> Result<Option<i64>, ConnectorError> {
-    if let Some(offset) = handoff.get(topic, partition) {
+    if let Some(offset) = local.get(topic, partition) {
         return offset.checked_add(1).map(Some).ok_or_else(|| {
             ConnectorError::ConfigurationError(format!(
-                "Kafka handoff offset overflow for '{topic}-{partition}'"
+                "Kafka local offset overflow for '{topic}-{partition}'"
             ))
         });
     }
-    if let Some(next) = handoff_baselines
-        .get(&(topic.to_string(), partition))
-        .copied()
-    {
-        return Ok(Some(next));
-    }
-    if allow_local {
-        if let Some(offset) = local.get(topic, partition) {
-            return offset.checked_add(1).map(Some).ok_or_else(|| {
-                ConnectorError::ConfigurationError(format!(
-                    "Kafka local offset overflow for '{topic}-{partition}'"
-                ))
-            });
-        }
-        if let Some(next) = local_baselines.get(&(topic.to_string(), partition)) {
-            return Ok(Some(*next));
-        }
+    if let Some(next) = local_baselines.get(&(topic.to_string(), partition)) {
+        return Ok(Some(*next));
     }
     Ok(None)
 }
@@ -3763,10 +3668,6 @@ impl KafkaSource {
                 } else {
                     startup_default_offset(&config.startup_mode)
                 };
-                // start() already loaded committed offsets into self.offsets, so
-                // there are no rotation handoff offsets at initial assignment.
-                let no_resume = OffsetTracker::new();
-                let no_resume_baselines = KafkaPartitionBaselines::new();
                 // Pin the final ownership publication only across synchronous librdkafka calls.
                 // Metadata and watermark I/O above must not delay assignment writers.
                 let published = registry.read_assignment();
@@ -3780,12 +3681,8 @@ impl KafkaSource {
                         published.owners(),
                         self_id,
                         &topic_meta,
-                        VnodeResumeCursors {
-                            local_offsets: &self.offsets,
-                            handoff_offsets: &no_resume,
-                            local_baselines: &self.manual_partition_baselines,
-                            handoff_baselines: &no_resume_baselines,
-                        },
+                        &self.offsets,
+                        &self.manual_partition_baselines,
                         default_offset,
                     )?
                 };

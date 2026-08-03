@@ -957,7 +957,6 @@ impl IntervalJoinState {
         Ok(())
     }
 
-    #[cfg(feature = "cluster")]
     pub(crate) fn validate_vnode(
         &self,
         vnode: u32,

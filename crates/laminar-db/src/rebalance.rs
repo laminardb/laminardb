@@ -25,7 +25,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::db::{LaminarDB, SnapshotAdoption};
+use crate::db::LaminarDB;
 use crate::engine_metrics::EngineMetrics;
 
 /// Tunables for the rebalance control plane.
@@ -75,21 +75,6 @@ impl RebalanceConfig {
             placement_isolation_tier: 0,
         }
     }
-}
-
-/// Log what moved so there's an audit trail of every rebalance-driven state transfer.
-fn log_adoption(source: &str, adoption: &SnapshotAdoption) {
-    if adoption.vnodes_requiring_restore.is_empty() {
-        return;
-    }
-    info!(
-        source,
-        version = adoption.version,
-        vnodes_requiring_restore = adoption.vnodes_requiring_restore.len(),
-        restored_vnode_count = adoption.restored_vnode_count,
-        restore_epoch = ?adoption.restore_epoch,
-        "installed vnode state after rebalance",
-    );
 }
 
 async fn close_local_assignment_authority(
@@ -184,13 +169,12 @@ async fn suspend_local_assignment_authority_locked(
 async fn try_suspend_recovery_assignment_authority(
     db: &Arc<LaminarDB>,
     controller: &ClusterController,
-    registry: &VnodeRegistry,
     deadline: tokio::time::Instant,
 ) -> Result<bool, String> {
     let _adoption = tokio::time::timeout_at(deadline, db.assignment_adoption_lock.lock())
         .await
         .map_err(|_| "timed out serializing recovery assignment suspension".to_string())?;
-    if db.has_unapplied_vnode_transition(registry) {
+    if db.has_unapplied_vnode_transition() {
         return Ok(false);
     }
     suspend_local_assignment_authority_locked(db, Some(controller), deadline).await?;
@@ -363,7 +347,7 @@ impl SnapshotWatcher {
         }
 
         // Serialize the report with assignment adoption and boot staging. A transition publishes
-        // its false report under this same lock before exposing pending/restoring state, so a
+        // its false report under this same lock before exposing pending state, so a
         // delayed watcher can never overwrite that withdrawal with stale readiness.
         let Ok(adoption_guard) =
             tokio::time::timeout_at(head_deadline, self.db.assignment_adoption_lock.lock()).await
@@ -903,7 +887,6 @@ impl SnapshotWatcher {
                         match try_suspend_recovery_assignment_authority(
                             &self.db,
                             controller,
-                            &self.registry,
                             head_deadline,
                         )
                         .await
@@ -963,14 +946,13 @@ impl SnapshotWatcher {
                             .adopt_assignment_snapshot(snap.clone(), head_deadline)
                             .await
                         {
-                            Ok(adoption) => {
+                            Ok(_) => {
                                 self.durable_drain_transition = None;
                                 self.durable_snapshot = Some(snap.clone());
                                 authority_revision = self
                                     .db
                                     .assignment_authority_revision
                                     .load(std::sync::atomic::Ordering::Acquire);
-                                log_adoption("watcher", &adoption);
                             }
                             Err(error) if error.is_shuffle_not_ready() => {
                                 // The local graph still needs the installed predecessor authority
@@ -1718,11 +1700,9 @@ async fn settle_observed_local_drain(
     let target_version = transition.target.assignment_version;
     let local_version = registry.assignment_version();
     if local_version < target_version {
-        let adoption = db
-            .adopt_assignment_snapshot(finalized.clone(), adoption_deadline)
+        db.adopt_assignment_snapshot(finalized.clone(), adoption_deadline)
             .await
             .map_err(|error| error.to_string())?;
-        log_adoption("watcher-drain-resolution", &adoption);
     }
     if registry.assignment_version() != target_version {
         return Err(format!(
@@ -2212,11 +2192,9 @@ async fn materialize_recovery_decision(
     .await
     .map_err(|_| "recovery assignment audit exceeded the materialization deadline".to_string())??;
     let version = durable.version;
-    let adoption = db
-        .adopt_assignment_snapshot(durable, deadline)
+    db.adopt_assignment_snapshot(durable, deadline)
         .await
         .map_err(|error| error.to_string())?;
-    log_adoption("rebalance-recovery", &adoption);
     let oldest_retained = version.saturating_sub(1);
     let maintenance_store = Arc::clone(store);
     let maintenance_authority = Arc::clone(&authority);
@@ -2414,8 +2392,8 @@ fn execute_graceful_rotation_owned(
             .map_err(|error| error.to_string())?;
         let publication_deadline = tokio::time::Instant::now() + config.checkpoint_timeout;
         let rotate_outcome = {
-            // Assignment adoption and startup recovery create pending/restoring vnode work under
-            // this lock. Keep it through the durable CAS so neither can appear after preflight but
+            // Assignment adoption and startup recovery create pending vnode work under this lock.
+            // Keep it through the durable CAS so it cannot appear after preflight but
             // before V+1 is published. The scope must end before conflict adoption or drain
             // finalization, both of which acquire the same lock.
             let _adoption = tokio::time::timeout_at(
@@ -2802,11 +2780,9 @@ fn try_rebalance_owned(
             // that exact live-process generation before planning another rotation. A replacement
             // process must not adopt a retained certificate naming its predecessor incarnation;
             // it proceeds below through the authority-sequenced recovery-successor path.
-            let adoption = db
-                .adopt_assignment_snapshot(current.clone(), head_deadline)
+            db.adopt_assignment_snapshot(current.clone(), head_deadline)
                 .await
                 .map_err(|error| error.to_string())?;
-            log_adoption("rebalance-reconcile", &adoption);
             let reconciled_version = registry.assignment_version();
             if reconciled_version < current.version {
                 return Err(format!(
@@ -3215,11 +3191,9 @@ async fn finalize_drain_snapshot(
     let version = durable.version;
     if assignment_binds_local_process(&durable, controller)? {
         let adoption_deadline = tokio::time::Instant::now() + config.checkpoint_timeout;
-        let adoption = db
-            .adopt_assignment_snapshot(durable, adoption_deadline)
+        db.adopt_assignment_snapshot(durable, adoption_deadline)
             .await
             .map_err(|error| error.to_string())?;
-        log_adoption("rebalance-drain-finalize", &adoption);
         if local_drain_participant(controller, transition).is_some() {
             db.resolve_local_source_drain(
                 transition.id(),
@@ -3325,11 +3299,9 @@ async fn adopt_any(
         db.validate_source_drain_snapshot(&snap)
             .map_err(|error| error.to_string())?;
     } else {
-        let adoption = db
-            .adopt_assignment_snapshot(snap, deadline)
+        db.adopt_assignment_snapshot(snap, deadline)
             .await
             .map_err(|e| e.to_string())?;
-        log_adoption("rebalance-conflict", &adoption);
     }
     Ok(())
 }

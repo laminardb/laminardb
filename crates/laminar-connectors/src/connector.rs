@@ -506,7 +506,7 @@ pub enum SourcePosition {
     /// Resume from an exact durable engine checkpoint.
     Resume {
         /// Checkpoint attempt that owns the connector state.
-        attempt: laminar_core::state::CheckpointAttempt,
+        attempt: laminar_core::checkpoint::CheckpointAttempt,
         /// Connector cursor captured by `attempt`.
         checkpoint: SourceCheckpoint,
     },
@@ -921,7 +921,7 @@ pub trait SinkConnector: Send {
     ///
     /// # Errors
     /// Returns `ConfigurationError` if the sink exposes a coordinated committer
-    /// yet relies on this default — it would seal epochs with no external commit.
+    /// yet relies on this default — it would finalize epochs with no external commit.
     async fn pre_commit(&mut self, _epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
         if self.as_coordinated_committer().is_some() {
             return Err(ConnectorError::ConfigurationError(
@@ -1070,8 +1070,8 @@ pub struct CoordinatedCommitCursor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatedCommitPayload {
     /// Exact checkpoint attempt that admitted this marker.
-    pub attempt: laminar_core::state::CheckpointAttempt,
-    /// Stable runtime participant id (`0` in local modes).
+    pub attempt: laminar_core::checkpoint::CheckpointAttempt,
+    /// Stable nonzero runtime participant ID.
     pub participant_id: u64,
     /// Connector-specific committable, or `None` for an explicitly empty cut.
     pub payload: Option<Vec<u8>>,
@@ -1089,8 +1089,8 @@ pub struct CoordinatedCommitBatch {
     /// Non-zero authority token that the external commit must persist atomically.
     pub fencing_token: u64,
     /// Highest exact attempt atomically covered by this commit.
-    pub target: laminar_core::state::CheckpointAttempt,
-    /// Every sealed participant marker through `target`, including empty ones.
+    pub target: laminar_core::checkpoint::CheckpointAttempt,
+    /// Every prepared participant marker through `target`, including empty ones.
     pub entries: Vec<CoordinatedCommitPayload>,
 }
 
@@ -1174,7 +1174,7 @@ impl CoordinatedCommitBatch {
     /// # Errors
     /// Returns a diagnostic when the batch is malformed or exceeds a fixed bound.
     pub fn validate_shape(&self) -> Result<(), String> {
-        use laminar_core::state::CheckpointAttemptRelation;
+        use laminar_core::checkpoint::CheckpointAttemptRelation;
 
         if !self.target.is_canonical() {
             return Err(
@@ -1184,10 +1184,10 @@ impl CoordinatedCommitBatch {
         if let Some(entry) = self
             .entries
             .iter()
-            .find(|entry| !entry.attempt.is_canonical())
+            .find(|entry| entry.participant_id == 0 || !entry.attempt.is_canonical())
         {
             return Err(format!(
-                "coordinated batch entry for participant {} must use one nonzero canonical checkpoint ID",
+                "coordinated batch entry must use a nonzero participant and canonical checkpoint ID; got participant {}",
                 entry.participant_id
             ));
         }
@@ -1521,7 +1521,7 @@ mod tests {
 
     #[test]
     fn source_start_rejects_split_and_zero_resume_before_connector_start() {
-        use laminar_core::state::CheckpointAttempt;
+        use laminar_core::checkpoint::CheckpointAttempt;
 
         for attempt in [CheckpointAttempt::new(7, 8), CheckpointAttempt::new(0, 0)] {
             let error = SourceStart::new(
@@ -1569,7 +1569,7 @@ mod tests {
 
     #[test]
     fn coordinated_namespace_is_bounded_stable_and_sink_scoped() {
-        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
         const DEPLOYMENT: &str = "018f0000-0000-7000-8000-000000000001";
 
         let first =
@@ -1602,7 +1602,7 @@ mod tests {
     fn coordinated_namespace_rejects_ambiguous_identity() {
         const DEPLOYMENT: &str = "018f0000-0000-7000-8000-000000000001";
 
-        use laminar_core::storage::checkpoint_manifest::{
+        use laminar_core::checkpoint::checkpoint_manifest::{
             PipelineIdentity, PIPELINE_IDENTITY_VERSION,
         };
         let malformed = PipelineIdentity {
@@ -1623,8 +1623,8 @@ mod tests {
 
     #[test]
     fn coordinated_batch_fingerprint_covers_the_exact_ordered_cut() {
-        use laminar_core::state::CheckpointAttempt;
-        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::CheckpointAttempt;
 
         let namespace = CoordinatedCommitNamespace::try_new(
             PipelineIdentity::empty(),
@@ -1684,8 +1684,8 @@ mod tests {
     }
 
     fn valid_coordinated_batch() -> CoordinatedCommitBatch {
-        use laminar_core::state::CheckpointAttempt;
-        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::CheckpointAttempt;
 
         let target = CheckpointAttempt::canonical(102);
         CoordinatedCommitBatch {
@@ -1703,7 +1703,7 @@ mod tests {
             target,
             entries: vec![CoordinatedCommitPayload {
                 attempt: target,
-                participant_id: 0,
+                participant_id: 1,
                 payload: None,
             }],
         }
@@ -1711,7 +1711,7 @@ mod tests {
 
     #[test]
     fn coordinated_batch_rejects_noncanonical_target_before_other_shape_checks() {
-        use laminar_core::state::CheckpointAttempt;
+        use laminar_core::checkpoint::CheckpointAttempt;
 
         for target in [
             CheckpointAttempt::new(102, 103),
@@ -1729,7 +1729,7 @@ mod tests {
 
     #[test]
     fn coordinated_batch_rejects_noncanonical_entry_before_other_shape_checks() {
-        use laminar_core::state::CheckpointAttempt;
+        use laminar_core::checkpoint::CheckpointAttempt;
 
         for attempt in [
             CheckpointAttempt::new(101, 102),
@@ -1739,18 +1739,22 @@ mod tests {
             batch.entries[0].attempt = attempt;
             let error = batch.validate_shape().unwrap_err();
             assert!(
-                error.contains(
-                    "entry for participant 0 must use one nonzero canonical checkpoint ID"
-                ),
+                error.contains("canonical checkpoint ID"),
                 "unexpected validation error: {error}"
             );
         }
+        let mut batch = valid_coordinated_batch();
+        batch.entries[0].participant_id = 0;
+        assert!(batch
+            .validate_shape()
+            .unwrap_err()
+            .contains("nonzero participant"));
     }
 
     #[test]
     fn coordinated_batch_rejects_cursor_rollback_and_unproven_overlap() {
-        use laminar_core::state::CheckpointAttempt;
-        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::CheckpointAttempt;
 
         let first = CheckpointAttempt::canonical(108);
         let target = CheckpointAttempt::canonical(110);
@@ -1770,12 +1774,12 @@ mod tests {
             entries: vec![
                 CoordinatedCommitPayload {
                     attempt: first,
-                    participant_id: 0,
+                    participant_id: 1,
                     payload: None,
                 },
                 CoordinatedCommitPayload {
                     attempt: target,
-                    participant_id: 0,
+                    participant_id: 1,
                     payload: None,
                 },
             ],
@@ -1799,8 +1803,8 @@ mod tests {
 
     #[test]
     fn coordinated_batch_requires_unique_canonical_attempt_participants() {
-        use laminar_core::state::CheckpointAttempt;
-        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::CheckpointAttempt;
 
         let namespace = CoordinatedCommitNamespace::try_new(
             PipelineIdentity::empty(),
@@ -1825,32 +1829,32 @@ mod tests {
             payload: None,
         };
 
-        let duplicate = batch(vec![payload(target, 0), payload(target, 0)]);
+        let duplicate = batch(vec![payload(target, 1), payload(target, 1)]);
         assert!(duplicate
             .validate_shape()
             .unwrap_err()
             .contains("duplicate"));
 
-        let out_of_order = batch(vec![payload(target, 1), payload(target, 0)]);
+        let out_of_order = batch(vec![payload(target, 2), payload(target, 1)]);
         assert!(out_of_order
             .validate_shape()
             .unwrap_err()
             .contains("out-of-order"));
 
         let noncanonical = batch(vec![
-            payload(CheckpointAttempt::new(3, 101), 0),
-            payload(target, 0),
+            payload(CheckpointAttempt::new(3, 101), 1),
+            payload(target, 2),
         ]);
         assert!(noncanonical
             .validate_shape()
             .unwrap_err()
-            .contains("one nonzero canonical checkpoint ID"));
+            .contains("canonical checkpoint ID"));
     }
 
     #[test]
     fn coordinated_batch_entry_limit_accepts_max_and_rejects_max_plus_one() {
-        use laminar_core::state::CheckpointAttempt;
-        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::CheckpointAttempt;
 
         let namespace = CoordinatedCommitNamespace::try_new(
             PipelineIdentity::empty(),
@@ -1867,7 +1871,7 @@ mod tests {
             },
             fencing_token: 1,
             target,
-            entries: (0..count)
+            entries: (1..=count)
                 .map(|participant_id| CoordinatedCommitPayload {
                     attempt: target,
                     participant_id: participant_id as u64,

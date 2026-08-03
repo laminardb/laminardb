@@ -1,82 +1,74 @@
 # Distributed state
 
 - **Status date:** 2026-08-03
-- **Decision:** accepted
-- **Implementation:** coordinator cutover in progress
-- **Production validation:** pending the full soak matrix
+- **Checkpoint core:** implemented
+- **Cluster state matrix:** incomplete and fail-closed
+- **Production validation:** pending the final soak matrix
 
-## Current implementation
+## State and durability
 
-Operator working state is in memory, and the public state-backend selector has been removed. The
-standalone server derives its temporary checkpoint-artifact backend from the single checkpoint URL.
-Aggregate and window hot maps use FxHashMap where their current layouts permit it.
+All deployment tiers use the same in-memory state machinery. Keyed aggregates and supported
+interval joins use concrete per-vnode maps; embedded and single-node runtimes own every vnode,
+while clusters spread those vnodes across nodes. There is no state-backend trait, embedded state
+database, local durable state, spill tier, or compatibility path.
 
-The coordinator still writes the version 6 manifest, operator sidecars, and legacy per-vnode
-StateBackend artifacts. Some operator layouts and local/cluster paths are not yet unified. Those
-are migration code, not the production target. No release should claim the target checkpoint shape
-or production readiness until that code is deleted and the final soaks pass.
+The only durable recovery authority is an immutable committed checkpoint plus replayable source
+offsets. Each participant writes one node-data object per checkpoint. The manifest records exact
+byte ranges and SHA-256 digests for complete dirty-vnode frames and directly references unchanged
+frames in older objects. The node-data object is created first; the immutable manifest is created
+last as the participant-readiness marker. PUT count therefore scales with participant count, not
+vnode count.
 
-## Settled target contract
+The committed index binds the deployment, pipeline ABI, checkpoint attempt, participant manifests,
+source offsets, per-channel watermarks and idle flags, assignment fence, and predecessor index.
+Recovery selects that exact index, verifies each manifest and range, restores only the local
+participant frames, then replays sources from the committed offsets. It never scans checkpoint
+objects to infer state references.
 
-Every deployment uses the same state machinery and defaults to 256 stable vnodes. Embedded and
-single-node runtimes are one node owning every configured vnode and use local shuffle channels. A
-cluster runs the same operators with vnodes spread across nodes and remote shuffles only when
-ownership crosses a node boundary.
+Retention follows explicit predecessor references, and manifests bind referenced chunks to
+validated frame counts. The live prefix is bounded, but garbage collection currently walks the
+committed-index chain to genesis to enumerate every expired cut. It computes live chunks from
+retained manifests, deletes only expired node objects absent from that live set, then removes
+expired manifests. It does not use object-store LIST to discover liveness.
 
-Vnodes are the unit of ownership, routing, checkpointing, restore, and rescale for joins,
-aggregations, windows, sessions, timers, temporal history, and materialized views. Authoritative
-working state is a concrete per-vnode FxHashMap; there is no hot-state trait, local state database,
-spill tier, or runtime backend selector.
+Checkpoint storage is provider-neutral through the `object_store` crate. Configuration selects
+local filesystem, S3 (including R2/MinIO through S3 endpoint options), GCS, or Azure Blob by URL.
+LaminarDB does not add provider-specific retry, multipart, backoff, or CAS code. Startup probes the
+conditional-write primitive required by checkpoint publication and fails closed when the store
+cannot prove it.
 
-A checkpoint contains window panes and open windows, session intervals, aggregation accumulators,
-join buffers and retained ASOF history, per-channel watermarks and idle flags, timers, source
-offsets, and connector recovery metadata.
-
-Each node writes one immutable data object per checkpoint. Dirty-vnode frames are concatenated and
-the manifest records their byte ranges and digests, so restore reads only assigned vnodes and PUT
-count scales with nodes rather than vnode count. Committed manifests carry explicit chunk reference
-counts for direct garbage collection; listing is never used to infer live references.
-
-Checkpoint storage is selected by URL and built through the object_store crate. The target path
-supports local files, S3 and S3-compatible R2/MinIO, GCS, and Azure Blob. Provider retry, backoff,
-multipart, and conditional-write behavior remain in object_store. Manifest publication uses a
-conditional put, and startup must fail unless a bounded capability probe proves the required Create
-or Update semantics.
-
-Recovery restores the latest committed checkpoint, then replays each source from offsets in that
-checkpoint. ALO and EO share operator state; their difference is the source, checkpoint-publication,
-and sink-commit contract.
+ALO and EO use identical operator state. Their difference is the admitted source replay and sink
+commit contract; checkpoint-committable sinks publish only after the committed index is durable.
 
 ## Current capability boundary
 
-The distributed join currently admits INNER, LEFT, RIGHT, FULL, LEFT/RIGHT SEMI, and LEFT/RIGHT
-ANTI over its supported bounded append-only shape. Mutable relation state, resumable hot-key
-fanout, temporal joins, cluster windows, and materialized views remain gaps.
+The runtime checkpoints aggregate accumulators, window/session state, bounded stream-join buffers,
+timers, channel progress, source offsets, reference-table history, and materialized-view images.
+Keyed aggregation and supported stream joins route by stable vnode in local and cluster execution.
+Reference-table and materialized-view images remain whole-node frames; cluster plans requiring
+them fail closed until they have assignment-fenced vnode ownership and restore.
 
-Cluster EO remains connector-gated. Exact-certified Kafka input with coordinated direct S3/S3A
-Delta publication is the admitted cluster composition. Kafka and Iceberg sinks remain ALO; other
-EO combinations fail before connector I/O. Single-node replay-capable delivery currently requires
-the fenced local filesystem checkpoint path; remote single-node writer fencing is not yet admitted.
+The following remain production gaps, not alternate state implementations:
 
-## Remaining cutover
+- Assignment changes that acquire a vnode fail closed until direct v7 range transfer and
+  assignment-fenced installation are complete. Revoke-only changes remain supported.
+- Failed or aborted prepared checkpoint objects are not yet reclaimed.
+- Local outcome selection still uses object listing, and retention metadata traversal is not yet
+  bounded by a durable head/floor.
+- Checkpoint capture still performs state-sized snapshot work synchronously; its tail latency is
+  not certified.
+- Mutable update/merge joins, materialized-view joins, unbounded retention policy, and the complete
+  cluster window/MV matrix still need planner/runtime certification.
+- Cluster EO remains connector-gated; unsupported source/sink compositions are rejected before I/O.
+- Production readiness remains unclaimed until correctness, recovery, skew, and latency gates pass.
 
-1. Atomically replace the legacy manifest writer and reader with one node object, vnode byte ranges,
-   complete vnode frames, per-channel event-time state, and direct range restore.
-2. Add manifest-led refcount GC, then delete LIST-based artifact GC, StateBackend, its
-   implementations, configuration type, integration tests, and builder plumbing.
-3. Finish the remaining operator and local/cluster topology migrations without alternate state
-   machinery.
-4. Add term-fenced remote single-node checkpoint publication without a second state path.
-5. Run deterministic correction oracles and the single-node/cluster × ALO/EO Zipfian fault and
-   latency soak matrix.
+## Validation gate
 
-## Evidence gate
-
-Production certification requires real-connector validity soaks for single-node ALO, single-node
-EO, three-node cluster ALO, and three-node cluster EO. Each run uses two Kafka inputs, Zipfian keys,
-process kills and recovery, an independent output oracle, checkpoint-progress checks, and explicit
-latency gates. ALO may duplicate replayed output but may not lose admitted records or invent
-results. EO may neither lose nor duplicate externally visible output.
+Final certification requires real-connector soaks for single-node ALO, single-node EO, three-node
+cluster ALO, and three-node cluster EO. The matrix uses two replayable inputs, Zipfian keys,
+checkpoint/restart and process-kill faults, an independent result oracle, checkpoint-progress
+checks, memory bounds, and explicit p50/p95/p99 latency gates. ALO may replay output but may not lose
+admitted records or invent results. EO may neither lose nor duplicate externally visible output.
 
 [ADR-008](architecture-decisions/ADR-008-managed-vnode-keyed-state.md) records the decision and its
 research basis.

@@ -1692,8 +1692,7 @@ impl CoordinatedCommitter for QueueCommitDeadlineSink {
 #[tokio::test(start_paused = true)]
 async fn queued_coordinated_commit_receives_only_its_remaining_budget() {
     use laminar_connectors::connector::{CoordinatedCommitNamespace, CoordinatedCommitPayload};
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::{CheckpointAttempt, PipelineIdentity};
 
     let write_started = Arc::new(AtomicBool::new(false));
     let write_gate = Arc::new(tokio::sync::Notify::new());

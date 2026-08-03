@@ -2,8 +2,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use laminar_connectors::connector::DeliveryGuarantee;
-use laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase;
-use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
 
 fn exact_builder_for_checkpoint(
     checkpoint_dir: &std::path::Path,
@@ -73,11 +71,11 @@ async fn second_local_exact_process_cannot_share_checkpoint_namespace() {
 #[tokio::test]
 async fn startup_uses_one_checkpoint_state_budget_for_admission_and_storage() {
     let root = tempfile::tempdir().unwrap();
-    let max_staged_bytes = 29;
+    let max_node_data_bytes = 29;
     let db = crate::db::LaminarDB::builder()
         .storage_dir(root.path())
         .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
-            max_staged_bytes: Some(max_staged_bytes),
+            max_node_data_bytes: Some(max_node_data_bytes),
             ..Default::default()
         })
         .build()
@@ -90,62 +88,16 @@ async fn startup_uses_one_checkpoint_state_budget_for_admission_and_storage() {
         let coordinator = coordinator
             .as_ref()
             .expect("checkpoint configuration must install a coordinator");
-        assert_eq!(coordinator.config().max_staged_bytes, max_staged_bytes);
-        assert_eq!(coordinator.store().max_state_data_bytes(), max_staged_bytes);
+        assert_eq!(
+            coordinator.config().max_node_data_bytes,
+            max_node_data_bytes
+        );
+        assert_eq!(
+            coordinator.store().max_node_data_bytes(),
+            max_node_data_bytes
+        );
     }
     db.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn local_startup_settles_prepared_witness_before_reconciliation() {
-    let root = tempfile::tempdir().unwrap();
-    let checkpoint_dir = root.path().join("checkpoints");
-    let first = exact_db(root.path()).await;
-    install_generator_pipeline(&first).await;
-    first.start().await.unwrap();
-    wait_for_processing_cycle(&first).await;
-    let committed = first.checkpoint().await.unwrap();
-    assert!(committed.success, "{:?}", committed.error);
-    first.shutdown().await.unwrap();
-
-    // Retain committed N and model a crash after a distinct N+1 Prepared manifest became
-    // durable but before its create-once terminal outcome became visible.
-    let manifest_store = FileSystemCheckpointStore::new(&checkpoint_dir);
-    let committed_manifest = manifest_store
-        .load_by_id(committed.checkpoint_id)
-        .await
-        .unwrap()
-        .unwrap();
-    let prepared_id = committed.checkpoint_id + 1;
-    let prepared_epoch = committed.epoch + 1;
-    let mut prepared = committed_manifest.clone();
-    prepared.checkpoint_id = prepared_id;
-    prepared.epoch = prepared_epoch;
-    prepared.durable_phase = DurableCheckpointPhase::Prepared;
-    manifest_store.save(&prepared).await.unwrap();
-
-    let restarted = exact_db(root.path()).await;
-    install_generator_pipeline(&restarted).await;
-    restarted
-        .start()
-        .await
-        .expect("startup recovery must settle the Prepared witness before reconciliation");
-
-    let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::local_filesystem(
-        &checkpoint_dir,
-    )
-    .unwrap();
-    let winner = decisions
-        .outcome(prepared_epoch)
-        .await
-        .unwrap()
-        .expect("recovery must publish a terminal winner");
-    assert_eq!(winner.checkpoint_id, prepared_id);
-    assert_eq!(
-        winner.verdict,
-        laminar_core::checkpoint_decision::CheckpointVerdict::Abort
-    );
-    restarted.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -249,8 +201,10 @@ async fn local_exact_file_url_uses_the_durable_locked_namespace() {
     let checkpoint = first.checkpoint().await.unwrap();
     assert!(checkpoint.success, "{:?}", checkpoint.error);
     assert!(object_root
+        .join("nodes")
+        .join("1")
         .join("checkpoints")
-        .join(format!("checkpoint_{:06}", checkpoint.checkpoint_id))
+        .join(format!("{:020}", checkpoint.checkpoint_id))
         .join("manifest.json")
         .is_file());
     let error = second

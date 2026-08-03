@@ -9,12 +9,12 @@ use laminar_core::streaming::{BackpressureStrategy, StreamCheckpointConfig};
 
 /// Default pipeline-wide lower-bound charge allowed for managed operator working state.
 ///
-/// This execution budget is independent of checkpoint storage and any future local-state backend.
+/// This execution budget is independent of checkpoint storage.
 pub const DEFAULT_MAX_MANAGED_STATE_BYTES: usize = 256 * 1024 * 1024;
 
 /// Default pre-encoding work charge allowed for one retractable MIN/MAX checkpoint capture.
 ///
-/// This limit is independent of checkpoint storage and any present or future local-state backend.
+/// This limit is independent of checkpoint storage.
 /// It is a cached accumulator work proxy, not an encoded-payload or process-RSS limit.
 pub const DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES: usize = 1024 * 1024;
 

@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::checkpoint::{
     probe_object_store_conditional_update, AssignmentDrainId, AssignmentDrainTransition,
-    CheckpointAssignmentFence, CheckpointStoreError, ClusterRecoveryCapsule, LeaderProof,
-    LeaderProofOwner, RecoveryCapsuleRef, MAX_CHECKPOINT_PARTICIPANTS,
+    CheckpointAssignmentFence, CheckpointStoreError, CommittedCheckpointIndex,
+    CommittedCheckpointRef, LeaderProof, LeaderProofOwner, MAX_CHECKPOINT_PARTICIPANTS,
 };
 use crate::checkpoint_decision::{
     CheckpointDecisionStore, CheckpointOutcome, CheckpointScope, CheckpointVerdict, DecisionError,
@@ -388,7 +388,7 @@ struct OutcomeLink {
 
 impl OutcomeLink {
     fn validate(self) -> Result<(), LeaseError> {
-        let attempt = crate::state::CheckpointAttempt::new(self.epoch, self.checkpoint_id);
+        let attempt = crate::checkpoint::CheckpointAttempt::new(self.epoch, self.checkpoint_id);
         if self.sequence == 0 || !attempt.is_canonical() {
             return Err(LeaseError::Invalid(
                 "checkpoint outcome link requires a nonzero authority sequence and one canonical checkpoint ID"
@@ -3902,8 +3902,8 @@ impl LeaderLeaseStore {
     /// same create-only object. An identical retry converges on the durable winner.
     ///
     /// # Errors
-    /// Fails closed for a stale proof, non-monotonic or conflicting outcome, malformed recovery
-    /// capsule, or object-store failure.
+    /// Fails closed for a stale proof, non-monotonic or conflicting outcome, malformed committed
+    /// checkpoint index, or object-store failure.
     pub async fn record_cluster_outcome(
         &self,
         proof: &LeaderProof,
@@ -3911,12 +3911,12 @@ impl LeaderLeaseStore {
         checkpoint_id: u64,
         assignment_fence: CheckpointAssignmentFence,
         verdict: CheckpointVerdict,
-        recovery_capsule: Option<RecoveryCapsuleRef>,
+        committed_checkpoint: Option<CommittedCheckpointRef>,
     ) -> Result<RecordOutcomeResult, ClusterCheckpointAuthorityError> {
         if !proof.is_canonical() {
             return Err(ClusterCheckpointAuthorityError::Fenced);
         }
-        let attempt = crate::state::CheckpointAttempt::new(epoch, checkpoint_id);
+        let attempt = crate::checkpoint::CheckpointAttempt::new(epoch, checkpoint_id);
         if !attempt.is_canonical() {
             return Err(DecisionError::Conflict(
                 "cluster checkpoint outcomes require one nonzero canonical checkpoint ID".into(),
@@ -3938,7 +3938,7 @@ impl LeaderLeaseStore {
                 Some(assignment_fence),
                 Some(proof.clone()),
                 verdict,
-                recovery_capsule,
+                committed_checkpoint,
             )
             .await?;
 
@@ -4798,47 +4798,70 @@ impl LeaderLeaseStore {
         self.stable_cluster_outcome(epoch).await
     }
 
-    /// Read one live cluster outcome together with its content-addressed recovery capsule.
-    /// Commit always returns a validated capsule; Abort returns `None` for the capsule.
+    /// Store one immutable committed-checkpoint index before publishing its Commit outcome.
+    pub async fn create_committed_checkpoint(
+        &self,
+        index: &CommittedCheckpointIndex,
+    ) -> Result<CommittedCheckpointRef, ClusterCheckpointAuthorityError> {
+        CheckpointDecisionStore::new(Arc::clone(&self.store))
+            .create_committed_checkpoint(index)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Load one exact content-addressed committed-checkpoint index.
+    pub async fn load_committed_checkpoint(
+        &self,
+        reference: &CommittedCheckpointRef,
+    ) -> Result<CommittedCheckpointIndex, ClusterCheckpointAuthorityError> {
+        CheckpointDecisionStore::new(Arc::clone(&self.store))
+            .load_committed_checkpoint(reference)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Read one live cluster outcome together with its committed checkpoint index.
+    /// Commit always returns a validated index; Abort returns `None`.
     ///
     /// # Errors
     ///
-    /// Fails when the authority history or selected recovery capsule is unavailable or invalid.
-    pub async fn cluster_outcome_with_recovery_capsule(
+    /// Fails when the authority history or selected committed index is unavailable or invalid.
+    pub async fn cluster_outcome_with_committed_checkpoint(
         &self,
         epoch: u64,
     ) -> Result<
-        Option<(CheckpointOutcome, Option<ClusterRecoveryCapsule>)>,
+        Option<(CheckpointOutcome, Option<CommittedCheckpointIndex>)>,
         ClusterCheckpointAuthorityError,
     > {
         let decisions = CheckpointDecisionStore::new(Arc::clone(&self.store));
         let Some(outcome) = self.stable_cluster_outcome(epoch).await? else {
             return Ok(None);
         };
-        let capsule = if outcome.is_commit() {
-            let reference = outcome.recovery_capsule.as_ref().ok_or_else(|| {
+        let index = if outcome.is_commit() {
+            let reference = outcome.committed_checkpoint.as_ref().ok_or_else(|| {
                 DecisionError::Conflict(format!(
-                    "cluster Commit epoch {} checkpoint {} has no recovery capsule",
+                    "cluster Commit epoch {} checkpoint {} has no committed checkpoint index",
                     outcome.epoch, outcome.checkpoint_id
                 ))
             })?;
-            let capsule = decisions.load_recovery_capsule(reference).await?;
-            if capsule.attempt.epoch != outcome.epoch
-                || capsule.attempt.checkpoint_id != outcome.checkpoint_id
-                || Some(&capsule.assignment_fence) != outcome.assignment_fence.as_ref()
-                || capsule.deployment_id != outcome.deployment_id
+            let index = decisions.load_committed_checkpoint(reference).await?;
+            if index.epoch != outcome.epoch
+                || index.checkpoint_id != outcome.checkpoint_id
+                || index.scope != outcome.scope
+                || index.assignment_fence.as_ref() != outcome.assignment_fence.as_ref()
+                || index.deployment_id != outcome.deployment_id
             {
                 return Err(DecisionError::Conflict(format!(
-                    "cluster Commit epoch {} checkpoint {} does not match recovery capsule '{}'",
+                    "cluster Commit epoch {} checkpoint {} does not match committed checkpoint '{}'",
                     outcome.epoch, outcome.checkpoint_id, reference.sha256
                 ))
                 .into());
             }
-            Some(capsule)
+            Some(index)
         } else {
             None
         };
-        Ok(Some((outcome, capsule)))
+        Ok(Some((outcome, index)))
     }
 
     /// Audit and return every live cluster outcome in ascending epoch order.
@@ -4919,7 +4942,7 @@ impl LeaderLeaseStore {
     /// authority chain.
     pub async fn cluster_attempt_settlement(
         &self,
-        attempt: crate::state::CheckpointAttempt,
+        attempt: crate::checkpoint::CheckpointAttempt,
     ) -> Result<Option<CheckpointOutcome>, ClusterCheckpointAuthorityError> {
         if !attempt.is_canonical() {
             return Err(DecisionError::Conflict(
@@ -4960,7 +4983,7 @@ impl LeaderLeaseStore {
                 ))
             })?;
         CheckpointDecisionStore::new(Arc::clone(&self.store))
-            .validate_recovery_capsule_for_outcome(recovery_cut)
+            .validate_committed_checkpoint_for_outcome(recovery_cut)
             .await?;
         Ok(Some(recovery_cut.clone()))
     }
@@ -5006,11 +5029,11 @@ impl LeaderLeaseStore {
     }
 
     /// Read an existing cluster retention boundary after auditing its outcome chain and selected
-    /// recovery capsule, without invoking a caller-supplied state-artifact preflight.
+    /// committed checkpoint, without invoking a caller-supplied state-artifact preflight.
     ///
     /// # Errors
     ///
-    /// Returns an error when the authority history or selected recovery capsule is invalid.
+    /// Returns an error when the authority history or selected committed checkpoint is invalid.
     pub async fn audited_cluster_outcome_retention_boundary(
         &self,
     ) -> Result<ClusterOutcomeRetentionBoundary, ClusterCheckpointAuthorityError> {
@@ -5062,59 +5085,10 @@ impl LeaderLeaseStore {
         }
     }
 
-    /// Run one bounded recovery-capsule cleanup step below the durable artifact horizon.
-    ///
-    /// This is deliberately independent of floor publication: cleanup failure cannot revoke an
-    /// already-authorized manifest/state retention horizon.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the authority history is invalid or cleanup storage operations fail.
-    pub async fn maintain_cluster_recovery_capsules(
-        &self,
-    ) -> Result<crate::checkpoint_decision::RecoveryCapsuleGcStep, ClusterCheckpointAuthorityError>
-    {
-        let current = self
-            .load_record()
-            .await?
-            .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-        let audited = self.cached_audited_cluster_outcomes_from(&current).await?;
-        let Some(floor) = current.outcome_floor.as_ref() else {
-            return Ok(crate::checkpoint_decision::RecoveryCapsuleGcStep {
-                examined: 0,
-                deleted: 0,
-                quarantined: 0,
-                pending: false,
-            });
-        };
-        if floor.artifact_before_epoch == 0 {
-            return Ok(crate::checkpoint_decision::RecoveryCapsuleGcStep {
-                examined: 0,
-                deleted: 0,
-                quarantined: 0,
-                pending: false,
-            });
-        }
-        let mut known_live_digests = BTreeSet::new();
-        known_live_digests.extend(
-            audited
-                .outcomes
-                .iter()
-                .filter(|outcome| outcome.epoch >= floor.artifact_before_epoch)
-                .filter_map(|outcome| outcome.recovery_capsule.as_ref())
-                .map(|reference| reference.sha256.clone()),
-        );
-        CheckpointDecisionStore::new(Arc::clone(&self.store))
-            .sweep_recovery_capsules_step(floor.artifact_before_epoch, &known_live_digests)
-            .await
-            .map_err(Into::into)
-    }
-
     /// Advance the cluster outcome floor through the exact next authority sequence.
     ///
     /// At least one live commit remains at or above the requested horizon. Outcome-bearing
-    /// records below the floor and unreferenced old recovery capsules become eligible for
-    /// best-effort deletion only after the floor is durable.
+    /// records below the floor become eligible for deletion only after the floor is durable.
     ///
     /// # Errors
     ///

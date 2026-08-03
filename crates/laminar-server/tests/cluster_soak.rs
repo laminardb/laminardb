@@ -85,12 +85,12 @@ use arrow_schema::DataType;
 use sha2::{Digest as _, Sha256};
 
 #[cfg(feature = "kafka")]
+use laminar_core::checkpoint::{CheckpointAttempt, CheckpointAttemptRelation};
+#[cfg(feature = "kafka")]
 use laminar_core::cluster::control::{
     AssignmentSnapshot, CheckpointAssignmentAdoption, CheckpointAssignmentFence,
     CheckpointParticipant, LocalProcessAuthorityEvidence, LocalProcessAuthorityIdentity,
 };
-#[cfg(feature = "kafka")]
-use laminar_core::state::{CheckpointAttempt, CheckpointAttemptRelation};
 
 const NODES: usize = 3;
 /// Per-node ports: http = BASE + i, gossip = BASE + 100 + i.
@@ -6182,7 +6182,7 @@ fn local_exact_checkpoint_source_sequence(
     checkpoint: DurableCheckpointStatus,
 ) -> Result<u64, String> {
     let path = checkpoint_dir.join(format!(
-        "checkpoints/checkpoint_{:06}/manifest.json",
+        "nodes/1/checkpoints/{:020}/manifest.json",
         checkpoint.checkpoint_id
     ));
     let bytes = std::fs::read(&path)
@@ -6193,13 +6193,6 @@ fn local_exact_checkpoint_source_sequence(
         return Err(format!(
             "checkpoint status {checkpoint:?} resolved to manifest identity checkpoint={} epoch={}",
             manifest.checkpoint_id, manifest.epoch
-        ));
-    }
-    if manifest.durable_phase
-        != laminar_core::checkpoint::checkpoint_manifest::DurableCheckpointPhase::Finalized
-    {
-        return Err(format!(
-            "checkpoint {checkpoint:?} source cursor was read from a non-finalized manifest"
         ));
     }
     let sequence = manifest
@@ -10616,15 +10609,13 @@ fn aggregate_prefix_formula_matches_sequential_source() {
 }
 
 #[test]
-fn local_exact_source_cursor_oracle_reads_filesystem_checkpoint_layout() {
+fn local_exact_source_cursor_oracle_reads_v7_node_manifest() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = DurableCheckpointStatus {
         checkpoint_id: 7,
         epoch: 7,
     };
     let mut manifest = laminar_core::checkpoint::CheckpointManifest::new(7, 7);
-    manifest.durable_phase =
-        laminar_core::checkpoint::checkpoint_manifest::DurableCheckpointPhase::Finalized;
     manifest.source_offsets.insert(
         "gen".into(),
         laminar_core::checkpoint::ConnectorCheckpoint::with_offsets(
@@ -10633,7 +10624,7 @@ fn local_exact_source_cursor_oracle_reads_filesystem_checkpoint_layout() {
     );
     let path = directory
         .path()
-        .join("checkpoints/checkpoint_000007/manifest.json");
+        .join("nodes/1/checkpoints/00000000000000000007/manifest.json");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 

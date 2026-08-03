@@ -654,10 +654,6 @@ impl SinkTaskHandle {
         }
     }
 
-    pub(crate) fn epoch_requires_recovery(&self) -> bool {
-        self.epoch_poisoned.load(Ordering::Acquire)
-    }
-
     fn ensure_open(&self) -> Result<(), ConnectorError> {
         if self.closing.load(Ordering::Acquire) {
             return Err(self.closed_err());
@@ -997,10 +993,6 @@ impl SinkTaskHandle {
 
     pub fn checkpoint_committable(&self) -> bool {
         self.contract.is_checkpoint_committable()
-    }
-
-    pub(crate) fn cluster_exact_delivery_certified(&self) -> bool {
-        self.contract.is_cluster_exact_delivery_certified()
     }
 
     pub fn name(&self) -> &str {

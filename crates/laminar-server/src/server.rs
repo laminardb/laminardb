@@ -180,8 +180,8 @@ pub async fn run_server(
     // TOML validator entirely.
     crate::config::validate_http_auth(&config)
         .map_err(|error| ServerError::Build(format!("HTTP authentication: {error}")))?;
-    resolved_checkpoint_state_bytes(&config.checkpoint)
-        .map_err(|error| ServerError::Build(format!("checkpoint.max_staged_bytes: {error}")))?;
+    resolved_checkpoint_node_data_bytes(&config.checkpoint)
+        .map_err(|error| ServerError::Build(format!("checkpoint.max_node_data_bytes: {error}")))?;
 
     // Cluster mode: gated behind the `cluster` feature flag.
     #[cfg(feature = "cluster")]
@@ -218,16 +218,11 @@ pub async fn run_server(
         .map_err(|error| ServerError::Build(format!("checkpoint storage: {error}")))?;
 
     let key_groups = config.server.resolved_key_groups();
-    let state_backend = checkpoint_state_backend(&config.checkpoint, key_groups)
-        .await
-        .map_err(|error| ServerError::Build(format!("checkpoint storage: {error}")))?;
     let vnode_registry = Arc::new(laminar_core::state::VnodeRegistry::single_owner(
         u32::from(key_groups),
         laminar_core::state::LOCAL_NODE_ID,
     ));
-    builder = builder
-        .state_backend(state_backend)
-        .vnode_registry(vnode_registry);
+    builder = builder.vnode_registry(vnode_registry);
 
     // Build the AI subsystem from `[ai]`/`[models]` and install it. Without
     // configured models this is a no-op and `ai_*` functions fail at plan time.
@@ -356,13 +351,9 @@ pub async fn run_server(
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CheckpointConfigurationError {
     #[error(transparent)]
-    Storage(#[from] laminar_core::storage::object_store_builder::ObjectStoreBuilderError),
-    #[error("checkpoint.max_staged_bytes: {0}")]
-    StateBudget(laminar_core::storage::checkpoint_store::CheckpointStoreError),
-    #[error("checkpoint store contract: {0}")]
-    StoreContract(laminar_core::storage::checkpoint_store::CheckpointStoreError),
-    #[error("checkpoint URL is not durable object storage ({0:?})")]
-    Durability(laminar_core::state::StateBackendDurability),
+    Storage(#[from] laminar_core::checkpoint::object_store_builder::ObjectStoreBuilderError),
+    #[error("checkpoint.max_node_data_bytes: {0}")]
+    NodeDataBudget(laminar_core::checkpoint::CheckpointStoreError),
 }
 
 /// Apply local-runtime checkpoint settings to a `LaminarDB` builder.
@@ -372,7 +363,7 @@ pub(crate) fn apply_local_checkpoint_config(
     checkpoint: &crate::config::CheckpointSection,
 ) -> Result<laminar_db::LaminarDbBuilder, CheckpointConfigurationError> {
     if checkpoint_url.starts_with("file://") {
-        laminar_core::storage::object_store_builder::file_url_path(checkpoint_url)?;
+        laminar_core::checkpoint::object_store_builder::file_url_path(checkpoint_url)?;
     }
     builder = apply_checkpoint_settings(builder, checkpoint)?;
     builder = builder.object_store_url(checkpoint_url.to_string());
@@ -396,71 +387,28 @@ fn apply_checkpoint_settings(
     builder: laminar_db::LaminarDbBuilder,
     checkpoint: &crate::config::CheckpointSection,
 ) -> Result<laminar_db::LaminarDbBuilder, CheckpointConfigurationError> {
-    let max_state_data_bytes = resolved_checkpoint_state_bytes(checkpoint)
-        .map_err(CheckpointConfigurationError::StateBudget)?;
+    let max_node_data_bytes = resolved_checkpoint_node_data_bytes(checkpoint)
+        .map_err(CheckpointConfigurationError::NodeDataBudget)?;
     Ok(builder.checkpoint(StreamCheckpointConfig {
         interval_ms: Some(u64::try_from(checkpoint.interval.as_millis()).unwrap_or(u64::MAX)),
         timeout_ms: Some(u64::try_from(checkpoint.timeout.as_millis()).unwrap_or(u64::MAX)),
         data_dir: None,
         max_retained: Some(checkpoint.max_retained),
-        max_staged_bytes: Some(max_state_data_bytes),
+        max_node_data_bytes: Some(max_node_data_bytes),
     }))
 }
 
-async fn checkpoint_state_backend(
-    checkpoint: &crate::config::CheckpointSection,
-    key_groups: laminar_core::state::KeyGroupCount,
-) -> Result<Arc<dyn laminar_core::state::StateBackend>, CheckpointConfigurationError> {
-    let store = laminar_core::storage::object_store_builder::build_object_store(
-        &checkpoint.url,
-        &checkpoint.storage,
-    )?;
-    let durability = laminar_core::state::StateBackendDurability::for_storage_url(&checkpoint.url);
-    let probe_timeout = std::time::Duration::from_secs(5);
-    match durability {
-        laminar_core::state::StateBackendDurability::NodeDurable => {
-            laminar_core::storage::checkpoint_store::probe_object_store_conditional_create(
-                store.as_ref(),
-                "startup/",
-                probe_timeout,
-            )
-            .await
-        }
-        laminar_core::state::StateBackendDurability::ClusterShared => {
-            laminar_core::storage::checkpoint_store::probe_object_store_conditional_update(
-                store.as_ref(),
-                "startup/",
-                probe_timeout,
-            )
-            .await
-        }
-        durability => return Err(CheckpointConfigurationError::Durability(durability)),
-    }
-    .map_err(CheckpointConfigurationError::StoreContract)?;
-    let vnode_capacity = u32::from(key_groups);
-    let backend = match durability {
-        laminar_core::state::StateBackendDurability::NodeDurable => {
-            laminar_core::state::ObjectStoreBackend::node_durable(store, "local", vnode_capacity)
-        }
-        laminar_core::state::StateBackendDurability::ClusterShared => {
-            laminar_core::state::ObjectStoreBackend::cluster_shared(store, "local", vnode_capacity)
-        }
-        durability => return Err(CheckpointConfigurationError::Durability(durability)),
-    };
-    Ok(Arc::new(backend))
-}
-
 /// Resolve the one capture and recovery admission budget used by every server checkpoint store.
-pub(crate) fn resolved_checkpoint_state_bytes(
+pub(crate) fn resolved_checkpoint_node_data_bytes(
     checkpoint: &crate::config::CheckpointSection,
-) -> Result<u64, laminar_core::storage::checkpoint_store::CheckpointStoreError> {
-    let max_state_data_bytes = checkpoint
-        .max_staged_bytes
-        .unwrap_or(laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_STATE_BYTES);
-    laminar_core::storage::checkpoint_store::validate_max_checkpoint_state_bytes(
-        max_state_data_bytes,
+) -> Result<u64, laminar_core::checkpoint::CheckpointStoreError> {
+    let max_node_data_bytes = checkpoint.max_node_data_bytes.unwrap_or(
+        laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES,
+    );
+    laminar_core::checkpoint::checkpoint_store::validate_max_checkpoint_node_data_bytes(
+        max_node_data_bytes,
     )?;
-    Ok(max_state_data_bytes)
+    Ok(max_node_data_bytes)
 }
 
 /// Execute DDL for all config sections (sources, lookups, pipelines, sinks, raw SQL).
@@ -912,13 +860,13 @@ mod tests {
     fn checkpoint_state_budget_has_one_default_and_honours_an_override() {
         let mut checkpoint = CheckpointSection::default();
         assert_eq!(
-            resolved_checkpoint_state_bytes(&checkpoint).unwrap(),
-            laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_STATE_BYTES
+            resolved_checkpoint_node_data_bytes(&checkpoint).unwrap(),
+            laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES
         );
 
-        checkpoint.max_staged_bytes = Some(8 * 1024 * 1024);
+        checkpoint.max_node_data_bytes = Some(8 * 1024 * 1024);
         assert_eq!(
-            resolved_checkpoint_state_bytes(&checkpoint).unwrap(),
+            resolved_checkpoint_node_data_bytes(&checkpoint).unwrap(),
             8 * 1024 * 1024
         );
     }
@@ -926,13 +874,13 @@ mod tests {
     #[test]
     fn checkpoint_state_budget_rejects_zero_and_unaddressable_limits() {
         let mut checkpoint = CheckpointSection {
-            max_staged_bytes: Some(0),
+            max_node_data_bytes: Some(0),
             ..CheckpointSection::default()
         };
-        assert!(resolved_checkpoint_state_bytes(&checkpoint).is_err());
+        assert!(resolved_checkpoint_node_data_bytes(&checkpoint).is_err());
 
-        checkpoint.max_staged_bytes = Some((isize::MAX as u64) + 1);
-        let error = resolved_checkpoint_state_bytes(&checkpoint).unwrap_err();
+        checkpoint.max_node_data_bytes = Some((isize::MAX as u64) + 1);
+        let error = resolved_checkpoint_node_data_bytes(&checkpoint).unwrap_err();
         assert!(error
             .to_string()
             .contains("exceeds this process address space"));
@@ -943,14 +891,14 @@ mod tests {
         for mode in [ServerMode::Single, ServerMode::Cluster] {
             let mut config: ServerConfig = toml::from_str("").unwrap();
             config.server.mode = mode;
-            config.checkpoint.max_staged_bytes = Some(0);
+            config.checkpoint.max_node_data_bytes = Some(0);
 
             let result = run_server(config, PathBuf::from("unused.toml")).await;
             let Err(error) = result else {
                 panic!("invalid checkpoint state budget was admitted in {mode:?} mode");
             };
             assert!(
-                error.to_string().contains("checkpoint.max_staged_bytes"),
+                error.to_string().contains("checkpoint.max_node_data_bytes"),
                 "{error}"
             );
         }
@@ -962,7 +910,7 @@ mod tests {
         config.server.diagnostic_read_token = Some(Secret::new("invalid"));
         // This second invalid value makes the test terminate safely even if authentication
         // validation is accidentally moved later; authentication must still win.
-        config.checkpoint.max_staged_bytes = Some(0);
+        config.checkpoint.max_node_data_bytes = Some(0);
 
         let result = run_server(config, PathBuf::from("unused.toml")).await;
         let Err(error) = result else {
@@ -972,7 +920,7 @@ mod tests {
         assert!(message.contains("HTTP authentication"), "{message}");
         assert!(message.contains("diagnostic_read_token"), "{message}");
         assert!(
-            !message.contains("checkpoint.max_staged_bytes"),
+            !message.contains("checkpoint.max_node_data_bytes"),
             "{message}"
         );
     }
@@ -1168,22 +1116,14 @@ mod tests {
                 &[participant],
                 kv,
                 Arc::clone(&object_store),
-                Arc::clone(&object_store),
                 std::time::Duration::from_secs(1),
             )
             .await
             .unwrap();
-        let state_backend: Arc<dyn laminar_core::state::StateBackend> =
-            Arc::new(laminar_core::state::ObjectStoreBackend::cluster_shared(
-                verified_namespaces.state_store(),
-                node.to_string(),
-                1,
-            ));
         let vnode_registry = Arc::new(laminar_core::state::VnodeRegistry::new(1));
         let db = LaminarDB::builder()
             .cluster_controller(controller)
             .verified_cluster_namespaces(verified_namespaces)
-            .state_backend(state_backend)
             .vnode_registry(vnode_registry)
             .catalog_manifest_store(Arc::clone(&manifest_store))
             .build()
