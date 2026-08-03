@@ -17,6 +17,7 @@ fn digest(byte: u8) -> String {
 async fn local_index(
     store: &CheckpointDecisionStore,
     checkpoint_id: u64,
+    predecessor: Option<CommittedCheckpointRef>,
 ) -> CommittedCheckpointIndex {
     CommittedCheckpointIndex {
         version: COMMITTED_CHECKPOINT_INDEX_VERSION,
@@ -27,7 +28,7 @@ async fn local_index(
         scope: CheckpointScope::Local,
         vnode_count: 4,
         assignment_fence: None,
-        predecessor: None,
+        predecessor,
         participants: vec![CommittedParticipantRef {
             participant_id: LOCAL_NODE_ID.0,
             manifest_len: 12,
@@ -45,7 +46,7 @@ async fn local_index(
 async fn committed_index_create_is_idempotent_and_exactly_verified() {
     let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let store = CheckpointDecisionStore::local_single_writer(raw);
-    let index = local_index(&store, 1).await;
+    let index = local_index(&store, 1, None).await;
 
     let reference = store.create_committed_checkpoint(&index).await.unwrap();
     assert_eq!(
@@ -66,7 +67,7 @@ async fn committed_index_create_is_idempotent_and_exactly_verified() {
 async fn local_commit_requires_the_content_addressed_index() {
     let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let store = CheckpointDecisionStore::local_single_writer(raw);
-    let index = local_index(&store, 1).await;
+    let index = local_index(&store, 1, None).await;
     let reference = store.create_committed_checkpoint(&index).await.unwrap();
 
     let result = store
@@ -84,7 +85,7 @@ async fn local_commit_requires_the_content_addressed_index() {
     assert!(matches!(result, RecordOutcomeResult::Created(_)));
     assert_eq!(
         store
-            .outcome(1)
+            .latest_committed_outcome()
             .await
             .unwrap()
             .unwrap()
@@ -97,7 +98,7 @@ async fn local_commit_requires_the_content_addressed_index() {
 async fn abort_forbids_a_committed_index_reference() {
     let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let store = CheckpointDecisionStore::local_single_writer(raw);
-    let index = local_index(&store, 1).await;
+    let index = local_index(&store, 1, None).await;
     let reference = store.create_committed_checkpoint(&index).await.unwrap();
 
     assert!(store
@@ -112,4 +113,172 @@ async fn abort_forbids_a_committed_index_reference() {
         )
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn decision_head_keeps_latest_commit_across_a_later_abort() {
+    let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let store = CheckpointDecisionStore::new(raw);
+    let first = local_index(&store, 1, None).await;
+    let first_ref = store.create_committed_checkpoint(&first).await.unwrap();
+    store
+        .record_outcome(
+            1,
+            1,
+            CheckpointScope::Local,
+            None,
+            None,
+            CheckpointVerdict::Commit,
+            Some(first_ref),
+        )
+        .await
+        .unwrap();
+    store
+        .record_outcome(
+            2,
+            2,
+            CheckpointScope::Local,
+            None,
+            None,
+            CheckpointVerdict::Abort,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .latest_committed_outcome()
+            .await
+            .unwrap()
+            .unwrap()
+            .epoch,
+        1
+    );
+    assert_eq!(
+        store
+            .latest_terminal_outcome()
+            .await
+            .unwrap()
+            .unwrap()
+            .epoch,
+        2
+    );
+}
+
+#[tokio::test]
+async fn local_commit_must_extend_the_authoritative_commit() {
+    let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let store = CheckpointDecisionStore::new(raw);
+    let first = local_index(&store, 1, None).await;
+    let first_ref = store.create_committed_checkpoint(&first).await.unwrap();
+    store
+        .record_outcome(
+            1,
+            1,
+            CheckpointScope::Local,
+            None,
+            None,
+            CheckpointVerdict::Commit,
+            Some(first_ref.clone()),
+        )
+        .await
+        .unwrap();
+
+    let fork = local_index(&store, 2, None).await;
+    let fork_ref = store.create_committed_checkpoint(&fork).await.unwrap();
+    assert!(store
+        .record_outcome(
+            2,
+            2,
+            CheckpointScope::Local,
+            None,
+            None,
+            CheckpointVerdict::Commit,
+            Some(fork_ref),
+        )
+        .await
+        .is_err());
+
+    let second = local_index(&store, 2, Some(first_ref)).await;
+    let second_ref = store.create_committed_checkpoint(&second).await.unwrap();
+    store
+        .record_outcome(
+            2,
+            2,
+            CheckpointScope::Local,
+            None,
+            None,
+            CheckpointVerdict::Commit,
+            Some(second_ref),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .latest_committed_outcome()
+            .await
+            .unwrap()
+            .unwrap()
+            .epoch,
+        2
+    );
+}
+
+#[tokio::test]
+async fn local_allocator_burns_the_reserved_suffix_on_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = CheckpointDecisionStore::local_filesystem(directory.path()).unwrap();
+    assert_eq!(store.allocate_checkpoint_id().await.unwrap(), 1);
+    assert_eq!(store.allocate_checkpoint_id().await.unwrap(), 2);
+    let reserved_through = store
+        .checkpoint_id_reservation_high_watermark()
+        .await
+        .unwrap();
+    assert_eq!(reserved_through, LOCAL_RESERVATION_SIZE);
+    drop(store);
+
+    let reopened = CheckpointDecisionStore::local_filesystem(directory.path()).unwrap();
+    assert_eq!(
+        reopened
+            .checkpoint_id_reservation_high_watermark()
+            .await
+            .unwrap(),
+        reserved_through
+    );
+    assert!(reopened.allocate_checkpoint_id().await.unwrap() > reserved_through);
+}
+
+#[test]
+fn abort_cannot_share_an_epoch_with_latest_commit() {
+    let deployment_id = uuid::Uuid::now_v7().to_string();
+    let commit = CheckpointOutcome {
+        version: CHECKPOINT_OUTCOME_VERSION,
+        scope: CheckpointScope::Local,
+        epoch: 1,
+        checkpoint_id: 1,
+        deployment_id: deployment_id.clone(),
+        assignment_fence: None,
+        leader_proof: None,
+        committed_checkpoint: Some(CommittedCheckpointRef {
+            epoch: 1,
+            checkpoint_id: 1,
+            len: 1,
+            sha256: digest(1),
+        }),
+        verdict: CheckpointVerdict::Commit,
+    };
+    let terminal = CheckpointOutcome {
+        committed_checkpoint: None,
+        verdict: CheckpointVerdict::Abort,
+        ..commit.clone()
+    };
+    let head = DurableCheckpointDecisionHead {
+        version: CHECKPOINT_DECISION_HEAD_VERSION,
+        deployment_id: deployment_id.clone(),
+        latest_terminal: terminal,
+        latest_commit: Some(commit),
+    };
+
+    assert!(CheckpointDecisionStore::validate_decision_head_shape(&head, &deployment_id).is_err());
 }

@@ -21,7 +21,8 @@ vnode count.
 
 The committed index binds the deployment, pipeline ABI, checkpoint attempt, participant manifests,
 source offsets, per-channel watermarks and idle flags, assignment fence, and predecessor index.
-Recovery selects that exact index, verifies each manifest and range, restores only the local
+Local recovery selects it from one authoritative decision head; cluster recovery uses the
+leader-fenced authority chain. Recovery verifies each manifest and range, restores only the local
 participant frames, then replays sources from the committed offsets. It never scans checkpoint
 objects to infer state references.
 
@@ -52,9 +53,9 @@ The following remain production gaps, not alternate state implementations:
 
 - Assignment changes that acquire a vnode fail closed until direct v7 range transfer and
   assignment-fenced installation are complete. Revoke-only changes remain supported.
-- Failed or aborted prepared checkpoint objects are not yet reclaimed.
-- Local outcome selection still uses object listing, and retention metadata traversal is not yet
-  bounded by a durable head/floor.
+- Durable Aborts reclaim exact prepared objects, including after restart. An attempt that crashes
+  before publishing a terminal decision can still leave unreferenced checkpoint metadata.
+- Retention traversal and deletion are not yet bounded by a crash-resumable artifact journal.
 - Checkpoint capture still performs state-sized snapshot work synchronously; its tail latency is
   not certified.
 - Mutable update/merge joins, materialized-view joins, unbounded retention policy, and the complete

@@ -28,29 +28,6 @@ impl Event {
     }
 }
 
-/// Serialized operator state for checkpointing.
-#[derive(Debug, Clone)]
-pub struct OperatorState {
-    /// Operator ID
-    pub operator_id: String,
-    /// State format version (for forward/backward compatibility detection)
-    pub version: u32,
-    /// Serialized state data
-    pub data: Vec<u8>,
-}
-
-impl OperatorState {
-    /// Create a version-1 operator state.
-    #[must_use]
-    pub fn v1(operator_id: String, data: Vec<u8>) -> Self {
-        Self {
-            operator_id,
-            version: 1,
-            data,
-        }
-    }
-}
-
 /// Errors that can occur in operators.
 #[derive(Debug, thiserror::Error)]
 pub enum OperatorError {

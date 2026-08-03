@@ -42,7 +42,7 @@ parquet-lookup = ["laminar-connectors/parquet-lookup"]
 files = ["laminar-connectors/files"]
 otel = ["laminar-connectors/otel"]
 nats = ["laminar-connectors/nats"]
-cluster = ["laminar-core/cluster", "laminar-sql/cluster", "dep:reqwest", "dep:uuid"]
+cluster = ["laminar-core/cluster", "laminar-sql/cluster", "dep:reqwest"]
 aws = ["laminar-core/aws"]
 gcs = ["laminar-core/gcs"]
 azure = ["laminar-core/azure"]
@@ -123,10 +123,9 @@ prometheus = { workspace = true }
 # Zero-copy byte buffers used by checkpoint payloads.
 bytes = { workspace = true }
 
-uuid = { workspace = true, optional = true }
+uuid = { workspace = true }
 
-# Object-store handle for the auto-wired 2PC decision store (single-instance
-# uses `LocalFileSystem`; cluster reuses the configured remote store).
+# Provider-neutral checkpoint data and decision metadata.
 object_store = { workspace = true }
 
 # Kafka producer/admin client used by `kafka_docker_scenarios.rs`.

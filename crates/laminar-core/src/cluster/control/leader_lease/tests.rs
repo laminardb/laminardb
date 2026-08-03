@@ -373,7 +373,7 @@ async fn committed_checkpoint(
     checkpoint_id: u64,
 ) -> CommittedCheckpointRef {
     assert_eq!(epoch, checkpoint_id, "test checkpoint must be canonical");
-    committed_checkpoint_variant(store, fence, checkpoint_id, 9).await
+    committed_checkpoint_with_predecessor(store, fence, checkpoint_id, 9, None).await
 }
 
 async fn committed_checkpoint_variant(
@@ -381,6 +381,16 @@ async fn committed_checkpoint_variant(
     fence: &CheckpointAssignmentFence,
     checkpoint_id: u64,
     variant: u8,
+) -> CommittedCheckpointRef {
+    committed_checkpoint_with_predecessor(store, fence, checkpoint_id, variant, None).await
+}
+
+async fn committed_checkpoint_with_predecessor(
+    store: &LeaderLeaseStore,
+    fence: &CheckpointAssignmentFence,
+    checkpoint_id: u64,
+    variant: u8,
+    predecessor: Option<CommittedCheckpointRef>,
 ) -> CommittedCheckpointRef {
     let decisions = CheckpointDecisionStore::new(Arc::clone(&store.store));
     let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
@@ -393,7 +403,7 @@ async fn committed_checkpoint_variant(
         scope: CheckpointScope::Cluster,
         vnode_count: u16::try_from(fence.vnode_count).unwrap(),
         assignment_fence: Some(fence.clone()),
-        predecessor: None,
+        predecessor,
         participants: fence
             .participants
             .iter()
@@ -420,7 +430,13 @@ async fn record_commit(
     checkpoint_id: u64,
 ) -> RecordOutcomeResult {
     assert_eq!(epoch, checkpoint_id, "test outcome must be canonical");
-    let committed_checkpoint = committed_checkpoint(store, fence, epoch, checkpoint_id).await;
+    let predecessor = store
+        .highest_cluster_committed_outcome()
+        .await
+        .unwrap()
+        .and_then(|outcome| outcome.committed_checkpoint);
+    let committed_checkpoint =
+        committed_checkpoint_with_predecessor(store, fence, checkpoint_id, 9, predecessor).await;
     store
         .record_cluster_outcome(
             proof,
@@ -5519,8 +5535,13 @@ async fn next_commit_is_rejected_at_the_live_commit_capacity_before_sequence_cre
 
     let next_epoch = maximum.checked_add(1).unwrap();
     let next_checkpoint_id = next_epoch;
+    let predecessor = current
+        .checkpoint_outcome
+        .as_ref()
+        .and_then(|outcome| outcome.committed_checkpoint.clone());
     let next_checkpoint =
-        committed_checkpoint(&store, &fence, next_epoch, next_checkpoint_id).await;
+        committed_checkpoint_with_predecessor(&store, &fence, next_checkpoint_id, 9, predecessor)
+            .await;
     let error = store
         .record_cluster_outcome(
             &proof,
@@ -6038,6 +6059,90 @@ async fn cluster_decision_rejects_noncanonical_attempt_before_mutation() {
 }
 
 #[tokio::test]
+async fn cluster_commit_rejects_a_fork_from_the_authoritative_commit_head() {
+    let store = store(1_000);
+    let incumbent = owner(1, 1, 1);
+    let LeaseOutcome::Acquired(first) = store
+        .acquire_or_renew_current_term_for_test(&incumbent, 0)
+        .await
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let proof = first.proof();
+    let fence = assignment_fence(&incumbent);
+    record_commit(&store, &proof, &fence, 1, 1).await;
+    let fork = committed_checkpoint(&store, &fence, 2, 2).await;
+    let before = store.load_record().await.unwrap().unwrap();
+
+    assert!(matches!(
+        store
+            .record_cluster_outcome(
+                &proof,
+                2,
+                2,
+                fence,
+                CheckpointVerdict::Commit,
+                Some(fork),
+            )
+            .await,
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(message)
+        )) if message.contains("does not extend the authoritative Commit head")
+    ));
+    assert_eq!(store.load_record().await.unwrap().unwrap(), before);
+}
+
+#[tokio::test]
+async fn cluster_commit_extends_the_same_head_after_an_intervening_abort() {
+    let store = store(1_000);
+    let incumbent = owner(1, 1, 1);
+    let LeaseOutcome::Acquired(first) = store
+        .acquire_or_renew_current_term_for_test(&incumbent, 0)
+        .await
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let proof = first.proof();
+    let fence = assignment_fence(&incumbent);
+    let first_checkpoint = committed_checkpoint(&store, &fence, 1, 1).await;
+    store
+        .record_cluster_outcome(
+            &proof,
+            1,
+            1,
+            fence.clone(),
+            CheckpointVerdict::Commit,
+            Some(first_checkpoint.clone()),
+        )
+        .await
+        .unwrap();
+    store
+        .record_cluster_outcome(&proof, 2, 2, fence.clone(), CheckpointVerdict::Abort, None)
+        .await
+        .unwrap();
+    let next_checkpoint =
+        committed_checkpoint_with_predecessor(&store, &fence, 3, 9, Some(first_checkpoint)).await;
+
+    assert!(matches!(
+        store
+            .record_cluster_outcome(
+                &proof,
+                3,
+                3,
+                fence,
+                CheckpointVerdict::Commit,
+                Some(next_checkpoint.clone()),
+            )
+            .await
+            .unwrap(),
+        RecordOutcomeResult::Created(outcome)
+            if outcome.committed_checkpoint == Some(next_checkpoint)
+    ));
+}
+
+#[tokio::test]
 async fn cluster_decision_rejects_foreign_owner_and_fencing_token() {
     let store = store(1_000);
     let incumbent = owner(1, 1, 1);
@@ -6224,7 +6329,9 @@ async fn assert_invalid_selected_cut_blocks_prune(corrupt: bool) {
     let proof = first.proof();
     let fence = assignment_fence(&incumbent);
     let first_checkpoint = committed_checkpoint(&store, &fence, 1, 1).await;
-    let selected_checkpoint = committed_checkpoint(&store, &fence, 2, 2).await;
+    let selected_checkpoint =
+        committed_checkpoint_with_predecessor(&store, &fence, 2, 9, Some(first_checkpoint.clone()))
+            .await;
     for (epoch, checkpoint_id, checkpoint) in [
         (1, 1, first_checkpoint.clone()),
         (2, 2, selected_checkpoint.clone()),
@@ -6547,7 +6654,14 @@ async fn ambiguous_floor_create_revalidates_the_winner_cut() {
     let proof = first.proof();
     let fence = assignment_fence(&incumbent);
     let first_checkpoint = committed_checkpoint(store.as_ref(), &fence, 1, 1).await;
-    let selected_checkpoint = committed_checkpoint(store.as_ref(), &fence, 2, 2).await;
+    let selected_checkpoint = committed_checkpoint_with_predecessor(
+        store.as_ref(),
+        &fence,
+        2,
+        9,
+        Some(first_checkpoint.clone()),
+    )
+    .await;
     for (epoch, checkpoint_id, checkpoint) in [
         (1, 1, first_checkpoint.clone()),
         (2, 2, selected_checkpoint.clone()),
@@ -6605,8 +6719,17 @@ async fn renewal_catalog_seal_and_takeover_preserve_outcome_head_and_floor() {
     let fence = assignment_fence(&incumbent);
     let decisions = CheckpointDecisionStore::new(Arc::clone(&store.store));
     let first_checkpoint = committed_checkpoint(&store, &fence, 1, 1).await;
-    let second_checkpoint = committed_checkpoint(&store, &fence, 2, 2).await;
-    let third_checkpoint = committed_checkpoint(&store, &fence, 3, 3).await;
+    let second_checkpoint =
+        committed_checkpoint_with_predecessor(&store, &fence, 2, 9, Some(first_checkpoint.clone()))
+            .await;
+    let third_checkpoint = committed_checkpoint_with_predecessor(
+        &store,
+        &fence,
+        3,
+        9,
+        Some(second_checkpoint.clone()),
+    )
+    .await;
     for (epoch, checkpoint_id, checkpoint) in [
         (1, 1, first_checkpoint.clone()),
         (2, 2, second_checkpoint.clone()),

@@ -2784,15 +2784,15 @@ impl LaminarDB {
                 .checkpoint_object_store()?
                 .ok_or_else(|| DbError::Checkpoint("checkpoint object store is disabled".into()))?;
             let probe_timeout = std::time::Duration::from_secs(10);
-            let probe = if startup_runtime == RuntimeMode::Cluster {
-                laminar_core::checkpoint::probe_object_store_conditional_update(
+            let probe = if uses_local_checkpoint_store {
+                laminar_core::checkpoint::probe_object_store_conditional_create(
                     checkpoint_backing.as_ref(),
                     "",
                     probe_timeout,
                 )
                 .await
             } else {
-                laminar_core::checkpoint::probe_object_store_conditional_create(
+                laminar_core::checkpoint::probe_object_store_conditional_update(
                     checkpoint_backing.as_ref(),
                     "",
                     probe_timeout,

@@ -3930,8 +3930,9 @@ impl LeaderLeaseStore {
         if !initial.lease.matches_proof(proof) {
             return Err(ClusterCheckpointAuthorityError::Fenced);
         }
-        let candidate = CheckpointDecisionStore::new(Arc::clone(&self.store))
-            .canonical_outcome(
+        let decisions = CheckpointDecisionStore::new(Arc::clone(&self.store));
+        let (candidate, committed_index) = decisions
+            .canonical_outcome_with_index(
                 epoch,
                 checkpoint_id,
                 CheckpointScope::Cluster,
@@ -3974,6 +3975,28 @@ impl LeaderLeaseStore {
                     .into());
                 }
             }
+            let (commit_index, expected_predecessor) = if candidate.is_commit() {
+                let index = committed_index.as_ref().ok_or_else(|| {
+                    DecisionError::Conflict(
+                        "canonical cluster Commit is missing its committed checkpoint index".into(),
+                    )
+                })?;
+                let expected_predecessor = outcomes
+                    .iter()
+                    .rev()
+                    .find(|outcome| outcome.is_commit())
+                    .and_then(|outcome| outcome.committed_checkpoint.clone());
+                if index.predecessor != expected_predecessor {
+                    return Err(DecisionError::Conflict(format!(
+                        "cluster Commit checkpoint {} does not extend the authoritative Commit head",
+                        candidate.checkpoint_id
+                    ))
+                    .into());
+                }
+                (Some(index), expected_predecessor)
+            } else {
+                (None, None)
+            };
             if candidate.is_commit() && snapshot.commit_links.len() >= MAX_LIVE_AUTHORITY_LINKS {
                 return Err(DecisionError::Conflict(format!(
                     "live Commit retention reached the fixed {MAX_LIVE_AUTHORITY_LINKS}-link authority bound; advance the artifact-retention horizon before admitting another Commit"
@@ -3998,6 +4021,14 @@ impl LeaderLeaseStore {
             {
                 tokio::task::yield_now().await;
                 continue;
+            }
+            if let (Some(index), Some(predecessor_ref)) =
+                (commit_index, expected_predecessor.as_ref())
+            {
+                let predecessor = decisions.load_committed_checkpoint(predecessor_ref).await?;
+                index
+                    .validate_predecessor_index(&predecessor)
+                    .map_err(DecisionError::Conflict)?;
             }
 
             let base_sequence = current.lease.seq;

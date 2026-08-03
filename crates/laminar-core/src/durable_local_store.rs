@@ -746,7 +746,6 @@ mod tests {
     use object_store::ObjectStoreExt;
 
     use super::*;
-    use crate::checkpoint_decision::{CheckpointDecisionStore, CheckpointScope, CheckpointVerdict};
 
     #[tokio::test]
     async fn create_is_exclusive_and_keeps_the_winner() {
@@ -1341,45 +1340,6 @@ mod tests {
         assert_eq!(delimited.objects.len(), 1);
         assert_eq!(delimited.objects[0].location, Path::from("nested/visible"));
         assert!(temporary_path.is_file());
-    }
-
-    #[tokio::test]
-    async fn reopen_hides_leftover_delete_tombstone_from_outcome_inventory() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = DurableLocalObjectStore::new(directory.path()).unwrap();
-        let object_store: Arc<dyn ObjectStore> = Arc::new(store);
-        let decisions = CheckpointDecisionStore::new(Arc::clone(&object_store));
-        for epoch in 1..=2 {
-            decisions
-                .record_outcome(
-                    epoch,
-                    epoch,
-                    CheckpointScope::Local,
-                    None,
-                    None,
-                    CheckpointVerdict::Abort,
-                    None,
-                )
-                .await
-                .unwrap();
-        }
-
-        let deleted = directory.path().join("checkpoint-outcomes/epoch=1/outcome");
-        let tombstone = internal_artifact_path(deleted.parent().unwrap());
-        durable_rename(&deleted, &tombstone, DurableRenameMode::NoReplace).unwrap();
-        assert!(tombstone.is_file());
-        drop(decisions);
-        drop(object_store);
-
-        let reopened: Arc<dyn ObjectStore> =
-            Arc::new(DurableLocalObjectStore::new(directory.path()).unwrap());
-        let outcomes = CheckpointDecisionStore::new(reopened)
-            .outcomes()
-            .await
-            .unwrap();
-        assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].epoch, 2);
-        assert!(tombstone.is_file());
     }
 
     #[tokio::test]
