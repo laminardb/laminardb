@@ -21,8 +21,6 @@ use crate::http;
 use crate::http::ClusterComponents;
 use crate::metrics::ServerMetrics;
 use crate::reload::ReloadGuard;
-#[cfg(test)]
-use laminar_core::state::StateBackendConfig;
 
 /// Handle to a running LaminarDB server. Call `wait_for_shutdown` to block until Ctrl-C.
 pub struct ServerHandle {
@@ -214,23 +212,15 @@ pub async fn run_server(
     if let Some(ref token) = config.server.console_token {
         builder = builder.http_auth_token(token.expose());
     }
-    let storage_dir = config.state.local_storage_dir();
-    if let Some(path) = storage_dir {
-        builder = builder.storage_dir(path);
-    }
-
     builder = builder.restart_policy(config.supervision.to_policy());
     builder = builder.incremental_emit(config.server.incremental_emit);
     builder = apply_local_checkpoint_config(builder, &config.checkpoint.url, &config.checkpoint)
         .map_err(|error| ServerError::Build(format!("checkpoint storage: {error}")))?;
 
-    // Build the state backend + single-owner vnode registry from config so
-    // the checkpoint coordinator's durability gate runs with real markers.
     let key_groups = config.server.resolved_key_groups();
-    let state_backend = config
-        .state
-        .build(key_groups)
-        .map_err(|e| ServerError::Build(format!("state backend: {e}")))?;
+    let state_backend = checkpoint_state_backend(&config.checkpoint, key_groups)
+        .await
+        .map_err(|error| ServerError::Build(format!("checkpoint storage: {error}")))?;
     let vnode_registry = Arc::new(laminar_core::state::VnodeRegistry::single_owner(
         u32::from(key_groups),
         laminar_core::state::NodeId(0),
@@ -369,6 +359,10 @@ pub(crate) enum CheckpointConfigurationError {
     Storage(#[from] laminar_core::storage::object_store_builder::ObjectStoreBuilderError),
     #[error("checkpoint.max_staged_bytes: {0}")]
     StateBudget(laminar_core::storage::checkpoint_store::CheckpointStoreError),
+    #[error("checkpoint store contract: {0}")]
+    StoreContract(laminar_core::storage::checkpoint_store::CheckpointStoreError),
+    #[error("checkpoint URL is not durable object storage ({0:?})")]
+    Durability(laminar_core::state::StateBackendDurability),
 }
 
 /// Apply local-runtime checkpoint settings to a `LaminarDB` builder.
@@ -377,21 +371,13 @@ pub(crate) fn apply_local_checkpoint_config(
     checkpoint_url: &str,
     checkpoint: &crate::config::CheckpointSection,
 ) -> Result<laminar_db::LaminarDbBuilder, CheckpointConfigurationError> {
-    let data_dir = if checkpoint_url.starts_with("file://") {
-        Some(laminar_core::storage::object_store_builder::file_url_path(
-            checkpoint_url,
-        )?)
-    } else {
-        None
-    };
-    builder = apply_checkpoint_settings(builder, checkpoint, data_dir)?;
-
-    let is_file = checkpoint_url.starts_with("file://");
-    if !checkpoint_url.is_empty() && !is_file {
-        builder = builder.object_store_url(checkpoint_url.to_string());
-        if !checkpoint.storage.is_empty() {
-            builder = builder.object_store_options(checkpoint.storage.clone());
-        }
+    if checkpoint_url.starts_with("file://") {
+        laminar_core::storage::object_store_builder::file_url_path(checkpoint_url)?;
+    }
+    builder = apply_checkpoint_settings(builder, checkpoint)?;
+    builder = builder.object_store_url(checkpoint_url.to_string());
+    if !checkpoint.storage.is_empty() {
+        builder = builder.object_store_options(checkpoint.storage.clone());
     }
 
     Ok(builder)
@@ -403,24 +389,65 @@ pub(crate) fn apply_verified_cluster_checkpoint_config(
     checkpoint: &crate::config::CheckpointSection,
     namespaces: laminar_core::cluster::control::VerifiedClusterNamespaces,
 ) -> Result<laminar_db::LaminarDbBuilder, CheckpointConfigurationError> {
-    Ok(apply_checkpoint_settings(builder, checkpoint, None)?
-        .verified_cluster_namespaces(namespaces))
+    Ok(apply_checkpoint_settings(builder, checkpoint)?.verified_cluster_namespaces(namespaces))
 }
 
 fn apply_checkpoint_settings(
     builder: laminar_db::LaminarDbBuilder,
     checkpoint: &crate::config::CheckpointSection,
-    data_dir: Option<PathBuf>,
 ) -> Result<laminar_db::LaminarDbBuilder, CheckpointConfigurationError> {
     let max_state_data_bytes = resolved_checkpoint_state_bytes(checkpoint)
         .map_err(CheckpointConfigurationError::StateBudget)?;
     Ok(builder.checkpoint(StreamCheckpointConfig {
         interval_ms: Some(u64::try_from(checkpoint.interval.as_millis()).unwrap_or(u64::MAX)),
         timeout_ms: Some(u64::try_from(checkpoint.timeout.as_millis()).unwrap_or(u64::MAX)),
-        data_dir,
+        data_dir: None,
         max_retained: Some(checkpoint.max_retained),
         max_staged_bytes: Some(max_state_data_bytes),
     }))
+}
+
+async fn checkpoint_state_backend(
+    checkpoint: &crate::config::CheckpointSection,
+    key_groups: laminar_core::state::KeyGroupCount,
+) -> Result<Arc<dyn laminar_core::state::StateBackend>, CheckpointConfigurationError> {
+    let store = laminar_core::storage::object_store_builder::build_object_store(
+        &checkpoint.url,
+        &checkpoint.storage,
+    )?;
+    let durability = laminar_core::state::StateBackendDurability::for_storage_url(&checkpoint.url);
+    let probe_timeout = std::time::Duration::from_secs(5);
+    match durability {
+        laminar_core::state::StateBackendDurability::NodeDurable => {
+            laminar_core::storage::checkpoint_store::probe_object_store_conditional_create(
+                store.as_ref(),
+                "startup/",
+                probe_timeout,
+            )
+            .await
+        }
+        laminar_core::state::StateBackendDurability::ClusterShared => {
+            laminar_core::storage::checkpoint_store::probe_object_store_conditional_update(
+                store.as_ref(),
+                "startup/",
+                probe_timeout,
+            )
+            .await
+        }
+        durability => return Err(CheckpointConfigurationError::Durability(durability)),
+    }
+    .map_err(CheckpointConfigurationError::StoreContract)?;
+    let vnode_capacity = u32::from(key_groups);
+    let backend = match durability {
+        laminar_core::state::StateBackendDurability::NodeDurable => {
+            laminar_core::state::ObjectStoreBackend::node_durable(store, "local", vnode_capacity)
+        }
+        laminar_core::state::StateBackendDurability::ClusterShared => {
+            laminar_core::state::ObjectStoreBackend::cluster_shared(store, "local", vnode_capacity)
+        }
+        durability => return Err(CheckpointConfigurationError::Durability(durability)),
+    };
+    Ok(Arc::new(backend))
 }
 
 /// Resolve the one capture and recovery admission budget used by every server checkpoint store.
@@ -958,7 +985,6 @@ mod tests {
         };
         let config = ServerConfig {
             server,
-            state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             supervision: Default::default(),
             sources: vec![],
@@ -1206,7 +1232,6 @@ mod tests {
         let db = laminar_db::LaminarDB::open().unwrap();
         let config = ServerConfig {
             server: ServerSection::default(),
-            state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             supervision: Default::default(),
             sources: vec![source],
@@ -1243,7 +1268,6 @@ mod tests {
         let db = laminar_db::LaminarDB::open().unwrap();
         let config = ServerConfig {
             server: ServerSection::default(),
-            state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             supervision: Default::default(),
             sources: vec![source],
@@ -1278,7 +1302,6 @@ mod tests {
         );
         let config = ServerConfig {
             server: ServerSection::default(),
-            state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             supervision: Default::default(),
             sources: vec![source],
@@ -1306,7 +1329,6 @@ mod tests {
 
         let config = ServerConfig {
             server: ServerSection::default(),
-            state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             supervision: Default::default(),
             sources: vec![],

@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use ahash::AHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use arrow::array::ArrayRef;
 use arrow::compute;
@@ -189,7 +189,8 @@ struct SessionGroupState {
     sessions: BTreeMap<i64, SessionAccState>,
 }
 
-type FixedWindowGroups = AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>;
+type FixedWindowGroups =
+    FxHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>;
 type FixedWindows = BTreeMap<i64, FixedWindowGroups>;
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -218,11 +219,11 @@ pub(crate) struct CoreWindowCheckpoint {
 #[cfg(feature = "cluster")]
 pub(crate) struct PreparedCoreWindowTransition {
     windows: FixedWindows,
-    session_groups: AHashMap<arrow::row::OwnedRow, SessionGroupState>,
+    session_groups: FxHashMap<arrow::row::OwnedRow, SessionGroupState>,
     high_watermark_ms: i64,
-    scratch_nogroup: AHashMap<i64, Vec<u32>>,
-    scratch_grouped: AHashMap<(i64, u32), Vec<u32>>,
-    scratch_group_keys: indexmap::IndexSet<arrow::row::OwnedRow, ahash::RandomState>,
+    scratch_nogroup: FxHashMap<i64, Vec<u32>>,
+    scratch_grouped: FxHashMap<(i64, u32), Vec<u32>>,
+    scratch_group_keys: indexmap::IndexSet<arrow::row::OwnedRow, FxBuildHasher>,
     accounted_state_bytes: usize,
 }
 
@@ -237,7 +238,7 @@ pub(crate) struct CoreWindowState {
     assigner: CoreWindowAssigner,
     windows: FixedWindows,
     // Only populated for session windows.
-    session_groups: AHashMap<arrow::row::OwnedRow, SessionGroupState>,
+    session_groups: FxHashMap<arrow::row::OwnedRow, SessionGroupState>,
     row_converter: arrow::row::RowConverter,
     agg_specs: Vec<AggFuncSpec>,
     num_group_cols: usize,
@@ -264,10 +265,10 @@ pub(crate) struct CoreWindowState {
     post_projection: Option<PostProjection>,
     prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
     having_sql_cache: Option<crate::operator::HavingSqlCache>,
-    scratch_nogroup: AHashMap<i64, Vec<u32>>,
+    scratch_nogroup: FxHashMap<i64, Vec<u32>>,
     // Group ids are dense within a batch and index into scratch_group_keys.
-    scratch_grouped: AHashMap<(i64, u32), Vec<u32>>,
-    scratch_group_keys: indexmap::IndexSet<arrow::row::OwnedRow, ahash::RandomState>,
+    scratch_grouped: FxHashMap<(i64, u32), Vec<u32>>,
+    scratch_group_keys: indexmap::IndexSet<arrow::row::OwnedRow, FxBuildHasher>,
     managed_global_tumbling: bool,
     accounted_state_bytes: usize,
 }
@@ -624,7 +625,7 @@ impl CoreWindowState {
         Ok(Some(Self {
             assigner,
             windows: BTreeMap::new(),
-            session_groups: AHashMap::new(),
+            session_groups: FxHashMap::default(),
             row_converter,
             agg_specs,
             num_group_cols,
@@ -651,8 +652,8 @@ impl CoreWindowState {
             post_projection,
             prom: None,
             having_sql_cache: None,
-            scratch_nogroup: AHashMap::new(),
-            scratch_grouped: AHashMap::new(),
+            scratch_nogroup: FxHashMap::default(),
+            scratch_grouped: FxHashMap::default(),
             scratch_group_keys: indexmap::IndexSet::default(),
             managed_global_tumbling,
             accounted_state_bytes: 0,
@@ -690,7 +691,7 @@ impl CoreWindowState {
             .saturating_add(std::mem::size_of::<(i64, FixedWindowGroups)>())
     }
 
-    fn scratch_nogroup_bytes(scratch: &AHashMap<i64, Vec<u32>>) -> usize {
+    fn scratch_nogroup_bytes(scratch: &FxHashMap<i64, Vec<u32>>) -> usize {
         scratch
             .capacity()
             .saturating_mul(std::mem::size_of::<(i64, Vec<u32>)>())
@@ -1377,7 +1378,7 @@ impl CoreWindowState {
 
     fn emit_window(
         &self,
-        groups: AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
+        groups: FxHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
     ) -> Result<Option<RecordBatch>, DbError> {
         crate::aggregate_state::emit_window_batch(
             groups,
@@ -1687,7 +1688,7 @@ impl CoreWindowState {
         self.windows.clear();
         let mut total_groups = 0usize;
         for wc in &checkpoint.windows {
-            let mut groups = AHashMap::new();
+            let mut groups = FxHashMap::default();
             for gc in &wc.groups {
                 let sv_key = ipc_to_scalars(&gc.key)?;
                 let row_key = crate::aggregate_state::scalar_key_to_owned_row(
@@ -1945,7 +1946,7 @@ impl CoreWindowState {
                 })?;
                 accumulators.push(accumulator);
             }
-            let mut groups = AHashMap::new();
+            let mut groups = FxHashMap::default();
             groups.try_reserve(1).map_err(|error| {
                 DbError::Checkpoint(format!("managed CoreWindow group reserve failed: {error}"))
             })?;
@@ -1955,10 +1956,10 @@ impl CoreWindowState {
         let accounted_state_bytes = Self::fixed_windows_bytes(&windows);
         Ok(PreparedCoreWindowTransition {
             windows,
-            session_groups: AHashMap::new(),
+            session_groups: FxHashMap::default(),
             high_watermark_ms: archive.checkpoint.high_watermark_ms.to_native(),
-            scratch_nogroup: AHashMap::new(),
-            scratch_grouped: AHashMap::new(),
+            scratch_nogroup: FxHashMap::default(),
+            scratch_grouped: FxHashMap::default(),
             scratch_group_keys: indexmap::IndexSet::default(),
             accounted_state_bytes,
         })
@@ -1969,10 +1970,10 @@ impl CoreWindowState {
         debug_assert!(self.managed_global_tumbling);
         PreparedCoreWindowTransition {
             windows: BTreeMap::new(),
-            session_groups: AHashMap::new(),
+            session_groups: FxHashMap::default(),
             high_watermark_ms: i64::MIN,
-            scratch_nogroup: AHashMap::new(),
-            scratch_grouped: AHashMap::new(),
+            scratch_nogroup: FxHashMap::default(),
+            scratch_grouped: FxHashMap::default(),
             scratch_group_keys: indexmap::IndexSet::default(),
             accounted_state_bytes: 0,
         }
@@ -2082,7 +2083,7 @@ mod tests {
         CoreWindowState {
             assigner: CoreWindowAssigner::Tumbling(TumblingWindowAssigner::from_millis(size_ms)),
             windows: BTreeMap::new(),
-            session_groups: AHashMap::new(),
+            session_groups: FxHashMap::default(),
             agg_specs,
             num_group_cols: 1,
             group_types: vec![DataType::Utf8],
@@ -2107,8 +2108,8 @@ mod tests {
             post_projection: None,
             prom: None,
             having_sql_cache: None,
-            scratch_nogroup: AHashMap::new(),
-            scratch_grouped: AHashMap::new(),
+            scratch_nogroup: FxHashMap::default(),
+            scratch_grouped: FxHashMap::default(),
             scratch_group_keys: indexmap::IndexSet::default(),
             managed_global_tumbling: false,
             accounted_state_bytes: 0,
@@ -2153,7 +2154,7 @@ mod tests {
         CoreWindowState {
             assigner: CoreWindowAssigner::Tumbling(TumblingWindowAssigner::from_millis(size_ms)),
             windows: BTreeMap::new(),
-            session_groups: AHashMap::new(),
+            session_groups: FxHashMap::default(),
             agg_specs,
             num_group_cols: 1,
             group_types: vec![DataType::Utf8],
@@ -2178,8 +2179,8 @@ mod tests {
             post_projection: None,
             prom: None,
             having_sql_cache: None,
-            scratch_nogroup: AHashMap::new(),
-            scratch_grouped: AHashMap::new(),
+            scratch_nogroup: FxHashMap::default(),
+            scratch_grouped: FxHashMap::default(),
             scratch_group_keys: indexmap::IndexSet::default(),
             managed_global_tumbling: false,
             accounted_state_bytes: 0,
@@ -2212,7 +2213,7 @@ mod tests {
                 size_ms, slide_ms,
             )),
             windows: BTreeMap::new(),
-            session_groups: AHashMap::new(),
+            session_groups: FxHashMap::default(),
             agg_specs,
             num_group_cols: 1,
             group_types: vec![DataType::Utf8],
@@ -2237,8 +2238,8 @@ mod tests {
             post_projection: None,
             prom: None,
             having_sql_cache: None,
-            scratch_nogroup: AHashMap::new(),
-            scratch_grouped: AHashMap::new(),
+            scratch_nogroup: FxHashMap::default(),
+            scratch_grouped: FxHashMap::default(),
             scratch_group_keys: indexmap::IndexSet::default(),
             managed_global_tumbling: false,
             accounted_state_bytes: 0,
@@ -2269,7 +2270,7 @@ mod tests {
         CoreWindowState {
             assigner: CoreWindowAssigner::Session { gap_ms },
             windows: BTreeMap::new(),
-            session_groups: AHashMap::new(),
+            session_groups: FxHashMap::default(),
             agg_specs,
             num_group_cols: 1,
             group_types: vec![DataType::Utf8],
@@ -2294,8 +2295,8 @@ mod tests {
             post_projection: None,
             prom: None,
             having_sql_cache: None,
-            scratch_nogroup: AHashMap::new(),
-            scratch_grouped: AHashMap::new(),
+            scratch_nogroup: FxHashMap::default(),
+            scratch_grouped: FxHashMap::default(),
             scratch_group_keys: indexmap::IndexSet::default(),
             managed_global_tumbling: false,
             accounted_state_bytes: 0,

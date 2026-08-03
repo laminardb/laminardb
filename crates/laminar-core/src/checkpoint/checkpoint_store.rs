@@ -2019,6 +2019,288 @@ async fn collect_bounded_state_data(
     Ok(bytes)
 }
 
+const CONDITIONAL_PROBE_INITIAL: &[u8] = b"laminardb-conditional-put-v1";
+const CONDITIONAL_PROBE_UPDATED: &[u8] = b"laminardb-conditional-put-v2";
+const CONDITIONAL_PROBE_CONFLICT: &[u8] = b"laminardb-conditional-put-conflict";
+
+/// Prove that an object store atomically rejects a second create at the same key.
+///
+/// The probe uses one unique object and deletes that exact key before returning. It never lists.
+///
+/// # Errors
+///
+/// Returns an error when the probe times out, the store violates conditional-create semantics,
+/// or the probe object cannot be removed safely.
+pub async fn probe_object_store_conditional_create(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    timeout: std::time::Duration,
+) -> Result<(), CheckpointStoreError> {
+    run_object_store_conditional_probe(store, prefix, false, timeout).await
+}
+
+/// Prove conditional create and update semantics, including stale-update rejection.
+///
+/// Mutable shared checkpoint heads require this stronger capability. Backends that only support
+/// atomic create remain suitable for immutable checkpoint objects.
+///
+/// # Errors
+///
+/// Returns an error when the probe times out, required conditional semantics are absent, or the
+/// probe object cannot be removed safely.
+pub async fn probe_object_store_conditional_update(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    timeout: std::time::Duration,
+) -> Result<(), CheckpointStoreError> {
+    run_object_store_conditional_probe(store, prefix, true, timeout).await
+}
+
+async fn run_object_store_conditional_probe(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    require_update: bool,
+    timeout: std::time::Duration,
+) -> Result<(), CheckpointStoreError> {
+    if timeout.is_zero() {
+        return Err(CheckpointStoreError::Invalid(
+            "conditional-put probe timeout must be nonzero".into(),
+        ));
+    }
+    let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
+    let raw_path = if prefix.is_empty() {
+        format!("_laminardb/conditional-put-probes/{}", uuid::Uuid::new_v4())
+    } else {
+        format!(
+            "{prefix}/_laminardb/conditional-put-probes/{}",
+            uuid::Uuid::new_v4()
+        )
+    };
+    let path = object_store::path::Path::parse(&raw_path).map_err(|error| {
+        CheckpointStoreError::Invalid(format!(
+            "invalid conditional-put probe path '{raw_path}': {error}"
+        ))
+    })?;
+    if path.as_ref() != raw_path {
+        return Err(CheckpointStoreError::Invalid(format!(
+            "conditional-put probe path is not canonical: '{raw_path}'"
+        )));
+    }
+
+    let probe_result =
+        tokio::time::timeout(timeout, conditional_probe_at(store, &path, require_update))
+            .await
+            .unwrap_or_else(|_| {
+                Err(CheckpointStoreError::Invalid(format!(
+                    "conditional-put probe exceeded {timeout:?}"
+                )))
+            });
+    let cleanup_result = tokio::time::timeout(timeout, cleanup_conditional_probe(store, &path))
+        .await
+        .unwrap_or_else(|_| {
+            Err(CheckpointStoreError::Invalid(format!(
+                "conditional-put probe cleanup exceeded {timeout:?}"
+            )))
+        });
+    match (probe_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(probe), Err(cleanup)) => Err(CheckpointStoreError::Invalid(format!(
+            "{probe}; conditional-put probe cleanup also failed: {cleanup}"
+        ))),
+    }
+}
+
+async fn cleanup_conditional_probe(
+    store: &dyn ObjectStore,
+    path: &object_store::path::Path,
+) -> Result<(), CheckpointStoreError> {
+    let delete_error = match store.delete(path).await {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => None,
+        Err(error) => Some(error.to_string()),
+    };
+    match store.get(path).await {
+        Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Ok(_) => Err(CheckpointStoreError::Invalid(delete_error.map_or_else(
+            || "conditional-put probe remained visible after deletion".into(),
+            |error| {
+                format!(
+                    "conditional-put probe DELETE failed ({error}) and the object remained visible"
+                )
+            },
+        ))),
+        Err(error) => Err(CheckpointStoreError::Invalid(delete_error.map_or_else(
+            || format!("verify conditional-put probe deletion: {error}"),
+            |delete| {
+                format!(
+                    "conditional-put probe DELETE failed ({delete}); verification failed ({error})"
+                )
+            },
+        ))),
+    }
+}
+
+async fn conditional_probe_at(
+    store: &dyn ObjectStore,
+    path: &object_store::path::Path,
+    require_update: bool,
+) -> Result<(), CheckpointStoreError> {
+    let create = PutOptions {
+        mode: PutMode::Create,
+        ..PutOptions::default()
+    };
+    match store
+        .put_opts(
+            path,
+            PutPayload::from_bytes(bytes::Bytes::from_static(CONDITIONAL_PROBE_INITIAL)),
+            create.clone(),
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(
+            object_store::Error::NotImplemented { .. } | object_store::Error::NotSupported { .. },
+        ) => {
+            return Err(CheckpointStoreError::Invalid(
+                "object store does not support conditional create".into(),
+            ));
+        }
+        Err(error) => return Err(CheckpointStoreError::ObjectStore(error)),
+    }
+
+    match store
+        .put_opts(
+            path,
+            PutPayload::from_bytes(bytes::Bytes::from_static(CONDITIONAL_PROBE_CONFLICT)),
+            create,
+        )
+        .await
+    {
+        Err(
+            object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. },
+        ) => {}
+        Ok(_) => {
+            return Err(CheckpointStoreError::Invalid(
+                "object store accepted a duplicate conditional create".into(),
+            ));
+        }
+        Err(
+            object_store::Error::NotImplemented { .. } | object_store::Error::NotSupported { .. },
+        ) => {
+            return Err(CheckpointStoreError::Invalid(
+                "object store does not support conditional create".into(),
+            ));
+        }
+        Err(error) => return Err(CheckpointStoreError::ObjectStore(error)),
+    }
+
+    let initial_version =
+        read_conditional_probe(store, path, CONDITIONAL_PROBE_INITIAL, require_update).await?;
+    if !require_update {
+        return Ok(());
+    }
+    let update = PutOptions {
+        mode: PutMode::Update(initial_version.clone()),
+        ..PutOptions::default()
+    };
+    match store
+        .put_opts(
+            path,
+            PutPayload::from_bytes(bytes::Bytes::from_static(CONDITIONAL_PROBE_UPDATED)),
+            update,
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(
+            object_store::Error::NotImplemented { .. } | object_store::Error::NotSupported { .. },
+        ) => {
+            return Err(CheckpointStoreError::Invalid(
+                "object store does not support PutMode::Update".into(),
+            ));
+        }
+        Err(error) => return Err(CheckpointStoreError::ObjectStore(error)),
+    }
+
+    let updated_version =
+        read_conditional_probe(store, path, CONDITIONAL_PROBE_UPDATED, true).await?;
+    if updated_version == initial_version {
+        return Err(CheckpointStoreError::Invalid(
+            "conditional-update version did not change after PutMode::Update".into(),
+        ));
+    }
+
+    let stale_update = PutOptions {
+        mode: PutMode::Update(initial_version),
+        ..PutOptions::default()
+    };
+    match store
+        .put_opts(
+            path,
+            PutPayload::from_bytes(bytes::Bytes::from_static(CONDITIONAL_PROBE_CONFLICT)),
+            stale_update,
+        )
+        .await
+    {
+        Err(object_store::Error::Precondition { .. }) => {}
+        Ok(_) => {
+            return Err(CheckpointStoreError::Invalid(
+                "object store accepted a stale PutMode::Update token".into(),
+            ));
+        }
+        Err(
+            object_store::Error::NotImplemented { .. } | object_store::Error::NotSupported { .. },
+        ) => {
+            return Err(CheckpointStoreError::Invalid(
+                "object store does not support stale PutMode::Update rejection".into(),
+            ));
+        }
+        Err(error) => return Err(CheckpointStoreError::ObjectStore(error)),
+    }
+
+    let durable_version =
+        read_conditional_probe(store, path, CONDITIONAL_PROBE_UPDATED, true).await?;
+    if durable_version != updated_version {
+        return Err(CheckpointStoreError::Invalid(
+            "object-store version changed after rejecting stale PutMode::Update".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn read_conditional_probe(
+    store: &dyn ObjectStore,
+    path: &object_store::path::Path,
+    expected: &[u8],
+    require_version: bool,
+) -> Result<UpdateVersion, CheckpointStoreError> {
+    let result = store.get(path).await?;
+    if result.meta.size != expected.len() as u64
+        || result.range.start != 0
+        || result.range.end != expected.len() as u64
+    {
+        return Err(CheckpointStoreError::Invalid(
+            "conditional-put probe returned inconsistent object bounds".into(),
+        ));
+    }
+    let version = UpdateVersion {
+        e_tag: result.meta.e_tag.clone(),
+        version: result.meta.version.clone(),
+    };
+    let bytes = result.bytes().await?;
+    if bytes.as_ref() != expected {
+        return Err(CheckpointStoreError::Invalid(
+            "conditional-put probe observed bytes from a rejected write".into(),
+        ));
+    }
+    if version.e_tag.is_none() && version.version.is_none() && require_version {
+        return Err(CheckpointStoreError::Invalid(
+            "object store returned neither ETag nor version for conditional update".into(),
+        ));
+    }
+    Ok(version)
+}
+
 /// Object-store-backed checkpoint store.
 ///
 /// Drives any `object_store::ObjectStore` backend (S3, GCS, Azure,

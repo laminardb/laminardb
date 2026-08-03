@@ -4,9 +4,6 @@
 mode = "single"
 bind = "127.0.0.1:8080"
 
-[state]
-backend = "in_process"
-
 [checkpoint]
 url = "file:///tmp/laminardb/checkpoints"
 interval = "10s"

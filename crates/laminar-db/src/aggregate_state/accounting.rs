@@ -18,7 +18,7 @@ use datafusion_expr::Accumulator;
 /// Categorized charged bytes retained by aggregate state.
 ///
 /// Collection element storage describes reserved inline key/value or vector-element bytes.
-/// Hash-table private control bytes remain excluded because `AHashMap` does not expose that layout
+/// Hash-table private control bytes remain excluded because `FxHashMap` does not expose that layout
 /// as a stable contract.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct AggregateStateUsage {

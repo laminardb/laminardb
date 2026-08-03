@@ -7,8 +7,7 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use ahash::{AHashMap, AHashSet};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use arrow::array::ArrayRef;
 use arrow::compute;
@@ -53,7 +52,7 @@ use vnode_state::{AggregateVnodeSlots, AggregateVnodeState};
 /// Builds the per-window result batch for one closed window.
 /// Output schema: `[group_cols..., agg_outputs...]`.
 pub(crate) fn emit_window_batch(
-    groups: ahash::AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
+    groups: FxHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
     row_converter: &arrow::row::RowConverter,
     num_group_cols: usize,
     agg_specs: &[AggFuncSpec],
@@ -344,7 +343,7 @@ type DecodedGroupState = (arrow::row::OwnedRow, i64, Vec<Vec<ArrayRef>>);
 #[cfg(feature = "cluster")]
 struct DecodedAggMutation {
     groups: Vec<DecodedGroupState>,
-    last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
+    last_emitted: FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
 }
 
 /// A transaction image containing only keys touched by one recovered vnode chain. Delta-only
@@ -352,15 +351,16 @@ struct DecodedAggMutation {
 /// The live maps change only after the complete base + delta sequence succeeds.
 #[cfg(feature = "cluster")]
 struct StagedAggMutation {
-    groups: AHashMap<arrow::row::OwnedRow, GroupEntry>,
-    last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
+    groups: FxHashMap<arrow::row::OwnedRow, GroupEntry>,
+    last_emitted: FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
     #[cfg(test)]
-    affected: AHashSet<arrow::row::OwnedRow>,
+    affected: FxHashSet<arrow::row::OwnedRow>,
 }
 
 #[cfg(feature = "cluster")]
 fn validate_unique_decoded_group_keys(groups: &[DecodedGroupState]) -> Result<(), DbError> {
-    let mut keys: AHashSet<&[u8]> = AHashSet::with_capacity(groups.len());
+    let mut keys: FxHashSet<&[u8]> =
+        FxHashSet::with_capacity_and_hasher(groups.len(), FxBuildHasher);
     if groups.iter().any(|(key, _, _)| !keys.insert(key.as_ref())) {
         return Err(DbError::Pipeline(
             "aggregate checkpoint contains a duplicate group key".into(),
@@ -632,13 +632,14 @@ fn validate_checkpoint_layout_and_keys(
         }
     }
 
-    let mut unique = AHashSet::with_capacity(keys.len());
+    let mut unique = FxHashSet::with_capacity_and_hasher(keys.len(), FxBuildHasher);
     if keys.iter().any(|key| !unique.insert(key.as_slice())) {
         return Err(DbError::Pipeline(format!(
             "{operation}: aggregate checkpoint contains a duplicate group key"
         )));
     }
-    let mut emitted = AHashSet::with_capacity(checkpoint.last_emitted.len());
+    let mut emitted =
+        FxHashSet::with_capacity_and_hasher(checkpoint.last_emitted.len(), FxBuildHasher);
     if checkpoint
         .last_emitted
         .iter()
@@ -694,7 +695,7 @@ pub(crate) fn merge_serialized_agg_cps(slices: &[bytes::Bytes]) -> Result<Vec<u8
             .checked_add(keys.len())
             .ok_or_else(|| DbError::Pipeline("merge agg row count overflow".into()))
     })?;
-    let mut unique = AHashSet::with_capacity(logical_rows);
+    let mut unique = FxHashSet::with_capacity_and_hasher(logical_rows, FxBuildHasher);
     if layouts
         .iter()
         .flatten()
@@ -1983,7 +1984,7 @@ impl IncrementalAggState {
 
     fn finish_emit_dirty_sets(
         &mut self,
-        dirty_by_vnode: Vec<(u32, AHashSet<arrow::row::OwnedRow>)>,
+        dirty_by_vnode: Vec<(u32, FxHashSet<arrow::row::OwnedRow>)>,
         emission_succeeded: bool,
     ) {
         for (vnode, dirty) in dirty_by_vnode {
@@ -2345,9 +2346,8 @@ impl IncrementalAggState {
     fn decode_last_emitted(
         &self,
         entries: &[EmittedCheckpoint],
-    ) -> Result<AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>, DbError> {
-        let mut out: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>> =
-            AHashMap::with_capacity(entries.len());
+    ) -> Result<FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>, DbError> {
+        let mut out = FxHashMap::with_capacity_and_hasher(entries.len(), FxBuildHasher);
         for ec in entries {
             let sv_key = ipc_to_scalars(&ec.key)?;
             let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
@@ -2610,7 +2610,7 @@ impl IncrementalAggState {
         &self,
         vnode: u32,
         vnode_count: NonZeroU32,
-        only: Option<&AHashSet<arrow::row::OwnedRow>>,
+        only: Option<&FxHashSet<arrow::row::OwnedRow>>,
     ) -> Result<Vec<EmittedCheckpoint>, DbError> {
         if !self.emit_changelog {
             return Ok(Vec::new());
@@ -2812,10 +2812,10 @@ impl IncrementalAggState {
     #[cfg(all(feature = "cluster", test))]
     fn build_delta_recovery_image(
         &mut self,
-        affected: AHashSet<arrow::row::OwnedRow>,
+        affected: FxHashSet<arrow::row::OwnedRow>,
     ) -> Result<StagedAggMutation, DbError> {
-        let mut groups = AHashMap::with_capacity(affected.len());
-        let mut last_emitted = AHashMap::with_capacity(affected.len());
+        let mut groups = FxHashMap::with_capacity_and_hasher(affected.len(), FxBuildHasher);
+        let mut last_emitted = FxHashMap::with_capacity_and_hasher(affected.len(), FxBuildHasher);
         for key in &affected {
             if let Some(entry) = self.clone_group_for_recovery(key)? {
                 groups.insert(key.clone(), entry);
@@ -3009,7 +3009,7 @@ impl IncrementalAggState {
         restored_vnodes
             .try_reserve(restore_count)
             .map_err(|error| reserve_error("restored vnode roster", error))?;
-        let mut replacement_by_vnode = AHashMap::new();
+        let mut replacement_by_vnode = FxHashMap::default();
         replacement_by_vnode
             .try_reserve(restore_count)
             .map_err(|error| reserve_error("replacement vnode roster", error))?;
@@ -3047,11 +3047,11 @@ impl IncrementalAggState {
                     checked_vnode_transition_capacity(total, delta.changed.last_emitted.len())
                 })?
                 .min(self.max_groups);
-            let mut staged_groups = AHashMap::new();
+            let mut staged_groups = FxHashMap::default();
             staged_groups
                 .try_reserve(group_capacity)
                 .map_err(|error| reserve_error("staged groups", error))?;
-            let mut staged_last_emitted = AHashMap::new();
+            let mut staged_last_emitted = FxHashMap::default();
             staged_last_emitted
                 .try_reserve(emitted_capacity)
                 .map_err(|error| reserve_error("staged changelog state", error))?;
@@ -3059,7 +3059,7 @@ impl IncrementalAggState {
                 groups: staged_groups,
                 last_emitted: staged_last_emitted,
                 #[cfg(test)]
-                affected: AHashSet::new(),
+                affected: FxHashSet::default(),
             };
             let belongs_to_vnode = |key: &arrow::row::OwnedRow| {
                 Self::vnode_for_group_key(self.num_group_cols, key, vnode_count) == vnode
@@ -3313,7 +3313,7 @@ impl IncrementalAggState {
             })
             .transpose()?;
 
-        let mut affected = AHashSet::new();
+        let mut affected = FxHashSet::default();
         if let Some(mutation) = &decoded_base {
             affected.extend(mutation.groups.iter().map(|(key, _, _)| key.clone()));
             affected.extend(mutation.last_emitted.keys().cloned());
@@ -3332,8 +3332,8 @@ impl IncrementalAggState {
 
         let mut staged = if decoded_base.is_some() {
             StagedAggMutation {
-                groups: AHashMap::with_capacity(affected.len()),
-                last_emitted: AHashMap::with_capacity(affected.len()),
+                groups: FxHashMap::with_capacity_and_hasher(affected.len(), FxBuildHasher),
+                last_emitted: FxHashMap::with_capacity_and_hasher(affected.len(), FxBuildHasher),
                 affected,
             }
         } else {

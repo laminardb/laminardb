@@ -40,9 +40,7 @@
 //! - `LAMINAR_SOAK_INTERVAL_MS`  checkpoint cadence (default 500; minimum 100)
 //! - `LAMINAR_SOAK_KILLS`  total fault rounds (local exact requires at least two)
 //! - `LAMINAR_SOAK_CHECKPOINT_URL`  required cluster-shared checkpoint prefix
-//! - `LAMINAR_SOAK_STATE_URL`  required cluster-shared state prefix for vnode partials
-//! - `LAMINAR_SOAK_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_REGION`  forwarded into both
-//!   storage maps
+//! - `LAMINAR_SOAK_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_REGION`  checkpoint storage
 //! - `LAMINAR_SOAK_DELTA_BUCKET`  existing bucket for unique EO output tables
 //! - `LAMINAR_SOAK_ALLOW_S3_EMULATOR=1`  debug/soak-only MinIO protocol validation; this does not
 //!   certify an emulator or custom endpoint for production
@@ -5972,7 +5970,6 @@ fn write_config(
     interval_ms: u64,
     key_groups: u32,
     checkpoint_url: &str,
-    state_url: &str,
     brokers: &str,
     left_topic: &str,
     right_topic: &str,
@@ -5984,16 +5981,11 @@ fn write_config(
     sink: &str,
     matrix_sinks: &str,
 ) -> PathBuf {
-    // Vnode partials go through [state], not [checkpoint]: without a SHARED state store the leader
-    // durability gate (which lists the full registry) can never seal an epoch.
     let http = BASE_PORT + id as u16;
     let gossip = BASE_PORT + 100 + id as u16;
     let seeds: Vec<String> = (0..NODES)
         .map(|i| format!("\"127.0.0.1:{}\"", BASE_PORT + 100 + i as u16))
         .collect();
-    let data_dir = dir.join(format!("node{id}-data"));
-    std::fs::create_dir_all(&data_dir).unwrap();
-
     let mut storage = String::new();
     for (env, key) in [
         ("LAMINAR_SOAK_S3_ENDPOINT", "endpoint"),
@@ -6033,12 +6025,6 @@ seeds = [{seeds}]
 gossip_port = {gossip}
 advertise_host = "127.0.0.1"
 
-[state]
-backend = "object_store"
-url = "{state_url}"
-
-[state.storage]
-{storage}
 [checkpoint]
 url = "{url}"
 interval = "{interval_ms}ms"
@@ -6096,9 +6082,7 @@ fn write_single_join_config(
     sink: &str,
     matrix_sinks: &str,
 ) -> PathBuf {
-    let state_dir = dir.join("join-state");
     let checkpoint_dir = dir.join("join-checkpoints");
-    std::fs::create_dir_all(&state_dir).unwrap();
     std::fs::create_dir_all(&checkpoint_dir).unwrap();
     let portable = |path: &Path| path.display().to_string().replace('\\', "/");
     let checkpoint_path = portable(&checkpoint_dir);
@@ -6117,10 +6101,6 @@ bind = "127.0.0.1:{SINGLE_JOIN_PORT}"
 delivery = "{delivery}"
 console_token = "{SOAK_CONSOLE_TOKEN}"
 
-[state]
-backend = "local"
-path = "{state_path}"
-
 [checkpoint]
 url = "{checkpoint_url}"
 interval = "{interval_ms}ms"
@@ -6129,7 +6109,6 @@ max_retained = 5
 
 {workload}
 "#,
-        state_path = portable(&state_dir),
         delivery = delivery.server_value(),
         workload = kafka_join_workload_config(
             brokers,
@@ -6156,9 +6135,7 @@ fn write_local_exact_config(
     max_rows: u64,
     rows_per_second: u64,
 ) -> PathBuf {
-    let state_dir = dir.join("state");
     let checkpoint_dir = dir.join("checkpoints");
-    std::fs::create_dir_all(&state_dir).unwrap();
     std::fs::create_dir_all(&checkpoint_dir).unwrap();
     let portable = |path: &Path| path.display().to_string().replace('\\', "/");
     let checkpoint_path = portable(&checkpoint_dir);
@@ -6183,10 +6160,6 @@ mode = "single"
 bind = "127.0.0.1:{BASE_PORT}"
 delivery = "exactly_once"
 
-[state]
-backend = "local"
-path = "{state_path}"
-
 [checkpoint]
 url = "{checkpoint_url}"
 interval = "{interval_ms}ms"
@@ -6198,7 +6171,6 @@ name = "gen"
 connector = "generator"
 properties = {{ "rows.per.second" = "{rows_per_second}", "batch.max.size" = "256", "max.rows" = "{max_rows}" }}
 "#,
-        state_path = portable(&state_dir),
     );
     let path = dir.join("local-exact.toml");
     std::fs::write(&path, config).unwrap();
@@ -7752,7 +7724,6 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     let run_id = soak_run_id();
     let checkpoint_url =
         scoped_soak_storage_url("LAMINAR_SOAK_CHECKPOINT_URL", &run_id, "checkpoints");
-    let state_url = scoped_soak_storage_url("LAMINAR_SOAK_STATE_URL", &run_id, "state");
     let left_topic = format!("soak-cluster-left-{run_id}");
     let right_topic = format!("soak-cluster-right-{run_id}");
     let matrix_left_topic = format!("soak-cluster-matrix-left-{run_id}");
@@ -7882,7 +7853,6 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
                 interval_ms,
                 key_group_count,
                 &checkpoint_url,
-                &state_url,
                 &brokers,
                 &left_topic,
                 &right_topic,

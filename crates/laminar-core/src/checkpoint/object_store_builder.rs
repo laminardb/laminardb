@@ -1,16 +1,16 @@
 //! Factory for building `ObjectStore` instances from URL schemes.
 //!
-//! Detects the cloud provider from the URL scheme (`s3://`, `gs://`, `az://`,
-//! `abfs://`, `abfss://`, `file://`) and constructs the appropriate backend.
-//! Cloud providers require their respective feature flags (`aws`, `gcs`, `azure`).
-//!
-//! Credentials are resolved via `from_env()` (reads standard env vars like
-//! `AWS_ACCESS_KEY_ID`) with explicit overrides from the `options` map.
+//! Provider selection, credentials, retries, and client construction are
+//! delegated to `object_store`. Explicit options override environment values.
 
 #![allow(clippy::disallowed_types)] // cold path: object store setup
 
 use std::collections::HashMap;
+#[cfg(any(feature = "aws", feature = "gcs", feature = "azure"))]
+use std::hash::Hash;
 use std::path::PathBuf;
+#[cfg(any(feature = "aws", feature = "gcs", feature = "azure"))]
+use std::str::FromStr;
 use std::sync::Arc;
 
 use object_store::local::LocalFileSystem;
@@ -19,19 +19,6 @@ use object_store::ObjectStore;
 /// Errors from object store construction.
 #[derive(Debug, thiserror::Error)]
 pub enum ObjectStoreBuilderError {
-    /// The URL scheme requires a feature that is not compiled in.
-    #[error("scheme '{scheme}' requires the '{feature}' feature flag (compile with --features {feature})")]
-    MissingFeature {
-        /// The URL scheme (e.g., "s3").
-        scheme: String,
-        /// The required cargo feature.
-        feature: String,
-    },
-
-    /// Unrecognized URL scheme.
-    #[error("unsupported object store URL scheme: '{0}'")]
-    UnsupportedScheme(String),
-
     /// The URL could not be parsed.
     #[error("invalid object store URL: {0}")]
     InvalidUrl(String),
@@ -51,19 +38,16 @@ impl From<object_store::Error> for ObjectStoreBuilderError {
 ///
 /// # Supported schemes
 ///
-/// | Scheme | Feature | Builder |
-/// |--------|---------|---------|
-/// | `file://` | (always) | `LocalFileSystem` |
-/// | `s3://` | `aws` | `AmazonS3Builder` |
-/// | `gs://` | `gcs` | `GoogleCloudStorageBuilder` |
-/// | `az://`, `abfs://`, `abfss://` | `azure` | `MicrosoftAzureBuilder` |
+/// | Scheme | Feature |
+/// |--------|---------|
+/// | `file://` | (always) |
+/// | `s3://`, `s3a://` | `aws` |
+/// | `gs://` | `gcs` |
+/// | `az://`, `abfs://`, `abfss://` | `azure` |
 ///
-/// The URL's path (everything after the bucket/container) is applied as a
-/// key prefix on the returned store, so every consumer — checkpoint
-/// manifests, decision markers, control plane, state partials — is rooted
-/// under it. The cloud builders themselves only consume the bucket from the
-/// URL; without the wrapper, two clusters sharing a bucket with different
-/// path prefixes would silently collide at the bucket root.
+/// The URL path is applied as a key prefix on the returned store. R2 and
+/// `MinIO` use the S3 scheme with the endpoint option supported by
+/// `object_store`.
 ///
 /// # Errors
 ///
@@ -74,38 +58,97 @@ pub fn build_object_store(
     url: &str,
     options: &HashMap<String, String>,
 ) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
-    let scheme = url
-        .find("://")
-        .map(|i| &url[..i])
-        .ok_or_else(|| ObjectStoreBuilderError::InvalidUrl(format!("no scheme in '{url}'")))?;
-
-    let store = match scheme {
-        // file:// uses the whole path as the filesystem root — already rooted.
+    let parsed = url::Url::parse(url)
+        .map_err(|error| ObjectStoreBuilderError::InvalidUrl(error.to_string()))?;
+    match parsed.scheme() {
         "file" => return build_local_file_system(url),
-        "s3" => build_s3(url, options),
-        "gs" => build_gcs(url, options),
-        "az" | "abfs" | "abfss" => build_azure(url, options),
-        other => Err(ObjectStoreBuilderError::UnsupportedScheme(
-            other.to_string(),
-        )),
-    }?;
+        "s3" | "s3a" | "gs" | "az" | "abfs" | "abfss" => {}
+        scheme => {
+            return Err(ObjectStoreBuilderError::InvalidUrl(format!(
+                "unsupported scheme '{scheme}'"
+            )));
+        }
+    }
+    #[cfg(any(feature = "aws", feature = "gcs", feature = "azure"))]
+    validate_explicit_options(parsed.scheme(), options)?;
 
-    Ok(match url_path_prefix(url) {
-        "" => store,
-        prefix => Arc::new(object_store::prefix::PrefixStore::new(
-            store,
-            object_store::path::Path::from(prefix),
-        )),
-    })
+    // `parse_url_opts` applies options in iteration order. Keep explicit settings after the
+    // environment so aliases that resolve to the same provider key have deterministic precedence.
+    let environment = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)));
+    let mut environment = environment
+        .filter(|(key, _)| provider_environment_key(parsed.scheme(), key))
+        .collect::<Vec<_>>();
+    environment.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    let resolved = environment.into_iter().chain(
+        options
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    let (store, prefix) = object_store::parse_url_opts(&parsed, resolved)
+        .map_err(|error| ObjectStoreBuilderError::Build(error.to_string()))?;
+    let store: Arc<dyn ObjectStore> = Arc::from(store);
+    if prefix.as_ref().is_empty() {
+        Ok(store)
+    } else {
+        Ok(Arc::new(object_store::prefix::PrefixStore::new(
+            store, prefix,
+        )))
+    }
 }
 
-/// The key prefix encoded in a cloud URL's path: everything after the
-/// bucket/container authority, e.g. `s3://bucket/a/b/` → `a/b`.
-fn url_path_prefix(url: &str) -> &str {
-    let after_scheme = url.find("://").map_or(url, |i| &url[i + 3..]);
-    after_scheme
-        .find('/')
-        .map_or("", |i| after_scheme[i + 1..].trim_matches('/'))
+fn provider_environment_key(scheme: &str, key: &str) -> bool {
+    match scheme {
+        "s3" | "s3a" => key.starts_with("AWS_"),
+        "gs" => key.starts_with("GOOGLE_") || key == "SERVICE_ACCOUNT",
+        "az" | "abfs" | "abfss" => key.starts_with("AZURE_") || key == "IDENTITY_ENDPOINT",
+        _ => false,
+    }
+}
+
+#[cfg(any(feature = "aws", feature = "gcs", feature = "azure"))]
+fn validate_explicit_options(
+    scheme: &str,
+    options: &HashMap<String, String>,
+) -> Result<(), ObjectStoreBuilderError> {
+    match scheme {
+        #[cfg(feature = "aws")]
+        "s3" | "s3a" => {
+            validate_typed_options::<object_store::aws::AmazonS3ConfigKey>("S3", options)
+        }
+        #[cfg(feature = "gcs")]
+        "gs" => validate_typed_options::<object_store::gcp::GoogleConfigKey>("GCS", options),
+        #[cfg(feature = "azure")]
+        "az" | "abfs" | "abfss" => {
+            validate_typed_options::<object_store::azure::AzureConfigKey>("Azure", options)
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(any(feature = "aws", feature = "gcs", feature = "azure"))]
+fn validate_typed_options<K>(
+    provider: &str,
+    options: &HashMap<String, String>,
+) -> Result<(), ObjectStoreBuilderError>
+where
+    K: FromStr + Eq + Hash,
+    K::Err: std::fmt::Display,
+{
+    let mut canonical = HashMap::<K, &str>::with_capacity(options.len());
+    for key in options.keys() {
+        let parsed = key.to_ascii_lowercase().parse::<K>().map_err(|error| {
+            ObjectStoreBuilderError::Build(format!(
+                "invalid {provider} storage option '{key}': {error}"
+            ))
+        })?;
+        if let Some(previous) = canonical.insert(parsed, key) {
+            return Err(ObjectStoreBuilderError::Build(format!(
+                "{provider} storage options '{previous}' and '{key}' configure the same setting"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Absolute local filesystem path from a canonical lowercase `file://` URL.
@@ -192,111 +235,6 @@ fn build_local_file_system(url: &str) -> Result<Arc<dyn ObjectStore>, ObjectStor
     Ok(Arc::new(fs))
 }
 
-// ---------------------------------------------------------------------------
-// S3 (feature = "aws")
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "aws")]
-fn build_s3(
-    url: &str,
-    options: &HashMap<String, String>,
-) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
-    use object_store::aws::AmazonS3Builder;
-
-    let mut builder = AmazonS3Builder::from_env().with_url(url);
-
-    for (key, value) in options {
-        let config_key = key.parse().map_err(|e: object_store::Error| {
-            ObjectStoreBuilderError::Build(format!("invalid S3 config key '{key}': {e}"))
-        })?;
-        builder = builder.with_config(config_key, value);
-    }
-
-    let store = builder.build()?;
-    Ok(Arc::new(store))
-}
-
-#[cfg(not(feature = "aws"))]
-fn build_s3(
-    _url: &str,
-    _options: &HashMap<String, String>,
-) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
-    Err(ObjectStoreBuilderError::MissingFeature {
-        scheme: "s3".to_string(),
-        feature: "aws".to_string(),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// GCS (feature = "gcs")
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "gcs")]
-fn build_gcs(
-    url: &str,
-    options: &HashMap<String, String>,
-) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
-    use object_store::gcp::GoogleCloudStorageBuilder;
-
-    let mut builder = GoogleCloudStorageBuilder::from_env().with_url(url);
-
-    for (key, value) in options {
-        let config_key = key.parse().map_err(|e: object_store::Error| {
-            ObjectStoreBuilderError::Build(format!("invalid GCS config key '{key}': {e}"))
-        })?;
-        builder = builder.with_config(config_key, value);
-    }
-
-    let store = builder.build()?;
-    Ok(Arc::new(store))
-}
-
-#[cfg(not(feature = "gcs"))]
-fn build_gcs(
-    _url: &str,
-    _options: &HashMap<String, String>,
-) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
-    Err(ObjectStoreBuilderError::MissingFeature {
-        scheme: "gs".to_string(),
-        feature: "gcs".to_string(),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Azure (feature = "azure")
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "azure")]
-fn build_azure(
-    url: &str,
-    options: &HashMap<String, String>,
-) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
-    use object_store::azure::MicrosoftAzureBuilder;
-
-    let mut builder = MicrosoftAzureBuilder::from_env().with_url(url);
-
-    for (key, value) in options {
-        let config_key = key.parse().map_err(|e: object_store::Error| {
-            ObjectStoreBuilderError::Build(format!("invalid Azure config key '{key}': {e}"))
-        })?;
-        builder = builder.with_config(config_key, value);
-    }
-
-    let store = builder.build()?;
-    Ok(Arc::new(store))
-}
-
-#[cfg(not(feature = "azure"))]
-fn build_azure(
-    _url: &str,
-    _options: &HashMap<String, String>,
-) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
-    Err(ObjectStoreBuilderError::MissingFeature {
-        scheme: "az".to_string(),
-        feature: "azure".to_string(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,67 +290,35 @@ mod tests {
     fn test_unknown_scheme_errors() {
         let result = build_object_store("ftp://bucket/prefix", &HashMap::new());
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("unsupported"), "got: {err}");
     }
 
     #[test]
     fn test_no_scheme_errors() {
         let result = build_object_store("/just/a/path", &HashMap::new());
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("no scheme"), "got: {err}");
     }
 
     #[test]
-    fn test_s3_without_feature_errors() {
-        // This test validates the behavior when aws feature is NOT compiled.
-        // When aws IS compiled, S3 builder will fail for other reasons (no region).
-        let result = build_object_store("s3://my-bucket/prefix", &HashMap::new());
-        if cfg!(feature = "aws") {
-            // With feature enabled, it will try to build (may fail due to missing config)
-            assert!(result.is_err() || result.is_ok());
-        } else {
-            let err = result.unwrap_err().to_string();
-            assert!(err.contains("aws"), "got: {err}");
-        }
+    fn ambient_options_are_scoped_to_the_selected_provider() {
+        assert!(provider_environment_key("s3", "AWS_REGION"));
+        assert!(!provider_environment_key("s3", "REGION"));
+        assert!(!provider_environment_key("s3", "AZURE_STORAGE_TOKEN"));
+        assert!(provider_environment_key("gs", "SERVICE_ACCOUNT"));
+        assert!(provider_environment_key("az", "IDENTITY_ENDPOINT"));
+        assert!(!provider_environment_key("az", "ENDPOINT"));
     }
 
+    #[cfg(feature = "aws")]
     #[test]
-    fn test_gs_without_feature_errors() {
-        let result = build_object_store("gs://my-bucket/prefix", &HashMap::new());
-        if cfg!(feature = "gcs") {
-            assert!(result.is_err() || result.is_ok());
-        } else {
-            let err = result.unwrap_err().to_string();
-            assert!(err.contains("gcs"), "got: {err}");
-        }
-    }
+    fn explicit_provider_options_fail_closed() {
+        let mut options = HashMap::from([("aws_regoin".to_string(), "us-east-1".to_string())]);
+        let error = validate_explicit_options("s3", &options).unwrap_err();
+        assert!(error.to_string().contains("aws_regoin"), "{error}");
 
-    #[test]
-    fn test_azure_without_feature_errors() {
-        let result = build_object_store("az://my-container/prefix", &HashMap::new());
-        if cfg!(feature = "azure") {
-            assert!(result.is_err() || result.is_ok());
-        } else {
-            let err = result.unwrap_err().to_string();
-            assert!(err.contains("azure"), "got: {err}");
-        }
-    }
-
-    /// The URL path roots ALL consumers of the store (manifests,
-    /// decision markers, control plane, state partials) — two clusters
-    /// sharing a bucket must not collide at the root.
-    #[test]
-    fn url_path_prefix_extraction() {
-        assert_eq!(url_path_prefix("s3://bucket"), "");
-        assert_eq!(url_path_prefix("s3://bucket/"), "");
-        assert_eq!(url_path_prefix("s3://bucket/a"), "a");
-        assert_eq!(url_path_prefix("s3://bucket/a/b/"), "a/b");
-        assert_eq!(url_path_prefix("gs://bucket/x"), "x");
-        assert_eq!(
-            url_path_prefix("abfss://container@account.dfs.core.windows.net/p/q"),
-            "p/q"
-        );
+        options = HashMap::from([
+            ("aws_region".to_string(), "us-east-1".to_string()),
+            ("region".to_string(), "us-west-2".to_string()),
+        ]);
+        assert!(validate_explicit_options("s3", &options).is_err());
     }
 }

@@ -4,10 +4,6 @@ laminardb:
   mode: cluster
   delivery: at_least_once
   logLevel: debug
-  workers: 4
-  state:
-    backend: object_store
-    url: "s3://laminardb-ci/state"
   checkpoint:
     interval: "30s"
     timeout: "120s"
@@ -56,9 +52,6 @@ sinks:
       topic: trade-volumes
 
 persistence:
-  state:
-    enabled: true
-    size: 50Gi
   checkpoints:
     enabled: true
     size: 100Gi

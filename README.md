@@ -134,22 +134,25 @@ For source code or local deployment options, see the [`laminardb-console-ui`](ht
 
 ## Cluster Mode & Setup
 
-LaminarDB supports multi-node cluster deployments. In this mode, streaming pipelines are partitioned across virtual nodes (vnodes), and checkpoint state is distributed across the cluster.
+LaminarDB supports multi-node cluster deployments. Streaming pipelines are partitioned across
+virtual nodes (vnodes), the same unit used by embedded and single-node execution.
 
 ### Architecture & Dynamics
 
 * **Membership & Discovery**: Nodes discover one another using either a gossip-based protocol (Chitchat peer-to-peer membership over a configured `gossip_port`) or a static seeds list.
 * **Coordination**: Membership selects a leader candidate, while a renewable shared-store lease fences leader-only control paths. Vnode assignments are CAS-published through `AssignmentSnapshotStore`; there is no embedded Raft service.
 * **Dynamic Rebalancing**: Stable key groups (256 by default) are dynamically distributed across active cluster nodes. When a new node joins or an existing node departs (or fails), the leader automatically rebalances the assignments. When shutting down gracefully, a node announces a `Draining` state, letting the leader reallocate its key groups before the node terminates.
-* **Distributed Checkpoints**: Checkpoint barriers flow through the distributed operator graph and state is sealed in shared storage. Delivery is admitted from the complete source/state/sink contract.
-* **State Store**: Requires a cluster-shared `object_store` backend (S3, GCS, or Azure Blob) so another node can read and recover state partitions. Local paths and `file://` URLs are node-durable, not cluster-shared.
+* **Distributed Checkpoints**: The current coordinator seals shared checkpoint artifacts. Its accepted replacement packs one dirty-vnode object per node with manifest-indexed byte ranges; that cutover is still in progress.
+* **Checkpoint Store**: Cluster execution requires a shared `object_store` URL. Single-node replay-capable delivery currently remains fenced to the local filesystem path.
 
 > [!IMPORTANT]
 > Cluster exactly-once is admitted only for exact-certified sources and a cluster-certified,
 > checkpoint-committable sink. The current admitted path is Kafka input to direct S3/S3A
 > append-mode Delta Lake. Kafka output remains at-least-once. Other exact combinations fail closed with `[LDB-5035]`
 > before connector I/O. The four-mode production soak matrix is still pending.
-> Embedded/single-node exactly-once requires node-durable state and the built-in local checkpoint/decision store, held under an OS-released exclusive deployment lock. For the standalone server, a `file://` checkpoint URL selects that store. Shared object-store URLs and library-injected object or decision stores fail closed with `[LDB-0014]` because their writer-fencing provenance cannot yet be proved.
+> The accepted state design is authoritative in-memory `FxHashMap` state per vnode with
+> object-store-only checkpoint durability. Public backend selection is removed, but the internal
+> checkpoint-artifact cutover and four-mode production soak matrix remain pending.
 > Cluster SQL admits stateless pipelines, supported non-windowed keyed aggregates, and one bounded
 > join stage over direct append-only, watermarked sources. The join supports `INNER`, `LEFT`,
 > `RIGHT`, `FULL`, `LEFT/RIGHT SEMI`, and `LEFT/RIGHT ANTI` with ordered `VARCHAR`/`BIGINT`
@@ -183,10 +186,6 @@ cluster_tls_cert = "/etc/laminardb/tls/node.crt"
 cluster_tls_key = "/etc/laminardb/tls/node.key"
 cluster_tls_client_ca = "/etc/laminardb/tls/cluster-ca.crt"
 cluster_tls_server_name = "laminardb-cluster.internal"
-
-[state]
-backend = "object_store"
-url = "s3://my-bucket/laminardb/state"
 
 [checkpoint]
 url = "s3://my-bucket/laminardb/checkpoints"
@@ -480,7 +479,7 @@ graph TD
         App["Application Logic"]:::appClass
         subgraph Engine["LaminarDB Engine (In-Process / BareMetal)"]
             Coord["Streaming Coordinator<br/>('laminar-compute' thread)"]:::coordClass
-            InMemState["In-Memory State Store<br/>(FxHashMap)"]:::stateClass
+            InMemState["Per-Vnode In-Memory State<br/>(FxHashMap)"]:::stateClass
             Coord <--> InMemState
         end
         App -->|"Push RecordBatches<br/>via Direct API"| Coord
@@ -492,7 +491,9 @@ graph TD
 ```
 
 ### 2. Embedded Mode (Embedded / Durable Profiles)
-Runs inside the host application process but enables single-node durability. The engine logs checkpoints and state snapshots to the local filesystem (`file://`) or a remote object store (S3, GCS, Azure Blob). If the process crashes, the `RecoveryManager` restores the engine state from the latest completed checkpoint.
+Runs inside the host application process with the same vnode state used by a cluster. Checkpoints
+use a local `file://` URL or a remote object-store URL. After a crash, the recovery manager restores
+the latest committed checkpoint and replays sources from its stored offsets.
 
 ```mermaid
 graph TD
@@ -507,7 +508,7 @@ graph TD
         App["Application Logic"]:::appClass
         subgraph Engine["LaminarDB Engine (Embedded Profile)"]
             Coord["Streaming Coordinator<br/>('laminar-compute' thread)"]:::coordClass
-            InMemState["In-Memory State Store<br/>(quick_cache / FxHashMap)"]:::stateClass
+            InMemState["Per-Vnode In-Memory State<br/>(FxHashMap)"]:::stateClass
             Checkpoint["Checkpoint Coordinator"]:::recoveryClass
             Recovery["Recovery Manager"]:::recoveryClass
             
@@ -518,8 +519,8 @@ graph TD
         App -->|"Push RecordBatches"| Coord
         Coord -->|"Pull Results"| App
     end
-    Checkpoint -->|"Write Epoch WAL<br/>and Checkpoints"| Storage["Durable Storage (Local Disk / S3 / GCS)"]:::storageClass
-    Storage -->|"Restore Manifest<br/>and State"| Recovery
+    Checkpoint -->|"Write Checkpoint"| Storage["Checkpoint Storage"]:::storageClass
+    Storage -->|"Restore Manifest<br/>and Operator State"| Recovery
     
     style HostApp fill:#3b82f6,fill-opacity:0.05,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 5 5
     style Engine fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
@@ -551,7 +552,7 @@ graph TD
         
         subgraph Engine["LaminarDB Engine (Embedded Library)"]
             Coord["Streaming Coordinator<br/>('laminar-compute')"]:::coordClass
-            State["In-Memory State Store<br/>(quick_cache / FxHashMap)"]:::stateClass
+            State["Per-Vnode In-Memory State<br/>(FxHashMap)"]:::stateClass
             Checkpoint["Checkpoint Coordinator"]:::checkpointClass
             Coord <--> State
             Checkpoint -.-> State
@@ -613,7 +614,7 @@ graph TD
     E1 ---|"gRPC and Arrow-Flight<br/>Data Shuffle"| E2
 
     %% Distributed Durability
-    Control1 -->|"Leader Lease and<br/>Assignment CAS"| SharedStore["Shared Object Store (S3 / GCS / Azure)"]:::storageClass
+    Control1 -->|"Leader Lease and<br/>Assignment CAS"| SharedStore["Shared Object Store"]:::storageClass
     Control2 -->|"Read Shared<br/>Control State"| SharedStore
     Node1 -->|"Coordinated 2-Phase<br/>Commit Checkpoints"| SharedStore
     Node2 -->|"Coordinated 2-Phase<br/>Commit Checkpoints"| SharedStore:::storageClass
@@ -644,7 +645,7 @@ graph TB
             Proj["Projections & Filters"]:::computeClass
             Window["Window Operators"]:::computeClass
             Join["Join Operators"]:::computeClass
-            LocalState["Local State (FxHashMap)"]:::computeClass
+            LocalState["Per-Vnode State (FxHashMap)"]:::computeClass
             
             Proj --> Window --> Join
             Window <--> LocalState

@@ -118,10 +118,6 @@ pub fn diff_configs(old: &ServerConfig, new: &ServerConfig) -> ConfigDiff {
         diff.warnings
             .push("[server] section changed — requires restart".to_string());
     }
-    if old.state != new.state {
-        diff.warnings
-            .push("[state] section changed — requires restart".to_string());
-    }
     if old.checkpoint != new.checkpoint {
         diff.warnings
             .push("[checkpoint] section changed — requires restart".to_string());
@@ -427,7 +423,6 @@ mod tests {
     fn empty_config() -> ServerConfig {
         ServerConfig {
             server: ServerSection::default(),
-            state: laminar_core::state::StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             supervision: Default::default(),
             sources: vec![],
@@ -493,7 +488,6 @@ mod tests {
         current.sinks.push(make_sink("old_sink", "old_pipeline"));
         current.server.bind = "127.0.0.1:8100".to_owned();
         current.server.console_token = Some(Secret::new("old-console-token"));
-        current.state = laminar_core::state::StateBackendConfig::local("./old-state");
         current.checkpoint.url = "file:///old-checkpoints".to_owned();
         current.supervision.max_restarts = Some(3);
         current.sql = Some("CREATE SOURCE retained (id BIGINT)".to_owned());
@@ -526,7 +520,6 @@ mod tests {
         );
 
         let retained_server = current.server.clone();
-        let retained_state = current.state.clone();
         let retained_checkpoint = current.checkpoint.clone();
         let retained_supervision = current.supervision.clone();
         let retained_sql = current.sql.clone();
@@ -542,7 +535,6 @@ mod tests {
         new.sinks = vec![make_sink("new_sink", "new_pipeline")];
         new.server.bind = "127.0.0.1:8200".to_owned();
         new.server.console_token = Some(Secret::new("new-console-token"));
-        new.state = laminar_core::state::StateBackendConfig::local("./new-state");
         new.checkpoint.url = "file:///new-checkpoints".to_owned();
         new.supervision.max_restarts = Some(9);
         new.sql = Some("CREATE SOURCE replaced (id BIGINT)".to_owned());
@@ -565,7 +557,6 @@ mod tests {
             current.server.console_token.as_ref().unwrap().expose(),
             "old-console-token"
         );
-        assert_eq!(current.state, retained_state);
         assert_eq!(current.checkpoint, retained_checkpoint);
         assert_eq!(current.supervision, retained_supervision);
         assert_eq!(current.sql, retained_sql);
@@ -677,14 +668,14 @@ mod tests {
         let old = empty_config();
         let mut new = empty_config();
         new.server.bind = "0.0.0.0:9999".to_string();
-        new.state = laminar_core::state::StateBackendConfig::local("./data/state");
+        new.checkpoint.url = "file:///data/checkpoints".to_owned();
         new.ai
             .defaults
             .insert("classify".to_string(), "m".to_string());
         let diff = diff_configs(&old, &new);
         assert!(diff.is_empty()); // no reloadable changes
         assert!(diff.warnings.iter().any(|w| w.contains("[server]")));
-        assert!(diff.warnings.iter().any(|w| w.contains("[state]")));
+        assert!(diff.warnings.iter().any(|w| w.contains("[checkpoint]")));
         assert!(diff.warnings.iter().any(|w| w.contains("[ai]")));
     }
 

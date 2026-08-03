@@ -10,8 +10,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use laminar_core::state::{
-    KeyGroupCount, StateBackendConfig, StateBackendDurability, DEFAULT_CLUSTER_KEY_GROUP_COUNT,
-    LOCAL_KEY_GROUP_COUNT,
+    KeyGroupCount, StateBackendDurability, DEFAULT_CLUSTER_KEY_GROUP_COUNT, LOCAL_KEY_GROUP_COUNT,
 };
 use laminar_db::DeliveryGuarantee;
 use regex::Regex;
@@ -359,14 +358,6 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
                 config.checkpoint.interval,
             ));
         }
-        let scope = config.state.durability_scope();
-        if !scope.satisfies(StateBackendDurability::ClusterShared) {
-            errors.push(format!(
-                "mode = \"cluster\" requires ClusterShared [state] storage; configured scope is \
-                 {scope:?}. Use s3://, gs://, or az:// storage; local paths and file:// are \
-                 node-local"
-            ));
-        }
         let checkpoint_scope = StateBackendDurability::for_storage_url(&config.checkpoint.url);
         if !checkpoint_scope.satisfies(StateBackendDurability::ClusterShared) {
             errors.push(format!(
@@ -383,13 +374,6 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
                  object-store checkpoints require a term-fenced deployment lease"
                     .to_string(),
             );
-        }
-        let scope = config.state.durability_scope();
-        if !scope.satisfies(StateBackendDurability::NodeDurable) {
-            errors.push(format!(
-                "exactly-once delivery requires at least NodeDurable [state] storage; configured \
-                 scope is {scope:?}"
-            ));
         }
         let checkpoint_scope = StateBackendDurability::for_storage_url(&config.checkpoint.url);
         if !checkpoint_scope.satisfies(StateBackendDurability::NodeDurable) {
@@ -464,8 +448,6 @@ fn connector_property_is_flat(value: &toml::Value) -> bool {
 pub struct ServerConfig {
     #[serde(default)]
     pub server: ServerSection,
-    #[serde(default)]
-    pub state: StateBackendConfig,
     #[serde(default)]
     pub checkpoint: CheckpointSection,
     /// `[supervision]` — auto-restart policy on a fatal fault (single-node only).
@@ -1107,6 +1089,60 @@ fn default_gossip_port() -> u16 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn shipped_server_configs_deserialize() {
+        for (name, input) in [
+            ("root", include_str!("../../../laminardb.toml")),
+            (
+                "minimal",
+                include_str!("../../../examples/laminardb-minimal.toml"),
+            ),
+            (
+                "standalone",
+                include_str!("../../../examples/laminardb.toml"),
+            ),
+            (
+                "cluster",
+                include_str!("../../../examples/laminardb-cluster.toml"),
+            ),
+            (
+                "binance-1",
+                include_str!("../../../examples/binance-cluster-node1.toml"),
+            ),
+            (
+                "binance-2",
+                include_str!("../../../examples/binance-cluster-node2.toml"),
+            ),
+            (
+                "bluesky-firehose",
+                include_str!("../../../examples/bluesky-firehose/laminar.toml"),
+            ),
+            (
+                "bluesky-news",
+                include_str!("../../../examples/bluesky-news/laminar.toml"),
+            ),
+            (
+                "aiops",
+                include_str!("../../../examples/claude-code-aiops/config.toml"),
+            ),
+            (
+                "iceberg",
+                include_str!("../../../examples/kafka-iceberg-timeseries/laminar.toml"),
+            ),
+            (
+                "nats",
+                include_str!("../../../examples/nats-payments/config.toml"),
+            ),
+            (
+                "server-demo",
+                include_str!("../../../examples/server-demo/laminardb.toml"),
+            ),
+        ] {
+            toml::from_str::<ServerConfig>(input)
+                .unwrap_or_else(|error| panic!("{name} config does not deserialize: {error}"));
+        }
+    }
+
     const AI_TOML: &str = r#"
 [server]
 
@@ -1329,9 +1365,6 @@ task = "classify"
 mode = "single"
 bind = "127.0.0.1:8080"
 
-[state]
-backend = "in_process"
-
 [checkpoint]
 url = "file:///tmp/checkpoints"
 interval = "10s"
@@ -1469,10 +1502,6 @@ bind = "0.0.0.0:8080"
 delivery = "at_least_once"
 key_groups = 256
 
-[state]
-backend = "object_store"
-url = "s3://bucket/state"
-
 [checkpoint]
 url = "s3://bucket/checkpoints"
 interval = "30s"
@@ -1505,12 +1534,8 @@ connector = "kafka"
         assert_eq!(config.server.mode, ServerMode::Cluster);
         assert_eq!(config.server.delivery, DeliveryGuarantee::AtLeastOnce);
         assert_eq!(config.server.resolved_key_groups().get(), 256);
-        assert!(matches!(
-            &config.state,
-            StateBackendConfig::ObjectStore { .. }
-        ));
         assert_eq!(
-            config.state.durability_scope(),
+            StateBackendDurability::for_storage_url(&config.checkpoint.url),
             StateBackendDurability::ClusterShared
         );
         assert!(config.discovery.is_some());
@@ -1527,21 +1552,10 @@ connector = "kafka"
 
     #[test]
     fn test_runtime_durability_scope_is_fail_closed() {
-        let local_exact: ServerConfig = toml::from_str(
-            r#"
-[server]
-delivery = "exactly_once"
-
-[state]
-backend = "in_process"
-"#,
-        )
-        .unwrap();
-        let ConfigError::ValidationErrors { errors } = validate_config(&local_exact).unwrap_err()
-        else {
-            panic!("expected validation errors");
-        };
-        assert!(errors.iter().any(|error| error.contains("NodeDurable")));
+        let local_exact: ServerConfig =
+            toml::from_str("[server]\ndelivery = \"exactly_once\"\n").unwrap();
+        validate_config(&local_exact)
+            .expect("the default durable checkpoint URL is sufficient for local exactly-once");
 
         let local_cluster: ServerConfig = toml::from_str(
             r#"
@@ -1549,10 +1563,6 @@ node_id = "node-1"
 
 [server]
 mode = "cluster"
-
-[state]
-backend = "local"
-path = "/tmp/laminar-state"
 
 [discovery]
 strategy = "static"
@@ -1565,7 +1575,9 @@ seeds = ["node-1:7946"]
         else {
             panic!("expected validation errors");
         };
-        assert!(errors.iter().any(|error| error.contains("ClusterShared")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("ClusterShared [checkpoint]")));
 
         let cluster_exact: ServerConfig = toml::from_str(
             r#"
@@ -1574,10 +1586,6 @@ node_id = "node-1"
 [server]
 mode = "cluster"
 delivery = "exactly_once"
-
-[state]
-backend = "object_store"
-url = "s3://bucket/state"
 
 [discovery]
 strategy = "static"
@@ -1602,10 +1610,6 @@ node_id = "node-1"
 mode = "cluster"
 delivery = "exactly_once"
 
-[state]
-backend = "object_store"
-url = "s3://bucket/state"
-
 [checkpoint]
 url = "s3://bucket/checkpoints"
 
@@ -1626,10 +1630,6 @@ node_id = "node-1"
 [server]
 mode = "cluster"
 delivery = "best_effort"
-
-[state]
-backend = "object_store"
-url = "s3://bucket/state"
 
 [checkpoint]
 url = "s3://bucket/checkpoints"
@@ -1674,10 +1674,6 @@ url = "memory://checkpoint"
 [server]
 delivery = "exactly_once"
 
-[state]
-backend = "local"
-path = "/tmp/laminar-state"
-
 [checkpoint]
 url = "s3://bucket/checkpoints"
 "#,
@@ -1689,20 +1685,6 @@ url = "s3://bucket/checkpoints"
             panic!("expected validation errors");
         };
         assert!(errors.iter().any(|error| error.contains("[LDB-0014]")));
-    }
-
-    #[test]
-    fn removed_managed_state_options_are_rejected() {
-        for option in [
-            "state_memory_budget_bytes = 1073741824",
-            "state_tier_dir = \"/data/tier\"",
-            "state_tier_group_demotion = true",
-        ] {
-            let input = format!("[server]\nmode = \"single\"\n{option}\n");
-            let error = toml::from_str::<ServerConfig>(&input)
-                .expect_err("removed managed-state options must not be ignored");
-            assert!(error.to_string().contains("unknown field"), "{error}");
-        }
     }
 
     #[test]
@@ -1875,10 +1857,6 @@ mode = "cluster"
 bind = "0.0.0.0:8080"
 delivery = "at_least_once"
 
-[state]
-backend = "object_store"
-url = "s3://bucket/state"
-
 [checkpoint]
 url = "s3://bucket/checkpoints"
 
@@ -1901,10 +1879,6 @@ node_id = "node-1"
 mode = "cluster"
 bind = "127.0.0.1:8080"
 delivery = "at_least_once"
-
-[state]
-backend = "object_store"
-url = "s3://bucket/state"
 
 [checkpoint]
 url = "s3://bucket/checkpoints"
@@ -1944,10 +1918,6 @@ node_id = "node-1"
 mode = "cluster"
 bind = "127.0.0.1:8080"
 delivery = "at_least_once"
-
-[state]
-backend = "object_store"
-url = "s3://bucket/state"
 
 [checkpoint]
 url = "s3://bucket/checkpoints"
@@ -2313,10 +2283,6 @@ bind = "127.0.0.1:8080"
 console_token = "{}"
 diagnostic_read_token = "{}"
 
-[state]
-backend = "object_store"
-url = "az://laminardb-test/state"
-
 [checkpoint]
 url = "az://laminardb-test/checkpoints"
 
@@ -2412,7 +2378,6 @@ alice = "wonderland-key"
     fn test_default_values_applied() {
         let config = ServerConfig {
             server: ServerSection::default(),
-            state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             supervision: Default::default(),
             sources: vec![],
@@ -2428,7 +2393,6 @@ alice = "wonderland-key"
 
         assert_eq!(config.server.mode, ServerMode::Single);
         assert_eq!(config.server.bind, "127.0.0.1:8080");
-        assert!(matches!(config.state, StateBackendConfig::InProcess));
         assert_eq!(config.checkpoint.interval, Duration::from_secs(10));
         assert_eq!(config.checkpoint.timeout, Duration::from_secs(120));
     }
@@ -2462,15 +2426,6 @@ alice = "wonderland-key"
             let input = format!("[server]\nmode = \"cluster\"\nkey_groups = {invalid}\n");
             assert!(toml::from_str::<ServerConfig>(&input).is_err());
         }
-    }
-
-    #[test]
-    fn state_rejects_retired_vnode_capacity() {
-        let error = toml::from_str::<ServerConfig>(
-            "[state]\nbackend = \"in_process\"\nvnode_capacity = 256\n",
-        )
-        .expect_err("key-group topology must not be configured per state backend");
-        assert!(error.to_string().contains("vnode_capacity"), "{error}");
     }
 
     #[test]

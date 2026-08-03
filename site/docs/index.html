@@ -498,7 +498,6 @@
       <h4>Server</h4>
       <a href="#server-config">Server Config</a>
       <a href="#cluster-config">Cluster Config</a>
-      <a href="#state-config">State Store</a>
       <a href="#checkpoint-config">Checkpoints</a>
       <a href="#console-ui-api">Console UI &amp; Control API</a>
       <a href="#rest-api">REST API</a>
@@ -718,8 +717,7 @@ mode = "single"
 bind = "0.0.0.0:8080"
 console_token = "supersecret"
 pgwire_bind = "0.0.0.0:5433"
-pgwire_allow_remote = true
-log_level = "info"</code></pre>
+pgwire_allow_remote = true</code></pre>
       </div>
 
       <!-- ============================================================ -->
@@ -730,10 +728,10 @@ log_level = "info"</code></pre>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">crates/laminar-server/src/config.rs:641</a></div>
 
       <p>
-        When <code>mode = "cluster"</code>, the server requires a unique <code>node_id</code> and a <code>[discovery]</code> section. Cluster coordination uses the configured shared state store; there is no separate <code>[coordination]</code> section or embedded Raft service.
+        When <code>mode = "cluster"</code>, the server requires a unique <code>node_id</code> and a <code>[discovery]</code> section. Cluster coordination uses the configured shared checkpoint object store; there is no separate <code>[coordination]</code> section or embedded Raft service.
       </p>
       <p>
-        Cluster mode requires shared state on S3, GCS, or Azure. At-least-once requires replayable input and a durable sink. Cluster exactly-once is connector-gated; the current candidate is exact-certified Kafka input with direct S3/S3A append-mode Delta Lake, pending the production soak gate. Local paths and <code>file://</code> state are rejected because peers cannot recover them.
+        Cluster mode requires a shared checkpoint URL on S3, GCS, or Azure. At-least-once requires replayable input and a durable sink. Cluster exactly-once is connector-gated; the current admitted composition is exact-certified Kafka input with direct S3/S3A append-mode Delta Lake, pending the production soak gate. Local paths and <code>file://</code> checkpoints are rejected because peers cannot recover them.
       </p>
 
       <h3>[discovery]</h3>
@@ -781,45 +779,6 @@ gossip_port = 7946
 advertise_host = "10.0.0.1"
 seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]</code></pre>
       </div>
-
-      <!-- STATE -->
-      <h2 id="state-config">[state]</h2>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/src/state/config.rs" target="_blank" rel="noopener">crates/laminar-core/src/state/config.rs:43</a></div>
-
-      <p>
-        The <code>[state]</code> section configures storage for per-vnode checkpoint artifacts and exact-attempt durability seals. Hot aggregate, join, and window state remains in the operator runtime; this setting does not provide an incremental disk-backed keyed-state engine. It is a tagged union using the <code>backend</code> key.
-      </p>
-
-      <h3>In-Process State (Non-durable, in-memory)</h3>
-      <p>Configure with <code>backend = "in_process"</code> (the default).</p>
-
-      <h3>Local State (Node-durable filesystem)</h3>
-      <p>Configure with <code>backend = "local"</code>. This survives a same-node process restart and is valid for embedded/single-node exactly-once, but it is not visible to another cluster node.</p>
-      <table class="config-table">
-        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
-        <tbody>
-          <tr>
-            <td class="field-name">path</td>
-            <td class="field-type">String</td>
-            <td class="field-required">required</td>
-            <td>Local directory path where state partitions are stored.</td>
-          </tr>
-        </tbody>
-      </table>
-
-      <h3>Object Store State (Failure scope determined by URL)</h3>
-      <p>Configure with <code>backend = "object_store"</code>. S3, GCS, and Azure URLs are cluster-shared; a <code>file://</code> URL remains node-durable only. Cluster mode requires one of the shared cloud schemes.</p>
-      <table class="config-table">
-        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
-        <tbody>
-          <tr>
-            <td class="field-name">url</td>
-            <td class="field-type">String</td>
-            <td class="field-required">required</td>
-            <td>State URL: <code>s3://</code>, <code>gs://</code>, <code>az://</code>/<code>abfs://</code>, or node-local <code>file://</code>.</td>
-          </tr>
-        </tbody>
-      </table>
 
       <!-- CHECKPOINT -->
       <h2 id="checkpoint-config">[checkpoint]</h2>
@@ -1066,7 +1025,7 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
       </p>
 
       <p><strong>What reloads without restart:</strong> sources, pipelines, sinks, lookups (add, remove, or change).</p>
-      <p><strong>What requires restart:</strong> <code>[server]</code>, <code>[state]</code>, <code>[checkpoint]</code> sections. A warning is returned if these sections change.</p>
+      <p><strong>What requires restart:</strong> <code>[server]</code> and <code>[checkpoint]</code> sections. A warning is returned if these sections change.</p>
 
       <p style="font-size: 0.8rem; color: var(--text-dim);">
         Reload order: remove changed/deleted sinks &rarr; pipelines &rarr; lookups &rarr; sources,
@@ -1841,12 +1800,12 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
           <tr>
             <td class="field-name" style="color: var(--text);">at_least_once</td>
             <td>Default. Recovery resumes replayable sources from the finalized checkpoint cut, so some records may be processed again.</td>
-            <td>Checkpointing, replayable sources, and durably acknowledged sinks. Cluster mode additionally requires cluster-shared state.</td>
+            <td>Checkpointing, replayable sources, and durably acknowledged sinks. Cluster mode additionally requires a cluster-shared checkpoint URL.</td>
           </tr>
           <tr>
             <td class="field-name" style="color: var(--text);">exactly_once</td>
             <td>Barrier-aligned state and source positions are sealed before checkpoint-committable sink output becomes externally visible.</td>
-            <td>Single-node requires node-durable state, an exclusively locked local checkpoint directory, an exact-certified replayable source, and a coordinated sink. Cluster mode additionally requires shared state, exact-certified Kafka input, and direct S3/S3A append-mode Delta Lake; native-cloud production certification remains release-soak gated. Kafka output and Apache Iceberg remain durable at-least-once. Unsupported combinations fail before connector I/O.</td>
+            <td>Single-node currently requires an exclusively locked local checkpoint directory, an exact-certified replayable source, and a coordinated sink. Cluster mode requires a shared checkpoint URL, exact-certified Kafka input, and direct S3/S3A append-mode Delta Lake; production certification remains release-soak gated. Kafka output and Apache Iceberg remain durable at-least-once. Unsupported combinations fail before connector I/O.</td>
           </tr>
         </tbody>
       </table>
@@ -1868,13 +1827,6 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
 mode = "single"
 bind = "0.0.0.0:8080"
 delivery = "at_least_once"
-
-[state]
-backend = "object_store"
-url = "s3://my-bucket/laminardb/state"
-
-[state.storage]
-aws_region = "us-east-1"
 
 [checkpoint]
 url = "s3://my-bucket/laminardb/checkpoints"

@@ -4,7 +4,6 @@
 //! `file://`, or S3/GCS/Azure).
 
 pub mod backend;
-pub mod config;
 pub mod in_process;
 pub mod object_store;
 pub mod partition_key;
@@ -16,7 +15,6 @@ pub use backend::{
     SealedCommitDescriptorWriter, SealedPartialReadEnvelope, SealedVnodePartial, SealedVnodeWriter,
     StateBackend, StateBackendDurability, StateBackendError, VnodePartialLineage,
 };
-pub use config::{StateBackendBuildError, StateBackendConfig};
 pub use in_process::InProcessBackend;
 pub use object_store::ObjectStoreBackend;
 pub use partition_key::{PartitionKeyCodecError, PartitionKeyCodecV1, PartitionKeySchemaV1};

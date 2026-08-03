@@ -131,10 +131,6 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
-            {{- if .Values.persistence.state.enabled }}
-            - name: state
-              mountPath: /var/lib/laminardb/state
-            {{- end }}
             - name: checkpoints
               mountPath: /var/lib/laminardb/checkpoints
             {{- if and .Values.laminardb.pgwire.enabled .Values.laminardb.pgwire.tls.existingSecret }}
@@ -151,17 +147,6 @@ spec:
             name: {{ include "laminardb.fullname" . }}
         - name: tmp
           emptyDir: {}
-        {{- if .Values.persistence.state.enabled }}
-        - name: state
-          {{- if .Values.persistence.state.useEmptyDir }}
-          emptyDir:
-            {{- if .Values.persistence.state.emptyDirMedium }}
-            medium: {{ .Values.persistence.state.emptyDirMedium }}
-            {{- end }}
-          {{- else }}
-          emptyDir: {}
-          {{- end }}
-        {{- end }}
         # Volatile; durable checkpoints need the StatefulSet PVC or an object store.
         - name: checkpoints
           emptyDir: {}

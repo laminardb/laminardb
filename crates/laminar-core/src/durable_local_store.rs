@@ -150,6 +150,7 @@ impl DurableLocalObjectStore {
     }
 
     /// Open a store with one live process owner for protocols that use local overwrites.
+    #[cfg(test)]
     pub(crate) fn new_exclusive(
         root: impl AsRef<FsPath>,
         lock_name: &str,

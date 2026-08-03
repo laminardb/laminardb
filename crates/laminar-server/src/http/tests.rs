@@ -380,7 +380,6 @@ fn test_state_with_db_and_gate(
         config_path: PathBuf::from("test.toml"),
         current_config: parking_lot::RwLock::new(crate::config::ServerConfig {
             server,
-            state: laminar_core::state::StateBackendConfig::default(),
             checkpoint: crate::config::CheckpointSection::default(),
             supervision: Default::default(),
             sources: vec![],
@@ -473,7 +472,6 @@ fn test_state_with_auth_and_gate(
         config_path: PathBuf::from("test.toml"),
         current_config: parking_lot::RwLock::new(crate::config::ServerConfig {
             server,
-            state: laminar_core::state::StateBackendConfig::default(),
             checkpoint: crate::config::CheckpointSection::default(),
             supervision: Default::default(),
             sources: vec![],

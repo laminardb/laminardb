@@ -21,9 +21,9 @@
   roster, vnode inventory, source cut, state seal, and external publication cursor. Production
   certification remains pending the four-mode real-connector fault, validity, and latency soak
   matrix.
-- Hot operator state remains in memory. `StateBackend` persists immutable checkpoint artifacts; no
-  embedded hot-state database is selected. A spill tier requires a separate measurement-led
-  decision.
+- The public `[state]` backend selector is removed; `[checkpoint]` is the sole durability
+  configuration. Aggregate and window hot maps now use `FxHashMap`. The final one-node-object
+  checkpoint cutover and production soak certification remain pending.
 - The v0.28 checkpoint and state format is intentionally incompatible with older persisted formats,
   which are rejected and require a fresh deployment namespace.
 

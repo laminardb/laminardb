@@ -394,8 +394,7 @@ impl LaminarDbBuilder {
 
     /// Pipeline-wide charged-byte limit for managed operator working state.
     ///
-    /// This is an execution-memory envelope and is independent of checkpoint or local-state
-    /// backend configuration.
+    /// This execution-memory envelope is independent of checkpoint storage.
     #[must_use]
     pub fn pipeline_max_managed_state_bytes(mut self, bytes: usize) -> Self {
         self.config.pipeline_max_managed_state_bytes = Some(bytes);
@@ -404,9 +403,8 @@ impl LaminarDbBuilder {
 
     /// Pre-encoding work limit for one retractable MIN/MAX checkpoint capture.
     ///
-    /// This is independent of checkpoint storage and local-state backend configuration. The charge
-    /// is a cached accumulator work proxy, not an encoded-payload or process-RSS limit. Database
-    /// construction rejects zero.
+    /// This is independent of checkpoint storage. The charge is a cached accumulator work proxy,
+    /// not an encoded-payload or process-RSS limit. Database construction rejects zero.
     #[must_use]
     pub fn pipeline_max_retractable_extremum_checkpoint_bytes(mut self, bytes: usize) -> Self {
         self.config

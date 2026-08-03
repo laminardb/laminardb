@@ -16,9 +16,9 @@ use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use crate::checkpoint::{
-    AssignmentDrainId, AssignmentDrainTransition, CheckpointAssignmentFence,
-    ClusterRecoveryCapsule, LeaderProof, LeaderProofOwner, RecoveryCapsuleRef,
-    MAX_CHECKPOINT_PARTICIPANTS,
+    probe_object_store_conditional_update, AssignmentDrainId, AssignmentDrainTransition,
+    CheckpointAssignmentFence, CheckpointStoreError, ClusterRecoveryCapsule, LeaderProof,
+    LeaderProofOwner, RecoveryCapsuleRef, MAX_CHECKPOINT_PARTICIPANTS,
 };
 use crate::checkpoint_decision::{
     CheckpointDecisionStore, CheckpointOutcome, CheckpointScope, CheckpointVerdict, DecisionError,
@@ -43,9 +43,6 @@ use super::snapshot::{
 const LEASE_PREFIX: &str = "control/leader-lease/";
 const AUTHORITY_HEAD_PATH: &str = "control/leader-lease-head/v1.json";
 const STORE_CONTRACT_PROBE_PREFIX: &str = "control/object-store-contract-probes/v1/";
-const STORE_CONTRACT_PROBE_V1: &[u8] = b"laminardb-control-store-contract-v1";
-const STORE_CONTRACT_PROBE_V2: &[u8] = b"laminardb-control-store-contract-v2";
-const STORE_CONTRACT_PROBE_STALE: &[u8] = b"laminardb-control-store-contract-stale";
 const RECOVERY_RELEASE_TERMINAL_PREFIX: &str = "control/recovery-release-terminals/v2/";
 const AUTHORITY_RECORD_VERSION: u32 = 9;
 const AUTHORITY_HEAD_VERSION: u32 = 1;
@@ -1670,214 +1667,16 @@ impl LeaderLeaseStore {
     /// Returns an error when the store does not enforce native conditional writes, omits update
     /// metadata, times out, or cannot remove the probe.
     pub async fn verify_store_contract(&self, timeout: Duration) -> Result<(), LeaseError> {
-        if timeout.is_zero() {
-            return Err(LeaseError::Invalid(
-                "object-store contract probe timeout must be nonzero".into(),
-            ));
-        }
-
-        let path = OsPath::from(format!(
-            "{STORE_CONTRACT_PROBE_PREFIX}{}.probe",
-            Uuid::new_v4()
-        ));
-        let validation = tokio::time::timeout(timeout, self.validate_store_contract_at(&path))
-            .await
-            .unwrap_or_else(|_| {
-                Err(LeaseError::Io(format!(
-                    "object-store contract probe exceeded {timeout:?}"
-                )))
-            });
-        let cleanup = tokio::time::timeout(timeout, self.cleanup_store_contract_probe(&path))
-            .await
-            .unwrap_or_else(|_| {
-                Err(LeaseError::Io(format!(
-                    "object-store contract probe cleanup exceeded {timeout:?}"
-                )))
-            });
-
-        match (validation, cleanup) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-            (Err(validation), Err(cleanup)) => Err(LeaseError::Io(format!(
-                "object-store contract validation failed ({validation}); cleanup failed ({cleanup})"
-            ))),
-        }
-    }
-
-    async fn validate_store_contract_at(&self, path: &OsPath) -> Result<(), LeaseError> {
-        self.store
-            .put_opts(
-                path,
-                PutPayload::from(Bytes::from_static(STORE_CONTRACT_PROBE_V1)),
-                PutOptions {
-                    mode: PutMode::Create,
-                    ..PutOptions::default()
-                },
-            )
-            .await
-            .map_err(|error| {
-                LeaseError::Io(format!(
-                    "object-store contract PutMode::Create failed: {error}"
-                ))
-            })?;
-
-        self.require_store_contract_create_conflict(path).await?;
-
-        let version_v1 = self
-            .read_store_contract_probe(path, STORE_CONTRACT_PROBE_V1)
-            .await?;
-        self.store
-            .put_opts(
-                path,
-                PutPayload::from(Bytes::from_static(STORE_CONTRACT_PROBE_V2)),
-                PutOptions {
-                    mode: PutMode::Update(version_v1.clone()),
-                    ..PutOptions::default()
-                },
-            )
-            .await
-            .map_err(|error| {
-                LeaseError::Io(format!(
-                    "object-store contract PutMode::Update failed: {error}"
-                ))
-            })?;
-
-        let version_v2 = self
-            .read_store_contract_probe(path, STORE_CONTRACT_PROBE_V2)
-            .await?;
-        if version_v2 == version_v1 {
-            return Err(LeaseError::Invalid(
-                "object-store conditional-update version did not change after PutMode::Update"
-                    .into(),
-            ));
-        }
-
-        match self
-            .store
-            .put_opts(
-                path,
-                PutPayload::from(Bytes::from_static(STORE_CONTRACT_PROBE_STALE)),
-                PutOptions {
-                    mode: PutMode::Update(version_v1),
-                    ..PutOptions::default()
-                },
-            )
-            .await
-        {
-            Err(object_store::Error::Precondition { .. }) => {}
-            Ok(_) => {
-                return Err(LeaseError::Invalid(
-                    "object-store accepted a stale PutMode::Update token".into(),
-                ));
-            }
-            Err(error) => {
-                return Err(LeaseError::Io(format!(
-                    "object-store stale PutMode::Update failed unexpectedly: {error}"
-                )));
-            }
-        }
-
-        let durable_version = self
-            .read_store_contract_probe(path, STORE_CONTRACT_PROBE_V2)
-            .await?;
-        if durable_version != version_v2 {
-            return Err(LeaseError::Invalid(
-                "object-store version changed after rejecting stale PutMode::Update".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    async fn require_store_contract_create_conflict(
-        &self,
-        path: &OsPath,
-    ) -> Result<(), LeaseError> {
-        match self
-            .store
-            .put_opts(
-                path,
-                PutPayload::from(Bytes::from_static(STORE_CONTRACT_PROBE_STALE)),
-                PutOptions {
-                    mode: PutMode::Create,
-                    ..PutOptions::default()
-                },
-            )
-            .await
-        {
-            Err(
-                object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. },
-            ) => Ok(()),
-            Ok(_) => Err(LeaseError::Invalid(
-                "object-store contract PutMode::Create overwrote an existing object".into(),
-            )),
-            Err(error) => Err(LeaseError::Io(format!(
-                "object-store contract duplicate PutMode::Create failed unexpectedly: {error}"
-            ))),
-        }
-    }
-
-    async fn read_store_contract_probe(
-        &self,
-        path: &OsPath,
-        expected: &[u8],
-    ) -> Result<UpdateVersion, LeaseError> {
-        let result = self.store.get(path).await.map_err(|error| {
-            LeaseError::Io(format!("object-store contract probe GET failed: {error}"))
-        })?;
-        let version = UpdateVersion {
-            e_tag: result.meta.e_tag.clone(),
-            version: result.meta.version.clone(),
-        };
-        if version.e_tag.is_none() && version.version.is_none() {
-            return Err(LeaseError::Invalid(
-                "object-store contract probe GET returned neither ETag nor version".into(),
-            ));
-        }
-        if result.meta.size != u64::try_from(expected.len()).unwrap_or(u64::MAX) {
-            return Err(LeaseError::Invalid(format!(
-                "object-store contract probe is {} bytes; expected {}",
-                result.meta.size,
-                expected.len()
-            )));
-        }
-        let bytes = result.bytes().await.map_err(|error| {
-            LeaseError::Io(format!(
-                "object-store contract probe payload read failed: {error}"
-            ))
-        })?;
-        if bytes.as_ref() != expected {
-            return Err(LeaseError::Invalid(
-                "object-store contract probe content changed unexpectedly".into(),
-            ));
-        }
-        Ok(version)
-    }
-
-    async fn cleanup_store_contract_probe(&self, path: &OsPath) -> Result<(), LeaseError> {
-        let delete_error = match self.store.delete(path).await {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => None,
-            Err(error) => Some(error.to_string()),
-        };
-        match self.store.get(path).await {
-            Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Ok(_) => Err(LeaseError::Io(delete_error.map_or_else(
-                || "object-store contract probe remained visible after deletion".into(),
-                |error| {
-                    format!(
-                        "object-store contract probe deletion failed ({error}) and the object remained visible"
-                    )
-                },
-            ))),
-            Err(error) => Err(LeaseError::Io(delete_error.map_or_else(
-                || format!("verify object-store contract probe deletion: {error}"),
-                |delete| {
-                    format!(
-                        "object-store contract probe deletion failed ({delete}); verification failed ({error})"
-                    )
-                },
-            ))),
-        }
+        probe_object_store_conditional_update(
+            self.store.as_ref(),
+            STORE_CONTRACT_PROBE_PREFIX,
+            timeout,
+        )
+        .await
+        .map_err(|error| match error {
+            CheckpointStoreError::Invalid(message) => LeaseError::Invalid(message),
+            error => LeaseError::Io(error.to_string()),
+        })
     }
 
     fn recovery_fault_inventory_from(record: &LeaderAuthorityRecord) -> RecoveryFaultInventory {

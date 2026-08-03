@@ -778,7 +778,6 @@ async fn occupied_http_port_fails_before_local_cluster_activation() {
     };
     let config = ServerConfig {
         server: server_config,
-        state: laminar_core::state::StateBackendConfig::default(),
         checkpoint: crate::config::CheckpointSection::default(),
         supervision: Default::default(),
         sources: Vec::new(),

@@ -1,89 +1,58 @@
-# ADR-008: One managed vnode-state lifecycle
+# ADR-008: In-memory vnode state with object-store checkpoints
 
 - **Status:** accepted; production validation pending
-- **Updated:** 2026-07-31
-- **Working state target:** one worker-local TidesDB instance
+- **Updated:** 2026-08-03
 - **Current status:** [distributed state](../DISTRIBUTED_STATE.md)
 
 ## Decision
 
-LaminarDB uses one lifecycle for stateful operators: stable identity, vnode ownership, capture,
-bounded restore, off-side preparation, fenced publication, revocation, accounting, and recovery.
-Every stateful operator consumes the same signed relation changes and stores its keyed indexes in
-that lifecycle. Operator-specific key and value encodings are allowed, but alternate state engines,
-ownership paths, checkpoint paths, and compatibility formats are not.
+LaminarDB keeps authoritative working state in concrete per-vnode `FxHashMap` layouts. Vnodes are
+the unit of routing, ownership, checkpointing, restore, and rescale for joins, aggregations,
+windows, sessions, timers, temporal history, and materialized views.
 
-`StateBackend` is the durable checkpoint-artifact boundary. Its in-process, local-disk, and object-
-store implementations change artifact placement only; they do not serve row-path lookups. Committed
-seals and recovery capsules remain authoritative.
+Embedded and single-node deployments use one node that owns every vnode and routes shuffles over
+local channels. Cluster deployments run the same stateful operators with vnodes spread across nodes.
+There is no storage trait for working state, embedded state database, local durable state, spill
+tier, or runtime selector.
 
-Working state uses one TidesDB database and one retained column family per worker. TidesDB owns
-memory-resident memtables, the shared block cache, WAL, flushing, compaction, and local-disk spill;
-LaminarDB does not duplicate those functions. Logical prefixes identify pipeline, operator, state
-table, vnode, ownership generation, and operator key. A processing batch changes all of its indexes
-in one transaction.
+The only durability mechanism is a checkpoint written through the `object_store` crate. Each node
+concatenates its dirty-vnode chunks into one checkpoint data object. The manifest indexes every
+vnode by byte range and records the state required for exact recovery: window panes and open
+windows, sessions, aggregate accumulators, join buffers and ASOF history, channel watermarks, idle
+flags, timers, and source offsets.
 
-Production configuration supplies an explicit engine memory budget and local-disk reserve. Writes
-flush from bounded memtables into local SSTables, and frequently read blocks stay in the block
-cache. Auto memory sizing, one database or column family per vnode, engine object-store mode, and a
-second Laminar-managed RAM/spill tier are rejected.
+Recovery restores the latest committed checkpoint and replays sources from its offsets. Range GETs
+load only the vnodes assigned to the recovering node. Chunk reference counts in committed manifests
+drive garbage collection; object listing is never used to infer references.
 
-TidesDB local data is disposable and is not the EO authority. `StateBackend` continues to store
-portable committed checkpoint artifacts through the existing provider-neutral object-store path.
-An uncertain local transaction outcome fail-stops the worker attempt; recovery restores the last
-committed vnode state and replays its source input.
+Checkpoint configuration is a provider-neutral URL. S3, GCS, Azure Blob, S3-compatible R2 and
+MinIO, and local filesystem storage use the same `object_store` path. LaminarDB does not add
+provider-specific retry, backoff, multipart, or CAS implementations. Manifest publication uses a
+conditional put, and startup fails unless a capability probe proves that the configured store
+honors it.
 
-TidesDB is the sole selected embedded engine, with no RocksDB fallback or runtime selector. Native
-9.3.15 has the required incomplete-batch rejection fix. Integration is gated on publication and
-qualification of the matching official Rust package; LaminarDB does not ship a fork, git dependency,
-or vendored native copy while that release is unavailable.
+At-least-once and exactly-once use identical operator state. Their difference is the composition of
+source replay, checkpoint publication, and sink commit contracts.
 
-## Supported distributed operators
+## Rationale
 
-The distributed join is a bounded, append-only directional event-time equi join over one or more
-ordered `BIGINT`/`VARCHAR` keys. `INNER`, left/right/full outer, left/right semi, and left/right anti
-joins use the same vnode state in single-node and cluster mode. Each side must be a directly
-watermarked source, and every join has a positive finite time bound.
-
-Join state is held per vnode. Checkpoints capture the exact owned roster, restore validates identity
-and lineage before decoding, and rebalance prepares replacement vnodes before an infallible fenced
-swap. Watermark advancement expires idle as well as active vnodes. Cross, as-of, general non-equi,
-unbounded, multiway, and intermediate-input joins remain rejected.
-
-Keyed grouped aggregates may consume a named join pipeline and use the same lifecycle. A fused
-`JOIN ... GROUP BY` stage and cluster event-time window aggregates remain rejected.
-
-## Delivery composition
-
-State correctness does not by itself provide exactly-once output. Runtime admission composes source,
-state, checkpoint decision, and sink contracts:
-
-- at-least-once requires replayable input and a durably acknowledged sink;
-- exactly-once requires exact-certified input and a checkpoint-committable sink; and
-- cluster exactly-once additionally requires cluster-certified source handoff and immutable external
-  publication.
-
-The admitted cluster exact composition is Kafka source input to direct S3/S3A append-mode Delta
-Lake; production certification remains gated on the full soak matrix.
-Kafka output remains at-least-once. Azure/GCS Delta require provider fault soaks before cluster-EO
-certification. Iceberg remains durable at-least-once because format-level atomic commits do not
-supply LaminarDB's checkpoint committer/cursor. Other exact combinations fail admission before I/O.
-
-## Resource and failure rules
-
-The graph accounts logical live, prepared, and retired state, including overlap during ownership
-transition. Record processing updates only touched state. Join materialization is capped by rows and
-bytes per cycle; exceeding a cap causes a terminal controlled failure instead of an unbounded
-allocation.
-
-Validation completes before owned decode or publication. A failure after stateful mutation begins
-requires recovery and withholds affected output. Logical accounting does not claim allocator, RSS,
-transport-buffer, or storage-client coverage; the soak matrix measures those operational effects.
+- [Megaphone](https://www.vldb.org/pvldb/vol12/p1002-hoffmann.pdf) shows that stable fine-grained
+  key bins let state move incrementally without stop-the-world migration.
+- [Styx (2026)](https://link.springer.com/article/10.1007/s00778-026-00971-x) reinforces
+  fine-grained key-set migration and asynchronous snapshots as tail-latency controls.
+- [Flink 2 disaggregated state](https://www.vldb.org/pvldb/vol18/p4846-mei.pdf) demonstrates that
+  remote hot state needs asynchronous access and caching to recover its I/O cost. LaminarDB keeps
+  object storage off the record path instead of adding that machinery before measurements require
+  it.
+- Flink's [SharedStateRegistry](https://nightlies.apache.org/flink/flink-docs-release-1.15/api/java/org/apache/flink/runtime/state/SharedStateRegistry.html)
+  provides the production precedent for explicit shared-checkpoint reference tracking.
 
 ## Consequences
 
-- Single-node and cluster joins share one state and recovery implementation.
-- ALO and EO differ by connector and commit contracts, not operator state machinery.
-- Checkpoint storage can vary without changing the single TidesDB hot-state path.
-- Unsupported shapes fail closed instead of entering legacy formats or fallback operators.
+- Record-path state lookup remains an in-memory hash lookup with no storage I/O.
+- Object-store PUT count scales with node count and checkpoint frequency, not vnode count.
+- One vnode representation serves local execution, cluster execution, and rescaling.
+- State larger than available memory is an explicit admission or capacity failure, not a silent
+  spill or alternate execution mode.
+- A committed checkpoint plus replayable source offsets is the complete recovery authority.
 - Production readiness remains unclaimed until the four-mode real-connector soak matrix passes.

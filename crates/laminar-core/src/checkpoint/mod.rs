@@ -41,8 +41,9 @@ pub use checkpoint_manifest::{
     PIPELINE_IDENTITY_VERSION,
 };
 pub use checkpoint_store::{
-    CheckpointStore, CheckpointStoreError, FileSystemCheckpointStore, ObjectStoreCheckpointStore,
-    RecoveryReport, ValidationIssue, ValidationResult,
+    probe_object_store_conditional_create, probe_object_store_conditional_update, CheckpointStore,
+    CheckpointStoreError, FileSystemCheckpointStore, ObjectStoreCheckpointStore, RecoveryReport,
+    ValidationIssue, ValidationResult,
 };
 pub use prepared_witness::{PreparedCheckpointWitness, MAX_PREPARED_CHECKPOINT_WITNESSES};
 pub use recovery_capsule::{

@@ -140,6 +140,7 @@ impl ObjectStoreBackend {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn node_durable_with_empty_prefix_cleanup<T>(
         store: Arc<T>,
         instance_id: impl Into<String>,

@@ -566,7 +566,7 @@
               <div class="layer-components">
                 <span class="layer-chip">StreamingCoordinator</span>
                 <span class="layer-chip">Operators</span>
-                <span class="layer-chip">State Store</span>
+                <span class="layer-chip">In-Memory State</span>
                 <span class="layer-chip">DataFusion Exec</span>
               </div>
             </div>
@@ -1096,7 +1096,7 @@ FROM tickets;</code></pre>
             <ul class="status-list">
               <li>Streaming operator graph evaluation (tumble, sliding, hopping, session windows).</li>
               <li>Bounded interval joins; lookup and temporal joins in local mode.</li>
-              <li>Dynamic partitioning and state store lookup indexing.</li>
+              <li>Dynamic vnode partitioning and in-memory lookup indexes.</li>
               <li>Chandy-Lamport barrier checkpointing (2-phase commit).</li>
               <li>Multi-node coordination, gossip discovery, durable leader leases, and CAS-published assignments.</li>
             </ul>

@@ -2,10 +2,8 @@ replicaCount: 3
 
 laminardb:
   mode: cluster
+  delivery: at_least_once
   logLevel: info
-  state:
-    backend: object_store
-    url: "s3://laminardb-ci/state"
   checkpoint:
     url: "s3://laminardb-ci/checkpoints"
   cluster:
@@ -14,8 +12,6 @@ laminardb:
       gossipPort: 7946
 
 persistence:
-  state:
-    enabled: false
   checkpoints:
     enabled: false
 

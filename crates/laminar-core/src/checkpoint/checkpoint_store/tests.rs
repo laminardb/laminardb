@@ -1144,6 +1144,32 @@ fn make_obj_store() -> ObjectStoreCheckpointStore {
 }
 
 #[tokio::test]
+async fn conditional_put_probes_are_capability_specific_and_clean_up() {
+    use futures::TryStreamExt;
+
+    let memory = Arc::new(object_store::memory::InMemory::new());
+    let timeout = std::time::Duration::from_secs(1);
+    probe_object_store_conditional_create(memory.as_ref(), "test/", timeout)
+        .await
+        .unwrap();
+    probe_object_store_conditional_update(memory.as_ref(), "test/", timeout)
+        .await
+        .unwrap();
+    assert!(memory.list(None).try_next().await.unwrap().is_none());
+
+    let directory = tempfile::tempdir().unwrap();
+    let local = object_store::local::LocalFileSystem::new_with_prefix(directory.path()).unwrap();
+    probe_object_store_conditional_create(&local, "test/", timeout)
+        .await
+        .unwrap();
+    let error = probe_object_store_conditional_update(&local, "test/", timeout)
+        .await
+        .expect_err("local filesystems do not offer token-based conditional update");
+    assert!(error.to_string().contains("PutMode::Update"), "{error}");
+    assert!(local.list(None).try_next().await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn test_obj_save_and_load_latest() {
     let store = make_obj_store();
     let m = make_manifest(1);

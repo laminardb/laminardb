@@ -1,6 +1,6 @@
-use ahash::{AHashMap, AHashSet};
 use datafusion_common::ScalarValue;
 use laminar_core::state::KeyGroupCount;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::accounting::{
     logical_collection_element_usage, logical_collection_spare_capacity_usage,
@@ -16,11 +16,11 @@ use crate::error::DbError;
 /// changelog state, and checkpoint bookkeeping under the same owner prevents a vnode transition
 /// from publishing only part of a group's state.
 pub(super) struct AggregateVnodeState {
-    pub(super) groups: AHashMap<arrow::row::OwnedRow, GroupEntry>,
-    pub(super) last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
-    pub(super) emit_dirty_keys: AHashSet<arrow::row::OwnedRow>,
-    pub(super) checkpoint_dirty_keys: AHashSet<arrow::row::OwnedRow>,
-    pub(super) last_emitted_dirty_keys: AHashSet<arrow::row::OwnedRow>,
+    pub(super) groups: FxHashMap<arrow::row::OwnedRow, GroupEntry>,
+    pub(super) last_emitted: FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
+    pub(super) emit_dirty_keys: FxHashSet<arrow::row::OwnedRow>,
+    pub(super) checkpoint_dirty_keys: FxHashSet<arrow::row::OwnedRow>,
+    pub(super) last_emitted_dirty_keys: FxHashSet<arrow::row::OwnedRow>,
     #[cfg(feature = "cluster")]
     pub(super) delta_chain_len: Option<u32>,
     #[cfg(feature = "cluster")]
@@ -39,11 +39,11 @@ pub(super) struct AggregateVnodeSlots {
 impl Default for AggregateVnodeState {
     fn default() -> Self {
         Self {
-            groups: AHashMap::new(),
-            last_emitted: AHashMap::new(),
-            emit_dirty_keys: AHashSet::new(),
-            checkpoint_dirty_keys: AHashSet::new(),
-            last_emitted_dirty_keys: AHashSet::new(),
+            groups: FxHashMap::default(),
+            last_emitted: FxHashMap::default(),
+            emit_dirty_keys: FxHashSet::default(),
+            checkpoint_dirty_keys: FxHashSet::default(),
+            last_emitted_dirty_keys: FxHashSet::default(),
             #[cfg(feature = "cluster")]
             delta_chain_len: None,
             #[cfg(feature = "cluster")]
@@ -54,7 +54,7 @@ impl Default for AggregateVnodeState {
 }
 
 impl AggregateVnodeState {
-    fn hash_set_spare_usage(values: &AHashSet<arrow::row::OwnedRow>) -> AggregateStateUsage {
+    fn hash_set_spare_usage(values: &FxHashSet<arrow::row::OwnedRow>) -> AggregateStateUsage {
         logical_collection_spare_capacity_usage::<arrow::row::OwnedRow>(
             values.capacity(),
             values.len(),
@@ -86,8 +86,8 @@ impl AggregateVnodeState {
 
     #[cfg(feature = "cluster")]
     pub(super) fn try_from_recovered(
-        groups: AHashMap<arrow::row::OwnedRow, GroupEntry>,
-        last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
+        groups: FxHashMap<arrow::row::OwnedRow, GroupEntry>,
+        last_emitted: FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
         mark_emit_dirty: bool,
         mark_checkpoint_dirty: bool,
     ) -> Result<Self, (&'static str, std::collections::TryReserveError)> {
@@ -206,7 +206,7 @@ impl AggregateVnodeState {
 
     pub(super) fn replace_emit_dirty_keys_after_attempt(
         &mut self,
-        mut dirty: AHashSet<arrow::row::OwnedRow>,
+        mut dirty: FxHashSet<arrow::row::OwnedRow>,
         emission_succeeded: bool,
     ) {
         let previous_spare = Self::hash_set_spare_usage(&dirty);

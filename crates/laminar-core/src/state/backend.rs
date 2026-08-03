@@ -994,7 +994,7 @@ impl StateBackendDurability {
             {
                 Self::NodeDurable
             }
-            Some("s3" | "gs" | "az" | "abfs" | "abfss") => Self::ClusterShared,
+            Some("s3" | "s3a" | "gs" | "az" | "abfs" | "abfss") => Self::ClusterShared,
             _ => Self::Volatile,
         }
     }
@@ -1489,6 +1489,29 @@ mod tests {
             !StateBackendDurability::NodeDurable.satisfies(StateBackendDurability::ClusterShared)
         );
         assert!(!StateBackendDurability::Volatile.satisfies(StateBackendDurability::NodeDurable));
+    }
+
+    #[test]
+    fn storage_urls_are_classified_fail_closed() {
+        for url in [
+            "s3://bucket/state",
+            "s3a://bucket/state",
+            "gs://bucket/state",
+            "az://container/state",
+        ] {
+            assert_eq!(
+                StateBackendDurability::for_storage_url(url),
+                StateBackendDurability::ClusterShared
+            );
+        }
+        assert_eq!(
+            StateBackendDurability::for_storage_url("file:///tmp/state"),
+            StateBackendDurability::NodeDurable
+        );
+        assert_eq!(
+            StateBackendDurability::for_storage_url("memory://state"),
+            StateBackendDurability::Volatile
+        );
     }
 
     #[test]

@@ -1095,28 +1095,6 @@ pub async fn start_cluster(
                 .into(),
         ));
     }
-    if !config
-        .state
-        .durability_scope()
-        .satisfies(laminar_core::state::StateBackendDurability::ClusterShared)
-    {
-        return Err(ClusterStartupError::EngineConstruction(
-            "cluster mode requires ClusterShared state storage".into(),
-        ));
-    }
-    let state_proof_store = config
-        .state
-        .build_object_store()
-        .map_err(|error| {
-            ClusterStartupError::EngineConstruction(format!(
-                "state namespace proof object store: {error}"
-            ))
-        })?
-        .ok_or_else(|| {
-            ClusterStartupError::EngineConstruction(
-                "cluster mode requires an object-store-backed state namespace".into(),
-            )
-        })?;
     let key_groups = config.server.resolved_key_groups();
 
     // Claim the stable node identity before discovery can publish a duplicate member. The
@@ -1391,10 +1369,6 @@ pub async fn start_cluster(
     if let Some(ref token) = config.server.console_token {
         builder = builder.http_auth_token(token.expose());
     }
-    if let Some(path) = config.state.local_storage_dir() {
-        builder = builder.storage_dir(path);
-    }
-
     // Build the vnode registry. If a shared `AssignmentSnapshot` already exists,
     // every node adopts it; otherwise the first peer CAS-creates it and losers
     // re-load and adopt the winner.
@@ -1465,7 +1439,7 @@ pub async fn start_cluster(
             &startup_participants,
             namespace_control,
             Arc::clone(&control_store),
-            state_proof_store,
+            Arc::clone(&control_store),
             cluster_cfg.formation_timeout,
         ) => Some(result),
     };
@@ -1492,7 +1466,7 @@ pub async fn start_cluster(
     }
     info!(
         participants = startup_participants.len(),
-        "Shared checkpoint and state namespaces verified"
+        "Shared checkpoint namespace verified"
     );
 
     let controller = tokio::select! {

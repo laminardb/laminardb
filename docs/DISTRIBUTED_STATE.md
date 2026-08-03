@@ -1,125 +1,81 @@
 # Distributed state
 
-- **Status date:** 2026-08-02
-- **Working state target:** one worker-local TidesDB instance
-- **Recovery authority:** committed checkpoint artifacts
+- **Status date:** 2026-08-03
+- **Decision:** accepted
+- **Implementation:** coordinator cutover in progress
 - **Production validation:** pending the full soak matrix
 
-## Current boundary
+## Current implementation
 
-LaminarDB has one managed vnode-state lifecycle: capture, restore, prepare, publish, revoke,
-account, and recover. The bounded interval join, aggregates, and windows use operator-specific
-payloads within that lifecycle; they are not alternate state engines or compatibility paths.
+Operator working state is in memory, and the public state-backend selector has been removed. The
+standalone server derives its temporary checkpoint-artifact backend from the single checkpoint URL.
+Aggregate and window hot maps use FxHashMap where their current layouts permit it.
 
-Source connectors declare append-only, keyed-upsert, or full-changelog input explicitly. Source
-primary keys are ordered catalog and pipeline-identity data. Mutation and raw CDC-envelope inputs
-remain fail-closed until the canonical signed-weight row schema is installed end to end.
+The coordinator still writes the version 6 manifest, operator sidecars, and legacy per-vnode
+StateBackend artifacts. Some operator layouts and local/cluster paths are not yet unified. Those
+are migration code, not the production target. No release should claim the target checkpoint shape
+or production readiness until that code is deleted and the final soaks pass.
 
-The current distributed join is an in-memory, append-only bounded event-time equi-join over direct
-watermarked sources while the common mutable relation state is built. It implements `INNER`,
-`LEFT`, `RIGHT`, `FULL`, `LEFT SEMI`, `RIGHT SEMI`, `LEFT ANTI`, and `RIGHT ANTI`. Keys may be
-ordered composites of Arrow `Utf8`/`Int64` columns, with the type matching at each position. Every
-projected expression needs an explicit alias. The join uses canonical tuple routing, per-vnode
-state, aligned checkpoint capture, bounded restore, and fenced rebalance.
+## Settled target contract
 
-The same operator and keyed-aggregate machinery runs in single-node and cluster mode under
-at-least-once or exactly-once delivery; the delivery choice changes the connector/checkpoint
-contract, not join or aggregation semantics. Output from any join kind can feed a supported keyed
-aggregate only through a separate named stream. Fused `JOIN ... GROUP BY`, joins over intermediate
-streams, unbounded/cross/general non-equality joins, and multi-way joins are rejected. Event-time
-windowed aggregation remains unsupported in cluster mode.
+Every deployment uses the same state machinery. Embedded and single-node runtimes are one node
+owning every vnode and use local shuffle channels. A cluster runs the same operators with vnodes
+spread across nodes and remote shuffles only when ownership crosses a node boundary.
 
-Cluster exactly-once is connector-gated. The current admitted composition is exact-certified Kafka
-input with direct S3/S3A coordinated append-mode Delta Lake. Delta also recognizes standard Azure
-Blob/ADLS and GCS targets for shared at-least-once operation and valid local contracts, but they are
-not cluster-EO certified until native provider fault soaks pass. Custom cloud endpoints and
-emulators are not EO evidence. A Kafka sink is durable at-least-once, not exactly-once. Iceberg
-append is durable at-least-once and is rejected for EO because it has no LaminarDB checkpoint-bound
-catalog commit cursor. Cluster materialized views and temporal/lookup joins remain fail-closed.
+Vnodes are the unit of ownership, routing, checkpointing, restore, and rescale for joins,
+aggregations, windows, sessions, timers, temporal history, and materialized views. Authoritative
+working state is a concrete per-vnode FxHashMap; there is no hot-state trait, local state database,
+spill tier, or runtime backend selector.
 
-## State and latency
+A checkpoint contains window panes and open windows, session intervals, aggregation accumulators,
+join buffers and retained ASOF history, per-channel watermarks and idle flags, timers, source
+offsets, and connector recovery metadata.
 
-The selected working-state shape is one TidesDB database with one retained column family per
-worker. Logical key prefixes separate pipelines, operators, tables, and vnodes. TidesDB owns the
-memtable, block cache, WAL, flush, compaction, and local-disk capacity. LaminarDB does not add a
-second full-state cache or implement spilling. Writes enter memtables and flush to local SSTables at
-bounded thresholds; frequently read SSTable blocks are retained in the engine's block cache.
+Each node writes one immutable data object per checkpoint. Dirty-vnode frames are concatenated and
+the manifest records their byte ranges and digests, so restore reads only assigned vnodes and PUT
+count scales with nodes rather than vnode count. Committed manifests carry explicit chunk reference
+counts for direct garbage collection; listing is never used to infer live references.
 
-The engine memory limit must be an explicit byte value derived from the process/container budget;
-TidesDB auto-sizing is not accepted in production containers. The block cache, write buffer, flush
-pressure, file-descriptor ceiling, and disk reserve are validated at startup and measured under
-checkpoint and compaction load. Local NVMe is the production profile. One admitted Arrow batch is
-applied as one atomic state transaction; an error with an uncertain outcome poisons that worker
-attempt before output or checkpoint publication.
+Checkpoint storage is selected by URL and built through the object_store crate. The target path
+supports local files, S3 and S3-compatible R2/MinIO, GCS, and Azure Blob. Provider retry, backoff,
+multipart, and conditional-write behavior remain in object_store. Manifest publication uses a
+conditional put, and startup must fail unless a bounded capability probe proves the required Create
+or Update semantics.
 
-`StateBackend` remains the durable checkpoint-artifact boundary in process, on local disk, or in
-shared object storage. It is not queried per row and is not a selectable hot-state engine. TidesDB
-directories are disposable local working state, so cluster recovery still uses provider-neutral
-committed checkpoint artifacts to restore vnodes on a new owner. TidesDB object-store mode is not
-part of this path.
+Recovery restores the latest committed checkpoint, then replays each source from offsets in that
+checkpoint. ALO and EO share operator state; their difference is the source, checkpoint-publication,
+and sink-commit contract.
 
-The record path uses bounded batches, cached logical byte accounting, and no checkpoint or object
-store I/O. Join output is hard-capped at 262,144 rows and 64 MiB per cycle. The current operator
-fails when one Zipfian fanout exceeds either cap and is therefore not production-ready for the
-required skew workload. The relation-state join must instead resume that fanout across bounded
-cycles, apply downstream backpressure, and checkpoint its output cursor with the state that proves
-which pairs were emitted. Checkpoint encoding, storage, and pruning remain off the record path.
+## Current capability boundary
 
-TidesDB is the only selected embedded engine; there is no RocksDB alternative or runtime backend
-selector. Native TidesDB 9.3.15 contains the required incomplete-transaction-batch rejection fix,
-but the matching official Rust wrapper and source crate are not yet published. Wrapper 0.11.1,
-which packages native 9.3.6, is not an integration target. LaminarDB will not use a git dependency,
-fork, or vendored C source. Runtime integration starts with the official 0.11.2-or-later package and
-passes the focused atomicity, lifecycle, memory-limit, and tail-latency gates. Until then, the
-existing in-memory layouts are transitional implementation, not a second product option. The
-wrapper declares Rust edition 2024, which the workspace's Rust 1.95 baseline already supports; do
-not raise the workspace toolchain requirement solely for this dependency.
+The distributed join currently admits INNER, LEFT, RIGHT, FULL, LEFT/RIGHT SEMI, and LEFT/RIGHT
+ANTI over its supported bounded append-only shape. Mutable relation state, resumable hot-key
+fanout, temporal joins, cluster windows, and materialized views remain gaps.
 
-## Implementation sequence
+Cluster EO remains connector-gated. Exact-certified Kafka input with coordinated direct S3/S3A
+Delta publication is the admitted cluster composition. Kafka and Iceberg sinks remain ALO; other
+EO combinations fail before connector I/O. Single-node replay-capable delivery currently requires
+the fenced local filesystem checkpoint path; remote single-node writer fencing is not yet admitted.
 
-1. Define one ingress contract for append, keyed-upsert, and full before/after changelogs. Normalize
-   all mutations to signed `__weight` rows and reject missing keys or before-images when correctness
-   cannot be proved.
-2. Add one private worker-local relation-state service backed only by TidesDB. Keep native types out
-   of operator APIs, use one database and column family per worker, and atomically apply each
-   admitted batch across all logical indexes.
-3. Move materialized views and grouped aggregates onto that relation state. Support group deletion,
-   checked retractions, checkpoint tombstones, and update output as old `-1` plus new `+1`.
-4. Move all eight symmetric join kinds onto signed left/right arrangements. Add correct outer,
-   semi, and anti transitions, resumable bounded fanout for skewed keys, then allow join output to
-   feed aggregation and materialized-view joins in local and cluster execution.
-5. Implement backward `ASOF`, event-time `FOR SYSTEM_TIME AS OF`, and `TEMPORAL PROBE JOIN`
-   `LIST`/`RANGE` as selection policies over one signed versioned right-side arrangement. Route
-   versions and probes by the equality key's vnode; checkpoint pending target-time probes,
-   selected-match ledgers, timers, and frontiers together. Emit `-1/+1` corrections when a mutation
-   changes the selected version, retain the per-key predecessor when compacting history, and
-   finalize only when `right_watermark > probe_time`. A temporal probe produces one nullable-right
-   result per requested offset. Forward/nearest forms require a finite tolerance; processing-time,
-   indefinitely non-final forms, and silent pending-probe eviction remain unsupported.
-6. Move windows, event-time indexes, watermarks, and timers onto the same state path. Bounded joins
-   evict only after their watermark/lateness contract; regular unbounded joins retain state without
-   a silent correctness-changing TTL.
-7. Admit sinks by their actual append, keyed-upsert, or full-changelog capability. Keep ALO and EO on
-   the same operator state; implement checkpoint-coupled Kafka, Delta, and Iceberg publication as
-   separate connector commit protocols.
-8. Remove superseded maps, codecs, compatibility paths, and append-only filters after each
-   replacement is live. Finish with deterministic correction oracles and the single-node/cluster ×
-   ALO/EO Zipfian fault-and-latency soak matrix.
+## Remaining cutover
+
+1. Atomically replace the legacy manifest writer and reader with one node object, vnode byte ranges,
+   complete vnode frames, per-channel event-time state, and direct range restore.
+2. Add manifest-led refcount GC, then delete LIST-based artifact GC, StateBackend, its
+   implementations, configuration type, integration tests, and builder plumbing.
+3. Finish the remaining operator and local/cluster topology migrations without alternate state
+   machinery.
+4. Add term-fenced remote single-node checkpoint publication without a second state path.
+5. Run deterministic correction oracles and the single-node/cluster × ALO/EO Zipfian fault and
+   latency soak matrix.
 
 ## Evidence gate
 
-The implementation is not production-certified until all four real-connector validity soaks pass:
+Production certification requires real-connector validity soaks for single-node ALO, single-node
+EO, three-node cluster ALO, and three-node cluster EO. Each run uses two Kafka inputs, Zipfian keys,
+process kills and recovery, an independent output oracle, checkpoint-progress checks, and explicit
+latency gates. ALO may duplicate replayed output but may not lose admitted records or invent
+results. EO may neither lose nor duplicate externally visible output.
 
-- single-node at-least-once;
-- single-node exactly-once;
-- three-node cluster at-least-once; and
-- three-node cluster exactly-once.
-
-Each run must use two Kafka inputs, Zipfian keys, process kills and recovery, an independent output
-oracle, checkpoint-progress checks, and explicit latency gates. At-least-once may duplicate output
-for replayed input after recovery but may not lose admitted records or invent join pairs.
-Exactly-once may neither lose nor duplicate externally visible output. A shortened or emulator-
-backed run is engineering evidence, not cloud-provider or production certification.
-
-ADR-008 defines the decision. Historical backend studies, cycle notes, and superseded designs have
-been removed from the active documentation set.
+[ADR-008](architecture-decisions/ADR-008-managed-vnode-keyed-state.md) records the decision and its
+research basis.

@@ -192,7 +192,6 @@ jobs:
           LAMINAR_SOAK_MIN_LIVE_STATE_BYTES: "8388608"
           LAMINAR_SOAK_DISCOVERY: ${{ matrix.discovery }}
           LAMINAR_SOAK_CHECKPOINT_URL: s3://laminardb-soak/${{ github.run_id }}/${{ matrix.topology }}-${{ matrix.delivery }}-${{ matrix.discovery }}/checkpoints
-          LAMINAR_SOAK_STATE_URL: s3://laminardb-soak/${{ github.run_id }}/${{ matrix.topology }}-${{ matrix.delivery }}-${{ matrix.discovery }}/state
           LAMINAR_SOAK_S3_ENDPOINT: http://127.0.0.1:19000
           LAMINAR_SOAK_S3_ACCESS_KEY: laminar
           LAMINAR_SOAK_S3_SECRET_KEY: laminar-test-secret
@@ -282,7 +281,6 @@ jobs:
           LAMINAR_SOAK_FAULT_INJECT_ROLE: ${{ matrix.role }}
           LAMINAR_SOAK_DISCOVERY: ${{ matrix.discovery }}
           LAMINAR_SOAK_CHECKPOINT_URL: s3://laminardb-soak/${{ github.run_id }}/recovery-${{ matrix.role }}-${{ matrix.discovery }}/checkpoints
-          LAMINAR_SOAK_STATE_URL: s3://laminardb-soak/${{ github.run_id }}/recovery-${{ matrix.role }}-${{ matrix.discovery }}/state
           LAMINAR_SOAK_S3_ENDPOINT: http://127.0.0.1:19000
           LAMINAR_SOAK_S3_ACCESS_KEY: laminar
           LAMINAR_SOAK_S3_SECRET_KEY: laminar-test-secret

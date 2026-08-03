@@ -82,7 +82,7 @@ RUN groupadd -g 1000 laminardb \
     && useradd -u 1000 -g laminardb -m -s /bin/false laminardb
 
 # Create data directories
-RUN mkdir -p /etc/laminardb /var/lib/laminardb/state /var/lib/laminardb/checkpoints \
+RUN mkdir -p /etc/laminardb /var/lib/laminardb/checkpoints \
     && chown -R laminardb:laminardb /etc/laminardb /var/lib/laminardb
 
 # Copy binary from builder
@@ -96,12 +96,6 @@ COPY <<'EOF' /etc/laminardb/laminardb.toml
 [server]
 mode = "single"
 bind = "0.0.0.0:8080"
-workers = 0
-log_level = "info"
-
-[state]
-backend = "local"
-path = "/var/lib/laminardb/state"
 
 [checkpoint]
 url = "file:///var/lib/laminardb/checkpoints"
