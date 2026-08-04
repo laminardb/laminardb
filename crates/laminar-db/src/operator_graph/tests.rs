@@ -22,6 +22,171 @@ fn test_batch() -> RecordBatch {
     .unwrap()
 }
 
+struct RichFrontierProbe(Arc<parking_lot::Mutex<Vec<InputFrontier>>>);
+
+#[async_trait]
+impl GraphOperator for RichFrontierProbe {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        unreachable!("the graph must use the rich frontier entry point")
+    }
+
+    async fn process_with_frontiers(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        frontiers: &[InputFrontier],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        *self.0.lock() = frontiers.to_vec();
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+}
+
+struct LegacyFrontierProbe {
+    watermarks: Arc<parking_lot::Mutex<Vec<i64>>>,
+    hold: i64,
+}
+
+#[async_trait]
+impl GraphOperator for LegacyFrontierProbe {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        *self.watermarks.lock() = watermarks.to_vec();
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn watermark_hold(&self) -> Option<i64> {
+        Some(self.hold)
+    }
+}
+
+#[tokio::test]
+async fn rich_frontiers_exclude_idle_inputs_and_remain_monotone() {
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let mut graph = test_graph();
+    let left = graph.ensure_source_node("left");
+    let right = graph.ensure_source_node("right");
+    let output = graph
+        .place_operator_node(
+            "frontier_probe",
+            Box::new(RichFrontierProbe(Arc::clone(&seen))),
+            2,
+        )
+        .unwrap();
+    graph.add_edge(left, output, 0);
+    graph.add_edge(right, output, 1);
+
+    let sources = FxHashMap::default();
+    let mut frontiers = FxHashMap::from_iter([
+        (
+            Arc::from("left"),
+            InputFrontier {
+                watermark: Some(100),
+                idle: false,
+            },
+        ),
+        (
+            Arc::from("right"),
+            InputFrontier {
+                watermark: Some(50),
+                idle: true,
+            },
+        ),
+    ]);
+    graph
+        .execute_cycle_with_frontiers(&sources, i64::MIN, Some(&frontiers))
+        .await
+        .unwrap();
+
+    assert_eq!(*seen.lock(), [frontiers["left"], frontiers["right"]]);
+    assert_eq!(graph.output_watermarks[output], 100);
+    assert!(!graph.output_idle[output]);
+
+    frontiers.get_mut("left").unwrap().idle = true;
+    frontiers.get_mut("right").unwrap().watermark = Some(200);
+    graph
+        .execute_cycle_with_frontiers(&sources, i64::MIN, Some(&frontiers))
+        .await
+        .unwrap();
+    assert_eq!(graph.output_watermarks[output], 200);
+    assert!(graph.output_idle[output]);
+
+    frontiers.get_mut("left").unwrap().idle = false;
+    frontiers.get_mut("left").unwrap().watermark = Some(75);
+    graph
+        .execute_cycle_with_frontiers(&sources, i64::MIN, Some(&frontiers))
+        .await
+        .unwrap();
+    assert_eq!(graph.output_watermarks[output], 200);
+    assert!(!graph.output_idle[output]);
+}
+
+#[tokio::test]
+async fn all_idle_frontier_respects_legacy_watermark_hold() {
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let mut graph = test_graph();
+    let left = graph.ensure_source_node("left");
+    let right = graph.ensure_source_node("right");
+    let output = graph
+        .place_operator_node(
+            "legacy_probe",
+            Box::new(LegacyFrontierProbe {
+                watermarks: Arc::clone(&seen),
+                hold: 150,
+            }),
+            2,
+        )
+        .unwrap();
+    graph.add_edge(left, output, 0);
+    graph.add_edge(right, output, 1);
+
+    let frontiers = FxHashMap::from_iter([
+        (
+            Arc::from("left"),
+            InputFrontier {
+                watermark: Some(100),
+                idle: true,
+            },
+        ),
+        (
+            Arc::from("right"),
+            InputFrontier {
+                watermark: Some(200),
+                idle: true,
+            },
+        ),
+    ]);
+    graph
+        .execute_cycle_with_frontiers(&FxHashMap::default(), i64::MIN, Some(&frontiers))
+        .await
+        .unwrap();
+
+    assert_eq!(*seen.lock(), [100, 200]);
+    assert_eq!(graph.output_watermarks[output], 150);
+    assert!(!graph.output_idle[output]);
+}
+
 #[cfg(feature = "cluster")]
 #[test]
 fn default_operator_rejects_checkpointed_shuffle() {

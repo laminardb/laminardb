@@ -18,6 +18,7 @@ use rustc_hash::FxHashMap;
 
 use crate::db::{filter_late_rows, SourceWatermarkState};
 use crate::error::DbError;
+use crate::operator_graph::InputFrontier;
 #[cfg(feature = "cluster")]
 use crate::operator_graph::ShuffleAlignmentOutcome;
 use crate::pipeline::CheckpointCompletion;
@@ -968,7 +969,7 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) source_entries_for_wm: FxHashMap<String, Arc<crate::catalog::SourceEntry>>,
     pub(crate) source_ids: FxHashMap<String, usize>,
     pub(crate) source_name_arcs: FxHashMap<usize, Arc<str>>,
-    pub(crate) source_wms_buf: FxHashMap<Arc<str>, i64>,
+    pub(crate) source_frontiers_buf: FxHashMap<Arc<str>, InputFrontier>,
     pub(crate) tracker: Option<laminar_core::time::WatermarkTracker>,
     pub(crate) prom: Arc<crate::engine_metrics::EngineMetrics>,
     #[cfg(feature = "cluster")]
@@ -1228,12 +1229,15 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
-    fn cap_source_watermarks_by_cluster_min(
-        source_wms: &mut FxHashMap<Arc<str>, i64>,
+    fn cap_source_frontiers_by_cluster_min(
+        source_frontiers: &mut FxHashMap<Arc<str>, InputFrontier>,
         cluster_wm: Option<i64>,
     ) {
-        for wm in source_wms.values_mut() {
-            *wm = Self::cap_watermark_by_cluster_min(*wm, cluster_wm);
+        for frontier in source_frontiers.values_mut() {
+            frontier.watermark = frontier.watermark.and_then(|watermark| {
+                let capped = Self::cap_watermark_by_cluster_min(watermark, cluster_wm);
+                (capped != i64::MIN).then_some(capped)
+            });
         }
     }
 
@@ -3995,20 +3999,26 @@ impl ConnectorPipelineCallback {
         Ok(())
     }
 
-    fn refresh_source_watermarks(&mut self) {
-        self.source_wms_buf.clear();
+    fn refresh_source_frontiers(&mut self) {
+        self.source_frontiers_buf.clear();
         if let Some(ref tracker) = self.tracker {
             for (&sid, name) in &self.source_name_arcs {
-                if let Some(watermark) = tracker.source_watermark(sid) {
-                    self.source_wms_buf.insert(Arc::clone(name), watermark);
-                }
+                self.source_frontiers_buf.insert(
+                    Arc::clone(name),
+                    InputFrontier {
+                        watermark: tracker
+                            .source_watermark(sid)
+                            .filter(|watermark| *watermark != i64::MIN),
+                        idle: tracker.is_idle(sid),
+                    },
+                );
             }
         }
 
         #[cfg(feature = "cluster")]
         if let Some(controller) = self.cluster_controller.as_ref() {
-            Self::cap_source_watermarks_by_cluster_min(
-                &mut self.source_wms_buf,
+            Self::cap_source_frontiers_by_cluster_min(
+                &mut self.source_frontiers_buf,
                 controller.cluster_min_watermark(),
             );
         }
@@ -4020,7 +4030,7 @@ impl ConnectorPipelineCallback {
     ) -> Result<(), crate::pipeline::CycleError> {
         #[cfg(feature = "cluster")]
         self.require_process_authority("checkpoint graph drain")?;
-        self.refresh_source_watermarks();
+        self.refresh_source_frontiers();
         let watermark = self.effective_pipeline_watermark();
         while !self.graph.checkpoint_is_quiescent() {
             #[cfg(feature = "cluster")]
@@ -4034,15 +4044,15 @@ impl ConnectorPipelineCallback {
                 return Err(crate::pipeline::CycleError::Recovery(error));
             }
 
-            let source_watermarks = if self.source_wms_buf.is_empty() {
+            let source_frontiers = if self.source_frontiers_buf.is_empty() {
                 None
             } else {
-                Some(&self.source_wms_buf)
+                Some(&self.source_frontiers_buf)
             };
             let pass_started = std::time::Instant::now();
             let results = match self
                 .graph
-                .execute_checkpoint_drain_cycle(watermark, source_watermarks)
+                .execute_checkpoint_drain_cycle_with_frontiers(watermark, source_frontiers)
                 .await
             {
                 Ok(results) => results,
@@ -4532,16 +4542,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 }
             }
         }
-        self.refresh_source_watermarks();
+        self.refresh_source_frontiers();
 
-        let swm_ref = if self.source_wms_buf.is_empty() {
+        let source_frontiers = if self.source_frontiers_buf.is_empty() {
             None
         } else {
-            Some(&self.source_wms_buf)
+            Some(&self.source_frontiers_buf)
         };
         let results = self
             .graph
-            .execute_cycle(source_batches, watermark, swm_ref)
+            .execute_cycle_with_frontiers(source_batches, watermark, source_frontiers)
             .await
             .map_err(|e| Self::map_graph_error(&e, &self.shutdown_signal))?;
         let (any_failed, failed_sources) = self.graph.take_cycle_failures();

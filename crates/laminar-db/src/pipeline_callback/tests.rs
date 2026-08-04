@@ -288,7 +288,7 @@ fn empty_callback_fixture() -> ConnectorPipelineCallback {
         source_entries_for_wm: FxHashMap::default(),
         source_ids: FxHashMap::default(),
         source_name_arcs: FxHashMap::default(),
-        source_wms_buf: FxHashMap::default(),
+        source_frontiers_buf: FxHashMap::default(),
         tracker: None,
         prom: Arc::new(crate::engine_metrics::EngineMetrics::new(
             &prometheus::Registry::new(),
@@ -1700,7 +1700,7 @@ fn cluster_callback_fixture(
             source_entries_for_wm,
             source_ids,
             source_name_arcs,
-            source_wms_buf: FxHashMap::default(),
+            source_frontiers_buf: FxHashMap::default(),
             tracker: Some(tracker),
             prom: Arc::new(crate::engine_metrics::EngineMetrics::new(
                 &prometheus::Registry::new(),
@@ -2368,19 +2368,72 @@ fn pending_and_absent_filters_dispatch_to_passthrough() {
     }
 }
 
+#[test]
+fn tracker_refresh_preserves_watermark_idleness_and_uninitialized_state() {
+    let mut callback = empty_callback_fixture();
+    callback.source_name_arcs = FxHashMap::from_iter([
+        (0, Arc::from("active")),
+        (1, Arc::from("idle")),
+        (2, Arc::from("uninitialized")),
+    ]);
+    let mut tracker = laminar_core::time::WatermarkTracker::new(3);
+    tracker.update_source(0, 1_000);
+    tracker.update_source(1, 500);
+    tracker.mark_idle(1);
+    tracker.mark_idle(2);
+    callback.tracker = Some(tracker);
+
+    callback.refresh_source_frontiers();
+
+    assert_eq!(
+        callback.source_frontiers_buf["active"],
+        InputFrontier {
+            watermark: Some(1_000),
+            idle: false,
+        }
+    );
+    assert_eq!(
+        callback.source_frontiers_buf["idle"],
+        InputFrontier {
+            watermark: Some(500),
+            idle: true,
+        }
+    );
+    assert_eq!(
+        callback.source_frontiers_buf["uninitialized"],
+        InputFrontier {
+            watermark: None,
+            idle: true,
+        }
+    );
+}
+
 /// A clustered runtime cannot finalize event time before its first
 /// globally committed frontier.
 #[cfg(feature = "cluster")]
 #[test]
-fn cap_source_watermarks_freezes_before_first_cluster_commit() {
-    let mut wms: FxHashMap<Arc<str>, i64> = FxHashMap::default();
-    wms.insert(Arc::from("a"), 1_000);
-    wms.insert(Arc::from("b"), 500);
+fn cap_source_frontiers_freezes_before_first_cluster_commit() {
+    let mut frontiers: FxHashMap<Arc<str>, InputFrontier> = FxHashMap::default();
+    frontiers.insert(
+        Arc::from("a"),
+        InputFrontier {
+            watermark: Some(1_000),
+            idle: false,
+        },
+    );
+    frontiers.insert(
+        Arc::from("b"),
+        InputFrontier {
+            watermark: Some(500),
+            idle: true,
+        },
+    );
 
-    ConnectorPipelineCallback::cap_source_watermarks_by_cluster_min(&mut wms, None);
+    ConnectorPipelineCallback::cap_source_frontiers_by_cluster_min(&mut frontiers, None);
 
-    assert_eq!(wms.get(&Arc::<str>::from("a")).copied(), Some(i64::MIN));
-    assert_eq!(wms.get(&Arc::<str>::from("b")).copied(), Some(i64::MIN));
+    assert_eq!(frontiers["a"].watermark, None);
+    assert_eq!(frontiers["b"].watermark, None);
+    assert!(frontiers["b"].idle);
 }
 
 /// When a cluster-wide minimum is published, sources that have
@@ -2388,26 +2441,35 @@ fn cap_source_watermarks_freezes_before_first_cluster_commit() {
 /// the cap are left alone (cap must not push watermarks forward).
 #[cfg(feature = "cluster")]
 #[test]
-fn cap_source_watermarks_lowers_only_sources_above_cluster_min() {
-    let mut wms: FxHashMap<Arc<str>, i64> = FxHashMap::default();
-    wms.insert(Arc::from("ahead"), 2_000);
-    wms.insert(Arc::from("at"), 1_500);
-    wms.insert(Arc::from("behind"), 800);
+fn cap_source_frontiers_lowers_only_sources_above_cluster_min() {
+    let mut frontiers: FxHashMap<Arc<str>, InputFrontier> =
+        [("ahead", 2_000), ("at", 1_500), ("behind", 800)]
+            .into_iter()
+            .map(|(name, watermark)| {
+                (
+                    Arc::from(name),
+                    InputFrontier {
+                        watermark: Some(watermark),
+                        idle: false,
+                    },
+                )
+            })
+            .collect();
 
-    ConnectorPipelineCallback::cap_source_watermarks_by_cluster_min(&mut wms, Some(1_500));
+    ConnectorPipelineCallback::cap_source_frontiers_by_cluster_min(&mut frontiers, Some(1_500));
 
     assert_eq!(
-        wms.get(&Arc::<str>::from("ahead")).copied(),
+        frontiers["ahead"].watermark,
         Some(1_500),
         "source above cluster min must be capped down",
     );
     assert_eq!(
-        wms.get(&Arc::<str>::from("at")).copied(),
+        frontiers["at"].watermark,
         Some(1_500),
         "source at cluster min unchanged",
     );
     assert_eq!(
-        wms.get(&Arc::<str>::from("behind")).copied(),
+        frontiers["behind"].watermark,
         Some(800),
         "source below cluster min must NOT be advanced by the cap",
     );

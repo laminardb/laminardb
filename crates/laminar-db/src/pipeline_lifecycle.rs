@@ -4288,7 +4288,7 @@ impl LaminarDB {
             .iter()
             .map(|(name, &source_id)| (source_id, Arc::<str>::from(name.as_str())))
             .collect();
-        let source_wms_buf = rustc_hash::FxHashMap::with_capacity_and_hasher(
+        let source_frontiers_buf = rustc_hash::FxHashMap::with_capacity_and_hasher(
             source_name_arcs.len(),
             rustc_hash::FxBuildHasher,
         );
@@ -4372,7 +4372,7 @@ impl LaminarDB {
             source_entries_for_wm: source_entries,
             source_ids,
             source_name_arcs,
-            source_wms_buf,
+            source_frontiers_buf,
             tracker,
             prom,
             #[cfg(feature = "cluster")]

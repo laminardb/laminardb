@@ -56,6 +56,32 @@ pub(crate) struct CapturedVnodeState {
     pub(crate) state: Option<bytes::Bytes>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct InputFrontier {
+    pub(crate) watermark: Option<i64>,
+    pub(crate) idle: bool,
+}
+
+impl InputFrontier {
+    const fn from_legacy(watermark: i64) -> Self {
+        Self {
+            watermark: if watermark == i64::MIN {
+                None
+            } else {
+                Some(watermark)
+            },
+            idle: false,
+        }
+    }
+
+    const fn legacy_watermark(self) -> i64 {
+        match self.watermark {
+            Some(watermark) => watermark,
+            None => i64::MIN,
+        }
+    }
+}
+
 impl ManagedStateAccountingSnapshot {
     fn total_bytes(self) -> usize {
         self.live
@@ -112,6 +138,18 @@ pub(crate) trait GraphOperator: Send {
         inputs: &[Vec<RecordBatch>],
         watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError>;
+
+    async fn process_with_frontiers(
+        &mut self,
+        inputs: &[Vec<RecordBatch>],
+        frontiers: &[InputFrontier],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let watermarks: smallvec::SmallVec<[i64; 2]> = frontiers
+            .iter()
+            .map(|frontier| frontier.legacy_watermark())
+            .collect();
+        self.process(inputs, &watermarks).await
+    }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError>;
     fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
@@ -256,6 +294,28 @@ enum GateDecision {
 enum GraphExecutionMode {
     Normal,
     CheckpointDrain,
+}
+
+#[derive(Clone, Copy)]
+enum SourceFrontiers<'a> {
+    Legacy(Option<&'a FxHashMap<Arc<str>, i64>>),
+    Rich(Option<&'a FxHashMap<Arc<str>, InputFrontier>>),
+}
+
+impl SourceFrontiers<'_> {
+    fn get(self, name: &Arc<str>, current_watermark: i64) -> InputFrontier {
+        match self {
+            Self::Legacy(frontiers) => frontiers
+                .and_then(|frontiers| frontiers.get(name).copied())
+                .map_or_else(
+                    || InputFrontier::from_legacy(current_watermark),
+                    InputFrontier::from_legacy,
+                ),
+            Self::Rich(frontiers) => frontiers
+                .and_then(|frontiers| frontiers.get(name).copied())
+                .unwrap_or_else(|| InputFrontier::from_legacy(current_watermark)),
+        }
+    }
 }
 
 const GRAPH_EXECUTION_POISON_REASON: &str =
@@ -614,6 +674,7 @@ pub(crate) struct OperatorGraph {
     input_buf_bytes: Vec<Vec<usize>>,
     input_sources: Vec<Vec<usize>>,
     output_watermarks: Vec<i64>,
+    output_idle: Vec<bool>,
     max_input_buf_batches: usize,
     max_input_buf_bytes: Option<usize>,
     backpressure_policy: BackpressurePolicy,
@@ -701,6 +762,7 @@ impl OperatorGraph {
             input_buf_bytes: Vec::new(),
             input_sources: Vec::new(),
             output_watermarks: Vec::new(),
+            output_idle: Vec::new(),
             max_input_buf_batches: 0,
             max_input_buf_bytes: None,
             backpressure_policy: BackpressurePolicy::default(),
@@ -1366,6 +1428,7 @@ impl OperatorGraph {
             self.input_buf_bytes[id] = vec![0; input_port_count];
             self.input_sources[id] = vec![usize::MAX; input_port_count];
             self.output_watermarks[id] = i64::MIN;
+            self.output_idle[id] = false;
             self.managed_state_accounting_peaks[id] = ManagedStateAccountingSnapshot::default();
             if let Some(domain) = self.node_domain.get_mut(id) {
                 *domain = 0;
@@ -1382,6 +1445,7 @@ impl OperatorGraph {
             self.input_buf_bytes.push(vec![0; input_port_count]);
             self.input_sources.push(vec![usize::MAX; input_port_count]);
             self.output_watermarks.push(i64::MIN);
+            self.output_idle.push(false);
             self.managed_state_accounting_peaks
                 .push(ManagedStateAccountingSnapshot::default());
             id
@@ -1781,6 +1845,7 @@ impl OperatorGraph {
             self.input_bufs[id] = vec![Vec::new(); input_port_count];
             self.input_buf_bytes[id] = vec![0; input_port_count];
             self.input_sources[id] = vec![usize::MAX; input_port_count];
+            self.output_idle[id] = false;
             self.source_map.remove(name);
             self.source_node_ids.remove(&id);
             // Downstream nodes already wired to the placeholder now depend on this query.
@@ -2099,6 +2164,7 @@ impl OperatorGraph {
             self.edges.retain(|e| e.source != id && e.target != id);
             self.input_sources[id].fill(usize::MAX);
             self.output_watermarks[id] = i64::MIN;
+            self.output_idle[id] = false;
             self.free_node_ids.push(id);
         }
 
@@ -2306,23 +2372,24 @@ impl OperatorGraph {
         };
 
         let port_count = self.nodes[node_id].input_port_count;
-        let watermarks: smallvec::SmallVec<[i64; 2]> = (0..port_count)
+        let frontiers: smallvec::SmallVec<[InputFrontier; 2]> = (0..port_count)
             .map(|port| {
                 let upstream = self.input_sources[node_id][port];
                 if upstream < self.output_watermarks.len() {
-                    self.output_watermarks[upstream]
+                    InputFrontier {
+                        watermark: (self.output_watermarks[upstream] != i64::MIN)
+                            .then_some(self.output_watermarks[upstream]),
+                        idle: self.output_idle[upstream],
+                    }
                 } else {
-                    current_watermark
+                    InputFrontier::from_legacy(current_watermark)
                 }
             })
             .collect();
 
         let output_result = self.nodes[node_id]
             .operator
-            .process(
-                if accept { inputs.as_slice() } else { &[][..] },
-                &watermarks,
-            )
+            .process_with_frontiers(if accept { inputs.as_slice() } else { &[][..] }, &frontiers)
             .await;
         let output_result = match output_result {
             Ok(batches) if self.nodes[node_id].capability.managed_state.is_some() => self
@@ -2349,7 +2416,7 @@ impl OperatorGraph {
                     // consumed. Operators return `wants_input == false` while graph-owned rows
                     // remain buffered, so advancing here would close downstream windows past data
                     // that has not run yet.
-                    self.propagate_operator_watermark(node_id, &watermarks, current_watermark);
+                    self.propagate_operator_frontier(node_id, &frontiers, current_watermark);
                 }
                 b
             }
@@ -2412,28 +2479,58 @@ impl OperatorGraph {
     }
 
     /// Source nodes are pre-seeded in `execute_cycle`, so skip them here.
-    fn propagate_operator_watermark(
+    fn propagate_operator_frontier(
         &mut self,
         node_id: usize,
-        watermarks: &[i64],
+        frontiers: &[InputFrontier],
         current_watermark: i64,
     ) {
         if self.source_node_ids.contains(&node_id) {
             return;
         }
-        let mut wm = watermarks
-            .iter()
-            .copied()
-            .min()
-            .unwrap_or(current_watermark);
-        if let Some(hold) = self.nodes[node_id].operator.watermark_hold() {
-            wm = wm.min(hold);
+
+        let mut active_seen = false;
+        let mut active_watermark = Some(i64::MAX);
+        let mut idle_watermark = None;
+        for frontier in frontiers {
+            if frontier.idle {
+                if let Some(watermark) = frontier.watermark {
+                    idle_watermark =
+                        Some(idle_watermark.map_or(watermark, |known: i64| known.max(watermark)));
+                }
+            } else {
+                active_seen = true;
+                active_watermark = match (active_watermark, frontier.watermark) {
+                    (Some(current), Some(watermark)) => Some(current.min(watermark)),
+                    _ => None,
+                };
+            }
         }
-        self.output_watermarks[node_id] = wm;
+
+        let mut output = if active_seen {
+            InputFrontier {
+                watermark: active_watermark,
+                idle: false,
+            }
+        } else if frontiers.is_empty() {
+            InputFrontier::from_legacy(current_watermark)
+        } else {
+            InputFrontier {
+                watermark: idle_watermark,
+                idle: true,
+            }
+        };
+        if let Some(hold) = self.nodes[node_id].operator.watermark_hold() {
+            output.watermark = output.watermark.map(|watermark| watermark.min(hold));
+            output.idle = false;
+        }
+        let watermark = self.output_watermarks[node_id].max(output.legacy_watermark());
+        self.output_watermarks[node_id] = watermark;
+        self.output_idle[node_id] = output.idle;
         if let Some(ref prom) = self.prom {
             prom.stream_watermark_ms
                 .with_label_values(&[&self.nodes[node_id].name])
-                .set(wm);
+                .set(watermark);
         }
     }
 
@@ -2490,7 +2587,22 @@ impl OperatorGraph {
         self.execute_cycle_with_mode(
             source_batches,
             current_watermark,
-            source_watermarks,
+            SourceFrontiers::Legacy(source_watermarks),
+            GraphExecutionMode::Normal,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_cycle_with_frontiers(
+        &mut self,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        current_watermark: i64,
+        source_frontiers: Option<&FxHashMap<Arc<str>, InputFrontier>>,
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
+        self.execute_cycle_with_mode(
+            source_batches,
+            current_watermark,
+            SourceFrontiers::Rich(source_frontiers),
             GraphExecutionMode::Normal,
         )
         .await
@@ -2560,7 +2672,22 @@ impl OperatorGraph {
         self.execute_cycle_with_mode(
             &source_batches,
             current_watermark,
-            frozen_source_watermarks,
+            SourceFrontiers::Legacy(frozen_source_watermarks),
+            GraphExecutionMode::CheckpointDrain,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_checkpoint_drain_cycle_with_frontiers(
+        &mut self,
+        current_watermark: i64,
+        frozen_source_frontiers: Option<&FxHashMap<Arc<str>, InputFrontier>>,
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
+        let source_batches = FxHashMap::default();
+        self.execute_cycle_with_mode(
+            &source_batches,
+            current_watermark,
+            SourceFrontiers::Rich(frozen_source_frontiers),
             GraphExecutionMode::CheckpointDrain,
         )
         .await
@@ -2570,7 +2697,7 @@ impl OperatorGraph {
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         current_watermark: i64,
-        source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
+        source_frontiers: SourceFrontiers<'_>,
         mode: GraphExecutionMode,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
         self.ensure_execution_not_poisoned()?;
@@ -2590,7 +2717,7 @@ impl OperatorGraph {
         // Arm only after it is held so cancellation while ownership is rotating is not poisoned.
         let mut attempt = GraphExecutionAttemptGuard::new(self);
         let result = self
-            .execute_cycle_attempt(source_batches, current_watermark, source_watermarks, mode)
+            .execute_cycle_attempt(source_batches, current_watermark, source_frontiers, mode)
             .await;
         attempt.complete();
         result
@@ -2600,7 +2727,7 @@ impl OperatorGraph {
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         current_watermark: i64,
-        source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
+        source_frontiers: SourceFrontiers<'_>,
         mode: GraphExecutionMode,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
         self.whole_restore_open = false;
@@ -2630,7 +2757,7 @@ impl OperatorGraph {
         }
 
         self.register_source_tables(source_batches);
-        self.prime_sources(source_batches, current_watermark, source_watermarks);
+        self.prime_sources(source_batches, current_watermark, source_frontiers);
 
         let checkpoint_drain_nodes = if mode == GraphExecutionMode::CheckpointDrain {
             Some(self.checkpoint_drain_nodes())
@@ -2859,7 +2986,7 @@ impl OperatorGraph {
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         current_watermark: i64,
-        source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
+        source_frontiers: SourceFrontiers<'_>,
     ) {
         for &(ref name, node_id) in &self.source_list {
             if let Some(batches) = source_batches.get(name) {
@@ -2869,12 +2996,14 @@ impl OperatorGraph {
                     self.input_buf_bytes[node_id][0] += bytes;
                 }
             }
-            let wm = source_watermarks
-                .and_then(|m| m.get(name).copied())
-                .unwrap_or(current_watermark);
-            self.output_watermarks[node_id] = wm;
+            let frontier = source_frontiers.get(name, current_watermark);
+            let watermark = self.output_watermarks[node_id].max(frontier.legacy_watermark());
+            self.output_watermarks[node_id] = watermark;
+            self.output_idle[node_id] = frontier.idle;
             if let Some(ref prom) = self.prom {
-                prom.stream_watermark_ms.with_label_values(&[name]).set(wm);
+                prom.stream_watermark_ms
+                    .with_label_values(&[name])
+                    .set(watermark);
             }
         }
     }
