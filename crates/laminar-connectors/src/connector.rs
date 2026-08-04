@@ -543,6 +543,26 @@ impl<'a> SourceMutationView<'a> {
 pub fn source_mutations(
     records: &RecordBatch,
 ) -> Result<Option<SourceMutationView<'_>>, ConnectorError> {
+    source_mutations_validated(records, false)
+}
+
+/// Borrow mutations from a slice derived from a strictly validated routed batch.
+///
+/// Unlike ingress validation, this permits a retained mutation column whose slice contains only
+/// puts. Layout, alignment, types, nulls, and values remain validated.
+///
+/// # Errors
+/// Returns an error for malformed mutation or row-position metadata.
+pub fn source_mutations_routed(
+    records: &RecordBatch,
+) -> Result<Option<SourceMutationView<'_>>, ConnectorError> {
+    source_mutations_validated(records, true)
+}
+
+fn source_mutations_validated(
+    records: &RecordBatch,
+    allow_all_put: bool,
+) -> Result<Option<SourceMutationView<'_>>, ConnectorError> {
     let Some(layout) = source_metadata_layout(records.schema().as_ref())? else {
         return Ok(None);
     };
@@ -581,7 +601,7 @@ pub fn source_mutations(
             }
         }
     }
-    if !has_tombstone {
+    if !has_tombstone && !allow_all_put {
         return Err(ConnectorError::SchemaMismatch(
             "all-put source mutations must omit the mutation metadata field".into(),
         ));
@@ -594,11 +614,26 @@ pub fn source_mutations(
 /// # Errors
 /// Returns an error when any source metadata field is malformed.
 pub fn strip_source_mutations(records: &RecordBatch) -> Result<RecordBatch, ConnectorError> {
+    strip_source_mutations_validated(records, false)
+}
+
+/// Remove mutation metadata from a slice derived from a strictly validated routed batch.
+///
+/// # Errors
+/// Returns an error when any source metadata field is malformed.
+pub fn strip_source_mutations_routed(records: &RecordBatch) -> Result<RecordBatch, ConnectorError> {
+    strip_source_mutations_validated(records, true)
+}
+
+fn strip_source_mutations_validated(
+    records: &RecordBatch,
+    allow_all_put: bool,
+) -> Result<RecordBatch, ConnectorError> {
     let schema = records.schema();
     let Some(layout) = source_metadata_layout(schema.as_ref())? else {
         return Ok(records.clone());
     };
-    source_mutations(records)?;
+    source_mutations_validated(records, allow_all_put)?;
     if !layout.has_mutations {
         return Ok(records.clone());
     }
@@ -727,14 +762,6 @@ impl SourceRowPositions {
         }
     }
 
-    fn append_to(
-        self,
-        records: &RecordBatch,
-        positioned_schema: &SchemaRef,
-    ) -> Result<RecordBatch, ConnectorError> {
-        self.append_metadata(records, positioned_schema, None)
-    }
-
     fn append_metadata(
         self,
         records: &RecordBatch,
@@ -861,38 +888,6 @@ impl SourceBatch {
     #[must_use]
     pub fn mutations(&self) -> Option<&[SourceMutation]> {
         self.mutations.as_deref()
-    }
-
-    /// Validate and append deterministic positions as reserved Arrow columns.
-    ///
-    /// # Errors
-    /// Returns an error when the contract and sidecar disagree or the sidecar is malformed.
-    pub fn into_records_with_positions(
-        self,
-        capability: SourceRowPositionCapability,
-        positioned_schema: &SchemaRef,
-    ) -> Result<RecordBatch, ConnectorError> {
-        if self.mutations.is_some() {
-            return Err(ConnectorError::SchemaMismatch(
-                "mixed source mutations require the metadata-aware batch path".into(),
-            ));
-        }
-        match (capability, self.row_positions) {
-            (SourceRowPositionCapability::Unavailable, None) => Ok(self.records),
-            (SourceRowPositionCapability::Unavailable, Some(_)) => {
-                Err(ConnectorError::SchemaMismatch(
-                    "source emitted row positions without declaring the capability".into(),
-                ))
-            }
-            (SourceRowPositionCapability::Deterministic, None) => {
-                Err(ConnectorError::SchemaMismatch(
-                    "source declared deterministic row positions but omitted the sidecar".into(),
-                ))
-            }
-            (SourceRowPositionCapability::Deterministic, Some(positions)) => {
-                positions.append_to(&self.records, positioned_schema)
-            }
-        }
     }
 
     /// Validate and append optional mixed mutations plus deterministic row positions.
@@ -2185,6 +2180,19 @@ mod tests {
         let positioned = strip_source_mutations(&encoded).unwrap();
         assert_eq!(positioned.schema(), positioned_schema);
         assert!(Arc::ptr_eq(positioned.column(0), records.column(0)));
+
+        let routed_put = encoded.slice(0, 1);
+        assert!(source_mutations(&routed_put).is_err());
+        assert_eq!(
+            source_mutations_routed(&routed_put)
+                .unwrap()
+                .unwrap()
+                .get(0),
+            Some(SourceMutation::Put)
+        );
+        let routed_visible = Arc::clone(routed_put.column(0));
+        let routed_positioned = strip_source_mutations_routed(&routed_put).unwrap();
+        assert!(Arc::ptr_eq(&routed_visible, routed_positioned.column(0)));
 
         let stripped = strip_source_row_positions(&encoded).unwrap();
         assert_eq!(stripped.schema(), records.schema());

@@ -4972,8 +4972,18 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         Ok(())
     }
 
-    fn extract_watermark(&mut self, source_name: &str, batch: &RecordBatch) {
+    fn extract_watermark(
+        &mut self,
+        source_name: &str,
+        batch: &RecordBatch,
+    ) -> Result<(), crate::pipeline::CycleError> {
         if let Some(wm_state) = self.watermark_states.get_mut(source_name) {
+            let max_ts = wm_state.extractor.extract(batch).map_err(|error| {
+                crate::pipeline::CycleError::Recovery(format!(
+                    "source '{source_name}' watermark extraction failed for column '{}': {error}",
+                    wm_state.column
+                ))
+            })?;
             if let Some(entry) = self.source_entries_for_wm.get(source_name) {
                 let external_wm = entry.source.current_watermark();
                 if let Some(wm) = wm_state.generator.advance_watermark(external_wm) {
@@ -4994,23 +5004,19 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 }
             }
 
-            if let Ok(max_ts) = wm_state.extractor.extract(batch) {
-                if let Some(wm) = wm_state.generator.on_event(max_ts) {
-                    if let Some(entry) = self.source_entries_for_wm.get(source_name) {
-                        entry.source.watermark(wm.timestamp());
-                    }
-                    self.prom
-                        .source_watermark_ms
-                        .with_label_values(&[source_name])
-                        .set(wm.timestamp());
-                    if let Some(ref mut trk) = self.tracker {
-                        if let Some(sid) = self.source_ids.get(source_name) {
-                            if let Some(global_wm) = trk.update_source(*sid, wm.timestamp()) {
-                                self.pipeline_watermark.store(
-                                    global_wm.timestamp(),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                            }
+            if let Some(wm) = wm_state.generator.on_event(max_ts) {
+                if let Some(entry) = self.source_entries_for_wm.get(source_name) {
+                    entry.source.watermark(wm.timestamp());
+                }
+                self.prom
+                    .source_watermark_ms
+                    .with_label_values(&[source_name])
+                    .set(wm.timestamp());
+                if let Some(ref mut trk) = self.tracker {
+                    if let Some(sid) = self.source_ids.get(source_name) {
+                        if let Some(global_wm) = trk.update_source(*sid, wm.timestamp()) {
+                            self.pipeline_watermark
+                                .store(global_wm.timestamp(), std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 }
@@ -5020,13 +5026,18 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         let row_count = batch.num_rows() as u64;
         self.prom.events_ingested.inc_by(row_count);
         self.prom.batches.inc();
+        Ok(())
     }
 
-    fn filter_late_rows(&self, source_name: &str, batch: &RecordBatch) -> Option<RecordBatch> {
+    fn filter_late_rows(
+        &self,
+        source_name: &str,
+        batch: &RecordBatch,
+    ) -> Result<Option<RecordBatch>, crate::pipeline::CycleError> {
         if let Some(wm_state) = self.watermark_states.get(source_name) {
             // Processing-time watermarks are wall-clock; filtering would drop every real row.
             if wm_state.generator.is_processing_time() {
-                return Some(batch.clone());
+                return Ok(Some(batch.clone()));
             }
             let current_wm = wm_state.generator.current_watermark();
             #[cfg(feature = "cluster")]
@@ -5061,22 +5072,18 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                 .inc_by(u64::try_from(late).unwrap_or(u64::MAX));
                             warn_late_drops(source_name, &wm_state.column, current_wm, late);
                         }
-                        return out;
+                        return Ok(out);
                     }
                     Err(e) => {
-                        // Schema drift, not lateness.
-                        tracing::error!(
-                            source = source_name,
-                            column = %wm_state.column,
-                            error = %e,
-                            "filter_late_rows: dropping batch (schema drift)"
-                        );
-                        return None;
+                        return Err(crate::pipeline::CycleError::Recovery(format!(
+                            "source '{source_name}' late-row preparation failed for column '{}': {e}",
+                            wm_state.column
+                        )));
                     }
                 }
             }
         }
-        Some(batch.clone())
+        Ok(Some(batch.clone()))
     }
 
     fn current_watermark(&self) -> i64 {

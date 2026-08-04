@@ -14,9 +14,10 @@ fn replayable_append_only_source_contract() -> laminar_connectors::connector::So
 }
 
 #[test]
-fn positioned_source_batch_is_hidden_from_the_ordinary_runtime_path() {
+fn append_only_metadata_is_encoded_then_hidden_zero_copy() {
     use laminar_connectors::connector::{
-        schema_with_source_row_positions, SourceRowPositions, SOURCE_ORDER_KEY_COLUMN,
+        schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,
+        SourceRowPositions, SOURCE_MUTATION_COLUMN, SOURCE_ORDER_KEY_COLUMN,
         SOURCE_PARTITION_COLUMN, SOURCE_SUB_OFFSET_COLUMN,
     };
 
@@ -33,11 +34,13 @@ fn positioned_source_batch_is_hidden_from_the_ordinary_runtime_path() {
         UInt32Array::from(vec![0, 1]),
     )
     .unwrap();
-    let expected_batch_schema = schema_with_source_row_positions(&schema).unwrap();
-    let output = prepare_visible_source_batch(
+    let positioned_schema = schema_with_source_row_positions(&schema).unwrap();
+    let mutation_schema = schema_with_source_mutations_and_row_positions(&schema).unwrap();
+    let output = prepare_encoded_source_batch(
         "positioned",
         &schema,
-        &expected_batch_schema,
+        &positioned_schema,
+        &mutation_schema,
         &[],
         &[],
         SourceRowPositionCapability::Deterministic,
@@ -45,17 +48,143 @@ fn positioned_source_batch_is_hidden_from_the_ordinary_runtime_path() {
     )
     .unwrap();
 
-    assert_eq!(output.schema(), schema);
+    assert_eq!(output.schema(), positioned_schema);
     assert!(Arc::ptr_eq(&visible_values, output.column(0)));
-    assert!(output.column_by_name(SOURCE_PARTITION_COLUMN).is_none());
-    assert!(output.column_by_name(SOURCE_ORDER_KEY_COLUMN).is_none());
-    assert!(output.column_by_name(SOURCE_SUB_OFFSET_COLUMN).is_none());
+    assert!(output.column_by_name(SOURCE_MUTATION_COLUMN).is_none());
+    assert!(output.column_by_name(SOURCE_PARTITION_COLUMN).is_some());
+    assert!(output.column_by_name(SOURCE_ORDER_KEY_COLUMN).is_some());
+    assert!(output.column_by_name(SOURCE_SUB_OFFSET_COLUMN).is_some());
+
+    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+    let mut coordinator = test_coordinator(
+        rx,
+        control_rx,
+        Arc::new(tokio::sync::Notify::new()),
+        DeliveryGuarantee::AtLeastOnce,
+        None,
+    );
+    let mut events = 0;
+    coordinator
+        .stage_batch(
+            0,
+            output,
+            checkpoint_at(1),
+            &mut MockCallback::new(),
+            &mut events,
+        )
+        .unwrap();
+    let visible = &coordinator.source_batches_buf["test_source"][0];
+    assert_eq!(visible.schema(), schema);
+    assert!(Arc::ptr_eq(&visible_values, visible.column(0)));
+    assert_eq!(coordinator.pending_watermark_batches[0].1.schema(), schema);
+    assert_eq!(events, 2);
+}
+
+#[test]
+fn source_preparation_failure_does_not_stage_offset_or_data() {
+    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+    let mut coordinator = test_coordinator(
+        rx,
+        control_rx,
+        Arc::new(tokio::sync::Notify::new()),
+        DeliveryGuarantee::AtLeastOnce,
+        None,
+    );
+    let mut callback = MockCallback::new();
+    callback.late_filter_error = Some("injected visible-schema failure".into());
+    let mut events = 0;
+
+    let error = coordinator
+        .stage_batch(
+            0,
+            int_batch(1),
+            checkpoint_at(9),
+            &mut callback,
+            &mut events,
+        )
+        .expect_err("source preparation must fail closed");
+
+    assert!(matches!(error, CycleError::Recovery(ref reason)
+        if reason.contains("injected visible-schema failure")));
+    assert!(coordinator.pending_offsets[0].is_none());
+    assert!(coordinator.source_batches_buf.is_empty());
+    assert!(coordinator.pending_watermark_batches.is_empty());
+    assert_eq!(events, 0);
+}
+
+#[tokio::test]
+async fn fully_filtered_batch_executes_an_empty_progress_cycle() {
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+    let coordinator = test_coordinator(
+        rx,
+        control_rx,
+        Arc::clone(&shutdown),
+        DeliveryGuarantee::AtLeastOnce,
+        None,
+    );
+    let mut callback = MockCallback::new();
+    callback.filter_all_rows = true;
+    let cycle_input_rows = Arc::clone(&callback.cycle_input_rows);
+    let run = tokio::spawn(coordinator.run(callback));
+
+    tx.send(SourceMsg::Batch {
+        source_idx: 0,
+        batch: int_batch(1),
+        checkpoint: checkpoint_at(1),
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while cycle_input_rows.lock().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("filtered source progress did not execute");
+
+    assert_eq!(&*cycle_input_rows.lock(), &[0]);
+    shutdown.notify_one();
+    assert!(matches!(run.await.unwrap(), ExitReason::Shutdown));
+}
+
+#[tokio::test]
+async fn watermark_extraction_failure_faults_before_cycle_publication() {
+    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+    let coordinator = test_coordinator(
+        rx,
+        control_rx,
+        Arc::new(tokio::sync::Notify::new()),
+        DeliveryGuarantee::AtLeastOnce,
+        None,
+    );
+    let mut callback = MockCallback::new();
+    callback.watermark_error = Some("invalid event-time column".into());
+    let cycle_input_rows = Arc::clone(&callback.cycle_input_rows);
+    tx.send(SourceMsg::Batch {
+        source_idx: 0,
+        batch: int_batch(1),
+        checkpoint: checkpoint_at(1),
+    })
+    .await
+    .unwrap();
+
+    let exit = coordinator.run(callback).await;
+
+    assert!(matches!(exit, ExitReason::Fault(ref reason)
+        if reason.contains("invalid event-time column")));
+    assert!(cycle_input_rows.lock().is_empty());
 }
 
 #[test]
 fn positioned_source_batches_fail_closed_on_misalignment_and_name_collision() {
     use laminar_connectors::connector::{
-        schema_with_source_row_positions, SourceRowPositions, SOURCE_PARTITION_COLUMN,
+        schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,
+        SourceRowPositions, SOURCE_PARTITION_COLUMN,
     };
 
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -76,11 +205,13 @@ fn positioned_source_batches_fail_closed_on_misalignment_and_name_collision() {
         vec![Arc::new(Int64Array::from(vec![1]))],
     )
     .unwrap();
-    let expected_batch_schema = schema_with_source_row_positions(&schema).unwrap();
-    assert!(prepare_visible_source_batch(
+    let positioned_schema = schema_with_source_row_positions(&schema).unwrap();
+    let mutation_schema = schema_with_source_mutations_and_row_positions(&schema).unwrap();
+    assert!(prepare_encoded_source_batch(
         "malformed",
         &schema,
-        &expected_batch_schema,
+        &positioned_schema,
+        &mutation_schema,
         &[],
         &[],
         SourceRowPositionCapability::Deterministic,
@@ -93,7 +224,7 @@ fn positioned_source_batches_fail_closed_on_misalignment_and_name_collision() {
         DataType::Binary,
         false,
     )]));
-    assert!(TrackedSourceRegistration::batch_schema(
+    assert!(TrackedSourceRegistration::metadata_schemas(
         "colliding",
         SourceContract::default(),
         &colliding,
@@ -335,6 +466,9 @@ struct MockCallback {
     barrier_outcome: Option<BarrierOutcome>,
     results: Vec<FxHashMap<Arc<str>, Vec<RecordBatch>>>,
     watermark: i64,
+    watermark_error: Option<String>,
+    late_filter_error: Option<String>,
+    filter_all_rows: bool,
     /// Halt cleanly on this 1-based cycle number.
     halt_at_cycle: Option<u32>,
     /// Fail on this 1-based cycle number.
@@ -416,6 +550,9 @@ impl MockCallback {
             barrier_outcome: None,
             results: Vec::new(),
             watermark: 0,
+            watermark_error: None,
+            late_filter_error: None,
+            filter_all_rows: false,
             halt_at_cycle: None,
             fatal_at_cycle: None,
             recovery_at_cycle: None,
@@ -714,19 +851,34 @@ impl PipelineCallback for MockCallback {
         Ok(())
     }
 
-    fn extract_watermark(&mut self, _source_name: &str, batch: &RecordBatch) {
+    fn extract_watermark(
+        &mut self,
+        _source_name: &str,
+        batch: &RecordBatch,
+    ) -> Result<(), CycleError> {
         #[cfg(feature = "cluster")]
         self.fence_process_authority_at(ProcessAuthorityFencePoint::Watermark);
+        if let Some(error) = &self.watermark_error {
+            return Err(CycleError::Recovery(error.clone()));
+        }
         // Use row count as a simple watermark proxy.
         {
             self.watermark = self
                 .watermark
                 .saturating_add(i64::try_from(batch.num_rows()).unwrap_or(i64::MAX));
         }
+        Ok(())
     }
 
-    fn filter_late_rows(&self, _source_name: &str, batch: &RecordBatch) -> Option<RecordBatch> {
-        Some(batch.clone())
+    fn filter_late_rows(
+        &self,
+        _source_name: &str,
+        batch: &RecordBatch,
+    ) -> Result<Option<RecordBatch>, CycleError> {
+        if let Some(error) = &self.late_filter_error {
+            return Err(CycleError::Recovery(error.clone()));
+        }
+        Ok((!self.filter_all_rows).then(|| batch.clone()))
     }
 
     fn current_watermark(&self) -> i64 {
@@ -7236,7 +7388,8 @@ fn source_data_after_barrier_returns_invariant_fault() {
             &mut events,
         )
         .expect_err("post-barrier data must fail closed");
-    assert!(error.contains("without an exact release"));
+    assert!(matches!(error, CycleError::Recovery(ref reason)
+        if reason.contains("without an exact release")));
 }
 
 /// CP-4: an exactly-once sink failure poisons the epoch and aborts its transaction; the
@@ -8433,10 +8586,14 @@ impl PipelineCallback for BackpressuredCallback {
     ) -> Result<(), CycleError> {
         self.inner.write_to_sinks(r, deadline).await
     }
-    fn extract_watermark(&mut self, s: &str, b: &RecordBatch) {
-        self.inner.extract_watermark(s, b);
+    fn extract_watermark(&mut self, s: &str, b: &RecordBatch) -> Result<(), CycleError> {
+        self.inner.extract_watermark(s, b)
     }
-    fn filter_late_rows(&self, s: &str, b: &RecordBatch) -> Option<RecordBatch> {
+    fn filter_late_rows(
+        &self,
+        s: &str,
+        b: &RecordBatch,
+    ) -> Result<Option<RecordBatch>, CycleError> {
         self.inner.filter_late_rows(s, b)
     }
     fn current_watermark(&self) -> i64 {

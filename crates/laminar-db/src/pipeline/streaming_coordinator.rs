@@ -15,9 +15,10 @@ use crossfire::{mpsc, AsyncRx, MAsyncTx};
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::SourceBatch;
 use laminar_connectors::connector::{
-    schema_with_source_row_positions, strip_source_row_positions, ConnectorCancellationPolicy,
-    ConnectorTaskTracker, DeliveryGuarantee, SourceConnector, SourceConsistency, SourceContract,
-    SourceInputMode, SourcePosition, SourceRowPositionCapability, SourceStart,
+    schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,
+    strip_source_row_positions, ConnectorCancellationPolicy, ConnectorTaskTracker,
+    DeliveryGuarantee, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
+    SourcePosition, SourceRowPositionCapability, SourceStart, SOURCE_MUTATION_COLUMN,
 };
 #[cfg(feature = "cluster")]
 use laminar_connectors::connector::{
@@ -967,7 +968,8 @@ pub(crate) struct TrackedSourceRegistration {
     source: SourceRegistration,
     contract: SourceContract,
     expected_schema: arrow_schema::SchemaRef,
-    batch_schema: arrow_schema::SchemaRef,
+    positioned_schema: arrow_schema::SchemaRef,
+    mutation_schema: arrow_schema::SchemaRef,
     primary_key: Vec<String>,
     primary_key_indices: Vec<usize>,
     schema_admitted: bool,
@@ -975,8 +977,8 @@ pub(crate) struct TrackedSourceRegistration {
 }
 
 pub(crate) const MUTATION_SOURCE_NOT_ADMITTED: &str =
-    "[LDB-5039] mutation sources are not admitted until canonical changelog normalization and \
-     schema propagation are installed";
+    "[LDB-5039] mutation sources are not admitted until route-aware stateful operator wiring is \
+     installed";
 
 pub(crate) fn admit_append_only_source(
     contract: SourceContract,
@@ -990,21 +992,23 @@ pub(crate) fn admit_append_only_source(
 }
 
 impl TrackedSourceRegistration {
-    fn batch_schema(
+    fn metadata_schemas(
         source_name: &str,
         contract: SourceContract,
         expected_schema: &arrow_schema::SchemaRef,
-    ) -> Result<arrow_schema::SchemaRef, DbError> {
-        let positioned_schema =
-            schema_with_source_row_positions(expected_schema).map_err(|error| {
-                DbError::Config(format!(
-                    "source '{source_name}' has an invalid row-position schema: {error}"
-                ))
-            })?;
+    ) -> Result<(arrow_schema::SchemaRef, arrow_schema::SchemaRef), DbError> {
+        let map_error = |error| {
+            DbError::Config(format!(
+                "source '{source_name}' has an invalid source-metadata schema: {error}"
+            ))
+        };
+        let positioned = schema_with_source_row_positions(expected_schema).map_err(map_error)?;
+        let mutations =
+            schema_with_source_mutations_and_row_positions(expected_schema).map_err(map_error)?;
         if contract.row_positions == SourceRowPositionCapability::Deterministic {
-            Ok(positioned_schema)
+            Ok((positioned, mutations))
         } else {
-            Ok(Arc::clone(expected_schema))
+            Ok((Arc::clone(expected_schema), Arc::clone(expected_schema)))
         }
     }
 
@@ -1025,7 +1029,8 @@ impl TrackedSourceRegistration {
     ) -> Result<Self, DbError> {
         let contract = Self::resolve_contract(&source)?;
         let expected_schema = source.connector.schema();
-        let batch_schema = Self::batch_schema(&source.name, contract, &expected_schema)?;
+        let (positioned_schema, mutation_schema) =
+            Self::metadata_schemas(&source.name, contract, &expected_schema)?;
         let task_fence = ConnectorTaskFenceRegistration::capture_registered(
             Arc::<str>::from(format!("source:{}", source.name)),
             source.connector.terminal_task_tracker(),
@@ -1035,7 +1040,8 @@ impl TrackedSourceRegistration {
             source,
             contract,
             expected_schema,
-            batch_schema,
+            positioned_schema,
+            mutation_schema,
             primary_key: Vec::new(),
             primary_key_indices: Vec::new(),
             schema_admitted: false,
@@ -1049,12 +1055,14 @@ impl TrackedSourceRegistration {
     ) -> Result<Self, DbError> {
         let contract = Self::resolve_contract(&source)?;
         let expected_schema = source.connector.schema();
-        let batch_schema = Self::batch_schema(&source.name, contract, &expected_schema)?;
+        let (positioned_schema, mutation_schema) =
+            Self::metadata_schemas(&source.name, contract, &expected_schema)?;
         Ok(Self {
             source,
             contract,
             expected_schema,
-            batch_schema,
+            positioned_schema,
+            mutation_schema,
             primary_key: Vec::new(),
             primary_key_indices: Vec::new(),
             schema_admitted: false,
@@ -1079,7 +1087,8 @@ impl TrackedSourceRegistration {
             })
             .collect::<Result<Vec<_>, _>>()?;
         self.expected_schema = expected_schema;
-        self.batch_schema = Self::batch_schema(&self.name, self.contract, &self.expected_schema)?;
+        (self.positioned_schema, self.mutation_schema) =
+            Self::metadata_schemas(&self.name, self.contract, &self.expected_schema)?;
         self.primary_key = primary_key;
         self.primary_key_indices = primary_key_indices;
         self.schema_admitted = true;
@@ -1095,10 +1104,11 @@ impl TrackedSourceRegistration {
     }
 }
 
-fn prepare_visible_source_batch(
+fn prepare_encoded_source_batch(
     source_name: &str,
     expected_schema: &arrow_schema::SchemaRef,
-    batch_schema: &arrow_schema::SchemaRef,
+    positioned_schema: &arrow_schema::SchemaRef,
+    mutation_schema: &arrow_schema::SchemaRef,
     primary_key: &[String],
     primary_key_indices: &[usize],
     capability: SourceRowPositionCapability,
@@ -1111,27 +1121,13 @@ fn prepare_visible_source_batch(
         primary_key_indices,
         &batch.records,
     )?;
-    let positioned_records = batch
-        .into_records_with_positions(capability, batch_schema)
+    batch
+        .into_records_with_metadata(capability, positioned_schema, mutation_schema)
         .map_err(|error| {
             laminar_core::streaming::StreamingError::InvalidConfig(format!(
-                "source '{source_name}' emitted invalid row positions: {error}"
+                "source '{source_name}' emitted invalid source metadata: {error}"
             ))
-        })?;
-    if capability == SourceRowPositionCapability::Deterministic {
-        validate_source_batch(
-            source_name,
-            batch_schema,
-            primary_key,
-            primary_key_indices,
-            &positioned_records,
-        )?;
-    }
-    strip_source_row_positions(&positioned_records).map_err(|error| {
-        laminar_core::streaming::StreamingError::InvalidConfig(format!(
-            "source '{source_name}' emitted invalid row-position columns: {error}"
-        ))
-    })
+        })
 }
 
 impl std::ops::Deref for TrackedSourceRegistration {
@@ -3094,12 +3090,15 @@ impl StreamingCoordinator {
                     }
                 }
                 if start_error.is_none() {
-                    match TrackedSourceRegistration::batch_schema(
+                    match TrackedSourceRegistration::metadata_schemas(
                         &src_name,
                         src.contract,
                         &src.expected_schema,
                     ) {
-                        Ok(schema) => src.batch_schema = schema,
+                        Ok((positioned, mutations)) => {
+                            src.positioned_schema = positioned;
+                            src.mutation_schema = mutations;
+                        }
                         Err(error) => {
                             start_error = Some(SourceStartFailure::Connector(error.to_string()));
                         }
@@ -3168,7 +3167,8 @@ impl StreamingCoordinator {
                 source: src,
                 contract,
                 expected_schema,
-                batch_schema,
+                positioned_schema,
+                mutation_schema,
                 primary_key,
                 primary_key_indices,
                 schema_admitted: _,
@@ -3831,10 +3831,11 @@ impl StreamingCoordinator {
 
                     match poll_result {
                         Ok(Some(batch)) => {
-                            let batch = match prepare_visible_source_batch(
+                            let batch = match prepare_encoded_source_batch(
                                 &src_name,
                                 &expected_schema,
-                                &batch_schema,
+                                &positioned_schema,
+                                &mutation_schema,
                                 &primary_key,
                                 &primary_key_indices,
                                 contract.row_positions,
@@ -4134,10 +4135,11 @@ impl StreamingCoordinator {
                         }
                         match poll_result {
                             Some(Ok(Some(batch))) => {
-                                let batch = match prepare_visible_source_batch(
+                                let batch = match prepare_encoded_source_batch(
                                     &src_name,
                                     &expected_schema,
-                                    &batch_schema,
+                                    &positioned_schema,
+                                    &mutation_schema,
                                     &primary_key,
                                     &primary_key_indices,
                                     contract.row_positions,
@@ -5095,7 +5097,7 @@ impl StreamingCoordinator {
                     &mut state.barriers,
                     &mut cycle_events,
                 ) {
-                    state.fault = Some(error);
+                    state.fault = Some(error.to_string());
                 }
             }
             if state.fault.is_some() {
@@ -5124,7 +5126,7 @@ impl StreamingCoordinator {
                             &mut state.barriers,
                             &mut cycle_events,
                         ) {
-                            state.fault = Some(error);
+                            state.fault = Some(error.to_string());
                             break;
                         }
                         drain_count += 1;
@@ -5149,17 +5151,25 @@ impl StreamingCoordinator {
                 break;
             }
 
-            for (name, batch) in self.pending_watermark_batches.drain(..) {
-                callback.extract_watermark(&name, &batch);
+            let staged_source_progress = !self.pending_watermark_batches.is_empty();
+            let watermark_result = self
+                .pending_watermark_batches
+                .drain(..)
+                .try_for_each(|(name, batch)| callback.extract_watermark(&name, &batch));
+            if let Err(error) = watermark_result {
+                self.discard_pending_offsets();
+                state.fault = Some(error.to_string());
+                break;
             }
 
             if !self.replay_pending {
                 callback.tick_idle_watermark();
             }
 
-            // Run on idle wakeups too when operators have deferred input; otherwise
-            // deferred data stalls once the source goes quiet.
+            // Run empty cycles for filtered source progress and deferred operator work so cursors,
+            // watermarks, and retained data do not stall when a source goes quiet.
             if !self.source_batches_buf.is_empty()
+                || staged_source_progress
                 || self.replay_pending
                 || callback.has_deferred_input()
             {
@@ -5410,13 +5420,27 @@ impl StreamingCoordinator {
         }
 
         if fault.is_none() && !intake_fenced {
-            for (name, batch) in self.pending_watermark_batches.drain(..) {
-                callback.extract_watermark(&name, &batch);
+            let staged_source_progress = !self.pending_watermark_batches.is_empty();
+            let watermark_result = self
+                .pending_watermark_batches
+                .drain(..)
+                .try_for_each(|(name, batch)| callback.extract_watermark(&name, &batch));
+            let watermarks_valid = match watermark_result {
+                Ok(()) => true,
+                Err(error) => {
+                    self.discard_pending_offsets();
+                    fault = Some(error.to_string());
+                    false
+                }
+            };
+            if watermarks_valid {
+                callback.tick_idle_watermark();
             }
-            callback.tick_idle_watermark();
-            if !self.source_batches_buf.is_empty()
-                || self.replay_pending
-                || callback.has_deferred_input()
+            if watermarks_valid
+                && (!self.source_batches_buf.is_empty()
+                    || staged_source_progress
+                    || self.replay_pending
+                    || callback.has_deferred_input())
             {
                 let cycle_start = Instant::now();
                 let wm = callback.current_watermark();
@@ -5534,26 +5558,42 @@ impl StreamingCoordinator {
         checkpoint: SourceCheckpoint,
         callback: &mut impl PipelineCallback,
         cycle_events: &mut u64,
-    ) {
-        if source_idx < self.pending_offsets.len() {
-            self.pending_offsets[source_idx] = Some(checkpoint);
+    ) -> Result<(), CycleError> {
+        let name = self.source_names.get(source_idx).cloned().ok_or_else(|| {
+            CycleError::Recovery(format!(
+                "source batch referenced unknown runtime index {source_idx}"
+            ))
+        })?;
+        let has_mutations = batch.column_by_name(SOURCE_MUTATION_COLUMN).is_some();
+        let visible = strip_source_row_positions(&batch).map_err(|error| {
+            CycleError::Recovery(format!(
+                "source '{name}' emitted invalid hidden metadata: {error}"
+            ))
+        })?;
+        if has_mutations {
+            return Err(CycleError::Recovery(format!(
+                "source '{name}' emitted mutations on the ordinary append-only route"
+            )));
         }
 
-        if let Some(name) = self.source_names.get(source_idx) {
-            {
-                *cycle_events += batch.num_rows() as u64;
-            }
-            // Filter against the pre-drain watermark. Extraction is deferred until after all
-            // batches are filtered so one batch cannot make the next batch appear late.
-            if let Some(filtered) = callback.filter_late_rows(name, &batch) {
-                self.source_batches_buf
-                    .entry(Arc::clone(name))
-                    .or_default()
-                    .push(filtered);
-            }
-            self.pending_watermark_batches
-                .push((Arc::clone(name), batch));
+        // Filter against the pre-drain watermark. Extraction is deferred until after all batches
+        // are filtered so one batch cannot make the next batch appear late.
+        let filtered = callback.filter_late_rows(&name, &visible)?;
+        let pending = self.pending_offsets.get_mut(source_idx).ok_or_else(|| {
+            CycleError::Recovery(format!(
+                "source '{name}' has no runtime offset slot at index {source_idx}"
+            ))
+        })?;
+        *pending = Some(checkpoint);
+        *cycle_events += visible.num_rows() as u64;
+        if let Some(filtered) = filtered {
+            self.source_batches_buf
+                .entry(Arc::clone(&name))
+                .or_default()
+                .push(filtered);
         }
+        self.pending_watermark_batches.push((name, visible));
+        Ok(())
     }
 
     /// Process one source message under the exact source-barrier ordering invariant.
@@ -5563,7 +5603,7 @@ impl StreamingCoordinator {
         callback: &mut impl PipelineCallback,
         barriers: &mut Vec<(usize, CheckpointBarrier, SourceCheckpoint)>,
         cycle_events: &mut u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), CycleError> {
         match msg {
             SourceMsg::Batch {
                 source_idx,
@@ -5571,14 +5611,14 @@ impl StreamingCoordinator {
                 checkpoint,
             } => {
                 if self.barrier_seen.contains(&source_idx) {
-                    return Err(format!(
+                    return Err(CycleError::Recovery(format!(
                         "source {} emitted data after its checkpoint barrier without an exact release",
                         self.source_names
                             .get(source_idx)
                             .map_or("<unknown>", AsRef::as_ref)
-                    ));
+                    )));
                 }
-                self.stage_batch(source_idx, batch, checkpoint, callback, cycle_events);
+                self.stage_batch(source_idx, batch, checkpoint, callback, cycle_events)?;
             }
             SourceMsg::Barrier {
                 source_idx,
@@ -5624,10 +5664,10 @@ impl StreamingCoordinator {
                 source_idx,
                 batch,
                 checkpoint,
-            } => {
-                self.stage_batch(source_idx, batch, checkpoint, callback, cycle_events);
-                None
-            }
+            } => self
+                .stage_batch(source_idx, batch, checkpoint, callback, cycle_events)
+                .err()
+                .map(|error| error.to_string()),
             SourceMsg::Barrier {
                 source_idx,
                 barrier,

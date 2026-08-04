@@ -522,10 +522,18 @@ pub trait PipelineCallback: Send + 'static {
     ) -> Result<(), CycleError>;
 
     /// Extract watermark from a batch for a given source.
-    fn extract_watermark(&mut self, source_name: &str, batch: &RecordBatch);
+    fn extract_watermark(
+        &mut self,
+        source_name: &str,
+        batch: &RecordBatch,
+    ) -> Result<(), CycleError>;
 
-    /// Filter late rows from a batch.
-    fn filter_late_rows(&self, source_name: &str, batch: &RecordBatch) -> Option<RecordBatch>;
+    /// Filter late rows from a validated visible batch.
+    fn filter_late_rows(
+        &self,
+        source_name: &str,
+        batch: &RecordBatch,
+    ) -> Result<Option<RecordBatch>, CycleError>;
 
     /// Current pipeline watermark.
     fn current_watermark(&self) -> i64;
