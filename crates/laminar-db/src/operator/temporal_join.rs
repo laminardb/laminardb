@@ -236,6 +236,13 @@ struct TemporalVnodeInventory {
 }
 
 #[cfg(feature = "cluster")]
+#[derive(Clone, Copy)]
+struct TemporalHandoffCut {
+    frontiers: [InputFrontier; 2],
+    published_output_frontier: Option<InputFrontier>,
+}
+
+#[cfg(feature = "cluster")]
 struct PreparedTemporalJoinTransition {
     slots: Vec<(u32, Option<Box<TemporalJoinVnodeState>>)>,
     local_assignment: VnodeAssignmentSnapshot,
@@ -247,6 +254,7 @@ struct PreparedTemporalJoinTransition {
     cluster_peers: Arc<[u64]>,
     peer_channels: [BTreeMap<u64, TemporalPeerChannel>; 2],
     bootstrap_broadcast: bool,
+    handoff_cut: Option<TemporalHandoffCut>,
 }
 
 #[cfg(feature = "cluster")]
@@ -528,6 +536,9 @@ impl ManagedTemporalJoinOperator {
         if u32::try_from(assignment.owners().len()).ok() != Some(self.vnode_count.get())
             || assignment.version() != self.local_assignment.version()
             || !std::ptr::eq(assignment.owners(), self.local_assignment.owners())
+            || config.sender.local_id() != config.self_id.0
+            || config.receiver.local_id() != config.self_id.0
+            || config.sender.incarnation() != config.receiver.incarnation()
             || config.sender.assignment_version() != assignment.version()
             || config.receiver.assignment_version() != assignment.version()
             || config.sender.recovery_gen() != config.receiver.recovery_gen()
@@ -1594,6 +1605,7 @@ impl ManagedTemporalJoinOperator {
         &self,
         assignment: &VnodeAssignmentSnapshot,
         self_id: NodeId,
+        frontiers: [InputFrontier; 2],
         mut state_at: impl FnMut(u32) -> Option<&'a TemporalJoinVnodeState>,
     ) -> Result<TemporalVnodeInventory, DbError> {
         let mut inventory = TemporalVnodeInventory {
@@ -1621,7 +1633,7 @@ impl ManagedTemporalJoinOperator {
                 continue;
             };
             if assignment.owners()[vnode as usize] != self_id
-                || Self::vnode_state_frontiers(state) != self.frontiers
+                || Self::vnode_state_frontiers(state) != frontiers
             {
                 return Err(DbError::Checkpoint(format!(
                     "temporal join [{}] vnode {vnode} is outside its assignment state cut",
@@ -3189,6 +3201,205 @@ impl ManagedTemporalJoinOperator {
     }
 
     #[cfg(feature = "cluster")]
+    fn portable_handoff_cut(
+        &self,
+        transition: &ManagedVnodeTransition<'_>,
+        fresh_acquirer: bool,
+    ) -> Result<Option<TemporalHandoffCut>, DbError> {
+        if !fresh_acquirer {
+            return Ok(None);
+        }
+        let mut donors = std::collections::BTreeSet::new();
+        for restore in transition.restores {
+            if !transition.predecessor.contains(restore.participant_id)
+                || self
+                    .local_assignment
+                    .owners()
+                    .get(restore.vnode as usize)
+                    .map(|owner| owner.0)
+                    != Some(restore.participant_id)
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal join [{}] vnode {} restore has invalid donor {}",
+                    self.name, restore.vnode, restore.participant_id
+                )));
+            }
+            donors.insert(restore.participant_id);
+        }
+        if donors.is_empty() {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] fresh owner has no acquired vnode frames",
+                self.name
+            )));
+        }
+
+        let predecessor_participants = transition.predecessor.participant_ids();
+        let mut whole_donors = std::collections::BTreeSet::new();
+        let mut common_frontiers = None;
+        let mut published_watermark = None;
+        let mut published_uninitialized = false;
+        for restore in transition.whole_restores {
+            if !whole_donors.insert(restore.participant_id)
+                || restore.state.len() > self.max_managed_state_bytes
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal join [{}] has an invalid whole frame for donor {}",
+                    self.name, restore.participant_id
+                )));
+            }
+            let checkpoint =
+                rkyv::from_bytes::<TemporalJoinOperatorCheckpoint, rkyv::rancor::Error>(
+                    restore.state,
+                )
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "temporal join [{}] donor {} whole checkpoint: {error}",
+                        self.name, restore.participant_id
+                    ))
+                })?;
+            if checkpoint.version != OPERATOR_CHECKPOINT_VERSION {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal join [{}] donor {} uses unsupported checkpoint version {}",
+                    self.name, restore.participant_id, checkpoint.version
+                )));
+            }
+            let frontiers: [InputFrontier; 2] = checkpoint.frontiers.map(Into::into);
+            let published_output_frontier = checkpoint.published_output_frontier.map(Into::into);
+            if frontiers
+                .iter()
+                .any(|frontier| frontier.watermark == Some(i64::MIN))
+                || published_output_frontier
+                    .is_some_and(|frontier: InputFrontier| frontier.watermark == Some(i64::MIN))
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal join [{}] donor {} has an invalid handoff frontier",
+                    self.name, restore.participant_id
+                )));
+            }
+            self.validate_published_output_frontier(frontiers, published_output_frontier)?;
+
+            let cluster = checkpoint.cluster.ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "temporal join [{}] donor {} whole checkpoint is not from cluster mode",
+                    self.name, restore.participant_id
+                ))
+            })?;
+            if cluster.assignment_version != transition.predecessor.assignment_version
+                || cluster.owner_map_digest != transition.predecessor.assignment_digest
+                || cluster.self_id != restore.participant_id
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal join [{}] donor {} whole checkpoint is outside the predecessor assignment",
+                    self.name, restore.participant_id
+                )));
+            }
+            let expected_peers = predecessor_participants
+                .iter()
+                .copied()
+                .filter(|peer| *peer != restore.participant_id)
+                .collect::<Vec<_>>();
+            if cluster
+                .remote_peer_cursors
+                .iter()
+                .flatten()
+                .any(|peer| expected_peers.binary_search(peer).is_err())
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal join [{}] donor {} has an invalid ordered-channel cursor",
+                    self.name, restore.participant_id
+                )));
+            }
+            let local_frontiers: [InputFrontier; 2] = cluster.local_frontiers.map(Into::into);
+            if local_frontiers
+                .iter()
+                .any(|frontier| frontier.watermark == Some(i64::MIN))
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal join [{}] donor {} has an invalid local frontier",
+                    self.name, restore.participant_id
+                )));
+            }
+            for (port, channels) in cluster.channels.into_iter().enumerate() {
+                if channels.len() != expected_peers.len() {
+                    return Err(DbError::Checkpoint(format!(
+                        "temporal join [{}] donor {} has an incomplete peer cut",
+                        self.name, restore.participant_id
+                    )));
+                }
+                let mut applied = Vec::with_capacity(channels.len());
+                for (expected_peer, channel) in expected_peers.iter().zip(channels) {
+                    let frontier: InputFrontier = channel.applied.into();
+                    if channel.peer != *expected_peer
+                        || !channel.events.is_empty()
+                        || !channel.positioned_ipc.is_empty()
+                        || !channel.mutation_ipc.is_empty()
+                        || frontier.watermark == Some(i64::MIN)
+                    {
+                        return Err(DbError::Checkpoint(format!(
+                            "temporal join [{}] donor {} has retained ordered channel state",
+                            self.name, restore.participant_id
+                        )));
+                    }
+                    applied.push(frontier);
+                }
+                let merged = merge_input_frontier_iter(
+                    std::iter::once(local_frontiers[port]).chain(applied),
+                    i64::MIN,
+                );
+                if merged != frontiers[port] {
+                    return Err(DbError::Checkpoint(format!(
+                        "temporal join [{}] donor {} input frontiers do not form one common cut",
+                        self.name, restore.participant_id
+                    )));
+                }
+            }
+            if common_frontiers.is_some_and(|expected| expected != frontiers) {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal join [{}] donor whole checkpoints disagree on the input handoff cut",
+                    self.name
+                )));
+            }
+            common_frontiers = Some(frontiers);
+            match published_output_frontier.and_then(|frontier| frontier.watermark) {
+                Some(watermark) if !published_uninitialized => {
+                    published_watermark = Some(
+                        published_watermark
+                            .map_or(watermark, |current: i64| current.min(watermark)),
+                    );
+                }
+                _ => {
+                    published_uninitialized = true;
+                    published_watermark = None;
+                }
+            }
+        }
+        if whole_donors != donors {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] whole checkpoints do not exactly cover acquired vnode donors",
+                self.name
+            )));
+        }
+        let frontiers = common_frontiers.ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "temporal join [{}] fresh owner is missing its portable whole cut",
+                self.name
+            ))
+        })?;
+        let published_output_frontier = if published_uninitialized {
+            None
+        } else {
+            published_watermark.map(|watermark| InputFrontier {
+                watermark: Some(watermark),
+                idle: false,
+            })
+        };
+        Ok(Some(TemporalHandoffCut {
+            frontiers,
+            published_output_frontier,
+        }))
+    }
+
+    #[cfg(feature = "cluster")]
     fn prepare_transition_image(
         &self,
         transition: ManagedVnodeTransition<'_>,
@@ -3273,6 +3484,7 @@ impl ManagedTemporalJoinOperator {
             .enumerate()
             .filter_map(|(vnode, owner)| (*owner == config.self_id).then_some(vnode as u32))
             .collect::<Vec<_>>();
+        let fresh_acquirer = predecessor_owned.is_empty() && !target_owned.is_empty();
         let expected_revoked = predecessor_owned
             .iter()
             .copied()
@@ -3297,6 +3509,12 @@ impl ManagedTemporalJoinOperator {
                 self.name
             )));
         }
+        let mut handoff_cut = self.portable_handoff_cut(&transition, fresh_acquirer)?;
+        let transition_frontiers = handoff_cut.map_or(self.frontiers, |cut| cut.frontiers);
+        let mut published_output_frontier = handoff_cut
+            .map_or(self.published_output_frontier, |cut| {
+                cut.published_output_frontier
+            });
 
         if self.pending_frontiers.is_some()
             || self.frontier_remaining != 0
@@ -3357,10 +3575,12 @@ impl ManagedTemporalJoinOperator {
             )));
         }
 
-        let current =
-            self.derive_vnode_inventory(&self.local_assignment, config.self_id, |vnode| {
-                self.vnode_states[vnode as usize].as_deref()
-            })?;
+        let current = self.derive_vnode_inventory(
+            &self.local_assignment,
+            config.self_id,
+            self.frontiers,
+            |vnode| self.vnode_states[vnode as usize].as_deref(),
+        )?;
         if current.resident_vnodes != self.resident_vnodes
             || current.vnode_pending_holds != self.vnode_pending_holds
             || current.pending_hold_counts != self.pending_hold_counts
@@ -3425,7 +3645,7 @@ impl ManagedTemporalJoinOperator {
                 limit,
             )?;
             if let Some(state) = state.as_ref() {
-                if Self::vnode_state_frontiers(state) != self.frontiers {
+                if Self::vnode_state_frontiers(state) != transition_frontiers {
                     return Err(DbError::Checkpoint(format!(
                         "temporal join [{}] restored vnode {} is outside the transition frontier cut",
                         self.name, restore.vnode
@@ -3438,20 +3658,22 @@ impl ManagedTemporalJoinOperator {
             replacements.insert(restore.vnode, state);
         }
 
-        let target_inventory =
-            self.derive_vnode_inventory(&assignment, config.self_id, |vnode| {
-                match replacements.get(&vnode) {
-                    Some(state) => state.as_deref(),
-                    None => self.vnode_states[vnode as usize].as_deref(),
-                }
-            })?;
+        let target_inventory = self.derive_vnode_inventory(
+            &assignment,
+            config.self_id,
+            transition_frontiers,
+            |vnode| match replacements.get(&vnode) {
+                Some(state) => state.as_deref(),
+                None => self.vnode_states[vnode as usize].as_deref(),
+            },
+        )?;
+        let target_hold = target_inventory
+            .pending_hold_counts
+            .first_key_value()
+            .map(|(hold, _)| *hold);
         if let (Some(published), Some(hold)) = (
-            self.published_output_frontier
-                .and_then(|frontier| frontier.watermark),
-            target_inventory
-                .pending_hold_counts
-                .first_key_value()
-                .map(|(hold, _)| *hold),
+            published_output_frontier.and_then(|frontier| frontier.watermark),
+            target_hold,
         ) {
             if hold < published {
                 return Err(DbError::Checkpoint(format!(
@@ -3460,32 +3682,51 @@ impl ManagedTemporalJoinOperator {
                 )));
             }
         }
+        if let Some(frontier) = published_output_frontier.as_mut() {
+            *frontier = frontier.held_at(target_hold);
+        }
+        if let Some(cut) = handoff_cut.as_mut() {
+            cut.published_output_frontier = published_output_frontier;
+        }
 
         let target_peers = Self::remote_owner_peers(&assignment, config.self_id);
         let mut peer_channels = [BTreeMap::new(), BTreeMap::new()];
         for port in 0..2 {
             for &peer in &target_peers {
-                let channel = self.peer_channels[port].get(&peer).map_or(
+                let channel = if fresh_acquirer {
                     TemporalPeerChannel {
-                        applied: self.frontiers[port],
-                        accepted: self.frontiers[port],
+                        applied: transition_frontiers[port],
+                        accepted: transition_frontiers[port],
                         events: VecDeque::new(),
-                    },
-                    |channel| TemporalPeerChannel {
-                        applied: channel.applied,
-                        accepted: channel.accepted,
-                        events: VecDeque::new(),
-                    },
-                );
+                    }
+                } else {
+                    self.peer_channels[port].get(&peer).map_or(
+                        TemporalPeerChannel {
+                            applied: transition_frontiers[port],
+                            accepted: transition_frontiers[port],
+                            events: VecDeque::new(),
+                        },
+                        |channel| TemporalPeerChannel {
+                            applied: channel.applied,
+                            accepted: channel.accepted,
+                            events: VecDeque::new(),
+                        },
+                    )
+                };
                 peer_channels[port].insert(peer, channel);
             }
+            let local_frontier = if fresh_acquirer {
+                transition_frontiers[port]
+            } else {
+                self.local_frontiers[port]
+            };
             let merged = merge_input_frontier_iter(
-                std::iter::once(self.local_frontiers[port])
+                std::iter::once(local_frontier)
                     .chain(peer_channels[port].values().map(|channel| channel.applied)),
                 i64::MIN,
             );
             validate_frontier(
-                self.frontiers[port],
+                transition_frontiers[port],
                 merged,
                 if port == 0 { "left" } else { "right" },
                 &self.name,
@@ -3504,6 +3745,7 @@ impl ManagedTemporalJoinOperator {
             cluster_peers: target_peers.into(),
             peer_channels,
             bootstrap_broadcast,
+            handoff_cut,
         };
         let total = live_bytes
             .checked_add(restore_payload_bytes)
@@ -4187,6 +4429,11 @@ impl GraphOperator for ManagedTemporalJoinOperator {
             &mut self.retained_state_bytes,
             &mut prepared.retained_state_bytes,
         );
+        if let Some(cut) = prepared.handoff_cut {
+            self.frontiers = cut.frontiers;
+            self.local_frontiers = cut.frontiers;
+            self.published_output_frontier = cut.published_output_frontier;
+        }
         self.maintenance_cursor = 0;
         self.maintenance_pending = prepared.maintenance_pending;
         self.maintenance_remaining = if self.maintenance_pending {
@@ -4827,6 +5074,239 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
+    async fn fresh_owner_installs_portable_cut_and_bootstrap_topology() {
+        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+
+        use crate::operator_graph::{ManagedVnodeRestore, ManagedWholeRestore};
+
+        let key = key_for_vnode(0);
+        let cut = frontier(100);
+        let (mut donor, _, _) = operator(8);
+        donor
+            .process_with_frontiers(
+                &[
+                    Vec::new(),
+                    vec![right_batch(
+                        std::slice::from_ref(&key),
+                        &["X"],
+                        &[90],
+                        &["live"],
+                        &[SourceMutation::Put],
+                    )],
+                ],
+                &cut,
+            )
+            .await
+            .unwrap();
+        while !donor.wants_input() {
+            donor.process_with_frontiers(&[], &cut).await.unwrap();
+        }
+        let captured = donor.checkpoint_vnodes(&[0], 2).unwrap().unwrap();
+        let vnode_frame = captured[0].state.as_deref().unwrap();
+
+        let scope = two_owner_scope().await;
+        let target_version = scope.registry.assignment_version() + 1;
+        let target_fence = CheckpointAssignmentFence::from_owner_map(
+            target_version,
+            &[1, 2],
+            vec![
+                CheckpointParticipant {
+                    node_id: 1,
+                    boot_incarnation: uuid::Uuid::from_u128(1),
+                },
+                CheckpointParticipant {
+                    node_id: 2,
+                    boot_incarnation: uuid::Uuid::from_u128(2),
+                },
+            ],
+        )
+        .unwrap();
+        scope
+            .sender
+            .install_assignment_fence(&target_fence, &[1, 2])
+            .unwrap();
+        scope
+            .receiver
+            .install_assignment_fence(&target_fence, &[1, 2])
+            .unwrap();
+        scope
+            .registry
+            .set_assignment_and_version(Arc::from([NodeId(1), NodeId(2)]), target_version);
+
+        let predecessor = CheckpointAssignmentFence::from_owner_map(
+            target_version - 1,
+            &[2, 3],
+            vec![
+                CheckpointParticipant {
+                    node_id: 2,
+                    boot_incarnation: uuid::Uuid::from_u128(2),
+                },
+                CheckpointParticipant {
+                    node_id: 3,
+                    boot_incarnation: uuid::Uuid::from_u128(3),
+                },
+            ],
+        )
+        .unwrap();
+        let predecessor_registry = VnodeRegistry::new(2);
+        predecessor_registry.set_assignment_and_version(
+            Arc::from([NodeId(2), NodeId(3)]),
+            predecessor.assignment_version,
+        );
+
+        let (mut target, _, _) = operator(8);
+        target.attach_cluster_shuffle(scope);
+        target.local_assignment = predecessor_registry.versioned_snapshot();
+        target.cluster_peers = Arc::from([2_u64, 3]);
+        for port in 0..2 {
+            target.peer_channels[port].entry(3).or_default();
+        }
+
+        let encode_whole =
+            |participant_id: u64, peer: u64, queued: bool, published_watermark: i64| {
+                let channel = |side: usize| TemporalCheckpointChannel {
+                    peer,
+                    applied: cut[side].into(),
+                    events: if queued && side == 0 {
+                        vec![TemporalCheckpointEvent::Frontier {
+                            recovery_gen: 0,
+                            frontier: cut[side].into(),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    positioned_ipc: Vec::new(),
+                    mutation_ipc: Vec::new(),
+                };
+                let checkpoint = TemporalJoinOperatorCheckpoint {
+                    version: OPERATOR_CHECKPOINT_VERSION,
+                    frontiers: cut.map(Into::into),
+                    maintenance_cursor: 0,
+                    maintenance_pending: false,
+                    maintenance_remaining: 0,
+                    maintenance_rescan: false,
+                    published_output_frontier: Some(
+                        InputFrontier {
+                            watermark: Some(published_watermark),
+                            idle: participant_id == 3,
+                        }
+                        .into(),
+                    ),
+                    cluster: Some(TemporalClusterCheckpoint {
+                        assignment_version: predecessor.assignment_version,
+                        owner_map_digest: predecessor.assignment_digest,
+                        self_id: participant_id,
+                        local_frontiers: cut.map(Into::into),
+                        remote_peer_cursors: [None; 2],
+                        channels: [vec![channel(0)], vec![channel(1)]],
+                    }),
+                };
+                rkyv::to_bytes::<rkyv::rancor::Error>(&checkpoint)
+                    .unwrap()
+                    .to_vec()
+            };
+        let restores = [ManagedVnodeRestore {
+            participant_id: 2,
+            vnode: 0,
+            state: vnode_frame,
+        }];
+
+        let absent_vnode = [ABSENT_VNODE];
+        let multi_donor_restores = [
+            ManagedVnodeRestore {
+                participant_id: 2,
+                vnode: 0,
+                state: vnode_frame,
+            },
+            ManagedVnodeRestore {
+                participant_id: 3,
+                vnode: 1,
+                state: &absent_vnode,
+            },
+        ];
+        let donor2_frame = encode_whole(2, 3, false, 80);
+        let donor3_frame = encode_whole(3, 2, false, 60);
+        let multi_donor_whole = [
+            ManagedWholeRestore {
+                participant_id: 2,
+                state: &donor2_frame,
+            },
+            ManagedWholeRestore {
+                participant_id: 3,
+                state: &donor3_frame,
+            },
+        ];
+        let merged = target
+            .portable_handoff_cut(
+                &ManagedVnodeTransition {
+                    predecessor: &predecessor,
+                    target: &target_fence,
+                    revoked: &rustc_hash::FxHashSet::default(),
+                    restores: &multi_donor_restores,
+                    whole_restores: &multi_donor_whole,
+                },
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.frontiers, cut);
+        assert_eq!(
+            merged.published_output_frontier,
+            Some(InputFrontier {
+                watermark: Some(60),
+                idle: false,
+            })
+        );
+
+        let queued_frame = encode_whole(2, 3, true, 100);
+        let queued_whole = [ManagedWholeRestore {
+            participant_id: 2,
+            state: &queued_frame,
+        }];
+        target
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &target_fence,
+                revoked: &rustc_hash::FxHashSet::default(),
+                restores: &restores,
+                whole_restores: &queued_whole,
+            })
+            .unwrap_err();
+        assert_eq!(target.frontiers, [InputFrontier::default(); 2]);
+        assert!(target.vnode_states.iter().all(Option::is_none));
+
+        let whole_frame = encode_whole(2, 3, false, 100);
+        let whole_restores = [ManagedWholeRestore {
+            participant_id: 2,
+            state: &whole_frame,
+        }];
+        target
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &target_fence,
+                revoked: &rustc_hash::FxHashSet::default(),
+                restores: &restores,
+                whole_restores: &whole_restores,
+            })
+            .unwrap();
+        assert_eq!(target.frontiers, [InputFrontier::default(); 2]);
+        target.publish_vnode_transition();
+        assert_eq!(target.frontiers, cut);
+        assert_eq!(target.local_frontiers, cut);
+        assert_eq!(target.published_output_frontier, Some(cut[0]));
+        assert_eq!(target.cluster_peers.as_ref(), &[2]);
+        for channel in target.peer_channels.iter().flat_map(BTreeMap::values) {
+            assert_eq!(channel.applied, cut[0]);
+            assert_eq!(channel.accepted, cut[0]);
+            assert!(channel.events.is_empty());
+        }
+        assert_eq!(target.last_broadcasts, [InputFrontier::default(); 2]);
+        assert!(target.checkpoint_drain_pending());
+        target.finish_vnode_transition();
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
     async fn vnode_transition_is_atomic_and_publishes_target_topology() {
         use laminar_core::checkpoint::CheckpointParticipant;
 
@@ -4890,6 +5370,7 @@ mod tests {
         let fence = install_all_local_assignment(&scope);
         let corrupt = [PRESENT_VNODE, 0xff];
         let corrupt_restore = [ManagedVnodeRestore {
+            participant_id: 2,
             vnode: 1,
             state: &corrupt,
         }];
@@ -4899,6 +5380,7 @@ mod tests {
                 target: &fence,
                 revoked: &rustc_hash::FxHashSet::default(),
                 restores: &corrupt_restore,
+                whole_restores: &[],
             })
             .unwrap_err();
         assert_eq!(target.local_assignment.version(), predecessor_version);
@@ -4906,6 +5388,7 @@ mod tests {
         assert_eq!(target.cluster_peers.as_ref(), &[2]);
 
         let restores = [ManagedVnodeRestore {
+            participant_id: 2,
             vnode: 1,
             state: frame,
         }];
@@ -4915,6 +5398,7 @@ mod tests {
                 target: &fence,
                 revoked: &rustc_hash::FxHashSet::default(),
                 restores: &restores,
+                whole_restores: &[],
             })
             .unwrap();
         assert!(target.managed_state_accounting().unwrap().prepared > 0);
@@ -4928,6 +5412,7 @@ mod tests {
                 target: &fence,
                 revoked: &rustc_hash::FxHashSet::default(),
                 restores: &restores,
+                whole_restores: &[],
             })
             .unwrap();
         target.publish_vnode_transition();

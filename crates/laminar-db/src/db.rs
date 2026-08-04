@@ -2605,6 +2605,7 @@ impl LaminarDB {
                     &new_assignment,
                     local_participant,
                     pipeline_identity,
+                    Vec::new(),
                     final_owner_exit,
                 )?;
             let transition_revoked: rustc_hash::FxHashSet<u32> =

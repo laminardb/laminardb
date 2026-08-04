@@ -3,12 +3,17 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use rustc_hash::FxHashSet;
+use laminar_core::checkpoint::StateFrameKey;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{publish_cluster_execution_poison, ManagedVnodeTransition, OperatorGraph};
+use super::{
+    publish_cluster_execution_poison, ManagedVnodeRestore, ManagedVnodeTransition,
+    ManagedWholeRestore, OperatorGraph,
+};
 use crate::error::DbError;
 use crate::operator::capability::{ManagedStateContract, OperatorStateClass};
 use crate::operator::sql_query::ClusterShuffleConfig;
+use crate::recovery_manager::RecoveredStateFrame;
 use crate::vnode_transition_staging::{
     InstalledVnodeStateBinding, InstalledVnodeStateHandle, PendingVnodeTransition,
     PendingVnodeTransitionHandle, VnodeTransitionKind,
@@ -21,6 +26,12 @@ struct VnodeTransitionAuthoritySnapshot {
     sender: Arc<laminar_core::shuffle::ShuffleSender>,
     receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
     transport_digest: [u8; 32],
+}
+
+#[derive(Default)]
+struct ProjectedTransitionFrames<'a> {
+    restores: Vec<ManagedVnodeRestore<'a>>,
+    whole_restores: Vec<ManagedWholeRestore<'a>>,
 }
 
 impl VnodeTransitionAuthoritySnapshot {
@@ -369,6 +380,8 @@ impl OperatorGraph {
             transition.pending.predecessor(),
             transition.pending.target(),
             &transition.revoked,
+            transition.pending.acquired_vnodes(),
+            transition.pending.state_frames(),
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -408,6 +421,8 @@ impl OperatorGraph {
             transition.pending.predecessor(),
             transition.pending.target(),
             &transition.revoked,
+            &[],
+            &[],
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -472,15 +487,26 @@ impl OperatorGraph {
         pending: &PendingVnodeTransition,
         installed_state: &InstalledVnodeStateHandle,
     ) -> Result<(), DbError> {
-        if !installed_state.lock().as_ref().is_some_and(|installed| {
-            installed.matches(pending.predecessor(), pending.pipeline_identity())
-        }) {
+        if !Self::installed_state_matches_pending(pending, installed_state.lock().as_ref()) {
             return Err(DbError::Checkpoint(
-                "[LDB-6051] graph does not have the exact predecessor assignment state installed"
+                "[LDB-6051] graph installed-state binding does not match the staged transition"
                     .into(),
             ));
         }
         Ok(())
+    }
+
+    fn installed_state_matches_pending(
+        pending: &PendingVnodeTransition,
+        installed: Option<&InstalledVnodeStateBinding>,
+    ) -> bool {
+        if pending.requires_predecessor_binding() {
+            installed.is_some_and(|binding| {
+                binding.matches(pending.predecessor(), pending.pipeline_identity())
+            })
+        } else {
+            installed.is_none()
+        }
     }
 
     fn prepare_final_owner_exit(&self) -> Result<PreparedFinalOwnerExit, DbError> {
@@ -560,6 +586,18 @@ impl OperatorGraph {
                 "[LDB-6051] revoked vnodes {invalid:?} are outside the target or remain locally owned"
             )));
         }
+        let mut invalid_acquired = pending
+            .acquired_vnodes()
+            .iter()
+            .copied()
+            .filter(|vnode| !authority.contains_vnode(*vnode) || !authority.owns(*vnode))
+            .collect::<Vec<_>>();
+        invalid_acquired.sort_unstable();
+        if !invalid_acquired.is_empty() {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6051] acquired vnodes {invalid_acquired:?} are outside the target or not locally owned"
+            )));
+        }
         let installed_state = self.installed_state_handle()?;
         Self::validate_installed_predecessor(&pending, &installed_state)?;
         let installed_binding = InstalledVnodeStateBinding::new(
@@ -596,6 +634,149 @@ impl OperatorGraph {
         }
     }
 
+    fn validate_relevant_acquired_vnodes(
+        &self,
+        node_idx: usize,
+        acquired: &[u32],
+        restored: &[u32],
+    ) -> Result<bool, DbError> {
+        let node = &self.nodes[node_idx];
+        match node.capability.state_class {
+            OperatorStateClass::GlobalSingleton => {
+                let relevant = acquired.binary_search(&0).is_ok();
+                let matches = if relevant {
+                    restored == [0]
+                } else {
+                    restored.is_empty()
+                };
+                if !matches {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6051] operator '{}' transition restore roster {restored:?} does not match acquired singleton state",
+                        node.name
+                    )));
+                }
+                Ok(relevant)
+            }
+            OperatorStateClass::VnodeKeyed => {
+                if restored != acquired {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6051] operator '{}' transition restore roster {restored:?} does not match acquired vnodes {acquired:?}",
+                        node.name
+                    )));
+                }
+                Ok(!acquired.is_empty())
+            }
+            state_class => Err(DbError::Checkpoint(format!(
+                "[LDB-6051] managed operator '{}' has unsupported transition placement {state_class:?}",
+                node.name
+            ))),
+        }
+    }
+
+    fn project_transition_frames<'a>(
+        &self,
+        node_indices: &[usize],
+        state_frames: &'a [RecoveredStateFrame],
+    ) -> Result<Vec<ProjectedTransitionFrames<'a>>, DbError> {
+        let mut operator_positions = FxHashMap::default();
+        let mut projected = (0..node_indices.len())
+            .map(|_| ProjectedTransitionFrames::default())
+            .collect::<Vec<_>>();
+        for (position, &node_idx) in node_indices.iter().enumerate() {
+            #[cfg(test)]
+            {
+                let contract = self.nodes[node_idx]
+                    .capability
+                    .managed_state
+                    .expect("managed operator inventory was filtered above");
+                if matches!(contract, ManagedStateContract::TestVnodeStateV1) {
+                    continue;
+                }
+            }
+            let name = Arc::clone(&self.nodes[node_idx].name);
+            if operator_positions
+                .insert(Arc::clone(&name), position)
+                .is_some()
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6051] managed operator name '{name}' is not unique"
+                )));
+            }
+        }
+
+        for frame in state_frames {
+            let (operator_id, vnode) = match &frame.key {
+                StateFrameKey::OperatorWhole { operator_id } => (operator_id, None),
+                StateFrameKey::Vnode { operator_id, vnode } => {
+                    (operator_id, Some(u32::from(*vnode)))
+                }
+            };
+            let name = operator_id.strip_prefix("graph:").ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6051] transition frame {:?} is not graph-managed state",
+                    frame.key
+                ))
+            })?;
+            let position = operator_positions.get(name).copied().ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6051] transition frame {:?} has no managed graph operator",
+                    frame.key
+                ))
+            })?;
+            if let Some(vnode) = vnode {
+                projected[position].restores.push(ManagedVnodeRestore {
+                    participant_id: frame.participant_id,
+                    vnode,
+                    state: frame.payload.as_ref(),
+                });
+            } else {
+                projected[position]
+                    .whole_restores
+                    .push(ManagedWholeRestore {
+                        participant_id: frame.participant_id,
+                        state: frame.payload.as_ref(),
+                    });
+            }
+        }
+        for frames in &mut projected {
+            frames
+                .restores
+                .sort_unstable_by_key(|restore| restore.vnode);
+        }
+        Ok(projected)
+    }
+
+    fn transition_payload_bytes(&self, frames: &[RecoveredStateFrame]) -> Result<usize, DbError> {
+        frames.iter().try_fold(0usize, |total, frame| {
+            total.checked_add(frame.payload.len()).ok_or_else(|| {
+                DbError::ManagedStateBudgetExceeded {
+                    context: "vnode transition staged payload".into(),
+                    accounted_bytes: usize::MAX,
+                    limit_bytes: self.max_managed_state_bytes,
+                }
+            })
+        })
+    }
+
+    fn validate_transition_state_budget(
+        &self,
+        payload_bytes: usize,
+        context: impl Into<String>,
+    ) -> Result<(), DbError> {
+        let accounted_bytes = self
+            .managed_state_accounted_bytes()
+            .checked_add(payload_bytes)
+            .unwrap_or(usize::MAX);
+        if accounted_bytes > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: context.into(),
+                accounted_bytes,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+        Ok(())
+    }
+
     fn canonical_managed_operator_indices(&self) -> Vec<usize> {
         let mut indices: Vec<usize> = self
             .nodes
@@ -618,9 +799,15 @@ impl OperatorGraph {
         predecessor: &laminar_core::checkpoint::CheckpointAssignmentFence,
         target: &laminar_core::checkpoint::CheckpointAssignmentFence,
         revoked: &FxHashSet<u32>,
+        acquired: &[u32],
+        state_frames: &[RecoveredStateFrame],
     ) -> Result<PreparedManagedOperators, DbError> {
+        let payload_bytes = self.transition_payload_bytes(state_frames)?;
+        self.validate_transition_state_budget(payload_bytes, "vnode transition staged payload")?;
+        let node_indices = self.canonical_managed_operator_indices();
+        let projected = self.project_transition_frames(&node_indices, state_frames)?;
         let mut attempted = Vec::new();
-        for node_idx in self.canonical_managed_operator_indices() {
+        for (node_idx, frames) in node_indices.into_iter().zip(projected) {
             let contract = self.nodes[node_idx]
                 .capability
                 .managed_state
@@ -643,13 +830,49 @@ impl OperatorGraph {
                     return Err(error);
                 }
             };
-            if relevant_revoked.is_empty()
+            let restored_vnodes = frames
+                .restores
+                .iter()
+                .map(|restore| restore.vnode)
+                .collect::<Vec<_>>();
+            let relevant_acquired = match self.validate_relevant_acquired_vnodes(
+                node_idx,
+                acquired,
+                &restored_vnodes,
+            ) {
+                Ok(relevant) => relevant,
+                Err(error) => {
+                    let prepared = PreparedManagedOperators {
+                        node_indices: attempted,
+                    };
+                    self.abort_and_finish_managed_operators(&prepared);
+                    return Err(error);
+                }
+            };
+            if !frames.whole_restores.is_empty()
                 && !matches!(
                     contract,
                     ManagedStateContract::BoundedIntervalJoinV1
                         | ManagedStateContract::TemporalJoinV1
                 )
             {
+                let name = Arc::clone(&self.nodes[node_idx].name);
+                let prepared = PreparedManagedOperators {
+                    node_indices: attempted,
+                };
+                self.abort_and_finish_managed_operators(&prepared);
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6051] operator '{name}' does not accept portable whole transition state"
+                )));
+            }
+            let relevant = !relevant_revoked.is_empty()
+                || relevant_acquired
+                || matches!(
+                    contract,
+                    ManagedStateContract::BoundedIntervalJoinV1
+                        | ManagedStateContract::TemporalJoinV1
+                );
+            if !relevant {
                 continue;
             }
             attempted.push(node_idx);
@@ -657,7 +880,8 @@ impl OperatorGraph {
                 predecessor,
                 target,
                 revoked: &relevant_revoked,
-                restores: &[],
+                restores: &frames.restores,
+                whole_restores: &frames.whole_restores,
             };
             if let Err(error) = self.nodes[node_idx]
                 .operator
@@ -672,15 +896,20 @@ impl OperatorGraph {
                     "[LDB-6051] vnode transition preparation for operator '{name}' failed: {error}"
                 )));
             }
+            if let Err(error) =
+                self.validate_transition_state_budget(payload_bytes, "vnode transition preparation")
+            {
+                let prepared = PreparedManagedOperators {
+                    node_indices: attempted,
+                };
+                self.abort_and_finish_managed_operators(&prepared);
+                return Err(error);
+            }
         }
         let prepared = PreparedManagedOperators {
             node_indices: attempted,
         };
         self.observe_managed_state_accounting(&prepared.node_indices);
-        if let Err(error) = self.validate_managed_state_budget("vnode transition preparation") {
-            self.abort_and_finish_managed_operators(&prepared);
-            return Err(error);
-        }
         Ok(prepared)
     }
 
@@ -698,7 +927,15 @@ impl OperatorGraph {
 
     fn publish_managed_operators(&mut self, prepared: &PreparedManagedOperators) {
         for node_idx in prepared.node_indices.iter().copied() {
-            self.nodes[node_idx].operator.publish_vnode_transition();
+            let frontier = {
+                let node = &mut self.nodes[node_idx];
+                node.operator.publish_vnode_transition();
+                node.operator.restored_output_frontier()
+            };
+            if let Some(frontier) = frontier {
+                self.output_watermarks[node_idx] = frontier.watermark_or_min();
+                self.output_idle[node_idx] = frontier.idle;
+            }
         }
     }
 
@@ -813,9 +1050,7 @@ impl OperatorGraph {
                 }
             };
         let mut installed = installed_state.lock();
-        let validation = if installed.as_ref().is_some_and(|binding| {
-            binding.matches(pending.predecessor(), pending.pipeline_identity())
-        }) {
+        let validation = if Self::installed_state_matches_pending(&pending, installed.as_ref()) {
             authority.revalidate_for_publication()
         } else {
             Err(DbError::Checkpoint(
@@ -848,6 +1083,7 @@ impl OperatorGraph {
         tracing::info!(
             assignment_version = authority.assignment.version(),
             revoked_vnodes = revoked.len(),
+            acquired_vnodes = pending.acquired_vnodes().len(),
             "completed staged vnode transition"
         );
         Ok(())

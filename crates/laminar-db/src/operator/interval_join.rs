@@ -32,6 +32,8 @@ use crate::operator::sql_query::ClusterShuffleConfig;
 #[cfg(feature = "cluster")]
 use crate::operator_graph::ManagedVnodeTransition;
 
+const OPERATOR_CHECKPOINT_VERSION: u8 = 1;
+
 #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 enum JoinInputSide {
     Left,
@@ -40,6 +42,7 @@ enum JoinInputSide {
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct IntervalJoinOperatorCheckpoint {
+    version: u8,
     join_type: u8,
     left_keys: Vec<String>,
     right_keys: Vec<String>,
@@ -53,11 +56,21 @@ struct IntervalJoinOperatorCheckpoint {
     applied_right_watermark: i64,
     applied_left_idle: bool,
     applied_right_idle: bool,
+    assignment_version: Option<u64>,
+    owner_map_digest: Option<[u8; 32]>,
+    participant_id: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct IntervalHandoffCut {
+    left_watermark: i64,
+    right_watermark: i64,
 }
 
 struct PreparedIntervalJoinTransition {
     replacements: Vec<(u32, Option<Box<IntervalJoinState>>)>,
     local_assignment: VnodeAssignmentSnapshot,
+    handoff_cut: Option<IntervalHandoffCut>,
 }
 
 enum IntervalJoinTransitionCleanup {
@@ -220,11 +233,196 @@ impl IntervalJoinOperator {
         config: &StreamJoinConfig,
         context: &str,
         max_state_bytes: usize,
+        cut: Option<IntervalHandoffCut>,
     ) -> Result<IntervalJoinState, DbError> {
         let checkpoint = rkyv::from_bytes::<JoinStateCheckpoint, rkyv::rancor::Error>(bytes)
             .map_err(|error| DbError::Checkpoint(format!("{context}: {error}")))?;
+        if let Some(cut) = cut {
+            let bound_ms = i64::try_from(config.time_bound.as_millis()).map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "{context}: configured time bound exceeds the supported millisecond range"
+                ))
+            })?;
+            let expected_left_cutoff = cut.right_watermark.saturating_sub(bound_ms);
+            let expected_right_cutoff = cut.left_watermark;
+            if checkpoint.left_evicted_cutoff > expected_left_cutoff
+                || checkpoint.right_evicted_cutoff > expected_right_cutoff
+                || (checkpoint.left_buffer_rows != 0
+                    && checkpoint.left_evicted_cutoff != expected_left_cutoff)
+                || (checkpoint.right_buffer_rows != 0
+                    && checkpoint.right_evicted_cutoff != expected_right_cutoff)
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "{context}: vnode eviction state is inconsistent with the portable handoff cut"
+                )));
+            }
+        }
         IntervalJoinState::from_checkpoint(&checkpoint, config, max_state_bytes)
             .map_err(|error| DbError::Checkpoint(format!("{context}: {error}")))
+    }
+
+    fn validate_checkpoint_config(
+        &self,
+        checkpoint: &IntervalJoinOperatorCheckpoint,
+    ) -> Result<(), DbError> {
+        let bound_ms = i64::try_from(self.config.time_bound.as_millis()).map_err(|_| {
+            DbError::Checkpoint(format!(
+                "interval join [{}] configured time bound exceeds the supported millisecond range",
+                self.projection.op_name
+            ))
+        })?;
+        if checkpoint.version != OPERATOR_CHECKPOINT_VERSION
+            || checkpoint.join_type != join_type_tag(self.config.join_type)
+            || checkpoint.left_keys != self.config.left_keys
+            || checkpoint.right_keys != self.config.right_keys
+            || checkpoint.left_time_column != self.config.left_time_column
+            || checkpoint.right_time_column != self.config.right_time_column
+            || checkpoint.left_table != self.config.left_table
+            || checkpoint.right_table != self.config.right_table
+            || checkpoint.bound_ms != bound_ms
+        {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] checkpoint version or configuration does not match the operator",
+                self.projection.op_name
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn checkpoint_assignment_identity(&self) -> Result<(u64, [u8; 32], u64), DbError> {
+        let config = self.cluster_shuffle.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "interval join [{}] has no cluster assignment",
+                self.projection.op_name
+            ))
+        })?;
+        let assignment = config.registry.versioned_snapshot();
+        let owners = assignment
+            .owners()
+            .iter()
+            .map(|owner| owner.0)
+            .collect::<Vec<_>>();
+        let owner_map_digest =
+            laminar_core::checkpoint::CheckpointAssignmentFence::owner_map_digest(
+                u32::from(self.key_group_count),
+                &owners,
+            );
+        let sender_digest = config.sender.active_assignment_digest();
+        let receiver_digest = config.receiver.active_assignment_digest();
+        if assignment.version() != self.local_assignment.version()
+            || assignment.owners() != self.local_assignment.owners()
+            || config.sender.local_id() != config.self_id.0
+            || config.receiver.local_id() != config.self_id.0
+            || config.sender.incarnation() != config.receiver.incarnation()
+            || config.sender.assignment_version() != assignment.version()
+            || config.receiver.assignment_version() != assignment.version()
+            || sender_digest.is_none()
+            || sender_digest != receiver_digest
+        {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] checkpoint assignment is not active",
+                self.projection.op_name
+            )));
+        }
+        Ok((assignment.version(), owner_map_digest, config.self_id.0))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn portable_handoff_cut(
+        &self,
+        transition: &ManagedVnodeTransition<'_>,
+        fresh_acquirer: bool,
+    ) -> Result<Option<IntervalHandoffCut>, DbError> {
+        if !fresh_acquirer {
+            return Ok(None);
+        }
+        let mut donors = std::collections::BTreeSet::new();
+        for restore in transition.restores {
+            if !transition.predecessor.contains(restore.participant_id)
+                || self
+                    .local_assignment
+                    .owners()
+                    .get(restore.vnode as usize)
+                    .map(|owner| owner.0)
+                    != Some(restore.participant_id)
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join [{}] vnode {} restore has invalid donor {}",
+                    self.projection.op_name, restore.vnode, restore.participant_id
+                )));
+            }
+            donors.insert(restore.participant_id);
+        }
+        if donors.is_empty() {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] fresh owner has no acquired vnode frames",
+                self.projection.op_name
+            )));
+        }
+        if transition.whole_restores.is_empty() {
+            return Ok(Some(IntervalHandoffCut {
+                left_watermark: i64::MIN,
+                right_watermark: i64::MIN,
+            }));
+        }
+
+        let mut whole_donors = std::collections::BTreeSet::new();
+        let mut common: Option<IntervalHandoffCut> = None;
+        for restore in transition.whole_restores {
+            if !whole_donors.insert(restore.participant_id)
+                || restore.state.len() > self.max_managed_state_bytes
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join [{}] has an invalid whole frame for donor {}",
+                    self.projection.op_name, restore.participant_id
+                )));
+            }
+            let checkpoint =
+                rkyv::from_bytes::<IntervalJoinOperatorCheckpoint, rkyv::rancor::Error>(
+                    restore.state,
+                )
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "interval join [{}] donor {} whole checkpoint: {error}",
+                        self.projection.op_name, restore.participant_id
+                    ))
+                })?;
+            self.validate_checkpoint_config(&checkpoint)?;
+            if !checkpoint.aligned_replay.is_empty()
+                || checkpoint.assignment_version != Some(transition.predecessor.assignment_version)
+                || checkpoint.owner_map_digest != Some(transition.predecessor.assignment_digest)
+                || checkpoint.participant_id != Some(restore.participant_id)
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join [{}] donor {} whole checkpoint is not a portable predecessor cut",
+                    self.projection.op_name, restore.participant_id
+                )));
+            }
+            let cut = IntervalHandoffCut {
+                left_watermark: checkpoint.applied_left_watermark,
+                right_watermark: checkpoint.applied_right_watermark,
+            };
+            if let Some(expected) = &mut common {
+                if expected.left_watermark != cut.left_watermark
+                    || expected.right_watermark != cut.right_watermark
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "interval join [{}] donor whole checkpoints disagree on the handoff watermarks",
+                        self.projection.op_name
+                    )));
+                }
+            } else {
+                common = Some(cut);
+            }
+        }
+        if whole_donors != donors {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] whole checkpoints do not exactly cover acquired vnode donors",
+                self.projection.op_name
+            )));
+        }
+        Ok(common)
     }
 
     fn execute_shard_cycle(
@@ -951,6 +1149,13 @@ impl GraphOperator for IntervalJoinOperator {
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
         #[cfg(feature = "cluster")]
+        if self.cluster_shuffle.is_none() && !self.aligned_replay.is_empty() {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] has cluster replay without an attached cluster scope",
+                self.projection.op_name
+            )));
+        }
+        #[cfg(feature = "cluster")]
         let mut retained_payload_bytes = 0usize;
         #[cfg(not(feature = "cluster"))]
         let retained_payload_bytes = 0usize;
@@ -1015,7 +1220,16 @@ impl GraphOperator for IntervalJoinOperator {
                 self.projection.op_name
             ))
         })?;
+        #[cfg(feature = "cluster")]
+        let assignment_identity = self
+            .cluster_shuffle
+            .as_ref()
+            .map(|_| self.checkpoint_assignment_identity())
+            .transpose()?;
+        #[cfg(not(feature = "cluster"))]
+        let assignment_identity: Option<(u64, [u8; 32], u64)> = None;
         let checkpoint = IntervalJoinOperatorCheckpoint {
+            version: OPERATOR_CHECKPOINT_VERSION,
             join_type: join_type_tag(self.config.join_type),
             left_keys: self.config.left_keys.clone(),
             right_keys: self.config.right_keys.clone(),
@@ -1029,6 +1243,9 @@ impl GraphOperator for IntervalJoinOperator {
             applied_right_watermark: self.applied_right_watermark,
             applied_left_idle: self.applied_left_idle,
             applied_right_idle: self.applied_right_idle,
+            assignment_version: assignment_identity.map(|identity| identity.0),
+            owner_map_digest: assignment_identity.map(|identity| identity.1),
+            participant_id: assignment_identity.map(|identity| identity.2),
         };
         // The retained IPC set is already <= M. Bound the final archive independently by M so a
         // valid image in (M/2, M] remains checkpointable; live + IPC + archive peak at <= 3M.
@@ -1075,30 +1292,32 @@ impl GraphOperator for IntervalJoinOperator {
                 self.projection.op_name
             ))
         })?;
-        let bound_ms = i64::try_from(self.config.time_bound.as_millis()).map_err(|_| {
-            DbError::Checkpoint(format!(
-                "interval join [{}] configured time bound exceeds the supported millisecond range",
-                self.projection.op_name
-            ))
-        })?;
-        if checkpoint.join_type != join_type_tag(self.config.join_type)
-            || checkpoint.left_keys != self.config.left_keys
-            || checkpoint.right_keys != self.config.right_keys
-            || checkpoint.left_time_column != self.config.left_time_column
-            || checkpoint.right_time_column != self.config.right_time_column
-            || checkpoint.left_table != self.config.left_table
-            || checkpoint.right_table != self.config.right_table
-            || checkpoint.bound_ms != bound_ms
+        self.validate_checkpoint_config(&checkpoint)?;
+        #[cfg(feature = "cluster")]
+        let expected_identity = self
+            .cluster_shuffle
+            .as_ref()
+            .map(|_| self.checkpoint_assignment_identity())
+            .transpose()?;
+        #[cfg(not(feature = "cluster"))]
+        let expected_identity: Option<(u64, [u8; 32], u64)> = None;
+        if let Some(expected) = expected_identity {
+            if checkpoint.assignment_version != Some(expected.0)
+                || checkpoint.owner_map_digest != Some(expected.1)
+                || checkpoint.participant_id != Some(expected.2)
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join [{}] checkpoint assignment does not match the restored operator",
+                    self.projection.op_name
+                )));
+            }
+        } else if checkpoint.assignment_version.is_some()
+            || checkpoint.owner_map_digest.is_some()
+            || checkpoint.participant_id.is_some()
+            || !checkpoint.aligned_replay.is_empty()
         {
             return Err(DbError::Checkpoint(format!(
-                "interval join [{}] checkpoint configuration does not match the restored operator",
-                self.projection.op_name
-            )));
-        }
-        #[cfg(not(feature = "cluster"))]
-        if !checkpoint.aligned_replay.is_empty() {
-            return Err(DbError::Checkpoint(format!(
-                "interval join [{}] checkpoint contains cluster shuffle replay",
+                "interval join [{}] checkpoint contains cluster state without an attached cluster scope",
                 self.projection.op_name
             )));
         }
@@ -1354,6 +1573,7 @@ impl GraphOperator for IntervalJoinOperator {
                 self.projection.op_name
             ),
             remaining,
+            None,
         )?;
         replacement.validate_vnode(vnode, vnode_count, &self.config)?;
         if let Some((left_schema, right_schema)) = &self.input_schemas {
@@ -1395,9 +1615,30 @@ impl GraphOperator for IntervalJoinOperator {
             .iter()
             .map(|owner| owner.0)
             .collect();
+        let target_contains_self = assignment.owners().contains(&config.self_id);
+        let endpoints_match_process = config.sender.local_id() == config.self_id.0
+            && config.receiver.local_id() == config.self_id.0
+            && config.sender.incarnation() == config.receiver.incarnation();
+        let active_transport = endpoints_match_process
+            && config.sender.assignment_version() == assignment.version()
+            && config.receiver.assignment_version() == assignment.version()
+            && config.sender.active_assignment_digest() == Some(transition.target.digest())
+            && config.receiver.active_assignment_digest()
+                == config.sender.active_assignment_digest()
+            && transition.target.participant_incarnation(config.self_id.0)
+                == Some(config.sender.incarnation());
+        let inactive_transport = endpoints_match_process
+            && config.sender.assignment_version() == 0
+            && config.receiver.assignment_version() == 0
+            && config.sender.active_assignment_digest().is_none()
+            && config.receiver.active_assignment_digest().is_none()
+            && !transition.target.contains(config.self_id.0);
         if transition.target.vnode_count != config.registry.vnode_count()
             || transition.target.assignment_version != assignment.version()
             || !transition.target.matches_owner_map(&owners)
+            || target_contains_self != transition.target.contains(config.self_id.0)
+            || (target_contains_self && !active_transport)
+            || (!target_contains_self && !inactive_transport)
             || transition.predecessor.assignment_version != self.local_assignment.version()
             || transition.predecessor.assignment_version.checked_add(1)
                 != Some(transition.target.assignment_version)
@@ -1411,6 +1652,43 @@ impl GraphOperator for IntervalJoinOperator {
                 assignment.version()
             )));
         }
+
+        let fresh_acquirer = transition
+            .predecessor
+            .participant_incarnation(config.self_id.0)
+            != Some(config.sender.incarnation());
+        if fresh_acquirer {
+            let target_owned = assignment
+                .owners()
+                .iter()
+                .enumerate()
+                .filter_map(|(vnode, owner)| (*owner == config.self_id).then_some(vnode as u32))
+                .collect::<Vec<_>>();
+            let restored = transition
+                .restores
+                .iter()
+                .map(|restore| restore.vnode)
+                .collect::<Vec<_>>();
+            if !transition.revoked.is_empty()
+                || target_owned.is_empty()
+                || restored != target_owned
+                || restored.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join [{}] fresh-owner transition does not contain every acquired vnode frame",
+                    self.projection.op_name
+                )));
+            }
+        }
+        let handoff_cut = self.portable_handoff_cut(&transition, fresh_acquirer)?;
+        let restore_cut = if transition.restores.is_empty() {
+            None
+        } else {
+            Some(handoff_cut.unwrap_or(IntervalHandoffCut {
+                left_watermark: self.applied_left_watermark,
+                right_watermark: self.applied_right_watermark,
+            }))
+        };
 
         if self.vnode_states.len() != transition.target.vnode_count as usize {
             return Err(DbError::Checkpoint(format!(
@@ -1471,7 +1749,11 @@ impl GraphOperator for IntervalJoinOperator {
         for restore in transition.restores {
             let remaining = self
                 .max_managed_state_bytes
-                .checked_sub(live_bytes.saturating_add(restored_bytes))
+                .checked_sub(
+                    live_bytes
+                        .saturating_add(restore_payload_bytes)
+                        .saturating_add(restored_bytes),
+                )
                 .ok_or_else(|| {
                     DbError::Checkpoint(format!(
                         "interval join [{}] transition state exceeds its {}-byte limit",
@@ -1486,6 +1768,7 @@ impl GraphOperator for IntervalJoinOperator {
                     self.projection.op_name, restore.vnode
                 ),
                 remaining,
+                restore_cut,
             )?;
             if let Some((left_schema, right_schema)) = &self.input_schemas {
                 state.seed_input_schemas(
@@ -1517,8 +1800,11 @@ impl GraphOperator for IntervalJoinOperator {
         let prepared = PreparedIntervalJoinTransition {
             replacements: replacements.into_iter().collect(),
             local_assignment: assignment,
+            handoff_cut,
         };
-        let total_bytes = live_bytes.saturating_add(Self::transition_accounted_bytes(&prepared));
+        let total_bytes = live_bytes
+            .saturating_add(restore_payload_bytes)
+            .saturating_add(Self::transition_accounted_bytes(&prepared));
         if total_bytes > self.max_managed_state_bytes {
             return Err(DbError::Checkpoint(format!(
                 "interval join [{}] prepared transition accounts {total_bytes} bytes; limit is {} bytes",
@@ -1556,6 +1842,13 @@ impl GraphOperator for IntervalJoinOperator {
             self.dirty_vnodes[*vnode as usize] = false;
         }
         std::mem::swap(&mut self.local_assignment, &mut prepared.local_assignment);
+        if let Some(mut cut) = prepared.handoff_cut {
+            std::mem::swap(&mut self.applied_left_watermark, &mut cut.left_watermark);
+            std::mem::swap(&mut self.applied_right_watermark, &mut cut.right_watermark);
+            self.applied_left_idle = false;
+            self.applied_right_idle = false;
+            prepared.handoff_cut = Some(cut);
+        }
         self.vnode_transition_cleanup = Some(IntervalJoinTransitionCleanup::Published(prepared));
     }
 
@@ -2351,6 +2644,198 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
+    async fn fresh_owner_stages_common_portable_cut_atomically() {
+        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+        use laminar_core::state::NodeId;
+
+        use crate::operator_graph::{ManagedVnodeRestore, ManagedWholeRestore};
+
+        let vnode_count = 2;
+        let (scope, target_fence) = single_owner_shuffle(vnode_count).await;
+        let mut target = IntervalJoinOperator::new(
+            "test_interval",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+        );
+        target.attach_cluster_shuffle(scope);
+        let predecessor_version = target_fence.assignment_version - 1;
+        let predecessor_owners = [2_u64, 3];
+        let predecessor = CheckpointAssignmentFence::from_owner_map(
+            predecessor_version,
+            &predecessor_owners,
+            vec![
+                CheckpointParticipant {
+                    node_id: 2,
+                    boot_incarnation: uuid::Uuid::from_u128(2),
+                },
+                CheckpointParticipant {
+                    node_id: 3,
+                    boot_incarnation: uuid::Uuid::from_u128(3),
+                },
+            ],
+        )
+        .unwrap();
+        let predecessor_registry = VnodeRegistry::new_unassigned(vnode_count);
+        predecessor_registry.set_assignment_and_version(
+            Arc::from(predecessor_owners.map(NodeId)),
+            predecessor_version,
+        );
+        target.local_assignment = predecessor_registry.versioned_snapshot();
+
+        let mut empty = IntervalJoinState::new();
+        let vnode0 = IntervalJoinOperator::serialize_state(
+            &mut empty,
+            &target.config,
+            "test vnode 0",
+            target.max_managed_state_bytes,
+        )
+        .unwrap();
+        let vnode1 = IntervalJoinOperator::serialize_state(
+            &mut IntervalJoinState::new(),
+            &target.config,
+            "test vnode 1",
+            target.max_managed_state_bytes,
+        )
+        .unwrap();
+        let restores = [
+            ManagedVnodeRestore {
+                participant_id: 2,
+                vnode: 0,
+                state: &vnode0,
+            },
+            ManagedVnodeRestore {
+                participant_id: 3,
+                vnode: 1,
+                state: &vnode1,
+            },
+        ];
+        let donor_config = target.config.clone();
+        let encode_whole = |participant_id: u64, right_watermark: i64, left_idle: bool| {
+            let checkpoint = IntervalJoinOperatorCheckpoint {
+                version: OPERATOR_CHECKPOINT_VERSION,
+                join_type: join_type_tag(donor_config.join_type),
+                left_keys: donor_config.left_keys.clone(),
+                right_keys: donor_config.right_keys.clone(),
+                left_time_column: donor_config.left_time_column.clone(),
+                right_time_column: donor_config.right_time_column.clone(),
+                left_table: donor_config.left_table.clone(),
+                right_table: donor_config.right_table.clone(),
+                bound_ms: i64::try_from(donor_config.time_bound.as_millis()).unwrap(),
+                aligned_replay: Vec::new(),
+                applied_left_watermark: 300,
+                applied_right_watermark: right_watermark,
+                applied_left_idle: left_idle,
+                applied_right_idle: false,
+                assignment_version: Some(predecessor.assignment_version),
+                owner_map_digest: Some(predecessor.assignment_digest),
+                participant_id: Some(participant_id),
+            };
+            rkyv::to_bytes::<rkyv::rancor::Error>(&checkpoint)
+                .unwrap()
+                .to_vec()
+        };
+        let donor2 = encode_whole(2, 250, true);
+        let disagreeing_donor3 = encode_whole(3, 251, false);
+        let disagreeing = [
+            ManagedWholeRestore {
+                participant_id: 2,
+                state: &donor2,
+            },
+            ManagedWholeRestore {
+                participant_id: 3,
+                state: &disagreeing_donor3,
+            },
+        ];
+        target
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &target_fence,
+                revoked: &rustc_hash::FxHashSet::default(),
+                restores: &restores,
+                whole_restores: &disagreeing,
+            })
+            .unwrap_err();
+        assert_eq!(target.applied_left_watermark, i64::MIN);
+        assert!(target.vnode_states.iter().all(Option::is_none));
+
+        let donor3 = encode_whole(3, 250, false);
+        let whole_restores = [
+            ManagedWholeRestore {
+                participant_id: 2,
+                state: &donor2,
+            },
+            ManagedWholeRestore {
+                participant_id: 3,
+                state: &donor3,
+            },
+        ];
+
+        let mut stale = IntervalJoinState::new();
+        let stale_key = key_for_vnode(0, vnode_count);
+        execute_interval_join_cycle(
+            &mut stale,
+            &[left_batch(&[stale_key.as_str()], &[200], &[1.0])],
+            &[],
+            &target.config,
+            i64::MIN,
+            i64::MIN,
+            i64::MIN,
+            i64::MIN,
+            target.max_managed_state_bytes,
+            &mut IntervalJoinOutputBudget::default(),
+        )
+        .unwrap();
+        let stale_vnode0 = IntervalJoinOperator::serialize_state(
+            &mut stale,
+            &target.config,
+            "stale vnode 0",
+            target.max_managed_state_bytes,
+        )
+        .unwrap();
+        let stale_restores = [
+            ManagedVnodeRestore {
+                participant_id: 2,
+                vnode: 0,
+                state: &stale_vnode0,
+            },
+            ManagedVnodeRestore {
+                participant_id: 3,
+                vnode: 1,
+                state: &vnode1,
+            },
+        ];
+        target
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &target_fence,
+                revoked: &rustc_hash::FxHashSet::default(),
+                restores: &stale_restores,
+                whole_restores: &whole_restores,
+            })
+            .unwrap_err();
+        assert!(target.vnode_states.iter().all(Option::is_none));
+
+        target
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &target_fence,
+                revoked: &rustc_hash::FxHashSet::default(),
+                restores: &restores,
+                whole_restores: &whole_restores,
+            })
+            .unwrap();
+        assert_eq!(target.applied_left_watermark, i64::MIN);
+        target.publish_vnode_transition();
+        assert_eq!(target.applied_left_watermark, 300);
+        assert_eq!(target.applied_right_watermark, 250);
+        assert!(!target.applied_left_idle);
+        assert!(!target.applied_right_idle);
+        target.finish_vnode_transition();
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
     async fn vnode_transition_preserves_checkpointed_admission_watermarks() {
         let vnode_count = 8;
         let (source_shuffle, _) = single_owner_shuffle(vnode_count).await;
@@ -2384,6 +2869,7 @@ mod tests {
                 target: &fence,
                 revoked: &rustc_hash::FxHashSet::default(),
                 restores: &[],
+                whole_restores: &[],
             })
             .unwrap();
         restored.publish_vnode_transition();
@@ -2452,6 +2938,7 @@ mod tests {
         );
         restored.attach_cluster_shuffle(restored_shuffle);
         let restores = [crate::operator_graph::ManagedVnodeRestore {
+            participant_id: 1,
             vnode,
             state: slice,
         }];
@@ -2462,6 +2949,7 @@ mod tests {
                 target: &fence,
                 revoked: &rustc_hash::FxHashSet::default(),
                 restores: &restores,
+                whole_restores: &[],
             })
             .unwrap();
         let prepared = restored.managed_state_accounting().unwrap();
@@ -2482,6 +2970,7 @@ mod tests {
                 target: &fence,
                 revoked: &rustc_hash::FxHashSet::default(),
                 restores: &restores,
+                whole_restores: &[],
             })
             .unwrap();
         restored.publish_vnode_transition();

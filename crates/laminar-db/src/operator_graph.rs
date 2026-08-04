@@ -351,7 +351,15 @@ pub(crate) trait GraphOperator: Send {
 /// One authoritative full vnode image prepared for a managed operator.
 #[cfg(feature = "cluster")]
 pub(crate) struct ManagedVnodeRestore<'a> {
+    pub(crate) participant_id: u64,
     pub(crate) vnode: u32,
+    pub(crate) state: &'a [u8],
+}
+
+/// One donor's whole-operator frame used to establish a portable handoff cut.
+#[cfg(feature = "cluster")]
+pub(crate) struct ManagedWholeRestore<'a> {
+    pub(crate) participant_id: u64,
     pub(crate) state: &'a [u8],
 }
 
@@ -362,6 +370,7 @@ pub(crate) struct ManagedVnodeTransition<'a> {
     pub(crate) target: &'a laminar_core::checkpoint::CheckpointAssignmentFence,
     pub(crate) revoked: &'a FxHashSet<u32>,
     pub(crate) restores: &'a [ManagedVnodeRestore<'a>],
+    pub(crate) whole_restores: &'a [ManagedWholeRestore<'a>],
 }
 
 pub(crate) struct OperatorCheckpoint {

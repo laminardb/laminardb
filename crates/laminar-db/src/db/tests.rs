@@ -362,6 +362,7 @@ fn pending_final_owner_exit_binds_exact_transition_and_process() {
         &target_owners,
         local,
         PipelineIdentity::empty(),
+        Vec::new(),
         Some(AuditedCommittedDrainTransition::from_canonical_for_test(transition.clone()).unwrap()),
     )
     .unwrap();
@@ -380,6 +381,7 @@ fn pending_final_owner_exit_binds_exact_transition_and_process() {
         &target_owners,
         local,
         PipelineIdentity::empty(),
+        Vec::new(),
         Some(AuditedCommittedDrainTransition::from_canonical_for_test(transition.clone()).unwrap()),
     )
     .expect_err("an identical owner map must not hide a skipped predecessor generation");
@@ -399,6 +401,7 @@ fn pending_final_owner_exit_binds_exact_transition_and_process() {
         &target_owners,
         wrong_process,
         PipelineIdentity::empty(),
+        Vec::new(),
         Some(AuditedCommittedDrainTransition::from_canonical_for_test(transition).unwrap()),
     )
     .is_err());
@@ -412,6 +415,7 @@ fn pending_final_owner_exit_binds_exact_transition_and_process() {
         &predecessor_owners,
         local,
         PipelineIdentity::empty(),
+        Vec::new(),
         None,
     )
     .unwrap();
