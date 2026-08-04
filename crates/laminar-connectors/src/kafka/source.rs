@@ -2,8 +2,8 @@
 //! deserializes with pluggable formats, and yields Arrow `RecordBatch`es.
 
 use arrow_array::builder::BinaryBuilder;
-use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
-use arrow_schema::SchemaRef;
+use arrow_array::{Array, RecordBatch, RecordBatchOptions, StringArray, UInt32Array};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::error::KafkaError;
@@ -3023,12 +3023,90 @@ fn kafka_row_positions(
     )
 }
 
-fn kafka_debezium_mutations(
-    records: &RecordBatch,
-) -> Result<Option<Box<[SourceMutation]>>, ConnectorError> {
-    let operation_index = records.schema().index_of("__op").map_err(|_| {
-        ConnectorError::SchemaMismatch("Kafka Debezium batch omitted the __op column".into())
-    })?;
+const KAFKA_METADATA_COLUMNS: [&str; 3] = ["_partition", "_offset", "_timestamp"];
+const KAFKA_HEADERS_COLUMN: &str = "_headers";
+
+fn validate_kafka_output_schema(
+    payload_schema: &SchemaRef,
+    include_metadata: bool,
+    include_headers: bool,
+) -> Result<(), ConnectorError> {
+    let collision = payload_schema.fields().iter().find(|field| {
+        (include_metadata
+            && KAFKA_METADATA_COLUMNS
+                .iter()
+                .any(|name| field.name().eq_ignore_ascii_case(name)))
+            || (include_headers && field.name().eq_ignore_ascii_case(KAFKA_HEADERS_COLUMN))
+    });
+    if let Some(field) = collision {
+        return Err(ConnectorError::SchemaMismatch(format!(
+            "Kafka payload schema contains configured connector metadata column '{}'",
+            field.name()
+        )));
+    }
+    Ok(())
+}
+
+fn kafka_output_schema(
+    payload_schema: &SchemaRef,
+    include_metadata: bool,
+    include_headers: bool,
+) -> SchemaRef {
+    if !include_metadata && !include_headers {
+        return Arc::clone(payload_schema);
+    }
+    let mut fields = payload_schema.fields().to_vec();
+    if include_metadata {
+        fields.extend([
+            Arc::new(Field::new("_partition", DataType::Int32, false)),
+            Arc::new(Field::new("_offset", DataType::Int64, false)),
+            Arc::new(Field::new(
+                "_timestamp",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            )),
+        ]);
+    }
+    if include_headers {
+        fields.push(Arc::new(Field::new(
+            KAFKA_HEADERS_COLUMN,
+            DataType::Utf8,
+            true,
+        )));
+    }
+    Arc::new(Schema::new_with_metadata(
+        fields,
+        payload_schema.metadata().clone(),
+    ))
+}
+
+fn normalize_kafka_debezium_batch(
+    records: RecordBatch,
+    visible_schema: &SchemaRef,
+) -> Result<(RecordBatch, Option<Box<[SourceMutation]>>), ConnectorError> {
+    let operation_index = visible_schema.fields().len();
+    let timestamp_index = operation_index + 1;
+    let records_schema = records.schema();
+    if records.num_columns() != timestamp_index + 1
+        || records_schema.fields()[..operation_index] != visible_schema.fields()[..]
+    {
+        return Err(ConnectorError::SchemaMismatch(
+            "Kafka Debezium decoder output does not match the configured visible schema".into(),
+        ));
+    }
+    let operation_field = records_schema.field(operation_index);
+    let timestamp_field = records_schema.field(timestamp_index);
+    if operation_field.name() != "__op"
+        || operation_field.data_type() != &DataType::Utf8
+        || operation_field.is_nullable()
+        || timestamp_field.name() != "__ts_ms"
+        || timestamp_field.data_type() != &DataType::Int64
+        || timestamp_field.is_nullable()
+    {
+        return Err(ConnectorError::SchemaMismatch(
+            "Kafka Debezium decoder control columns are malformed or misplaced".into(),
+        ));
+    }
     let operations = records
         .column(operation_index)
         .as_any()
@@ -3036,7 +3114,25 @@ fn kafka_debezium_mutations(
         .ok_or_else(|| {
             ConnectorError::SchemaMismatch("Kafka Debezium __op column must be Utf8".into())
         })?;
-    decode_debezium_mutations(operations, records.num_rows())
+    let mutations = decode_debezium_mutations(operations, records.num_rows())?;
+    if records.column(timestamp_index).null_count() != 0 {
+        return Err(ConnectorError::SchemaMismatch(
+            "Kafka Debezium __ts_ms column must not contain nulls".into(),
+        ));
+    }
+
+    let options = RecordBatchOptions::new().with_row_count(Some(records.num_rows()));
+    let visible = RecordBatch::try_new_with_options(
+        Arc::clone(visible_schema),
+        records.columns()[..operation_index].to_vec(),
+        &options,
+    )
+    .map_err(|error| {
+        ConnectorError::SchemaMismatch(format!(
+            "failed to remove Kafka Debezium decoder control columns: {error}"
+        ))
+    })?;
+    Ok((visible, mutations))
 }
 
 fn decode_debezium_mutations(
@@ -3469,44 +3565,48 @@ impl KafkaSource {
             }
         }
 
-        // Append metadata columns if configured.
-        let needs_meta = include_metadata && !self.poll_meta_partitions.is_empty();
-        let needs_headers = include_headers && !self.poll_meta_headers.is_empty();
-        let batch = if needs_meta || needs_headers {
-            use arrow_schema::{DataType, Field};
+        let rows = batch.num_rows();
+        let metadata_aligned = !include_metadata
+            || (self.poll_meta_partitions.len() == rows
+                && self.poll_meta_offsets.len() == rows
+                && self.poll_meta_timestamps.len() == rows);
+        let headers_aligned = !include_headers || self.poll_meta_headers.len() == rows;
+        if !metadata_aligned || !headers_aligned {
+            return Err(terminalize_guaranteed_poll_error(
+                self.delivery,
+                &mut self.state,
+                &self.metrics,
+                self.reader_shutdown.as_ref(),
+                ConnectorError::Internal(
+                    "Kafka connector metadata is not aligned with the decoded rows".into(),
+                ),
+            ));
+        }
 
-            let mut fields = batch.schema().fields().to_vec();
+        let batch = if include_metadata || include_headers {
+            let output_schema =
+                kafka_output_schema(&batch.schema(), include_metadata, include_headers);
             let mut columns: Vec<Arc<dyn arrow_array::Array>> = batch.columns().to_vec();
 
-            if needs_meta {
+            if include_metadata {
                 use arrow_array::{Int32Array, Int64Array, TimestampMillisecondArray};
-                use arrow_schema::TimeUnit;
-                fields.push(Arc::new(Field::new("_partition", DataType::Int32, false)));
                 columns.push(Arc::new(Int32Array::from(std::mem::take(
                     &mut self.poll_meta_partitions,
                 ))));
-                fields.push(Arc::new(Field::new("_offset", DataType::Int64, false)));
                 columns.push(Arc::new(Int64Array::from(std::mem::take(
                     &mut self.poll_meta_offsets,
                 ))));
-                fields.push(Arc::new(Field::new(
-                    "_timestamp",
-                    DataType::Timestamp(TimeUnit::Millisecond, None),
-                    true,
-                )));
                 columns.push(Arc::new(TimestampMillisecondArray::from(std::mem::take(
                     &mut self.poll_meta_timestamps,
                 ))));
             }
-            if needs_headers {
-                fields.push(Arc::new(Field::new("_headers", DataType::Utf8, true)));
+            if include_headers {
                 columns.push(Arc::new(arrow_array::StringArray::from(std::mem::take(
                     &mut self.poll_meta_headers,
                 ))));
             }
 
-            let meta_schema = Arc::new(arrow_schema::Schema::new(fields));
-            arrow_array::RecordBatch::try_new(meta_schema, columns).map_err(|e| {
+            arrow_array::RecordBatch::try_new(output_schema, columns).map_err(|e| {
                 terminalize_guaranteed_poll_error(
                     self.delivery,
                     &mut self.state,
@@ -3697,6 +3797,11 @@ impl KafkaSource {
             );
             self.schema = schema;
         }
+        validate_kafka_output_schema(
+            &self.schema,
+            kafka_config.include_metadata,
+            kafka_config.include_headers,
+        )?;
 
         info!(
             brokers = %kafka_config.bootstrap_servers,
@@ -4886,6 +4991,19 @@ impl SourceConnector for KafkaSource {
         }
 
         let (batch, good_indices) = self.decode_polled_payloads().await?;
+        let (batch, mutations) = if self.config.format == Format::Debezium {
+            normalize_kafka_debezium_batch(batch, &self.schema).map_err(|error| {
+                terminalize_guaranteed_poll_error(
+                    self.delivery,
+                    &mut self.state,
+                    &self.metrics,
+                    self.reader_shutdown.as_ref(),
+                    error,
+                )
+            })?
+        } else {
+            (batch, None)
+        };
         let row_positions = kafka_row_positions(
             self.source_name.as_ref(),
             &self.poll_staged_offsets,
@@ -4907,19 +5025,6 @@ impl SourceConnector for KafkaSource {
             include_metadata,
             include_headers,
         )?;
-        let mutations = if self.config.format == Format::Debezium {
-            kafka_debezium_mutations(&batch).map_err(|error| {
-                terminalize_guaranteed_poll_error(
-                    self.delivery,
-                    &mut self.state,
-                    &self.metrics,
-                    self.reader_shutdown.as_ref(),
-                    error,
-                )
-            })?
-        } else {
-            None
-        };
         // Construct the complete output before publishing its cursor. In particular,
         // metadata/header column validation above is fallible and must not retire a rotation
         // baseline or advance the recovery position for a batch that cannot be returned.
@@ -4985,7 +5090,11 @@ impl SourceConnector for KafkaSource {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        kafka_output_schema(
+            &self.schema,
+            self.config.include_metadata,
+            self.config.include_headers,
+        )
     }
 
     fn checkpoint_ready(&self) -> Result<bool, ConnectorError> {

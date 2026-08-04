@@ -505,14 +505,44 @@ fn validate_encoded_source_schema(
     Ok(())
 }
 
-/// Decode the optional row-aligned mutation metadata.
+/// Validated borrowed access to row-aligned source mutations.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceMutationView<'a> {
+    values: &'a UInt8Array,
+}
+
+impl<'a> SourceMutationView<'a> {
+    /// Number of row mutations.
+    #[must_use]
+    pub fn len(self) -> usize {
+        self.values.len()
+    }
+
+    /// Whether the batch has no row mutations.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Mutation for `row`, if it is in bounds.
+    #[must_use]
+    pub fn get(self, row: usize) -> Option<SourceMutation> {
+        self.values.values().get(row).map(|value| match *value {
+            0 => SourceMutation::Put,
+            1 => SourceMutation::Tombstone,
+            _ => unreachable!("SourceMutationView is validated when constructed"),
+        })
+    }
+}
+
+/// Borrow the optional row-aligned mutation metadata after validating it.
 ///
 /// # Errors
 /// Returns an error for malformed metadata, nulls, unknown values, or a noncanonical all-put
 /// mutation column.
-pub fn decode_source_mutations(
+pub fn source_mutations(
     records: &RecordBatch,
-) -> Result<Option<Box<[SourceMutation]>>, ConnectorError> {
+) -> Result<Option<SourceMutationView<'_>>, ConnectorError> {
     let Some(layout) = source_metadata_layout(records.schema().as_ref())? else {
         return Ok(None);
     };
@@ -539,15 +569,11 @@ pub fn decode_source_mutations(
             "source mutation metadata must not contain nulls".into(),
         ));
     }
-    let mut decoded = Vec::with_capacity(mutations.len());
     let mut has_tombstone = false;
     for &value in mutations.values() {
         match value {
-            0 => decoded.push(SourceMutation::Put),
-            1 => {
-                decoded.push(SourceMutation::Tombstone);
-                has_tombstone = true;
-            }
+            0 => {}
+            1 => has_tombstone = true,
             value => {
                 return Err(ConnectorError::SchemaMismatch(format!(
                     "source mutation metadata contains unknown value {value}"
@@ -560,7 +586,7 @@ pub fn decode_source_mutations(
             "all-put source mutations must omit the mutation metadata field".into(),
         ));
     }
-    Ok(Some(decoded.into_boxed_slice()))
+    Ok(Some(SourceMutationView { values: mutations }))
 }
 
 /// Remove only mutation metadata while retaining the exact trailing row positions.
@@ -572,7 +598,7 @@ pub fn strip_source_mutations(records: &RecordBatch) -> Result<RecordBatch, Conn
     let Some(layout) = source_metadata_layout(schema.as_ref())? else {
         return Ok(records.clone());
     };
-    decode_source_mutations(records)?;
+    source_mutations(records)?;
     if !layout.has_mutations {
         return Ok(records.clone());
     }
@@ -611,7 +637,7 @@ pub fn strip_source_row_positions(records: &RecordBatch) -> Result<RecordBatch, 
     let Some(layout) = source_metadata_layout(schema.as_ref())? else {
         return Ok(records.clone());
     };
-    decode_source_mutations(records)?;
+    source_mutations(records)?;
     let visible_schema = Arc::new(Schema::new_with_metadata(
         schema.fields()[..layout.visible_columns].to_vec(),
         schema.metadata().clone(),
@@ -2146,10 +2172,11 @@ mod tests {
                 &mutation_schema,
             )
             .unwrap();
-        assert_eq!(
-            decode_source_mutations(&encoded).unwrap().as_deref(),
-            Some(&[SourceMutation::Put, SourceMutation::Tombstone][..])
-        );
+        let mutations = source_mutations(&encoded).unwrap().unwrap();
+        assert_eq!(mutations.len(), 2);
+        assert!(!mutations.is_empty());
+        assert_eq!(mutations.get(0), Some(SourceMutation::Put));
+        assert_eq!(mutations.get(1), Some(SourceMutation::Tombstone));
         assert_eq!(
             encoded.schema().field(records.num_columns()).name(),
             SOURCE_MUTATION_COLUMN
@@ -2176,7 +2203,7 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&puts.schema(), &positioned_schema));
         assert!(puts.column_by_name(SOURCE_MUTATION_COLUMN).is_none());
-        assert!(decode_source_mutations(&puts).unwrap().is_none());
+        assert!(source_mutations(&puts).unwrap().is_none());
     }
 
     #[test]
@@ -2222,7 +2249,7 @@ mod tests {
             Field::new(SOURCE_MUTATION_COLUMN, DataType::Int64, false),
             Arc::new(Int64Array::from(vec![0, 1])),
         );
-        assert!(decode_source_mutations(&wrong_type).is_err());
+        assert!(source_mutations(&wrong_type).is_err());
 
         let null = malformed(
             Field::new(SOURCE_MUTATION_COLUMN, DataType::UInt8, true),
@@ -2234,7 +2261,7 @@ mod tests {
             Field::new(SOURCE_MUTATION_COLUMN, DataType::UInt8, false),
             Arc::new(UInt8Array::from(vec![0, 2])),
         );
-        assert!(decode_source_mutations(&unknown).is_err());
+        assert!(source_mutations(&unknown).is_err());
         assert!(strip_source_mutations(&unknown).is_err());
 
         let all_put = malformed(
@@ -2250,7 +2277,7 @@ mod tests {
         let mutation_column = columns.remove(mutation_index);
         columns.push(mutation_column);
         let misplaced = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
-        assert!(decode_source_mutations(&misplaced).is_err());
+        assert!(source_mutations(&misplaced).is_err());
     }
 
     #[test]

@@ -340,6 +340,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "delta-lake")]
     #[test]
     fn stable_storage_options_exclude_environment_fallbacks() {
         let mut explicit = HashMap::new();

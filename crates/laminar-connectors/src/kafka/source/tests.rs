@@ -588,9 +588,11 @@ fn debezium_operations_are_validated_and_normalized() {
 }
 
 #[tokio::test]
-async fn debezium_poll_attaches_mutations_without_changing_visible_schema() {
+async fn debezium_poll_returns_declared_schema_with_positions_and_mutations() {
     let mut config = test_config();
     config.format = Format::Debezium;
+    config.include_metadata = true;
+    config.include_headers = true;
     let mut source = KafkaSource::new(test_schema(), config, None);
     source.state = ConnectorState::Running;
     source.source_name = Arc::from("inventory");
@@ -612,8 +614,8 @@ async fn debezium_poll_attaches_mutations_without_changing_visible_schema() {
             partition: 1,
             partition_vnode: None,
             offset,
-            timestamp_ms: None,
-            headers_json: None,
+            timestamp_ms: Some(offset),
+            headers_json: Some(format!(r#"{{"offset":{offset}}}"#)),
         }))
         .await
         .unwrap();
@@ -626,8 +628,18 @@ async fn debezium_poll_attaches_mutations_without_changing_visible_schema() {
         batch.mutations(),
         Some(&[SourceMutation::Put, SourceMutation::Tombstone][..])
     );
-    assert!(batch.records.column_by_name("__op").is_some());
-    assert!(batch.records.column_by_name("__ts_ms").is_some());
+    assert_eq!(batch.records.schema(), source.schema());
+    assert!(batch.records.column_by_name("__op").is_none());
+    assert!(batch.records.column_by_name("__ts_ms").is_none());
+    for name in ["_partition", "_offset", "_timestamp", "_headers"] {
+        assert!(
+            batch.records.column_by_name(name).is_some(),
+            "missing {name}"
+        );
+    }
+    let positions = batch.row_positions().unwrap();
+    assert_eq!(positions.partition().len(), 2);
+    assert!(positions.order_key().value(0) < positions.order_key().value(1));
 }
 
 #[test]
