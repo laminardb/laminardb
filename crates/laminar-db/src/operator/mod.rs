@@ -109,6 +109,22 @@ impl RetainedBatch {
     pub(crate) const fn uniform_vnode(&self) -> Option<u32> {
         self.uniform_vnode
     }
+
+    pub(crate) fn heap_bytes(&self) -> Option<usize> {
+        self.batch
+            .num_columns()
+            .checked_mul(std::mem::size_of::<Arc<dyn arrow::array::Array>>())?
+            .checked_add(self.batch.get_array_memory_size())?
+            .checked_add(
+                self.routed_vnodes
+                    .len()
+                    .checked_mul(std::mem::size_of::<u32>())?,
+            )?
+            .checked_add(self._admissions.len().checked_mul(std::mem::size_of::<
+                laminar_core::shuffle::ShuffleBatchAdmission,
+            >())?)?
+            .checked_add(4 * std::mem::size_of::<usize>())
+    }
 }
 
 #[cfg(feature = "cluster")]

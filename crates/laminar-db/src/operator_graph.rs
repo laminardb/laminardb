@@ -106,10 +106,19 @@ pub(crate) fn merge_input_frontiers(
     frontiers: &[InputFrontier],
     fallback_watermark: i64,
 ) -> InputFrontier {
+    merge_input_frontier_iter(frontiers.iter().copied(), fallback_watermark)
+}
+
+pub(crate) fn merge_input_frontier_iter(
+    frontiers: impl IntoIterator<Item = InputFrontier>,
+    fallback_watermark: i64,
+) -> InputFrontier {
     let mut active_seen = false;
+    let mut channel_seen = false;
     let mut active_watermark = Some(i64::MAX);
     let mut idle_watermark = None;
     for frontier in frontiers {
+        channel_seen = true;
         if frontier.idle {
             if let Some(watermark) = frontier.watermark {
                 idle_watermark =
@@ -128,13 +137,13 @@ pub(crate) fn merge_input_frontiers(
             watermark: active_watermark,
             idle: false,
         }
-    } else if frontiers.is_empty() {
-        InputFrontier::from_watermark(fallback_watermark)
-    } else {
+    } else if channel_seen {
         InputFrontier {
             watermark: idle_watermark,
             idle: true,
         }
+    } else {
+        InputFrontier::from_watermark(fallback_watermark)
     }
 }
 

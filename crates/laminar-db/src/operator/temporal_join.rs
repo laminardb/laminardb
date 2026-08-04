@@ -1,10 +1,14 @@
 //! Managed vnode-local temporal join execution.
 
 use std::collections::BTreeMap;
+#[cfg(feature = "cluster")]
+use std::collections::VecDeque;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+#[cfg(feature = "cluster")]
+use arrow::array::{Array, TimestampMillisecondArray};
 use arrow::datatypes::SchemaRef;
 use arrow::row::Rows;
 use async_trait::async_trait;
@@ -22,7 +26,11 @@ use laminar_sql::translator::TemporalJoinTranslatorConfig;
 
 use crate::error::DbError;
 use crate::operator::capability::OperatorCapability;
+#[cfg(feature = "cluster")]
+use crate::operator::sql_query::ClusterShuffleConfig;
 use crate::operator::ProjectingJoinState;
+#[cfg(feature = "cluster")]
+use crate::operator_graph::merge_input_frontier_iter;
 use crate::operator_graph::{
     merge_input_frontiers, CapturedVnodeState, GraphOperator, InputFrontier,
     ManagedStateAccountingSnapshot, OperatorCheckpoint,
@@ -36,6 +44,14 @@ const PRESENT_VNODE: u8 = 1;
 const OPERATOR_CHECKPOINT_VERSION: u8 = 1;
 const PENDING_HOLD_ENTRY_CHARGE: usize = 64;
 const TEMPORAL_TMP_TABLE: &str = "__temporal_tmp";
+#[cfg(feature = "cluster")]
+const REMOTE_EVENT_BUDGET_PER_SIDE: usize = 64;
+#[cfg(feature = "cluster")]
+const REMOTE_EVENT_CHARGE: usize = std::mem::size_of::<TemporalRemoteEvent>();
+#[cfg(feature = "cluster")]
+const REMOTE_DRAIN_BYTE_BUDGET_PER_SIDE: usize = laminar_core::shuffle::ROUTE_MAX_BATCH_BYTES * 2;
+#[cfg(feature = "cluster")]
+const REMOTE_DRAIN_ROW_BUDGET_PER_SIDE: usize = laminar_core::shuffle::ROUTE_MAX_BATCH_ROWS * 2;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct TemporalJoinOperatorCheckpoint {
@@ -63,16 +79,98 @@ pub(crate) struct TemporalJoinExecutionLimits {
     pub(crate) maintenance_vnode_budget: NonZeroUsize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TemporalInputSide {
     Left,
     Right,
 }
 
+impl TemporalInputSide {
+    const fn port(self) -> usize {
+        match self {
+            Self::Left => 0,
+            Self::Right => 1,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
+#[derive(Clone)]
 struct RoutedTemporalBatch {
     batch: RecordBatch,
     keys: Arc<Rows>,
     source_rows: Arc<[u32]>,
+}
+
+#[cfg(feature = "cluster")]
+struct QueuedTemporalBatch {
+    retained: crate::operator::RetainedBatch,
+    keys: Arc<Rows>,
+    row_vnodes: Vec<u32>,
+    charged_bytes: usize,
+}
+
+#[cfg(feature = "cluster")]
+enum TemporalRemoteEvent {
+    Data(QueuedTemporalBatch),
+    Frontier(InputFrontier),
+}
+
+#[cfg(feature = "cluster")]
+impl TemporalRemoteEvent {
+    fn payload_bytes(&self) -> usize {
+        match self {
+            Self::Data(batch) => batch.charged_bytes,
+            Self::Frontier(_) => 0,
+        }
+    }
+
+    fn rows(&self) -> usize {
+        match self {
+            Self::Data(batch) => batch.retained.batch().num_rows(),
+            Self::Frontier(_) => 0,
+        }
+    }
+
+    fn drain_bytes(&self) -> Option<usize> {
+        self.payload_bytes()
+            .checked_add(REMOTE_EVENT_CHARGE)?
+            .checked_add(match self {
+                Self::Data(batch) => batch.retained.batch().get_array_memory_size(),
+                Self::Frontier(_) => 0,
+            })
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Default)]
+struct TemporalPeerChannel {
+    applied: InputFrontier,
+    accepted: InputFrontier,
+    events: VecDeque<TemporalRemoteEvent>,
+}
+
+#[cfg(feature = "cluster")]
+struct RemoteDrainPlan {
+    routed: BTreeMap<u32, [Vec<RoutedTemporalBatch>; 2]>,
+    applied: [BTreeMap<u64, InputFrontier>; 2],
+    consumed: [BTreeMap<u64, usize>; 2],
+    cursors: [Option<u64>; 2],
+    released_bytes: usize,
+}
+
+#[cfg(feature = "cluster")]
+struct ClusterInputPlan {
+    routed: BTreeMap<u32, [Vec<RoutedTemporalBatch>; 2]>,
+    outbound: Vec<(u64, laminar_core::shuffle::ShuffleMessage)>,
+    local_frontiers: [InputFrontier; 2],
+    effective_frontiers: [InputFrontier; 2],
 }
 
 pub(crate) struct ManagedTemporalJoinOperator {
@@ -111,6 +209,28 @@ pub(crate) struct ManagedTemporalJoinOperator {
     maintenance_remaining: usize,
     maintenance_rescan: bool,
     published_output_frontier: Option<InputFrontier>,
+    #[cfg(feature = "cluster")]
+    left_stage: String,
+    #[cfg(feature = "cluster")]
+    right_stage: String,
+    #[cfg(feature = "cluster")]
+    cluster_shuffle: Option<ClusterShuffleConfig>,
+    #[cfg(feature = "cluster")]
+    cluster_peers: Arc<[u64]>,
+    #[cfg(feature = "cluster")]
+    local_frontiers: [InputFrontier; 2],
+    #[cfg(feature = "cluster")]
+    peer_channels: [BTreeMap<u64, TemporalPeerChannel>; 2],
+    #[cfg(feature = "cluster")]
+    last_broadcasts: [InputFrontier; 2],
+    #[cfg(feature = "cluster")]
+    remote_peer_cursors: [Option<u64>; 2],
+    #[cfg(feature = "cluster")]
+    queued_shuffle_bytes: usize,
+    #[cfg(feature = "cluster")]
+    queued_remote_events: usize,
+    #[cfg(feature = "cluster")]
+    queued_event_capacity_bytes: usize,
 }
 
 impl ManagedTemporalJoinOperator {
@@ -215,6 +335,28 @@ impl ManagedTemporalJoinOperator {
             maintenance_remaining: 0,
             maintenance_rescan: false,
             published_output_frontier: None,
+            #[cfg(feature = "cluster")]
+            left_stage: format!("{name}::left"),
+            #[cfg(feature = "cluster")]
+            right_stage: format!("{name}::right"),
+            #[cfg(feature = "cluster")]
+            cluster_shuffle: None,
+            #[cfg(feature = "cluster")]
+            cluster_peers: Arc::from([]),
+            #[cfg(feature = "cluster")]
+            local_frontiers: [InputFrontier::default(); 2],
+            #[cfg(feature = "cluster")]
+            peer_channels: [BTreeMap::new(), BTreeMap::new()],
+            #[cfg(feature = "cluster")]
+            last_broadcasts: [InputFrontier::default(); 2],
+            #[cfg(feature = "cluster")]
+            remote_peer_cursors: [None; 2],
+            #[cfg(feature = "cluster")]
+            queued_shuffle_bytes: 0,
+            #[cfg(feature = "cluster")]
+            queued_remote_events: 0,
+            #[cfg(feature = "cluster")]
+            queued_event_capacity_bytes: 0,
         };
         let validation = operator.state_config(0, operator.max_managed_state_bytes)?;
         let _ = TemporalJoinVnodeState::try_new(
@@ -223,6 +365,80 @@ impl ManagedTemporalJoinOperator {
             validation,
         )?;
         Ok(operator)
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
+        debug_assert!(self.resident_vnodes.is_empty());
+        debug_assert_eq!(config.registry.vnode_count(), self.vnode_count.get());
+        let assignment = config.registry.versioned_snapshot();
+        self.local_assignment = assignment.clone();
+        let peers = Self::remote_owner_peers(&assignment, config.self_id);
+        for &peer in &peers {
+            self.peer_channels[0].entry(peer).or_default();
+            self.peer_channels[1].entry(peer).or_default();
+        }
+        self.cluster_peers = peers.into();
+        self.cluster_shuffle = Some(config);
+    }
+
+    #[cfg(feature = "cluster")]
+    fn remote_owner_peers(assignment: &VnodeAssignmentSnapshot, self_id: NodeId) -> Vec<u64> {
+        assignment
+            .owners()
+            .iter()
+            .copied()
+            .filter(|owner| !owner.is_unassigned() && *owner != self_id)
+            .map(|owner| owner.0)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn active_cluster_scope(
+        &self,
+    ) -> Result<(ClusterShuffleConfig, VnodeAssignmentSnapshot, Arc<[u64]>), DbError> {
+        let config = self.cluster_shuffle.clone().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "temporal join [{}] has no cluster shuffle scope",
+                self.name
+            ))
+        })?;
+        let assignment = config.registry.versioned_snapshot();
+        if assignment.version() != self.local_assignment.version()
+            || config.sender.assignment_version() != assignment.version()
+            || config.receiver.assignment_version() != assignment.version()
+            || config.sender.recovery_gen() != config.receiver.recovery_gen()
+        {
+            return Err(DbError::ShuffleNotReady(format!(
+                "temporal join [{}] cluster ownership is outside its attached assignment",
+                self.name
+            )));
+        }
+        Ok((config, assignment, Arc::clone(&self.cluster_peers)))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn stage_for_side(&self, side: TemporalInputSide) -> &str {
+        match side {
+            TemporalInputSide::Left => &self.left_stage,
+            TemporalInputSide::Right => &self.right_stage,
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn side_for_stage(&self, stage: &str) -> Result<TemporalInputSide, DbError> {
+        if stage == self.left_stage {
+            Ok(TemporalInputSide::Left)
+        } else if stage == self.right_stage {
+            Ok(TemporalInputSide::Right)
+        } else {
+            Err(DbError::ShuffleTerminal(format!(
+                "temporal join [{}] rejected unknown shuffle stage '{stage}'",
+                self.name
+            )))
+        }
     }
 
     fn state_config(
@@ -329,7 +545,7 @@ impl ManagedTemporalJoinOperator {
             .len()
             .checked_mul(std::mem::size_of::<i64>())
             .ok_or_else(|| self.accounting_error())?;
-        [
+        let total = [
             vnode_slots,
             resident_roster,
             pending_holds,
@@ -345,13 +561,54 @@ impl ManagedTemporalJoinOperator {
             total
                 .checked_add(bytes)
                 .ok_or_else(|| self.accounting_error())
-        })
+        })?;
+        #[cfg(feature = "cluster")]
+        let total = total
+            .checked_add(self.cluster_topology_charge()?)
+            .ok_or_else(|| self.accounting_error())?;
+        Ok(total)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn cluster_topology_charge(&self) -> Result<usize, DbError> {
+        let stages = self
+            .left_stage
+            .capacity()
+            .checked_add(self.right_stage.capacity())
+            .ok_or_else(|| self.accounting_error())?;
+        let peers = self
+            .cluster_peers
+            .len()
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or_else(|| self.accounting_error())?;
+        let channels = self
+            .cluster_peers
+            .len()
+            .checked_mul(2)
+            .and_then(|entries| {
+                entries.checked_mul(
+                    std::mem::size_of::<(u64, TemporalPeerChannel)>()
+                        .checked_add(PENDING_HOLD_ENTRY_CHARGE)?,
+                )
+            })
+            .and_then(|bytes| bytes.checked_add(self.queued_event_capacity_bytes))
+            .ok_or_else(|| self.accounting_error())?;
+        stages
+            .checked_add(peers)
+            .and_then(|total| total.checked_add(channels))
+            .ok_or_else(|| self.accounting_error())
     }
 
     fn checked_accounted_state_bytes(&self) -> Result<usize, DbError> {
-        self.topology_charge()?
+        let accounted = self
+            .topology_charge()?
             .checked_add(self.retained_state_bytes)
-            .ok_or_else(|| self.accounting_error())
+            .ok_or_else(|| self.accounting_error())?;
+        #[cfg(feature = "cluster")]
+        let accounted = accounted
+            .checked_add(self.queued_shuffle_bytes)
+            .ok_or_else(|| self.accounting_error())?;
+        Ok(accounted)
     }
 
     fn add_resident_vnode(&mut self, vnode: u32) {
@@ -418,38 +675,51 @@ impl ManagedTemporalJoinOperator {
             )));
         }
         for batch in inputs.first().into_iter().flatten() {
-            let mutations = source_mutations(batch).map_err(|error| {
-                DbError::SchemaMismatch(format!(
-                    "temporal join [{}] left source metadata: {error}",
-                    self.name
-                ))
-            })?;
-            if mutations.is_some() {
-                return Err(DbError::InvalidOperation(format!(
-                    "temporal join [{}] left input must be append-only",
-                    self.name
-                )));
-            }
-            if batch.schema().as_ref() != self.left_schema.as_ref() {
-                return Err(self.schema_error("left"));
-            }
+            self.validate_side_batch(TemporalInputSide::Left, batch)?;
         }
         for batch in inputs.get(1).into_iter().flatten() {
-            source_mutations(batch).map_err(|error| {
-                DbError::SchemaMismatch(format!(
-                    "temporal join [{}] right source metadata: {error}",
-                    self.name
-                ))
-            })?;
-            let positioned = strip_source_mutations(batch).map_err(|error| {
-                DbError::SchemaMismatch(format!(
-                    "temporal join [{}] right source metadata: {error}",
-                    self.name
-                ))
-            })?;
-            if positioned.schema().as_ref() != self.right_schema.as_ref() {
-                return Err(self.schema_error("right"));
+            self.validate_side_batch(TemporalInputSide::Right, batch)?;
+        }
+        Ok(())
+    }
+
+    fn validate_side_batch(
+        &self,
+        side: TemporalInputSide,
+        batch: &RecordBatch,
+    ) -> Result<(), DbError> {
+        let side_name = side.name();
+        let schema = match side {
+            TemporalInputSide::Left => {
+                let mutations = source_mutations(batch).map_err(|error| {
+                    DbError::SchemaMismatch(format!(
+                        "temporal join [{}] left source metadata: {error}",
+                        self.name
+                    ))
+                })?;
+                if mutations.is_some() {
+                    return Err(DbError::InvalidOperation(format!(
+                        "temporal join [{}] left input must be append-only",
+                        self.name
+                    )));
+                }
+                batch.schema()
             }
+            TemporalInputSide::Right => strip_source_mutations(batch)
+                .map_err(|error| {
+                    DbError::SchemaMismatch(format!(
+                        "temporal join [{}] right source metadata: {error}",
+                        self.name
+                    ))
+                })?
+                .schema(),
+        };
+        let expected = match side {
+            TemporalInputSide::Left => &self.left_schema,
+            TemporalInputSide::Right => &self.right_schema,
+        };
+        if schema.as_ref() != expected.as_ref() {
+            return Err(self.schema_error(side_name));
         }
         Ok(())
     }
@@ -459,6 +729,33 @@ impl ManagedTemporalJoinOperator {
             "temporal join [{}] {side} batch does not match its declared positioned schema",
             self.name
         ))
+    }
+
+    fn encoded_route_keys(
+        &self,
+        side: TemporalInputSide,
+        batch: &RecordBatch,
+    ) -> Result<(Arc<Rows>, Vec<u32>), DbError> {
+        let key_indices = match side {
+            TemporalInputSide::Left => &self.left_key_indices,
+            TemporalInputSide::Right => &self.right_key_indices,
+        };
+        let columns = key_indices
+            .iter()
+            .map(|&index| Arc::clone(batch.column(index)))
+            .collect::<Vec<_>>();
+        let keys = Arc::new(self.key_codec.encode_columns(&columns).map_err(|error| {
+            DbError::Pipeline(format!(
+                "temporal join [{}] {} key encoding: {error}",
+                self.name,
+                side.name()
+            ))
+        })?);
+        let row_vnodes = keys
+            .iter()
+            .map(|key| PartitionKeyCodecV1::vnode_for_encoded(key.data(), self.vnode_count))
+            .collect();
+        Ok((keys, row_vnodes))
     }
 
     fn route_local_inputs(
@@ -477,25 +774,8 @@ impl ManagedTemporalJoinOperator {
                 inputs.get(1).map_or(&[] as &[RecordBatch], Vec::as_slice),
             ),
         ] {
-            let key_indices = match side {
-                TemporalInputSide::Left => &self.left_key_indices,
-                TemporalInputSide::Right => &self.right_key_indices,
-            };
             for batch in batches.iter().filter(|batch| batch.num_rows() != 0) {
-                let columns = key_indices
-                    .iter()
-                    .map(|&index| Arc::clone(batch.column(index)))
-                    .collect::<Vec<_>>();
-                let keys = Arc::new(self.key_codec.encode_columns(&columns).map_err(|error| {
-                    DbError::Pipeline(format!(
-                        "temporal join [{}] local key encoding: {error}",
-                        self.name
-                    ))
-                })?);
-                let row_vnodes = keys
-                    .iter()
-                    .map(|key| PartitionKeyCodecV1::vnode_for_encoded(key.data(), self.vnode_count))
-                    .collect::<Vec<_>>();
+                let (keys, row_vnodes) = self.encoded_route_keys(side, batch)?;
                 let plan = laminar_core::shuffle::route_checkpointed_batch(
                     batch,
                     &row_vnodes,
@@ -525,6 +805,533 @@ impl ManagedTemporalJoinOperator {
             }
         }
         Ok(routed)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn effective_cluster_frontiers(
+        &self,
+        local: [InputFrontier; 2],
+        applied: Option<&[BTreeMap<u64, InputFrontier>; 2]>,
+        consumed: Option<&[BTreeMap<u64, usize>; 2]>,
+    ) -> Result<[InputFrontier; 2], DbError> {
+        let merge_side = |port: usize| -> Result<InputFrontier, DbError> {
+            let peers = self.peer_channels[port].iter().map(|(peer, channel)| {
+                let mut frontier = applied
+                    .and_then(|frontiers| frontiers[port].get(peer).copied())
+                    .unwrap_or(channel.applied);
+                let consumed = consumed
+                    .and_then(|counts| counts[port].get(peer).copied())
+                    .unwrap_or(0);
+                if channel.events.len() > consumed {
+                    frontier.idle = false;
+                    frontier.watermark = match (frontier.watermark, self.frontiers[port].watermark)
+                    {
+                        (Some(frontier), Some(floor)) => Some(frontier.max(floor)),
+                        (None, floor) => floor,
+                        (frontier, None) => frontier,
+                    };
+                }
+                frontier
+            });
+            let merged =
+                merge_input_frontier_iter(std::iter::once(local[port]).chain(peers), i64::MIN);
+            let side = if port == 0 { "left" } else { "right" };
+            validate_frontier(self.frontiers[port], merged, side, &self.name)?;
+            Ok(merged)
+        };
+        Ok([merge_side(0)?, merge_side(1)?])
+    }
+
+    #[cfg(feature = "cluster")]
+    fn plan_cluster_inputs(
+        &self,
+        inputs: &[Vec<RecordBatch>],
+        frontiers: [InputFrontier; 2],
+        config: &ClusterShuffleConfig,
+        assignment: &VnodeAssignmentSnapshot,
+        peers: &[u64],
+    ) -> Result<ClusterInputPlan, DbError> {
+        self.validate_inputs(inputs)?;
+        for side in [TemporalInputSide::Left, TemporalInputSide::Right] {
+            let port = side.port();
+            validate_frontier(
+                self.local_frontiers[port],
+                frontiers[port],
+                side.name(),
+                &self.name,
+            )?;
+            if frontiers[port].idle
+                && inputs
+                    .get(port)
+                    .is_some_and(|batches| batches.iter().any(|batch| batch.num_rows() != 0))
+            {
+                return Err(DbError::InvalidOperation(format!(
+                    "temporal join [{}] received {} data from an idle local channel",
+                    self.name,
+                    side.name()
+                )));
+            }
+        }
+        let mut local_frontiers = frontiers;
+        for side in [TemporalInputSide::Left, TemporalInputSide::Right] {
+            let port = side.port();
+            if self.local_frontiers[port].idle && !local_frontiers[port].idle {
+                local_frontiers[port].watermark = match (
+                    local_frontiers[port].watermark,
+                    self.frontiers[port].watermark,
+                ) {
+                    (Some(current), Some(floor)) => Some(current.max(floor)),
+                    (None, floor) => floor,
+                    (current, None) => current,
+                };
+            }
+        }
+
+        let mut routed: BTreeMap<u32, [Vec<RoutedTemporalBatch>; 2]> = BTreeMap::new();
+        let mut remote_data: [BTreeMap<u64, Vec<laminar_core::shuffle::ShuffleMessage>>; 2] =
+            [BTreeMap::new(), BTreeMap::new()];
+        for side in [TemporalInputSide::Right, TemporalInputSide::Left] {
+            let port = side.port();
+            for batch in inputs
+                .get(port)
+                .into_iter()
+                .flatten()
+                .filter(|batch| batch.num_rows() != 0)
+            {
+                let accepted = if self.local_frontiers[port].idle {
+                    self.frontiers[port]
+                } else {
+                    self.local_frontiers[port]
+                };
+                self.validate_batch_lateness(side, batch, accepted, false)?;
+                let (keys, row_vnodes) = self.encoded_route_keys(side, batch)?;
+                let plan = laminar_core::shuffle::route_checkpointed_batch(
+                    batch,
+                    &row_vnodes,
+                    assignment,
+                    config.self_id,
+                )
+                .map_err(|error| {
+                    crate::operator::shuffle_routing_error(
+                        &format!("temporal join [{}] {} routing", self.name, side.name()),
+                        &error,
+                    )
+                })?;
+                for route in plan.local {
+                    routed.entry(route.vnode).or_default()[port].push(RoutedTemporalBatch {
+                        batch: route.batch,
+                        keys: Arc::clone(&keys),
+                        source_rows: route.source_rows,
+                    });
+                }
+                for route in plan.remote {
+                    remote_data[port].entry(route.owner.0).or_default().push(
+                        laminar_core::shuffle::ShuffleMessage::checkpointed_routed(
+                            self.stage_for_side(side).to_owned(),
+                            route.routed_vnodes,
+                            route.batch,
+                        ),
+                    );
+                }
+            }
+        }
+
+        let mut outbound = Vec::new();
+        for &peer in peers {
+            for side in [TemporalInputSide::Right, TemporalInputSide::Left] {
+                let port = side.port();
+                let current = local_frontiers[port];
+                let data = remote_data[port].remove(&peer);
+                let has_data = data.as_ref().is_some_and(|messages| !messages.is_empty());
+                if has_data && self.last_broadcasts[port].idle && !current.idle {
+                    let previous = self.last_broadcasts[port];
+                    outbound.push((
+                        peer,
+                        laminar_core::shuffle::ShuffleMessage::Frontier {
+                            stage: self.stage_for_side(side).to_owned(),
+                            watermark: previous.watermark,
+                            idle: false,
+                        },
+                    ));
+                }
+                if let Some(messages) = data {
+                    outbound.extend(messages.into_iter().map(|message| (peer, message)));
+                }
+                if has_data || self.last_broadcasts[port] != current {
+                    outbound.push((
+                        peer,
+                        laminar_core::shuffle::ShuffleMessage::Frontier {
+                            stage: self.stage_for_side(side).to_owned(),
+                            watermark: current.watermark,
+                            idle: current.idle,
+                        },
+                    ));
+                }
+            }
+        }
+        if remote_data.iter().any(|by_peer| !by_peer.is_empty()) {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] routed data outside its owner frontier roster",
+                self.name
+            )));
+        }
+        let effective_frontiers = self.effective_cluster_frontiers(local_frontiers, None, None)?;
+        Ok(ClusterInputPlan {
+            routed,
+            outbound,
+            local_frontiers,
+            effective_frontiers,
+        })
+    }
+
+    #[cfg(feature = "cluster")]
+    fn validate_remote_batch_scope(
+        &self,
+        batch: &crate::operator::RetainedBatch,
+        config: &ClusterShuffleConfig,
+        assignment: &VnodeAssignmentSnapshot,
+        peers: &[u64],
+    ) -> Result<u64, DbError> {
+        let peer = batch.peer().ok_or_else(|| {
+            DbError::ShuffleTerminal(format!(
+                "temporal join [{}] received unscoped shuffle data",
+                self.name
+            ))
+        })?;
+        if peers.binary_search(&peer).is_err()
+            || batch.assignment_version() != Some(assignment.version())
+            || batch.recovery_gen() != Some(config.receiver.recovery_gen())
+        {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] received shuffle data from peer {peer} outside assignment {} recovery {}",
+                self.name,
+                assignment.version(),
+                config.receiver.recovery_gen()
+            )));
+        }
+        Ok(peer)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn validate_batch_lateness(
+        &self,
+        side: TemporalInputSide,
+        batch: &RecordBatch,
+        accepted: InputFrontier,
+        reject_idle: bool,
+    ) -> Result<(), DbError> {
+        if reject_idle && accepted.idle {
+            return Err(DbError::ShuffleTerminal(format!(
+                "temporal join [{}] received {} data while peer channel was idle",
+                self.name,
+                side.name()
+            )));
+        }
+        let Some(frontier) = accepted.watermark else {
+            return Ok(());
+        };
+        let (time_index, lateness) = match side {
+            TemporalInputSide::Left => (self.left_time_index, self.limits.left_allowed_lateness_ms),
+            TemporalInputSide::Right => {
+                (self.right_time_index, self.limits.right_allowed_lateness_ms)
+            }
+        };
+        let times = batch
+            .column(time_index)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .ok_or_else(|| self.schema_error(side.name()))?;
+        for row in 0..times.len() {
+            if times.is_null(row) {
+                continue;
+            }
+            let deadline = times.value(row).checked_add(lateness).ok_or_else(|| {
+                DbError::Pipeline(format!(
+                    "temporal join [{}] {} lateness deadline overflowed",
+                    self.name,
+                    side.name()
+                ))
+            })?;
+            if deadline < frontier {
+                return Err(DbError::Pipeline(format!(
+                    "temporal join [{}] {} event at {} arrived behind its applied frontier {frontier} and allowed lateness",
+                    self.name,
+                    side.name(),
+                    times.value(row)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn remote_input_error(
+        &self,
+        side: TemporalInputSide,
+        context: &str,
+        error: DbError,
+    ) -> DbError {
+        DbError::ShuffleTerminal(format!(
+            "temporal join [{}] rejected {} shuffle {context}: {error}",
+            self.name,
+            side.name()
+        ))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn prepare_remote_batch(
+        &self,
+        side: TemporalInputSide,
+        retained: crate::operator::RetainedBatch,
+        config: &ClusterShuffleConfig,
+        assignment: &VnodeAssignmentSnapshot,
+        peers: &[u64],
+    ) -> Result<(u64, QueuedTemporalBatch), DbError> {
+        let peer = self.validate_remote_batch_scope(&retained, config, assignment, peers)?;
+        self.validate_side_batch(side, retained.batch())
+            .map_err(|error| self.remote_input_error(side, "schema", error))?;
+        let accepted = self.peer_channels[side.port()]
+            .get(&peer)
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "temporal join [{}] has no {} channel for peer {peer}",
+                    self.name,
+                    side.name()
+                ))
+            })?
+            .accepted;
+        self.validate_batch_lateness(side, retained.batch(), accepted, true)
+            .map_err(|error| self.remote_input_error(side, "lateness", error))?;
+        let (keys, row_vnodes) = self
+            .encoded_route_keys(side, retained.batch())
+            .map_err(|error| self.remote_input_error(side, "partition key", error))?;
+        let mut actual = row_vnodes.clone();
+        actual.sort_unstable();
+        actual.dedup();
+        if actual.iter().any(|vnode| {
+            assignment
+                .owners()
+                .get(*vnode as usize)
+                .is_none_or(|owner| *owner != config.self_id)
+        }) {
+            return Err(DbError::ShuffleTerminal(format!(
+                "temporal join [{}] received {} data outside this node's vnode ownership",
+                self.name,
+                side.name()
+            )));
+        }
+        if actual.as_slice() != retained.routed_vnodes() {
+            return Err(DbError::ShuffleTerminal(format!(
+                "temporal join [{}] {} shuffle vnode metadata {:?} does not match decoded rows {actual:?}",
+                self.name,
+                side.name(),
+                retained.routed_vnodes()
+            )));
+        }
+        let charged_bytes = retained
+            .heap_bytes()
+            .and_then(|bytes| bytes.checked_add(keys.size()))
+            .and_then(|bytes| {
+                row_vnodes
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .and_then(|vnodes| bytes.checked_add(vnodes))
+            })
+            .ok_or_else(|| self.accounting_error())?;
+        let preflight_total = self
+            .checked_accounted_state_bytes()?
+            .checked_add(charged_bytes)
+            .and_then(|bytes| bytes.checked_add(REMOTE_EVENT_CHARGE))
+            .ok_or_else(|| self.accounting_error())?;
+        if preflight_total > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("temporal join [{}] ordered shuffle queue", self.name),
+                accounted_bytes: preflight_total,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+        Ok((
+            peer,
+            QueuedTemporalBatch {
+                retained,
+                keys,
+                row_vnodes,
+                charged_bytes,
+            },
+        ))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn has_remote_events(&self) -> bool {
+        self.queued_remote_events != 0
+    }
+
+    #[cfg(feature = "cluster")]
+    fn build_remote_drain_plan(
+        &self,
+        assignment: &VnodeAssignmentSnapshot,
+        self_id: NodeId,
+    ) -> Result<RemoteDrainPlan, DbError> {
+        let mut plan = RemoteDrainPlan {
+            routed: BTreeMap::new(),
+            applied: [BTreeMap::new(), BTreeMap::new()],
+            consumed: [BTreeMap::new(), BTreeMap::new()],
+            cursors: self.remote_peer_cursors,
+            released_bytes: 0,
+        };
+        for side in [TemporalInputSide::Right, TemporalInputSide::Left] {
+            let port = side.port();
+            let peers = self.cluster_peers.as_ref();
+            if peers.is_empty() {
+                continue;
+            }
+            let mut index = self.remote_peer_cursors[port].map_or(0, |cursor| {
+                let next = peers.partition_point(|peer| *peer <= cursor);
+                (next != peers.len()).then_some(next).unwrap_or(0)
+            });
+            let mut empty_visits = 0usize;
+            let mut budget = REMOTE_EVENT_BUDGET_PER_SIDE;
+            let mut admitted_bytes = 0usize;
+            let mut admitted_rows = 0usize;
+            let mut admitted_events = 0usize;
+            while budget != 0 && empty_visits < peers.len() {
+                let peer = peers[index];
+                index = (index + 1) % peers.len();
+                let offset = plan.consumed[port].get(&peer).copied().unwrap_or(0);
+                let channel = &self.peer_channels[port][&peer];
+                let Some(event) = channel.events.get(offset) else {
+                    empty_visits += 1;
+                    continue;
+                };
+                let event_bytes = event.drain_bytes().ok_or_else(|| self.accounting_error())?;
+                let next_bytes = admitted_bytes
+                    .checked_add(event_bytes)
+                    .ok_or_else(|| self.accounting_error())?;
+                let next_rows = admitted_rows
+                    .checked_add(event.rows())
+                    .ok_or_else(|| self.accounting_error())?;
+                if admitted_events != 0
+                    && (next_bytes > REMOTE_DRAIN_BYTE_BUDGET_PER_SIDE
+                        || next_rows > REMOTE_DRAIN_ROW_BUDGET_PER_SIDE)
+                {
+                    break;
+                }
+                empty_visits = 0;
+                match event {
+                    TemporalRemoteEvent::Data(batch) => {
+                        let routes = laminar_core::shuffle::route_checkpointed_batch(
+                            batch.retained.batch(),
+                            &batch.row_vnodes,
+                            assignment,
+                            self_id,
+                        )
+                        .map_err(|error| {
+                            crate::operator::shuffle_routing_error(
+                                &format!(
+                                    "temporal join [{}] queued {} routing",
+                                    self.name,
+                                    side.name()
+                                ),
+                                &error,
+                            )
+                        })?;
+                        if !routes.remote.is_empty() {
+                            return Err(DbError::Checkpoint(format!(
+                                "temporal join [{}] queued {} data is no longer locally owned",
+                                self.name,
+                                side.name()
+                            )));
+                        }
+                        for route in routes.local {
+                            plan.routed.entry(route.vnode).or_default()[port].push(
+                                RoutedTemporalBatch {
+                                    batch: route.batch,
+                                    keys: Arc::clone(&batch.keys),
+                                    source_rows: route.source_rows,
+                                },
+                            );
+                        }
+                    }
+                    TemporalRemoteEvent::Frontier(frontier) => {
+                        let previous = plan.applied[port]
+                            .get(&peer)
+                            .copied()
+                            .unwrap_or(channel.applied);
+                        validate_frontier(previous, *frontier, side.name(), &self.name)?;
+                        plan.applied[port].insert(peer, *frontier);
+                    }
+                }
+                admitted_bytes = next_bytes;
+                admitted_rows = next_rows;
+                admitted_events += 1;
+                plan.released_bytes = plan
+                    .released_bytes
+                    .checked_add(event.payload_bytes())
+                    .ok_or_else(|| self.accounting_error())?;
+                plan.consumed[port].insert(peer, offset + 1);
+                plan.cursors[port] = Some(peer);
+                budget -= 1;
+            }
+        }
+        Ok(plan)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn commit_remote_drain(&mut self, plan: &RemoteDrainPlan) {
+        for port in 0..2 {
+            for (&peer, &count) in &plan.consumed[port] {
+                let channel = self.peer_channels[port]
+                    .get_mut(&peer)
+                    .expect("planned temporal peer channel");
+                for _ in 0..count {
+                    channel
+                        .events
+                        .pop_front()
+                        .expect("planned temporal remote event");
+                }
+            }
+            for (&peer, &frontier) in &plan.applied[port] {
+                self.peer_channels[port]
+                    .get_mut(&peer)
+                    .expect("planned temporal peer frontier")
+                    .applied = frontier;
+            }
+        }
+        self.remote_peer_cursors = plan.cursors;
+        self.queued_shuffle_bytes = self
+            .queued_shuffle_bytes
+            .checked_sub(plan.released_bytes)
+            .expect("planned temporal queue accounting");
+        let released_events = plan
+            .consumed
+            .iter()
+            .flat_map(BTreeMap::values)
+            .sum::<usize>();
+        self.queued_remote_events = self
+            .queued_remote_events
+            .checked_sub(released_events)
+            .expect("planned temporal event accounting");
+    }
+
+    #[cfg(feature = "cluster")]
+    fn normalize_remote_frontier(
+        &self,
+        side: TemporalInputSide,
+        previous: InputFrontier,
+        mut next: InputFrontier,
+    ) -> InputFrontier {
+        if previous.idle && !next.idle {
+            let port = side.port();
+            let floor = self
+                .pending_frontiers
+                .map_or(self.frontiers[port], |pending| pending[port]);
+            next.watermark = match (next.watermark, floor.watermark) {
+                (Some(next), Some(applied)) => Some(next.max(applied)),
+                (None, applied) => applied,
+                (next, None) => next,
+            };
+        }
+        next
     }
 
     fn prepare_vnode(&mut self, vnode: u32, accounted_total: &mut usize) -> Result<usize, DbError> {
@@ -946,7 +1753,19 @@ impl ManagedTemporalJoinOperator {
                 .and_then(|frontier| frontier.watermark)
                 .unwrap_or(i64::MIN)
         });
-        pending_hold.into_iter().chain(staged_hold).min()
+        #[cfg(feature = "cluster")]
+        let remote_hold = self.has_remote_events().then(|| {
+            self.published_output_frontier
+                .and_then(|frontier| frontier.watermark)
+                .unwrap_or(i64::MIN)
+        });
+        #[cfg(not(feature = "cluster"))]
+        let remote_hold = None;
+        pending_hold
+            .into_iter()
+            .chain(staged_hold)
+            .chain(remote_hold)
+            .min()
     }
 
     fn derive_output_frontier(&self, input: InputFrontier) -> InputFrontier {
@@ -993,6 +1812,14 @@ impl ManagedTemporalJoinOperator {
             )));
         }
         let routed = self.route_local_inputs(inputs)?;
+        self.execute_routed(&routed, frontiers)
+    }
+
+    fn execute_routed(
+        &mut self,
+        routed: &BTreeMap<u32, [Vec<RoutedTemporalBatch>; 2]>,
+        frontiers: [InputFrontier; 2],
+    ) -> Result<Vec<RecordBatch>, DbError> {
         validate_frontier(self.frontiers[0], frontiers[0], "left", &self.name)?;
         validate_frontier(self.frontiers[1], frontiers[1], "right", &self.name)?;
         let mut accounted = self.checked_accounted_state_bytes()?;
@@ -1004,14 +1831,14 @@ impl ManagedTemporalJoinOperator {
             });
         }
         let mut applied = false;
-        for (&vnode, sides) in &routed {
+        for (&vnode, sides) in routed {
             match self.apply_right_batches(vnode, &sides[1], &mut accounted) {
                 Ok(changed) => applied |= changed,
                 Err(error) => return Err(self.after_apply_error(applied, vnode, error)),
             }
         }
         let mut output = Vec::new();
-        for (&vnode, sides) in &routed {
+        for (&vnode, sides) in routed {
             match self.apply_left_batches(vnode, &sides[0], &mut accounted) {
                 Ok((changed, batches)) => {
                     applied |= changed;
@@ -1033,6 +1860,110 @@ impl ManagedTemporalJoinOperator {
             }
         }
         self.record_published_output_frontier(&frontiers);
+        Ok(output)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn post_cluster_send_error(&self, admitted: bool, error: DbError) -> DbError {
+        if !admitted || error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
+            return error;
+        }
+        DbError::ShufflePartialSend(format!(
+            "temporal join [{}] failed after outbound shuffle admission: {error}",
+            self.name
+        ))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn remote_replay_error(&self, error: DbError) -> DbError {
+        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
+            error
+        } else {
+            DbError::Checkpoint(format!(
+                "temporal join [{}] ordered shuffle replay requires recovery: {error}",
+                self.name
+            ))
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn drain_remote_events(
+        &mut self,
+        config: &ClusterShuffleConfig,
+        assignment: &VnodeAssignmentSnapshot,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let plan = self
+            .build_remote_drain_plan(assignment, config.self_id)
+            .map_err(|error| self.remote_replay_error(error))?;
+        let effective = self
+            .effective_cluster_frontiers(
+                self.local_frontiers,
+                Some(&plan.applied),
+                Some(&plan.consumed),
+            )
+            .map_err(|error| self.remote_replay_error(error))?;
+        let output = self
+            .execute_routed(&plan.routed, effective)
+            .map_err(|error| self.remote_replay_error(error))?;
+        let output = self
+            .project_output(output)
+            .await
+            .map_err(|error| self.remote_replay_error(error))?;
+        self.commit_remote_drain(&plan);
+        self.record_published_output_frontier(&effective);
+        Ok(output)
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn process_cluster(
+        &mut self,
+        inputs: &[Vec<RecordBatch>],
+        frontiers: [InputFrontier; 2],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let (config, assignment, peers) = self.active_cluster_scope()?;
+        if self.pending_frontiers.is_some() || self.maintenance_pending {
+            if inputs.iter().any(|batches| !batches.is_empty()) {
+                return Err(DbError::InvalidOperation(format!(
+                    "temporal join [{}] received input while bounded work was pending",
+                    self.name
+                )));
+            }
+            let target = self.pending_frontiers.unwrap_or(self.frontiers);
+            return self
+                .process_and_project(&[], target)
+                .await
+                .map_err(|error| self.remote_replay_error(error));
+        }
+        if self.has_remote_events() {
+            if inputs.iter().any(|batches| !batches.is_empty()) {
+                return Err(DbError::InvalidOperation(format!(
+                    "temporal join [{}] received local input while ordered shuffle replay was pending",
+                    self.name
+                )));
+            }
+            return self.drain_remote_events(&config, &assignment).await;
+        }
+
+        let plan = self.plan_cluster_inputs(inputs, frontiers, &config, &assignment, &peers)?;
+        let outbound_admitted = !plan.outbound.is_empty();
+        if outbound_admitted {
+            crate::operator::send_shuffle_plan(
+                &config.sender,
+                assignment.version(),
+                plan.outbound,
+                self.name.as_ref(),
+            )
+            .await?;
+        }
+        let output = self
+            .execute_routed(&plan.routed, plan.effective_frontiers)
+            .map_err(|error| self.post_cluster_send_error(outbound_admitted, error))?;
+        let output = self.project_output(output).await.map_err(|error| {
+            let error = self.post_projection_error(error);
+            self.post_cluster_send_error(outbound_admitted, error)
+        })?;
+        self.local_frontiers = plan.local_frontiers;
+        self.last_broadcasts = plan.local_frontiers;
         Ok(output)
     }
 
@@ -1060,16 +1991,20 @@ impl ManagedTemporalJoinOperator {
         frontiers: [InputFrontier; 2],
     ) -> Result<Vec<RecordBatch>, DbError> {
         let output = self.process_common(inputs, frontiers)?;
-        self.project_output(output).await.map_err(|error| {
-            if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
-                error
-            } else {
-                DbError::StatefulOperatorPartialApply(format!(
-                    "temporal join [{}] admitted state before post-projection failed: {error}",
-                    self.name
-                ))
-            }
-        })
+        self.project_output(output)
+            .await
+            .map_err(|error| self.post_projection_error(error))
+    }
+
+    fn post_projection_error(&self, error: DbError) -> DbError {
+        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
+            error
+        } else {
+            DbError::StatefulOperatorPartialApply(format!(
+                "temporal join [{}] admitted state before post-projection failed: {error}",
+                self.name
+            ))
+        }
     }
 
     fn after_apply_error(&self, applied: bool, vnode: u32, error: DbError) -> DbError {
@@ -1080,6 +2015,74 @@ impl ManagedTemporalJoinOperator {
             "temporal join [{}] admitted state before vnode {vnode} failed: {error}",
             self.name
         ))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn reserve_remote_event_slot(
+        &mut self,
+        side: TemporalInputSide,
+        peer: u64,
+        payload_bytes: usize,
+        context: &str,
+    ) -> Result<(usize, usize), DbError> {
+        let next_queue_bytes = self
+            .queued_shuffle_bytes
+            .checked_add(payload_bytes)
+            .ok_or_else(|| self.accounting_error())?;
+        let next_queue_events = self
+            .queued_remote_events
+            .checked_add(1)
+            .ok_or_else(|| self.accounting_error())?;
+        let current_accounted = self.checked_accounted_state_bytes()?;
+        let port = side.port();
+        let previous_capacity = self.peer_channels[port][&peer].events.capacity();
+        let reserve_error = self.peer_channels[port]
+            .get_mut(&peer)
+            .expect("validated temporal peer channel")
+            .events
+            .try_reserve_exact(1)
+            .err();
+        if let Some(error) = reserve_error {
+            return Err(DbError::Pipeline(format!(
+                "temporal join [{}] could not reserve {context}: {error}",
+                self.name
+            )));
+        }
+        let reserved_capacity = self.peer_channels[port][&peer].events.capacity();
+        let added_capacity_bytes = reserved_capacity
+            .checked_sub(previous_capacity)
+            .and_then(|slots| slots.checked_mul(REMOTE_EVENT_CHARGE))
+            .ok_or_else(|| self.accounting_error())?;
+        let next_accounted = current_accounted
+            .checked_add(added_capacity_bytes)
+            .and_then(|bytes| bytes.checked_add(payload_bytes))
+            .ok_or_else(|| self.accounting_error())?;
+        if next_accounted > self.max_managed_state_bytes {
+            self.peer_channels[port]
+                .get_mut(&peer)
+                .expect("reserved temporal peer channel")
+                .events
+                .shrink_to(previous_capacity);
+            let retained_capacity = self.peer_channels[port][&peer].events.capacity();
+            let retained_capacity_bytes = retained_capacity
+                .checked_sub(previous_capacity)
+                .and_then(|slots| slots.checked_mul(REMOTE_EVENT_CHARGE))
+                .ok_or_else(|| self.accounting_error())?;
+            self.queued_event_capacity_bytes = self
+                .queued_event_capacity_bytes
+                .checked_add(retained_capacity_bytes)
+                .ok_or_else(|| self.accounting_error())?;
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("temporal join [{}] {context}", self.name),
+                accounted_bytes: next_accounted,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+        self.queued_event_capacity_bytes = self
+            .queued_event_capacity_bytes
+            .checked_add(added_capacity_bytes)
+            .ok_or_else(|| self.accounting_error())?;
+        Ok((next_queue_bytes, next_queue_events))
     }
 
     fn validate_vnode_roster(
@@ -1153,6 +2156,12 @@ impl GraphOperator for ManagedTemporalJoinOperator {
                 .filter(|watermark| *watermark != i64::MIN),
             idle: false,
         };
+        #[cfg(feature = "cluster")]
+        if self.cluster_shuffle.is_some() {
+            return self
+                .process_cluster(inputs, [frontier(0), frontier(1)])
+                .await;
+        }
         self.process_and_project(inputs, [frontier(0), frontier(1)])
             .await
     }
@@ -1168,11 +2177,24 @@ impl GraphOperator for ManagedTemporalJoinOperator {
                 self.name
             )));
         }
+        #[cfg(feature = "cluster")]
+        if self.cluster_shuffle.is_some() {
+            return self
+                .process_cluster(inputs, [frontiers[0], frontiers[1]])
+                .await;
+        }
         self.process_and_project(inputs, [frontiers[0], frontiers[1]])
             .await
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        #[cfg(feature = "cluster")]
+        if self.cluster_shuffle.is_some() {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] cluster channel state is not checkpointable yet",
+                self.name
+            )));
+        }
         if self.pending_frontiers.is_some() {
             return Err(DbError::Checkpoint(format!(
                 "temporal join [{}] cannot checkpoint during bounded frontier fanout",
@@ -1232,6 +2254,13 @@ impl GraphOperator for ManagedTemporalJoinOperator {
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+        #[cfg(feature = "cluster")]
+        if self.cluster_shuffle.is_some() {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] cluster channel checkpoint restore is not supported yet",
+                self.name
+            )));
+        }
         if self.whole_restored
             || !self.resident_vnodes.is_empty()
             || self.frontiers != [InputFrontier::default(); 2]
@@ -1317,16 +2346,102 @@ impl GraphOperator for ManagedTemporalJoinOperator {
     }
 
     fn wants_input(&self) -> bool {
-        self.pending_frontiers.is_none() && !self.maintenance_pending
+        let ready = self.pending_frontiers.is_none() && !self.maintenance_pending;
+        #[cfg(feature = "cluster")]
+        let ready = ready && !self.has_remote_events();
+        ready
+    }
+
+    #[cfg(feature = "cluster")]
+    fn checkpoint_aligned_replay_pending(&self) -> bool {
+        self.has_remote_events()
     }
 
     fn checkpoint_drain_pending(&self) -> bool {
         self.pending_frontiers.is_some()
     }
 
+    #[cfg(feature = "cluster")]
+    fn stage_checkpointed_shuffle(
+        &mut self,
+        stage: &str,
+        batch: crate::operator::RetainedBatch,
+        _watermark: i64,
+    ) -> Result<(), DbError> {
+        let side = self.side_for_stage(stage)?;
+        let (config, assignment, peers) = self.active_cluster_scope()?;
+        let (peer, batch) = self.prepare_remote_batch(side, batch, &config, &assignment, &peers)?;
+        let (next_queue_bytes, next_queue_events) = self.reserve_remote_event_slot(
+            side,
+            peer,
+            batch.charged_bytes,
+            "ordered shuffle queue",
+        )?;
+        self.queued_shuffle_bytes = next_queue_bytes;
+        self.queued_remote_events = next_queue_events;
+        self.peer_channels[side.port()]
+            .get_mut(&peer)
+            .expect("reserved temporal peer channel")
+            .events
+            .push_back(TemporalRemoteEvent::Data(batch));
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn stage_checkpointed_shuffle_frontier(
+        &mut self,
+        stage: &str,
+        peer: u64,
+        frontier: InputFrontier,
+        assignment_version: u64,
+        recovery_gen: u64,
+    ) -> Result<(), DbError> {
+        let side = self.side_for_stage(stage)?;
+        let (config, assignment, peers) = self.active_cluster_scope()?;
+        if peers.binary_search(&peer).is_err()
+            || assignment_version != assignment.version()
+            || recovery_gen != config.receiver.recovery_gen()
+            || frontier.watermark == Some(i64::MIN)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] received {} frontier from peer {peer} outside assignment {} recovery {}",
+                self.name,
+                side.name(),
+                assignment.version(),
+                config.receiver.recovery_gen()
+            )));
+        }
+        let previous = self.peer_channels[side.port()][&peer].accepted;
+        validate_frontier(previous, frontier, side.name(), &self.name)?;
+        let frontier = self.normalize_remote_frontier(side, previous, frontier);
+        let (next_queue_bytes, next_queue_events) =
+            self.reserve_remote_event_slot(side, peer, 0, "ordered frontier queue")?;
+        self.queued_shuffle_bytes = next_queue_bytes;
+        self.queued_remote_events = next_queue_events;
+        let channel = self.peer_channels[side.port()]
+            .get_mut(&peer)
+            .expect("reserved temporal peer channel");
+        channel
+            .events
+            .push_back(TemporalRemoteEvent::Frontier(frontier));
+        channel.accepted = frontier;
+        Ok(())
+    }
+
     fn output_frontier(&self, input: InputFrontier) -> InputFrontier {
-        self.published_output_frontier
-            .unwrap_or_else(|| self.derive_output_frontier(input))
+        let output = self
+            .published_output_frontier
+            .unwrap_or_else(|| self.derive_output_frontier(input));
+        #[cfg(feature = "cluster")]
+        {
+            let mut output = output;
+            if self.has_remote_events() {
+                output.idle = false;
+            }
+            return output;
+        }
+        #[cfg(not(feature = "cluster"))]
+        output
     }
 
     #[cfg(feature = "cluster")]
@@ -2059,5 +3174,319 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(value.value(0), "live");
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn two_owner_scope() -> ClusterShuffleConfig {
+        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+        use laminar_core::cluster::control::LeaseDeadline;
+        use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+
+        let registry = Arc::new(VnodeRegistry::new(2));
+        registry.set_assignment(vec![NodeId(1), NodeId(2)].into());
+        let receiver = Arc::new(
+            ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap(), uuid::Uuid::from_u128(1))
+                .await
+                .unwrap(),
+        );
+        let sender = Arc::new(ShuffleSender::new(1, uuid::Uuid::from_u128(1)));
+        let deadline = Arc::new(LeaseDeadline::live_for(std::time::Duration::from_secs(60)));
+        receiver
+            .install_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
+        sender.install_process_lease_deadline(deadline).unwrap();
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            registry.assignment_version(),
+            &[1, 2],
+            vec![
+                CheckpointParticipant {
+                    node_id: 1,
+                    boot_incarnation: uuid::Uuid::from_u128(1),
+                },
+                CheckpointParticipant {
+                    node_id: 2,
+                    boot_incarnation: uuid::Uuid::from_u128(2),
+                },
+            ],
+        )
+        .unwrap();
+        sender.install_assignment_fence(&fence, &[1, 2]).unwrap();
+        receiver.install_assignment_fence(&fence, &[1, 2]).unwrap();
+        ClusterShuffleConfig {
+            registry,
+            sender,
+            receiver,
+            self_id: NodeId(1),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn cluster_plan_is_atomic_and_orders_idle_revival_data_and_frontier() {
+        use laminar_core::shuffle::ShuffleMessage;
+
+        let key = key_for_vnode(1);
+        let (mut operator, _, _) = operator(8);
+        let scope = two_owner_scope().await;
+        operator.attach_cluster_shuffle(scope.clone());
+        let idle = InputFrontier {
+            watermark: Some(100),
+            idle: true,
+        };
+        operator.local_frontiers = [idle; 2];
+        operator.frontiers = [InputFrontier {
+            watermark: Some(200),
+            idle: false,
+        }; 2];
+        for port in 0..2 {
+            let channel = operator.peer_channels[port].get_mut(&2).unwrap();
+            channel.applied = idle;
+            channel.accepted = idle;
+        }
+        operator.last_broadcasts = [idle; 2];
+        let left = left_batch(std::slice::from_ref(&key), &["X"], &[210], &[7]);
+        let right = right_batch(
+            std::slice::from_ref(&key),
+            &["X"],
+            &[205],
+            &["live"],
+            &[SourceMutation::Put],
+        );
+        let active = [InputFrontier {
+            watermark: Some(150),
+            idle: false,
+        }; 2];
+        let assignment = scope.registry.versioned_snapshot();
+        let plan = operator
+            .plan_cluster_inputs(
+                &[vec![left], vec![right]],
+                active,
+                &scope,
+                &assignment,
+                &[2],
+            )
+            .unwrap();
+        assert_eq!(plan.outbound.len(), 6);
+        let expected = [
+            ("temporal::right", "frontier", Some(100)),
+            ("temporal::right", "data", None),
+            ("temporal::right", "frontier", Some(200)),
+            ("temporal::left", "frontier", Some(100)),
+            ("temporal::left", "data", None),
+            ("temporal::left", "frontier", Some(200)),
+        ];
+        for ((peer, message), (stage, kind, watermark)) in plan.outbound.iter().zip(expected) {
+            assert_eq!(*peer, 2);
+            match (kind, message) {
+                (
+                    "frontier",
+                    ShuffleMessage::Frontier {
+                        stage: actual,
+                        watermark: actual_watermark,
+                        idle: false,
+                    },
+                ) => {
+                    assert_eq!(actual, stage);
+                    assert_eq!(*actual_watermark, watermark);
+                }
+                ("data", ShuffleMessage::Data { stage: actual, .. }) => {
+                    assert_eq!(actual, stage);
+                }
+                _ => panic!("unexpected temporal shuffle order"),
+            }
+        }
+        operator.local_frontiers = plan.local_frontiers;
+        operator.last_broadcasts = [idle; 2];
+        let revived_without_data = operator
+            .plan_cluster_inputs(
+                &[Vec::new(), Vec::new()],
+                operator.local_frontiers,
+                &scope,
+                &assignment,
+                &[2],
+            )
+            .unwrap();
+        assert_eq!(revived_without_data.outbound.len(), 2);
+        assert!(revived_without_data.outbound.iter().all(|(_, message)| {
+            matches!(
+                message,
+                ShuffleMessage::Frontier {
+                    watermark: Some(200),
+                    idle: false,
+                    ..
+                }
+            )
+        }));
+        operator.last_broadcasts = revived_without_data.local_frontiers;
+        let unchanged = operator
+            .plan_cluster_inputs(
+                &[Vec::new(), Vec::new()],
+                plan.local_frontiers,
+                &scope,
+                &assignment,
+                &[2],
+            )
+            .unwrap();
+        assert!(unchanged.outbound.is_empty());
+
+        let invalid_left = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        assert!(operator
+            .plan_cluster_inputs(
+                &[vec![invalid_left], Vec::new()],
+                plan.local_frontiers,
+                &scope,
+                &assignment,
+                &[2],
+            )
+            .is_err());
+
+        operator.local_frontiers[0] = InputFrontier {
+            watermark: Some(300),
+            idle: false,
+        };
+        operator.frontiers[0] = InputFrontier {
+            watermark: Some(100),
+            idle: false,
+        };
+        let late = left_batch(std::slice::from_ref(&key), &["X"], &[250], &[8]);
+        assert!(operator
+            .plan_cluster_inputs(
+                &[vec![late], Vec::new()],
+                operator.local_frontiers,
+                &scope,
+                &assignment,
+                &[2],
+            )
+            .is_err());
+
+        let nullable = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("venue", DataType::Utf8, false),
+                Field::new(
+                    "event_time",
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    true,
+                ),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["X"])),
+                Arc::new(TimestampMillisecondArray::from(vec![None])),
+            ],
+        )
+        .unwrap();
+        operator
+            .validate_batch_lateness(
+                TemporalInputSide::Left,
+                &nullable,
+                operator.local_frontiers[0],
+                false,
+            )
+            .unwrap();
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn cluster_peer_frontiers_hold_revival_and_checkpoint_fail_closed() {
+        let (mut operator, _, _) = operator(8);
+        let scope = two_owner_scope().await;
+        operator.attach_cluster_shuffle(scope.clone());
+        let local = InputFrontier {
+            watermark: Some(500),
+            idle: false,
+        };
+        assert_eq!(
+            operator
+                .effective_cluster_frontiers([local; 2], None, None)
+                .unwrap()[0]
+                .watermark,
+            None
+        );
+        operator.peer_channels[0].get_mut(&2).unwrap().applied = InputFrontier {
+            watermark: Some(100),
+            idle: true,
+        };
+        assert_eq!(
+            operator
+                .effective_cluster_frontiers([local; 2], None, None)
+                .unwrap()[0],
+            local
+        );
+
+        operator.frontiers[1] = InputFrontier {
+            watermark: Some(200),
+            idle: false,
+        };
+        let idle = InputFrontier {
+            watermark: Some(100),
+            idle: true,
+        };
+        let channel = operator.peer_channels[1].get_mut(&2).unwrap();
+        channel.applied = idle;
+        channel.accepted = idle;
+        let assignment = scope.registry.assignment_version();
+        let recovery = scope.receiver.recovery_gen();
+        operator
+            .stage_checkpointed_shuffle_frontier(
+                "temporal::right",
+                2,
+                InputFrontier {
+                    watermark: Some(100),
+                    idle: false,
+                },
+                assignment,
+                recovery,
+            )
+            .unwrap();
+        assert_eq!(operator.peer_channels[1][&2].accepted.watermark, Some(200));
+        let held = operator
+            .effective_cluster_frontiers([local; 2], None, None)
+            .unwrap()[1];
+        assert_eq!(held.watermark, Some(200));
+        assert!(!held.idle);
+
+        let channel = operator.peer_channels[1].get_mut(&2).unwrap();
+        channel.events.clear();
+        channel.applied = idle;
+        channel.accepted = idle;
+        operator.queued_remote_events = 0;
+        operator.queued_shuffle_bytes = 0;
+        operator.pending_frontiers = Some([
+            operator.frontiers[0],
+            InputFrontier {
+                watermark: Some(500),
+                idle: false,
+            },
+        ]);
+        operator
+            .stage_checkpointed_shuffle_frontier(
+                "temporal::right",
+                2,
+                InputFrontier {
+                    watermark: Some(100),
+                    idle: false,
+                },
+                assignment,
+                recovery,
+            )
+            .unwrap();
+        assert_eq!(operator.peer_channels[1][&2].accepted.watermark, Some(500));
+        assert!(
+            operator.checked_accounted_state_bytes().unwrap() <= operator.max_managed_state_bytes
+        );
+        assert!(operator
+            .stage_checkpointed_shuffle_frontier(
+                "temporal::right",
+                2,
+                InputFrontier {
+                    watermark: Some(150),
+                    idle: false,
+                },
+                assignment,
+                recovery,
+            )
+            .is_err());
+        assert!(matches!(operator.checkpoint(), Err(DbError::Checkpoint(_))));
     }
 }
