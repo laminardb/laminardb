@@ -77,6 +77,8 @@ pub struct LocalRoute {
     pub vnode: u32,
     /// Rows for that vnode, preserving their input order.
     pub batch: RecordBatch,
+    /// Original input-row indices, aligned one-for-one with `batch`.
+    pub source_rows: Arc<[u32]>,
 }
 
 /// One bounded owner-coalesced remote batch.
@@ -297,10 +299,11 @@ pub fn route_checkpointed_batch(
 
     let mut plan = CheckpointRoutePlan::default();
     for (vnode, indices) in local_groups {
-        for (_, slice) in bounded_slices(batch, &indices, vnode)? {
+        for (range, slice) in bounded_slices(batch, &indices, vnode)? {
             plan.local.push(LocalRoute {
                 vnode,
                 batch: slice,
+                source_rows: Arc::from(&indices[range]),
             });
         }
     }
@@ -553,6 +556,7 @@ mod tests {
 
         assert_eq!(plan.local.len(), 1);
         assert_eq!(plan.local[0].vnode, 1);
+        assert_eq!(plan.local[0].source_rows.as_ref(), &[4]);
         assert_eq!(
             plan.local[0]
                 .batch

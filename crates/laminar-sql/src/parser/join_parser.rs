@@ -279,8 +279,13 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
 
     // Check for temporal join (FOR SYSTEM_TIME AS OF)
     if let Some(left_time_col) = extract_temporal_left_time(&join.relation, &sides)? {
-        let (left_key, right_key, additional, _, _) =
+        let (left_key, right_key, additional, time_bound, time_cols) =
             analyze_join_constraint(&join.join_operator, &sides)?;
+        if time_bound.is_some() || time_cols.is_some() {
+            return Err(ParseError::StreamingError(
+                "temporal joins do not accept an additional time-bound predicate".into(),
+            ));
+        }
         let mut analysis = JoinAnalysis::temporal(
             left_table,
             right_table,
@@ -470,14 +475,32 @@ pub(crate) fn parse_temporal_probe_query(
 
     let mut cursor = temporal_index + 3;
     let on_index = find_top_level_word_from(&tokens, cursor, "ON").ok_or_else(|| {
-        ParseError::StreamingError("TEMPORAL PROBE JOIN requires ON (key)".into())
+        ParseError::StreamingError("TEMPORAL PROBE JOIN requires ON (key, ...)".into())
     })?;
     let right = parse_probe_relation(&tokens[cursor..on_index], "right")?;
     cursor = on_index + 1;
 
     expect_token(&tokens, &mut cursor, &Token::LParen, "ON (")?;
-    let key = take_word(&tokens, &mut cursor, "temporal probe equality key")?;
-    expect_token(&tokens, &mut cursor, &Token::RParen, "ON (key)")?;
+    let mut keys = Vec::new();
+    loop {
+        keys.push(take_word(
+            &tokens,
+            &mut cursor,
+            "temporal probe equality key",
+        )?);
+        match tokens.get(cursor) {
+            Some(Token::Comma) => cursor += 1,
+            Some(Token::RParen) => {
+                cursor += 1;
+                break;
+            }
+            _ => {
+                return Err(ParseError::StreamingError(
+                    "TEMPORAL PROBE JOIN keys must be a comma-separated identifier list".into(),
+                ));
+            }
+        }
+    }
     expect_word(&tokens, &mut cursor, "TIMESTAMPS")?;
     expect_token(&tokens, &mut cursor, &Token::LParen, "TIMESTAMPS (")?;
     let left_time = parse_probe_column(&tokens, &mut cursor, &Token::Comma)?;
@@ -515,13 +538,20 @@ pub(crate) fn parse_temporal_probe_query(
         _ => unreachable!("temporal probe parser admits only INNER or LEFT"),
     };
     let right_sql = right.versioned_sql(&left_time.column, &left);
-    let normalized_join = format!(
-        "{join} {right_sql} ON {}.{} = {}.{}",
-        left.reference(),
-        key,
-        right.reference(),
-        key
-    );
+    let equality_predicate = keys
+        .iter()
+        .map(|key| {
+            format!(
+                "{}.{} = {}.{}",
+                left.reference(),
+                key,
+                right.reference(),
+                key
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let normalized_join = format!("{join} {right_sql} ON {equality_predicate}");
     let normalized_sql = tokens[..clause_start]
         .iter()
         .map(ToString::to_string)
@@ -550,10 +580,21 @@ pub(crate) fn parse_temporal_probe_query(
     let mut analysis = analyze_join(select)?.ok_or_else(|| {
         ParseError::StreamingError("normalized temporal probe join is missing its join".into())
     })?;
+    let normalized_keys = std::iter::once((
+        analysis.left_key_column.as_str(),
+        analysis.right_key_column.as_str(),
+    ))
+    .chain(
+        analysis
+            .additional_key_columns
+            .iter()
+            .map(|(left, right)| (left.as_str(), right.as_str())),
+    );
     if analysis.left_table != left.name()
         || analysis.right_table != right.name()
-        || analysis.left_key_column != key.value
-        || analysis.right_key_column != key.value
+        || !normalized_keys.eq(keys
+            .iter()
+            .map(|key| (key.value.as_str(), key.value.as_str())))
     {
         return Err(ParseError::StreamingError(
             "TEMPORAL PROBE JOIN normalization changed its relation or key binding".into(),
@@ -1219,8 +1260,13 @@ pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, Parse
 
         if let Some(left_time_col) = extract_temporal_left_time(&join.relation, &sides)? {
             // Temporal join: right side has FOR SYSTEM_TIME AS OF
-            let (left_key, right_key, additional, _, _) =
+            let (left_key, right_key, additional, time_bound, time_cols) =
                 analyze_join_constraint(&join.join_operator, &sides)?;
+            if time_bound.is_some() || time_cols.is_some() {
+                return Err(ParseError::StreamingError(
+                    "temporal joins do not accept an additional time-bound predicate".into(),
+                ));
+            }
 
             let mut analysis = JoinAnalysis::temporal(
                 prev_left_table.clone(),

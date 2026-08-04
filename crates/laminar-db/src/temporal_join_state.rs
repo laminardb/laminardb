@@ -9,7 +9,7 @@ use arrow::array::{
     TimestampMillisecondArray, UInt32Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use arrow::row::{RowConverter, SortField};
+use arrow::row::{RowConverter, Rows, SortField};
 use laminar_connectors::connector::{
     SourceMutation, SourceMutationView, SOURCE_ORDER_KEY_COLUMN as SOURCE_ORDER_COLUMN,
     SOURCE_PARTITION_COLUMN, SOURCE_SUB_OFFSET_COLUMN,
@@ -71,6 +71,7 @@ pub(crate) struct TemporalJoinStateConfig {
     pub(crate) vnode_count: NonZeroU32,
     pub(crate) left_key_indices: Vec<usize>,
     pub(crate) right_key_indices: Vec<usize>,
+    pub(crate) key_codec: Arc<PartitionKeyCodecV1>,
     pub(crate) left_time_index: usize,
     pub(crate) right_time_index: usize,
     pub(crate) left_name: String,
@@ -254,7 +255,6 @@ pub(crate) struct TemporalJoinVnodeState {
     left_schema: SchemaRef,
     right_schema: SchemaRef,
     output_schema: SchemaRef,
-    key_codec: PartitionKeyCodecV1,
     left_row_codec: RowConverter,
     right_row_codec: RowConverter,
     history: VnodeHistory,
@@ -302,13 +302,6 @@ impl TemporalJoinVnodeState {
             ));
         }
         validate_output_names(&left_schema, &right_schema, &config)?;
-        let key_types = config
-            .left_key_indices
-            .iter()
-            .map(|&index| left_schema.field(index).data_type().clone());
-        let key_codec = PartitionKeyCodecV1::try_new(key_types).map_err(|error| {
-            DbError::Config(format!("temporal join key is not partitionable: {error}"))
-        })?;
         let left_row_codec = row_codec(&left_schema, "left")?;
         let right_row_codec = row_codec(&right_schema, "right")?;
         let output_schema = output_schema(&left_schema, &right_schema, &config);
@@ -327,7 +320,6 @@ impl TemporalJoinVnodeState {
             left_schema,
             right_schema,
             output_schema,
-            key_codec,
             left_row_codec,
             right_row_codec,
             history: FxHashMap::default(),
@@ -395,17 +387,40 @@ impl TemporalJoinVnodeState {
         Some(earliest_probe.min(earliest_probe.saturating_sub(self.maximum_offset)))
     }
 
+    #[cfg(test)]
     pub(crate) fn apply_right_batch(
         &mut self,
         batch: &RecordBatch,
         operations: Option<SourceMutationView<'_>>,
     ) -> Result<TemporalRightApplyStats, DbError> {
         self.validate_batch_schema(batch, false)?;
+        let keys = self.encode_keys(batch, false)?;
+        self.apply_right_batch_with_keys(batch, operations, &keys, None)
+    }
+
+    pub(crate) fn apply_right_batch_routed(
+        &mut self,
+        batch: &RecordBatch,
+        operations: Option<SourceMutationView<'_>>,
+        keys: &Rows,
+        source_rows: &[u32],
+    ) -> Result<TemporalRightApplyStats, DbError> {
+        self.validate_batch_schema(batch, false)?;
+        self.validate_routed_keys(batch, keys, source_rows)?;
+        self.apply_right_batch_with_keys(batch, operations, keys, Some(source_rows))
+    }
+
+    fn apply_right_batch_with_keys(
+        &mut self,
+        batch: &RecordBatch,
+        operations: Option<SourceMutationView<'_>>,
+        keys: &Rows,
+        source_rows: Option<&[u32]>,
+    ) -> Result<TemporalRightApplyStats, DbError> {
         if operations.is_some_and(|operations| operations.len() != batch.num_rows()) {
             return Err(self.pipeline_error("right CDC operation count does not match row count"));
         }
         let positions = extract_source_positions(batch)?;
-        let keys = self.encode_keys(batch, false)?;
         let times = extract_times(batch, self.config.right_time_index, "right")?;
         let fingerprints = fingerprint_rows(&self.right_row_codec, batch, "right")?;
         let key_columns = self.key_columns(batch, false);
@@ -416,10 +431,13 @@ impl TemporalJoinVnodeState {
 
         for (row, source_position) in positions.iter().enumerate() {
             let null_key = key_columns.iter().any(|column| column.is_null(row));
-            let key = (!null_key).then(|| Box::<[u8]>::from(keys.row(row).as_ref()));
+            let key_row = source_rows.map_or(row, |rows| rows[row] as usize);
+            let key = (!null_key).then(|| Box::<[u8]>::from(keys.row(key_row).data()));
             let event_time = (!times.is_null(row)).then(|| times.value(row));
-            if let Some(key) = key.as_deref() {
-                self.validate_vnode(key)?;
+            if source_rows.is_none() {
+                if let Some(key) = key.as_deref() {
+                    self.validate_vnode(key)?;
+                }
             }
             let tombstone = operations.and_then(|operations| operations.get(row))
                 == Some(SourceMutation::Tombstone);
@@ -545,8 +563,30 @@ impl TemporalJoinVnodeState {
         Ok(stats)
     }
 
+    #[cfg(test)]
     pub(crate) fn probe_left_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch, DbError> {
         self.validate_batch_schema(batch, true)?;
+        let keys = self.encode_keys(batch, true)?;
+        self.probe_left_batch_with_keys(batch, &keys, None)
+    }
+
+    pub(crate) fn probe_left_batch_routed(
+        &mut self,
+        batch: &RecordBatch,
+        keys: &Rows,
+        source_rows: &[u32],
+    ) -> Result<RecordBatch, DbError> {
+        self.validate_batch_schema(batch, true)?;
+        self.validate_routed_keys(batch, keys, source_rows)?;
+        self.probe_left_batch_with_keys(batch, keys, Some(source_rows))
+    }
+
+    fn probe_left_batch_with_keys(
+        &mut self,
+        batch: &RecordBatch,
+        keys: &Rows,
+        source_rows: Option<&[u32]>,
+    ) -> Result<RecordBatch, DbError> {
         let expanded_rows = batch
             .num_rows()
             .checked_mul(self.offsets.len())
@@ -554,7 +594,6 @@ impl TemporalJoinVnodeState {
         u32::try_from(expanded_rows)
             .map_err(|_| self.pipeline_error("temporal probe expansion exceeds the row limit"))?;
         let positions = extract_source_positions(batch)?;
-        let keys = self.encode_keys(batch, true)?;
         let times = extract_times(batch, self.config.left_time_index, "left")?;
         let fingerprints = fingerprint_rows(&self.left_row_codec, batch, "left")?;
         let key_columns = self.key_columns(batch, true);
@@ -572,9 +611,12 @@ impl TemporalJoinVnodeState {
                 .map_err(|_| self.pipeline_error("temporal probe expansion is too large"))?;
             let null_key = key_columns.iter().any(|column| column.is_null(row));
             let event_time = (!times.is_null(row)).then(|| times.value(row));
-            let key = (!null_key).then(|| Box::<[u8]>::from(keys.row(row).as_ref()));
-            if let Some(key) = key.as_deref() {
-                self.validate_vnode(key)?;
+            let key_row = source_rows.map_or(row, |rows| rows[row] as usize);
+            let key = (!null_key).then(|| Box::<[u8]>::from(keys.row(key_row).data()));
+            if source_rows.is_none() {
+                if let Some(key) = key.as_deref() {
+                    self.validate_vnode(key)?;
+                }
             }
             let row = u32::try_from(row)
                 .map_err(|_| self.pipeline_error("left batch exceeds the supported row count"))?;
@@ -1094,9 +1136,28 @@ impl TemporalJoinVnodeState {
 
     fn encode_keys(&self, batch: &RecordBatch, left: bool) -> Result<arrow::row::Rows, DbError> {
         let columns: Vec<ArrayRef> = self.key_columns(batch, left).into_iter().cloned().collect();
-        self.key_codec.encode_columns(&columns).map_err(|error| {
-            self.pipeline_error(&format!("could not encode temporal join key: {error}"))
-        })
+        self.config
+            .key_codec
+            .encode_columns(&columns)
+            .map_err(|error| {
+                self.pipeline_error(&format!("could not encode temporal join key: {error}"))
+            })
+    }
+
+    fn validate_routed_keys(
+        &self,
+        batch: &RecordBatch,
+        keys: &Rows,
+        source_rows: &[u32],
+    ) -> Result<(), DbError> {
+        if source_rows.len() != batch.num_rows()
+            || source_rows
+                .iter()
+                .any(|row| *row as usize >= keys.num_rows())
+        {
+            return Err(self.pipeline_error("routed temporal keys do not cover the routed batch"));
+        }
+        Ok(())
     }
 
     fn validate_vnode(&self, key: &[u8]) -> Result<(), DbError> {
@@ -2776,6 +2837,7 @@ mod tests {
             vnode_count: NonZeroU32::new(1).unwrap(),
             left_key_indices: vec![0],
             right_key_indices: vec![0],
+            key_codec: Arc::new(PartitionKeyCodecV1::try_new([DataType::Utf8]).unwrap()),
             left_time_index: 2,
             right_time_index: 2,
             left_name: "trades".into(),

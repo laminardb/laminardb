@@ -6,13 +6,15 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use arrow::row::Rows;
 use async_trait::async_trait;
 use laminar_connectors::connector::{
     source_mutations, source_mutations_routed, strip_source_mutations,
     strip_source_mutations_routed,
 };
 use laminar_core::state::{
-    KeyGroupCount, NodeId, VnodeAssignmentSnapshot, VnodeRegistry, LOCAL_NODE_ID,
+    KeyGroupCount, NodeId, PartitionKeyCodecV1, VnodeAssignmentSnapshot, VnodeRegistry,
+    LOCAL_NODE_ID,
 };
 use laminar_sql::temporal::{MAX_TEMPORAL_PROBES_PER_ROW, MAX_TEMPORAL_PROBE_HORIZON_MS};
 use laminar_sql::translator::TemporalJoinTranslatorConfig;
@@ -63,6 +65,12 @@ enum TemporalInputSide {
     Right,
 }
 
+struct RoutedTemporalBatch {
+    batch: RecordBatch,
+    keys: Arc<Rows>,
+    source_rows: Arc<[u32]>,
+}
+
 pub(crate) struct ManagedTemporalJoinOperator {
     name: Arc<str>,
     config: TemporalJoinTranslatorConfig,
@@ -71,6 +79,8 @@ pub(crate) struct ManagedTemporalJoinOperator {
     right_schema: SchemaRef,
     left_key_indices: Vec<usize>,
     right_key_indices: Vec<usize>,
+    key_codec: Arc<PartitionKeyCodecV1>,
+    vnode_count: NonZeroU32,
     left_time_index: usize,
     right_time_index: usize,
     minimum_probe_offset: i64,
@@ -107,18 +117,35 @@ impl ManagedTemporalJoinOperator {
         key_group_count: KeyGroupCount,
         limits: TemporalJoinExecutionLimits,
     ) -> Result<Self, DbError> {
-        let left_key_indices = vec![column_index(
-            &left_schema,
-            &config.left_key_column,
-            name,
-            "left key",
-        )?];
-        let right_key_indices = vec![column_index(
-            &right_schema,
-            &config.right_key_column,
-            name,
-            "right key",
-        )?];
+        if config.left_key_columns.is_empty()
+            || config.left_key_columns.len() != config.right_key_columns.len()
+        {
+            return Err(DbError::Config(format!(
+                "temporal join [{name}] requires paired equality keys"
+            )));
+        }
+        let left_key_indices = config
+            .left_key_columns
+            .iter()
+            .map(|column| column_index(&left_schema, column, name, "left key"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let right_key_indices = config
+            .right_key_columns
+            .iter()
+            .map(|column| column_index(&right_schema, column, name, "right key"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let key_codec = Arc::new(
+            PartitionKeyCodecV1::try_new(
+                left_key_indices
+                    .iter()
+                    .map(|&index| left_schema.field(index).data_type().clone()),
+            )
+            .map_err(|error| {
+                DbError::Config(format!(
+                    "temporal join [{name}] key is not partitionable: {error}"
+                ))
+            })?,
+        );
         let left_time_index = column_index(
             &left_schema,
             &config.left_time_column,
@@ -139,6 +166,8 @@ impl ManagedTemporalJoinOperator {
             .min()
             .ok_or_else(|| DbError::Config("temporal probe schedule must not be empty".into()))?;
         let vnode_count = u32::from(key_group_count);
+        let vnode_count_nonzero = NonZeroU32::new(vnode_count)
+            .ok_or_else(|| DbError::Config("temporal vnode count must be nonzero".into()))?;
         let local_assignment =
             VnodeRegistry::single_owner(vnode_count, LOCAL_NODE_ID).versioned_snapshot();
         let operator = Self {
@@ -149,6 +178,8 @@ impl ManagedTemporalJoinOperator {
             right_schema,
             left_key_indices,
             right_key_indices,
+            key_codec,
+            vnode_count: vnode_count_nonzero,
             left_time_index,
             right_time_index,
             minimum_probe_offset,
@@ -193,10 +224,10 @@ impl ManagedTemporalJoinOperator {
     ) -> Result<TemporalJoinStateConfig, DbError> {
         Ok(TemporalJoinStateConfig {
             vnode,
-            vnode_count: NonZeroU32::new(u32::from(self.key_group_count))
-                .ok_or_else(|| DbError::Config("temporal vnode count must be nonzero".into()))?,
+            vnode_count: self.vnode_count,
             left_key_indices: self.left_key_indices.clone(),
             right_key_indices: self.right_key_indices.clone(),
+            key_codec: Arc::clone(&self.key_codec),
             left_time_index: self.left_time_index,
             right_time_index: self.right_time_index,
             left_name: self.config.left_table.clone(),
@@ -252,6 +283,20 @@ impl ManagedTemporalJoinOperator {
             .checked_add(self.right_key_indices.capacity())
             .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<usize>()))
             .ok_or_else(|| self.accounting_error())?;
+        let configured_keys = self
+            .config
+            .left_key_columns
+            .capacity()
+            .checked_add(self.config.right_key_columns.capacity())
+            .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<String>()))
+            .and_then(|bytes| {
+                self.config
+                    .left_key_columns
+                    .iter()
+                    .chain(&self.config.right_key_columns)
+                    .try_fold(bytes, |total, column| total.checked_add(column.capacity()))
+            })
+            .ok_or_else(|| self.accounting_error())?;
         let bool_rosters = self
             .checkpointed_vnodes
             .capacity()
@@ -263,8 +308,6 @@ impl ManagedTemporalJoinOperator {
             .len()
             .checked_add(self.config.left_table.capacity())
             .and_then(|bytes| bytes.checked_add(self.config.right_table.capacity()))
-            .and_then(|bytes| bytes.checked_add(self.config.left_key_column.capacity()))
-            .and_then(|bytes| bytes.checked_add(self.config.right_key_column.capacity()))
             .and_then(|bytes| bytes.checked_add(self.config.left_time_column.capacity()))
             .and_then(|bytes| bytes.checked_add(self.config.right_time_column.capacity()))
             .and_then(|bytes| {
@@ -284,6 +327,7 @@ impl ManagedTemporalJoinOperator {
             pending_holds,
             assignment,
             key_indices,
+            configured_keys,
             bool_rosters,
             strings,
             schedule,
@@ -412,10 +456,9 @@ impl ManagedTemporalJoinOperator {
     fn route_local_inputs(
         &self,
         inputs: &[Vec<RecordBatch>],
-    ) -> Result<BTreeMap<u32, [Vec<RecordBatch>; 2]>, DbError> {
+    ) -> Result<BTreeMap<u32, [Vec<RoutedTemporalBatch>; 2]>, DbError> {
         self.validate_inputs(inputs)?;
-        let mut routed: BTreeMap<u32, [Vec<RecordBatch>; 2]> = BTreeMap::new();
-        let vnode_count = u32::from(self.key_group_count);
+        let mut routed: BTreeMap<u32, [Vec<RoutedTemporalBatch>; 2]> = BTreeMap::new();
         for (side, batches) in [
             (
                 TemporalInputSide::Left,
@@ -431,13 +474,20 @@ impl ManagedTemporalJoinOperator {
                 TemporalInputSide::Right => &self.right_key_indices,
             };
             for batch in batches.iter().filter(|batch| batch.num_rows() != 0) {
-                let row_vnodes = laminar_core::shuffle::row_vnodes(batch, key_indices, vnode_count)
-                    .map_err(|error| {
-                        DbError::Pipeline(format!(
-                            "temporal join [{}] local routing: {error}",
-                            self.name
-                        ))
-                    })?;
+                let columns = key_indices
+                    .iter()
+                    .map(|&index| Arc::clone(batch.column(index)))
+                    .collect::<Vec<_>>();
+                let keys = Arc::new(self.key_codec.encode_columns(&columns).map_err(|error| {
+                    DbError::Pipeline(format!(
+                        "temporal join [{}] local key encoding: {error}",
+                        self.name
+                    ))
+                })?);
+                let row_vnodes = keys
+                    .iter()
+                    .map(|key| PartitionKeyCodecV1::vnode_for_encoded(key.data(), self.vnode_count))
+                    .collect::<Vec<_>>();
                 let plan = laminar_core::shuffle::route_checkpointed_batch(
                     batch,
                     &row_vnodes,
@@ -458,7 +508,11 @@ impl ManagedTemporalJoinOperator {
                 }
                 let port = matches!(side, TemporalInputSide::Right) as usize;
                 for route in plan.local {
-                    routed.entry(route.vnode).or_default()[port].push(route.batch);
+                    routed.entry(route.vnode).or_default()[port].push(RoutedTemporalBatch {
+                        batch: route.batch,
+                        keys: Arc::clone(&keys),
+                        source_rows: route.source_rows,
+                    });
                 }
             }
         }
@@ -555,15 +609,15 @@ impl ManagedTemporalJoinOperator {
     fn apply_right_batches(
         &mut self,
         vnode: u32,
-        batches: &[RecordBatch],
+        batches: &[RoutedTemporalBatch],
         accounted_total: &mut usize,
     ) -> Result<bool, DbError> {
         if batches.is_empty() {
             return Ok(false);
         }
         let mut applied = false;
-        for batch in batches {
-            let operations = source_mutations_routed(batch).map_err(|error| {
+        for routed in batches {
+            let operations = source_mutations_routed(&routed.batch).map_err(|error| {
                 DbError::SchemaMismatch(format!(
                     "temporal join [{}] routed right mutations: {error}",
                     self.name
@@ -573,7 +627,7 @@ impl ManagedTemporalJoinOperator {
                 Ok(operations) => operations,
                 Err(error) => return Err(self.after_apply_error(applied, vnode, error)),
             };
-            let positioned = strip_source_mutations_routed(batch).map_err(|error| {
+            let positioned = strip_source_mutations_routed(&routed.batch).map_err(|error| {
                 DbError::SchemaMismatch(format!(
                     "temporal join [{}] routed right mutations: {error}",
                     self.name
@@ -587,7 +641,12 @@ impl ManagedTemporalJoinOperator {
             let result = self.vnode_states[vnode as usize]
                 .as_mut()
                 .expect("temporal vnode state initialized")
-                .apply_right_batch(&positioned, operations);
+                .apply_right_batch_routed(
+                    &positioned,
+                    operations,
+                    &routed.keys,
+                    &routed.source_rows,
+                );
             if let Err(error) = result {
                 return Err(self.after_apply_error(applied, vnode, error));
             }
@@ -602,7 +661,7 @@ impl ManagedTemporalJoinOperator {
     fn apply_left_batches(
         &mut self,
         vnode: u32,
-        batches: &[RecordBatch],
+        batches: &[RoutedTemporalBatch],
         accounted_total: &mut usize,
     ) -> Result<(bool, Vec<RecordBatch>), DbError> {
         if batches.is_empty() {
@@ -610,12 +669,12 @@ impl ManagedTemporalJoinOperator {
         }
         let mut output = Vec::new();
         let mut applied = false;
-        for batch in batches {
+        for routed in batches {
             let previous = self.prepare_vnode(vnode, accounted_total)?;
             let result = self.vnode_states[vnode as usize]
                 .as_mut()
                 .expect("temporal vnode state initialized")
-                .probe_left_batch(batch);
+                .probe_left_batch_routed(&routed.batch, &routed.keys, &routed.source_rows);
             let result = match result {
                 Ok(result) => result,
                 Err(error) => return Err(self.after_apply_error(applied, vnode, error)),
@@ -1462,6 +1521,7 @@ mod tests {
     fn visible_schemas() -> (SchemaRef, SchemaRef) {
         let left = Arc::new(Schema::new(vec![
             Field::new("symbol", DataType::Utf8, false),
+            Field::new("venue", DataType::Utf8, false),
             Field::new(
                 "trade_time",
                 DataType::Timestamp(TimeUnit::Millisecond, None),
@@ -1471,6 +1531,7 @@ mod tests {
         ]));
         let right = Arc::new(Schema::new(vec![
             Field::new("symbol", DataType::Utf8, false),
+            Field::new("venue", DataType::Utf8, false),
             Field::new(
                 "quote_time",
                 DataType::Timestamp(TimeUnit::Millisecond, None),
@@ -1497,8 +1558,8 @@ mod tests {
         TemporalJoinTranslatorConfig {
             left_table: "trades".into(),
             right_table: "quotes".into(),
-            left_key_column: "symbol".into(),
-            right_key_column: "symbol".into(),
+            left_key_columns: vec!["symbol".into(), "venue".into()],
+            right_key_columns: vec!["symbol".into(), "venue".into()],
             left_time_column: "trade_time".into(),
             right_time_column: "quote_time".into(),
             join_kind: TemporalJoinKind::Left,
@@ -1534,12 +1595,13 @@ mod tests {
         .unwrap()
     }
 
-    fn left_batch(keys: &[String], times: &[i64], ids: &[i64]) -> RecordBatch {
+    fn left_batch(keys: &[String], venues: &[&str], times: &[i64], ids: &[i64]) -> RecordBatch {
         let (visible, _) = visible_schemas();
         let rows = RecordBatch::try_new(
             Arc::clone(&visible),
             vec![
                 Arc::new(StringArray::from_iter_values(keys)),
+                Arc::new(StringArray::from(venues.to_vec())),
                 Arc::new(TimestampMillisecondArray::from(times.to_vec())),
                 Arc::new(Int64Array::from(ids.to_vec())),
             ],
@@ -1559,6 +1621,7 @@ mod tests {
 
     fn right_batch(
         keys: &[String],
+        venues: &[&str],
         times: &[i64],
         values: &[&str],
         mutations: &[SourceMutation],
@@ -1568,6 +1631,7 @@ mod tests {
             Arc::clone(&visible),
             vec![
                 Arc::new(StringArray::from_iter_values(keys)),
+                Arc::new(StringArray::from(venues.to_vec())),
                 Arc::new(TimestampMillisecondArray::from(times.to_vec())),
                 Arc::new(StringArray::from(values.to_vec())),
             ],
@@ -1590,8 +1654,8 @@ mod tests {
     fn key_for_vnode(target: u32) -> String {
         for candidate in 0..1_000 {
             let key = format!("key-{candidate}");
-            let batch = left_batch(std::slice::from_ref(&key), &[0], &[0]);
-            if laminar_core::shuffle::row_vnodes(&batch, &[0], 2).unwrap() == [target] {
+            let batch = left_batch(std::slice::from_ref(&key), &["X"], &[0], &[0]);
+            if laminar_core::shuffle::row_vnodes(&batch, &[0, 1], 2).unwrap() == [target] {
                 return key;
             }
         }
@@ -1617,16 +1681,23 @@ mod tests {
         let key1 = key_for_vnode(1);
         let (mut operator, _, _) = operator(1);
         let right = right_batch(
-            &[key0.clone(), key0.clone(), key1.clone()],
-            &[90, 110, 95],
-            &["old", "deleted", "live"],
+            &[key0.clone(), key0.clone(), key1.clone(), key0.clone()],
+            &["X", "X", "X", "Y"],
+            &[90, 110, 95, 100],
+            &["old", "deleted", "live", "other-venue"],
             &[
                 SourceMutation::Put,
                 SourceMutation::Tombstone,
                 SourceMutation::Put,
+                SourceMutation::Put,
             ],
         );
-        let left = left_batch(&[key0.clone(), key0, key1], &[100, 120, 120], &[1, 2, 3]);
+        let left = left_batch(
+            &[key0.clone(), key0.clone(), key1, key0],
+            &["X", "X", "X", "Y"],
+            &[100, 120, 120, 120],
+            &[1, 2, 3, 4],
+        );
         let fronts = frontier(200);
         let mut output = operator
             .process_with_frontiers(&[vec![left], vec![right]], &fronts)
@@ -1691,7 +1762,12 @@ mod tests {
         }
         assert_eq!(
             actual,
-            BTreeMap::from([(1, Some("old".into())), (2, None), (3, Some("live".into())),])
+            BTreeMap::from([
+                (1, Some("old".into())),
+                (2, None),
+                (3, Some("live".into())),
+                (4, Some("other-venue".into())),
+            ])
         );
 
         #[cfg(feature = "cluster")]
@@ -1741,6 +1817,7 @@ mod tests {
         let (mut donor, _, _) = operator(8);
         let right = right_batch(
             std::slice::from_ref(&key),
+            &["X"],
             &[90],
             &["live"],
             &[SourceMutation::Put],
@@ -1775,7 +1852,7 @@ mod tests {
         let recaptured = restored.checkpoint_vnodes(&[0, 1], 2).unwrap().unwrap();
         assert!(recaptured.iter().all(|frame| frame.state.is_some()));
 
-        let left = left_batch(std::slice::from_ref(&key), &[100], &[7]);
+        let left = left_batch(std::slice::from_ref(&key), &["X"], &[100], &[7]);
         let output = restored
             .process_with_frontiers(&[vec![left], Vec::new()], &frontier(200))
             .await

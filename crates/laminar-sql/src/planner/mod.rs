@@ -791,6 +791,7 @@ impl StreamingPlanner {
             if !step.is_temporal_join() {
                 continue;
             }
+            let (_, right_key_columns) = temporal_key_columns(step)?;
             let left = self.sources.get(&step.left_table).ok_or_else(|| {
                 PlanningError::SourceNotFound(format!(
                     "{} (temporal left input must be a registered event-time source)",
@@ -820,10 +821,16 @@ impl StreamingPlanner {
                     step.right_table
                 ))
             })?;
-            if right.primary_key.as_slice() != [step.right_key_column.as_str()] {
+            if !right
+                .primary_key
+                .iter()
+                .map(String::as_str)
+                .eq(right_key_columns.iter().copied())
+            {
                 return Err(PlanningError::InvalidQuery(format!(
                     "temporal right source '{}' must declare PRIMARY KEY ({}) matching the join key",
-                    step.right_table, step.right_key_column
+                    step.right_table,
+                    right_key_columns.join(", ")
                 )));
             }
             let right_time = right.watermark_column.as_ref().ok_or_else(|| {
@@ -925,6 +932,26 @@ fn object_name_to_string(name: &ObjectName) -> String {
     }
 }
 
+fn temporal_key_columns(step: &JoinAnalysis) -> Result<(Vec<&str>, Vec<&str>), PlanningError> {
+    let mut left = Vec::with_capacity(1 + step.additional_key_columns.len());
+    let mut right = Vec::with_capacity(1 + step.additional_key_columns.len());
+    left.push(step.left_key_column.as_str());
+    right.push(step.right_key_column.as_str());
+    for (left_column, right_column) in &step.additional_key_columns {
+        left.push(left_column);
+        right.push(right_column);
+    }
+    if left.is_empty()
+        || left.len() != right.len()
+        || left.iter().chain(&right).any(|column| column.is_empty())
+    {
+        return Err(PlanningError::InvalidQuery(
+            "temporal join equality keys must be non-empty and have matching cardinality".into(),
+        ));
+    }
+    Ok((left, right))
+}
+
 fn apply_temporal_probe_analysis(
     multi: &mut MultiJoinAnalysis,
     temporal_probe: Option<&JoinAnalysis>,
@@ -937,11 +964,13 @@ fn apply_temporal_probe_analysis(
             "TEMPORAL PROBE JOIN requires one explicitly named two-way stage".into(),
         ));
     };
+    let (normalized_left_keys, normalized_right_keys) = temporal_key_columns(normalized)?;
+    let (probe_left_keys, probe_right_keys) = temporal_key_columns(temporal_probe)?;
     if !normalized.is_temporal_join()
         || normalized.left_table != temporal_probe.left_table
         || normalized.right_table != temporal_probe.right_table
-        || normalized.left_key_column != temporal_probe.left_key_column
-        || normalized.right_key_column != temporal_probe.right_key_column
+        || normalized_left_keys != probe_left_keys
+        || normalized_right_keys != probe_right_keys
         || normalized.left_time_column != temporal_probe.left_time_column
         || normalized.join_type != temporal_probe.join_type
     {
@@ -1672,12 +1701,91 @@ mod tests {
     }
 
     #[test]
+    fn temporal_as_of_preserves_composite_key_order_and_requires_exact_primary_key() {
+        for (primary_key, accepted) in [
+            ("tenant, symbol", true),
+            ("symbol, tenant", false),
+            ("tenant", false),
+        ] {
+            let mut planner = StreamingPlanner::new();
+            for sql in [
+                "CREATE SOURCE trades (tenant VARCHAR, symbol VARCHAR, trade_time TIMESTAMP, WATERMARK FOR trade_time)".to_string(),
+                format!(
+                    "CREATE SOURCE quotes (tenant VARCHAR NOT NULL, symbol VARCHAR NOT NULL, quote_time TIMESTAMP, PRIMARY KEY ({primary_key}), WATERMARK FOR quote_time)"
+                ),
+            ] {
+                let statement = StreamingParser::parse_sql(&sql).unwrap();
+                planner.plan(&statement[0]).unwrap();
+            }
+
+            let statement = StreamingParser::parse_sql(
+                "SELECT * FROM trades t \
+                 JOIN quotes FOR SYSTEM_TIME AS OF t.trade_time AS q \
+                 ON t.tenant = q.tenant AND t.symbol = q.symbol",
+            )
+            .unwrap();
+            let planned = planner.plan(&statement[0]);
+            if accepted {
+                let StreamingPlan::Query(plan) = planned.unwrap() else {
+                    panic!("expected temporal query plan");
+                };
+                let Some(JoinOperatorConfig::Temporal(config)) =
+                    plan.join_config.and_then(|mut configs| configs.pop())
+                else {
+                    panic!("expected canonical temporal config");
+                };
+                assert_eq!(config.left_key_columns, ["tenant", "symbol"]);
+                assert_eq!(config.right_key_columns, ["tenant", "symbol"]);
+            } else {
+                let error = planned.unwrap_err().to_string();
+                assert!(error.contains("PRIMARY KEY (tenant, symbol)"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn temporal_as_of_rejects_invalid_equality_expressions() {
+        for (query, expected) in [
+            (
+                "SELECT * FROM trades t \
+                 JOIN quotes FOR SYSTEM_TIME AS OF t.trade_time AS q \
+                 ON LOWER(t.symbol) = q.symbol",
+                "qualified column references",
+            ),
+            (
+                "SELECT * FROM trades AS quotes \
+                 JOIN quotes FOR SYSTEM_TIME AS OF trades.trade_time AS q \
+                 ON quotes.symbol = q.symbol",
+                "names both inputs",
+            ),
+            (
+                "SELECT * FROM trades t \
+                 JOIN quotes FOR SYSTEM_TIME AS OF t.trade_time AS q \
+                 ON t.symbol = q.symbol AND q.quote_time BETWEEN t.trade_time AND t.trade_time + INTERVAL '1' SECOND",
+                "additional time-bound",
+            ),
+        ] {
+            let mut planner = StreamingPlanner::new();
+            register_temporal_sources(&mut planner);
+            let statement = StreamingParser::parse_sql(query).unwrap();
+            let error = planner.plan(&statement[0]).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
     fn temporal_probe_list_uses_the_as_of_config() {
         let mut planner = StreamingPlanner::new();
-        register_temporal_sources(&mut planner);
+        for sql in [
+            "CREATE SOURCE trades (symbol VARCHAR, venue VARCHAR, trade_time TIMESTAMP, WATERMARK FOR trade_time)",
+            "CREATE SOURCE quotes (symbol VARCHAR NOT NULL, venue VARCHAR NOT NULL, quote_time TIMESTAMP, PRIMARY KEY (symbol, venue), WATERMARK FOR quote_time)",
+        ] {
+            let statement = StreamingParser::parse_sql(sql).unwrap();
+            planner.plan(&statement[0]).unwrap();
+        }
         let statement = StreamingParser::parse_sql(
             "CREATE STREAM markouts AS SELECT probe.offset_ms, probe.probe_time, q.price \
-             FROM trades t TEMPORAL PROBE JOIN quotes q ON (symbol) \
+             FROM trades t TEMPORAL PROBE JOIN quotes q ON (symbol, venue) \
              TIMESTAMPS (trade_time, quote_time) LIST (-1s, 0s, 5s) AS probe",
         )
         .unwrap();
@@ -1689,6 +1797,8 @@ mod tests {
         else {
             panic!("expected canonical temporal config");
         };
+        assert_eq!(config.left_key_columns, ["symbol", "venue"]);
+        assert_eq!(config.right_key_columns, ["symbol", "venue"]);
         assert_eq!(config.probe_schedule.offsets_ms(), [-1_000, 0, 5_000]);
         assert_eq!(config.probe_alias.as_deref(), Some("probe"));
     }

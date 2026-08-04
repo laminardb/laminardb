@@ -58,10 +58,10 @@ pub struct TemporalJoinTranslatorConfig {
     pub left_table: String,
     /// Versioned right input relation.
     pub right_table: String,
-    /// Left equality key.
-    pub left_key_column: String,
-    /// Right equality key.
-    pub right_key_column: String,
+    /// Ordered left-side equality key columns.
+    pub left_key_columns: Vec<String>,
+    /// Ordered right-side equality key columns.
+    pub right_key_columns: Vec<String>,
     /// Left event-time column.
     pub left_time_column: String,
     /// Explicit right event-time/version column.
@@ -147,14 +147,25 @@ impl std::fmt::Display for LookupJoinConfig {
 
 impl std::fmt::Display for TemporalJoinTranslatorConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} TEMPORAL JOIN ON ", self.join_kind)?;
+        for (index, (left, right)) in self
+            .left_key_columns
+            .iter()
+            .zip(&self.right_key_columns)
+            .enumerate()
+        {
+            if index != 0 {
+                write!(f, " AND ")?;
+            }
+            write!(
+                f,
+                "{}.{} = {}.{}",
+                self.left_table, left, self.right_table, right
+            )?;
+        }
         write!(
             f,
-            "{:?} TEMPORAL JOIN ON {}.{} = {}.{} ({} -> {}, probes: {})",
-            self.join_kind,
-            self.left_table,
-            self.left_key_column,
-            self.right_table,
-            self.right_key_column,
+            " ({} -> {}, probes: {})",
             self.left_time_column,
             self.right_time_column,
             self.probe_schedule.len(),
@@ -179,12 +190,6 @@ impl JoinOperatorConfig {
     /// Returns an error when the analyzed join has no supported, complete runtime contract.
     pub fn from_analysis(analysis: &JoinAnalysis) -> Result<Self, String> {
         if analysis.is_temporal_join() {
-            if !analysis.additional_key_columns.is_empty() {
-                return Err(
-                    "temporal joins support exactly one equality key; composite predicates are not implemented"
-                        .to_string(),
-                );
-            }
             let join_kind = match analysis.join_type {
                 JoinType::Inner => TemporalJoinKind::Inner,
                 JoinType::Left => TemporalJoinKind::Left,
@@ -208,11 +213,13 @@ impl JoinOperatorConfig {
             if probe_schedule.is_multi_horizon() && analysis.temporal_probe_alias.is_none() {
                 return Err("multi-horizon temporal probes require an output alias".into());
             }
+            let (left_key_columns, right_key_columns) = ordered_key_columns(analysis);
+            validate_temporal_key_columns(&left_key_columns, &right_key_columns)?;
             return Ok(JoinOperatorConfig::Temporal(TemporalJoinTranslatorConfig {
                 left_table: analysis.left_table.clone(),
                 right_table: analysis.right_table.clone(),
-                left_key_column: analysis.left_key_column.clone(),
-                right_key_column: analysis.right_key_column.clone(),
+                left_key_columns,
+                right_key_columns,
                 left_time_column,
                 right_time_column,
                 join_kind,
@@ -250,14 +257,7 @@ impl JoinOperatorConfig {
             if time_bound.is_zero() {
                 return Err("stream-stream joins require a positive finite time bound".to_string());
             }
-            let mut left_keys = Vec::with_capacity(1 + analysis.additional_key_columns.len());
-            let mut right_keys = Vec::with_capacity(1 + analysis.additional_key_columns.len());
-            left_keys.push(analysis.left_key_column.clone());
-            right_keys.push(analysis.right_key_column.clone());
-            for (left, right) in &analysis.additional_key_columns {
-                left_keys.push(left.clone());
-                right_keys.push(right.clone());
-            }
+            let (left_keys, right_keys) = ordered_key_columns(analysis);
             Ok(JoinOperatorConfig::StreamStream(StreamJoinConfig {
                 join_type: analysis.join_type,
                 left_keys,
@@ -303,7 +303,7 @@ impl JoinOperatorConfig {
         match self {
             JoinOperatorConfig::StreamStream(config) => &config.left_keys,
             JoinOperatorConfig::Lookup(config) => std::slice::from_ref(&config.stream_key),
-            JoinOperatorConfig::Temporal(config) => std::slice::from_ref(&config.left_key_column),
+            JoinOperatorConfig::Temporal(config) => &config.left_key_columns,
         }
     }
 
@@ -313,9 +313,33 @@ impl JoinOperatorConfig {
         match self {
             JoinOperatorConfig::StreamStream(config) => &config.right_keys,
             JoinOperatorConfig::Lookup(config) => std::slice::from_ref(&config.lookup_key),
-            JoinOperatorConfig::Temporal(config) => std::slice::from_ref(&config.right_key_column),
+            JoinOperatorConfig::Temporal(config) => &config.right_key_columns,
         }
     }
+}
+
+fn ordered_key_columns(analysis: &JoinAnalysis) -> (Vec<String>, Vec<String>) {
+    let mut left = Vec::with_capacity(1 + analysis.additional_key_columns.len());
+    let mut right = Vec::with_capacity(1 + analysis.additional_key_columns.len());
+    left.push(analysis.left_key_column.clone());
+    right.push(analysis.right_key_column.clone());
+    for (left_column, right_column) in &analysis.additional_key_columns {
+        left.push(left_column.clone());
+        right.push(right_column.clone());
+    }
+    (left, right)
+}
+
+fn validate_temporal_key_columns(left: &[String], right: &[String]) -> Result<(), String> {
+    if left.is_empty()
+        || left.len() != right.len()
+        || left.iter().chain(right).any(String::is_empty)
+    {
+        return Err(
+            "temporal join equality keys must be non-empty and have matching cardinality".into(),
+        );
+    }
+    Ok(())
 }
 
 impl StreamJoinConfig {
@@ -639,15 +663,20 @@ mod tests {
             JoinType::Inner,
         );
         analysis.right_time_column = Some("version_time".into());
+        analysis
+            .additional_key_columns
+            .push(("venue".into(), "market".into()));
 
         let config = JoinOperatorConfig::from_analysis(&analysis).unwrap();
         assert!(config.is_temporal());
         assert!(!config.is_lookup());
         assert!(!config.is_stream_stream());
-        assert_eq!(config.left_keys(), ["product_id"]);
-        assert_eq!(config.right_keys(), ["id"]);
+        assert_eq!(config.left_keys(), ["product_id", "venue"]);
+        assert_eq!(config.right_keys(), ["id", "market"]);
 
         if let JoinOperatorConfig::Temporal(tc) = config {
+            assert_eq!(tc.left_key_columns, ["product_id", "venue"]);
+            assert_eq!(tc.right_key_columns, ["id", "market"]);
             assert_eq!(tc.left_time_column, "order_time");
             assert_eq!(tc.right_time_column, "version_time");
             assert_eq!(tc.join_kind, TemporalJoinKind::Inner);
@@ -675,6 +704,22 @@ mod tests {
         } else {
             panic!("Expected Temporal config");
         }
+    }
+
+    #[test]
+    fn temporal_join_requires_non_empty_keys() {
+        let mut analysis = JoinAnalysis::temporal(
+            "orders".into(),
+            "products".into(),
+            String::new(),
+            "id".into(),
+            "order_time".into(),
+            JoinType::Inner,
+        );
+        analysis.right_time_column = Some("version_time".into());
+
+        let error = JoinOperatorConfig::from_analysis(&analysis).unwrap_err();
+        assert!(error.contains("non-empty"), "{error}");
     }
 
     #[test]

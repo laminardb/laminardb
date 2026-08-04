@@ -2181,8 +2181,8 @@ fn test_remove_query() {
     let temporal_config = TemporalJoinTranslatorConfig {
         left_table: "trades".to_string(),
         right_table: "versions".to_string(),
-        left_key_column: "symbol".to_string(),
-        right_key_column: "symbol".to_string(),
+        left_key_columns: vec!["symbol".to_string()],
+        right_key_columns: vec!["symbol".to_string()],
         left_time_column: "ts".to_string(),
         right_time_column: "valid_from".to_string(),
         join_kind: laminar_sql::translator::TemporalJoinKind::Inner,

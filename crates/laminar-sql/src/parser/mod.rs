@@ -1723,7 +1723,7 @@ mod tests {
         let sql = "CREATE STREAM markouts_long AS \
                    SELECT t.s, p.offset_ms FROM trade_probe t \
                    TEMPORAL PROBE JOIN price_ref r \
-                       ON (s) TIMESTAMPS (ts, ts) \
+                       ON (s, venue) TIMESTAMPS (ts, ts) \
                        LIST (0s, 1s, 5s, 30s) AS p";
         let StreamingStatement::CreateStream {
             query, query_sql, ..
@@ -1743,7 +1743,17 @@ mod tests {
             [0, 1_000, 5_000, 30_000]
         );
         assert_eq!(analysis.temporal_probe_alias.as_deref(), Some("p"));
+        assert_eq!(analysis.left_key_column, "s");
+        assert_eq!(analysis.right_key_column, "s");
+        assert_eq!(
+            analysis.additional_key_columns,
+            [("venue".to_string(), "venue".to_string())]
+        );
         assert!(query_sql.contains("FOR SYSTEM_TIME AS OF"), "{query_sql}");
+        assert!(
+            query_sql.contains("t.s = r.s AND t.venue = r.venue"),
+            "{query_sql}"
+        );
         assert!(!query_sql.contains("TEMPORAL PROBE"), "{query_sql}");
     }
 
@@ -1776,6 +1786,14 @@ mod tests {
             let sql = format!(
                 "SELECT * FROM trades t TEMPORAL PROBE JOIN quotes q ON (symbol) \
                  TIMESTAMPS (trade_time, quote_time) {invalid} AS probe"
+            );
+            assert!(parse_streaming_sql(&sql).is_err(), "accepted: {sql}");
+        }
+
+        for keys in ["", "symbol,", ", symbol", "symbol venue"] {
+            let sql = format!(
+                "SELECT * FROM trades t TEMPORAL PROBE JOIN quotes q ON ({keys}) \
+                 TIMESTAMPS (trade_time, quote_time) LIST (0s) AS probe"
             );
             assert!(parse_streaming_sql(&sql).is_err(), "accepted: {sql}");
         }
