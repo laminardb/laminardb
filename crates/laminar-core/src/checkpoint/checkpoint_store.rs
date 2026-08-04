@@ -546,7 +546,8 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         let loaded = if nonempty.is_empty() {
             Vec::new()
         } else {
-            self.store.get_ranges(&path, &nonempty).await?
+            object_store::coalesce_ranges(&nonempty, |range| self.store.get_range(&path, range), 0)
+                .await?
         };
         let mut loaded = loaded.into_iter();
         let mut result = Vec::with_capacity(ranges.len());

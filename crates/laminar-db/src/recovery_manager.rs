@@ -9,13 +9,14 @@ use laminar_core::checkpoint::CheckpointStore;
 use laminar_core::checkpoint::{
     checkpoint_manifest_bytes, checkpoint_sha256, ByteRange, ChannelProgress, CheckpointManifest,
     CheckpointScope, CommittedCheckpointIndex, ConnectorCheckpoint, PipelineIdentity, StateChunkId,
-    StateFrameKey,
+    StateFrame, StateFrameKey,
 };
 use laminar_core::checkpoint_decision::{CheckpointOutcome, CheckpointVerdict};
 
 use crate::error::DbError;
 
-const PARALLEL_CHUNK_READS: usize = 8;
+const PARALLEL_MANIFEST_READS: usize = 8;
+const PARALLEL_CHUNK_READS: usize = 4;
 
 /// One checksummed state frame staged during recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +90,79 @@ struct ChunkMetadata {
     sha256: String,
 }
 
+#[derive(Debug)]
+pub(crate) struct VerifiedStateFramePlan {
+    chunks: BTreeMap<StateChunkId, ChunkMetadata>,
+    frames: BTreeMap<StateChunkId, Vec<PendingFrame>>,
+}
+
+impl VerifiedStateFramePlan {
+    pub(crate) fn new(
+        manifest: &CheckpointManifest,
+        selected: &[StateFrame],
+    ) -> Result<Self, DbError> {
+        if selected.windows(2).any(|pair| pair[0].key >= pair[1].key) {
+            return Err(checkpoint_error(
+                "selected state frames are not in canonical logical-key order",
+            ));
+        }
+
+        let mut declared = BTreeMap::<StateChunkId, ChunkMetadata>::new();
+        insert_chunk(
+            &mut declared,
+            manifest.node_data.chunk,
+            ChunkMetadata {
+                object_length: manifest.node_data.object_length,
+                sha256: manifest.node_data.sha256.clone(),
+            },
+        )?;
+        for reference in &manifest.referenced_chunks {
+            insert_chunk(
+                &mut declared,
+                reference.chunk,
+                ChunkMetadata {
+                    object_length: reference.object_length,
+                    sha256: reference.sha256.clone(),
+                },
+            )?;
+        }
+
+        let mut chunks = BTreeMap::new();
+        let mut frames = BTreeMap::<StateChunkId, Vec<PendingFrame>>::new();
+        for frame in selected {
+            let Ok(index) = manifest
+                .state_frames
+                .binary_search_by(|candidate| candidate.key.cmp(&frame.key))
+            else {
+                return Err(checkpoint_error(format!(
+                    "selected state frame {:?} is absent from its manifest",
+                    frame.key
+                )));
+            };
+            if manifest.state_frames[index] != *frame {
+                return Err(checkpoint_error(format!(
+                    "selected state frame {:?} differs from its manifest declaration",
+                    frame.key
+                )));
+            }
+            let metadata = declared.get(&frame.chunk).cloned().ok_or_else(|| {
+                checkpoint_error(format!(
+                    "state frame {:?} references undeclared node object {:?}",
+                    frame.key, frame.chunk
+                ))
+            })?;
+            insert_chunk(&mut chunks, frame.chunk, metadata)?;
+            frames.entry(frame.chunk).or_default().push(PendingFrame {
+                participant_id: manifest.participant_id,
+                key: frame.key.clone(),
+                range: frame.range,
+                sha256: frame.sha256.clone(),
+            });
+        }
+        Ok(Self { chunks, frames })
+    }
+}
+
 impl<'a> RecoveryManager<'a> {
     /// Bind recovery to one runtime topology, deployment, and outcome domain.
     #[must_use]
@@ -147,7 +221,7 @@ impl<'a> RecoveryManager<'a> {
             }
         });
         let mut manifests = futures::stream::iter(reads)
-            .buffer_unordered(PARALLEL_CHUNK_READS)
+            .buffer_unordered(PARALLEL_MANIFEST_READS)
             .try_collect::<Vec<_>>()
             .await?;
         manifests.sort_unstable_by_key(|manifest| manifest.participant_id);
@@ -162,7 +236,8 @@ impl<'a> RecoveryManager<'a> {
                     "local participant {local_participant} is absent from the committed checkpoint"
                 ))
             })?;
-        let state_frames = self.load_frames(local_manifest).await?;
+        let plan = VerifiedStateFramePlan::new(local_manifest, &local_manifest.state_frames)?;
+        let state_frames = load_verified_state_frames(self.store, vec![plan]).await?;
 
         Ok(RecoveredState {
             outcome: outcome.clone(),
@@ -286,117 +361,99 @@ impl<'a> RecoveryManager<'a> {
         }
         Ok(())
     }
+}
 
-    async fn load_frames(
-        &self,
-        manifest: &CheckpointManifest,
-    ) -> Result<Vec<RecoveredStateFrame>, DbError> {
-        let mut chunks = BTreeMap::<StateChunkId, ChunkMetadata>::new();
-        let mut frames = BTreeMap::<StateChunkId, Vec<PendingFrame>>::new();
+pub(crate) async fn load_verified_state_frames(
+    store: &dyn CheckpointStore,
+    plans: Vec<VerifiedStateFramePlan>,
+) -> Result<Vec<RecoveredStateFrame>, DbError> {
+    let mut chunks = BTreeMap::<StateChunkId, ChunkMetadata>::new();
+    let mut frames = BTreeMap::<StateChunkId, Vec<PendingFrame>>::new();
 
-        insert_chunk(
-            &mut chunks,
-            manifest.node_data.chunk,
-            ChunkMetadata {
-                object_length: manifest.node_data.object_length,
-                sha256: manifest.node_data.sha256.clone(),
-            },
-        )?;
-        for reference in &manifest.referenced_chunks {
-            insert_chunk(
-                &mut chunks,
-                reference.chunk,
-                ChunkMetadata {
-                    object_length: reference.object_length,
-                    sha256: reference.sha256.clone(),
-                },
-            )?;
+    for plan in plans {
+        for (chunk, metadata) in plan.chunks {
+            insert_chunk(&mut chunks, chunk, metadata)?;
         }
-        for frame in &manifest.state_frames {
-            frames.entry(frame.chunk).or_default().push(PendingFrame {
-                participant_id: manifest.participant_id,
-                key: frame.key.clone(),
-                range: frame.range,
-                sha256: frame.sha256.clone(),
-            });
+        for (chunk, mut pending) in plan.frames {
+            frames.entry(chunk).or_default().append(&mut pending);
         }
-
-        let work = frames.into_iter().map(|(chunk, requests)| {
-            let store = self.store;
-            let expected = chunks.remove(&chunk);
-            async move {
-                let expected = expected.ok_or_else(|| {
-                    checkpoint_error(format!(
-                        "state frames reference undeclared node object {chunk:?}"
-                    ))
-                })?;
-                let actual_len = store
-                    .node_data_len(chunk)
-                    .await
-                    .map_err(|error| checkpoint_error(format!("node object {chunk:?}: {error}")))?
-                    .ok_or_else(|| checkpoint_error(format!("node object {chunk:?} is missing")))?;
-                if actual_len != expected.object_length {
-                    return Err(checkpoint_error(format!(
-                        "node object {chunk:?} length {actual_len} differs from declared length {}",
-                        expected.object_length
-                    )));
-                }
-
-                let ranges = requests
-                    .iter()
-                    .map(|request| request.range)
-                    .collect::<Vec<_>>();
-                let payloads = store
-                    .load_node_data_ranges(chunk, &ranges)
-                    .await
-                    .map_err(|error| checkpoint_error(format!("node object {chunk:?}: {error}")))?
-                    .ok_or_else(|| checkpoint_error(format!("node object {chunk:?} is missing")))?;
-                if payloads.len() != requests.len() {
-                    return Err(checkpoint_error(format!(
-                        "node object {chunk:?} returned an incomplete range set"
-                    )));
-                }
-
-                requests
-                    .into_iter()
-                    .zip(payloads)
-                    .map(|(request, payload)| {
-                        let actual = checkpoint_sha256(&payload);
-                        if actual != request.sha256 {
-                            return Err(checkpoint_error(format!(
-                                "state frame {:?} checksum mismatch: expected {}, got {actual}",
-                                request.key, request.sha256
-                            )));
-                        }
-                        Ok(RecoveredStateFrame {
-                            participant_id: request.participant_id,
-                            key: request.key,
-                            payload,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, DbError>>()
-            }
-        });
-
-        let mut recovered = futures::stream::iter(work)
-            .buffer_unordered(PARALLEL_CHUNK_READS)
-            .try_collect::<Vec<Vec<RecoveredStateFrame>>>()
-            .await?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        recovered.sort_unstable_by(|left, right| {
-            (left.participant_id, &left.key).cmp(&(right.participant_id, &right.key))
-        });
-        if recovered.windows(2).any(|pair| {
-            pair[0].participant_id == pair[1].participant_id && pair[0].key == pair[1].key
-        }) {
-            return Err(checkpoint_error(
-                "recovered state contains duplicate logical frames",
-            ));
-        }
-        Ok(recovered)
     }
+
+    let work = frames.into_iter().map(|(chunk, requests)| {
+        let expected = chunks.remove(&chunk);
+        async move {
+            let expected = expected.ok_or_else(|| {
+                checkpoint_error(format!(
+                    "state frames reference undeclared node object {chunk:?}"
+                ))
+            })?;
+            let actual_len = store
+                .node_data_len(chunk)
+                .await
+                .map_err(|error| checkpoint_error(format!("node object {chunk:?}: {error}")))?
+                .ok_or_else(|| checkpoint_error(format!("node object {chunk:?} is missing")))?;
+            if actual_len != expected.object_length {
+                return Err(checkpoint_error(format!(
+                    "node object {chunk:?} length {actual_len} differs from declared length {}",
+                    expected.object_length
+                )));
+            }
+
+            let ranges = requests
+                .iter()
+                .map(|request| request.range)
+                .collect::<Vec<_>>();
+            let payloads = store
+                .load_node_data_ranges(chunk, &ranges)
+                .await
+                .map_err(|error| checkpoint_error(format!("node object {chunk:?}: {error}")))?
+                .ok_or_else(|| checkpoint_error(format!("node object {chunk:?} is missing")))?;
+            if payloads.len() != requests.len() {
+                return Err(checkpoint_error(format!(
+                    "node object {chunk:?} returned an incomplete range set"
+                )));
+            }
+
+            requests
+                .into_iter()
+                .zip(payloads)
+                .map(|(request, payload)| {
+                    let actual = checkpoint_sha256(&payload);
+                    if actual != request.sha256 {
+                        return Err(checkpoint_error(format!(
+                            "state frame {:?} checksum mismatch: expected {}, got {actual}",
+                            request.key, request.sha256
+                        )));
+                    }
+                    Ok(RecoveredStateFrame {
+                        participant_id: request.participant_id,
+                        key: request.key,
+                        payload: Bytes::copy_from_slice(&payload),
+                    })
+                })
+                .collect::<Result<Vec<_>, DbError>>()
+        }
+    });
+
+    let mut recovered = futures::stream::iter(work)
+        .buffer_unordered(PARALLEL_CHUNK_READS)
+        .try_collect::<Vec<Vec<RecoveredStateFrame>>>()
+        .await?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    recovered.sort_unstable_by(|left, right| {
+        (left.participant_id, &left.key).cmp(&(right.participant_id, &right.key))
+    });
+    if recovered
+        .windows(2)
+        .any(|pair| pair[0].participant_id == pair[1].participant_id && pair[0].key == pair[1].key)
+    {
+        return Err(checkpoint_error(
+            "recovered state contains duplicate logical frames",
+        ));
+    }
+    Ok(recovered)
 }
 
 fn merge_manifest_progress(
