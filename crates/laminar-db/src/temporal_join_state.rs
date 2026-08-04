@@ -1,7 +1,7 @@
 //! Vnode-local state for event-time temporal joins.
 
-use std::collections::BTreeMap;
-use std::num::NonZeroU32;
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -22,11 +22,13 @@ use sha2::{Digest, Sha256};
 
 use crate::error::DbError;
 
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 const MAP_ENTRY_CHARGE: usize = 128;
 const VERSION_ENTRY_CHARGE: usize = 256;
 const TIMER_ENTRY_CHARGE: usize = 96;
 const BATCH_CHARGE: usize = 256;
+const BASE_STATE_CHARGE: usize = 512;
+const HISTORY_KEY_ROSTER_CHARGE: usize = 32;
 const POSITION_COLUMN_COUNT: usize = 3;
 
 #[derive(
@@ -89,6 +91,18 @@ pub(crate) struct TemporalRightApplyStats {
     pub(crate) ignored_nulls: usize,
 }
 
+pub(crate) struct TemporalReadyDrain {
+    pub(crate) output: RecordBatch,
+    pub(crate) drained_probes: usize,
+    pub(crate) has_more: bool,
+}
+
+pub(crate) struct TemporalHistoryGcDrain {
+    pub(crate) steps: usize,
+    pub(crate) removed_versions: usize,
+    pub(crate) has_more: bool,
+}
+
 #[derive(Clone)]
 struct RowRef {
     batch: Arc<RecordBatch>,
@@ -140,6 +154,12 @@ struct OutputRow {
     right: Option<RowRef>,
     offset_ms: i64,
     probe_time: Option<i64>,
+}
+
+struct HistoryGcRemoval {
+    roster_index: usize,
+    order: (i64, TemporalSourcePosition),
+    batch_id: Option<u64>,
 }
 
 type VersionChain = BTreeMap<(i64, TemporalSourcePosition), Version>;
@@ -212,6 +232,11 @@ struct TemporalJoinCheckpoint {
     right_frontier: Option<i64>,
     right_idle: bool,
     history_evicted_before: Option<i64>,
+    history_key_roster: Vec<Vec<u8>>,
+    history_gc_cursor: u64,
+    history_gc_sweep_end: u64,
+    history_gc_active_cutoff: Option<i64>,
+    history_gc_completed_cutoff: Option<i64>,
     applied_right: Vec<CheckpointMutationIdentity>,
     versions: Vec<CheckpointVersion>,
     pending: Vec<CheckpointProbe>,
@@ -223,6 +248,7 @@ struct TemporalJoinCheckpoint {
 pub(crate) struct TemporalJoinVnodeState {
     config: TemporalJoinStateConfig,
     offsets: Vec<i64>,
+    minimum_offset: i64,
     left_schema: SchemaRef,
     right_schema: SchemaRef,
     output_schema: SchemaRef,
@@ -230,10 +256,11 @@ pub(crate) struct TemporalJoinVnodeState {
     left_row_codec: RowConverter,
     right_row_codec: RowConverter,
     history: VnodeHistory,
+    history_key_roster: Vec<Box<[u8]>>,
     applied_right: FxHashMap<TemporalSourcePosition, MutationIdentity>,
     right_batches: FxHashMap<u64, RetainedBatch>,
     pending: FxHashMap<ProbeIdentity, PendingProbe>,
-    timers: BTreeMap<i64, Vec<ProbeIdentity>>,
+    timers: BTreeMap<i64, BTreeSet<ProbeIdentity>>,
     left_batches: FxHashMap<u64, RetainedBatch>,
     finalized: FxHashMap<ProbeIdentity, FinalizedProbe>,
     next_batch_id: u64,
@@ -242,6 +269,10 @@ pub(crate) struct TemporalJoinVnodeState {
     right_frontier: Option<i64>,
     right_idle: bool,
     history_evicted_before: Option<i64>,
+    history_gc_cursor: usize,
+    history_gc_sweep_end: usize,
+    history_gc_active_cutoff: Option<i64>,
+    history_gc_completed_cutoff: Option<i64>,
     charged_bytes: usize,
 }
 
@@ -253,11 +284,17 @@ impl TemporalJoinVnodeState {
     ) -> Result<Self, DbError> {
         validate_config(&left_schema, &right_schema, &config)?;
         let offsets = expand_offsets(&config.schedule, config.limits)?;
+        let minimum_offset = offsets
+            .iter()
+            .copied()
+            .min()
+            .expect("validated temporal schedule is non-empty");
         if config.schedule.is_multi_horizon() && !config.emit_probe_metadata {
             return Err(DbError::Config(
                 "multi-horizon temporal probes must emit offset_ms and probe_time".into(),
             ));
         }
+        validate_output_names(&left_schema, &right_schema, &config)?;
         let key_types = config
             .left_key_indices
             .iter()
@@ -268,9 +305,17 @@ impl TemporalJoinVnodeState {
         let left_row_codec = row_codec(&left_schema, "left")?;
         let right_row_codec = row_codec(&right_schema, "right")?;
         let output_schema = output_schema(&left_schema, &right_schema, &config);
-        let mut state = Self {
+        if BASE_STATE_CHARGE > config.limits.max_retained_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("temporal join vnode {} base state", config.vnode),
+                accounted_bytes: BASE_STATE_CHARGE,
+                limit_bytes: config.limits.max_retained_bytes,
+            });
+        }
+        Ok(Self {
             config,
             offsets,
+            minimum_offset,
             left_schema,
             right_schema,
             output_schema,
@@ -278,6 +323,7 @@ impl TemporalJoinVnodeState {
             left_row_codec,
             right_row_codec,
             history: FxHashMap::default(),
+            history_key_roster: Vec::new(),
             applied_right: FxHashMap::default(),
             right_batches: FxHashMap::default(),
             pending: FxHashMap::default(),
@@ -290,10 +336,12 @@ impl TemporalJoinVnodeState {
             right_frontier: None,
             right_idle: false,
             history_evicted_before: None,
-            charged_bytes: 0,
-        };
-        state.refresh_charge()?;
-        Ok(state)
+            history_gc_cursor: 0,
+            history_gc_sweep_end: 0,
+            history_gc_active_cutoff: None,
+            history_gc_completed_cutoff: None,
+            charged_bytes: BASE_STATE_CHARGE,
+        })
     }
 
     pub(crate) fn output_schema(&self) -> SchemaRef {
@@ -384,37 +432,46 @@ impl TemporalJoinVnodeState {
             .iter()
             .filter(|entry| entry.0.as_ref().is_some_and(|entry| !entry.2))
             .count();
-        let growth = candidates
-            .iter()
-            .try_fold(0usize, |total, entry| {
-                let history = entry.0.as_ref().map_or(0, |(key, _, _)| {
-                    VERSION_ENTRY_CHARGE
-                        .saturating_add(MAP_ENTRY_CHARGE)
-                        .saturating_add(key.len())
-                        .saturating_add(entry.1.heap_bytes())
-                });
-                total
-                    .checked_add(MAP_ENTRY_CHARGE.saturating_add(history))
-                    .and_then(|value| {
-                        value.checked_add(
-                            entry
-                                .2
-                                .key
-                                .as_deref()
-                                .map_or(0, <[u8]>::len)
-                                .saturating_add(entry.1.heap_bytes()),
-                        )
-                    })
-            })
-            .and_then(|value| {
-                if live_count == 0 {
-                    Some(value)
-                } else {
-                    value.checked_add(batch.get_array_memory_size().saturating_add(BATCH_CHARGE))
+        let mut growth = 0usize;
+        let mut new_history_keys: FxHashSet<&[u8]> = FxHashSet::default();
+        for (version, source, identity, _) in &candidates {
+            let applied = MAP_ENTRY_CHARGE
+                .checked_add(source.heap_bytes())
+                .and_then(|value| value.checked_add(identity.key.as_deref().map_or(0, <[u8]>::len)))
+                .ok_or_else(|| self.pipeline_error("right dedup accounting overflow"))?;
+            growth = growth
+                .checked_add(applied)
+                .ok_or_else(|| self.pipeline_error("right retained-state accounting overflow"))?;
+            if let Some((key, _, _)) = version {
+                let version_charge = VERSION_ENTRY_CHARGE
+                    .checked_add(source.heap_bytes())
+                    .ok_or_else(|| self.pipeline_error("right version accounting overflow"))?;
+                growth = growth.checked_add(version_charge).ok_or_else(|| {
+                    self.pipeline_error("right retained-state accounting overflow")
+                })?;
+                if !self.history.contains_key(key.as_ref()) && new_history_keys.insert(key.as_ref())
+                {
+                    let key_charge = MAP_ENTRY_CHARGE
+                        .checked_add(key.len())
+                        .and_then(|value| value.checked_add(HISTORY_KEY_ROSTER_CHARGE))
+                        .and_then(|value| value.checked_add(key.len()))
+                        .ok_or_else(|| {
+                            self.pipeline_error("right history-key accounting overflow")
+                        })?;
+                    growth = growth.checked_add(key_charge).ok_or_else(|| {
+                        self.pipeline_error("right retained-state accounting overflow")
+                    })?;
                 }
-            })
-            .ok_or_else(|| self.pipeline_error("right retained-state accounting overflow"))?;
-        self.ensure_state_growth(growth, "right version admission")?;
+            }
+        }
+        if live_count != 0 {
+            growth = growth
+                .checked_add(batch_charge(batch).ok_or_else(|| {
+                    self.pipeline_error("right retained-batch accounting overflow")
+                })?)
+                .ok_or_else(|| self.pipeline_error("right retained-state accounting overflow"))?;
+        }
+        let admitted_charge = self.admitted_charge(growth, "right version admission")?;
         let batch_id = if live_count == 0 {
             None
         } else {
@@ -435,13 +492,21 @@ impl TemporalJoinVnodeState {
                 let version = Version {
                     row: (!tombstone).then_some((batch_id.expect("live batch exists"), row)),
                 };
-                let replaced = self.history.entry(key).or_default().insert(order, version);
+                let replaced = match self.history.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().insert(order, version)
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        self.history_key_roster.push(entry.key().clone());
+                        entry.insert(BTreeMap::new()).insert(order, version)
+                    }
+                };
                 debug_assert!(replaced.is_none());
                 stats.inserted += 1;
             }
             self.applied_right.insert(source, identity);
         }
-        self.refresh_charge()?;
+        self.charged_bytes = admitted_charge;
         Ok(stats)
     }
 
@@ -582,49 +647,33 @@ impl TemporalJoinVnodeState {
                 self.config.vnode, self.config.limits.max_pending_probes
             )));
         }
-        let pending_growth = new_pending
-            .checked_mul(VERSION_ENTRY_CHARGE.saturating_add(TIMER_ENTRY_CHARGE))
-            .and_then(|value| {
-                if new_pending == 0 {
-                    Some(value)
-                } else {
-                    value.checked_add(batch.get_array_memory_size().saturating_add(BATCH_CHARGE))
-                }
-            })
-            .ok_or_else(|| self.pipeline_error("pending temporal state accounting overflow"))?;
-        let pending_position_growth = planned
-            .iter()
-            .filter(|entry| entry.2.is_some())
-            .try_fold(0usize, |total, entry| {
-                let key_bytes = entry.2.as_ref().map_or(0, |(key, _, _, _, _)| key.len());
-                total.checked_add(
-                    entry
-                        .0
-                        .source
-                        .heap_bytes()
-                        .saturating_mul(2)
-                        .saturating_add(key_bytes),
-                )
-            })
-            .ok_or_else(|| self.pipeline_error("pending source-position accounting overflow"))?;
-        let finalized_growth = new_finalized
-            .checked_mul(MAP_ENTRY_CHARGE)
-            .and_then(|base| {
-                planned
-                    .iter()
-                    .filter(|entry| entry.2.is_none())
-                    .try_fold(base, |total, entry| {
-                        total
-                            .checked_add(entry.1.key.as_deref().map_or(0, <[u8]>::len))
-                            .and_then(|value| value.checked_add(entry.0.source.heap_bytes()))
-                    })
-            })
-            .ok_or_else(|| self.pipeline_error("finalized temporal state accounting overflow"))?;
-        let growth = pending_growth
-            .checked_add(pending_position_growth)
-            .and_then(|value| value.checked_add(finalized_growth))
+        let mut growth = 0usize;
+        for (identity, fingerprint, pending) in &planned {
+            let entry_charge = if let Some((key, _, _, _, _)) = pending {
+                VERSION_ENTRY_CHARGE
+                    .checked_add(TIMER_ENTRY_CHARGE)
+                    .and_then(|value| value.checked_add(key.len()))
+                    .and_then(|value| value.checked_add(identity.source.heap_bytes()))
+                    .and_then(|value| value.checked_add(identity.source.heap_bytes()))
+            } else {
+                MAP_ENTRY_CHARGE
+                    .checked_add(fingerprint.key.as_deref().map_or(0, <[u8]>::len))
+                    .and_then(|value| value.checked_add(identity.source.heap_bytes()))
+            }
             .ok_or_else(|| self.pipeline_error("left temporal state accounting overflow"))?;
-        self.ensure_state_growth(growth, "left probe admission")?;
+            growth = growth
+                .checked_add(entry_charge)
+                .ok_or_else(|| self.pipeline_error("left temporal state accounting overflow"))?;
+        }
+        if new_pending != 0 {
+            growth = growth
+                .checked_add(batch_charge(batch).ok_or_else(|| {
+                    self.pipeline_error("left retained-batch accounting overflow")
+                })?)
+                .ok_or_else(|| self.pipeline_error("left temporal state accounting overflow"))?;
+        }
+        debug_assert_eq!(planned.len(), new_pending + new_finalized);
+        let admitted_charge = self.admitted_charge(growth, "left probe admission")?;
         let output = self.build_output(&outputs)?;
         let left_batch_id = if new_pending == 0 {
             None
@@ -642,10 +691,12 @@ impl TemporalJoinVnodeState {
         }
         for (identity, fingerprint, pending) in planned {
             if let Some((key, left_event_time, probe_time, deadline, row)) = pending {
-                self.timers
+                let inserted = self
+                    .timers
                     .entry(deadline)
                     .or_default()
-                    .push(identity.clone());
+                    .insert(identity.clone());
+                debug_assert!(inserted);
                 self.pending.insert(
                     identity,
                     PendingProbe {
@@ -662,7 +713,7 @@ impl TemporalJoinVnodeState {
                 self.finalized.insert(identity, fingerprint);
             }
         }
-        self.refresh_charge()?;
+        self.charged_bytes = admitted_charge;
         Ok(output)
     }
 
@@ -673,85 +724,186 @@ impl TemporalJoinVnodeState {
     ) -> Result<(), DbError> {
         validate_frontier(self.left_frontier, frontier, "left")?;
         if let Some(frontier) = frontier {
+            self.schedule_history_gc(Some(frontier), self.right_frontier);
             self.left_frontier = Some(frontier);
-            self.gc_history()?;
         }
         self.left_idle = idle;
-        self.refresh_charge()
+        Ok(())
     }
 
     pub(crate) fn advance_right_frontier(
         &mut self,
         frontier: Option<i64>,
         idle: bool,
-    ) -> Result<RecordBatch, DbError> {
+    ) -> Result<(), DbError> {
         validate_frontier(self.right_frontier, frontier, "right")?;
-        let Some(frontier) = frontier else {
-            self.right_idle = idle;
-            return Ok(RecordBatch::new_empty(Arc::clone(&self.output_schema)));
+        if let Some(frontier) = frontier {
+            self.schedule_history_gc(self.left_frontier, Some(frontier));
+            self.right_frontier = Some(frontier);
+        }
+        self.right_idle = idle;
+        Ok(())
+    }
+
+    pub(crate) fn has_ready_probes(&self) -> bool {
+        self.right_frontier.is_some_and(|frontier| {
+            self.timers
+                .first_key_value()
+                .is_some_and(|(deadline, _)| *deadline < frontier)
+        })
+    }
+
+    pub(crate) fn drain_ready_probes(
+        &mut self,
+        max_probes: NonZeroUsize,
+    ) -> Result<TemporalReadyDrain, DbError> {
+        let Some(frontier) = self.right_frontier else {
+            return Ok(TemporalReadyDrain {
+                output: RecordBatch::new_empty(Arc::clone(&self.output_schema)),
+                drained_probes: 0,
+                has_more: false,
+            });
         };
-        let ready_deadlines: Vec<i64> = self
-            .timers
-            .range(..frontier)
-            .map(|(&time, _)| time)
-            .collect();
-        let mut outputs = Vec::new();
         let mut ready = Vec::new();
-        let mut seen = FxHashSet::default();
-        for &deadline in &ready_deadlines {
-            let mut identities = self.timers.get(&deadline).cloned().unwrap_or_default();
-            identities.sort_unstable();
-            for identity in identities {
-                if !seen.insert(identity.clone()) {
-                    return Err(self.pipeline_error("temporal timer contains a duplicate probe"));
-                }
-                let Some(probe) = self.pending.get(&identity) else {
-                    return Err(self.pipeline_error("temporal timer referenced a missing probe"));
-                };
-                if probe.deadline != deadline {
-                    return Err(self.pipeline_error("temporal timer deadline disagrees with probe"));
-                }
-                let left = self.left_row(probe.left_batch, probe.left_row)?;
-                let right = self.lookup(&probe.key, probe.probe_time)?;
-                self.push_final_output(
-                    &mut outputs,
-                    left,
-                    right,
-                    identity.offset_ms,
-                    Some(probe.probe_time),
-                );
-                ready.push((deadline, identity));
+        ready
+            .try_reserve(max_probes.get().min(self.pending.len()))
+            .map_err(|_| self.pipeline_error("ready temporal probe budget is too large"))?;
+        for (&deadline, identities) in self.timers.range(..frontier) {
+            let remaining = max_probes.get() - ready.len();
+            ready.extend(
+                identities
+                    .iter()
+                    .take(remaining)
+                    .cloned()
+                    .map(|identity| (deadline, identity)),
+            );
+            if ready.len() == max_probes.get() {
+                break;
             }
+        }
+        if ready.is_empty() {
+            return Ok(TemporalReadyDrain {
+                output: RecordBatch::new_empty(Arc::clone(&self.output_schema)),
+                drained_probes: 0,
+                has_more: false,
+            });
+        }
+
+        let mut outputs = Vec::new();
+        let mut finalized = Vec::with_capacity(ready.len());
+        let mut seen = FxHashSet::default();
+        let mut batch_releases: FxHashMap<u64, usize> = FxHashMap::default();
+        let mut removed_charge = 0usize;
+        let mut added_charge = 0usize;
+        for (deadline, identity) in &ready {
+            if !seen.insert(identity.clone()) {
+                return Err(self.pipeline_error("temporal timer contains a duplicate probe"));
+            }
+            let Some(probe) = self.pending.get(identity) else {
+                return Err(self.pipeline_error("temporal timer referenced a missing probe"));
+            };
+            if probe.deadline != *deadline {
+                return Err(self.pipeline_error("temporal timer deadline disagrees with probe"));
+            }
+            if self.finalized.contains_key(identity) {
+                return Err(self.pipeline_error("temporal probe is both pending and finalized"));
+            }
+            let left = self.left_row(probe.left_batch, probe.left_row)?;
+            let right = self.lookup(&probe.key, probe.probe_time)?;
+            self.push_final_output(
+                &mut outputs,
+                left,
+                right,
+                identity.offset_ms,
+                Some(probe.probe_time),
+            );
+            let value = FinalizedProbe {
+                key: Some(probe.key.clone()),
+                left_event_time: Some(probe.left_event_time),
+                payload_fingerprint: probe.payload_fingerprint,
+            };
+            removed_charge = removed_charge
+                .checked_add(self.pending_probe_charge(identity, probe)?)
+                .ok_or_else(|| self.pipeline_error("ready-probe accounting overflow"))?;
+            added_charge = added_charge
+                .checked_add(self.finalized_probe_charge(identity, &value)?)
+                .ok_or_else(|| self.pipeline_error("finalized-probe accounting overflow"))?;
+            let releases = batch_releases.entry(probe.left_batch).or_default();
+            *releases = releases
+                .checked_add(1)
+                .ok_or_else(|| self.pipeline_error("ready-probe reference overflow"))?;
+            finalized.push((identity.clone(), value));
+        }
+        for (&batch_id, &release_count) in &batch_releases {
+            let retained = self.left_batches.get(&batch_id).ok_or_else(|| {
+                self.pipeline_error("pending temporal probe referenced a missing left batch")
+            })?;
+            if release_count > retained.references {
+                return Err(
+                    self.pipeline_error("temporal left batch reference count would underflow")
+                );
+            }
+            if release_count == retained.references {
+                removed_charge = removed_charge
+                    .checked_add(batch_charge(&retained.batch).ok_or_else(|| {
+                        self.pipeline_error("left retained-batch accounting overflow")
+                    })?)
+                    .ok_or_else(|| self.pipeline_error("ready-probe accounting overflow"))?;
+            }
+        }
+        let next_charge = self
+            .charged_bytes
+            .checked_sub(removed_charge)
+            .and_then(|value| value.checked_add(added_charge))
+            .ok_or_else(|| self.pipeline_error("ready-probe accounting underflowed"))?;
+        if next_charge > self.config.limits.max_retained_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("temporal join vnode {} finalized probes", self.config.vnode),
+                accounted_bytes: next_charge,
+                limit_bytes: self.config.limits.max_retained_bytes,
+            });
         }
         let output = self.build_output(&outputs)?;
 
-        self.right_frontier = Some(frontier);
-        self.right_idle = idle;
-        for deadline in ready_deadlines {
-            self.timers.remove(&deadline);
-        }
-        for (deadline, identity) in ready {
-            let probe = self.pending.remove(&identity).ok_or_else(|| {
-                self.pipeline_error("temporal timer referenced a missing probe during commit")
-            })?;
-            if probe.deadline != deadline {
-                return Err(
-                    self.pipeline_error("temporal timer deadline changed while committing a probe")
-                );
+        for ((deadline, identity), (_, value)) in ready.iter().zip(finalized) {
+            let remove_deadline = {
+                let identities = self
+                    .timers
+                    .get_mut(deadline)
+                    .expect("validated timer exists");
+                let removed = identities.remove(identity);
+                debug_assert!(removed);
+                identities.is_empty()
+            };
+            if remove_deadline {
+                self.timers.remove(deadline);
             }
-            self.finalized.insert(
-                identity,
-                FinalizedProbe {
-                    key: Some(probe.key),
-                    left_event_time: Some(probe.left_event_time),
-                    payload_fingerprint: probe.payload_fingerprint,
-                },
-            );
-            self.release_left_batch(probe.left_batch)?;
+            let removed = self.pending.remove(identity);
+            debug_assert!(removed.is_some());
+            let replaced = self.finalized.insert(identity.clone(), value);
+            debug_assert!(replaced.is_none());
         }
-        self.gc_history()?;
-        self.refresh_charge()?;
-        Ok(output)
+        for (batch_id, release_count) in batch_releases {
+            let remove_batch = {
+                let retained = self
+                    .left_batches
+                    .get_mut(&batch_id)
+                    .expect("validated batch exists");
+                retained.references -= release_count;
+                retained.references == 0
+            };
+            if remove_batch {
+                self.left_batches.remove(&batch_id);
+            }
+        }
+        self.charged_bytes = next_charge;
+        self.schedule_history_gc(self.left_frontier, self.right_frontier);
+        let has_more = self.has_ready_probes();
+        Ok(TemporalReadyDrain {
+            output,
+            drained_probes: ready.len(),
+            has_more,
+        })
     }
 
     pub(crate) fn checkpoint(&self, max_encoded_bytes: usize) -> Result<Vec<u8>, DbError> {
@@ -792,6 +944,10 @@ impl TemporalJoinVnodeState {
                 payload_fingerprint: identity.payload_fingerprint,
             })
             .collect();
+        let history_gc_cursor = u64::try_from(self.history_gc_cursor)
+            .map_err(|_| DbError::Checkpoint("temporal history GC cursor exceeds u64".into()))?;
+        let history_gc_sweep_end = u64::try_from(self.history_gc_sweep_end)
+            .map_err(|_| DbError::Checkpoint("temporal history GC roster exceeds u64".into()))?;
         let checkpoint = TemporalJoinCheckpoint {
             format_version: FORMAT_VERSION,
             config: self.checkpoint_config()?,
@@ -800,6 +956,15 @@ impl TemporalJoinVnodeState {
             right_frontier: self.right_frontier,
             right_idle: self.right_idle,
             history_evicted_before: self.history_evicted_before,
+            history_key_roster: self
+                .history_key_roster
+                .iter()
+                .map(|key| key.to_vec())
+                .collect(),
+            history_gc_cursor,
+            history_gc_sweep_end,
+            history_gc_active_cutoff: self.history_gc_active_cutoff,
+            history_gc_completed_cutoff: self.history_gc_completed_cutoff,
             applied_right,
             versions,
             pending,
@@ -837,35 +1002,25 @@ impl TemporalJoinVnodeState {
         state.right_frontier = checkpoint.right_frontier;
         state.right_idle = checkpoint.right_idle;
         state.history_evicted_before = checkpoint.history_evicted_before;
+        state.history_gc_cursor = usize::try_from(checkpoint.history_gc_cursor)
+            .map_err(|_| DbError::Checkpoint("temporal history GC cursor exceeds usize".into()))?;
+        state.history_gc_sweep_end = usize::try_from(checkpoint.history_gc_sweep_end)
+            .map_err(|_| DbError::Checkpoint("temporal history GC roster exceeds usize".into()))?;
+        state.history_gc_active_cutoff = checkpoint.history_gc_active_cutoff;
+        state.history_gc_completed_cutoff = checkpoint.history_gc_completed_cutoff;
+        let history_key_roster = checkpoint.history_key_roster;
         let right_rows = deserialize_batch_stream(&checkpoint.right_rows_ipc)
             .map_err(|error| DbError::Checkpoint(format!("temporal right IPC: {error}")))?;
         let left_rows = deserialize_batch_stream(&checkpoint.left_rows_ipc)
             .map_err(|error| DbError::Checkpoint(format!("temporal left IPC: {error}")))?;
         state.restore_applied_right(checkpoint.applied_right)?;
         state.restore_versions(checkpoint.versions, right_rows)?;
+        state.restore_history_gc_roster(history_key_roster)?;
         state.restore_pending(checkpoint.pending, left_rows)?;
         state.restore_finalized(checkpoint.finalized)?;
         state.validate_restored_history_anchor()?;
         state.validate_restored_probe_consistency()?;
-        if let Some(frontier) = state.right_frontier {
-            if state
-                .timers
-                .keys()
-                .next()
-                .is_some_and(|deadline| *deadline < frontier)
-            {
-                return Err(DbError::Checkpoint(
-                    "temporal checkpoint contains an already-final probe".into(),
-                ));
-            }
-        }
-        state.refresh_charge()?;
-        if state.charged_bytes > state.config.limits.max_retained_bytes {
-            return Err(DbError::Checkpoint(format!(
-                "restored temporal state uses {} bytes; limit is {}",
-                state.charged_bytes, state.config.limits.max_retained_bytes
-            )));
-        }
+        state.restore_charge()?;
         Ok(state)
     }
 
@@ -1053,10 +1208,9 @@ impl TemporalJoinVnodeState {
         })
     }
 
-    fn gc_history(&mut self) -> Result<(), DbError> {
-        let (Some(right_frontier), Some(left_frontier)) = (self.right_frontier, self.left_frontier)
-        else {
-            return Ok(());
+    fn schedule_history_gc(&mut self, left_frontier: Option<i64>, right_frontier: Option<i64>) {
+        let (Some(right_frontier), Some(left_frontier)) = (right_frontier, left_frontier) else {
+            return;
         };
         let retention_cutoff = right_frontier
             .checked_sub(self.config.history_retention_ms)
@@ -1064,60 +1218,212 @@ impl TemporalJoinVnodeState {
         let Some(earliest_future_event) =
             left_frontier.checked_sub(self.config.left_allowed_lateness_ms)
         else {
-            return Ok(());
+            return;
         };
-        let Some(minimum_offset) = self.offsets.iter().copied().min() else {
-            return Ok(());
+        let Some(earliest_future_probe) = earliest_future_event.checked_add(self.minimum_offset)
+        else {
+            return;
         };
-        let Some(earliest_future_probe) = earliest_future_event.checked_add(minimum_offset) else {
-            return Ok(());
-        };
-        let oldest_pending = self.pending.values().map(|probe| probe.probe_time).min();
+        let oldest_pending = self.timers.first_key_value().map(|(deadline, _)| {
+            deadline
+                .checked_sub(self.config.right_allowed_lateness_ms)
+                .expect("validated temporal timer deadline cannot underflow")
+        });
         let cutoff = oldest_pending
             .map_or(retention_cutoff.min(earliest_future_probe), |pending| {
                 retention_cutoff.min(earliest_future_probe).min(pending)
             });
         if cutoff == i64::MIN {
-            return Ok(());
+            return;
         }
-        let minimum_position = TemporalSourcePosition {
-            partition: Vec::new(),
-            order: Vec::new(),
-            sub_offset: 0,
+        self.history_evicted_before = Some(
+            self.history_evicted_before
+                .map_or(cutoff, |previous| previous.max(cutoff)),
+        );
+        if self.history_key_roster.is_empty() {
+            self.history_gc_completed_cutoff = self.history_evicted_before;
+            self.history_gc_active_cutoff = None;
+            self.history_gc_cursor = 0;
+            self.history_gc_sweep_end = 0;
+        } else if self.history_gc_active_cutoff.is_none()
+            && cutoff_is_newer(
+                self.history_evicted_before,
+                self.history_gc_completed_cutoff,
+            )
+        {
+            self.history_gc_active_cutoff = self.history_evicted_before;
+            self.history_gc_cursor = 0;
+            self.history_gc_sweep_end = self.history_key_roster.len();
+        }
+    }
+
+    pub(crate) fn has_history_gc_work(&self) -> bool {
+        self.history_gc_active_cutoff.is_some()
+            || cutoff_is_newer(
+                self.history_evicted_before,
+                self.history_gc_completed_cutoff,
+            )
+    }
+
+    pub(crate) fn drain_history_gc(
+        &mut self,
+        max_steps: NonZeroUsize,
+    ) -> Result<TemporalHistoryGcDrain, DbError> {
+        if !self.has_history_gc_work() {
+            return Ok(TemporalHistoryGcDrain {
+                steps: 0,
+                removed_versions: 0,
+                has_more: false,
+            });
+        }
+        if self.history_key_roster.is_empty() {
+            self.history_gc_completed_cutoff = self.history_evicted_before;
+            self.history_gc_active_cutoff = None;
+            self.history_gc_cursor = 0;
+            self.history_gc_sweep_end = 0;
+            return Ok(TemporalHistoryGcDrain {
+                steps: 0,
+                removed_versions: 0,
+                has_more: false,
+            });
+        }
+
+        let active_cutoff = self
+            .history_gc_active_cutoff
+            .or(self.history_evicted_before)
+            .ok_or_else(|| self.pipeline_error("history GC work has no requested cutoff"))?;
+        let mut cursor = if self.history_gc_active_cutoff.is_some() {
+            self.history_gc_cursor
+        } else {
+            0
         };
-        let boundary = (cutoff, minimum_position);
-        let mut removed = Vec::new();
-        for versions in self.history.values_mut() {
-            let mut recent = versions.split_off(&boundary);
-            let anchor = versions.pop_last();
-            removed.extend(std::mem::take(versions));
-            if let Some((order, version)) = anchor {
-                versions.insert(order, version);
-            }
-            versions.append(&mut recent);
+        let sweep_end = if self.history_gc_active_cutoff.is_some() {
+            self.history_gc_sweep_end
+        } else {
+            self.history_key_roster.len()
+        };
+        if sweep_end == 0 || sweep_end > self.history_key_roster.len() || cursor >= sweep_end {
+            return Err(self.pipeline_error("history GC cursor is outside its active key roster"));
         }
-        let removed_any = !removed.is_empty();
-        for ((_, _source), version) in removed {
-            if let Some((batch, _)) = version.row {
-                self.release_right_batch(batch)?;
+
+        let mut steps = 0usize;
+        let mut removals = Vec::new();
+        let mut last_planned_order: Option<(i64, TemporalSourcePosition)> = None;
+        while steps < max_steps.get() && cursor < sweep_end {
+            let key = self.history_key_roster[cursor].as_ref();
+            let versions = self
+                .history
+                .get(key)
+                .ok_or_else(|| self.pipeline_error("history GC roster referenced a missing key"))?;
+            let mut entries = if let Some(order) = last_planned_order.as_ref() {
+                versions.range((
+                    std::ops::Bound::Excluded(order.clone()),
+                    std::ops::Bound::Unbounded,
+                ))
+            } else {
+                versions.range(..)
+            };
+            let (oldest_order, oldest_version) = entries.next().ok_or_else(|| {
+                self.pipeline_error("history GC encountered an empty version chain")
+            })?;
+            let successor_is_below_cutoff = entries
+                .next()
+                .is_some_and(|((event_time, _), _)| *event_time < active_cutoff);
+            if successor_is_below_cutoff {
+                let order = oldest_order.clone();
+                removals.push(HistoryGcRemoval {
+                    roster_index: cursor,
+                    order: order.clone(),
+                    batch_id: oldest_version.row.map(|(batch_id, _)| batch_id),
+                });
+                last_planned_order = Some(order);
+            } else {
+                cursor += 1;
+                last_planned_order = None;
+            }
+            steps += 1;
+        }
+
+        let mut batch_releases: FxHashMap<u64, usize> = FxHashMap::default();
+        let mut removed_charge = 0usize;
+        for removal in &removals {
+            removed_charge = removed_charge
+                .checked_add(
+                    VERSION_ENTRY_CHARGE
+                        .checked_add(removal.order.1.heap_bytes())
+                        .ok_or_else(|| self.pipeline_error("history GC accounting overflow"))?,
+                )
+                .ok_or_else(|| self.pipeline_error("history GC accounting overflow"))?;
+            if let Some(batch_id) = removal.batch_id {
+                let releases = batch_releases.entry(batch_id).or_default();
+                *releases = releases
+                    .checked_add(1)
+                    .ok_or_else(|| self.pipeline_error("history GC reference overflow"))?;
             }
         }
-        self.history.retain(|_, versions| !versions.is_empty());
-        if removed_any {
-            self.history_evicted_before = Some(
-                self.history_evicted_before
-                    .map_or(cutoff, |previous| previous.max(cutoff)),
+        for (&batch_id, &release_count) in &batch_releases {
+            let retained = self.right_batches.get(&batch_id).ok_or_else(|| {
+                self.pipeline_error("temporal version referenced a missing right batch")
+            })?;
+            if release_count > retained.references {
+                return Err(
+                    self.pipeline_error("temporal right batch reference count would underflow")
+                );
+            }
+            if release_count == retained.references {
+                removed_charge = removed_charge
+                    .checked_add(batch_charge(&retained.batch).ok_or_else(|| {
+                        self.pipeline_error("right retained-batch accounting overflow")
+                    })?)
+                    .ok_or_else(|| self.pipeline_error("history GC accounting overflow"))?;
+            }
+        }
+        let next_charge = self
+            .charged_bytes
+            .checked_sub(removed_charge)
+            .ok_or_else(|| self.pipeline_error("history GC accounting underflowed"))?;
+
+        for removal in &removals {
+            let key = self.history_key_roster[removal.roster_index].as_ref();
+            let removed = self
+                .history
+                .get_mut(key)
+                .expect("validated history GC key exists")
+                .remove(&removal.order);
+            assert!(removed.is_some(), "validated history GC version exists");
+        }
+        for (batch_id, release_count) in batch_releases {
+            let remove_batch = {
+                let retained = self
+                    .right_batches
+                    .get_mut(&batch_id)
+                    .expect("validated history GC batch exists");
+                retained.references -= release_count;
+                retained.references == 0
+            };
+            if remove_batch {
+                self.right_batches.remove(&batch_id);
+            }
+        }
+        self.charged_bytes = next_charge;
+        if cursor == sweep_end {
+            self.history_gc_completed_cutoff = Some(
+                self.history_gc_completed_cutoff
+                    .map_or(active_cutoff, |completed| completed.max(active_cutoff)),
             );
+            self.history_gc_active_cutoff = None;
+            self.history_gc_cursor = 0;
+            self.history_gc_sweep_end = 0;
+        } else {
+            self.history_gc_active_cutoff = Some(active_cutoff);
+            self.history_gc_cursor = cursor;
+            self.history_gc_sweep_end = sweep_end;
         }
-        Ok(())
-    }
-
-    fn release_right_batch(&mut self, batch_id: u64) -> Result<(), DbError> {
-        release_batch(&mut self.right_batches, batch_id, "right")
-    }
-
-    fn release_left_batch(&mut self, batch_id: u64) -> Result<(), DbError> {
-        release_batch(&mut self.left_batches, batch_id, "left")
+        Ok(TemporalHistoryGcDrain {
+            steps,
+            removed_versions: removals.len(),
+            has_more: self.has_history_gc_work(),
+        })
     }
 
     fn allocate_batch_id(&mut self) -> Result<u64, DbError> {
@@ -1129,7 +1435,7 @@ impl TemporalJoinVnodeState {
         Ok(id)
     }
 
-    fn ensure_state_growth(&self, growth: usize, context: &str) -> Result<(), DbError> {
+    fn admitted_charge(&self, growth: usize, context: &str) -> Result<usize, DbError> {
         let accounted = self
             .charged_bytes
             .checked_add(growth)
@@ -1141,10 +1447,10 @@ impl TemporalJoinVnodeState {
                 limit_bytes: self.config.limits.max_retained_bytes,
             });
         }
-        Ok(())
+        Ok(accounted)
     }
 
-    fn refresh_charge(&mut self) -> Result<(), DbError> {
+    fn restore_charge(&mut self) -> Result<(), DbError> {
         self.charged_bytes = calculate_charge(self)?;
         if self.charged_bytes > self.config.limits.max_retained_bytes {
             return Err(DbError::ManagedStateBudgetExceeded {
@@ -1154,6 +1460,30 @@ impl TemporalJoinVnodeState {
             });
         }
         Ok(())
+    }
+
+    fn pending_probe_charge(
+        &self,
+        identity: &ProbeIdentity,
+        probe: &PendingProbe,
+    ) -> Result<usize, DbError> {
+        VERSION_ENTRY_CHARGE
+            .checked_add(TIMER_ENTRY_CHARGE)
+            .and_then(|value| value.checked_add(probe.key.len()))
+            .and_then(|value| value.checked_add(identity.source.heap_bytes()))
+            .and_then(|value| value.checked_add(identity.source.heap_bytes()))
+            .ok_or_else(|| self.pipeline_error("pending-probe accounting overflow"))
+    }
+
+    fn finalized_probe_charge(
+        &self,
+        identity: &ProbeIdentity,
+        probe: &FinalizedProbe,
+    ) -> Result<usize, DbError> {
+        MAP_ENTRY_CHARGE
+            .checked_add(probe.key.as_deref().map_or(0, <[u8]>::len))
+            .and_then(|value| value.checked_add(identity.source.heap_bytes()))
+            .ok_or_else(|| self.pipeline_error("probe dedup accounting overflow"))
     }
 
     fn pipeline_error(&self, message: &str) -> DbError {
@@ -1240,6 +1570,7 @@ impl TemporalJoinVnodeState {
             || checkpoint.versions.len() > entry_limit
             || checkpoint.applied_right.len() > entry_limit
             || checkpoint.finalized.len() > entry_limit
+            || checkpoint.history_key_roster.len() > entry_limit
         {
             return Err(DbError::Checkpoint(
                 "temporal checkpoint exceeds configured state limits".into(),
@@ -1258,6 +1589,45 @@ impl TemporalJoinVnodeState {
             return Err(DbError::Checkpoint(
                 "temporal checkpoint history floor is ahead of its right frontier".into(),
             ));
+        }
+        let roster_len = u64::try_from(checkpoint.history_key_roster.len())
+            .map_err(|_| DbError::Checkpoint("temporal history GC roster exceeds u64".into()))?;
+        if checkpoint
+            .history_gc_completed_cutoff
+            .is_some_and(|completed| {
+                checkpoint
+                    .history_evicted_before
+                    .is_none_or(|requested| completed > requested)
+            })
+        {
+            return Err(DbError::Checkpoint(
+                "temporal completed history GC cutoff is ahead of its request".into(),
+            ));
+        }
+        match checkpoint.history_gc_active_cutoff {
+            Some(active) => {
+                if checkpoint.history_gc_sweep_end == 0
+                    || checkpoint.history_gc_sweep_end > roster_len
+                    || checkpoint.history_gc_cursor >= checkpoint.history_gc_sweep_end
+                    || checkpoint
+                        .history_evicted_before
+                        .is_none_or(|requested| active > requested)
+                    || checkpoint
+                        .history_gc_completed_cutoff
+                        .is_some_and(|completed| active <= completed)
+                {
+                    return Err(DbError::Checkpoint(
+                        "temporal active history GC cursor or cutoff is invalid".into(),
+                    ));
+                }
+            }
+            None => {
+                if checkpoint.history_gc_cursor != 0 || checkpoint.history_gc_sweep_end != 0 {
+                    return Err(DbError::Checkpoint(
+                        "temporal inactive history GC retains a cursor".into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -1479,16 +1849,70 @@ impl TemporalJoinVnodeState {
                 }
             }
         }
-        if let Some(floor) = self.history_evicted_before {
+        Ok(())
+    }
+
+    fn restore_history_gc_roster(&mut self, roster: Vec<Vec<u8>>) -> Result<(), DbError> {
+        if roster.len() != self.history.len() {
+            return Err(DbError::Checkpoint(
+                "temporal history GC roster does not cover every history key".into(),
+            ));
+        }
+        let mut seen = FxHashSet::default();
+        self.history_key_roster
+            .try_reserve(roster.len())
+            .map_err(|_| DbError::Checkpoint("temporal history GC roster is too large".into()))?;
+        for key in roster {
+            if !seen.insert(key.clone()) || !self.history.contains_key(key.as_slice()) {
+                return Err(DbError::Checkpoint(
+                    "temporal history GC roster contains a duplicate or unknown key".into(),
+                ));
+            }
+            self.history_key_roster.push(key.into_boxed_slice());
+        }
+        self.validate_restored_history_gc_progress()
+    }
+
+    fn validate_restored_history_gc_progress(&self) -> Result<(), DbError> {
+        if let Some(completed) = self.history_gc_completed_cutoff {
             for versions in self.history.values() {
                 if versions
                     .keys()
-                    .filter(|(event_time, _)| *event_time < floor)
+                    .filter(|(event_time, _)| *event_time < completed)
                     .count()
                     > 1
                 {
                     return Err(DbError::Checkpoint(
-                        "temporal checkpoint retained multiple versions below its history floor"
+                        "temporal history retains unswept versions below its completed GC cutoff"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        if let Some(active) = self.history_gc_active_cutoff {
+            for key in &self.history_key_roster[..self.history_gc_cursor] {
+                let versions = &self.history[key.as_ref()];
+                if versions
+                    .keys()
+                    .filter(|(event_time, _)| *event_time < active)
+                    .count()
+                    > 1
+                {
+                    return Err(DbError::Checkpoint(
+                        "temporal history GC cursor skips an unswept key".into(),
+                    ));
+                }
+            }
+            for key in &self.history_key_roster[self.history_gc_sweep_end..] {
+                let versions = &self.history[key.as_ref()];
+                if versions
+                    .keys()
+                    .filter(|(event_time, _)| *event_time < active)
+                    .count()
+                    > 1
+                {
+                    return Err(DbError::Checkpoint(
+                        "temporal history appended after the active GC snapshot retains multiple pre-cutoff versions"
                             .into(),
                     ));
                 }
@@ -1557,14 +1981,6 @@ impl TemporalJoinVnodeState {
                     "temporal pending checkpoint row is out of bounds".into(),
                 ));
             }
-            if self
-                .right_frontier
-                .is_some_and(|frontier| probe.deadline < frontier)
-            {
-                return Err(DbError::Checkpoint(
-                    "temporal checkpoint contains an already-final probe".into(),
-                ));
-            }
             self.reject_evicted_probe(probe.probe_time)
                 .map_err(|error| DbError::Checkpoint(error.to_string()))?;
             if !used_rows.insert(probe.left_row) {
@@ -1588,10 +2004,16 @@ impl TemporalJoinVnodeState {
                 source: probe.source,
                 offset_ms: probe.offset_ms,
             };
-            self.timers
+            let inserted_timer = self
+                .timers
                 .entry(probe.deadline)
                 .or_default()
-                .push(identity.clone());
+                .insert(identity.clone());
+            if !inserted_timer {
+                return Err(DbError::Checkpoint(
+                    "duplicate temporal timer in checkpoint".into(),
+                ));
+            }
             if self
                 .pending
                 .insert(
@@ -1869,6 +2291,53 @@ fn validate_position_schema(schema: &Schema, side: &str) -> Result<(), DbError> 
     Ok(())
 }
 
+fn validate_output_names(
+    left: &Schema,
+    right: &Schema,
+    config: &TemporalJoinStateConfig,
+) -> Result<(), DbError> {
+    let left_visible = left.fields().len() - POSITION_COLUMN_COUNT;
+    let right_visible = right.fields().len() - POSITION_COLUMN_COUNT;
+    let mut names = FxHashSet::default();
+    for field in &left.fields()[..left_visible] {
+        if !names.insert(field.name().to_ascii_lowercase()) {
+            return Err(DbError::Config(format!(
+                "temporal output column name collision: {}",
+                field.name()
+            )));
+        }
+    }
+    for field in &right.fields()[..right_visible] {
+        let name = format!("{}_{}", field.name(), config.right_name);
+        if !names.insert(name.to_ascii_lowercase()) {
+            return Err(DbError::Config(format!(
+                "temporal output column name collision: {name}"
+            )));
+        }
+    }
+    if config.emit_probe_metadata {
+        for name in ["offset_ms", "probe_time"] {
+            if !names.insert(name.to_owned()) {
+                return Err(DbError::Config(format!(
+                    "temporal output column name collision: {name}"
+                )));
+            }
+        }
+    }
+    for name in [
+        SOURCE_PARTITION_COLUMN,
+        SOURCE_ORDER_COLUMN,
+        SOURCE_SUB_OFFSET_COLUMN,
+    ] {
+        if !names.insert(name.to_ascii_lowercase()) {
+            return Err(DbError::Config(format!(
+                "temporal output column name collision: {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn expand_offsets(
     schedule: &TemporalProbeSchedule,
     limits: TemporalStateLimits,
@@ -2121,46 +2590,52 @@ fn compact_rows(schema: &Schema, rows: &[RowRef], side: &str) -> Result<RecordBa
         .map_err(|error| DbError::Checkpoint(format!("temporal {side} compaction: {error}")))
 }
 
-fn release_batch(
-    batches: &mut FxHashMap<u64, RetainedBatch>,
-    batch_id: u64,
-    side: &str,
-) -> Result<(), DbError> {
-    let retained = batches.get_mut(&batch_id).ok_or_else(|| {
-        DbError::Pipeline(format!("temporal {side} row referenced a missing batch"))
-    })?;
-    retained.references = retained.references.checked_sub(1).ok_or_else(|| {
-        DbError::Pipeline(format!("temporal {side} batch reference count underflowed"))
-    })?;
-    if retained.references == 0 {
-        batches.remove(&batch_id);
-    }
-    Ok(())
+fn batch_charge(batch: &RecordBatch) -> Option<usize> {
+    batch.get_array_memory_size().checked_add(BATCH_CHARGE)
+}
+
+fn cutoff_is_newer(candidate: Option<i64>, completed: Option<i64>) -> bool {
+    candidate.is_some_and(|candidate| completed.is_none_or(|completed| candidate > completed))
 }
 
 fn calculate_charge(state: &TemporalJoinVnodeState) -> Result<usize, DbError> {
-    let mut bytes = 512usize;
+    let mut bytes = BASE_STATE_CHARGE;
     for (key, versions) in &state.history {
         bytes = bytes
-            .checked_add(MAP_ENTRY_CHARGE + key.len())
-            .and_then(|value| {
-                value.checked_add(versions.len().saturating_mul(VERSION_ENTRY_CHARGE))
-            })
-            .and_then(|value| {
-                versions.keys().try_fold(value, |total, (_, source)| {
-                    total.checked_add(source.heap_bytes())
-                })
-            })
+            .checked_add(
+                MAP_ENTRY_CHARGE
+                    .checked_add(key.len())
+                    .ok_or_else(|| state.pipeline_error("history accounting overflow"))?,
+            )
             .ok_or_else(|| state.pipeline_error("history accounting overflow"))?;
+        for (_, source) in versions.keys() {
+            bytes = bytes
+                .checked_add(
+                    VERSION_ENTRY_CHARGE
+                        .checked_add(source.heap_bytes())
+                        .ok_or_else(|| state.pipeline_error("history accounting overflow"))?,
+                )
+                .ok_or_else(|| state.pipeline_error("history accounting overflow"))?;
+        }
     }
     for (source, identity) in &state.applied_right {
         bytes = bytes
             .checked_add(
                 MAP_ENTRY_CHARGE
-                    + identity.key.as_deref().map_or(0, <[u8]>::len)
-                    + source.heap_bytes(),
+                    .checked_add(identity.key.as_deref().map_or(0, <[u8]>::len))
+                    .and_then(|value| value.checked_add(source.heap_bytes()))
+                    .ok_or_else(|| state.pipeline_error("right dedup accounting overflow"))?,
             )
             .ok_or_else(|| state.pipeline_error("right dedup accounting overflow"))?;
+    }
+    for key in &state.history_key_roster {
+        bytes = bytes
+            .checked_add(
+                HISTORY_KEY_ROSTER_CHARGE
+                    .checked_add(key.len())
+                    .ok_or_else(|| state.pipeline_error("history roster accounting overflow"))?,
+            )
+            .ok_or_else(|| state.pipeline_error("history roster accounting overflow"))?;
     }
     for retained in state
         .right_batches
@@ -2169,30 +2644,19 @@ fn calculate_charge(state: &TemporalJoinVnodeState) -> Result<usize, DbError> {
     {
         bytes = bytes
             .checked_add(
-                retained
-                    .batch
-                    .get_array_memory_size()
-                    .saturating_add(BATCH_CHARGE),
+                batch_charge(&retained.batch)
+                    .ok_or_else(|| state.pipeline_error("batch accounting overflow"))?,
             )
             .ok_or_else(|| state.pipeline_error("batch accounting overflow"))?;
     }
     for (identity, probe) in &state.pending {
         bytes = bytes
-            .checked_add(
-                VERSION_ENTRY_CHARGE
-                    + TIMER_ENTRY_CHARGE
-                    + probe.key.len()
-                    + identity.source.heap_bytes().saturating_mul(2),
-            )
+            .checked_add(state.pending_probe_charge(identity, probe)?)
             .ok_or_else(|| state.pipeline_error("pending-probe accounting overflow"))?;
     }
     for (identity, probe) in &state.finalized {
         bytes = bytes
-            .checked_add(
-                MAP_ENTRY_CHARGE
-                    + probe.key.as_deref().map_or(0, <[u8]>::len)
-                    + identity.source.heap_bytes(),
-            )
+            .checked_add(state.finalized_probe_charge(identity, probe)?)
             .ok_or_else(|| state.pipeline_error("probe dedup accounting overflow"))?;
     }
     Ok(bytes)
@@ -2475,6 +2939,26 @@ mod tests {
                 .to_string()
                 .contains("retention must cover")
         );
+
+        let schedule = TemporalProbeSchedule::list(vec![0, 1]).unwrap();
+        let mut fields = schema("left").fields().to_vec();
+        fields[0] = Arc::new(Field::new("OFFSET_MS", DataType::Utf8, true));
+        assert!(TemporalJoinVnodeState::try_new(
+            Arc::new(Schema::new(fields)),
+            schema("right"),
+            config(TemporalJoinKind::Left, schedule),
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("output column name collision"));
+
+        let mut below_base = config(TemporalJoinKind::Left, TemporalProbeSchedule::as_of());
+        below_base.limits.max_retained_bytes = BASE_STATE_CHARGE - 1;
+        assert!(matches!(
+            TemporalJoinVnodeState::try_new(schema("left"), schema("right"), below_base),
+            Err(DbError::ManagedStateBudgetExceeded { .. })
+        ));
     }
 
     #[test]
@@ -2493,30 +2977,40 @@ mod tests {
         state.apply_right_batch(&right, None).unwrap();
         let left = batch(
             schema("left"),
-            vec![Some("A")],
-            vec![Some(1)],
-            vec![Some(100)],
-            vec![2],
+            vec![Some("A"), Some("A")],
+            vec![Some(1), Some(2)],
+            vec![Some(100), Some(100)],
+            vec![2, 3],
         );
         assert_eq!(state.probe_left_batch(&left).unwrap().num_rows(), 0);
-        assert_eq!(state.pending_probes(), 1);
+        assert_eq!(state.pending_probes(), 2);
+        state.advance_right_frontier(Some(149), false).unwrap();
+        assert!(!state.has_ready_probes());
+        state.advance_right_frontier(Some(150), false).unwrap();
+        assert!(!state.has_ready_probes());
+        state.advance_right_frontier(Some(151), false).unwrap();
+        assert!(state.has_ready_probes());
+        let drained = state
+            .drain_ready_probes(NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert_eq!(prices(&drained.output), vec![Some(7)]);
+        assert_eq!(drained.drained_probes, 1);
+        assert!(drained.has_more);
         assert_eq!(
-            state
-                .advance_right_frontier(Some(149), false)
-                .unwrap()
-                .num_rows(),
-            0
+            state.accounted_state_bytes(),
+            calculate_charge(&state).unwrap()
         );
-        assert_eq!(
-            state
-                .advance_right_frontier(Some(150), false)
-                .unwrap()
-                .num_rows(),
-            0
-        );
-        let output = state.advance_right_frontier(Some(151), false).unwrap();
-        assert_eq!(prices(&output), vec![Some(7)]);
+        let drained = state
+            .drain_ready_probes(NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert_eq!(prices(&drained.output), vec![Some(7)]);
+        assert_eq!(drained.drained_probes, 1);
+        assert!(!drained.has_more);
         assert_eq!(state.pending_probes(), 0);
+        assert_eq!(
+            state.accounted_state_bytes(),
+            calculate_charge(&state).unwrap()
+        );
     }
 
     #[test]
@@ -2524,19 +3018,75 @@ mod tests {
         let mut cfg = config(TemporalJoinKind::Left, TemporalProbeSchedule::as_of());
         cfg.history_retention_ms = 50;
         let mut state =
-            TemporalJoinVnodeState::try_new(schema("left"), schema("right"), cfg).unwrap();
+            TemporalJoinVnodeState::try_new(schema("left"), schema("right"), cfg.clone()).unwrap();
         let right = batch(
             schema("right"),
-            vec![Some("A"), Some("A"), Some("A")],
-            vec![Some(1), Some(2), Some(3)],
-            vec![Some(10), Some(20), Some(100)],
-            vec![1, 2, 3],
+            vec![Some("A"), Some("A"), Some("A"), Some("B"), Some("B")],
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
+            vec![Some(10), Some(20), Some(100), Some(10), Some(20)],
+            vec![1, 2, 3, 4, 5],
         );
         state.apply_right_batch(&right, None).unwrap();
         state.advance_right_frontier(Some(120), false).unwrap();
-        assert_eq!(state.retained_versions(), 3);
+        assert_eq!(state.retained_versions(), 5);
         state.advance_left_frontier(Some(120), false).unwrap();
-        assert_eq!(state.retained_versions(), 2);
+        assert_eq!(state.retained_versions(), 5);
+        assert!(state.has_history_gc_work());
+        let drained = state
+            .drain_history_gc(NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert_eq!(drained.steps, 1);
+        assert_eq!(drained.removed_versions, 1);
+        assert!(drained.has_more);
+        assert_eq!(state.retained_versions(), 4);
+        assert_eq!(
+            state.accounted_state_bytes(),
+            calculate_charge(&state).unwrap()
+        );
+
+        let checkpoint = state.checkpoint(4 * 1024 * 1024).unwrap();
+        let mut corrupted =
+            rkyv::from_bytes::<TemporalJoinCheckpoint, rkyv::rancor::Error>(&checkpoint).unwrap();
+        corrupted.history_gc_sweep_end = 1;
+        let writer = rkyv::ser::writer::IoWriter::new(
+            laminar_core::serialization::BoundedBytesWriter::new(4 * 1024 * 1024),
+        );
+        let corrupted = rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(&corrupted, writer)
+            .unwrap()
+            .into_inner()
+            .into_vec();
+        assert!(TemporalJoinVnodeState::restore(
+            schema("left"),
+            schema("right"),
+            cfg.clone(),
+            &corrupted,
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("appended after the active GC snapshot"));
+
+        let mut restored =
+            TemporalJoinVnodeState::restore(schema("left"), schema("right"), cfg, &checkpoint)
+                .unwrap();
+        assert!(restored.has_history_gc_work());
+        let drained = restored
+            .drain_history_gc(NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert_eq!(drained.steps, 1);
+        assert_eq!(drained.removed_versions, 0);
+        assert!(drained.has_more);
+        let drained = restored
+            .drain_history_gc(NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert_eq!(drained.removed_versions, 1);
+        assert!(drained.has_more);
+        let drained = restored
+            .drain_history_gc(NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert_eq!(drained.removed_versions, 0);
+        assert!(!drained.has_more);
+        assert_eq!(restored.retained_versions(), 3);
     }
 
     #[test]
@@ -2563,11 +3113,25 @@ mod tests {
         );
         assert_eq!(state.probe_left_batch(&left).unwrap().num_rows(), 1);
         state.advance_left_frontier(Some(200), false).unwrap();
+        assert_eq!(state.retained_versions(), 2);
+        assert!(state.has_history_gc_work());
 
         let checkpoint = state.checkpoint(4 * 1024 * 1024).unwrap();
-        let restored =
+        let mut restored =
             TemporalJoinVnodeState::restore(schema("left"), schema("right"), cfg, &checkpoint)
                 .unwrap();
+        assert_eq!(restored.retained_versions(), 2);
+        assert!(restored.has_history_gc_work());
+        let first = restored
+            .drain_history_gc(NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert_eq!(first.removed_versions, 1);
+        assert!(first.has_more);
+        let second = restored
+            .drain_history_gc(NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert_eq!(second.removed_versions, 0);
+        assert!(!second.has_more);
         assert_eq!(restored.retained_versions(), 1);
     }
 
@@ -2663,20 +3227,18 @@ mod tests {
         );
         state.probe_left_batch(&left).unwrap();
         state.advance_left_frontier(Some(90), true).unwrap();
+        state.advance_right_frontier(Some(151), false).unwrap();
+        assert!(state.has_ready_probes());
         let checkpoint = state.checkpoint(4 * 1024 * 1024).unwrap();
         let mut restored =
             TemporalJoinVnodeState::restore(schema("left"), schema("right"), cfg, &checkpoint)
                 .unwrap();
         assert_eq!(restored.retained_versions(), 1);
         assert_eq!(restored.pending_probes(), 1);
-        assert_eq!(
-            restored
-                .advance_right_frontier(Some(150), false)
-                .unwrap()
-                .num_rows(),
-            0
-        );
-        let output = restored.advance_right_frontier(Some(151), false).unwrap();
-        assert_eq!(prices(&output), vec![Some(9)]);
+        assert!(restored.has_ready_probes());
+        let drained = restored
+            .drain_ready_probes(NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert_eq!(prices(&drained.output), vec![Some(9)]);
     }
 }
