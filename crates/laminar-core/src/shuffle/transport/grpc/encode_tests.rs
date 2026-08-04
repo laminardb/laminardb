@@ -38,6 +38,55 @@ fn payload(encoded: Encoded) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn frontier_encoding_preserves_initialized_and_idle_state() {
+    for (watermark, idle) in [
+        (Some(-7), false),
+        (Some(42), true),
+        (None, false),
+        (None, true),
+    ] {
+        let encoded = frame(ShuffleMessage::Frontier {
+            stage: "right-input".into(),
+            watermark,
+            idle,
+        })
+        .await;
+        assert_eq!(encoded.frames.len(), 1);
+        let shuffle_frame::Kind::Frontier(frontier) =
+            encoded.frames.into_iter().next().unwrap().kind.unwrap()
+        else {
+            panic!("expected frontier frame");
+        };
+        assert_eq!(frontier.stage, "right-input");
+        assert_eq!(frontier.watermark, watermark);
+        assert_eq!(frontier.idle, idle);
+        assert_eq!(frontier.recovery_gen, 0);
+        assert_eq!(frontier.seq, 0);
+    }
+}
+
+#[test]
+fn frontier_rejects_noncanonical_progress() {
+    for message in [
+        ShuffleMessage::Frontier {
+            stage: String::new(),
+            watermark: None,
+            idle: false,
+        },
+        ShuffleMessage::Frontier {
+            stage: "stage".into(),
+            watermark: Some(i64::MIN),
+            idle: true,
+        },
+    ] {
+        assert_eq!(
+            outbound_workspace_bytes(&message).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+}
+
+#[tokio::test]
 async fn each_logical_batch_is_self_contained_without_stage_codec_state() {
     let batch = |name: &str| {
         let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]));

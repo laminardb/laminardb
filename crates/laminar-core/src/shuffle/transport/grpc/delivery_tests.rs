@@ -42,6 +42,18 @@ fn deliver(
     Ok(true)
 }
 
+#[test]
+fn ordered_delivery_suppresses_duplicates_and_reports_gaps() {
+    let tracker = DeliveryTracker::default();
+    let stream = fence(1, 10, 100, 1);
+    tracker.observe_hello(stream).unwrap();
+
+    assert!(deliver(&tracker, &stream, 0).unwrap());
+    assert!(!deliver(&tracker, &stream, 0).unwrap());
+    assert!(deliver(&tracker, &stream, 2).unwrap());
+    assert_eq!(tracker.delivery_loss_incidents.load(ACQUIRE), 1);
+}
+
 fn admitted_test_budget() -> InboundReservation {
     let bytes = crate::shuffle::message::MAX_PAYLOAD_BYTES;
     let permits = u32::try_from(bytes).unwrap();

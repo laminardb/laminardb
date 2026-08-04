@@ -15,6 +15,7 @@ message ShuffleFrame {
     Hello hello = 1;
     RoutedData data = 2;
     Barrier barrier = 3;
+    Frontier frontier = 4;
   }
 }
 
@@ -74,12 +75,24 @@ message RoutedData {
   uint32 total_payload_bytes = 8;
 }
 
-// Ordered after the sender's preceding checkpointed data.
+// Per-stage event-time progress ordered with routed data.
+message Frontier {
+  string stage = 1;
+  // Absent means the channel has not established an event-time watermark.
+  optional int64 watermark = 2;
+  bool idle = 3;
+  // Must match the stream recovery scope.
+  uint64 recovery_gen = 4;
+  // Shares RoutedData's monotonic sequence domain.
+  uint64 seq = 5;
+}
+
+// Ordered after the sender's preceding checkpointed data and frontiers.
 message Barrier {
   uint64 checkpoint_id = 1;
   uint64 epoch = 2;
   uint64 flags = 3;
-  // Exclusive data high-water for this ordered stream.
+  // Exclusive data/frontier high-water for this ordered stream.
   uint64 last_seq = 4;
   // Must equal the stream and checkpoint assignment certificate.
   uint64 assignment_version = 5;

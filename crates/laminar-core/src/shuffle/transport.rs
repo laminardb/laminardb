@@ -11,6 +11,7 @@ use crate::checkpoint::CheckpointAttempt;
 /// Secondary queue and holdover item bound; byte semaphores are the primary
 /// admission control in cluster mode.
 const SHUFFLE_RECV_QUEUE: usize = 256;
+const MAX_STAGE_NAME_BYTES: usize = 4096;
 
 /// Peer identifier on the wire; matches `cluster::discovery::NodeId`'s inner type.
 pub type ShufflePeerId = u64;
@@ -30,6 +31,22 @@ fn validate_checkpoint_barrier(
             NONCANONICAL_BARRIER,
         ))
     }
+}
+
+fn validate_frontier(stage: &str, watermark: Option<i64>) -> std::io::Result<()> {
+    if stage.is_empty() || stage.len() > MAX_STAGE_NAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "shuffle stage scope is empty or too long",
+        ));
+    }
+    if watermark == Some(i64::MIN) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "shuffle frontier uses the reserved uninitialized watermark",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -76,13 +93,13 @@ pub(crate) mod shuffle_v1 {
     tonic::include_proto!("laminar.shuffle.v1");
 }
 
-/// Inbound staging shared by both builds: frames for another stage are bucketed
-/// for that stage's drainer, and mid-cycle barriers are stashed for the aligning
-/// checkpoint under the same item bound as the receive queue.
+/// Inbound staging shared by both builds. Ordered controls stop the data drainer
+/// and remain under the same item bound as the receive queue.
 struct Holdover {
     staged: parking_lot::Mutex<rustc_hash::FxHashMap<String, Vec<ReceivedBatch>>>,
+    frontiers: parking_lot::Mutex<Vec<ReceivedFrontierCut>>,
     barriers: parking_lot::Mutex<BarrierHoldover>,
-    /// Shared across data and barriers so repeatedly draining the bounded receive
+    /// Shared across data and controls so repeatedly draining the bounded receive
     /// queue cannot turn it into an unbounded secondary queue.
     items: std::sync::atomic::AtomicUsize,
     capacity: usize,
@@ -134,6 +151,7 @@ impl Holdover {
     fn new(capacity: usize) -> Self {
         Self {
             staged: parking_lot::Mutex::default(),
+            frontiers: parking_lot::Mutex::default(),
             barriers: parking_lot::Mutex::default(),
             items: std::sync::atomic::AtomicUsize::new(0),
             capacity,
@@ -229,6 +247,25 @@ impl Holdover {
 
     fn take_staged_barriers(&self) -> Vec<ReceivedShuffle> {
         std::mem::take(&mut self.barriers.lock().staged)
+    }
+
+    fn has_staged_frontiers(&self) -> bool {
+        !self.frontiers.lock().is_empty()
+    }
+
+    fn stage_frontier(&self, frontier: ReceivedFrontierCut) {
+        self.frontiers.lock().push(frontier);
+    }
+
+    fn take_staged_frontiers(&self) -> Vec<ReceivedFrontierCut> {
+        std::mem::take(&mut *self.frontiers.lock())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn clear_staged_frontiers(&self) {
+        let frontiers = self.take_staged_frontiers();
+        let item_count = frontiers.iter().map(ReceivedFrontierCut::item_count).sum();
+        self.release_items(item_count);
     }
 
     #[cfg(feature = "cluster")]
@@ -482,8 +519,8 @@ impl ReceivedShuffle {
         self.recovery_gen
     }
 
-    /// Data carries its logical-frame sequence. A barrier carries the exclusive data high-water
-    /// sequence it closes.
+    /// Data and frontiers carry their logical-frame sequence. A barrier carries the exclusive
+    /// high-water sequence it closes.
     #[must_use]
     pub const fn checkpoint_sequence(&self) -> u64 {
         self.checkpoint_sequence
@@ -508,6 +545,66 @@ impl std::fmt::Debug for ReceivedShuffle {
             .field("admitted", &self.reservation.is_some())
             .finish_non_exhaustive()
     }
+}
+
+/// A frontier and the same-stage batches from its ordered peer stream that precede it.
+#[derive(Debug)]
+pub struct ReceivedFrontierCut {
+    preceding: Vec<ReceivedBatch>,
+    frontier: ReceivedShuffle,
+}
+
+impl ReceivedFrontierCut {
+    /// Batches that must be applied before the frontier.
+    #[must_use]
+    pub fn preceding(&self) -> &[ReceivedBatch] {
+        &self.preceding
+    }
+
+    /// Frontier closing the returned batch prefix.
+    #[must_use]
+    pub const fn frontier(&self) -> &ReceivedShuffle {
+        &self.frontier
+    }
+
+    /// Consume the cut in application order: batches first, then frontier.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<ReceivedBatch>, ReceivedShuffle) {
+        (self.preceding, self.frontier)
+    }
+
+    fn item_count(&self) -> usize {
+        self.preceding.len() + 1
+    }
+
+    fn stage(&self) -> &str {
+        let ShuffleMessage::Frontier { stage, .. } = self.frontier.message() else {
+            unreachable!("frontier cut contains a frontier message");
+        };
+        stage
+    }
+}
+
+fn take_frontier_prefix(
+    staged: &mut rustc_hash::FxHashMap<String, Vec<ReceivedBatch>>,
+    stage: &str,
+    frontier: &ReceivedShuffle,
+) -> Vec<ReceivedBatch> {
+    let Some(batches) = staged.remove(stage) else {
+        return Vec::new();
+    };
+    let (preceding, remaining): (Vec<_>, Vec<_>) = batches.into_iter().partition(|batch| {
+        batch.peer == frontier.peer
+            && batch.sender_incarnation == frontier.sender_incarnation
+            && batch.receiver_incarnation == frontier.receiver_incarnation
+            && batch.assignment_version == frontier.assignment_version
+            && batch.recovery_gen == frontier.recovery_gen
+            && batch.checkpoint_sequence < frontier.checkpoint_sequence
+    });
+    if !remaining.is_empty() {
+        staged.insert(stage.to_owned(), remaining);
+    }
+    preceding
 }
 
 #[cfg(feature = "cluster")]
@@ -546,13 +643,14 @@ mod grpc {
     use super::shuffle_v1::shuffle_transport_client::ShuffleTransportClient;
     use super::shuffle_v1::shuffle_transport_server::{ShuffleTransport, ShuffleTransportServer};
     use super::shuffle_v1::{
-        Barrier, HandshakeRequest, HandshakeResponse, Hello, RoutedData, ShuffleFrame,
-        ShuffleSummary,
+        Barrier, Frontier as WireFrontier, HandshakeRequest, HandshakeResponse, Hello, RoutedData,
+        ShuffleFrame, ShuffleSummary,
     };
     use super::{
-        is_scope_cancelled, scope_cancelled_io, validate_checkpoint_barrier, CheckpointAttempt,
-        Holdover, InboundReservation, ReceivedBatch, ReceivedShuffle, ShuffleMessage,
-        ShufflePeerId, NONCANONICAL_BARRIER, SCOPE_CANCELLED, SHUFFLE_ADDR_KEY, SHUFFLE_RECV_QUEUE,
+        is_scope_cancelled, scope_cancelled_io, take_frontier_prefix, validate_checkpoint_barrier,
+        validate_frontier, CheckpointAttempt, Holdover, InboundReservation, ReceivedBatch,
+        ReceivedFrontierCut, ReceivedShuffle, ShuffleMessage, ShufflePeerId, MAX_STAGE_NAME_BYTES,
+        NONCANONICAL_BARRIER, SCOPE_CANCELLED, SHUFFLE_ADDR_KEY, SHUFFLE_RECV_QUEUE,
     };
     use crate::checkpoint::{CheckpointAssignmentFence, CheckpointBarrier};
     use crate::cluster::control::{ClusterKv, LeaseDeadline};
@@ -589,8 +687,8 @@ mod grpc {
     const _: () = assert!(MAX_SCHEMA_WIRE_BYTES + 8 <= MAX_WIRE_PAYLOAD_BYTES);
     const MAX_FRAGMENTS: usize =
         crate::shuffle::message::MAX_PAYLOAD_BYTES / MAX_WIRE_PAYLOAD_BYTES;
-    const MAX_STAGE_NAME_BYTES: usize = 4096;
     const BLOCKING_IPC_THRESHOLD_BYTES: usize = 512 * 1024;
+    const FRONTIER_WORKSPACE_BYTES: usize = 2 * MAX_STAGE_NAME_BYTES + 1024;
     /// One wire fragment plus protobuf metadata. Logical Arrow payloads are reassembled under a
     /// separate 16 MiB cap.
     const MAX_SHUFFLE_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -845,6 +943,11 @@ mod grpc {
     /// A message prepared before its sequence is fixed and inserted into the ordered queue.
     enum PreparedMessage {
         Barrier(CheckpointBarrier),
+        Frontier {
+            stage: String,
+            watermark: Option<i64>,
+            idle: bool,
+        },
         Data {
             stage: String,
             routed_vnodes: Vec<u32>,
@@ -855,7 +958,7 @@ mod grpc {
     struct Outbound {
         gen: u64,
         assignment_version: u64,
-        /// Data: this frame's sequence. `Barrier`: frames enqueued to this peer so far.
+        /// Data/frontier: this frame's sequence. `Barrier`: ordered frames enqueued so far.
         seq: u64,
         msg: PreparedMessage,
         /// Present only for checkpoint barriers admitted by `fan_out_barrier`.
@@ -1126,6 +1229,12 @@ mod grpc {
                 validate_checkpoint_barrier(*barrier)?;
                 Ok(1024)
             }
+            ShuffleMessage::Frontier {
+                stage, watermark, ..
+            } => {
+                validate_frontier(stage, *watermark)?;
+                Ok(FRONTIER_WORKSPACE_BYTES)
+            }
             ShuffleMessage::Data {
                 stage,
                 routed_vnodes,
@@ -1253,6 +1362,18 @@ mod grpc {
     {
         match msg {
             ShuffleMessage::Barrier(barrier) => Ok((PreparedMessage::Barrier(*barrier), budget)),
+            ShuffleMessage::Frontier {
+                stage,
+                watermark,
+                idle,
+            } => Ok((
+                PreparedMessage::Frontier {
+                    stage: stage.clone(),
+                    watermark: *watermark,
+                    idle: *idle,
+                },
+                budget,
+            )),
             ShuffleMessage::Data {
                 stage,
                 routed_vnodes,
@@ -1818,6 +1939,23 @@ mod grpc {
                 }
                 frames
             }
+            PreparedMessage::Frontier {
+                stage,
+                watermark,
+                idle,
+            } => {
+                validate_frontier(&stage, watermark)
+                    .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+                VecDeque::from([ShuffleFrame {
+                    kind: Some(shuffle_frame::Kind::Frontier(WireFrontier {
+                        stage,
+                        watermark,
+                        idle,
+                        recovery_gen: gen,
+                        seq,
+                    })),
+                }])
+            }
         };
         Ok(Encoded {
             frames,
@@ -1890,8 +2028,8 @@ mod grpc {
         assignment_suspended: AtomicBool,
         /// Stamped onto every outbound data message; bumped by a coordinated rewind.
         recovery_gen: Arc<AtomicU64>,
-        /// Data frames enqueued per peer. Lives here, not on `PeerConn`, so it survives the
-        /// reconnect that discards a queue — otherwise the loss would leave no trace.
+        /// Ordered data/frontier frames enqueued per peer. Lives here, not on `PeerConn`, so it
+        /// survives a reconnect that discards a queue and leaves a detectable gap.
         seqs: Mutex<FxHashMap<ShufflePeerId, u64>>,
         checkpointed_control_node_budget: Arc<Semaphore>,
         node_budget: Arc<Semaphore>,
@@ -2337,8 +2475,8 @@ mod grpc {
             };
             let (prepared, budget) = prepare_outbound_message(msg, budget).await?;
             self.validate_scope(&scope, expected_assignment_version)?;
-            // Stamp data before enqueue. A frame the transport later discards still leaves a hole
-            // the peer can see; a barrier carries the running count.
+            // Stamp ordered frames before enqueue. A frame the transport later discards leaves a
+            // hole the peer can see; a barrier carries the running count.
             let gen = scope.recovery_gen;
             let seq = {
                 // Parking-lot guards are deliberately scoped before the enqueue await. The
@@ -2356,7 +2494,7 @@ mod grpc {
                 }
                 let counter = seqs.entry(peer).or_insert(0);
                 match msg {
-                    ShuffleMessage::Data { .. } => {
+                    ShuffleMessage::Data { .. } | ShuffleMessage::Frontier { .. } => {
                         let seq = *counter;
                         *counter = counter.checked_add(1).ok_or_else(|| {
                             io::Error::other("shuffle delivery sequence exhausted")
@@ -3204,6 +3342,7 @@ mod grpc {
             rotate_scope_token(&self.scope_cancel, &self.process_lease, false);
             self.pending_handshakes.clear();
             self.delivery.reset_assignment();
+            self.holdover.clear_staged_frontiers();
             let version = next.fence.assignment_version;
             *assignment = Some(next);
             self.assignment_suspended.store(false, Ordering::Release);
@@ -3236,6 +3375,7 @@ mod grpc {
             self.assignment_version.store(0, Ordering::Release);
             self.pending_handshakes.clear();
             self.delivery.reset_assignment();
+            self.holdover.clear_staged_frontiers();
             self.assignment_resumed.notify_waiters();
         }
 
@@ -3268,6 +3408,7 @@ mod grpc {
             rotate_scope_token(&self.scope_cancel, &self.process_lease, false);
             self.pending_handshakes.clear();
             self.delivery.prepare_recovery(gen);
+            self.holdover.clear_staged_frontiers();
             self.recovery_gen.store(gen, Ordering::Release);
             rotate_scope_token(
                 &self.scope_cancel,
@@ -3562,6 +3703,26 @@ mod grpc {
             )
         }
 
+        fn stage_frontier_if_current(&self, cut: ReceivedFrontierCut) -> bool {
+            let frontier = cut.frontier();
+            let assignment = self.assignment.read();
+            let Some(assignment) = assignment.as_ref() else {
+                return false;
+            };
+            let current = self.retain_queued_scope_for_assignment(
+                assignment,
+                frontier.peer,
+                frontier.sender_incarnation,
+                frontier.receiver_incarnation,
+                frontier.assignment_version,
+                frontier.recovery_gen,
+            ) && self.process_lease.require_live_io().is_ok();
+            if current {
+                self.holdover.stage_frontier(cut);
+            }
+            current
+        }
+
         /// Await the next `(peer_id, msg)`; `None` once the server stops and the
         /// queue drains. Concurrent callers serialise via `rx_returned`;
         /// cancellation-safe.
@@ -3652,13 +3813,12 @@ mod grpc {
             out
         }
 
-        /// Drain the inbound queue into `staged`: bucket data by stage,
-        /// and stash the first `Barrier`. A staged barrier closes the normal drainer until
-        /// alignment takes it, preserving every following frame's position relative to that cut.
+        /// Drain the inbound queue into `staged`: bucket data by stage and stop at the first
+        /// ordered control. The control must be consumed before later data can pass it.
         /// Once the shared holdover is full, leave the bounded receive queue intact so transport
         /// admission backpressures peers.
         fn drain_inbound_into(&self, staged: &mut FxHashMap<String, Vec<ReceivedBatch>>) -> bool {
-            if self.holdover.has_staged_barriers() {
+            if self.holdover.has_staged_barriers() || self.holdover.has_staged_frontiers() {
                 return false;
             }
             let slot = self.rx.lock();
@@ -3711,6 +3871,38 @@ mod grpc {
                             checkpoint_sequence,
                         });
                     }
+                    ShuffleMessage::Frontier {
+                        stage,
+                        watermark,
+                        idle,
+                    } => {
+                        let frontier = ReceivedShuffle {
+                            peer,
+                            message: ShuffleMessage::Frontier {
+                                stage: stage.clone(),
+                                watermark,
+                                idle,
+                            },
+                            reservation,
+                            sender_incarnation,
+                            receiver_incarnation,
+                            stream_id,
+                            assignment_version,
+                            assignment_digest,
+                            recovery_gen,
+                            checkpoint_sequence,
+                        };
+                        let preceding = take_frontier_prefix(staged, &stage, &frontier);
+                        let cut = ReceivedFrontierCut {
+                            preceding,
+                            frontier,
+                        };
+                        let item_count = cut.item_count();
+                        if self.stage_frontier_if_current(cut) {
+                            return false;
+                        }
+                        self.holdover.release_items(item_count);
+                    }
                     ShuffleMessage::Barrier(b) => {
                         let barrier = ReceivedShuffle {
                             peer,
@@ -3758,6 +3950,16 @@ mod grpc {
             barriers
         }
 
+        /// Take the frontier that stopped the checkpointed data drainer.
+        #[must_use]
+        pub fn drain_staged_frontiers(&self) -> Vec<ReceivedFrontierCut> {
+            let mut frontiers = self.holdover.take_staged_frontiers();
+            let item_count = frontiers.iter().map(ReceivedFrontierCut::item_count).sum();
+            self.holdover.release_items(item_count);
+            frontiers.retain(|cut| self.retain_received(cut.frontier()));
+            frontiers
+        }
+
         /// Whether an in-band barrier currently blocks normal holdover draining.
         #[must_use]
         pub fn has_staged_checkpoint_barriers(&self) -> bool {
@@ -3770,6 +3972,9 @@ mod grpc {
         pub fn stage_checkpointed_inbound(&self) -> bool {
             if self.holdover.has_staged_barriers() {
                 return true;
+            }
+            if self.holdover.has_staged_frontiers() {
+                return false;
             }
             let arrived = self.barrier_arrivals.load(Ordering::Acquire);
             if arrived == self.barrier_reconciled.load(Ordering::Acquire) {
@@ -3834,10 +4039,9 @@ mod grpc {
         /// data/barrier order must remain visible to checkpoint alignment.
         ///
         /// # Errors
-        /// Returns a typed cancellation while assignment consumption is suspended, or a process
-        /// lease error after this receiver loses execution authority. An error observed before
-        /// extraction leaves the holdover untouched; the caller revalidates authority immediately
-        /// after a successful transfer.
+        /// Returns a typed cancellation while assignment consumption is suspended, a process
+        /// lease error after this receiver loses execution authority, or `WouldBlock` when an
+        /// ordered frontier cut must be consumed first. An error leaves the holdover untouched.
         pub fn drain_checkpointed_holdover(&self) -> io::Result<Vec<(String, ReceivedBatch)>> {
             let mut staged = self.holdover.staged.lock();
             self.process_lease.require_live_io()?;
@@ -3852,6 +4056,12 @@ mod grpc {
             if self.assignment_version.load(Ordering::Acquire) == 0 {
                 self.process_lease.require_live_io()?;
                 return Err(scope_cancelled_io());
+            }
+            if self.holdover.has_staged_frontiers() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "shuffle frontier cut must be consumed before checkpoint holdover transfer",
+                ));
             }
 
             let item_count = staged.values().map(Vec::len).sum();
@@ -3896,8 +4106,13 @@ mod grpc {
         #[must_use]
         pub fn drain_all_staged(&self) -> Vec<(String, ReceivedBatch)> {
             let mut staged = self.holdover.staged.lock();
-            let item_count = staged.values().map(Vec::len).sum();
-            let drained = staged
+            let frontiers = self.holdover.take_staged_frontiers();
+            let item_count = staged.values().map(Vec::len).sum::<usize>()
+                + frontiers
+                    .iter()
+                    .map(ReceivedFrontierCut::item_count)
+                    .sum::<usize>();
+            let mut drained: Vec<_> = staged
                 .drain()
                 .flat_map(|(stage, batches)| {
                     batches.into_iter().filter_map(move |batch| {
@@ -3905,6 +4120,15 @@ mod grpc {
                     })
                 })
                 .collect();
+            for cut in frontiers {
+                let stage = cut.stage().to_owned();
+                drained.extend(
+                    cut.preceding
+                        .into_iter()
+                        .filter(|batch| self.retain_batch(batch))
+                        .map(|batch| (stage.clone(), batch)),
+                );
+            }
             self.holdover.release_items(item_count);
             drained
         }
@@ -3949,8 +4173,8 @@ mod grpc {
         expected: u64,
     }
 
-    /// Resolves a prepared logical data frame exactly once. An unresolved admission is loss
-    /// unless its exact assignment/recovery lifetime was deliberately cancelled.
+    /// Resolves a prepared logical data or frontier frame exactly once. An unresolved admission
+    /// is loss unless its exact assignment/recovery lifetime was deliberately cancelled.
     struct DataAdmission<'a> {
         tracker: &'a DeliveryTracker,
         reservation: Option<DataReservation>,
@@ -4595,7 +4819,7 @@ mod grpc {
         delivery.reject_protocol(fence.sender_node_id, reason)
     }
 
-    /// Publish preceding-data completeness before making the barrier observable. A failed
+    /// Publish preceding ordered-frame completeness before making the barrier observable. A failed
     /// barrier enqueue cannot seal a checkpoint, while delaying this commit until after enqueue
     /// would let the consumer observe the barrier before its loss fence.
     async fn publish_barrier(
@@ -4800,6 +5024,79 @@ mod grpc {
                         break;
                     }
                 }
+                shuffle_frame::Kind::Frontier(v) => {
+                    frames_received += 1;
+                    if assembly.is_some() {
+                        return Err(reject_stream_protocol(
+                            delivery,
+                            &fence,
+                            "shuffle frontier arrived before its preceding batch completed",
+                        ));
+                    }
+                    if v.recovery_gen != fence.recovery_gen {
+                        return Err(reject_stream_protocol(
+                            delivery,
+                            &fence,
+                            "shuffle frontier generation differs from its stream handshake",
+                        ));
+                    }
+                    validate_frontier(&v.stage, v.watermark).map_err(|error| {
+                        reject_stream_protocol(delivery, &fence, &error.to_string())
+                    })?;
+                    let _ingress_guard = tokio::select! {
+                        biased;
+                        () = stream_cancel.cancelled() => return Err(scope_cancelled_status()),
+                        guard = ingress.lock() => guard,
+                    };
+                    validate_active_stream_scope(
+                        assignment_version,
+                        recovery_gen,
+                        delivery,
+                        &fence,
+                        stream_cancel,
+                        process_lease,
+                    )?;
+                    let Some(reservation) = delivery.prepare_data(&fence, v.seq)? else {
+                        continue;
+                    };
+                    let mut reservation =
+                        Some(DataAdmission::new(delivery, reservation, stream_cancel));
+                    let forwarded = forward_frontier(
+                        tx,
+                        fence,
+                        v.stage,
+                        v.watermark,
+                        v.idle,
+                        v.seq,
+                        stream_cancel,
+                        process_lease,
+                    )
+                    .await;
+                    match forwarded {
+                        Ok(true) => {
+                            if let Some(admission) = reservation.take() {
+                                admission.commit_after_enqueue()?;
+                            }
+                        }
+                        Ok(false) => break,
+                        Err(status) => {
+                            if status.code() == tonic::Code::Cancelled {
+                                if let Some(admission) = reservation.take() {
+                                    admission.cancel();
+                                }
+                            }
+                            return Err(status);
+                        }
+                    }
+                    validate_active_stream_scope(
+                        assignment_version,
+                        recovery_gen,
+                        delivery,
+                        &fence,
+                        stream_cancel,
+                        process_lease,
+                    )?;
+                }
                 shuffle_frame::Kind::Data(v) => {
                     frames_received += 1;
                     if v.recovery_gen != fence.recovery_gen {
@@ -4938,6 +5235,33 @@ mod grpc {
         Ok(ShuffleSummary { frames_received })
     }
 
+    async fn forward_frontier(
+        tx: &InboundTx,
+        fence: StreamFence,
+        stage: String,
+        watermark: Option<i64>,
+        idle: bool,
+        checkpoint_sequence: u64,
+        cancel: &CancellationToken,
+        process_lease: &ProcessLeaseGate,
+    ) -> Result<bool, tonic::Status> {
+        process_lease.require_live_status()?;
+        validate_frontier(&stage, watermark)
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(scope_cancelled_status()),
+            result = tx.send(Inbound {
+                peer: fence.sender_node_id,
+                msg: ShuffleMessage::Frontier { stage, watermark, idle },
+                budget: None,
+                fence,
+                assignment_digest: None,
+                checkpoint_sequence,
+            }) => Ok(result.is_ok()),
+        }
+    }
+
     /// Forward one logical batch after validating certified vnode ownership. `Ok(false)` when the
     /// queue has closed.
     async fn forward_routed_batch(
@@ -5024,8 +5348,9 @@ mod shim {
     use rustc_hash::FxHashMap;
 
     use super::{
-        validate_checkpoint_barrier, Holdover, ReceivedBatch, ReceivedShuffle, ShuffleMessage,
-        ShufflePeerId, SHUFFLE_RECV_QUEUE,
+        take_frontier_prefix, validate_checkpoint_barrier, validate_frontier, Holdover,
+        ReceivedBatch, ReceivedFrontierCut, ReceivedShuffle, ShuffleMessage, ShufflePeerId,
+        SHUFFLE_RECV_QUEUE,
     };
     use crate::checkpoint::{CheckpointAssignmentFence, CheckpointBarrier};
 
@@ -5107,10 +5432,15 @@ mod shim {
             peer: ShufflePeerId,
             msg: &ShuffleMessage,
         ) -> std::future::Ready<io::Result<()>> {
-            if let ShuffleMessage::Barrier(barrier) = msg {
-                if let Err(error) = validate_checkpoint_barrier(*barrier) {
-                    return std::future::ready(Err(error));
-                }
+            let validation = match msg {
+                ShuffleMessage::Barrier(barrier) => validate_checkpoint_barrier(*barrier),
+                ShuffleMessage::Frontier {
+                    stage, watermark, ..
+                } => validate_frontier(stage, *watermark),
+                ShuffleMessage::Data { .. } => Ok(()),
+            };
+            if let Err(error) = validation {
+                return std::future::ready(Err(error));
             }
             std::future::ready(Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -5323,7 +5653,7 @@ mod shim {
         }
 
         fn drain_inbound_into(&self, staged: &mut FxHashMap<String, Vec<ReceivedBatch>>) {
-            if self.holdover.has_staged_barriers() {
+            if self.holdover.has_staged_barriers() || self.holdover.has_staged_frontiers() {
                 return;
             }
             let slot = self.rx.lock();
@@ -5363,6 +5693,34 @@ mod shim {
                                 recovery_gen,
                                 checkpoint_sequence,
                             });
+                        }
+                        ShuffleMessage::Frontier {
+                            stage,
+                            watermark,
+                            idle,
+                        } => {
+                            let frontier = ReceivedShuffle {
+                                peer,
+                                message: ShuffleMessage::Frontier {
+                                    stage: stage.clone(),
+                                    watermark,
+                                    idle,
+                                },
+                                reservation,
+                                sender_incarnation,
+                                receiver_incarnation,
+                                stream_id,
+                                assignment_version,
+                                assignment_digest: None,
+                                recovery_gen,
+                                checkpoint_sequence,
+                            };
+                            let preceding = take_frontier_prefix(staged, &stage, &frontier);
+                            self.holdover.stage_frontier(ReceivedFrontierCut {
+                                preceding,
+                                frontier,
+                            });
+                            break;
                         }
                         ShuffleMessage::Barrier(barrier) => {
                             let barrier = ReceivedShuffle {
@@ -5405,12 +5763,26 @@ mod shim {
             barriers
         }
 
+        /// Take the frontier that stopped the checkpointed data drainer.
+        #[must_use]
+        pub fn drain_staged_frontiers(&self) -> Vec<ReceivedFrontierCut> {
+            let frontiers = self.holdover.take_staged_frontiers();
+            let item_count = frontiers.iter().map(ReceivedFrontierCut::item_count).sum();
+            self.holdover.release_items(item_count);
+            frontiers
+        }
+
         /// Empty the per-stage holdover, returning every buffered `(stage, batch)`.
         #[must_use]
         pub fn drain_all_staged(&self) -> Vec<(String, ReceivedBatch)> {
             let mut staged = self.holdover.staged.lock();
-            let item_count = staged.values().map(Vec::len).sum();
-            let drained = staged
+            let frontiers = self.holdover.take_staged_frontiers();
+            let item_count = staged.values().map(Vec::len).sum::<usize>()
+                + frontiers
+                    .iter()
+                    .map(ReceivedFrontierCut::item_count)
+                    .sum::<usize>();
+            let mut drained: Vec<_> = staged
                 .drain()
                 .flat_map(|(stage, batches)| {
                     batches
@@ -5418,6 +5790,14 @@ mod shim {
                         .map(move |staged| (stage.clone(), staged))
                 })
                 .collect();
+            for cut in frontiers {
+                let stage = cut.stage().to_owned();
+                drained.extend(
+                    cut.preceding
+                        .into_iter()
+                        .map(|batch| (stage.clone(), batch)),
+                );
+            }
             self.holdover.release_items(item_count);
             drained
         }
