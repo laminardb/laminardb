@@ -543,7 +543,7 @@ impl TemporalJoinVnodeState {
             if let Some((key, event_time, tombstone)) = version {
                 let order = (event_time, source.clone());
                 let version = Version {
-                    row: (!tombstone).then_some((batch_id.expect("live batch exists"), row)),
+                    row: (!tombstone).then(|| (batch_id.expect("live batch exists"), row)),
                 };
                 let replaced = match self.history.entry(key) {
                     std::collections::hash_map::Entry::Occupied(mut entry) => {

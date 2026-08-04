@@ -86,6 +86,25 @@ impl RetainedBatch {
         }
     }
 
+    pub(crate) fn restored_channel(
+        batch: RecordBatch,
+        peer: u64,
+        assignment_version: u64,
+        recovery_gen: u64,
+        routed_vnodes: Arc<[u32]>,
+    ) -> Self {
+        let uniform_vnode = uniform_vnode_hint(&routed_vnodes);
+        Self {
+            batch,
+            _admissions: Arc::from([]),
+            assignment_version: Some(assignment_version),
+            peer: Some(peer),
+            recovery_gen: Some(recovery_gen),
+            routed_vnodes,
+            uniform_vnode,
+        }
+    }
+
     pub(crate) const fn batch(&self) -> &RecordBatch {
         &self.batch
     }
