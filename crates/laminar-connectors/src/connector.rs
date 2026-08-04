@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
-use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt32Array};
+use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -345,6 +345,67 @@ pub fn schema_with_source_row_positions(schema: &SchemaRef) -> Result<SchemaRef,
     )))
 }
 
+/// Remove connector row-position columns without copying their Arrow buffers.
+///
+/// Batches without reserved fields are returned unchanged. If any reserved field is present, all
+/// three fields must be the exact trailing fields produced by
+/// [`schema_with_source_row_positions`].
+///
+/// # Errors
+/// Returns an error for partial, misplaced, nullable, or incorrectly typed position fields.
+pub fn strip_source_row_positions(records: &RecordBatch) -> Result<RecordBatch, ConnectorError> {
+    let schema = records.schema();
+    let fields = schema.fields();
+    let first_reserved = fields.iter().position(|field| {
+        SOURCE_POSITION_COLUMNS
+            .iter()
+            .any(|reserved| field.name().eq_ignore_ascii_case(reserved))
+    });
+    let Some(first_reserved) = first_reserved else {
+        return Ok(records.clone());
+    };
+    let visible_columns = fields.len().checked_sub(SOURCE_POSITION_COLUMNS.len());
+    let Some(visible_columns) = visible_columns else {
+        return Err(ConnectorError::SchemaMismatch(
+            "source row-position columns must be the exact three trailing fields".into(),
+        ));
+    };
+    if first_reserved != visible_columns {
+        return Err(ConnectorError::SchemaMismatch(
+            "source row-position columns must be the exact three trailing fields".into(),
+        ));
+    }
+
+    let expected = [
+        (SOURCE_PARTITION_COLUMN, DataType::Binary),
+        (SOURCE_ORDER_KEY_COLUMN, DataType::Binary),
+        (SOURCE_SUB_OFFSET_COLUMN, DataType::UInt32),
+    ];
+    for (field, (name, data_type)) in fields[visible_columns..].iter().zip(expected) {
+        if field.name() != name || field.data_type() != &data_type || field.is_nullable() {
+            return Err(ConnectorError::SchemaMismatch(
+                "source row-position columns must be the exact three trailing typed fields".into(),
+            ));
+        }
+    }
+
+    let visible_schema = Arc::new(Schema::new_with_metadata(
+        fields[..visible_columns].to_vec(),
+        schema.metadata().clone(),
+    ));
+    let options = RecordBatchOptions::new().with_row_count(Some(records.num_rows()));
+    RecordBatch::try_new_with_options(
+        visible_schema,
+        records.columns()[..visible_columns].to_vec(),
+        &options,
+    )
+    .map_err(|error| {
+        ConnectorError::SchemaMismatch(format!(
+            "failed to strip source row-position columns: {error}"
+        ))
+    })
+}
+
 /// Deterministic source coordinates aligned one-for-one with decoded rows.
 #[derive(Debug, Clone)]
 pub struct SourceRowPositions {
@@ -439,12 +500,22 @@ impl SourceRowPositions {
     }
 }
 
+/// Canonical mutation applied by a stateful operator for one source row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceMutation {
+    /// Insert or replace the keyed value.
+    Put,
+    /// Remove the keyed value.
+    Tombstone,
+}
+
 /// A batch of records read from a source connector.
 #[derive(Debug, Clone)]
 pub struct SourceBatch {
     /// Arrow batch carrying the records.
     pub records: RecordBatch,
     row_positions: Option<SourceRowPositions>,
+    mutations: Option<Box<[SourceMutation]>>,
 }
 
 impl SourceBatch {
@@ -454,6 +525,7 @@ impl SourceBatch {
         Self {
             records,
             row_positions: None,
+            mutations: None,
         }
     }
 
@@ -469,13 +541,45 @@ impl SourceBatch {
         Ok(Self {
             records,
             row_positions: Some(row_positions),
+            mutations: None,
         })
+    }
+
+    /// Attach row-aligned mutations to a batch.
+    ///
+    /// All-`Put` input is canonicalized to the default. Connectors should call this only for
+    /// batches that may contain tombstones.
+    ///
+    /// # Errors
+    /// Returns an error when the mutation count differs from the decoded row count.
+    pub fn with_mutations(
+        mut self,
+        mutations: impl Into<Box<[SourceMutation]>>,
+    ) -> Result<Self, ConnectorError> {
+        let mutations = mutations.into();
+        if mutations.len() != self.records.num_rows() {
+            return Err(ConnectorError::SchemaMismatch(format!(
+                "source mutation count {} does not match decoded row count {}",
+                mutations.len(),
+                self.records.num_rows()
+            )));
+        }
+        self.mutations = mutations
+            .contains(&SourceMutation::Tombstone)
+            .then_some(mutations);
+        Ok(self)
     }
 
     /// Deterministic row positions, when supplied by the connector.
     #[must_use]
     pub const fn row_positions(&self) -> Option<&SourceRowPositions> {
         self.row_positions.as_ref()
+    }
+
+    /// Mixed row mutations, or `None` when every row is a [`SourceMutation::Put`].
+    #[must_use]
+    pub fn mutations(&self) -> Option<&[SourceMutation]> {
+        self.mutations.as_deref()
     }
 
     /// Validate and append deterministic positions as reserved Arrow columns.
@@ -1681,6 +1785,7 @@ mod tests {
         let batch = SourceBatch::new(test_batch(10));
         assert_eq!(batch.num_rows(), 10);
         assert!(batch.row_positions().is_none());
+        assert!(batch.mutations().is_none());
     }
 
     #[test]
@@ -1699,6 +1804,43 @@ mod tests {
         )
         .unwrap();
         assert!(SourceBatch::positioned(test_batch(1), positions).is_err());
+    }
+
+    #[test]
+    fn source_batch_validates_and_canonicalizes_mutations() {
+        let mixed = SourceBatch::new(test_batch(2))
+            .with_mutations(vec![SourceMutation::Put, SourceMutation::Tombstone])
+            .unwrap();
+        assert_eq!(
+            mixed.mutations(),
+            Some(&[SourceMutation::Put, SourceMutation::Tombstone][..])
+        );
+
+        let puts = SourceBatch::new(test_batch(2))
+            .with_mutations(vec![SourceMutation::Put; 2])
+            .unwrap();
+        assert!(puts.mutations().is_none());
+        assert!(SourceBatch::new(test_batch(2))
+            .with_mutations(vec![SourceMutation::Tombstone])
+            .is_err());
+    }
+
+    #[test]
+    fn source_row_positions_strip_round_trip_without_copying_visible_arrays() {
+        let records = test_batch(2);
+        let positioned_schema = schema_with_source_row_positions(&records.schema()).unwrap();
+        let positions = SourceRowPositions::try_new(
+            BinaryArray::from(vec![&b"p0"[..], &b"p0"[..]]),
+            BinaryArray::from(vec![&b"0"[..], &b"1"[..]]),
+            UInt32Array::from(vec![0, 0]),
+        )
+        .unwrap();
+        let positioned = positions.append_to(&records, &positioned_schema).unwrap();
+
+        let stripped = strip_source_row_positions(&positioned).unwrap();
+        assert_eq!(stripped.schema(), records.schema());
+        assert_eq!(stripped.num_rows(), records.num_rows());
+        assert!(Arc::ptr_eq(stripped.column(0), records.column(0)));
     }
 
     #[test]

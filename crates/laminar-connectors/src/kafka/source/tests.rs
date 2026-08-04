@@ -561,6 +561,76 @@ fn kafka_positions_use_topic_partition_and_ordered_offset() {
 }
 
 #[test]
+fn debezium_operations_are_validated_and_normalized() {
+    let operations = arrow_array::StringArray::from(vec!["c", "u", "r", "d"]);
+    assert_eq!(
+        decode_debezium_mutations(&operations, 4)
+            .unwrap()
+            .as_deref(),
+        Some(
+            &[
+                SourceMutation::Put,
+                SourceMutation::Put,
+                SourceMutation::Put,
+                SourceMutation::Tombstone,
+            ][..]
+        )
+    );
+
+    let put_only = arrow_array::StringArray::from(vec!["c", "u", "r"]);
+    assert!(decode_debezium_mutations(&put_only, 3).unwrap().is_none());
+    assert!(decode_debezium_mutations(&put_only, 2).is_err());
+    assert!(
+        decode_debezium_mutations(&arrow_array::StringArray::from(vec![Some("c"), None]), 2)
+            .is_err()
+    );
+    assert!(decode_debezium_mutations(&arrow_array::StringArray::from(vec!["x"]), 1).is_err());
+}
+
+#[tokio::test]
+async fn debezium_poll_attaches_mutations_without_changing_visible_schema() {
+    let mut config = test_config();
+    config.format = Format::Debezium;
+    let mut source = KafkaSource::new(test_schema(), config, None);
+    source.state = ConnectorState::Running;
+    source.source_name = Arc::from("inventory");
+
+    let (tx, rx) = crossfire::mpsc::bounded_async::<KafkaReaderItem>(2);
+    for (offset, data) in [
+        (
+            10,
+            br#"{"before":null,"after":{"id":1,"value":"new"},"op":"c","ts_ms":1}"#.as_slice(),
+        ),
+        (
+            11,
+            br#"{"before":{"id":1,"value":"new"},"after":null,"op":"d","ts_ms":2}"#.as_slice(),
+        ),
+    ] {
+        tx.send(KafkaReaderItem::Payload(KafkaPayload {
+            data: data.to_vec(),
+            topic: Arc::from("events"),
+            partition: 1,
+            partition_vnode: None,
+            offset,
+            timestamp_ms: None,
+            headers_json: None,
+        }))
+        .await
+        .unwrap();
+    }
+    source.channel_len.store(2, Ordering::Release);
+    source.msg_rx = Some(rx);
+
+    let batch = source.poll_batch(2).await.unwrap().unwrap();
+    assert_eq!(
+        batch.mutations(),
+        Some(&[SourceMutation::Put, SourceMutation::Tombstone][..])
+    );
+    assert!(batch.records.column_by_name("__op").is_some());
+    assert!(batch.records.column_by_name("__ts_ms").is_some());
+}
+
+#[test]
 fn debezium_contract_is_keyed_upsert_from_request_config() {
     let source = KafkaSource::new(test_schema(), test_config(), None);
     let mut config = ConnectorConfig::new("kafka");

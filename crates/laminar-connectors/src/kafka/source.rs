@@ -2,7 +2,7 @@
 //! deserializes with pluggable formats, and yields Arrow `RecordBatch`es.
 
 use arrow_array::builder::BinaryBuilder;
-use arrow_array::UInt32Array;
+use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
@@ -22,8 +22,8 @@ use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
     ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, DeliveryGuarantee, SourceBatch,
     SourceConnector, SourceConsistency, SourceContract, SourceDrainOutcome, SourceDrainRequest,
-    SourceDrainResolution, SourceInputMode, SourcePosition, SourceRowPositionCapability,
-    SourceRowPositions, SourceStart, SourceTopology,
+    SourceDrainResolution, SourceInputMode, SourceMutation, SourcePosition,
+    SourceRowPositionCapability, SourceRowPositions, SourceStart, SourceTopology,
 };
 use crate::error::{ConnectorError, SerdeError};
 use crate::serde::{self, Format, RecordDeserializer};
@@ -3023,6 +3023,65 @@ fn kafka_row_positions(
     )
 }
 
+fn kafka_debezium_mutations(
+    records: &RecordBatch,
+) -> Result<Option<Box<[SourceMutation]>>, ConnectorError> {
+    let operation_index = records.schema().index_of("__op").map_err(|_| {
+        ConnectorError::SchemaMismatch("Kafka Debezium batch omitted the __op column".into())
+    })?;
+    let operations = records
+        .column(operation_index)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            ConnectorError::SchemaMismatch("Kafka Debezium __op column must be Utf8".into())
+        })?;
+    decode_debezium_mutations(operations, records.num_rows())
+}
+
+fn decode_debezium_mutations(
+    operations: &StringArray,
+    row_count: usize,
+) -> Result<Option<Box<[SourceMutation]>>, ConnectorError> {
+    if operations.len() != row_count {
+        return Err(ConnectorError::SchemaMismatch(format!(
+            "Kafka Debezium operation count {} does not match decoded row count {}",
+            operations.len(),
+            row_count
+        )));
+    }
+
+    let mut mutations: Option<Vec<SourceMutation>> = None;
+    for (row, operation) in operations.iter().enumerate() {
+        let operation = operation.ok_or_else(|| {
+            ConnectorError::SchemaMismatch(format!(
+                "Kafka Debezium __op is null at decoded row {row}"
+            ))
+        })?;
+        match operation {
+            "c" | "u" | "r" => {
+                if let Some(mutations) = mutations.as_mut() {
+                    mutations.push(SourceMutation::Put);
+                }
+            }
+            "d" => {
+                let mutations = mutations.get_or_insert_with(|| {
+                    let mut mutations = Vec::with_capacity(row_count);
+                    mutations.resize(row, SourceMutation::Put);
+                    mutations
+                });
+                mutations.push(SourceMutation::Tombstone);
+            }
+            unknown => {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "Kafka Debezium __op has unknown value '{unknown}' at decoded row {row}"
+                )));
+            }
+        }
+    }
+    Ok(mutations.map(Vec::into_boxed_slice))
+}
+
 async fn fetch_explicit_topic_metadata(
     blocking_tasks: KafkaBlockingTasks,
     consumer: Arc<StreamConsumer<LaminarConsumerContext>>,
@@ -4848,6 +4907,19 @@ impl SourceConnector for KafkaSource {
             include_metadata,
             include_headers,
         )?;
+        let mutations = if self.config.format == Format::Debezium {
+            kafka_debezium_mutations(&batch).map_err(|error| {
+                terminalize_guaranteed_poll_error(
+                    self.delivery,
+                    &mut self.state,
+                    &self.metrics,
+                    self.reader_shutdown.as_ref(),
+                    error,
+                )
+            })?
+        } else {
+            None
+        };
         // Construct the complete output before publishing its cursor. In particular,
         // metadata/header column validation above is fallible and must not retire a rotation
         // baseline or advance the recovery position for a batch that cannot be returned.
@@ -4860,6 +4932,19 @@ impl SourceConnector for KafkaSource {
                 error,
             )
         })?;
+        let output = if let Some(mutations) = mutations {
+            output.with_mutations(mutations).map_err(|error| {
+                terminalize_guaranteed_poll_error(
+                    self.delivery,
+                    &mut self.state,
+                    &self.metrics,
+                    self.reader_shutdown.as_ref(),
+                    error,
+                )
+            })?
+        } else {
+            output
+        };
         let num_rows = output.num_rows();
 
         if !self.poll_staged_offsets.is_empty() {
