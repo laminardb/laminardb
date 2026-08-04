@@ -1,6 +1,6 @@
 use super::super::callback::CycleOutcome;
 use super::*;
-use arrow::array::Int64Array;
+use arrow::array::{BinaryArray, Int64Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
@@ -11,6 +11,94 @@ fn replayable_append_only_source_contract() -> laminar_connectors::connector::So
         laminar_connectors::connector::SourceTopology::Singleton,
         laminar_connectors::connector::SourceInputMode::AppendOnly,
     )
+}
+
+#[test]
+fn positioned_source_batch_is_hidden_from_the_ordinary_runtime_path() {
+    use laminar_connectors::connector::{
+        schema_with_source_row_positions, SourceRowPositions, SOURCE_ORDER_KEY_COLUMN,
+        SOURCE_PARTITION_COLUMN, SOURCE_SUB_OFFSET_COLUMN,
+    };
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let records = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1, 2]))],
+    )
+    .unwrap();
+    let visible_values = Arc::clone(records.column(0));
+    let positions = SourceRowPositions::try_new(
+        BinaryArray::from(vec![&b"p0"[..], &b"p0"[..]]),
+        BinaryArray::from(vec![&b"o1"[..], &b"o2"[..]]),
+        UInt32Array::from(vec![0, 1]),
+    )
+    .unwrap();
+    let expected_batch_schema = schema_with_source_row_positions(&schema).unwrap();
+    let output = prepare_visible_source_batch(
+        "positioned",
+        &schema,
+        &expected_batch_schema,
+        &[],
+        &[],
+        SourceRowPositionCapability::Deterministic,
+        SourceBatch::positioned(records, positions).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(output.schema(), schema);
+    assert!(Arc::ptr_eq(&visible_values, output.column(0)));
+    assert!(output.column_by_name(SOURCE_PARTITION_COLUMN).is_none());
+    assert!(output.column_by_name(SOURCE_ORDER_KEY_COLUMN).is_none());
+    assert!(output.column_by_name(SOURCE_SUB_OFFSET_COLUMN).is_none());
+}
+
+#[test]
+fn positioned_source_batches_fail_closed_on_misalignment_and_name_collision() {
+    use laminar_connectors::connector::{
+        schema_with_source_row_positions, SourceRowPositions, SOURCE_PARTITION_COLUMN,
+    };
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let two_rows = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1, 2]))],
+    )
+    .unwrap();
+    let positions = SourceRowPositions::try_new(
+        BinaryArray::from(vec![&b"p"[..], &b"p"[..]]),
+        BinaryArray::from(vec![&b"1"[..], &b"2"[..]]),
+        UInt32Array::from(vec![0, 0]),
+    )
+    .unwrap();
+    let mut malformed = SourceBatch::positioned(two_rows, positions).unwrap();
+    malformed.records = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1]))],
+    )
+    .unwrap();
+    let expected_batch_schema = schema_with_source_row_positions(&schema).unwrap();
+    assert!(prepare_visible_source_batch(
+        "malformed",
+        &schema,
+        &expected_batch_schema,
+        &[],
+        &[],
+        SourceRowPositionCapability::Deterministic,
+        malformed,
+    )
+    .is_err());
+
+    let colliding = Arc::new(Schema::new(vec![Field::new(
+        SOURCE_PARTITION_COLUMN.to_ascii_uppercase(),
+        DataType::Binary,
+        false,
+    )]));
+    assert!(TrackedSourceRegistration::batch_schema(
+        "colliding",
+        SourceContract::default(),
+        &colliding,
+    )
+    .is_err());
 }
 
 #[test]

@@ -15,8 +15,9 @@ use crossfire::{mpsc, AsyncRx, MAsyncTx};
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::SourceBatch;
 use laminar_connectors::connector::{
-    ConnectorCancellationPolicy, ConnectorTaskTracker, DeliveryGuarantee, SourceConnector,
-    SourceConsistency, SourceContract, SourceInputMode, SourcePosition, SourceStart,
+    schema_with_source_row_positions, strip_source_row_positions, ConnectorCancellationPolicy,
+    ConnectorTaskTracker, DeliveryGuarantee, SourceConnector, SourceConsistency, SourceContract,
+    SourceInputMode, SourcePosition, SourceRowPositionCapability, SourceStart,
 };
 #[cfg(feature = "cluster")]
 use laminar_connectors::connector::{
@@ -966,6 +967,7 @@ pub(crate) struct TrackedSourceRegistration {
     source: SourceRegistration,
     contract: SourceContract,
     expected_schema: arrow_schema::SchemaRef,
+    batch_schema: arrow_schema::SchemaRef,
     primary_key: Vec<String>,
     primary_key_indices: Vec<usize>,
     schema_admitted: bool,
@@ -988,6 +990,24 @@ pub(crate) fn admit_append_only_source(
 }
 
 impl TrackedSourceRegistration {
+    fn batch_schema(
+        source_name: &str,
+        contract: SourceContract,
+        expected_schema: &arrow_schema::SchemaRef,
+    ) -> Result<arrow_schema::SchemaRef, DbError> {
+        let positioned_schema =
+            schema_with_source_row_positions(expected_schema).map_err(|error| {
+                DbError::Config(format!(
+                    "source '{source_name}' has an invalid row-position schema: {error}"
+                ))
+            })?;
+        if contract.row_positions == SourceRowPositionCapability::Deterministic {
+            Ok(positioned_schema)
+        } else {
+            Ok(Arc::clone(expected_schema))
+        }
+    }
+
     fn resolve_contract(source: &SourceRegistration) -> Result<SourceContract, DbError> {
         let contract = source.connector.contract(&source.config).map_err(|error| {
             DbError::Config(format!(
@@ -1005,6 +1025,7 @@ impl TrackedSourceRegistration {
     ) -> Result<Self, DbError> {
         let contract = Self::resolve_contract(&source)?;
         let expected_schema = source.connector.schema();
+        let batch_schema = Self::batch_schema(&source.name, contract, &expected_schema)?;
         let task_fence = ConnectorTaskFenceRegistration::capture_registered(
             Arc::<str>::from(format!("source:{}", source.name)),
             source.connector.terminal_task_tracker(),
@@ -1014,6 +1035,7 @@ impl TrackedSourceRegistration {
             source,
             contract,
             expected_schema,
+            batch_schema,
             primary_key: Vec::new(),
             primary_key_indices: Vec::new(),
             schema_admitted: false,
@@ -1027,10 +1049,12 @@ impl TrackedSourceRegistration {
     ) -> Result<Self, DbError> {
         let contract = Self::resolve_contract(&source)?;
         let expected_schema = source.connector.schema();
+        let batch_schema = Self::batch_schema(&source.name, contract, &expected_schema)?;
         Ok(Self {
             source,
             contract,
             expected_schema,
+            batch_schema,
             primary_key: Vec::new(),
             primary_key_indices: Vec::new(),
             schema_admitted: false,
@@ -1055,6 +1079,7 @@ impl TrackedSourceRegistration {
             })
             .collect::<Result<Vec<_>, _>>()?;
         self.expected_schema = expected_schema;
+        self.batch_schema = Self::batch_schema(&self.name, self.contract, &self.expected_schema)?;
         self.primary_key = primary_key;
         self.primary_key_indices = primary_key_indices;
         self.schema_admitted = true;
@@ -1068,6 +1093,45 @@ impl TrackedSourceRegistration {
     fn has_reserved_mutation_columns(&self) -> bool {
         schema_has_reserved_mutation_columns(self.expected_schema.as_ref())
     }
+}
+
+fn prepare_visible_source_batch(
+    source_name: &str,
+    expected_schema: &arrow_schema::SchemaRef,
+    batch_schema: &arrow_schema::SchemaRef,
+    primary_key: &[String],
+    primary_key_indices: &[usize],
+    capability: SourceRowPositionCapability,
+    batch: SourceBatch,
+) -> Result<RecordBatch, laminar_core::streaming::StreamingError> {
+    validate_source_batch(
+        source_name,
+        expected_schema,
+        primary_key,
+        primary_key_indices,
+        &batch.records,
+    )?;
+    let positioned_records = batch
+        .into_records_with_positions(capability, batch_schema)
+        .map_err(|error| {
+            laminar_core::streaming::StreamingError::InvalidConfig(format!(
+                "source '{source_name}' emitted invalid row positions: {error}"
+            ))
+        })?;
+    if capability == SourceRowPositionCapability::Deterministic {
+        validate_source_batch(
+            source_name,
+            batch_schema,
+            primary_key,
+            primary_key_indices,
+            &positioned_records,
+        )?;
+    }
+    strip_source_row_positions(&positioned_records).map_err(|error| {
+        laminar_core::streaming::StreamingError::InvalidConfig(format!(
+            "source '{source_name}' emitted invalid row-position columns: {error}"
+        ))
+    })
 }
 
 impl std::ops::Deref for TrackedSourceRegistration {
@@ -3029,6 +3093,18 @@ impl StreamingCoordinator {
                         )));
                     }
                 }
+                if start_error.is_none() {
+                    match TrackedSourceRegistration::batch_schema(
+                        &src_name,
+                        src.contract,
+                        &src.expected_schema,
+                    ) {
+                        Ok(schema) => src.batch_schema = schema,
+                        Err(error) => {
+                            start_error = Some(SourceStartFailure::Connector(error.to_string()));
+                        }
+                    }
+                }
             }
             if let Some(failure) = start_error {
                 let error = match failure {
@@ -3092,6 +3168,7 @@ impl StreamingCoordinator {
                 source: src,
                 contract,
                 expected_schema,
+                batch_schema,
                 primary_key,
                 primary_key_indices,
                 schema_admitted: _,
@@ -3213,7 +3290,7 @@ impl StreamingCoordinator {
 
                 let mut lifecycle = SourceConnectorLifecycle::default();
                 let mut pending_barrier = None;
-                let mut pending_batch: Option<SourceBatch> = None;
+                let mut pending_batch: Option<RecordBatch> = None;
                 #[cfg(feature = "cluster")]
                 let mut active_source_drain: Option<ActiveSourceDrain> = None;
 
@@ -3423,7 +3500,7 @@ impl StreamingCoordinator {
                             Ok(Some(checkpoint)) => {
                                 let msg = SourceMsg::Batch {
                                     source_idx: idx,
-                                    batch: batch.records,
+                                    batch,
                                     checkpoint,
                                 };
                                 if !send_source_msg(
@@ -3754,20 +3831,25 @@ impl StreamingCoordinator {
 
                     match poll_result {
                         Ok(Some(batch)) => {
-                            if let Err(error) = validate_source_batch(
+                            let batch = match prepare_visible_source_batch(
                                 &src_name,
                                 &expected_schema,
+                                &batch_schema,
                                 &primary_key,
                                 &primary_key_indices,
-                                &batch.records,
+                                contract.row_positions,
+                                batch,
                             ) {
-                                lifecycle.fault_data_plane();
-                                let _ = task_fault_tx.send(SourceFault {
-                                    source: Arc::from(src_name.as_str()),
-                                    error: error.to_string(),
-                                });
-                                break;
-                            }
+                                Ok(batch) => batch,
+                                Err(error) => {
+                                    lifecycle.fault_data_plane();
+                                    let _ = task_fault_tx.send(SourceFault {
+                                        source: Arc::from(src_name.as_str()),
+                                        error: error.to_string(),
+                                    });
+                                    break;
+                                }
+                            };
                             let checkpoint = match lifecycle.run_sync_hook(
                                 &src_name,
                                 "polled batch checkpoint capture",
@@ -3793,7 +3875,7 @@ impl StreamingCoordinator {
                             };
                             let msg = SourceMsg::Batch {
                                 source_idx: idx,
-                                batch: batch.records,
+                                batch,
                                 checkpoint,
                             };
                             if !send_source_msg(
@@ -4004,7 +4086,7 @@ impl StreamingCoordinator {
                                 if task_tx
                                     .try_send(SourceMsg::Batch {
                                         source_idx: idx,
-                                        batch: batch.records,
+                                        batch,
                                         checkpoint,
                                     })
                                     .is_err()
@@ -4052,20 +4134,25 @@ impl StreamingCoordinator {
                         }
                         match poll_result {
                             Some(Ok(Some(batch))) => {
-                                if let Err(error) = validate_source_batch(
+                                let batch = match prepare_visible_source_batch(
                                     &src_name,
                                     &expected_schema,
+                                    &batch_schema,
                                     &primary_key,
                                     &primary_key_indices,
-                                    &batch.records,
+                                    contract.row_positions,
+                                    batch,
                                 ) {
-                                    lifecycle.fault_data_plane();
-                                    let _ = task_fault_tx.send(SourceFault {
-                                        source: Arc::from(src_name.as_str()),
-                                        error: error.to_string(),
-                                    });
-                                    break;
-                                }
+                                    Ok(batch) => batch,
+                                    Err(error) => {
+                                        lifecycle.fault_data_plane();
+                                        let _ = task_fault_tx.send(SourceFault {
+                                            source: Arc::from(src_name.as_str()),
+                                            error: error.to_string(),
+                                        });
+                                        break;
+                                    }
+                                };
                                 let checkpoint = match lifecycle.run_sync_hook(
                                     &src_name,
                                     "shutdown tail checkpoint capture",
@@ -4088,7 +4175,7 @@ impl StreamingCoordinator {
                                 };
                                 let msg = SourceMsg::Batch {
                                     source_idx: idx,
-                                    batch: batch.records,
+                                    batch,
                                     checkpoint,
                                 };
                                 if task_tx.try_send(msg).is_err() {
