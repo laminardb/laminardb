@@ -125,6 +125,7 @@ pub mod subscription;
 mod table_provider;
 mod table_rows;
 mod table_store;
+mod temporal_join_state;
 #[cfg(feature = "cluster")]
 mod vnode_transition_staging;
 
