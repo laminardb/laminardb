@@ -822,7 +822,7 @@ pub(crate) struct OperatorGraph {
     // Logical pipeline/state ABI bound into every managed vnode transition.
     #[cfg(feature = "cluster")]
     pipeline_identity: Option<laminar_core::checkpoint::PipelineIdentity>,
-    // One immutable revocation transition, consumed only after complete lifecycle success.
+    // One immutable assignment transition, consumed only after complete lifecycle success.
     #[cfg(feature = "cluster")]
     pending_vnode_transition: Option<crate::vnode_transition_staging::PendingVnodeTransitionHandle>,
     // Success-only binding for the exact vnode state installed in this graph generation.
@@ -1048,7 +1048,7 @@ impl OperatorGraph {
 
     /// Whether an aligned checkpoint can snapshot without leaving queued graph input outside the
     /// cut. A staged vnode transition is pending graph work too: an idle pipeline must run one
-    /// drain pass to revoke old state and install acquired state before capture. Buffer presence is
+    /// drain pass to publish operator state against the target assignment. Buffer presence is
     /// checked separately from bytes because Arrow permits positive-row record batches whose
     /// arrays occupy zero bytes.
     pub(crate) fn checkpoint_is_quiescent(&self) -> bool {
@@ -2744,7 +2744,7 @@ impl OperatorGraph {
         .await
     }
 
-    /// Complete only staged vnode revocation, without stepping operators on source or
+    /// Complete only the staged vnode transition, without stepping operators on source or
     /// buffered graph input. This lets a fenced recovery drain the predecessor transition before
     /// adopting a newer assignment without reopening source intake.
     #[cfg(feature = "cluster")]

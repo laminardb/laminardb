@@ -1,4 +1,4 @@
-//! Managed vnode revocation at an assignment boundary.
+//! Managed vnode state transitions at assignment boundaries.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -492,9 +492,9 @@ impl OperatorGraph {
         self.validate_pending_pipeline_identity(&pending)?;
         let transition = match pending.kind() {
             VnodeTransitionKind::CommittedFinalOwnerExit(transition) => transition.clone(),
-            VnodeTransitionKind::Revoke => {
+            VnodeTransitionKind::RetainedOwner => {
                 return Err(DbError::Checkpoint(
-                    "[LDB-6051] revoke transition has no committed final-owner-exit authority"
+                    "[LDB-6051] retained-owner transition has no committed final-owner-exit authority"
                         .into(),
                 ));
             }
@@ -526,7 +526,7 @@ impl OperatorGraph {
         let Some((pending_handle, pending)) = self.pending_transition_snapshot() else {
             return Ok(None);
         };
-        if !matches!(pending.kind(), VnodeTransitionKind::Revoke) {
+        if !matches!(pending.kind(), VnodeTransitionKind::RetainedOwner) {
             return Err(DbError::ShuffleNotReady(
                 "[LDB-6051] committed final-owner-exit cleanup requires the fenced control path"
                     .into(),
@@ -549,11 +549,6 @@ impl OperatorGraph {
         })?;
         let authority = VnodeTransitionAuthoritySnapshot::capture(config, pending.target())?;
         let revoked: FxHashSet<u32> = pending.revoked_vnodes().iter().copied().collect();
-        if revoked.is_empty() {
-            return Err(DbError::Checkpoint(
-                "[LDB-6051] pending vnode transition contains no graph work".into(),
-            ));
-        }
         let mut invalid: Vec<u32> = revoked
             .iter()
             .copied()
@@ -648,7 +643,13 @@ impl OperatorGraph {
                     return Err(error);
                 }
             };
-            if relevant_revoked.is_empty() {
+            if relevant_revoked.is_empty()
+                && !matches!(
+                    contract,
+                    ManagedStateContract::BoundedIntervalJoinV1
+                        | ManagedStateContract::TemporalJoinV1
+                )
+            {
                 continue;
             }
             attempted.push(node_idx);
@@ -668,7 +669,7 @@ impl OperatorGraph {
                 };
                 self.abort_and_finish_managed_operators(&prepared);
                 return Err(DbError::Checkpoint(format!(
-                    "[LDB-6051] vnode revocation preparation for operator '{name}' failed: {error}"
+                    "[LDB-6051] vnode transition preparation for operator '{name}' failed: {error}"
                 )));
             }
         }
@@ -676,7 +677,7 @@ impl OperatorGraph {
             node_indices: attempted,
         };
         self.observe_managed_state_accounting(&prepared.node_indices);
-        if let Err(error) = self.validate_managed_state_budget("vnode revocation preparation") {
+        if let Err(error) = self.validate_managed_state_budget("vnode transition preparation") {
             self.abort_and_finish_managed_operators(&prepared);
             return Err(error);
         }
@@ -847,7 +848,7 @@ impl OperatorGraph {
         tracing::info!(
             assignment_version = authority.assignment.version(),
             revoked_vnodes = revoked.len(),
-            "completed staged vnode revocation"
+            "completed staged vnode transition"
         );
         Ok(())
     }

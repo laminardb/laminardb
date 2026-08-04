@@ -405,7 +405,7 @@ fn pending_final_owner_exit_binds_exact_transition_and_process() {
 
     let unchanged_target =
         CheckpointAssignmentFence::from_owner_map(3, &[1, 1], vec![local]).unwrap();
-    assert!(PendingVnodeTransition::assignment_change(
+    let topology_only = PendingVnodeTransition::assignment_change(
         CheckpointAssignmentFence::from_owner_map(2, &[1, 1], vec![local]).unwrap(),
         &predecessor_owners,
         unchanged_target,
@@ -414,7 +414,8 @@ fn pending_final_owner_exit_binds_exact_transition_and_process() {
         PipelineIdentity::empty(),
         None,
     )
-    .is_err());
+    .unwrap();
+    assert!(topology_only.revoked_vnodes().is_empty());
 }
 use laminar_core::catalog::CatalogObjectKind;
 #[cfg(feature = "cluster")]
@@ -540,6 +541,249 @@ async fn install_test_process_and_leader_authority(
         .unwrap();
     controller.set_leader_lease_store(leader_authority);
     proof
+}
+
+#[cfg(feature = "cluster")]
+struct VnodeRevocationProbe(Arc<parking_lot::Mutex<Vec<u32>>>);
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl crate::operator_graph::GraphOperator for VnodeRevocationProbe {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::test_vnode_state()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<arrow::record_batch::RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>, DbError> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<crate::operator_graph::OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn drop_owned_vnodes(&mut self, revoked: &rustc_hash::FxHashSet<u32>) -> Result<(), DbError> {
+        let mut revoked = revoked.iter().copied().collect::<Vec<_>>();
+        revoked.sort_unstable();
+        *self.0.lock() = revoked;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn complete_audited_vnode_revocation(final_owner_exit: bool) {
+    use laminar_core::checkpoint::{CheckpointParticipant, PipelineIdentity};
+    use laminar_core::cluster::control::{
+        AssignmentDrainDecision, AssignmentSnapshot, ClusterController, ClusterKv, InMemoryKv,
+        RotateOutcome,
+    };
+    use laminar_core::cluster::discovery::{NodeId as ClusterNodeId, NodeInfo};
+    use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+    use laminar_core::state::{KeyGroupCount, NodeId, VnodeRegistry};
+
+    let self_id = NodeId(1);
+    let successor_id = NodeId(2);
+    let (authority_store, assignments) = test_assignment_history();
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(ClusterNodeId(self_id.0)));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let controller = Arc::new(ClusterController::new(
+        ClusterNodeId(self_id.0),
+        kv,
+        Some(Arc::clone(&assignments)),
+        members_rx,
+    ));
+    let leader = install_test_process_and_leader_authority(
+        &controller,
+        Arc::clone(&authority_store),
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    let local = CheckpointParticipant {
+        node_id: self_id.0,
+        boot_incarnation: controller.recovery_incarnation(),
+    };
+    let successor = CheckpointParticipant {
+        node_id: successor_id.0,
+        boot_incarnation: uuid::Uuid::from_u128(22),
+    };
+    let predecessor = AssignmentSnapshot::empty()
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[self_id, self_id]),
+            vec![local],
+        )
+        .unwrap();
+    assignments.save_if_absent(&predecessor).await.unwrap();
+    let target_owners = if final_owner_exit {
+        vec![successor_id, successor_id]
+    } else {
+        vec![self_id, successor_id]
+    };
+    let target_participants = if final_owner_exit {
+        vec![successor]
+    } else {
+        vec![local, successor]
+    };
+    let draining = predecessor
+        .next_draining(
+            AssignmentSnapshot::vnodes_from_vec(&target_owners),
+            target_participants,
+            leader.clone(),
+        )
+        .unwrap();
+    assert!(matches!(
+        assignments
+            .save_if_version(&draining, predecessor.version)
+            .await
+            .unwrap(),
+        RotateOutcome::Rotated
+    ));
+    let target = draining.committed_target().unwrap();
+    let authority = controller.checkpoint_authority().unwrap();
+    let transition = draining.drain_transition.as_ref().unwrap();
+    let handoff = crate::rebalance::record_assignment_checkpoint_for_test(
+        &authority,
+        &authority_store,
+        &transition.predecessor,
+        &transition.leader,
+    )
+    .await;
+    let decision = AssignmentDrainDecision::commit(transition, leader, handoff).unwrap();
+    authority
+        .record_assignment_drain_decision(&transition.leader, decision)
+        .await
+        .unwrap();
+    assignments
+        .finalize_drain(&draining, &target)
+        .await
+        .unwrap();
+
+    let registry = Arc::new(VnodeRegistry::single_owner(2, self_id));
+    assert_eq!(registry.assignment_version(), predecessor.version);
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(authority_store)
+        .vnode_registry(Arc::clone(&registry))
+        .assignment_snapshot_store(assignments)
+        .build()
+        .await
+        .unwrap();
+    DbState::Running.store(&db.state);
+    let identity = PipelineIdentity::empty();
+    let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
+        crate::checkpoint_coordinator::CheckpointConfig::default(),
+        test_checkpoint_store(),
+    )
+    .unwrap();
+    coordinator
+        .bind_pipeline_identity(identity.clone())
+        .unwrap();
+    coordinator.set_assignment_version(predecessor.version);
+    coordinator.set_vnode_set(vec![0, 1]);
+    *db.coordinator.lock().await = Some(coordinator);
+    *db.installed_vnode_state.lock() = Some(
+        crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
+            predecessor.assignment_fence().unwrap(),
+            identity.clone(),
+        )
+        .unwrap(),
+    );
+
+    let adoption = db
+        .adopt_assignment_snapshot(
+            target.clone(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    assert!(adoption.adopted);
+    let pending = db.pending_vnode_transition.lock().clone().unwrap();
+    assert_eq!(
+        pending.predecessor(),
+        &predecessor.assignment_fence().unwrap()
+    );
+    assert!(db
+        .installed_vnode_state
+        .lock()
+        .as_ref()
+        .is_some_and(|installed| installed.matches(pending.predecessor(), &identity)));
+
+    let receiver = Arc::new(
+        ShuffleReceiver::bind(
+            self_id.0,
+            "127.0.0.1:0".parse().unwrap(),
+            local.boot_incarnation,
+        )
+        .await
+        .unwrap(),
+    );
+    let sender = Arc::new(ShuffleSender::new(self_id.0, local.boot_incarnation));
+    let process_deadline = Arc::new(laminar_core::cluster::control::LeaseDeadline::live_for(
+        std::time::Duration::from_secs(30),
+    ));
+    receiver
+        .install_process_lease_deadline(Arc::clone(&process_deadline))
+        .unwrap();
+    sender
+        .install_process_lease_deadline(process_deadline)
+        .unwrap();
+    let target_fence = target.assignment_fence().unwrap();
+    if !final_owner_exit {
+        let owners = [self_id.0, successor_id.0];
+        receiver
+            .install_assignment_fence(&target_fence, &owners)
+            .unwrap();
+        sender
+            .install_assignment_fence(&target_fence, &owners)
+            .unwrap();
+    }
+
+    let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let mut graph =
+        crate::operator_graph::OperatorGraph::new(laminar_sql::create_session_context());
+    graph.set_key_group_count(KeyGroupCount::try_from(2_u32).unwrap());
+    graph.push_test_node(
+        "revocation-probe",
+        Box::new(VnodeRevocationProbe(Arc::clone(&observed))),
+    );
+    graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
+        registry,
+        sender,
+        receiver,
+        self_id,
+    });
+    graph.set_pipeline_identity(identity.clone());
+    graph.set_pending_vnode_transition_handle(Arc::clone(&db.pending_vnode_transition));
+    graph.set_installed_vnode_state_handle(Arc::clone(&db.installed_vnode_state));
+    graph.set_rotation_execution_fence(Arc::clone(&db.rotation_execution_fence));
+
+    assert!(graph.complete_pending_vnode_transition().await.unwrap());
+    let expected_revoked: &[u32] = if final_owner_exit { &[0, 1] } else { &[1] };
+    assert_eq!(observed.lock().as_slice(), expected_revoked);
+    assert!(db.pending_vnode_transition.lock().is_none());
+    if final_owner_exit {
+        assert!(db.installed_vnode_state.lock().is_none());
+    } else {
+        assert!(db
+            .installed_vnode_state
+            .lock()
+            .as_ref()
+            .is_some_and(|installed| installed.matches(&target_fence, &identity)));
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn audited_vnode_revoke_preserves_predecessor_binding_until_graph_publication() {
+    complete_audited_vnode_revocation(false).await;
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn audited_final_owner_exit_preserves_predecessor_binding_until_graph_publication() {
+    complete_audited_vnode_revocation(true).await;
 }
 
 #[cfg(feature = "cluster")]

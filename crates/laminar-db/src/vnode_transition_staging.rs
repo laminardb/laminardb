@@ -1,4 +1,4 @@
-//! Assignment-fenced vnode revocation staged for one graph generation.
+//! Assignment-fenced vnode state transition staged for one graph generation.
 
 use std::sync::Arc;
 
@@ -64,16 +64,16 @@ impl InstalledVnodeStateBinding {
     }
 }
 
-/// Completion authority for one revoke-only transition.
+/// Completion authority for one assignment transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum VnodeTransitionKind {
-    /// The process retains at least one vnode after dropping the revoked set.
-    Revoke,
+    /// The process remains in the target assignment, with or without local revocation.
+    RetainedOwner,
     /// The process loses its last vnode under an audited committed drain.
     CommittedFinalOwnerExit(AssignmentDrainTransition),
 }
 
-/// Immutable revoke batch published before the target assignment becomes executable.
+/// Immutable state transition published before the target assignment becomes executable.
 #[derive(Debug)]
 pub(crate) struct PendingVnodeTransition {
     predecessor: CheckpointAssignmentFence,
@@ -123,12 +123,6 @@ impl PendingVnodeTransition {
             )));
         }
         let revoked_vnodes = sorted_difference(&predecessor_owned, &target_owned);
-        if revoked_vnodes.is_empty() {
-            return Err(transition_error(
-                "assignment transition contains no local vnode work",
-            ));
-        }
-
         let kind = match (
             target_owned.is_empty(),
             predecessor_owned.is_empty(),
@@ -153,7 +147,7 @@ impl PendingVnodeTransition {
                     "final-owner exit authority was supplied for a non-final transition",
                 ));
             }
-            _ => VnodeTransitionKind::Revoke,
+            _ => VnodeTransitionKind::RetainedOwner,
         };
 
         Ok(Self {
@@ -285,7 +279,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(transition.kind(), &VnodeTransitionKind::Revoke);
+        assert_eq!(transition.kind(), &VnodeTransitionKind::RetainedOwner);
         assert_eq!(transition.revoked_vnodes(), &[0]);
 
         let acquisition_predecessor = fence(1, &[2, 1], vec![local, remote]);
@@ -306,6 +300,26 @@ mod tests {
                 .contains("committed-frame vnode reassignment is not implemented"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn assignment_change_preserves_topology_only_generation() {
+        let local = participant(1, 1);
+        let old_remote = participant(2, 2);
+        let new_remote = participant(3, 3);
+        let transition = PendingVnodeTransition::assignment_change(
+            fence(1, &[1, 2], vec![local, old_remote]),
+            &[NodeId(1), NodeId(2)],
+            fence(2, &[1, 3], vec![local, new_remote]),
+            &[NodeId(1), NodeId(3)],
+            local,
+            PipelineIdentity::empty(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(transition.kind(), &VnodeTransitionKind::RetainedOwner);
+        assert!(transition.revoked_vnodes().is_empty());
     }
 
     #[test]

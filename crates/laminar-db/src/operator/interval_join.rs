@@ -57,6 +57,7 @@ struct IntervalJoinOperatorCheckpoint {
 
 struct PreparedIntervalJoinTransition {
     replacements: Vec<(u32, Option<Box<IntervalJoinState>>)>,
+    local_assignment: VnodeAssignmentSnapshot,
 }
 
 enum IntervalJoinTransitionCleanup {
@@ -163,6 +164,7 @@ impl IntervalJoinOperator {
             .capacity()
             .saturating_mul(std::mem::size_of::<Option<Box<IntervalJoinState>>>())
             .saturating_add(32)
+            .saturating_add(std::mem::size_of::<VnodeAssignmentSnapshot>())
             .saturating_add(
                 self.vnode_states
                     .iter()
@@ -179,6 +181,7 @@ impl IntervalJoinOperator {
             .capacity()
             .saturating_mul(std::mem::size_of::<(u32, Option<Box<IntervalJoinState>>)>())
             .saturating_add(32)
+            .saturating_add(std::mem::size_of::<VnodeAssignmentSnapshot>())
             .saturating_add(
                 transition
                     .replacements
@@ -1386,9 +1389,21 @@ impl GraphOperator for IntervalJoinOperator {
         })?;
         let assignment = config.registry.versioned_snapshot();
         let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
+        let predecessor_owners: Vec<u64> = self
+            .local_assignment
+            .owners()
+            .iter()
+            .map(|owner| owner.0)
+            .collect();
         if transition.target.vnode_count != config.registry.vnode_count()
             || transition.target.assignment_version != assignment.version()
             || !transition.target.matches_owner_map(&owners)
+            || transition.predecessor.assignment_version != self.local_assignment.version()
+            || transition.predecessor.assignment_version.checked_add(1)
+                != Some(transition.target.assignment_version)
+            || !transition
+                .predecessor
+                .matches_owner_map(&predecessor_owners)
         {
             return Err(DbError::Checkpoint(format!(
                 "interval join [{}] transition target does not match assignment {}",
@@ -1501,6 +1516,7 @@ impl GraphOperator for IntervalJoinOperator {
         }
         let prepared = PreparedIntervalJoinTransition {
             replacements: replacements.into_iter().collect(),
+            local_assignment: assignment,
         };
         let total_bytes = live_bytes.saturating_add(Self::transition_accounted_bytes(&prepared));
         if total_bytes > self.max_managed_state_bytes {
@@ -1539,6 +1555,7 @@ impl GraphOperator for IntervalJoinOperator {
             self.checkpointed_vnodes[*vnode as usize] = false;
             self.dirty_vnodes[*vnode as usize] = false;
         }
+        std::mem::swap(&mut self.local_assignment, &mut prepared.local_assignment);
         self.vnode_transition_cleanup = Some(IntervalJoinTransitionCleanup::Published(prepared));
     }
 
@@ -1620,10 +1637,21 @@ mod tests {
     }
 
     #[cfg(feature = "cluster")]
-    fn single_owner_predecessor(
+    fn install_single_owner_predecessor(
+        operator: &mut IntervalJoinOperator,
         target: &laminar_core::checkpoint::CheckpointAssignmentFence,
     ) -> laminar_core::checkpoint::CheckpointAssignmentFence {
         let owners = vec![1; target.vnode_count as usize];
+        let registry =
+            VnodeRegistry::single_owner(target.vnode_count, laminar_core::state::NodeId(1));
+        let predecessor_version = target.assignment_version - 1;
+        if predecessor_version > registry.assignment_version() {
+            registry.set_assignment_and_version(
+                vec![laminar_core::state::NodeId(1); target.vnode_count as usize].into(),
+                predecessor_version,
+            );
+        }
+        operator.local_assignment = registry.versioned_snapshot();
         laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
             target.assignment_version - 1,
             &owners,
@@ -2349,7 +2377,7 @@ mod tests {
         );
         restored.attach_cluster_shuffle(restored_shuffle);
         restored.restore(checkpoint).unwrap();
-        let predecessor = single_owner_predecessor(&fence);
+        let predecessor = install_single_owner_predecessor(&mut restored, &fence);
         restored
             .prepare_vnode_transition(ManagedVnodeTransition {
                 predecessor: &predecessor,
@@ -2359,6 +2387,10 @@ mod tests {
             })
             .unwrap();
         restored.publish_vnode_transition();
+        assert_eq!(
+            restored.local_assignment.version(),
+            fence.assignment_version
+        );
         restored.finish_vnode_transition();
 
         let error = restored
@@ -2423,7 +2455,7 @@ mod tests {
             vnode,
             state: slice,
         }];
-        let predecessor = single_owner_predecessor(&fence);
+        let predecessor = install_single_owner_predecessor(&mut restored, &fence);
         restored
             .prepare_vnode_transition(ManagedVnodeTransition {
                 predecessor: &predecessor,
@@ -2439,6 +2471,10 @@ mod tests {
         let aborted = restored.managed_state_accounting().unwrap();
         assert!(aborted.prepared > 0);
         assert_eq!(aborted.retired, 0);
+        assert_eq!(
+            restored.local_assignment.version(),
+            predecessor.assignment_version
+        );
         restored.finish_vnode_transition();
         restored
             .prepare_vnode_transition(ManagedVnodeTransition {
@@ -2449,6 +2485,10 @@ mod tests {
             })
             .unwrap();
         restored.publish_vnode_transition();
+        assert_eq!(
+            restored.local_assignment.version(),
+            fence.assignment_version
+        );
         restored.finish_vnode_transition();
 
         let output = restored

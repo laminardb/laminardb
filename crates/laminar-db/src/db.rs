@@ -2577,7 +2577,8 @@ impl LaminarDB {
             adopted: true,
             version: snapshot.version,
         };
-        let has_local_transition = !revoked.is_empty();
+        // Stateful joins cache routing and peer topology even when local ownership is unchanged.
+        let has_local_transition = !old_owned.is_empty();
         let pending_transition = if has_local_transition {
             guard.as_ref().ok_or_else(|| {
                 DbError::Checkpoint(format!(
@@ -2674,9 +2675,6 @@ impl LaminarDB {
             )));
         }
         *pending_slot = pending_transition;
-        if pending_slot.is_some() {
-            installed_state.take();
-        }
         registry.set_assignment_and_version(new_assignment, snapshot.version);
         if let Some(coord) = guard.as_mut() {
             coord.set_assignment_version(snapshot.version);
