@@ -358,6 +358,7 @@ pub(crate) struct ManagedVnodeRestore<'a> {
 /// Exact operator-local projection of one graph vnode transition.
 #[cfg(feature = "cluster")]
 pub(crate) struct ManagedVnodeTransition<'a> {
+    pub(crate) predecessor: &'a laminar_core::checkpoint::CheckpointAssignmentFence,
     pub(crate) target: &'a laminar_core::checkpoint::CheckpointAssignmentFence,
     pub(crate) revoked: &'a FxHashSet<u32>,
     pub(crate) restores: &'a [ManagedVnodeRestore<'a>],

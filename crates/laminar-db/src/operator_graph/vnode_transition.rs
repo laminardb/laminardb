@@ -365,9 +365,11 @@ impl OperatorGraph {
             Arc::clone(&transition.pending_handle),
             Arc::clone(&transition.pending),
         );
-        let prepared = match self
-            .prepare_managed_operators(transition.pending.target(), &transition.revoked)
-        {
+        let prepared = match self.prepare_managed_operators(
+            transition.pending.predecessor(),
+            transition.pending.target(),
+            &transition.revoked,
+        ) {
             Ok(prepared) => prepared,
             Err(error) => {
                 unwind.complete();
@@ -402,9 +404,11 @@ impl OperatorGraph {
             Arc::clone(&transition.pending_handle),
             Arc::clone(&transition.pending),
         );
-        let prepared = match self
-            .prepare_managed_operators(transition.pending.target(), &transition.revoked)
-        {
+        let prepared = match self.prepare_managed_operators(
+            transition.pending.predecessor(),
+            transition.pending.target(),
+            &transition.revoked,
+        ) {
             Ok(prepared) => prepared,
             Err(error) => {
                 unwind.complete();
@@ -616,6 +620,7 @@ impl OperatorGraph {
 
     fn prepare_managed_operators(
         &mut self,
+        predecessor: &laminar_core::checkpoint::CheckpointAssignmentFence,
         target: &laminar_core::checkpoint::CheckpointAssignmentFence,
         revoked: &FxHashSet<u32>,
     ) -> Result<PreparedManagedOperators, DbError> {
@@ -648,6 +653,7 @@ impl OperatorGraph {
             }
             attempted.push(node_idx);
             let input = ManagedVnodeTransition {
+                predecessor,
                 target,
                 revoked: &relevant_revoked,
                 restores: &[],

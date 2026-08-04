@@ -35,6 +35,8 @@ use crate::operator::sql_query::ClusterShuffleConfig;
 use crate::operator::ProjectingJoinState;
 #[cfg(feature = "cluster")]
 use crate::operator_graph::merge_input_frontier_iter;
+#[cfg(feature = "cluster")]
+use crate::operator_graph::ManagedVnodeTransition;
 use crate::operator_graph::{
     merge_input_frontiers, CapturedVnodeState, GraphOperator, InputFrontier,
     ManagedStateAccountingSnapshot, OperatorCheckpoint,
@@ -225,6 +227,35 @@ struct TemporalPeerChannel {
 }
 
 #[cfg(feature = "cluster")]
+struct TemporalVnodeInventory {
+    resident_vnodes: Vec<u32>,
+    vnode_pending_holds: Vec<Option<i64>>,
+    pending_hold_counts: BTreeMap<i64, usize>,
+    retained_state_bytes: usize,
+    maintenance_pending: bool,
+}
+
+#[cfg(feature = "cluster")]
+struct PreparedTemporalJoinTransition {
+    slots: Vec<(u32, Option<Box<TemporalJoinVnodeState>>)>,
+    local_assignment: VnodeAssignmentSnapshot,
+    resident_vnodes: Vec<u32>,
+    vnode_pending_holds: Vec<Option<i64>>,
+    pending_hold_counts: BTreeMap<i64, usize>,
+    retained_state_bytes: usize,
+    maintenance_pending: bool,
+    cluster_peers: Arc<[u64]>,
+    peer_channels: [BTreeMap<u64, TemporalPeerChannel>; 2],
+    bootstrap_broadcast: bool,
+}
+
+#[cfg(feature = "cluster")]
+enum TemporalJoinTransitionCleanup {
+    Aborted(PreparedTemporalJoinTransition),
+    Published(PreparedTemporalJoinTransition),
+}
+
+#[cfg(feature = "cluster")]
 struct DecodedTemporalCluster {
     local_frontiers: [InputFrontier; 2],
     peer_channels: [BTreeMap<u64, TemporalPeerChannel>; 2],
@@ -309,6 +340,10 @@ pub(crate) struct ManagedTemporalJoinOperator {
     queued_remote_events: usize,
     #[cfg(feature = "cluster")]
     queued_event_capacity_bytes: usize,
+    #[cfg(feature = "cluster")]
+    prepared_vnode_transition: Option<PreparedTemporalJoinTransition>,
+    #[cfg(feature = "cluster")]
+    vnode_transition_cleanup: Option<TemporalJoinTransitionCleanup>,
 }
 
 impl ManagedTemporalJoinOperator {
@@ -435,6 +470,10 @@ impl ManagedTemporalJoinOperator {
             queued_remote_events: 0,
             #[cfg(feature = "cluster")]
             queued_event_capacity_bytes: 0,
+            #[cfg(feature = "cluster")]
+            prepared_vnode_transition: None,
+            #[cfg(feature = "cluster")]
+            vnode_transition_cleanup: None,
         };
         let validation = operator.state_config(0, operator.max_managed_state_bytes)?;
         let _ = TemporalJoinVnodeState::try_new(
@@ -1278,6 +1317,67 @@ impl ManagedTemporalJoinOperator {
         })
     }
 
+    fn vnode_state_frontiers(state: &TemporalJoinVnodeState) -> [InputFrontier; 2] {
+        let (left_watermark, left_idle, right_watermark, right_idle) = state.frontier_snapshot();
+        [
+            InputFrontier {
+                watermark: left_watermark,
+                idle: left_idle,
+            },
+            InputFrontier {
+                watermark: right_watermark,
+                idle: right_idle,
+            },
+        ]
+    }
+
+    fn decode_vnode_frame(
+        &self,
+        vnode: u32,
+        vnode_count: u32,
+        bytes: &[u8],
+        max_state_bytes: usize,
+    ) -> Result<Option<Box<TemporalJoinVnodeState>>, DbError> {
+        if vnode_count != u32::from(self.key_group_count) || vnode >= vnode_count {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] vnode {vnode} restore does not match its {vnode_count}-vnode topology",
+                self.name
+            )));
+        }
+        let (&tag, payload) = bytes.split_first().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "temporal join [{}] vnode {vnode} frame is empty",
+                self.name
+            ))
+        })?;
+        match tag {
+            ABSENT_VNODE if payload.is_empty() => Ok(None),
+            ABSENT_VNODE => Err(DbError::Checkpoint(format!(
+                "temporal join [{}] absent vnode {vnode} frame has a payload",
+                self.name
+            ))),
+            PRESENT_VNODE if payload.is_empty() => Err(DbError::Checkpoint(format!(
+                "temporal join [{}] present vnode {vnode} frame has no payload",
+                self.name
+            ))),
+            PRESENT_VNODE => {
+                let config = self.state_config(vnode, max_state_bytes)?;
+                TemporalJoinVnodeState::restore(
+                    Arc::clone(&self.left_schema),
+                    Arc::clone(&self.right_schema),
+                    config,
+                    payload,
+                )
+                .map(Box::new)
+                .map(Some)
+            }
+            _ => Err(DbError::Checkpoint(format!(
+                "temporal join [{}] vnode {vnode} frame has unknown tag {tag}",
+                self.name
+            ))),
+        }
+    }
+
     fn topology_charge(&self) -> Result<usize, DbError> {
         let vnode_slots = self
             .vnode_states
@@ -1415,6 +1515,128 @@ impl ManagedTemporalJoinOperator {
             .checked_add(self.queued_shuffle_bytes)
             .ok_or_else(|| self.accounting_error())?;
         Ok(accounted)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn transition_accounted_bytes(transition: &PreparedTemporalJoinTransition) -> usize {
+        let slots = transition
+            .slots
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(
+                u32,
+                Option<Box<TemporalJoinVnodeState>>,
+            )>())
+            .saturating_add(
+                transition
+                    .slots
+                    .iter()
+                    .filter_map(|(_, state)| state.as_deref())
+                    .fold(0usize, |total, state| {
+                        total.saturating_add(state.accounted_state_bytes())
+                    }),
+            );
+        let vnode_metadata = transition
+            .resident_vnodes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(
+                transition
+                    .vnode_pending_holds
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Option<i64>>()),
+            )
+            .saturating_add(
+                transition
+                    .pending_hold_counts
+                    .len()
+                    .saturating_mul(PENDING_HOLD_ENTRY_CHARGE),
+            );
+        let assignment = transition.local_assignment.owners().len().saturating_mul(
+            std::mem::size_of::<NodeId>().saturating_add(std::mem::size_of::<u64>()),
+        );
+        let peers = transition
+            .cluster_peers
+            .len()
+            .saturating_mul(std::mem::size_of::<u64>());
+        let channels = transition
+            .peer_channels
+            .iter()
+            .map(BTreeMap::len)
+            .sum::<usize>()
+            .saturating_mul(
+                std::mem::size_of::<(u64, TemporalPeerChannel)>()
+                    .saturating_add(PENDING_HOLD_ENTRY_CHARGE),
+            )
+            .saturating_add(
+                transition
+                    .peer_channels
+                    .iter()
+                    .flat_map(BTreeMap::values)
+                    .fold(0usize, |total, channel| {
+                        total.saturating_add(
+                            channel
+                                .events
+                                .capacity()
+                                .saturating_mul(REMOTE_EVENT_CHARGE),
+                        )
+                    }),
+            );
+        std::mem::size_of::<PreparedTemporalJoinTransition>()
+            .saturating_add(slots)
+            .saturating_add(vnode_metadata)
+            .saturating_add(assignment)
+            .saturating_add(peers)
+            .saturating_add(channels)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn derive_vnode_inventory<'a>(
+        &self,
+        assignment: &VnodeAssignmentSnapshot,
+        self_id: NodeId,
+        mut state_at: impl FnMut(u32) -> Option<&'a TemporalJoinVnodeState>,
+    ) -> Result<TemporalVnodeInventory, DbError> {
+        let mut inventory = TemporalVnodeInventory {
+            resident_vnodes: Vec::with_capacity(self.vnode_states.len()),
+            vnode_pending_holds: Vec::with_capacity(self.vnode_states.len()),
+            pending_hold_counts: BTreeMap::new(),
+            retained_state_bytes: 0,
+            maintenance_pending: false,
+        };
+        for vnode in 0..self.vnode_count.get() {
+            let state = state_at(vnode);
+            let hold = state.and_then(TemporalJoinVnodeState::pending_watermark_hold);
+            inventory.vnode_pending_holds.push(hold);
+            if let Some(hold) = hold {
+                let count = inventory
+                    .pending_hold_counts
+                    .get(&hold)
+                    .copied()
+                    .unwrap_or(0usize)
+                    .checked_add(1)
+                    .ok_or_else(|| self.accounting_error())?;
+                inventory.pending_hold_counts.insert(hold, count);
+            }
+            let Some(state) = state else {
+                continue;
+            };
+            if assignment.owners()[vnode as usize] != self_id
+                || Self::vnode_state_frontiers(state) != self.frontiers
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal join [{}] vnode {vnode} is outside its assignment state cut",
+                    self.name
+                )));
+            }
+            inventory.resident_vnodes.push(vnode);
+            inventory.retained_state_bytes = inventory
+                .retained_state_bytes
+                .checked_add(state.accounted_state_bytes())
+                .ok_or_else(|| self.accounting_error())?;
+            inventory.maintenance_pending |=
+                state.has_ready_probes() || state.has_history_gc_work();
+        }
+        Ok(inventory)
     }
 
     fn add_resident_vnode(&mut self, vnode: u32) {
@@ -2966,6 +3188,337 @@ impl ManagedTemporalJoinOperator {
         Ok((next_queue_bytes, next_queue_events))
     }
 
+    #[cfg(feature = "cluster")]
+    fn prepare_transition_image(
+        &self,
+        transition: ManagedVnodeTransition<'_>,
+    ) -> Result<PreparedTemporalJoinTransition, DbError> {
+        let config = self.cluster_shuffle.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "temporal join [{}] cannot transition without cluster ownership",
+                self.name
+            ))
+        })?;
+        let assignment = config.registry.versioned_snapshot();
+        let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
+        let target_contains_self = assignment.owners().contains(&config.self_id);
+        let active_transport = config.sender.local_id() == config.self_id.0
+            && config.receiver.local_id() == config.self_id.0
+            && config.sender.incarnation() == config.receiver.incarnation()
+            && config.sender.assignment_version() == assignment.version()
+            && config.receiver.assignment_version() == assignment.version()
+            && config.sender.active_assignment_digest() == Some(transition.target.digest())
+            && config.receiver.active_assignment_digest()
+                == config.sender.active_assignment_digest()
+            && transition.target.participant_incarnation(config.self_id.0)
+                == Some(config.sender.incarnation());
+        let inactive_transport = config.sender.assignment_version() == 0
+            && config.receiver.assignment_version() == 0
+            && config.sender.active_assignment_digest().is_none()
+            && config.receiver.active_assignment_digest().is_none()
+            && !transition.target.contains(config.self_id.0);
+        if transition.target.vnode_count != self.vnode_count.get()
+            || transition.target.assignment_version != assignment.version()
+            || !transition.target.matches_owner_map(&owners)
+            || config.sender.recovery_gen() != config.receiver.recovery_gen()
+            || target_contains_self != transition.target.contains(config.self_id.0)
+            || (target_contains_self && !active_transport)
+            || (!target_contains_self && !inactive_transport)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] transition target does not match active assignment {}",
+                self.name,
+                assignment.version()
+            )));
+        }
+        let predecessor_owners = self
+            .local_assignment
+            .owners()
+            .iter()
+            .map(|owner| owner.0)
+            .collect::<Vec<_>>();
+        if transition.predecessor.vnode_count != self.vnode_count.get()
+            || transition.predecessor.assignment_version != self.local_assignment.version()
+            || !transition
+                .predecessor
+                .matches_owner_map(&predecessor_owners)
+            || transition.predecessor.assignment_version.checked_add(1)
+                != Some(transition.target.assignment_version)
+            || self.local_assignment.owners().len() != assignment.owners().len()
+        {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] transition is not adjacent to its installed assignment {}",
+                self.name,
+                self.local_assignment.version()
+            )));
+        }
+
+        let predecessor_owned = if transition
+            .predecessor
+            .participant_incarnation(config.self_id.0)
+            == Some(config.sender.incarnation())
+        {
+            self.local_assignment
+                .owners()
+                .iter()
+                .enumerate()
+                .filter_map(|(vnode, owner)| (*owner == config.self_id).then_some(vnode as u32))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let target_owned = assignment
+            .owners()
+            .iter()
+            .enumerate()
+            .filter_map(|(vnode, owner)| (*owner == config.self_id).then_some(vnode as u32))
+            .collect::<Vec<_>>();
+        let expected_revoked = predecessor_owned
+            .iter()
+            .copied()
+            .filter(|vnode| target_owned.binary_search(vnode).is_err())
+            .collect::<rustc_hash::FxHashSet<_>>();
+        let expected_restored = target_owned
+            .iter()
+            .copied()
+            .filter(|vnode| predecessor_owned.binary_search(vnode).is_err())
+            .collect::<Vec<_>>();
+        let restored_vnodes = transition
+            .restores
+            .iter()
+            .map(|restore| restore.vnode)
+            .collect::<Vec<_>>();
+        if transition.revoked != &expected_revoked
+            || restored_vnodes != expected_restored
+            || restored_vnodes.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] transition does not match its exact ownership delta",
+                self.name
+            )));
+        }
+
+        if self.pending_frontiers.is_some()
+            || self.frontier_remaining != 0
+            || self.frontier_has_work
+            || self.queued_shuffle_bytes != 0
+            || self.queued_remote_events != 0
+            || self.last_broadcasts != self.local_frontiers
+        {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] transition requires a drained frontier and channel cut",
+                self.name
+            )));
+        }
+        let predecessor_peers = Self::remote_owner_peers(&self.local_assignment, config.self_id);
+        if self.cluster_peers.as_ref() != predecessor_peers.as_slice()
+            || self.peer_channels.iter().any(|channels| {
+                channels.len() != predecessor_peers.len()
+                    || !channels
+                        .keys()
+                        .copied()
+                        .eq(predecessor_peers.iter().copied())
+            })
+            || self
+                .remote_peer_cursors
+                .iter()
+                .flatten()
+                .any(|peer| predecessor_peers.binary_search(peer).is_err())
+        {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] transition found stale predecessor peer topology",
+                self.name
+            )));
+        }
+        let mut event_capacity_bytes = 0usize;
+        for channel in self.peer_channels.iter().flat_map(BTreeMap::values) {
+            if !channel.events.is_empty() || channel.accepted != channel.applied {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal join [{}] transition found undrained ordered channel state",
+                    self.name
+                )));
+            }
+            event_capacity_bytes = event_capacity_bytes
+                .checked_add(
+                    channel
+                        .events
+                        .capacity()
+                        .checked_mul(REMOTE_EVENT_CHARGE)
+                        .ok_or_else(|| self.accounting_error())?,
+                )
+                .ok_or_else(|| self.accounting_error())?;
+        }
+        if event_capacity_bytes != self.queued_event_capacity_bytes
+            || self.effective_cluster_frontiers(self.local_frontiers, None, None)? != self.frontiers
+        {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] transition found inconsistent channel accounting or frontier",
+                self.name
+            )));
+        }
+
+        let current =
+            self.derive_vnode_inventory(&self.local_assignment, config.self_id, |vnode| {
+                self.vnode_states[vnode as usize].as_deref()
+            })?;
+        if current.resident_vnodes != self.resident_vnodes
+            || current.vnode_pending_holds != self.vnode_pending_holds
+            || current.pending_hold_counts != self.pending_hold_counts
+            || current.retained_state_bytes != self.retained_state_bytes
+        {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] transition found inconsistent vnode caches",
+                self.name
+            )));
+        }
+
+        let live_bytes = self.checked_accounted_state_bytes()?;
+        if live_bytes > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("temporal join [{}] vnode transition", self.name),
+                accounted_bytes: live_bytes,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+        let restore_payload_bytes = transition
+            .restores
+            .iter()
+            .try_fold(0usize, |total, restore| {
+                total.checked_add(restore.state.len())
+            })
+            .ok_or_else(|| self.accounting_error())?;
+        if restore_payload_bytes > self.max_managed_state_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] transition restore payload exceeds its {}-byte limit",
+                self.name, self.max_managed_state_bytes
+            )));
+        }
+
+        let mut replacements = BTreeMap::new();
+        for &vnode in transition.revoked {
+            replacements.insert(vnode, None);
+        }
+        let mut restored_state_bytes = 0usize;
+        for restore in transition.restores {
+            let limit = if restore.state.first() == Some(&PRESENT_VNODE) {
+                self.max_managed_state_bytes
+                    .checked_sub(live_bytes)
+                    .and_then(|bytes| bytes.checked_sub(restore_payload_bytes))
+                    .and_then(|bytes| bytes.checked_sub(restored_state_bytes))
+                    .and_then(|bytes| bytes.checked_sub(PENDING_HOLD_ENTRY_CHARGE))
+                    .filter(|bytes| *bytes != 0)
+                    .ok_or_else(|| DbError::ManagedStateBudgetExceeded {
+                        context: format!(
+                            "temporal join [{}] vnode {} transition restore",
+                            self.name, restore.vnode
+                        ),
+                        accounted_bytes: live_bytes.saturating_add(restored_state_bytes),
+                        limit_bytes: self.max_managed_state_bytes,
+                    })?
+            } else {
+                1
+            };
+            let state = self.decode_vnode_frame(
+                restore.vnode,
+                transition.target.vnode_count,
+                restore.state,
+                limit,
+            )?;
+            if let Some(state) = state.as_ref() {
+                if Self::vnode_state_frontiers(state) != self.frontiers {
+                    return Err(DbError::Checkpoint(format!(
+                        "temporal join [{}] restored vnode {} is outside the transition frontier cut",
+                        self.name, restore.vnode
+                    )));
+                }
+                restored_state_bytes = restored_state_bytes
+                    .checked_add(state.accounted_state_bytes())
+                    .ok_or_else(|| self.accounting_error())?;
+            }
+            replacements.insert(restore.vnode, state);
+        }
+
+        let target_inventory =
+            self.derive_vnode_inventory(&assignment, config.self_id, |vnode| {
+                match replacements.get(&vnode) {
+                    Some(state) => state.as_deref(),
+                    None => self.vnode_states[vnode as usize].as_deref(),
+                }
+            })?;
+        if let (Some(published), Some(hold)) = (
+            self.published_output_frontier
+                .and_then(|frontier| frontier.watermark),
+            target_inventory
+                .pending_hold_counts
+                .first_key_value()
+                .map(|(hold, _)| *hold),
+        ) {
+            if hold < published {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal join [{}] restored hold {hold} precedes published output frontier {published}",
+                    self.name
+                )));
+            }
+        }
+
+        let target_peers = Self::remote_owner_peers(&assignment, config.self_id);
+        let mut peer_channels = [BTreeMap::new(), BTreeMap::new()];
+        for port in 0..2 {
+            for &peer in &target_peers {
+                let channel = self.peer_channels[port].get(&peer).map_or(
+                    TemporalPeerChannel {
+                        applied: self.frontiers[port],
+                        accepted: self.frontiers[port],
+                        events: VecDeque::new(),
+                    },
+                    |channel| TemporalPeerChannel {
+                        applied: channel.applied,
+                        accepted: channel.accepted,
+                        events: VecDeque::new(),
+                    },
+                );
+                peer_channels[port].insert(peer, channel);
+            }
+            let merged = merge_input_frontier_iter(
+                std::iter::once(self.local_frontiers[port])
+                    .chain(peer_channels[port].values().map(|channel| channel.applied)),
+                i64::MIN,
+            );
+            validate_frontier(
+                self.frontiers[port],
+                merged,
+                if port == 0 { "left" } else { "right" },
+                &self.name,
+            )?;
+        }
+
+        let bootstrap_broadcast = !target_owned.is_empty() && !target_peers.is_empty();
+        let prepared = PreparedTemporalJoinTransition {
+            slots: replacements.into_iter().collect(),
+            local_assignment: assignment,
+            resident_vnodes: target_inventory.resident_vnodes,
+            vnode_pending_holds: target_inventory.vnode_pending_holds,
+            pending_hold_counts: target_inventory.pending_hold_counts,
+            retained_state_bytes: target_inventory.retained_state_bytes,
+            maintenance_pending: target_inventory.maintenance_pending,
+            cluster_peers: target_peers.into(),
+            peer_channels,
+            bootstrap_broadcast,
+        };
+        let total = live_bytes
+            .checked_add(restore_payload_bytes)
+            .and_then(|bytes| bytes.checked_add(Self::transition_accounted_bytes(&prepared)))
+            .ok_or_else(|| self.accounting_error())?;
+        if total > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("temporal join [{}] prepared vnode transition", self.name),
+                accounted_bytes: total,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+        Ok(prepared)
+    }
+
     fn validate_vnode_roster(
         &self,
         required_vnodes: &[u32],
@@ -3002,10 +3555,29 @@ impl GraphOperator for ManagedTemporalJoinOperator {
     }
 
     fn managed_state_accounting(&self) -> Option<ManagedStateAccountingSnapshot> {
+        #[cfg(feature = "cluster")]
+        let (prepared, retired) = {
+            let prepared = self
+                .prepared_vnode_transition
+                .as_ref()
+                .map_or(0, Self::transition_accounted_bytes);
+            match self.vnode_transition_cleanup.as_ref() {
+                Some(TemporalJoinTransitionCleanup::Aborted(transition)) => (
+                    prepared.saturating_add(Self::transition_accounted_bytes(transition)),
+                    0,
+                ),
+                Some(TemporalJoinTransitionCleanup::Published(transition)) => {
+                    (prepared, Self::transition_accounted_bytes(transition))
+                }
+                None => (prepared, 0),
+            }
+        };
+        #[cfg(not(feature = "cluster"))]
+        let (prepared, retired) = (0, 0);
         Some(ManagedStateAccountingSnapshot {
             live: self.checked_accounted_state_bytes().unwrap_or(usize::MAX),
-            prepared: 0,
-            retired: 0,
+            prepared,
+            retired,
         })
     }
 
@@ -3276,7 +3848,8 @@ impl GraphOperator for ManagedTemporalJoinOperator {
     fn wants_input(&self) -> bool {
         let ready = self.pending_frontiers.is_none() && !self.maintenance_pending;
         #[cfg(feature = "cluster")]
-        let ready = ready && !self.has_remote_events();
+        let ready =
+            ready && !self.has_remote_events() && self.last_broadcasts == self.local_frontiers;
         ready
     }
 
@@ -3286,7 +3859,10 @@ impl GraphOperator for ManagedTemporalJoinOperator {
     }
 
     fn checkpoint_drain_pending(&self) -> bool {
-        self.pending_frontiers.is_some()
+        let pending = self.pending_frontiers.is_some();
+        #[cfg(feature = "cluster")]
+        let pending = pending || self.last_broadcasts != self.local_frontiers;
+        pending
     }
 
     #[cfg(feature = "cluster")]
@@ -3463,104 +4039,64 @@ impl GraphOperator for ManagedTemporalJoinOperator {
     }
 
     fn restore_vnode(&mut self, vnode: u32, vnode_count: u32, bytes: &[u8]) -> Result<(), DbError> {
-        if vnode_count != u32::from(self.key_group_count) || vnode >= vnode_count {
-            return Err(DbError::Checkpoint(format!(
-                "temporal join [{}] vnode {vnode} restore does not match its {vnode_count}-vnode topology",
-                self.name
-            )));
-        }
-        let (&tag, payload) = bytes.split_first().ok_or_else(|| {
-            DbError::Checkpoint(format!(
-                "temporal join [{}] vnode {vnode} frame is empty",
-                self.name
-            ))
-        })?;
-        let current_bytes = self.vnode_states[vnode as usize]
+        let current_bytes = self
+            .vnode_states
+            .get(vnode as usize)
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "temporal join [{}] vnode {vnode} restore does not match its {vnode_count}-vnode topology",
+                    self.name
+                ))
+            })?
             .as_ref()
             .map_or(0, |state| state.accounted_state_bytes());
-        let replacement = match tag {
-            ABSENT_VNODE if payload.is_empty() => None,
-            ABSENT_VNODE => {
-                return Err(DbError::Checkpoint(format!(
-                    "temporal join [{}] absent vnode {vnode} frame has a payload",
-                    self.name
-                )));
-            }
-            PRESENT_VNODE if !payload.is_empty() => {
-                let total = self.checked_accounted_state_bytes()?;
-                let other = total
-                    .checked_sub(current_bytes)
-                    .ok_or_else(|| self.accounting_error())?;
-                let limit = self
-                    .max_managed_state_bytes
-                    .checked_sub(other)
-                    .and_then(|limit| limit.checked_sub(PENDING_HOLD_ENTRY_CHARGE))
-                    .filter(|limit| *limit != 0)
-                    .ok_or_else(|| DbError::ManagedStateBudgetExceeded {
-                        context: format!("temporal join [{}] vnode {vnode} restore", self.name),
-                        accounted_bytes: total,
-                        limit_bytes: self.max_managed_state_bytes,
-                    })?;
-                let config = self.state_config(vnode, limit)?;
-                let state = TemporalJoinVnodeState::restore(
-                    Arc::clone(&self.left_schema),
-                    Arc::clone(&self.right_schema),
-                    config,
-                    payload,
-                )?;
-                let (left_watermark, left_idle, right_watermark, right_idle) =
-                    state.frontier_snapshot();
-                if self.whole_restored
-                    && !self.maintenance_pending
-                    && (state.has_ready_probes() || state.has_history_gc_work())
-                {
-                    return Err(DbError::Checkpoint(format!(
-                        "temporal join [{}] whole checkpoint omits restored maintenance work",
-                        self.name
-                    )));
-                }
-                let restored = [
-                    InputFrontier {
-                        watermark: left_watermark,
-                        idle: left_idle,
-                    },
-                    InputFrontier {
-                        watermark: right_watermark,
-                        idle: right_idle,
-                    },
-                ];
-                if self.whole_restored && self.frontiers != restored {
-                    return Err(DbError::Checkpoint(format!(
-                        "temporal join [{}] whole and vnode frontiers disagree",
-                        self.name
-                    )));
-                }
-                if self
-                    .restored_frontiers
-                    .is_some_and(|expected| expected != restored)
-                {
-                    return Err(DbError::Checkpoint(format!(
-                        "temporal join [{}] restored vnode frontiers disagree",
-                        self.name
-                    )));
-                }
-                self.restored_frontiers = Some(restored);
-                self.frontiers = restored;
-                Some(Box::new(state))
-            }
-            PRESENT_VNODE => {
-                return Err(DbError::Checkpoint(format!(
-                    "temporal join [{}] present vnode {vnode} frame has no payload",
-                    self.name
-                )));
-            }
-            _ => {
-                return Err(DbError::Checkpoint(format!(
-                    "temporal join [{}] vnode {vnode} frame has unknown tag {tag}",
-                    self.name
-                )));
-            }
+        let total = self.checked_accounted_state_bytes()?;
+        let limit = if bytes.first() == Some(&PRESENT_VNODE) {
+            let other = total
+                .checked_sub(current_bytes)
+                .ok_or_else(|| self.accounting_error())?;
+            self.max_managed_state_bytes
+                .checked_sub(other)
+                .and_then(|limit| limit.checked_sub(PENDING_HOLD_ENTRY_CHARGE))
+                .filter(|limit| *limit != 0)
+                .ok_or_else(|| DbError::ManagedStateBudgetExceeded {
+                    context: format!("temporal join [{}] vnode {vnode} restore", self.name),
+                    accounted_bytes: total,
+                    limit_bytes: self.max_managed_state_bytes,
+                })?
+        } else {
+            1
         };
+        let replacement = self.decode_vnode_frame(vnode, vnode_count, bytes, limit)?;
+        if let Some(state) = replacement.as_ref() {
+            let restored = Self::vnode_state_frontiers(state);
+            if self.whole_restored
+                && !self.maintenance_pending
+                && (state.has_ready_probes() || state.has_history_gc_work())
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal join [{}] whole checkpoint omits restored maintenance work",
+                    self.name
+                )));
+            }
+            if self.whole_restored && self.frontiers != restored {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal join [{}] whole and vnode frontiers disagree",
+                    self.name
+                )));
+            }
+            if self
+                .restored_frontiers
+                .is_some_and(|expected| expected != restored)
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal join [{}] restored vnode frontiers disagree",
+                    self.name
+                )));
+            }
+            self.restored_frontiers = Some(restored);
+            self.frontiers = restored;
+        }
         let replacement_bytes = replacement
             .as_ref()
             .map_or(0, |state| state.accounted_state_bytes());
@@ -3598,6 +4134,84 @@ impl GraphOperator for ManagedTemporalJoinOperator {
             }
         }
         Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn prepare_vnode_transition(
+        &mut self,
+        transition: ManagedVnodeTransition<'_>,
+    ) -> Result<(), DbError> {
+        if self.prepared_vnode_transition.is_some() || self.vnode_transition_cleanup.is_some() {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] already owns vnode transition state",
+                self.name
+            )));
+        }
+        self.prepared_vnode_transition = Some(self.prepare_transition_image(transition)?);
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn abort_vnode_transition(&mut self) {
+        let Some(prepared) = self.prepared_vnode_transition.take() else {
+            return;
+        };
+        assert!(self.vnode_transition_cleanup.is_none());
+        self.vnode_transition_cleanup = Some(TemporalJoinTransitionCleanup::Aborted(prepared));
+    }
+
+    #[cfg(feature = "cluster")]
+    fn publish_vnode_transition(&mut self) {
+        let mut prepared = self
+            .prepared_vnode_transition
+            .take()
+            .expect("temporal join transition must be prepared before publication");
+        assert!(self.vnode_transition_cleanup.is_none());
+        for (vnode, state) in &mut prepared.slots {
+            let index = *vnode as usize;
+            std::mem::swap(&mut self.vnode_states[index], state);
+            self.checkpointed_vnodes[index] = false;
+            self.dirty_vnodes[index] = false;
+        }
+        std::mem::swap(&mut self.local_assignment, &mut prepared.local_assignment);
+        std::mem::swap(&mut self.resident_vnodes, &mut prepared.resident_vnodes);
+        std::mem::swap(
+            &mut self.vnode_pending_holds,
+            &mut prepared.vnode_pending_holds,
+        );
+        std::mem::swap(
+            &mut self.pending_hold_counts,
+            &mut prepared.pending_hold_counts,
+        );
+        std::mem::swap(
+            &mut self.retained_state_bytes,
+            &mut prepared.retained_state_bytes,
+        );
+        self.maintenance_cursor = 0;
+        self.maintenance_pending = prepared.maintenance_pending;
+        self.maintenance_remaining = if self.maintenance_pending {
+            self.resident_vnodes.len()
+        } else {
+            0
+        };
+        self.maintenance_rescan = false;
+        std::mem::swap(&mut self.cluster_peers, &mut prepared.cluster_peers);
+        std::mem::swap(&mut self.peer_channels, &mut prepared.peer_channels);
+        self.last_broadcasts = if prepared.bootstrap_broadcast {
+            [InputFrontier::default(); 2]
+        } else {
+            self.local_frontiers
+        };
+        self.remote_peer_cursors = [None; 2];
+        self.queued_shuffle_bytes = 0;
+        self.queued_remote_events = 0;
+        self.queued_event_capacity_bytes = 0;
+        self.vnode_transition_cleanup = Some(TemporalJoinTransitionCleanup::Published(prepared));
+    }
+
+    #[cfg(feature = "cluster")]
+    fn finish_vnode_transition(&mut self) {
+        self.vnode_transition_cleanup = None;
     }
 
     fn force_full_vnode_capture(&mut self) {
@@ -4180,6 +4794,154 @@ mod tests {
             receiver,
             self_id: NodeId(1),
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn install_all_local_assignment(scope: &ClusterShuffleConfig) -> CheckpointAssignmentFence {
+        use laminar_core::checkpoint::CheckpointParticipant;
+
+        let version = scope.registry.assignment_version() + 1;
+        let owners = [1_u64, 1];
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            version,
+            &owners,
+            vec![CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: uuid::Uuid::from_u128(1),
+            }],
+        )
+        .unwrap();
+        scope
+            .sender
+            .install_assignment_fence(&fence, &owners)
+            .unwrap();
+        scope
+            .receiver
+            .install_assignment_fence(&fence, &owners)
+            .unwrap();
+        scope
+            .registry
+            .set_assignment_and_version(Arc::from(owners.map(NodeId)), version);
+        fence
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn vnode_transition_is_atomic_and_publishes_target_topology() {
+        use laminar_core::checkpoint::CheckpointParticipant;
+
+        use crate::operator_graph::ManagedVnodeRestore;
+
+        let key = key_for_vnode(1);
+        let cut = frontier(100);
+        let (mut donor, _, _) = operator(8);
+        donor
+            .process_with_frontiers(
+                &[
+                    Vec::new(),
+                    vec![right_batch(
+                        std::slice::from_ref(&key),
+                        &["X"],
+                        &[90],
+                        &["live"],
+                        &[SourceMutation::Put],
+                    )],
+                ],
+                &cut,
+            )
+            .await
+            .unwrap();
+        while !donor.wants_input() {
+            donor.process_with_frontiers(&[], &cut).await.unwrap();
+        }
+        let captured = donor.checkpoint_vnodes(&[1], 2).unwrap().unwrap();
+        let frame = captured[0].state.as_deref().unwrap();
+
+        let (mut target, _, _) = operator(8);
+        let scope = two_owner_scope().await;
+        target.attach_cluster_shuffle(scope.clone());
+        target.frontiers = cut;
+        target.local_frontiers = cut;
+        target.last_broadcasts = cut;
+        for channel in target
+            .peer_channels
+            .iter_mut()
+            .flat_map(BTreeMap::values_mut)
+        {
+            channel.applied = cut[0];
+            channel.accepted = cut[0];
+        }
+        let predecessor_version = target.local_assignment.version();
+        let predecessor = CheckpointAssignmentFence::from_owner_map(
+            predecessor_version,
+            &[1, 2],
+            vec![
+                CheckpointParticipant {
+                    node_id: 1,
+                    boot_incarnation: uuid::Uuid::from_u128(1),
+                },
+                CheckpointParticipant {
+                    node_id: 2,
+                    boot_incarnation: uuid::Uuid::from_u128(2),
+                },
+            ],
+        )
+        .unwrap();
+        let fence = install_all_local_assignment(&scope);
+        let corrupt = [PRESENT_VNODE, 0xff];
+        let corrupt_restore = [ManagedVnodeRestore {
+            vnode: 1,
+            state: &corrupt,
+        }];
+        target
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &fence,
+                revoked: &rustc_hash::FxHashSet::default(),
+                restores: &corrupt_restore,
+            })
+            .unwrap_err();
+        assert_eq!(target.local_assignment.version(), predecessor_version);
+        assert!(target.vnode_states.iter().all(Option::is_none));
+        assert_eq!(target.cluster_peers.as_ref(), &[2]);
+
+        let restores = [ManagedVnodeRestore {
+            vnode: 1,
+            state: frame,
+        }];
+        target
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &fence,
+                revoked: &rustc_hash::FxHashSet::default(),
+                restores: &restores,
+            })
+            .unwrap();
+        assert!(target.managed_state_accounting().unwrap().prepared > 0);
+        target.abort_vnode_transition();
+        assert!(target.vnode_states.iter().all(Option::is_none));
+        target.finish_vnode_transition();
+
+        target
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &fence,
+                revoked: &rustc_hash::FxHashSet::default(),
+                restores: &restores,
+            })
+            .unwrap();
+        target.publish_vnode_transition();
+        assert_eq!(target.local_assignment.version(), fence.assignment_version);
+        assert_eq!(target.resident_vnodes, [1]);
+        assert_eq!(
+            target.vnode_states[1].as_ref().unwrap().retained_versions(),
+            1
+        );
+        assert!(target.cluster_peers.is_empty());
+        assert!(target.managed_state_accounting().unwrap().retired > 0);
+        target.finish_vnode_transition();
+        assert!(!target.checkpoint_drain_pending());
+        assert!(target.wants_input());
     }
 
     #[cfg(feature = "cluster")]

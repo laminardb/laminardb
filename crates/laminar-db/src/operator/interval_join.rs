@@ -1575,6 +1575,7 @@ mod tests {
         let self_id = NodeId(1);
         let incarnation = uuid::Uuid::from_u128(1);
         let registry = Arc::new(VnodeRegistry::single_owner(vnode_count, self_id));
+        registry.set_assignment(vec![self_id; vnode_count as usize].into());
         let receiver = Arc::new(
             laminar_core::shuffle::ShuffleReceiver::bind(
                 self_id.0,
@@ -1616,6 +1617,19 @@ mod tests {
             },
             fence,
         )
+    }
+
+    #[cfg(feature = "cluster")]
+    fn single_owner_predecessor(
+        target: &laminar_core::checkpoint::CheckpointAssignmentFence,
+    ) -> laminar_core::checkpoint::CheckpointAssignmentFence {
+        let owners = vec![1; target.vnode_count as usize];
+        laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
+            target.assignment_version - 1,
+            &owners,
+            target.participants.clone(),
+        )
+        .unwrap()
     }
 
     #[cfg(feature = "cluster")]
@@ -2335,8 +2349,10 @@ mod tests {
         );
         restored.attach_cluster_shuffle(restored_shuffle);
         restored.restore(checkpoint).unwrap();
+        let predecessor = single_owner_predecessor(&fence);
         restored
             .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
                 target: &fence,
                 revoked: &rustc_hash::FxHashSet::default(),
                 restores: &[],
@@ -2407,8 +2423,10 @@ mod tests {
             vnode,
             state: slice,
         }];
+        let predecessor = single_owner_predecessor(&fence);
         restored
             .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
                 target: &fence,
                 revoked: &rustc_hash::FxHashSet::default(),
                 restores: &restores,
@@ -2424,6 +2442,7 @@ mod tests {
         restored.finish_vnode_transition();
         restored
             .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
                 target: &fence,
                 revoked: &rustc_hash::FxHashSet::default(),
                 restores: &restores,
