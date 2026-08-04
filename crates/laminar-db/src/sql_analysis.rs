@@ -7,8 +7,6 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use datafusion::physical_plan::PhysicalExpr;
-use datafusion::prelude::SessionContext;
 use datafusion_expr::LogicalPlan;
 use sqlparser::ast::{
     visit_expressions, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
@@ -329,20 +327,6 @@ fn normalize_ident(ident: &Ident) -> String {
     ident.value.clone()
 }
 
-/// Compiled post-join projection for stateful queries.
-pub(crate) struct CompiledPostProjection {
-    pub(crate) exprs: Vec<Arc<dyn PhysicalExpr>>,
-    pub(crate) output_schema: SchemaRef,
-}
-
-impl std::fmt::Debug for CompiledPostProjection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CompiledPostProjection")
-            .field("output_schema", &self.output_schema)
-            .finish_non_exhaustive()
-    }
-}
-
 pub(crate) struct ProjectionFilterInfo {
     pub(crate) proj_exprs: Vec<datafusion_expr::Expr>,
     pub(crate) filter_predicate: Option<datafusion_expr::Expr>,
@@ -419,39 +403,6 @@ fn extract_filter_or_scan(
     }
 }
 
-pub(crate) fn extract_projection_exprs(
-    plan: &LogicalPlan,
-    input_schema: &SchemaRef,
-    ctx: &SessionContext,
-) -> Option<(Vec<Arc<dyn PhysicalExpr>>, SchemaRef)> {
-    let proj = match plan {
-        LogicalPlan::Projection(p) => p,
-        LogicalPlan::SubqueryAlias(a) => {
-            return extract_projection_exprs(&a.input, input_schema, ctx);
-        }
-        _ => return None,
-    };
-
-    let df_schema = datafusion_common::DFSchema::try_from(input_schema.as_ref().clone()).ok()?;
-    let state = ctx.state();
-    let exec_props = state.execution_props();
-
-    let mut exprs = Vec::with_capacity(proj.expr.len());
-    let mut fields = Vec::with_capacity(proj.expr.len());
-
-    for (i, expr) in proj.expr.iter().enumerate() {
-        let phys =
-            datafusion::physical_expr::create_physical_expr(expr, &df_schema, exec_props).ok()?;
-        let name = proj.schema.field(i).name().clone();
-        let dt = phys.data_type(input_schema).ok()?;
-        let nullable = phys.nullable(input_schema).unwrap_or(true);
-        fields.push(arrow::datatypes::Field::new(name, dt, nullable));
-        exprs.push(phys);
-    }
-
-    let output_schema = Arc::new(arrow::datatypes::Schema::new(fields));
-    Some((exprs, output_schema))
-}
 use crate::operator::lookup_enrich::{disambiguated_lookup_name, LookupEnrichConfig};
 
 /// Detect a partial lookup-enrich join and return its operator config plus residual projection.

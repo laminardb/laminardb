@@ -486,8 +486,7 @@ pub(crate) fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
     }
 }
 
-/// Pre-compiled projection: evaluates pre-agg expressions via `PhysicalExpr::evaluate`
-/// instead of re-planning SQL each cycle.
+/// Compiled projection and optional filter evaluated directly against Arrow batches.
 pub(crate) struct CompiledProjection {
     pub(crate) exprs: Vec<Arc<dyn PhysicalExpr>>,
     pub(crate) filter: Option<Arc<dyn PhysicalExpr>>,

@@ -9,9 +9,10 @@ use arrow::datatypes::SchemaRef;
 use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
 
+use crate::aggregate_state::CompiledProjection;
 use crate::db::exact_table_reference;
 use crate::error::DbError;
-use crate::sql_analysis::{extract_projection_exprs, CompiledPostProjection};
+use crate::sql_analysis::extract_projection_filter;
 
 #[cfg(feature = "cluster")]
 #[derive(Clone)]
@@ -254,21 +255,58 @@ pub(crate) async fn try_compile_post_projection(
     proj_sql: &str,
     tmp_table_name: &str,
     batch_schema: &SchemaRef,
-) -> Option<CompiledPostProjection> {
+) -> Option<CompiledProjection> {
     let empty =
         datafusion::datasource::MemTable::try_new(batch_schema.clone(), vec![vec![]]).ok()?;
     let _ = ctx.deregister_table(exact_table_reference(tmp_table_name));
     ctx.register_table(exact_table_reference(tmp_table_name), Arc::new(empty))
         .ok()?;
 
-    let df = ctx.sql(proj_sql).await.ok()?;
-    let plan = df.logical_plan().clone();
+    let plan = ctx
+        .sql(proj_sql)
+        .await
+        .ok()
+        .map(|dataframe| dataframe.logical_plan().clone());
     let _ = ctx.deregister_table(exact_table_reference(tmp_table_name));
+    let plan = plan?;
 
-    let (exprs, output_schema) = extract_projection_exprs(&plan, batch_schema, ctx)?;
-    Some(CompiledPostProjection {
+    let info = extract_projection_filter(&plan)?;
+    let state = ctx.state();
+    let props = state.execution_props();
+    let mut exprs = Vec::with_capacity(info.proj_exprs.len());
+    let mut fields = Vec::with_capacity(info.proj_exprs.len());
+    for expr in &info.proj_exprs {
+        let physical =
+            datafusion::physical_expr::create_physical_expr(expr, &info.input_df_schema, props)
+                .ok()?;
+        let data_type = physical.data_type(info.input_df_schema.as_arrow()).ok()?;
+        let nullable = physical
+            .nullable(info.input_df_schema.as_arrow())
+            .unwrap_or(true);
+        let name = match expr {
+            datafusion_expr::Expr::Column(column) => column.name.clone(),
+            datafusion_expr::Expr::Alias(alias) => alias.name.clone(),
+            _ => expr.schema_name().to_string(),
+        };
+        fields.push(arrow::datatypes::Field::new(name, data_type, nullable));
+        exprs.push(physical);
+    }
+    let filter = if let Some(predicate) = info.filter_predicate.as_ref() {
+        Some(
+            datafusion::physical_expr::create_physical_expr(
+                predicate,
+                &info.input_df_schema,
+                props,
+            )
+            .ok()?,
+        )
+    } else {
+        None
+    };
+    Some(CompiledProjection {
         exprs,
-        output_schema,
+        filter,
+        output_schema: Arc::new(arrow::datatypes::Schema::new(fields)),
     })
 }
 
@@ -403,30 +441,10 @@ mod shuffle_tests {
     }
 }
 
-fn apply_compiled_post_projection(
-    proj: &CompiledPostProjection,
-    batch: &RecordBatch,
-) -> Result<RecordBatch, DbError> {
-    if batch.num_rows() == 0 {
-        return Ok(RecordBatch::new_empty(Arc::clone(&proj.output_schema)));
-    }
-    let mut arrays = Vec::with_capacity(proj.exprs.len());
-    for expr in &proj.exprs {
-        let col = expr
-            .evaluate(batch)
-            .map_err(|e| DbError::Pipeline(format!("post-projection evaluate: {e}")))?
-            .into_array(batch.num_rows())
-            .map_err(|e| DbError::Pipeline(format!("post-projection to array: {e}")))?;
-        arrays.push(col);
-    }
-    RecordBatch::try_new(Arc::clone(&proj.output_schema), arrays)
-        .map_err(|e| DbError::Pipeline(format!("post-projection batch: {e}")))
-}
-
 /// Compiled-expr or `LiveSqlCache` fallback for post-projection; populated on first use.
 #[derive(Default)]
 pub(crate) struct PostProjectionCache {
-    compiled: Option<CompiledPostProjection>,
+    compiled: Option<CompiledProjection>,
     compile_failed: bool,
     sql_cache: Option<LiveSqlCache>,
 }
@@ -499,7 +517,7 @@ pub(crate) async fn apply_post_projection(
     if let Some(ref proj) = cache.compiled {
         let mut result = Vec::with_capacity(batches.len());
         for batch in &batches {
-            let projected = apply_compiled_post_projection(proj, batch)?;
+            let projected = proj.evaluate(batch)?;
             if projected.num_rows() > 0 {
                 result.push(projected);
             }
@@ -518,4 +536,48 @@ pub(crate) async fn apply_post_projection(
         .expect("sql_cache built above")
         .apply(op_name, batches)
         .await
+}
+
+#[cfg(test)]
+mod post_projection_tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    #[tokio::test]
+    async fn compiled_post_projection_applies_where_filter() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+        let mut cache = PostProjectionCache::default();
+        let result = apply_post_projection(
+            &SessionContext::new(),
+            "projection_filter_test",
+            "__post_projection_filter_test",
+            Some("SELECT value + 1 AS adjusted FROM __post_projection_filter_test WHERE id >= 2"),
+            &mut cache,
+            vec![batch],
+        )
+        .await
+        .unwrap();
+
+        assert!(cache.compiled.is_some());
+        assert!(cache.sql_cache.is_none());
+        assert_eq!(result.len(), 1);
+        let adjusted = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(adjusted.values(), &[21, 31]);
+    }
 }
