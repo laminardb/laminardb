@@ -82,6 +82,42 @@ impl InputFrontier {
     }
 }
 
+pub(crate) fn merge_input_frontiers(
+    frontiers: &[InputFrontier],
+    legacy_watermark: i64,
+) -> InputFrontier {
+    let mut active_seen = false;
+    let mut active_watermark = Some(i64::MAX);
+    let mut idle_watermark = None;
+    for frontier in frontiers {
+        if frontier.idle {
+            if let Some(watermark) = frontier.watermark {
+                idle_watermark =
+                    Some(idle_watermark.map_or(watermark, |known: i64| known.max(watermark)));
+            }
+        } else {
+            active_seen = true;
+            active_watermark = match (active_watermark, frontier.watermark) {
+                (Some(current), Some(watermark)) => Some(current.min(watermark)),
+                _ => None,
+            };
+        }
+    }
+    if active_seen {
+        InputFrontier {
+            watermark: active_watermark,
+            idle: false,
+        }
+    } else if frontiers.is_empty() {
+        InputFrontier::from_legacy(legacy_watermark)
+    } else {
+        InputFrontier {
+            watermark: idle_watermark,
+            idle: true,
+        }
+    }
+}
+
 impl ManagedStateAccountingSnapshot {
     fn total_bytes(self) -> usize {
         self.live
@@ -180,6 +216,11 @@ pub(crate) trait GraphOperator: Send {
 
     /// Whether barrier alignment retained shuffle input that must replay before vnode handoff.
     fn checkpoint_aligned_replay_pending(&self) -> bool {
+        false
+    }
+
+    /// Whether non-snapshotable internal work must finish before checkpoint capture.
+    fn checkpoint_drain_pending(&self) -> bool {
         false
     }
 
@@ -977,7 +1018,9 @@ impl OperatorGraph {
             .iter()
             .enumerate()
             .filter(|(_, node)| !node.removed)
-            .all(|(node_id, _)| !self.node_has_buffered_input(node_id))
+            .all(|(node_id, node)| {
+                !self.node_has_buffered_input(node_id) && !node.operator.checkpoint_drain_pending()
+            })
     }
 
     /// Whether the graph can hand off vnode state without transferring retained shuffle replay.
@@ -1023,7 +1066,8 @@ impl OperatorGraph {
         for (node_id, node) in self.nodes.iter().enumerate() {
             if !node.removed
                 && (self.node_has_buffered_input(node_id)
-                    || node.operator.checkpoint_aligned_replay_pending())
+                    || node.operator.checkpoint_aligned_replay_pending()
+                    || node.operator.checkpoint_drain_pending())
             {
                 drain.insert(node_id);
                 pending.push_back(node_id);
@@ -2507,37 +2551,7 @@ impl OperatorGraph {
             return;
         }
 
-        let mut active_seen = false;
-        let mut active_watermark = Some(i64::MAX);
-        let mut idle_watermark = None;
-        for frontier in frontiers {
-            if frontier.idle {
-                if let Some(watermark) = frontier.watermark {
-                    idle_watermark =
-                        Some(idle_watermark.map_or(watermark, |known: i64| known.max(watermark)));
-                }
-            } else {
-                active_seen = true;
-                active_watermark = match (active_watermark, frontier.watermark) {
-                    (Some(current), Some(watermark)) => Some(current.min(watermark)),
-                    _ => None,
-                };
-            }
-        }
-
-        let mut output = if active_seen {
-            InputFrontier {
-                watermark: active_watermark,
-                idle: false,
-            }
-        } else if frontiers.is_empty() {
-            InputFrontier::from_legacy(current_watermark)
-        } else {
-            InputFrontier {
-                watermark: idle_watermark,
-                idle: true,
-            }
-        };
+        let mut output = merge_input_frontiers(frontiers, current_watermark);
         if let Some(hold) = self.nodes[node_id].operator.watermark_hold() {
             output.watermark = output.watermark.map(|watermark| watermark.min(hold));
             output.idle = false;
@@ -2983,7 +2997,8 @@ impl OperatorGraph {
             .filter(|(node_id, node)| {
                 !node.removed
                     && (self.node_has_buffered_input(*node_id)
-                        || node.operator.checkpoint_aligned_replay_pending())
+                        || node.operator.checkpoint_aligned_replay_pending()
+                        || node.operator.checkpoint_drain_pending())
             })
             .map(|(node_id, _)| node_id)
             .collect();

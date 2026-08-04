@@ -222,7 +222,10 @@ fn default_operator_rejects_ordered_shuffle_staging() {
 }
 
 #[cfg(feature = "cluster")]
-struct CheckpointAlignedReplayProbe(Arc<std::sync::atomic::AtomicBool>);
+struct CheckpointAlignedReplayProbe {
+    aligned_replay: Arc<std::sync::atomic::AtomicBool>,
+    checkpoint_drain: Arc<std::sync::atomic::AtomicBool>,
+}
 
 #[cfg(feature = "cluster")]
 #[async_trait]
@@ -244,7 +247,13 @@ impl GraphOperator for CheckpointAlignedReplayProbe {
     }
 
     fn checkpoint_aligned_replay_pending(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Acquire)
+        self.aligned_replay
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn checkpoint_drain_pending(&self) -> bool {
+        self.checkpoint_drain
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -252,10 +261,14 @@ impl GraphOperator for CheckpointAlignedReplayProbe {
 #[test]
 fn handoff_quiescence_includes_checkpoint_aligned_replay() {
     let replay_pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let drain_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
     graph.push_test_node(
         "replay",
-        Box::new(CheckpointAlignedReplayProbe(Arc::clone(&replay_pending))),
+        Box::new(CheckpointAlignedReplayProbe {
+            aligned_replay: Arc::clone(&replay_pending),
+            checkpoint_drain: Arc::clone(&drain_pending),
+        }),
     );
     graph.compute_topo_order();
 
@@ -265,6 +278,13 @@ fn handoff_quiescence_includes_checkpoint_aligned_replay() {
     assert!(graph.take_cycle_deferrals().0);
 
     replay_pending.store(false, std::sync::atomic::Ordering::Release);
+    drain_pending.store(true, std::sync::atomic::Ordering::Release);
+    assert!(!graph.checkpoint_is_quiescent());
+    assert!(!graph.handoff_is_quiescent());
+    graph.record_cycle_deferrals();
+    assert!(graph.take_cycle_deferrals().0);
+
+    drain_pending.store(false, std::sync::atomic::Ordering::Release);
     assert!(graph.handoff_is_quiescent());
 }
 

@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use crate::error::DbError;
 
 const FORMAT_VERSION: u8 = 2;
+const CHECKPOINT_ALIGNMENT: usize = rkyv::util::AlignedVec::<16>::ALIGNMENT;
 const MAP_ENTRY_CHARGE: usize = 128;
 const VERSION_ENTRY_CHARGE: usize = 256;
 const TIMER_ENTRY_CHARGE: usize = 96;
@@ -249,6 +250,7 @@ pub(crate) struct TemporalJoinVnodeState {
     config: TemporalJoinStateConfig,
     offsets: Vec<i64>,
     minimum_offset: i64,
+    maximum_offset: i64,
     left_schema: SchemaRef,
     right_schema: SchemaRef,
     output_schema: SchemaRef,
@@ -289,6 +291,11 @@ impl TemporalJoinVnodeState {
             .copied()
             .min()
             .expect("validated temporal schedule is non-empty");
+        let maximum_offset = offsets
+            .iter()
+            .copied()
+            .max()
+            .expect("validated temporal schedule is non-empty");
         if config.schedule.is_multi_horizon() && !config.emit_probe_metadata {
             return Err(DbError::Config(
                 "multi-horizon temporal probes must emit offset_ms and probe_time".into(),
@@ -316,6 +323,7 @@ impl TemporalJoinVnodeState {
             config,
             offsets,
             minimum_offset,
+            maximum_offset,
             left_schema,
             right_schema,
             output_schema,
@@ -358,6 +366,33 @@ impl TemporalJoinVnodeState {
 
     pub(crate) const fn accounted_state_bytes(&self) -> usize {
         self.charged_bytes
+    }
+
+    pub(crate) fn set_retained_byte_limit(&mut self, bytes: usize) -> Result<(), DbError> {
+        if bytes < self.charged_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("temporal join vnode {} retained state", self.config.vnode),
+                accounted_bytes: self.charged_bytes,
+                limit_bytes: bytes,
+            });
+        }
+        self.config.limits.max_retained_bytes = bytes;
+        Ok(())
+    }
+
+    pub(crate) const fn frontier_snapshot(&self) -> (Option<i64>, bool, Option<i64>, bool) {
+        (
+            self.left_frontier,
+            self.left_idle,
+            self.right_frontier,
+            self.right_idle,
+        )
+    }
+
+    pub(crate) fn pending_watermark_hold(&self) -> Option<i64> {
+        let (&deadline, _) = self.timers.first_key_value()?;
+        let earliest_probe = deadline - self.config.right_allowed_lateness_ms;
+        Some(earliest_probe.min(earliest_probe.saturating_sub(self.maximum_offset)))
     }
 
     pub(crate) fn apply_right_batch(
@@ -986,6 +1021,15 @@ impl TemporalJoinVnodeState {
         config: TemporalJoinStateConfig,
         bytes: &[u8],
     ) -> Result<Self, DbError> {
+        let aligned;
+        let bytes = if bytes.as_ptr().align_offset(CHECKPOINT_ALIGNMENT) == 0 {
+            bytes
+        } else {
+            let mut copy = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+            copy.extend_from_slice(bytes);
+            aligned = copy;
+            &aligned
+        };
         let checkpoint = rkyv::from_bytes::<TemporalJoinCheckpoint, rkyv::rancor::Error>(bytes)
             .map_err(|error| DbError::Checkpoint(format!("temporal checkpoint: {error}")))?;
         let mut state = Self::try_new(left_schema, right_schema, config)?;
@@ -3007,6 +3051,7 @@ mod tests {
         );
         assert_eq!(state.probe_left_batch(&left).unwrap().num_rows(), 0);
         assert_eq!(state.pending_probes(), 2);
+        assert_eq!(state.pending_watermark_hold(), Some(100));
         state.advance_right_frontier(Some(149), false).unwrap();
         assert!(!state.has_ready_probes());
         state.advance_right_frontier(Some(150), false).unwrap();
@@ -3030,6 +3075,7 @@ mod tests {
         assert_eq!(drained.drained_probes, 1);
         assert!(!drained.has_more);
         assert_eq!(state.pending_probes(), 0);
+        assert_eq!(state.pending_watermark_hold(), None);
         assert_eq!(
             state.accounted_state_bytes(),
             calculate_charge(&state).unwrap()
@@ -3258,6 +3304,7 @@ mod tests {
                 .unwrap();
         assert_eq!(restored.retained_versions(), 1);
         assert_eq!(restored.pending_probes(), 1);
+        assert_eq!(restored.pending_watermark_hold(), Some(100));
         assert!(restored.has_ready_probes());
         let drained = restored
             .drain_ready_probes(NonZeroUsize::new(1).unwrap())

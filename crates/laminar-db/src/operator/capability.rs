@@ -33,6 +33,8 @@ pub(crate) enum ManagedStateContract {
     CoreWindowV1,
     /// Whole-image state for the bounded, append-only vnode-keyed interval join.
     BoundedIntervalJoinV1,
+    /// Vnode-local version history, probes, frontiers, and timers for temporal joins.
+    TemporalJoinV1,
     #[cfg(test)]
     TestVnodeStateV1,
 }
@@ -143,10 +145,15 @@ impl OperatorCapability {
             Implementation::Tombstoned | Implementation::Rejecting => {
                 Self::internal(implementation, State::Stateless)
             }
-            Implementation::ChangelogEnrich | Implementation::TemporalJoin => Self::rejected(
+            Implementation::ChangelogEnrich => Self::rejected(
                 implementation,
                 State::RebuildableReplicated,
                 "replicated lookup state has no cluster snapshot/version contract",
+            ),
+            Implementation::TemporalJoin => Self::rejected(
+                implementation,
+                State::VnodeKeyed,
+                "temporal state is DDL-closed until ordered cluster channels and recovery are certified",
             ),
             Implementation::AiInference => Self::rejected(
                 implementation,
@@ -226,6 +233,16 @@ impl OperatorCapability {
             OperatorStateClass::VnodeKeyed,
         )
         .with_managed_state(ManagedStateContract::BoundedIntervalJoinV1)
+    }
+
+    /// Descriptor for the managed temporal operator while its DDL cutover remains closed.
+    pub(crate) const fn managed_temporal_join() -> Self {
+        Self::rejected(
+            OperatorImplementation::TemporalJoin,
+            OperatorStateClass::VnodeKeyed,
+            "temporal state is DDL-closed until ordered cluster channels and recovery are certified",
+        )
+        .with_managed_state(ManagedStateContract::TemporalJoinV1)
     }
 
     /// Descriptor for the DDL-guarded, vnode-managed grouped-aggregate path.
@@ -339,9 +356,9 @@ mod tests {
             (Implementation::Rejecting, State::Stateless, InternalOnly),
             (
                 Implementation::TemporalJoin,
-                State::RebuildableReplicated,
+                State::VnodeKeyed,
                 Rejected {
-                    reason: "replicated lookup state has no cluster snapshot/version contract",
+                    reason: "temporal state is DDL-closed until ordered cluster channels and recovery are certified",
                 },
             ),
             (

@@ -628,7 +628,8 @@ impl OperatorGraph {
             match contract {
                 ManagedStateContract::SqlAggregateV1
                 | ManagedStateContract::CoreWindowV1
-                | ManagedStateContract::BoundedIntervalJoinV1 => {}
+                | ManagedStateContract::BoundedIntervalJoinV1
+                | ManagedStateContract::TemporalJoinV1 => {}
                 #[cfg(test)]
                 ManagedStateContract::TestVnodeStateV1 => continue,
             }
