@@ -528,7 +528,7 @@ pub trait PipelineCallback: Send + 'static {
         batch: &RecordBatch,
     ) -> Result<(), CycleError>;
 
-    /// Filter late rows from a validated visible batch.
+    /// Filter late rows while preserving any validated hidden source metadata.
     fn filter_late_rows(
         &self,
         source_name: &str,

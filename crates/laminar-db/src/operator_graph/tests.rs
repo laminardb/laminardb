@@ -1,5 +1,5 @@
 use super::*;
-use arrow::array::{Array, Float64Array, Int64Array, StringArray};
+use arrow::array::{Array, BinaryArray, Float64Array, Int64Array, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 
 fn test_schema() -> Arc<Schema> {
@@ -23,6 +23,28 @@ fn test_batch() -> RecordBatch {
 }
 
 struct RichFrontierProbe(Arc<parking_lot::Mutex<Vec<InputFrontier>>>);
+
+struct BatchProbe(Arc<parking_lot::Mutex<Vec<RecordBatch>>>);
+
+#[async_trait]
+impl GraphOperator for BatchProbe {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        self.0.lock().extend(inputs.iter().flatten().cloned());
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+}
 
 #[async_trait]
 impl GraphOperator for RichFrontierProbe {
@@ -2063,6 +2085,106 @@ fn test_source_passthrough() {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 2);
     });
+}
+
+#[tokio::test]
+async fn source_views_share_payloads_but_hide_positions_from_ordinary_queries() {
+    use laminar_connectors::connector::{
+        schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,
+        SourceBatch, SourceRowPositionCapability, SourceRowPositions, SOURCE_PARTITION_COLUMN,
+    };
+
+    let visible_batch = test_batch();
+    let visible_schema = visible_batch.schema();
+    let visible_values = Arc::clone(visible_batch.column(0));
+    let positioned_schema = schema_with_source_row_positions(&visible_schema).unwrap();
+    let mutation_schema = schema_with_source_mutations_and_row_positions(&visible_schema).unwrap();
+    let positions = SourceRowPositions::try_new(
+        BinaryArray::from(vec![&b"p0"[..], &b"p0"[..]]),
+        BinaryArray::from(vec![&b"1"[..], &b"2"[..]]),
+        UInt32Array::from(vec![0, 0]),
+    )
+    .unwrap();
+    let positioned_batch = SourceBatch::positioned(visible_batch, positions)
+        .unwrap()
+        .into_records_with_metadata(
+            SourceRowPositionCapability::Deterministic,
+            &positioned_schema,
+            &mutation_schema,
+        )
+        .unwrap();
+
+    let ordinary_seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let positioned_seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let mut graph = test_graph();
+    graph.register_source_schema("trades".into(), Arc::clone(&visible_schema));
+    let ordinary_source = graph.ensure_source_node("trades");
+    let positioned_source = graph.ensure_positioned_source_node("trades");
+    let ordinary_node = graph
+        .place_operator_node(
+            "ordinary_probe",
+            Box::new(BatchProbe(Arc::clone(&ordinary_seen))),
+            1,
+        )
+        .unwrap();
+    let positioned_node = graph
+        .place_operator_node(
+            "positioned_probe",
+            Box::new(BatchProbe(Arc::clone(&positioned_seen))),
+            1,
+        )
+        .unwrap();
+    graph.add_edge(ordinary_source, ordinary_node, 0);
+    graph.add_edge(positioned_source, positioned_node, 0);
+
+    let sources = FxHashMap::from_iter([(Arc::from("trades"), vec![positioned_batch])]);
+    let frontiers = FxHashMap::from_iter([(
+        Arc::from("trades"),
+        InputFrontier {
+            watermark: Some(42),
+            idle: true,
+        },
+    )]);
+    graph
+        .execute_cycle_with_frontiers(&sources, i64::MIN, Some(&frontiers))
+        .await
+        .unwrap();
+
+    let ordinary_batches = ordinary_seen.lock();
+    let positioned_batches = positioned_seen.lock();
+    assert_eq!(ordinary_batches[0].schema(), visible_schema);
+    assert!(ordinary_batches[0]
+        .column_by_name(SOURCE_PARTITION_COLUMN)
+        .is_none());
+    assert_eq!(positioned_batches[0].schema(), positioned_schema);
+    assert!(positioned_batches[0]
+        .column_by_name(SOURCE_PARTITION_COLUMN)
+        .is_some());
+    assert!(Arc::ptr_eq(&visible_values, ordinary_batches[0].column(0)));
+    assert!(Arc::ptr_eq(
+        &visible_values,
+        positioned_batches[0].column(0)
+    ));
+    assert_eq!(
+        graph.node_domain[ordinary_node],
+        graph.node_domain[positioned_node]
+    );
+    assert_eq!(graph.output_watermarks[ordinary_source], 42);
+    assert_eq!(graph.output_watermarks[positioned_source], 42);
+    assert!(graph.output_idle[ordinary_source]);
+    assert!(graph.output_idle[positioned_source]);
+
+    drop(ordinary_batches);
+    drop(positioned_batches);
+    graph.set_shared_source_isolation(true, usize::MAX);
+    graph.compute_topo_order();
+    assert_ne!(
+        graph.node_domain[ordinary_node],
+        graph.node_domain[positioned_node]
+    );
+    let failed = FxHashSet::from_iter([graph.node_domain[positioned_node]]);
+    assert!(!graph.source_feeds_failed_domain(ordinary_source, &failed));
+    assert!(graph.source_feeds_failed_domain(positioned_source, &failed));
 }
 
 #[test]

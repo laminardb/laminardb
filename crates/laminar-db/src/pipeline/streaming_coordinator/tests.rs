@@ -14,7 +14,7 @@ fn replayable_append_only_source_contract() -> laminar_connectors::connector::So
 }
 
 #[test]
-fn append_only_metadata_is_encoded_then_hidden_zero_copy() {
+fn append_only_metadata_stays_row_aligned_through_late_filtering() {
     use laminar_connectors::connector::{
         schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,
         SourceRowPositions, SOURCE_MUTATION_COLUMN, SOURCE_ORDER_KEY_COLUMN,
@@ -27,7 +27,6 @@ fn append_only_metadata_is_encoded_then_hidden_zero_copy() {
         vec![Arc::new(Int64Array::from(vec![1, 2]))],
     )
     .unwrap();
-    let visible_values = Arc::clone(records.column(0));
     let positions = SourceRowPositions::try_new(
         BinaryArray::from(vec![&b"p0"[..], &b"p0"[..]]),
         BinaryArray::from(vec![&b"o1"[..], &b"o2"[..]]),
@@ -49,7 +48,6 @@ fn append_only_metadata_is_encoded_then_hidden_zero_copy() {
     .unwrap();
 
     assert_eq!(output.schema(), positioned_schema);
-    assert!(Arc::ptr_eq(&visible_values, output.column(0)));
     assert!(output.column_by_name(SOURCE_MUTATION_COLUMN).is_none());
     assert!(output.column_by_name(SOURCE_PARTITION_COLUMN).is_some());
     assert!(output.column_by_name(SOURCE_ORDER_KEY_COLUMN).is_some());
@@ -64,20 +62,27 @@ fn append_only_metadata_is_encoded_then_hidden_zero_copy() {
         DeliveryGuarantee::AtLeastOnce,
         None,
     );
+    let mut callback = MockCallback::new();
+    callback.filter_first_row = true;
     let mut events = 0;
     coordinator
-        .stage_batch(
-            0,
-            output,
-            checkpoint_at(1),
-            &mut MockCallback::new(),
-            &mut events,
-        )
+        .stage_batch(0, output, checkpoint_at(1), &mut callback, &mut events)
         .unwrap();
-    let visible = &coordinator.source_batches_buf["test_source"][0];
-    assert_eq!(visible.schema(), schema);
-    assert!(Arc::ptr_eq(&visible_values, visible.column(0)));
+    let positioned = &coordinator.source_batches_buf["test_source"][0];
+    assert_eq!(positioned.schema(), positioned_schema);
+    assert_eq!(positioned.num_rows(), 1);
+    assert_eq!(
+        positioned
+            .column_by_name(SOURCE_ORDER_KEY_COLUMN)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap()
+            .value(0),
+        b"o2"
+    );
     assert_eq!(coordinator.pending_watermark_batches[0].1.schema(), schema);
+    assert_eq!(coordinator.pending_watermark_batches[0].1.num_rows(), 2);
     assert_eq!(events, 2);
 }
 
@@ -469,6 +474,7 @@ struct MockCallback {
     watermark_error: Option<String>,
     late_filter_error: Option<String>,
     filter_all_rows: bool,
+    filter_first_row: bool,
     /// Halt cleanly on this 1-based cycle number.
     halt_at_cycle: Option<u32>,
     /// Fail on this 1-based cycle number.
@@ -553,6 +559,7 @@ impl MockCallback {
             watermark_error: None,
             late_filter_error: None,
             filter_all_rows: false,
+            filter_first_row: false,
             halt_at_cycle: None,
             fatal_at_cycle: None,
             recovery_at_cycle: None,
@@ -878,7 +885,14 @@ impl PipelineCallback for MockCallback {
         if let Some(error) = &self.late_filter_error {
             return Err(CycleError::Recovery(error.clone()));
         }
-        Ok((!self.filter_all_rows).then(|| batch.clone()))
+        if self.filter_all_rows {
+            Ok(None)
+        } else if self.filter_first_row {
+            let skip = usize::from(batch.num_rows() != 0);
+            Ok(Some(batch.slice(skip, batch.num_rows() - skip)))
+        } else {
+            Ok(Some(batch.clone()))
+        }
     }
 
     fn current_watermark(&self) -> i64 {

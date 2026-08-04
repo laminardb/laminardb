@@ -8,6 +8,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
+use laminar_connectors::connector::strip_source_row_positions;
 use laminar_core::state::{KeyGroupCount, DEFAULT_KEY_GROUP_COUNT};
 use laminar_sql::datafusion::live_source::{LiveSourceHandle, LiveSourceProvider};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -511,6 +512,18 @@ struct GraphEdge {
     target: usize,
 }
 
+#[derive(Clone, Copy)]
+enum SourceBatchView {
+    Visible,
+    Positioned,
+}
+
+struct SourceRoute {
+    name: Arc<str>,
+    node_id: usize,
+    view: SourceBatchView,
+}
+
 struct SourcePassthrough;
 
 #[async_trait]
@@ -721,7 +734,8 @@ pub(crate) struct OperatorGraph {
     cycle_deferred_sources: FxHashSet<Arc<str>>,
     cycle_any_deferred: bool,
     source_map: FxHashMap<Arc<str>, usize>,
-    source_list: Vec<(Arc<str>, usize)>,
+    positioned_source_map: FxHashMap<Arc<str>, usize>,
+    source_list: Vec<SourceRoute>,
     source_node_ids: FxHashSet<usize>,
     output_map: FxHashMap<Arc<str>, usize>,
     // Reverse of `output_map` (node id → is an output); rebuilt in `compute_topo_order`.
@@ -810,6 +824,7 @@ impl OperatorGraph {
             cycle_deferred_sources: FxHashSet::default(),
             cycle_any_deferred: false,
             source_map: FxHashMap::default(),
+            positioned_source_map: FxHashMap::default(),
             source_list: Vec::new(),
             source_node_ids: FxHashSet::default(),
             output_map: FxHashMap::default(),
@@ -1529,6 +1544,18 @@ impl OperatorGraph {
         node_id
     }
 
+    fn ensure_positioned_source_node(&mut self, table_name: &str) -> usize {
+        if let Some(&id) = self.positioned_source_map.get(table_name) {
+            return id;
+        }
+        let source_name: Arc<str> = Arc::from(table_name);
+        let node_name: Arc<str> = Arc::from(format!("__temporal_source::{table_name}"));
+        let node_id = self.allocate_node(GraphNode::new(node_name, Box::new(SourcePassthrough), 1));
+        self.positioned_source_map.insert(source_name, node_id);
+        self.source_node_ids.insert(node_id);
+        node_id
+    }
+
     fn insert_filter_node(&mut self, name: &str, filter_sql: String, source_id: usize) -> usize {
         let node_id = self.allocate_node(GraphNode::new(
             Arc::from(name),
@@ -1561,9 +1588,8 @@ impl OperatorGraph {
             self.find_node(&sjc.right_table)
                 .unwrap_or_else(|| self.ensure_source_node(&sjc.right_table));
         } else if let Some(tc) = temporal_config {
-            if self.find_node(&tc.left_table).is_none() {
-                self.ensure_source_node(&tc.left_table);
-            }
+            self.ensure_positioned_source_node(&tc.left_table);
+            self.ensure_positioned_source_node(&tc.right_table);
         } else {
             for table_ref in table_refs {
                 if self.find_node(table_ref).is_none() {
@@ -1620,9 +1646,11 @@ impl OperatorGraph {
             }
             false
         } else if let Some(tc) = temporal_config {
-            let stream_id = self.find_node(&tc.left_table).expect("source ensured");
-            self.add_edge(stream_id, node_id, 0);
-            self.output_map.contains_key(tc.left_table.as_str())
+            let left_id = self.positioned_source_map[tc.left_table.as_str()];
+            let right_id = self.positioned_source_map[tc.right_table.as_str()];
+            self.add_edge(left_id, node_id, 0);
+            self.add_edge(right_id, node_id, 1);
+            false
         } else {
             let mut depends_on_query = false;
             for table_ref in table_refs {
@@ -1850,7 +1878,11 @@ impl OperatorGraph {
             incremental,
             changelog_enrich_config,
         );
-        let input_port_count = if stream_join_config.is_some() { 2 } else { 1 };
+        let input_port_count = if stream_join_config.is_some() || temporal_config.is_some() {
+            2
+        } else {
+            1
+        };
 
         self.ensure_query_source_nodes(
             stream_join_config.as_ref(),
@@ -2318,7 +2350,21 @@ impl OperatorGraph {
 
         self.source_list.clear();
         self.source_list
-            .extend(self.source_map.iter().map(|(k, v)| (Arc::clone(k), *v)));
+            .extend(self.source_map.iter().map(|(name, node_id)| SourceRoute {
+                name: Arc::clone(name),
+                node_id: *node_id,
+                view: SourceBatchView::Visible,
+            }));
+        self.source_list
+            .extend(
+                self.positioned_source_map
+                    .iter()
+                    .map(|(name, node_id)| SourceRoute {
+                        name: Arc::clone(name),
+                        node_id: *node_id,
+                        view: SourceBatchView::Positioned,
+                    }),
+            );
 
         self.output_node_ids.clear();
         self.output_node_ids
@@ -2341,6 +2387,19 @@ impl OperatorGraph {
 
         let n = self.nodes.len();
         let mut parent: Vec<usize> = (0..n).collect();
+
+        if !self.shared_source_isolation {
+            for (name, visible) in &self.source_map {
+                let Some(positioned) = self.positioned_source_map.get(name.as_ref()) else {
+                    continue;
+                };
+                let a = find(&mut parent, *visible);
+                let b = find(&mut parent, *positioned);
+                if a != b {
+                    parent[a] = b;
+                }
+            }
+        }
 
         for edge in &self.edges {
             if self.nodes[edge.source].removed || self.nodes[edge.target].removed {
@@ -2395,11 +2454,32 @@ impl OperatorGraph {
                 .any(|&(target, _)| failed.contains(&self.node_domain[target]))
     }
 
-    fn register_source_tables(&mut self, source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
+    fn visible_source_batches(
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
+        let mut visible_sources = FxHashMap::default();
+        visible_sources.reserve(source_batches.len());
         for (name, batches) in source_batches {
             if batches.is_empty() {
                 continue;
             }
+            let visible = batches
+                .iter()
+                .map(|batch| {
+                    strip_source_row_positions(batch).map_err(|error| {
+                        DbError::SchemaMismatch(format!(
+                            "source '{name}' has invalid hidden metadata: {error}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            visible_sources.insert(Arc::clone(name), visible);
+        }
+        Ok(visible_sources)
+    }
+
+    fn register_source_tables(&mut self, visible_sources: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
+        for (name, batches) in visible_sources {
             // Lazily create the provider if register_source_schema wasn't called (e.g. tests).
             if !self.live_handles.contains_key(name.as_ref()) {
                 let schema = batches[0].schema();
@@ -2579,7 +2659,7 @@ impl OperatorGraph {
         let has_routes = !self.nodes[node_id].output_routes.is_empty();
         let is_output = self.output_node_ids.contains(&node_id);
 
-        if has_routes {
+        if has_routes && !self.source_node_ids.contains(&node_id) {
             let name_ref = node_name.as_ref();
             if !self.live_handles.contains_key(name_ref) {
                 let schema = batches[0].schema();
@@ -2762,6 +2842,7 @@ impl OperatorGraph {
         source_frontiers: SourceFrontiers<'_>,
         mode: GraphExecutionMode,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
+        let visible_source_batches = Self::visible_source_batches(source_batches)?;
         self.whole_restore_open = false;
 
         #[cfg(feature = "cluster")]
@@ -2796,8 +2877,13 @@ impl OperatorGraph {
             return Err(error);
         }
 
-        self.register_source_tables(source_batches);
-        self.prime_sources(source_batches, current_watermark, source_frontiers);
+        self.register_source_tables(&visible_source_batches);
+        self.prime_sources(
+            source_batches,
+            &visible_source_batches,
+            current_watermark,
+            source_frontiers,
+        );
 
         let checkpoint_drain_nodes = if mode == GraphExecutionMode::CheckpointDrain {
             Some(self.checkpoint_drain_nodes())
@@ -2959,8 +3045,8 @@ impl OperatorGraph {
         let failed_names: Vec<Arc<str>> = self
             .source_list
             .iter()
-            .filter(|(_, node_id)| self.source_feeds_failed_domain(*node_id, failed_domains))
-            .map(|(name, _)| Arc::clone(name))
+            .filter(|route| self.source_feeds_failed_domain(route.node_id, failed_domains))
+            .map(|route| Arc::clone(&route.name))
             .collect();
         self.cycle_failed_sources.extend(failed_names);
         if failed_domains.len() == self.domain_count {
@@ -3014,11 +3100,11 @@ impl OperatorGraph {
         let deferred_sources: Vec<Arc<str>> = self
             .source_list
             .iter()
-            .filter(|(_, node_id)| {
-                deferred_nodes.contains(node_id)
-                    || self.source_feeds_failed_domain(*node_id, &deferred_domains)
+            .filter(|route| {
+                deferred_nodes.contains(&route.node_id)
+                    || self.source_feeds_failed_domain(route.node_id, &deferred_domains)
             })
-            .map(|(name, _)| Arc::clone(name))
+            .map(|route| Arc::clone(&route.name))
             .collect();
         self.cycle_deferred_sources.extend(deferred_sources);
     }
@@ -3026,24 +3112,29 @@ impl OperatorGraph {
     fn prime_sources(
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        visible_source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         current_watermark: i64,
         source_frontiers: SourceFrontiers<'_>,
     ) {
-        for &(ref name, node_id) in &self.source_list {
-            if let Some(batches) = source_batches.get(name) {
+        for route in &self.source_list {
+            let batches = match route.view {
+                SourceBatchView::Visible => visible_source_batches.get(&route.name),
+                SourceBatchView::Positioned => source_batches.get(&route.name),
+            };
+            if let Some(batches) = batches {
                 if !batches.is_empty() {
                     let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
-                    self.input_bufs[node_id][0].extend(batches.iter().cloned());
-                    self.input_buf_bytes[node_id][0] += bytes;
+                    self.input_bufs[route.node_id][0].extend(batches.iter().cloned());
+                    self.input_buf_bytes[route.node_id][0] += bytes;
                 }
             }
-            let frontier = source_frontiers.get(name, current_watermark);
-            let watermark = self.output_watermarks[node_id].max(frontier.legacy_watermark());
-            self.output_watermarks[node_id] = watermark;
-            self.output_idle[node_id] = frontier.idle;
+            let frontier = source_frontiers.get(&route.name, current_watermark);
+            let watermark = self.output_watermarks[route.node_id].max(frontier.legacy_watermark());
+            self.output_watermarks[route.node_id] = watermark;
+            self.output_idle[route.node_id] = frontier.idle;
             if let Some(ref prom) = self.prom {
                 prom.stream_watermark_ms
-                    .with_label_values(&[name])
+                    .with_label_values(&[&route.name])
                     .set(watermark);
             }
         }

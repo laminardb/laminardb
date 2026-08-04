@@ -5578,7 +5578,7 @@ impl StreamingCoordinator {
 
         // Filter against the pre-drain watermark. Extraction is deferred until after all batches
         // are filtered so one batch cannot make the next batch appear late.
-        let filtered = callback.filter_late_rows(&name, &visible)?;
+        let filtered = callback.filter_late_rows(&name, &batch)?;
         let pending = self.pending_offsets.get_mut(source_idx).ok_or_else(|| {
             CycleError::Recovery(format!(
                 "source '{name}' has no runtime offset slot at index {source_idx}"
