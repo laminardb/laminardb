@@ -4,7 +4,9 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
-use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, RecordBatchOptions, UInt32Array};
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, RecordBatch, RecordBatchOptions, UInt32Array, UInt8Array,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -306,8 +308,17 @@ pub const SOURCE_PARTITION_COLUMN: &str = "__source_partition";
 pub const SOURCE_ORDER_KEY_COLUMN: &str = "__source_order_key";
 /// Reserved column carrying a row ordinal within one source cursor.
 pub const SOURCE_SUB_OFFSET_COLUMN: &str = "__source_sub_offset";
+/// Reserved column carrying row-level source mutations for stateful operators.
+#[doc(hidden)]
+pub const SOURCE_MUTATION_COLUMN: &str = "__source_mutation";
 
 const SOURCE_POSITION_COLUMNS: [&str; 3] = [
+    SOURCE_PARTITION_COLUMN,
+    SOURCE_ORDER_KEY_COLUMN,
+    SOURCE_SUB_OFFSET_COLUMN,
+];
+const SOURCE_METADATA_COLUMNS: [&str; 4] = [
+    SOURCE_MUTATION_COLUMN,
     SOURCE_PARTITION_COLUMN,
     SOURCE_ORDER_KEY_COLUMN,
     SOURCE_SUB_OFFSET_COLUMN,
@@ -318,18 +329,42 @@ const SOURCE_POSITION_COLUMNS: [&str; 3] = [
 /// # Errors
 /// Returns an error when the declared schema already uses a reserved field name.
 pub fn schema_with_source_row_positions(schema: &SchemaRef) -> Result<SchemaRef, ConnectorError> {
+    schema_with_source_metadata(schema, false)
+}
+
+/// Append the mixed-mutation field and trailing row-position fields to a declared schema.
+///
+/// # Errors
+/// Returns an error when the declared schema already uses a reserved field name.
+pub fn schema_with_source_mutations_and_row_positions(
+    schema: &SchemaRef,
+) -> Result<SchemaRef, ConnectorError> {
+    schema_with_source_metadata(schema, true)
+}
+
+fn schema_with_source_metadata(
+    schema: &SchemaRef,
+    include_mutations: bool,
+) -> Result<SchemaRef, ConnectorError> {
     if let Some(field) = schema.fields().iter().find(|field| {
-        SOURCE_POSITION_COLUMNS
+        SOURCE_METADATA_COLUMNS
             .iter()
             .any(|reserved| field.name().eq_ignore_ascii_case(reserved))
     }) {
         return Err(ConnectorError::SchemaMismatch(format!(
-            "source schema contains reserved row-position column '{}'",
+            "source schema contains reserved metadata column '{}'",
             field.name()
         )));
     }
 
     let mut fields = schema.fields().to_vec();
+    if include_mutations {
+        fields.push(Arc::new(Field::new(
+            SOURCE_MUTATION_COLUMN,
+            DataType::UInt8,
+            false,
+        )));
+    }
     fields.extend([
         Arc::new(Field::new(SOURCE_PARTITION_COLUMN, DataType::Binary, false)),
         Arc::new(Field::new(SOURCE_ORDER_KEY_COLUMN, DataType::Binary, false)),
@@ -345,64 +380,250 @@ pub fn schema_with_source_row_positions(schema: &SchemaRef) -> Result<SchemaRef,
     )))
 }
 
-/// Remove connector row-position columns without copying their Arrow buffers.
-///
-/// Batches without reserved fields are returned unchanged. If any reserved field is present, all
-/// three fields must be the exact trailing fields produced by
-/// [`schema_with_source_row_positions`].
-///
-/// # Errors
-/// Returns an error for partial, misplaced, nullable, or incorrectly typed position fields.
-pub fn strip_source_row_positions(records: &RecordBatch) -> Result<RecordBatch, ConnectorError> {
-    let schema = records.schema();
+#[derive(Clone, Copy)]
+struct SourceMetadataLayout {
+    visible_columns: usize,
+    has_mutations: bool,
+}
+
+fn source_metadata_layout(schema: &Schema) -> Result<Option<SourceMetadataLayout>, ConnectorError> {
     let fields = schema.fields();
-    let first_reserved = fields.iter().position(|field| {
-        SOURCE_POSITION_COLUMNS
+    if !fields.iter().any(|field| {
+        SOURCE_METADATA_COLUMNS
             .iter()
             .any(|reserved| field.name().eq_ignore_ascii_case(reserved))
-    });
-    let Some(first_reserved) = first_reserved else {
-        return Ok(records.clone());
-    };
-    let visible_columns = fields.len().checked_sub(SOURCE_POSITION_COLUMNS.len());
-    let Some(visible_columns) = visible_columns else {
-        return Err(ConnectorError::SchemaMismatch(
-            "source row-position columns must be the exact three trailing fields".into(),
-        ));
-    };
-    if first_reserved != visible_columns {
-        return Err(ConnectorError::SchemaMismatch(
-            "source row-position columns must be the exact three trailing fields".into(),
-        ));
+    }) {
+        return Ok(None);
     }
 
-    let expected = [
+    let position_start = fields
+        .len()
+        .checked_sub(SOURCE_POSITION_COLUMNS.len())
+        .ok_or_else(|| {
+            ConnectorError::SchemaMismatch(
+                "source metadata must end with the exact three row-position fields".into(),
+            )
+        })?;
+    let expected_positions = [
         (SOURCE_PARTITION_COLUMN, DataType::Binary),
         (SOURCE_ORDER_KEY_COLUMN, DataType::Binary),
         (SOURCE_SUB_OFFSET_COLUMN, DataType::UInt32),
     ];
-    for (field, (name, data_type)) in fields[visible_columns..].iter().zip(expected) {
+    for (field, (name, data_type)) in fields[position_start..].iter().zip(expected_positions) {
         if field.name() != name || field.data_type() != &data_type || field.is_nullable() {
             return Err(ConnectorError::SchemaMismatch(
-                "source row-position columns must be the exact three trailing typed fields".into(),
+                "source metadata must end with the exact three typed row-position fields".into(),
             ));
         }
     }
 
+    let has_mutations = position_start != 0
+        && fields[position_start - 1]
+            .name()
+            .eq_ignore_ascii_case(SOURCE_MUTATION_COLUMN);
+    let visible_columns = position_start - usize::from(has_mutations);
+    if has_mutations {
+        let field = &fields[visible_columns];
+        if field.name() != SOURCE_MUTATION_COLUMN
+            || field.data_type() != &DataType::UInt8
+            || field.is_nullable()
+        {
+            return Err(ConnectorError::SchemaMismatch(
+                "source mutation metadata must be the exact non-null UInt8 field immediately before row positions"
+                    .into(),
+            ));
+        }
+    }
+    if fields[..visible_columns].iter().any(|field| {
+        SOURCE_METADATA_COLUMNS
+            .iter()
+            .any(|reserved| field.name().eq_ignore_ascii_case(reserved))
+    }) {
+        return Err(ConnectorError::SchemaMismatch(
+            "source metadata fields are reserved and must use their exact trailing positions"
+                .into(),
+        ));
+    }
+
+    Ok(Some(SourceMetadataLayout {
+        visible_columns,
+        has_mutations,
+    }))
+}
+
+fn validate_source_position_arrays(
+    records: &RecordBatch,
+    layout: SourceMetadataLayout,
+) -> Result<(), ConnectorError> {
+    let position_start = layout.visible_columns + usize::from(layout.has_mutations);
+    let partition = records.columns()[position_start]
+        .as_any()
+        .downcast_ref::<BinaryArray>();
+    let order = records.columns()[position_start + 1]
+        .as_any()
+        .downcast_ref::<BinaryArray>();
+    let sub_offset = records.columns()[position_start + 2]
+        .as_any()
+        .downcast_ref::<UInt32Array>();
+    let (Some(partition), Some(order), Some(sub_offset)) = (partition, order, sub_offset) else {
+        return Err(ConnectorError::SchemaMismatch(
+            "source row-position metadata arrays have invalid types".into(),
+        ));
+    };
+    if partition.len() != records.num_rows()
+        || order.len() != records.num_rows()
+        || sub_offset.len() != records.num_rows()
+    {
+        return Err(ConnectorError::SchemaMismatch(
+            "source row-position metadata is not row-aligned".into(),
+        ));
+    }
+    if partition.null_count() != 0 || order.null_count() != 0 || sub_offset.null_count() != 0 {
+        return Err(ConnectorError::SchemaMismatch(
+            "source row-position metadata must not contain nulls".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_encoded_source_schema(
+    visible: &Schema,
+    encoded: &Schema,
+    expect_mutations: bool,
+) -> Result<(), ConnectorError> {
+    let layout = source_metadata_layout(encoded)?.ok_or_else(|| {
+        ConnectorError::SchemaMismatch("encoded source schema is missing row positions".into())
+    })?;
+    if layout.has_mutations != expect_mutations
+        || encoded.fields()[..layout.visible_columns] != visible.fields()[..]
+        || encoded.metadata() != visible.metadata()
+    {
+        return Err(ConnectorError::SchemaMismatch(
+            "encoded source schema does not match its visible schema and metadata contract".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Decode the optional row-aligned mutation metadata.
+///
+/// # Errors
+/// Returns an error for malformed metadata, nulls, unknown values, or a noncanonical all-put
+/// mutation column.
+pub fn decode_source_mutations(
+    records: &RecordBatch,
+) -> Result<Option<Box<[SourceMutation]>>, ConnectorError> {
+    let Some(layout) = source_metadata_layout(records.schema().as_ref())? else {
+        return Ok(None);
+    };
+    validate_source_position_arrays(records, layout)?;
+    if !layout.has_mutations {
+        return Ok(None);
+    }
+    let mutations = records
+        .column(layout.visible_columns)
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .ok_or_else(|| {
+            ConnectorError::SchemaMismatch("source mutation metadata array is not UInt8".into())
+        })?;
+    if mutations.len() != records.num_rows() {
+        return Err(ConnectorError::SchemaMismatch(format!(
+            "source mutation count {} does not match decoded row count {}",
+            mutations.len(),
+            records.num_rows()
+        )));
+    }
+    if mutations.null_count() != 0 {
+        return Err(ConnectorError::SchemaMismatch(
+            "source mutation metadata must not contain nulls".into(),
+        ));
+    }
+    let mut decoded = Vec::with_capacity(mutations.len());
+    let mut has_tombstone = false;
+    for &value in mutations.values() {
+        match value {
+            0 => decoded.push(SourceMutation::Put),
+            1 => {
+                decoded.push(SourceMutation::Tombstone);
+                has_tombstone = true;
+            }
+            value => {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "source mutation metadata contains unknown value {value}"
+                )));
+            }
+        }
+    }
+    if !has_tombstone {
+        return Err(ConnectorError::SchemaMismatch(
+            "all-put source mutations must omit the mutation metadata field".into(),
+        ));
+    }
+    Ok(Some(decoded.into_boxed_slice()))
+}
+
+/// Remove only mutation metadata while retaining the exact trailing row positions.
+///
+/// # Errors
+/// Returns an error when any source metadata field is malformed.
+pub fn strip_source_mutations(records: &RecordBatch) -> Result<RecordBatch, ConnectorError> {
+    let schema = records.schema();
+    let Some(layout) = source_metadata_layout(schema.as_ref())? else {
+        return Ok(records.clone());
+    };
+    decode_source_mutations(records)?;
+    if !layout.has_mutations {
+        return Ok(records.clone());
+    }
+    let mut fields = schema.fields()[..layout.visible_columns].to_vec();
+    fields.extend(
+        schema.fields()[layout.visible_columns + 1..]
+            .iter()
+            .cloned(),
+    );
+    let mut columns = records.columns()[..layout.visible_columns].to_vec();
+    columns.extend(
+        records.columns()[layout.visible_columns + 1..]
+            .iter()
+            .cloned(),
+    );
+    let options = RecordBatchOptions::new().with_row_count(Some(records.num_rows()));
+    RecordBatch::try_new_with_options(
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        columns,
+        &options,
+    )
+    .map_err(|error| {
+        ConnectorError::SchemaMismatch(format!("failed to strip source mutation metadata: {error}"))
+    })
+}
+
+/// Remove all connector metadata without copying visible Arrow buffers.
+///
+/// Batches without reserved fields are returned unchanged. Mutation metadata, when present, must
+/// be immediately before the exact trailing row-position fields.
+///
+/// # Errors
+/// Returns an error for partial, misplaced, nullable, incorrectly typed, or invalid metadata.
+pub fn strip_source_row_positions(records: &RecordBatch) -> Result<RecordBatch, ConnectorError> {
+    let schema = records.schema();
+    let Some(layout) = source_metadata_layout(schema.as_ref())? else {
+        return Ok(records.clone());
+    };
+    decode_source_mutations(records)?;
     let visible_schema = Arc::new(Schema::new_with_metadata(
-        fields[..visible_columns].to_vec(),
+        schema.fields()[..layout.visible_columns].to_vec(),
         schema.metadata().clone(),
     ));
     let options = RecordBatchOptions::new().with_row_count(Some(records.num_rows()));
     RecordBatch::try_new_with_options(
         visible_schema,
-        records.columns()[..visible_columns].to_vec(),
+        records.columns()[..layout.visible_columns].to_vec(),
         &options,
     )
     .map_err(|error| {
-        ConnectorError::SchemaMismatch(format!(
-            "failed to strip source row-position columns: {error}"
-        ))
+        ConnectorError::SchemaMismatch(format!("failed to strip source metadata: {error}"))
     })
 }
 
@@ -485,17 +706,51 @@ impl SourceRowPositions {
         records: &RecordBatch,
         positioned_schema: &SchemaRef,
     ) -> Result<RecordBatch, ConnectorError> {
+        self.append_metadata(records, positioned_schema, None)
+    }
+
+    fn append_metadata(
+        self,
+        records: &RecordBatch,
+        encoded_schema: &SchemaRef,
+        mutations: Option<&[SourceMutation]>,
+    ) -> Result<RecordBatch, ConnectorError> {
         self.validate_row_count(records.num_rows())?;
+        validate_encoded_source_schema(
+            records.schema().as_ref(),
+            encoded_schema.as_ref(),
+            mutations.is_some(),
+        )?;
+        if let Some(mutations) = mutations {
+            if mutations.len() != records.num_rows() {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "source mutation count {} does not match decoded row count {}",
+                    mutations.len(),
+                    records.num_rows()
+                )));
+            }
+            if !mutations.contains(&SourceMutation::Tombstone) {
+                return Err(ConnectorError::SchemaMismatch(
+                    "all-put source mutations must omit the mutation metadata field".into(),
+                ));
+            }
+        }
         let mut columns = records.columns().to_vec();
+        if let Some(mutations) = mutations {
+            columns.push(Arc::new(UInt8Array::from_iter_values(
+                mutations.iter().map(|mutation| match mutation {
+                    SourceMutation::Put => 0,
+                    SourceMutation::Tombstone => 1,
+                }),
+            )));
+        }
         columns.extend([
             Arc::new(self.partition) as ArrayRef,
             Arc::new(self.order_key) as ArrayRef,
             Arc::new(self.sub_offset) as ArrayRef,
         ]);
-        RecordBatch::try_new(Arc::clone(positioned_schema), columns).map_err(|error| {
-            ConnectorError::SchemaMismatch(format!(
-                "failed to append source row positions: {error}"
-            ))
+        RecordBatch::try_new(Arc::clone(encoded_schema), columns).map_err(|error| {
+            ConnectorError::SchemaMismatch(format!("failed to append source metadata: {error}"))
         })
     }
 }
@@ -591,6 +846,11 @@ impl SourceBatch {
         capability: SourceRowPositionCapability,
         positioned_schema: &SchemaRef,
     ) -> Result<RecordBatch, ConnectorError> {
+        if self.mutations.is_some() {
+            return Err(ConnectorError::SchemaMismatch(
+                "mixed source mutations require the metadata-aware batch path".into(),
+            ));
+        }
         match (capability, self.row_positions) {
             (SourceRowPositionCapability::Unavailable, None) => Ok(self.records),
             (SourceRowPositionCapability::Unavailable, Some(_)) => {
@@ -605,6 +865,45 @@ impl SourceBatch {
             }
             (SourceRowPositionCapability::Deterministic, Some(positions)) => {
                 positions.append_to(&self.records, positioned_schema)
+            }
+        }
+    }
+
+    /// Validate and append optional mixed mutations plus deterministic row positions.
+    ///
+    /// The mutation field is omitted for the canonical all-`Put` case.
+    ///
+    /// # Errors
+    /// Returns an error when capability, schema, or row-aligned metadata is malformed.
+    pub fn into_records_with_metadata(
+        self,
+        capability: SourceRowPositionCapability,
+        positioned_schema: &SchemaRef,
+        mutation_schema: &SchemaRef,
+    ) -> Result<RecordBatch, ConnectorError> {
+        let Self {
+            records,
+            row_positions,
+            mutations,
+        } = self;
+        match (capability, row_positions) {
+            (SourceRowPositionCapability::Unavailable, None) if mutations.is_none() => Ok(records),
+            (SourceRowPositionCapability::Unavailable, _) => Err(ConnectorError::SchemaMismatch(
+                "source emitted state metadata without declaring deterministic row positions"
+                    .into(),
+            )),
+            (SourceRowPositionCapability::Deterministic, None) => {
+                Err(ConnectorError::SchemaMismatch(
+                    "source declared deterministic row positions but omitted the sidecar".into(),
+                ))
+            }
+            (SourceRowPositionCapability::Deterministic, Some(positions)) => {
+                let schema = if mutations.is_some() {
+                    mutation_schema
+                } else {
+                    positioned_schema
+                };
+                positions.append_metadata(&records, schema, mutations.as_deref())
             }
         }
     }
@@ -1826,21 +2125,132 @@ mod tests {
     }
 
     #[test]
-    fn source_row_positions_strip_round_trip_without_copying_visible_arrays() {
+    fn source_metadata_round_trip_is_sparse_and_zero_copy() {
         let records = test_batch(2);
         let positioned_schema = schema_with_source_row_positions(&records.schema()).unwrap();
+        let mutation_schema =
+            schema_with_source_mutations_and_row_positions(&records.schema()).unwrap();
         let positions = SourceRowPositions::try_new(
             BinaryArray::from(vec![&b"p0"[..], &b"p0"[..]]),
             BinaryArray::from(vec![&b"0"[..], &b"1"[..]]),
             UInt32Array::from(vec![0, 0]),
         )
         .unwrap();
-        let positioned = positions.append_to(&records, &positioned_schema).unwrap();
+        let encoded = SourceBatch::positioned(records.clone(), positions.clone())
+            .unwrap()
+            .with_mutations(vec![SourceMutation::Put, SourceMutation::Tombstone])
+            .unwrap()
+            .into_records_with_metadata(
+                SourceRowPositionCapability::Deterministic,
+                &positioned_schema,
+                &mutation_schema,
+            )
+            .unwrap();
+        assert_eq!(
+            decode_source_mutations(&encoded).unwrap().as_deref(),
+            Some(&[SourceMutation::Put, SourceMutation::Tombstone][..])
+        );
+        assert_eq!(
+            encoded.schema().field(records.num_columns()).name(),
+            SOURCE_MUTATION_COLUMN
+        );
 
-        let stripped = strip_source_row_positions(&positioned).unwrap();
+        let positioned = strip_source_mutations(&encoded).unwrap();
+        assert_eq!(positioned.schema(), positioned_schema);
+        assert!(Arc::ptr_eq(positioned.column(0), records.column(0)));
+
+        let stripped = strip_source_row_positions(&encoded).unwrap();
         assert_eq!(stripped.schema(), records.schema());
         assert_eq!(stripped.num_rows(), records.num_rows());
         assert!(Arc::ptr_eq(stripped.column(0), records.column(0)));
+
+        let puts = SourceBatch::positioned(records.clone(), positions)
+            .unwrap()
+            .with_mutations(vec![SourceMutation::Put; 2])
+            .unwrap()
+            .into_records_with_metadata(
+                SourceRowPositionCapability::Deterministic,
+                &positioned_schema,
+                &mutation_schema,
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&puts.schema(), &positioned_schema));
+        assert!(puts.column_by_name(SOURCE_MUTATION_COLUMN).is_none());
+        assert!(decode_source_mutations(&puts).unwrap().is_none());
+    }
+
+    #[test]
+    fn source_metadata_rejects_collisions_and_malformed_batches() {
+        let collision = Arc::new(Schema::new(vec![Field::new(
+            "__SOURCE_MUTATION",
+            DataType::UInt8,
+            false,
+        )]));
+        assert!(schema_with_source_row_positions(&collision).is_err());
+        assert!(schema_with_source_mutations_and_row_positions(&collision).is_err());
+
+        let records = test_batch(2);
+        let positioned_schema = schema_with_source_row_positions(&records.schema()).unwrap();
+        let mutation_schema =
+            schema_with_source_mutations_and_row_positions(&records.schema()).unwrap();
+        let positions = SourceRowPositions::try_new(
+            BinaryArray::from(vec![&b"p0"[..], &b"p0"[..]]),
+            BinaryArray::from(vec![&b"0"[..], &b"1"[..]]),
+            UInt32Array::from(vec![0, 0]),
+        )
+        .unwrap();
+        let encoded = SourceBatch::positioned(records.clone(), positions)
+            .unwrap()
+            .with_mutations(vec![SourceMutation::Put, SourceMutation::Tombstone])
+            .unwrap()
+            .into_records_with_metadata(
+                SourceRowPositionCapability::Deterministic,
+                &positioned_schema,
+                &mutation_schema,
+            )
+            .unwrap();
+        let mutation_index = records.num_columns();
+
+        let malformed = |field: Field, array: ArrayRef| {
+            let mut fields = encoded.schema().fields().to_vec();
+            fields[mutation_index] = Arc::new(field);
+            let mut columns = encoded.columns().to_vec();
+            columns[mutation_index] = array;
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+        };
+        let wrong_type = malformed(
+            Field::new(SOURCE_MUTATION_COLUMN, DataType::Int64, false),
+            Arc::new(Int64Array::from(vec![0, 1])),
+        );
+        assert!(decode_source_mutations(&wrong_type).is_err());
+
+        let null = malformed(
+            Field::new(SOURCE_MUTATION_COLUMN, DataType::UInt8, true),
+            Arc::new(UInt8Array::from(vec![Some(0), None])),
+        );
+        assert!(strip_source_mutations(&null).is_err());
+
+        let unknown = malformed(
+            Field::new(SOURCE_MUTATION_COLUMN, DataType::UInt8, false),
+            Arc::new(UInt8Array::from(vec![0, 2])),
+        );
+        assert!(decode_source_mutations(&unknown).is_err());
+        assert!(strip_source_mutations(&unknown).is_err());
+
+        let all_put = malformed(
+            Field::new(SOURCE_MUTATION_COLUMN, DataType::UInt8, false),
+            Arc::new(UInt8Array::from(vec![0, 0])),
+        );
+        assert!(strip_source_mutations(&all_put).is_err());
+
+        let mut fields = encoded.schema().fields().to_vec();
+        let mutation_field = fields.remove(mutation_index);
+        fields.push(mutation_field);
+        let mut columns = encoded.columns().to_vec();
+        let mutation_column = columns.remove(mutation_index);
+        columns.push(mutation_column);
+        let misplaced = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        assert!(decode_source_mutations(&misplaced).is_err());
     }
 
     #[test]
