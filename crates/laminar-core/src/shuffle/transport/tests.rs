@@ -151,6 +151,43 @@ async fn sender_natural_process_lease_expiry_cancels_blocked_admission() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sender_marks_post_enqueue_process_lease_loss_as_admitted() {
+    let receiver = bind_on_loopback(2).await;
+    let sender = ShuffleSender::new(1, Uuid::from_u128(2));
+    let deadline = Arc::new(LeaseDeadline::live_for(std::time::Duration::from_secs(60)));
+    sender
+        .install_process_lease_deadline(Arc::clone(&deadline))
+        .unwrap();
+    let fence = assignment_fence(1, &[1, 2]);
+    sender
+        .install_assignment_fence(&fence, &assignment_owners(&[1, 2]))
+        .unwrap();
+    sender.register_peer(2, receiver.local_addr());
+
+    let (enqueued, release) = sender.pause_next_send_after_enqueue_for_test();
+    let message = ShuffleMessage::checkpointed("stage".into(), 0, one_row(1));
+    let send = sender.send_to_for_assignment(2, 1, &message);
+    tokio::pin!(send);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::select! {
+            () = enqueued.notified() => {}
+            result = &mut send => panic!("send completed before the post-enqueue pause: {result:?}"),
+        }
+    })
+    .await
+    .expect("shuffle frame did not enter the outbound queue");
+    deadline.fence();
+    release.notify_one();
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), send)
+        .await
+        .expect("post-enqueue lease loss did not finish the send")
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(shuffle_send_may_have_been_admitted(&error));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn receiver_process_lease_expiry_rejects_handshake_without_assignment_invalidation() {
     use super::shuffle_v1::shuffle_transport_client::ShuffleTransportClient;
     use super::shuffle_v1::HandshakeRequest;

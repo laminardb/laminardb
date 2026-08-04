@@ -74,13 +74,13 @@ impl GraphOperator for RichFrontierProbe {
     }
 }
 
-struct LegacyFrontierProbe {
+struct FrontierHoldProbe {
     watermarks: Arc<parking_lot::Mutex<Vec<i64>>>,
     hold: i64,
 }
 
 #[async_trait]
-impl GraphOperator for LegacyFrontierProbe {
+impl GraphOperator for FrontierHoldProbe {
     fn cluster_capability(&self) -> OperatorCapability {
         OperatorCapability::test_probe()
     }
@@ -98,8 +98,8 @@ impl GraphOperator for LegacyFrontierProbe {
         Ok(None)
     }
 
-    fn watermark_hold(&self) -> Option<i64> {
-        Some(self.hold)
+    fn output_frontier(&self, input: InputFrontier) -> InputFrontier {
+        input.held_at(Some(self.hold))
     }
 }
 
@@ -165,15 +165,15 @@ async fn rich_frontiers_exclude_idle_inputs_and_remain_monotone() {
 }
 
 #[tokio::test]
-async fn all_idle_frontier_respects_legacy_watermark_hold() {
+async fn all_idle_frontier_respects_operator_hold() {
     let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let mut graph = test_graph();
     let left = graph.ensure_source_node("left");
     let right = graph.ensure_source_node("right");
     let output = graph
         .place_operator_node(
-            "legacy_probe",
-            Box::new(LegacyFrontierProbe {
+            "frontier_hold_probe",
+            Box::new(FrontierHoldProbe {
                 watermarks: Arc::clone(&seen),
                 hold: 150,
             }),
@@ -207,6 +207,17 @@ async fn all_idle_frontier_respects_legacy_watermark_hold() {
     assert_eq!(*seen.lock(), [100, 200]);
     assert_eq!(graph.output_watermarks[output], 150);
     assert!(!graph.output_idle[output]);
+    assert_eq!(
+        InputFrontier {
+            watermark: Some(100),
+            idle: true,
+        }
+        .held_at(Some(i64::MIN)),
+        InputFrontier {
+            watermark: None,
+            idle: false,
+        }
+    );
 }
 
 #[cfg(feature = "cluster")]
@@ -457,14 +468,14 @@ impl GraphOperator for RestoreFailureProbe {
 }
 
 #[cfg(feature = "cluster")]
-struct RestoredReplayWatermarkProbe {
-    replay_watermark: Option<i64>,
+struct RestoredReplayFrontierProbe {
+    replay_frontier: Option<InputFrontier>,
     processed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(feature = "cluster")]
 #[async_trait]
-impl GraphOperator for RestoredReplayWatermarkProbe {
+impl GraphOperator for RestoredReplayFrontierProbe {
     fn cluster_capability(&self) -> OperatorCapability {
         OperatorCapability::test_probe()
     }
@@ -474,41 +485,53 @@ impl GraphOperator for RestoredReplayWatermarkProbe {
         inputs: &[Vec<RecordBatch>],
         _watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
-        if self.replay_watermark.is_none() {
+        if self.replay_frontier.is_none() {
             return Ok(Vec::new());
         }
         assert!(inputs.is_empty(), "replay-only cycle accepted new input");
-        self.replay_watermark = None;
+        self.replay_frontier = None;
         self.processed
             .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(vec![test_batch()])
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
-        Ok(self.replay_watermark.map(|watermark| OperatorCheckpoint {
-            data: watermark.to_le_bytes().to_vec(),
+        Ok(self.replay_frontier.map(|frontier| {
+            let mut data = frontier
+                .watermark
+                .unwrap_or(i64::MIN)
+                .to_le_bytes()
+                .to_vec();
+            data.push(u8::from(frontier.idle));
+            OperatorCheckpoint { data }
         }))
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        let encoded: [u8; 8] = checkpoint
-            .data
-            .try_into()
-            .map_err(|_| DbError::Checkpoint("invalid replay-watermark probe checkpoint".into()))?;
-        self.replay_watermark = Some(i64::from_le_bytes(encoded));
+        if checkpoint.data.len() != 9 {
+            return Err(DbError::Checkpoint(
+                "invalid replay-frontier probe checkpoint".into(),
+            ));
+        }
+        let watermark = i64::from_le_bytes(checkpoint.data[..8].try_into().unwrap());
+        self.replay_frontier = Some(InputFrontier {
+            watermark: (watermark != i64::MIN).then_some(watermark),
+            idle: checkpoint.data[8] != 0,
+        });
         Ok(())
     }
 
-    fn watermark_hold(&self) -> Option<i64> {
-        self.replay_watermark
+    fn output_frontier(&self, input: InputFrontier) -> InputFrontier {
+        input.held_at(self.replay_frontier.and_then(|frontier| frontier.watermark))
     }
 
-    fn restored_output_watermark(&self) -> Option<i64> {
-        self.replay_watermark
+    fn restored_output_frontier(&self) -> Option<InputFrontier> {
+        self.replay_frontier
+            .map(|frontier| frontier.held_at(frontier.watermark))
     }
 
     fn wants_input(&self) -> bool {
-        self.replay_watermark.is_none()
+        self.replay_frontier.is_none()
     }
 }
 
@@ -582,28 +605,28 @@ fn state_frame_restore_enforces_managed_state_budget() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn restored_frame_seeds_output_watermark_until_replay_finishes() {
+async fn restored_frame_seeds_output_frontier_until_replay_finishes() {
     let processed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
     graph.push_test_node(
         "replay",
-        Box::new(RestoredReplayWatermarkProbe {
-            replay_watermark: None,
+        Box::new(RestoredReplayFrontierProbe {
+            replay_frontier: None,
             processed: Arc::clone(&processed),
         }),
     );
+    let mut checkpoint = 42_i64.to_le_bytes().to_vec();
+    checkpoint.push(1);
     let (mut graph, count) = graph
         .restore_state_frames(
-            &[(
-                "replay".to_string(),
-                bytes::Bytes::copy_from_slice(&42_i64.to_le_bytes()),
-            )],
+            &[("replay".to_string(), bytes::Bytes::from(checkpoint))],
             &[],
             u32::from(laminar_core::state::DEFAULT_KEY_GROUP_COUNT.get()),
         )
         .unwrap();
     assert_eq!(count, 1);
     assert_eq!(graph.output_watermarks[0], 42);
+    assert!(!graph.output_idle[0]);
 
     let mut results = FxHashMap::default();
     graph
@@ -612,12 +635,14 @@ async fn restored_frame_seeds_output_watermark_until_replay_finishes() {
         .unwrap();
     assert!(processed.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(graph.output_watermarks[0], 42);
+    assert!(!graph.output_idle[0]);
 
     graph
         .execute_single_operator(0, 100, &mut results)
         .await
         .unwrap();
     assert_eq!(graph.output_watermarks[0], 100);
+    assert!(!graph.output_idle[0]);
 }
 
 #[tokio::test]
@@ -776,6 +801,10 @@ impl GraphOperator for OrderedShuffleProbe {
         batch: RetainedBatch,
         _watermark: i64,
     ) -> Result<(), DbError> {
+        assert_eq!(batch.routed_vnodes(), &[0]);
+        assert_eq!(batch.peer(), Some(2));
+        assert!(batch.assignment_version().is_some());
+        assert_eq!(batch.recovery_gen(), Some(0));
         let event_time = batch
             .batch()
             .column(2)
@@ -1023,6 +1052,7 @@ async fn alignment_consumes_an_exposed_frontier_cut_before_holdover() {
 
     let mut harness = alignment_harness().await;
     let events = install_ordered_probe(&mut harness);
+    harness.graph.output_idle[0] = true;
     let attempt = CheckpointAttempt::new(70, 70);
     let stage = "out::left";
     send_remote(
@@ -1073,7 +1103,6 @@ async fn alignment_consumes_an_exposed_frontier_cut_before_holdover() {
         assert!(tokio::time::Instant::now() < stage_deadline);
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
-
     harness
         .graph
         .align_shuffle_barriers(
@@ -1085,6 +1114,7 @@ async fn alignment_consumes_an_exposed_frontier_cut_before_holdover() {
         )
         .await
         .unwrap();
+    assert!(!harness.graph.output_idle[0]);
     let events = events.lock();
     assert_eq!(events.len(), 2);
     assert_eq!(events[0], OrderedShuffleEvent::Batch(10));
@@ -1497,7 +1527,14 @@ async fn align_shuffle_barriers_retains_peer_rows_then_aligns_exact_attempt() {
         "peer's pre-barrier row retained by the operator"
     );
     assert_eq!(got[0].num_rows(), batch.num_rows());
+    assert_eq!(got[0].routed_vnodes(), &[0]);
     assert_eq!(got[0].uniform_vnode(), Some(0));
+    assert_eq!(got[0].peer(), Some(2));
+    assert_eq!(
+        got[0].assignment_version(),
+        Some(harness.fence.assignment_version)
+    );
+    assert_eq!(got[0].recovery_gen(), Some(0));
 }
 
 #[cfg(feature = "cluster")]
@@ -2438,10 +2475,11 @@ fn rejected_control_add_removes_all_query_artifacts() {
     assert!(graph.edges.iter().all(
         |edge| !rejected_nodes.contains(&edge.source) && !rejected_nodes.contains(&edge.target)
     ));
-    assert!(graph.nodes.iter().all(|node| node
-        .output_routes
-        .iter()
-        .all(|(target, _)| !rejected_nodes.contains(target))));
+    assert!(graph.nodes.iter().all(|node| {
+        node.output_routes
+            .iter()
+            .all(|(target, _)| !rejected_nodes.contains(target))
+    }));
 }
 
 #[test]

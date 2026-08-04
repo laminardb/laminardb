@@ -20,6 +20,9 @@ pub(crate) struct RetainedBatch {
     batch: RecordBatch,
     _admissions: Arc<[laminar_core::shuffle::ShuffleBatchAdmission]>,
     assignment_version: Option<u64>,
+    peer: Option<u64>,
+    recovery_gen: Option<u64>,
+    routed_vnodes: Arc<[u32]>,
     uniform_vnode: Option<u32>,
 }
 
@@ -38,34 +41,47 @@ impl RetainedBatch {
             batch,
             _admissions: Arc::from([]),
             assignment_version: None,
+            peer: None,
+            recovery_gen: None,
+            routed_vnodes: Arc::from([]),
             uniform_vnode: None,
         }
     }
 
-    #[cfg(feature = "cluster")]
     pub(crate) fn from_received(received: laminar_core::shuffle::ReceivedBatch) -> Self {
         let assignment_version = received.assignment_version();
-        let uniform_vnode = uniform_vnode_hint(received.routed_vnodes());
+        let peer = received.peer();
+        let recovery_gen = received.recovery_gen();
+        let routed_vnodes = received.routed_vnodes_arc();
+        let uniform_vnode = uniform_vnode_hint(&routed_vnodes);
         let (batch, admission) = received.into_parts();
         Self {
             batch,
             _admissions: Arc::from([admission]),
             assignment_version: Some(assignment_version),
+            peer: Some(peer),
+            recovery_gen: Some(recovery_gen),
+            routed_vnodes,
             uniform_vnode,
         }
     }
 
-    #[cfg(feature = "cluster")]
     pub(crate) fn admitted(
         batch: RecordBatch,
         admission: laminar_core::shuffle::ShuffleBatchAdmission,
+        peer: u64,
         assignment_version: u64,
-        uniform_vnode: Option<u32>,
+        recovery_gen: u64,
+        routed_vnodes: Arc<[u32]>,
     ) -> Self {
+        let uniform_vnode = uniform_vnode_hint(&routed_vnodes);
         Self {
             batch,
             _admissions: Arc::from([admission]),
             assignment_version: Some(assignment_version),
+            peer: Some(peer),
+            recovery_gen: Some(recovery_gen),
+            routed_vnodes,
             uniform_vnode,
         }
     }
@@ -74,9 +90,20 @@ impl RetainedBatch {
         &self.batch
     }
 
-    #[cfg(feature = "cluster")]
     pub(crate) const fn assignment_version(&self) -> Option<u64> {
         self.assignment_version
+    }
+
+    pub(crate) const fn peer(&self) -> Option<u64> {
+        self.peer
+    }
+
+    pub(crate) const fn recovery_gen(&self) -> Option<u64> {
+        self.recovery_gen
+    }
+
+    pub(crate) fn routed_vnodes(&self) -> &[u32] {
+        &self.routed_vnodes
     }
 
     pub(crate) const fn uniform_vnode(&self) -> Option<u32> {
@@ -114,7 +141,7 @@ pub(crate) fn shuffle_send_error(
 ) -> DbError {
     if sent_any {
         return DbError::ShufflePartialSend(format!(
-            "{context}: send to peer {peer} failed after an earlier frame was admitted: {error}"
+            "{context}: send to peer {peer} failed after a frame was or may have been admitted: {error}"
         ));
     }
     if matches!(
@@ -136,17 +163,67 @@ pub(crate) async fn send_shuffle_plan(
     outbound: Vec<(u64, laminar_core::shuffle::ShuffleMessage)>,
     context: &str,
 ) -> Result<(), DbError> {
+    let mut group_indices = rustc_hash::FxHashMap::default();
+    let mut peer_groups = Vec::<(u64, Vec<(usize, laminar_core::shuffle::ShuffleMessage)>)>::new();
+    for (index, (peer, message)) in outbound.into_iter().enumerate() {
+        let group_index = if let Some(group_index) = group_indices.get(&peer) {
+            *group_index
+        } else {
+            let group_index = peer_groups.len();
+            group_indices.insert(peer, group_index);
+            peer_groups.push((peer, Vec::new()));
+            group_index
+        };
+        peer_groups[group_index].1.push((index, message));
+    }
+
+    let outcomes =
+        futures::future::join_all(peer_groups.into_iter().map(|(peer, messages)| async move {
+            let mut admitted_any = false;
+            for (index, message) in messages {
+                match sender
+                    .send_to_for_assignment(peer, assignment_version, &message)
+                    .await
+                {
+                    Ok(()) => admitted_any = true,
+                    Err(error) => {
+                        admitted_any |=
+                            laminar_core::shuffle::shuffle_send_may_have_been_admitted(&error);
+                        return (admitted_any, Some((index, peer, error)));
+                    }
+                }
+            }
+            (admitted_any, None)
+        }))
+        .await;
+
     let mut sent_any = false;
-    for (peer, message) in outbound {
-        match sender
-            .send_to_for_assignment(peer, assignment_version, &message)
-            .await
-        {
-            Ok(()) => sent_any = true,
-            Err(error) => return Err(shuffle_send_error(context, peer, &error, sent_any)),
+    let mut errors = Vec::new();
+    for (admitted, error) in outcomes {
+        sent_any |= admitted;
+        if let Some(error) = error {
+            errors.push(error);
         }
     }
-    Ok(())
+
+    let first_error = if sent_any {
+        errors.into_iter().min_by_key(|(index, _, _)| *index)
+    } else {
+        errors.into_iter().min_by_key(|(index, _, error)| {
+            let terminal = matches!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::InvalidData
+                    | std::io::ErrorKind::Unsupported
+            );
+            (!terminal, *index)
+        })
+    };
+
+    match first_error {
+        Some((_, peer, error)) => Err(shuffle_send_error(context, peer, &error, sent_any)),
+        None => Ok(()),
+    }
 }
 
 /// Re-execute a cached physical plan without re-planning; source leaves are swapped per cycle.
@@ -402,14 +479,40 @@ mod shuffle_tests {
     }
 
     #[tokio::test]
-    async fn send_plan_classifies_failure_after_admission_as_partial() {
+    async fn send_plan_prioritizes_terminal_error_without_admission() {
+        let (sender, _receiver) = sender_with_reachable_peer_two().await;
+        let error = send_shuffle_plan(
+            &sender,
+            1,
+            vec![
+                (3, ShuffleMessage::checkpointed("stage".into(), 2, batch(1))),
+                (1, ShuffleMessage::checkpointed("stage".into(), 0, batch(2))),
+            ],
+            "test shuffle",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, DbError::ShuffleTerminal(_)));
+    }
+
+    #[tokio::test]
+    async fn send_plan_completes_peer_groups_and_preserves_peer_order() {
         let (sender, receiver) = sender_with_reachable_peer_two().await;
         let error = send_shuffle_plan(
             &sender,
             1,
             vec![
-                (2, ShuffleMessage::checkpointed("left".into(), 1, batch(1))),
                 (3, ShuffleMessage::checkpointed("right".into(), 2, batch(2))),
+                (2, ShuffleMessage::checkpointed("left".into(), 1, batch(1))),
+                (
+                    2,
+                    ShuffleMessage::Frontier {
+                        stage: "left".into(),
+                        watermark: Some(10),
+                        idle: false,
+                    },
+                ),
             ],
             "join shuffle",
         )
@@ -418,11 +521,16 @@ mod shuffle_tests {
 
         assert!(matches!(error, DbError::ShufflePartialSend(_)));
         assert!(error.requires_pipeline_recovery());
-        let received = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
             .await
-            .expect("admitted first frame was not delivered")
+            .expect("admitted data frame was not delivered")
             .expect("shuffle receiver closed");
-        assert!(matches!(received.message(), ShuffleMessage::Data { .. }));
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("admitted frontier frame was not delivered")
+            .expect("shuffle receiver closed");
+        assert!(matches!(first.message(), ShuffleMessage::Data { .. }));
+        assert!(matches!(second.message(), ShuffleMessage::Frontier { .. }));
     }
 
     #[tokio::test]

@@ -24,7 +24,7 @@ use crate::interval_join::{
     JoinStateCheckpoint,
 };
 use crate::operator::ProjectingJoinState;
-use crate::operator_graph::CapturedVnodeState;
+use crate::operator_graph::{CapturedVnodeState, InputFrontier};
 use crate::operator_graph::{GraphOperator, ManagedStateAccountingSnapshot, OperatorCheckpoint};
 
 #[cfg(feature = "cluster")]
@@ -51,6 +51,8 @@ struct IntervalJoinOperatorCheckpoint {
     aligned_replay: Vec<(u64, JoinInputSide, i64, Vec<u8>)>,
     applied_left_watermark: i64,
     applied_right_watermark: i64,
+    applied_left_idle: bool,
+    applied_right_idle: bool,
 }
 
 struct PreparedIntervalJoinTransition {
@@ -80,6 +82,8 @@ pub(crate) struct IntervalJoinOperator {
     vnode_transition_cleanup: Option<IntervalJoinTransitionCleanup>,
     applied_left_watermark: i64,
     applied_right_watermark: i64,
+    applied_left_idle: bool,
+    applied_right_idle: bool,
 }
 
 impl IntervalJoinOperator {
@@ -129,6 +133,8 @@ impl IntervalJoinOperator {
             vnode_transition_cleanup: None,
             applied_left_watermark: i64::MIN,
             applied_right_watermark: i64::MIN,
+            applied_left_idle: false,
+            applied_right_idle: false,
         }
     }
 
@@ -419,15 +425,9 @@ impl IntervalJoinOperator {
             ),
         ] {
             let expected_schema =
-                self.input_schemas.as_ref().map(
-                    |schemas| {
-                        if port == 0 {
-                            &schemas.0
-                        } else {
-                            &schemas.1
-                        }
-                    },
-                );
+                self.input_schemas
+                    .as_ref()
+                    .map(|schemas| if port == 0 { &schemas.0 } else { &schemas.1 });
             for (batch_index, batch) in inputs.get(port).into_iter().flatten().enumerate() {
                 if let Some(expected) = expected_schema {
                     if batch.schema().as_ref() != expected.as_ref() {
@@ -756,12 +756,14 @@ impl IntervalJoinOperator {
     async fn process_cluster(
         &mut self,
         inputs: &[Vec<RecordBatch>],
-        left_watermark: i64,
-        right_watermark: i64,
+        left_frontier: InputFrontier,
+        right_frontier: InputFrontier,
     ) -> Result<Vec<RecordBatch>, DbError> {
         if !self.aligned_replay.is_empty() {
             return self.execute_aligned_replay().await;
         }
+        let left_watermark = left_frontier.watermark.unwrap_or(i64::MIN);
+        let right_watermark = right_frontier.watermark.unwrap_or(i64::MIN);
         let (mut routed, _admitted, outbound_admitted) = self.route_cluster_inputs(inputs).await?;
         let frontier_advanced = left_watermark > self.applied_left_watermark
             || right_watermark > self.applied_right_watermark;
@@ -777,6 +779,8 @@ impl IntervalJoinOperator {
             .map_err(|error| self.post_shuffle_admission_error(outbound_admitted, error))?;
         self.applied_left_watermark = self.applied_left_watermark.max(left_watermark);
         self.applied_right_watermark = self.applied_right_watermark.max(right_watermark);
+        self.applied_left_idle = left_frontier.idle;
+        self.applied_right_idle = right_frontier.idle;
         Ok(output)
     }
 
@@ -832,9 +836,11 @@ impl IntervalJoinOperator {
         match side {
             JoinInputSide::Left => {
                 self.applied_left_watermark = self.applied_left_watermark.max(watermark);
+                self.applied_left_idle = false;
             }
             JoinInputSide::Right => {
                 self.applied_right_watermark = self.applied_right_watermark.max(watermark);
+                self.applied_right_idle = false;
             }
         }
         Ok(output)
@@ -892,11 +898,36 @@ impl GraphOperator for IntervalJoinOperator {
     ) -> Result<Vec<RecordBatch>, DbError> {
         let left_watermark = watermarks.first().copied().unwrap_or(i64::MIN);
         let right_watermark = watermarks.get(1).copied().unwrap_or(left_watermark);
+        self.process_with_frontiers(
+            inputs,
+            &[
+                InputFrontier {
+                    watermark: (left_watermark != i64::MIN).then_some(left_watermark),
+                    idle: false,
+                },
+                InputFrontier {
+                    watermark: (right_watermark != i64::MIN).then_some(right_watermark),
+                    idle: false,
+                },
+            ],
+        )
+        .await
+    }
+
+    async fn process_with_frontiers(
+        &mut self,
+        inputs: &[Vec<RecordBatch>],
+        frontiers: &[InputFrontier],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let left_frontier = frontiers.first().copied().unwrap_or_default();
+        let right_frontier = frontiers.get(1).copied().unwrap_or(left_frontier);
+        let left_watermark = left_frontier.watermark.unwrap_or(i64::MIN);
+        let right_watermark = right_frontier.watermark.unwrap_or(i64::MIN);
 
         #[cfg(feature = "cluster")]
         if self.cluster_shuffle.is_some() {
             return self
-                .process_cluster(inputs, left_watermark, right_watermark)
+                .process_cluster(inputs, left_frontier, right_frontier)
                 .await;
         }
 
@@ -910,6 +941,8 @@ impl GraphOperator for IntervalJoinOperator {
         let output = self.project_output(output).await?;
         self.applied_left_watermark = self.applied_left_watermark.max(left_watermark);
         self.applied_right_watermark = self.applied_right_watermark.max(right_watermark);
+        self.applied_left_idle = left_frontier.idle;
+        self.applied_right_idle = right_frontier.idle;
         Ok(output)
     }
 
@@ -968,6 +1001,8 @@ impl GraphOperator for IntervalJoinOperator {
         if aligned_replay.is_empty()
             && self.applied_left_watermark == i64::MIN
             && self.applied_right_watermark == i64::MIN
+            && !self.applied_left_idle
+            && !self.applied_right_idle
         {
             return Ok(None);
         }
@@ -989,6 +1024,8 @@ impl GraphOperator for IntervalJoinOperator {
             aligned_replay,
             applied_left_watermark: self.applied_left_watermark,
             applied_right_watermark: self.applied_right_watermark,
+            applied_left_idle: self.applied_left_idle,
+            applied_right_idle: self.applied_right_idle,
         };
         // The retained IPC set is already <= M. Bound the final archive independently by M so a
         // valid image in (M/2, M] remains checkpointable; live + IPC + archive peak at <= 3M.
@@ -1008,7 +1045,11 @@ impl GraphOperator for IntervalJoinOperator {
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        if self.applied_left_watermark != i64::MIN || self.applied_right_watermark != i64::MIN {
+        if self.applied_left_watermark != i64::MIN
+            || self.applied_right_watermark != i64::MIN
+            || self.applied_left_idle
+            || self.applied_right_idle
+        {
             return Err(DbError::Checkpoint(format!(
                 "interval join [{}] checkpoint restore was applied more than once",
                 self.projection.op_name
@@ -1091,13 +1132,15 @@ impl GraphOperator for IntervalJoinOperator {
 
         self.applied_left_watermark = checkpoint.applied_left_watermark;
         self.applied_right_watermark = checkpoint.applied_right_watermark;
+        self.applied_left_idle = checkpoint.applied_left_idle;
+        self.applied_right_idle = checkpoint.applied_right_idle;
         #[cfg(feature = "cluster")]
         self.aligned_replay.extend(decoded_replay);
 
         Ok(())
     }
 
-    fn watermark_hold(&self) -> Option<i64> {
+    fn output_frontier(&self, input: InputFrontier) -> InputFrontier {
         let bound_ms = i64::try_from(self.config.time_bound.as_millis()).unwrap_or(i64::MAX);
         let right_only = matches!(
             self.config.join_type,
@@ -1111,8 +1154,10 @@ impl GraphOperator for IntervalJoinOperator {
             self.applied_left_watermark
                 .min(self.applied_right_watermark.saturating_sub(bound_ms))
         };
+        let mut output = input.with_watermark_ceiling(Some(safe));
+        output.idle = self.applied_left_idle && self.applied_right_idle;
         #[cfg(feature = "cluster")]
-        let safe = self
+        let replay_hold = self
             .aligned_replay
             .iter()
             .map(|(_, side, watermark, _)| {
@@ -1122,14 +1167,18 @@ impl GraphOperator for IntervalJoinOperator {
                     watermark.saturating_sub(bound_ms)
                 }
             })
-            .min()
-            .map_or(safe, |replay| safe.min(replay));
-        Some(safe)
+            .min();
+        #[cfg(feature = "cluster")]
+        let output = output.held_at(replay_hold);
+        output
     }
 
     #[cfg(feature = "cluster")]
-    fn restored_output_watermark(&self) -> Option<i64> {
-        self.watermark_hold()
+    fn restored_output_frontier(&self) -> Option<InputFrontier> {
+        Some(self.output_frontier(InputFrontier {
+            watermark: Some(i64::MAX),
+            idle: false,
+        }))
     }
 
     #[cfg(feature = "cluster")]
@@ -1652,8 +1701,15 @@ mod tests {
         }
     }
 
+    fn unconstrained_frontier() -> InputFrontier {
+        InputFrontier {
+            watermark: Some(i64::MAX),
+            idle: true,
+        }
+    }
+
     #[test]
-    fn watermark_hold_uses_the_preserved_output_side() {
+    fn output_frontier_uses_the_preserved_output_side() {
         use laminar_sql::parser::join_parser::JoinType;
 
         for join_type in [
@@ -1672,13 +1728,58 @@ mod tests {
                 IntervalJoinOperator::new("frontier", config, None, SessionContext::new());
             operator.applied_left_watermark = 2_000;
             operator.applied_right_watermark = 1_500;
+            operator.applied_left_idle = true;
+            operator.applied_right_idle = true;
             let expected = if matches!(join_type, JoinType::RightSemi | JoinType::RightAnti) {
                 1_500
             } else {
                 1_400
             };
-            assert_eq!(operator.watermark_hold(), Some(expected), "{join_type:?}");
+            let output = operator.output_frontier(unconstrained_frontier());
+            assert_eq!(output.watermark, Some(expected), "{join_type:?}");
+            assert!(output.idle, "{join_type:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn all_input_idle_is_checkpointed_and_restored() {
+        let mut operator =
+            IntervalJoinOperator::new("idle-frontier", test_config(), None, SessionContext::new());
+        let frontiers = [
+            InputFrontier {
+                watermark: Some(200),
+                idle: true,
+            },
+            InputFrontier {
+                watermark: Some(400),
+                idle: true,
+            },
+        ];
+        operator
+            .process_with_frontiers(&[Vec::new(), Vec::new()], &frontiers)
+            .await
+            .unwrap();
+
+        let checkpoint = operator.checkpoint().unwrap().unwrap();
+        let mut restored =
+            IntervalJoinOperator::new("idle-frontier", test_config(), None, SessionContext::new());
+        restored.restore(checkpoint).unwrap();
+
+        assert!(restored.applied_left_idle);
+        assert!(restored.applied_right_idle);
+        let output = restored.output_frontier(InputFrontier {
+            watermark: Some(i64::MAX),
+            idle: false,
+        });
+        assert_eq!(
+            output,
+            InputFrontier {
+                watermark: Some(200),
+                idle: true,
+            }
+        );
+        #[cfg(feature = "cluster")]
+        assert_eq!(restored.restored_output_frontier(), Some(output));
     }
 
     #[cfg(feature = "cluster")]
@@ -1699,7 +1800,9 @@ mod tests {
                 5_000,
                 crate::operator::RetainedBatch::local(right_batch(&["A"], &[5_000], &[1.0])),
             ));
-            assert_eq!(operator.watermark_hold(), Some(expected), "{join_type:?}");
+            let output = operator.output_frontier(unconstrained_frontier());
+            assert_eq!(output.watermark, Some(expected), "{join_type:?}");
+            assert!(!output.idle, "{join_type:?}");
         }
     }
 
@@ -1889,7 +1992,7 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn aligned_replay_sweeps_resident_vnodes_before_advancing_watermark() {
+    async fn aligned_replay_reactivates_input_and_sweeps_resident_vnodes() {
         use laminar_sql::parser::join_parser::JoinType;
 
         let (shuffle, _) = single_owner_shuffle(2).await;
@@ -1912,6 +2015,8 @@ mod tests {
         let initial = op.process(&[vec![left], vec![]], &[0, 0]).await.unwrap();
         assert!(initial.is_empty());
         assert!(op.vnode_states[0].is_some());
+        op.applied_left_idle = true;
+        op.applied_right_idle = true;
         op.aligned_replay.push_back((
             assignment_version,
             JoinInputSide::Right,
@@ -1923,7 +2028,10 @@ mod tests {
 
         assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
         assert_eq!(op.applied_right_watermark, 300);
+        assert!(op.applied_left_idle);
+        assert!(!op.applied_right_idle);
         assert!(op.aligned_replay.is_empty());
+        assert!(!op.output_frontier(unconstrained_frontier()).idle);
         assert_eq!(op.vnode_states[0].as_ref().unwrap().buffered_rows(), (0, 0));
     }
 
@@ -2121,7 +2229,10 @@ mod tests {
             .process(&[vec![left], vec![right]], &[50, 50])
             .await
             .unwrap();
-        assert_eq!(op.watermark_hold(), Some(-50));
+        assert_eq!(
+            op.output_frontier(unconstrained_frontier()).watermark,
+            Some(-50)
+        );
 
         let metadata = op
             .checkpoint()
@@ -2143,7 +2254,10 @@ mod tests {
         let mut op2 = IntervalJoinOperator::new("test_interval", test_config(), None, ctx);
         op2.restore(metadata).unwrap();
         op2.restore_vnode(0, 1, &state).unwrap();
-        assert_eq!(op2.watermark_hold(), Some(-50));
+        assert_eq!(
+            op2.output_frontier(unconstrained_frontier()).watermark,
+            Some(-50)
+        );
 
         // New right data should match the restored left
         let right2 = right_batch(&["A"], &[120], &[2.0]);

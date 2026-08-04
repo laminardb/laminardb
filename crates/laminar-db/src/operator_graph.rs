@@ -64,7 +64,7 @@ pub(crate) struct InputFrontier {
 }
 
 impl InputFrontier {
-    const fn from_legacy(watermark: i64) -> Self {
+    const fn from_watermark(watermark: i64) -> Self {
         Self {
             watermark: if watermark == i64::MIN {
                 None
@@ -75,17 +75,36 @@ impl InputFrontier {
         }
     }
 
-    const fn legacy_watermark(self) -> i64 {
+    const fn watermark_or_min(self) -> i64 {
         match self.watermark {
             Some(watermark) => watermark,
             None => i64::MIN,
         }
     }
+
+    pub(crate) fn with_watermark_ceiling(mut self, ceiling: Option<i64>) -> Self {
+        if let Some(ceiling) = ceiling {
+            self.watermark = if ceiling == i64::MIN {
+                None
+            } else {
+                self.watermark.map(|watermark| watermark.min(ceiling))
+            };
+        }
+        self
+    }
+
+    pub(crate) fn held_at(mut self, hold: Option<i64>) -> Self {
+        if let Some(hold) = hold {
+            self = self.with_watermark_ceiling(Some(hold));
+            self.idle = false;
+        }
+        self
+    }
 }
 
 pub(crate) fn merge_input_frontiers(
     frontiers: &[InputFrontier],
-    legacy_watermark: i64,
+    fallback_watermark: i64,
 ) -> InputFrontier {
     let mut active_seen = false;
     let mut active_watermark = Some(i64::MAX);
@@ -110,7 +129,7 @@ pub(crate) fn merge_input_frontiers(
             idle: false,
         }
     } else if frontiers.is_empty() {
-        InputFrontier::from_legacy(legacy_watermark)
+        InputFrontier::from_watermark(fallback_watermark)
     } else {
         InputFrontier {
             watermark: idle_watermark,
@@ -183,7 +202,7 @@ pub(crate) trait GraphOperator: Send {
     ) -> Result<Vec<RecordBatch>, DbError> {
         let watermarks: smallvec::SmallVec<[i64; 2]> = frontiers
             .iter()
-            .map(|frontier| frontier.legacy_watermark())
+            .map(|frontier| frontier.watermark_or_min())
             .collect();
         self.process(inputs, &watermarks).await
     }
@@ -195,17 +214,15 @@ pub(crate) trait GraphOperator: Send {
         ))
     }
 
-    /// Output watermark ceiling. Holds the watermark at `min(input_wm, hold)` so
-    /// in-flight rows (e.g. async AI enrichment) aren't treated as late downstream.
-    /// `None` = no hold.
-    fn watermark_hold(&self) -> Option<i64> {
-        None
+    /// Derive the output frontier from the merged input frontier.
+    fn output_frontier(&self, input: InputFrontier) -> InputFrontier {
+        input
     }
 
-    /// Safe output watermark reconstructed from retained checkpoint work. Restore uses this seed
+    /// Safe output frontier reconstructed from retained checkpoint work. Restore uses this seed
     /// before any cycle runs; returning a value asserts that the durable cut had reached it.
     #[cfg(feature = "cluster")]
-    fn restored_output_watermark(&self) -> Option<i64> {
+    fn restored_output_frontier(&self) -> Option<InputFrontier> {
         None
     }
 
@@ -355,22 +372,22 @@ enum GraphExecutionMode {
 
 #[derive(Clone, Copy)]
 enum SourceFrontiers<'a> {
-    Legacy(Option<&'a FxHashMap<Arc<str>, i64>>),
-    Rich(Option<&'a FxHashMap<Arc<str>, InputFrontier>>),
+    Watermarks(Option<&'a FxHashMap<Arc<str>, i64>>),
+    Frontiers(Option<&'a FxHashMap<Arc<str>, InputFrontier>>),
 }
 
 impl SourceFrontiers<'_> {
     fn get(self, name: &Arc<str>, current_watermark: i64) -> InputFrontier {
         match self {
-            Self::Legacy(frontiers) => frontiers
+            Self::Watermarks(frontiers) => frontiers
                 .and_then(|frontiers| frontiers.get(name).copied())
                 .map_or_else(
-                    || InputFrontier::from_legacy(current_watermark),
-                    InputFrontier::from_legacy,
+                    || InputFrontier::from_watermark(current_watermark),
+                    InputFrontier::from_watermark,
                 ),
-            Self::Rich(frontiers) => frontiers
+            Self::Frontiers(frontiers) => frontiers
                 .and_then(|frontiers| frontiers.get(name).copied())
-                .unwrap_or_else(|| InputFrontier::from_legacy(current_watermark)),
+                .unwrap_or_else(|| InputFrontier::from_watermark(current_watermark)),
         }
     }
 }
@@ -1693,7 +1710,7 @@ impl OperatorGraph {
                 .any(|join| matches!(join, JoinOperatorConfig::Temporal(_)))
         }) {
             self.build_errors.push(DbError::Unsupported(
-                "temporal joins require the managed two-input vnode operator; legacy lookup execution is disabled"
+                "temporal joins require the managed two-input vnode operator; lookup execution is unsupported"
                     .into(),
             ));
             return;
@@ -2108,7 +2125,7 @@ impl OperatorGraph {
 
         if temporal_config.is_some() {
             return Box::new(operator::temporal_filter::RejectingOperator::new(
-                "temporal joins require the managed two-input vnode operator; legacy lookup execution is disabled",
+                "temporal joins require the managed two-input vnode operator; lookup execution is unsupported",
             ));
         }
 
@@ -2524,7 +2541,7 @@ impl OperatorGraph {
                         idle: self.output_idle[upstream],
                     }
                 } else {
-                    InputFrontier::from_legacy(current_watermark)
+                    InputFrontier::from_watermark(current_watermark)
                 }
             })
             .collect();
@@ -2631,12 +2648,9 @@ impl OperatorGraph {
             return;
         }
 
-        let mut output = merge_input_frontiers(frontiers, current_watermark);
-        if let Some(hold) = self.nodes[node_id].operator.watermark_hold() {
-            output.watermark = output.watermark.map(|watermark| watermark.min(hold));
-            output.idle = false;
-        }
-        let watermark = self.output_watermarks[node_id].max(output.legacy_watermark());
+        let input = merge_input_frontiers(frontiers, current_watermark);
+        let output = self.nodes[node_id].operator.output_frontier(input);
+        let watermark = self.output_watermarks[node_id].max(output.watermark_or_min());
         self.output_watermarks[node_id] = watermark;
         self.output_idle[node_id] = output.idle;
         if let Some(ref prom) = self.prom {
@@ -2699,7 +2713,7 @@ impl OperatorGraph {
         self.execute_cycle_with_mode(
             source_batches,
             current_watermark,
-            SourceFrontiers::Legacy(source_watermarks),
+            SourceFrontiers::Watermarks(source_watermarks),
             GraphExecutionMode::Normal,
         )
         .await
@@ -2714,7 +2728,7 @@ impl OperatorGraph {
         self.execute_cycle_with_mode(
             source_batches,
             current_watermark,
-            SourceFrontiers::Rich(source_frontiers),
+            SourceFrontiers::Frontiers(source_frontiers),
             GraphExecutionMode::Normal,
         )
         .await
@@ -2784,7 +2798,7 @@ impl OperatorGraph {
         self.execute_cycle_with_mode(
             &source_batches,
             current_watermark,
-            SourceFrontiers::Legacy(frozen_source_watermarks),
+            SourceFrontiers::Watermarks(frozen_source_watermarks),
             GraphExecutionMode::CheckpointDrain,
         )
         .await
@@ -2799,7 +2813,7 @@ impl OperatorGraph {
         self.execute_cycle_with_mode(
             &source_batches,
             current_watermark,
-            SourceFrontiers::Rich(frozen_source_frontiers),
+            SourceFrontiers::Frontiers(frozen_source_frontiers),
             GraphExecutionMode::CheckpointDrain,
         )
         .await
@@ -3129,7 +3143,7 @@ impl OperatorGraph {
                 }
             }
             let frontier = source_frontiers.get(&route.name, current_watermark);
-            let watermark = self.output_watermarks[route.node_id].max(frontier.legacy_watermark());
+            let watermark = self.output_watermarks[route.node_id].max(frontier.watermark_or_min());
             self.output_watermarks[route.node_id] = watermark;
             self.output_idle[route.node_id] = frontier.idle;
             if let Some(ref prom) = self.prom {
@@ -3297,6 +3311,7 @@ impl OperatorGraph {
             .stage_checkpointed_shuffle(stage, batch, watermark);
         if result.is_ok() {
             self.output_watermarks[idx] = self.output_watermarks[idx].min(watermark);
+            self.output_idle[idx] = false;
         }
         result
     }
@@ -3489,7 +3504,9 @@ impl OperatorGraph {
         received: laminar_core::shuffle::ReceivedShuffle,
         watermark: i64,
     ) -> Result<(), DbError> {
+        let peer = received.peer();
         let assignment_version = received.assignment_version();
+        let recovery_gen = received.recovery_gen();
         let (message, admission) = received.into_parts();
         let laminar_core::shuffle::ShuffleMessage::Data {
             stage,
@@ -3501,10 +3518,16 @@ impl OperatorGraph {
                 "non-data frame entered shuffle data staging".into(),
             ));
         };
-        let uniform_vnode = crate::operator::uniform_vnode_hint(&routed_vnodes);
         self.stage_checkpointed_shuffle(
             &stage,
-            RetainedBatch::admitted(batch, admission, assignment_version, uniform_vnode),
+            RetainedBatch::admitted(
+                batch,
+                admission,
+                peer,
+                assignment_version,
+                recovery_gen,
+                routed_vnodes,
+            ),
             watermark,
         )
     }
@@ -3677,8 +3700,8 @@ impl OperatorGraph {
             }
             laminar_core::checkpoint::CheckpointAttemptRelation::Conflict => {
                 Err(DbError::Pipeline(format!(
-                "shuffle barrier attempt mismatch: expected {expected:?}, received {observed:?}"
-            )))
+                    "shuffle barrier attempt mismatch: expected {expected:?}, received {observed:?}"
+                )))
             }
         }
     }
@@ -3780,9 +3803,7 @@ impl OperatorGraph {
                         attempt.checkpoint_id, attempt.epoch
                     )));
                 }
-                if durable.verdict
-                    != laminar_core::checkpoint_decision::CheckpointVerdict::Abort
-                {
+                if durable.verdict != laminar_core::checkpoint_decision::CheckpointVerdict::Abort {
                     return Err(DbError::Pipeline(format!(
                         "shuffle barrier alignment for checkpoint {} epoch {} observed durable {:?} instead of Abort",
                         attempt.checkpoint_id, attempt.epoch, durable.verdict
@@ -3790,16 +3811,16 @@ impl OperatorGraph {
                 }
                 Ok(Some(ShuffleAlignmentOutcome::Aborted))
             }
-            laminar_core::checkpoint::CheckpointAttemptRelation::Newer => Err(DbError::Pipeline(
-                format!(
+            laminar_core::checkpoint::CheckpointAttemptRelation::Newer => {
+                Err(DbError::Pipeline(format!(
                     "checkpoint {} epoch {} was superseded by durable terminal checkpoint {} epoch {} ({:?})",
                     attempt.checkpoint_id,
                     attempt.epoch,
                     durable.checkpoint_id,
                     durable.epoch,
                     durable.verdict
-                ),
-            )),
+                )))
+            }
             laminar_core::checkpoint::CheckpointAttemptRelation::Older
             | laminar_core::checkpoint::CheckpointAttemptRelation::Conflict => {
                 Err(DbError::Pipeline(format!(
@@ -4457,8 +4478,9 @@ impl OperatorGraph {
         #[cfg(feature = "cluster")]
         for (node_id, node) in self.nodes.iter_mut().enumerate() {
             if !node.removed {
-                if let Some(watermark) = node.operator.restored_output_watermark() {
-                    self.output_watermarks[node_id] = watermark;
+                if let Some(frontier) = node.operator.restored_output_frontier() {
+                    self.output_watermarks[node_id] = frontier.watermark_or_min();
+                    self.output_idle[node_id] = frontier.idle;
                 }
             }
         }

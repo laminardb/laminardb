@@ -14,9 +14,9 @@ pub use routing::{
     RemoteRoute, ShuffleRoutingError, ROUTE_MAX_BATCH_BYTES, ROUTE_MAX_BATCH_ROWS,
     ROUTE_TARGET_BATCH_BYTES,
 };
-#[cfg(feature = "cluster")]
-pub use transport::SHUFFLE_ADDR_KEY;
 pub use transport::{
     is_scope_cancelled, ReceivedBatch, ReceivedFrontierCut, ReceivedShuffle, ShuffleBatchAdmission,
     ShufflePeerId, ShuffleReceiver, ShuffleSender,
 };
+#[cfg(feature = "cluster")]
+pub use transport::{shuffle_send_may_have_been_admitted, SHUFFLE_ADDR_KEY};

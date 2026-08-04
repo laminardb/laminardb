@@ -35,12 +35,12 @@ use crate::error::DbError;
 #[cfg(feature = "cluster")]
 use crate::operator::capability::{ManagedStateContract, OperatorStateClass};
 use crate::operator::capability::{OperatorCapability, OperatorImplementation};
-#[cfg(feature = "cluster")]
-use crate::operator_graph::ManagedVnodeTransition;
 use crate::operator_graph::{
     try_evaluate_compiled, CapturedVnodeState, GraphOperator, ManagedStateAccountingSnapshot,
     OperatorCheckpoint,
 };
+#[cfg(feature = "cluster")]
+use crate::operator_graph::{InputFrontier, ManagedVnodeTransition};
 use crate::sql_analysis::{extract_projection_filter, single_source_table};
 
 // Resolved on first `process()` call by introspecting the SQL.
@@ -1074,19 +1074,26 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
-    fn watermark_hold(&self) -> Option<i64> {
-        self.aligned_replay
-            .iter()
-            .map(|(_, watermark, _)| *watermark)
-            .min()
+    fn output_frontier(&self, input: InputFrontier) -> InputFrontier {
+        input.held_at(
+            self.aligned_replay
+                .iter()
+                .map(|(_, watermark, _)| *watermark)
+                .min(),
+        )
     }
 
     #[cfg(feature = "cluster")]
-    fn restored_output_watermark(&self) -> Option<i64> {
-        self.aligned_replay
+    fn restored_output_frontier(&self) -> Option<InputFrontier> {
+        let watermark = self
+            .aligned_replay
             .iter()
             .map(|(_, watermark, _)| *watermark)
-            .min()
+            .min()?;
+        Some(InputFrontier {
+            watermark: Some(watermark),
+            idle: false,
+        })
     }
 
     #[cfg(feature = "cluster")]

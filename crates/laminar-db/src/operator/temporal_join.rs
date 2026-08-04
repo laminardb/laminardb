@@ -8,9 +8,10 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow::row::Rows;
 use async_trait::async_trait;
+use datafusion::prelude::SessionContext;
 use laminar_connectors::connector::{
     source_mutations, source_mutations_routed, strip_source_mutations,
-    strip_source_mutations_routed,
+    strip_source_mutations_routed, strip_source_row_positions,
 };
 use laminar_core::state::{
     KeyGroupCount, NodeId, PartitionKeyCodecV1, VnodeAssignmentSnapshot, VnodeRegistry,
@@ -21,6 +22,7 @@ use laminar_sql::translator::TemporalJoinTranslatorConfig;
 
 use crate::error::DbError;
 use crate::operator::capability::OperatorCapability;
+use crate::operator::ProjectingJoinState;
 use crate::operator_graph::{
     merge_input_frontiers, CapturedVnodeState, GraphOperator, InputFrontier,
     ManagedStateAccountingSnapshot, OperatorCheckpoint,
@@ -33,6 +35,7 @@ const ABSENT_VNODE: u8 = 0;
 const PRESENT_VNODE: u8 = 1;
 const OPERATOR_CHECKPOINT_VERSION: u8 = 1;
 const PENDING_HOLD_ENTRY_CHARGE: usize = 64;
+const TEMPORAL_TMP_TABLE: &str = "__temporal_tmp";
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct TemporalJoinOperatorCheckpoint {
@@ -46,6 +49,7 @@ struct TemporalJoinOperatorCheckpoint {
     maintenance_remaining: u32,
     maintenance_rescan: bool,
     published_output_watermark: Option<i64>,
+    published_output_idle: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -73,6 +77,7 @@ struct RoutedTemporalBatch {
 
 pub(crate) struct ManagedTemporalJoinOperator {
     name: Arc<str>,
+    projection: ProjectingJoinState,
     config: TemporalJoinTranslatorConfig,
     limits: TemporalJoinExecutionLimits,
     left_schema: SchemaRef,
@@ -105,13 +110,15 @@ pub(crate) struct ManagedTemporalJoinOperator {
     maintenance_pending: bool,
     maintenance_remaining: usize,
     maintenance_rescan: bool,
-    published_output_watermark: Option<i64>,
+    published_output_frontier: Option<InputFrontier>,
 }
 
 impl ManagedTemporalJoinOperator {
     pub(crate) fn try_new(
         name: &str,
         config: TemporalJoinTranslatorConfig,
+        projection_sql: Option<Arc<str>>,
+        ctx: SessionContext,
         left_schema: SchemaRef,
         right_schema: SchemaRef,
         key_group_count: KeyGroupCount,
@@ -172,6 +179,7 @@ impl ManagedTemporalJoinOperator {
             VnodeRegistry::single_owner(vnode_count, LOCAL_NODE_ID).versioned_snapshot();
         let operator = Self {
             name: Arc::from(name),
+            projection: ProjectingJoinState::new(name, ctx, projection_sql, TEMPORAL_TMP_TABLE),
             config,
             limits,
             left_schema,
@@ -206,7 +214,7 @@ impl ManagedTemporalJoinOperator {
             maintenance_pending: false,
             maintenance_remaining: 0,
             maintenance_rescan: false,
-            published_output_watermark: None,
+            published_output_frontier: None,
         };
         let validation = operator.state_config(0, operator.max_managed_state_bytes)?;
         let _ = TemporalJoinVnodeState::try_new(
@@ -921,35 +929,54 @@ impl ManagedTemporalJoinOperator {
         Ok((changed, output))
     }
 
-    fn current_watermark_hold(&self) -> Option<i64> {
-        let frontier_hold = self.frontiers[0].watermark.map(|watermark| {
+    fn output_watermark_ceiling(&self) -> Option<i64> {
+        self.frontiers[0].watermark.map(|watermark| {
             let left_floor = watermark.saturating_sub(self.limits.left_allowed_lateness_ms);
             left_floor.min(left_floor.saturating_add(self.minimum_probe_offset))
-        });
+        })
+    }
+
+    fn pending_output_hold(&self) -> Option<i64> {
         let pending_hold = self
             .pending_hold_counts
             .first_key_value()
             .map(|(hold, _)| *hold);
-        let staged_hold = self
-            .pending_frontiers
-            .map(|_| self.published_output_watermark.unwrap_or(i64::MIN));
-        [frontier_hold, pending_hold, staged_hold]
-            .into_iter()
-            .flatten()
-            .min()
+        let staged_hold = self.pending_frontiers.map(|_| {
+            self.published_output_frontier
+                .and_then(|frontier| frontier.watermark)
+                .unwrap_or(i64::MIN)
+        });
+        pending_hold.into_iter().chain(staged_hold).min()
     }
 
-    fn record_published_output_watermark(&mut self, input_frontiers: &[InputFrontier]) {
-        let mut output = merge_input_frontiers(input_frontiers, i64::MIN);
-        if let Some(hold) = self.current_watermark_hold() {
-            output.watermark = output.watermark.map(|watermark| watermark.min(hold));
+    fn derive_output_frontier(&self, input: InputFrontier) -> InputFrontier {
+        let mut output = input
+            .with_watermark_ceiling(self.output_watermark_ceiling())
+            .held_at(self.pending_output_hold());
+        if self.maintenance_pending {
+            output.idle = false;
         }
-        if let Some(watermark) = output.watermark.filter(|watermark| *watermark != i64::MIN) {
-            self.published_output_watermark = Some(
-                self.published_output_watermark
-                    .map_or(watermark, |published| published.max(watermark)),
-            );
+        output
+    }
+
+    fn record_published_output_frontier(&mut self, input_frontiers: &[InputFrontier]) {
+        let output = self.derive_output_frontier(merge_input_frontiers(input_frontiers, i64::MIN));
+        if output == InputFrontier::default() && self.published_output_frontier.is_none() {
+            return;
         }
+        let watermark = match (
+            self.published_output_frontier
+                .and_then(|frontier| frontier.watermark),
+            output.watermark,
+        ) {
+            (Some(previous), Some(current)) => Some(previous.max(current)),
+            (Some(previous), None) => Some(previous),
+            (None, current) => current,
+        };
+        self.published_output_frontier = Some(InputFrontier {
+            watermark,
+            idle: output.idle,
+        });
     }
 
     fn process_common(
@@ -1005,8 +1032,44 @@ impl ManagedTemporalJoinOperator {
                 Err(error) => return Err(self.after_apply_error(applied, 0, error)),
             }
         }
-        self.record_published_output_watermark(&frontiers);
+        self.record_published_output_frontier(&frontiers);
         Ok(output)
+    }
+
+    async fn project_output(
+        &mut self,
+        join_result: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let visible = join_result
+            .iter()
+            .map(|batch| {
+                strip_source_row_positions(batch).map_err(|error| {
+                    DbError::SchemaMismatch(format!(
+                        "temporal join [{}] produced invalid hidden metadata: {error}",
+                        self.name
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.projection.apply(visible).await
+    }
+
+    async fn process_and_project(
+        &mut self,
+        inputs: &[Vec<RecordBatch>],
+        frontiers: [InputFrontier; 2],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let output = self.process_common(inputs, frontiers)?;
+        self.project_output(output).await.map_err(|error| {
+            if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
+                error
+            } else {
+                DbError::StatefulOperatorPartialApply(format!(
+                    "temporal join [{}] admitted state before post-projection failed: {error}",
+                    self.name
+                ))
+            }
+        })
     }
 
     fn after_apply_error(&self, applied: bool, vnode: u32, error: DbError) -> DbError {
@@ -1090,7 +1153,8 @@ impl GraphOperator for ManagedTemporalJoinOperator {
                 .filter(|watermark| *watermark != i64::MIN),
             idle: false,
         };
-        self.process_common(inputs, [frontier(0), frontier(1)])
+        self.process_and_project(inputs, [frontier(0), frontier(1)])
+            .await
     }
 
     async fn process_with_frontiers(
@@ -1104,7 +1168,8 @@ impl GraphOperator for ManagedTemporalJoinOperator {
                 self.name
             )));
         }
-        self.process_common(inputs, [frontiers[0], frontiers[1]])
+        self.process_and_project(inputs, [frontiers[0], frontiers[1]])
+            .await
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
@@ -1119,7 +1184,7 @@ impl GraphOperator for ManagedTemporalJoinOperator {
             && !self.maintenance_pending
             && self.maintenance_remaining == 0
             && !self.maintenance_rescan
-            && self.published_output_watermark.is_none()
+            && self.published_output_frontier.is_none()
         {
             return Ok(None);
         }
@@ -1145,7 +1210,12 @@ impl GraphOperator for ManagedTemporalJoinOperator {
             maintenance_pending: self.maintenance_pending,
             maintenance_remaining,
             maintenance_rescan: self.maintenance_rescan,
-            published_output_watermark: self.published_output_watermark,
+            published_output_watermark: self
+                .published_output_frontier
+                .and_then(|frontier| frontier.watermark),
+            published_output_idle: self
+                .published_output_frontier
+                .is_some_and(|frontier| frontier.idle),
         };
         let writer = rkyv::ser::writer::IoWriter::new(
             laminar_core::serialization::BoundedBytesWriter::new(self.max_managed_state_bytes),
@@ -1166,7 +1236,7 @@ impl GraphOperator for ManagedTemporalJoinOperator {
             || !self.resident_vnodes.is_empty()
             || self.frontiers != [InputFrontier::default(); 2]
             || self.pending_frontiers.is_some()
-            || self.published_output_watermark.is_some()
+            || self.published_output_frontier.is_some()
         {
             return Err(DbError::Checkpoint(format!(
                 "temporal join [{}] operator checkpoint was restored more than once",
@@ -1236,7 +1306,12 @@ impl GraphOperator for ManagedTemporalJoinOperator {
         self.maintenance_pending = checkpoint.maintenance_pending;
         self.maintenance_remaining = remaining;
         self.maintenance_rescan = checkpoint.maintenance_rescan;
-        self.published_output_watermark = checkpoint.published_output_watermark;
+        self.published_output_frontier = (checkpoint.published_output_watermark.is_some()
+            || checkpoint.published_output_idle)
+            .then_some(InputFrontier {
+                watermark: checkpoint.published_output_watermark,
+                idle: checkpoint.published_output_idle,
+            });
         self.whole_restored = true;
         Ok(())
     }
@@ -1249,13 +1324,14 @@ impl GraphOperator for ManagedTemporalJoinOperator {
         self.pending_frontiers.is_some()
     }
 
-    fn watermark_hold(&self) -> Option<i64> {
-        self.current_watermark_hold()
+    fn output_frontier(&self, input: InputFrontier) -> InputFrontier {
+        self.published_output_frontier
+            .unwrap_or_else(|| self.derive_output_frontier(input))
     }
 
     #[cfg(feature = "cluster")]
-    fn restored_output_watermark(&self) -> Option<i64> {
-        self.published_output_watermark
+    fn restored_output_frontier(&self) -> Option<InputFrontier> {
+        self.published_output_frontier
     }
 
     fn checkpoint_vnodes(
@@ -1350,7 +1426,7 @@ impl GraphOperator for ManagedTemporalJoinOperator {
                 return Err(DbError::Checkpoint(format!(
                     "temporal join [{}] absent vnode {vnode} frame has a payload",
                     self.name
-                )))
+                )));
             }
             PRESENT_VNODE if !payload.is_empty() => {
                 let total = self.checked_accounted_state_bytes()?;
@@ -1418,13 +1494,13 @@ impl GraphOperator for ManagedTemporalJoinOperator {
                 return Err(DbError::Checkpoint(format!(
                     "temporal join [{}] present vnode {vnode} frame has no payload",
                     self.name
-                )))
+                )));
             }
             _ => {
                 return Err(DbError::Checkpoint(format!(
                     "temporal join [{}] vnode {vnode} frame has unknown tag {tag}",
                     self.name
-                )))
+                )));
             }
         };
         let replacement_bytes = replacement
@@ -1515,6 +1591,7 @@ mod tests {
     use laminar_connectors::connector::{
         schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,
         SourceBatch, SourceMutation, SourceRowPositionCapability, SourceRowPositions,
+        SOURCE_ORDER_KEY_COLUMN, SOURCE_PARTITION_COLUMN, SOURCE_SUB_OFFSET_COLUMN,
     };
     use laminar_sql::temporal::{TemporalJoinKind, TemporalProbeSchedule};
 
@@ -1569,12 +1646,21 @@ mod tests {
     }
 
     fn operator(ready_probe_budget: usize) -> (ManagedTemporalJoinOperator, SchemaRef, SchemaRef) {
+        operator_with_projection(ready_probe_budget, None)
+    }
+
+    fn operator_with_projection(
+        ready_probe_budget: usize,
+        projection_sql: Option<&str>,
+    ) -> (ManagedTemporalJoinOperator, SchemaRef, SchemaRef) {
         let (left_visible, right_visible) = visible_schemas();
         let left = schema_with_source_row_positions(&left_visible).unwrap();
         let right = schema_with_source_row_positions(&right_visible).unwrap();
         let operator = ManagedTemporalJoinOperator::try_new(
             "temporal",
             config(),
+            projection_sql.map(Arc::from),
+            SessionContext::new(),
             Arc::clone(&left),
             Arc::clone(&right),
             KeyGroupCount::try_from(2_u16).unwrap(),
@@ -1739,7 +1825,16 @@ mod tests {
         assert!(operator.vnode_states.iter().all(Option::is_some));
         assert_eq!(operator.resident_vnodes, [0, 1]);
         assert_eq!(operator.frontiers, advanced);
-        assert_eq!(operator.watermark_hold(), Some(250));
+        assert_eq!(
+            operator.output_frontier(InputFrontier {
+                watermark: Some(300),
+                idle: false,
+            }),
+            InputFrontier {
+                watermark: Some(250),
+                idle: false,
+            }
+        );
 
         let mut actual = BTreeMap::new();
         for batch in output {
@@ -1776,7 +1871,7 @@ mod tests {
             restored_cut.frontiers = [
                 InputFrontier {
                     watermark: Some(100),
-                    idle: false,
+                    idle: true,
                 },
                 InputFrontier {
                     watermark: Some(50),
@@ -1784,11 +1879,17 @@ mod tests {
                 },
             ];
             let restored_frontiers = restored_cut.frontiers;
-            restored_cut.record_published_output_watermark(&restored_frontiers);
+            restored_cut.record_published_output_frontier(&restored_frontiers);
             let checkpoint = restored_cut.checkpoint().unwrap().unwrap();
             let (mut recovered, _, _) = self::operator(1);
             recovered.restore(checkpoint).unwrap();
-            assert_eq!(recovered.restored_output_watermark(), Some(100));
+            assert_eq!(
+                recovered.restored_output_frontier(),
+                Some(InputFrontier {
+                    watermark: Some(100),
+                    idle: true,
+                })
+            );
         }
 
         let (_, left_schema, right_schema) = self::operator(1);
@@ -1798,6 +1899,8 @@ mod tests {
         let mut negative = ManagedTemporalJoinOperator::try_new(
             "negative",
             negative_config,
+            None,
+            SessionContext::new(),
             left_schema,
             right_schema,
             KeyGroupCount::try_from(2_u16).unwrap(),
@@ -1808,7 +1911,99 @@ mod tests {
             watermark: Some(100),
             idle: false,
         };
-        assert_eq!(negative.watermark_hold(), Some(50));
+        assert_eq!(
+            negative.output_frontier(InputFrontier {
+                watermark: Some(100),
+                idle: false,
+            }),
+            InputFrontier {
+                watermark: Some(50),
+                idle: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_sees_only_visible_join_columns() {
+        let keys = [key_for_vnode(0), key_for_vnode(1)];
+        let (mut operator, _, _) = operator_with_projection(
+            8,
+            Some("SELECT * FROM __temporal_tmp WHERE value_quotes = 'live'"),
+        );
+        let left = left_batch(&keys, &["X", "X"], &[100, 100], &[7, 8]);
+        let right = right_batch(
+            &keys,
+            &["X", "X"],
+            &[90, 90],
+            &["live", "stale"],
+            &[SourceMutation::Put, SourceMutation::Put],
+        );
+
+        let frontiers = frontier(200);
+        let mut output = operator
+            .process_with_frontiers(&[vec![left], vec![right]], &frontiers)
+            .await
+            .unwrap();
+        while !operator.wants_input() {
+            output.extend(
+                operator
+                    .process_with_frontiers(&[], &frontiers)
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(
+            output[0]
+                .column_by_name("trade_id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            7
+        );
+        assert_eq!(
+            output[0]
+                .column_by_name("value_quotes")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "live"
+        );
+        for hidden in [
+            SOURCE_PARTITION_COLUMN,
+            SOURCE_ORDER_KEY_COLUMN,
+            SOURCE_SUB_OFFSET_COLUMN,
+        ] {
+            assert!(output[0].column_by_name(hidden).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn post_projection_failure_requires_recovery_after_state_admission() {
+        let key = key_for_vnode(0);
+        let (mut operator, _, _) =
+            operator_with_projection(8, Some("SELECT missing_column FROM __temporal_tmp"));
+        let left = left_batch(std::slice::from_ref(&key), &["X"], &[100], &[7]);
+        let right = right_batch(
+            std::slice::from_ref(&key),
+            &["X"],
+            &[90],
+            &["live"],
+            &[SourceMutation::Put],
+        );
+
+        let error = operator
+            .process_with_frontiers(&[vec![left], vec![right]], &frontier(200))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DbError::StatefulOperatorPartialApply(_)));
+        assert!(operator.vnode_states.iter().any(Option::is_some));
     }
 
     #[tokio::test]

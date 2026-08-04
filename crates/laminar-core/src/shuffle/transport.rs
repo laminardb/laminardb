@@ -61,6 +61,29 @@ impl std::fmt::Display for ScopeCancelled {
 impl std::error::Error for ScopeCancelled {}
 
 #[cfg(feature = "cluster")]
+#[derive(Debug)]
+struct MayHaveAdmittedShuffleFrame(std::io::Error);
+
+#[cfg(feature = "cluster")]
+impl std::fmt::Display for MayHaveAdmittedShuffleFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl std::error::Error for MayHaveAdmittedShuffleFrame {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn may_have_admitted_shuffle_frame(error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(error.kind(), MayHaveAdmittedShuffleFrame(error))
+}
+
+#[cfg(feature = "cluster")]
 fn scope_cancelled_io() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::ConnectionAborted, ScopeCancelled)
 }
@@ -72,6 +95,16 @@ pub fn is_scope_cancelled(error: &std::io::Error) -> bool {
     error
         .get_ref()
         .and_then(|source| source.downcast_ref::<ScopeCancelled>())
+        .is_some()
+}
+
+/// Whether a failed outbound operation may already have entered the peer's ordered send queue.
+#[cfg(feature = "cluster")]
+#[must_use]
+pub fn shuffle_send_may_have_been_admitted(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<MayHaveAdmittedShuffleFrame>())
         .is_some()
 }
 
@@ -387,6 +420,12 @@ impl ReceivedBatch {
         &self.routed_vnodes
     }
 
+    /// Clone the canonical vnode set without copying its contents.
+    #[must_use]
+    pub fn routed_vnodes_arc(&self) -> std::sync::Arc<[u32]> {
+        std::sync::Arc::clone(&self.routed_vnodes)
+    }
+
     /// Peer and exact transport stream that delivered this batch.
     #[must_use]
     pub const fn peer(&self) -> ShufflePeerId {
@@ -648,10 +687,11 @@ mod grpc {
         ShuffleFrame, ShuffleSummary,
     };
     use super::{
-        is_scope_cancelled, scope_cancelled_io, take_frontier_prefix, validate_checkpoint_barrier,
-        validate_frontier, CheckpointAttempt, Holdover, InboundReservation, ReceivedBatch,
-        ReceivedFrontierCut, ReceivedShuffle, ShuffleMessage, ShufflePeerId, MAX_STAGE_NAME_BYTES,
-        NONCANONICAL_BARRIER, SCOPE_CANCELLED, SHUFFLE_ADDR_KEY, SHUFFLE_RECV_QUEUE,
+        is_scope_cancelled, may_have_admitted_shuffle_frame, scope_cancelled_io,
+        take_frontier_prefix, validate_checkpoint_barrier, validate_frontier, CheckpointAttempt,
+        Holdover, InboundReservation, ReceivedBatch, ReceivedFrontierCut, ReceivedShuffle,
+        ShuffleMessage, ShufflePeerId, MAX_STAGE_NAME_BYTES, NONCANONICAL_BARRIER, SCOPE_CANCELLED,
+        SHUFFLE_ADDR_KEY, SHUFFLE_RECV_QUEUE,
     };
     use crate::checkpoint::{CheckpointAssignmentFence, CheckpointBarrier};
     use crate::cluster::control::{ClusterKv, LeaseDeadline};
@@ -2034,6 +2074,8 @@ mod grpc {
         seqs: Mutex<FxHashMap<ShufflePeerId, u64>>,
         checkpointed_control_node_budget: Arc<Semaphore>,
         node_budget: Arc<Semaphore>,
+        #[cfg(test)]
+        post_enqueue_pause: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     }
 
     impl std::fmt::Debug for ShuffleSender {
@@ -2075,7 +2117,26 @@ mod grpc {
                     CHECKPOINTED_CONTROL_NODE_BUDGET_BYTES,
                 )),
                 node_budget: Arc::new(Semaphore::new(OUTBOUND_NODE_BUDGET_BYTES)),
+                #[cfg(test)]
+                post_enqueue_pause: Mutex::new(None),
             }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn pause_next_send_after_enqueue_for_test(
+            &self,
+        ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let replaced = self
+                .post_enqueue_pause
+                .lock()
+                .replace((Arc::clone(&entered), Arc::clone(&release)));
+            assert!(
+                replaced.is_none(),
+                "post-enqueue send pause already installed"
+            );
+            (entered, release)
         }
 
         /// Node id bound into every outbound stream handshake.
@@ -2515,24 +2576,37 @@ mod grpc {
             };
             self.validate_scope(&scope, expected_assignment_version)?;
             match conn.tx.try_send(out) {
-                Ok(()) => self.process_lease.require_live_io(),
+                Ok(()) => {}
                 Err(crossfire::TrySendError::Full(out)) => tokio::select! {
                     biased;
-                    () = self.process_lease.wait_until_lost() => Err(process_lease_expired_io()),
-                    () = scope.cancel.cancelled() => Err(scope_cancelled_io()),
-                    result = conn.tx.send(out) => {
-                        result.map_err(|_| io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            format!("shuffle stream to peer {peer} closed"),
-                        ))?;
-                        self.process_lease.require_live_io()
-                    },
+                    () = self.process_lease.wait_until_lost() => {
+                        return Err(process_lease_expired_io());
+                    }
+                    () = scope.cancel.cancelled() => return Err(scope_cancelled_io()),
+                    result = conn.tx.send(out) => result.map_err(|_| io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        format!("shuffle stream to peer {peer} closed"),
+                    ))?,
                 },
-                Err(crossfire::TrySendError::Disconnected(_)) => Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    format!("shuffle stream to peer {peer} closed"),
-                )),
+                Err(crossfire::TrySendError::Disconnected(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        format!("shuffle stream to peer {peer} closed"),
+                    ));
+                }
             }
+
+            #[cfg(test)]
+            let post_enqueue_pause = { self.post_enqueue_pause.lock().take() };
+            #[cfg(test)]
+            if let Some((entered, release)) = post_enqueue_pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+
+            self.process_lease
+                .require_live_io()
+                .map_err(may_have_admitted_shuffle_frame)
         }
 
         fn validate_expected_assignment(&self, expected: Option<u64>) -> io::Result<()> {

@@ -27,7 +27,7 @@ use laminar_sql::datafusion::{LookupTableRegistry, PartialLookupState, Registere
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
 use crate::operator::ProjectingJoinState;
-use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
+use crate::operator_graph::{GraphOperator, InputFrontier, OperatorCheckpoint};
 
 const SUBMIT_CAPACITY: usize = 256;
 const RESULT_CAPACITY: usize = 256;
@@ -670,12 +670,14 @@ impl GraphOperator for LookupEnrichOperator {
         Ok(())
     }
 
-    fn watermark_hold(&self) -> Option<i64> {
-        self.pending
-            .values()
-            .map(|batch| batch.ingest_watermark)
-            .chain(self.replay.iter().map(|(watermark, _)| *watermark))
-            .min()
+    fn output_frontier(&self, input: InputFrontier) -> InputFrontier {
+        input.held_at(
+            self.pending
+                .values()
+                .map(|batch| batch.ingest_watermark)
+                .chain(self.replay.iter().map(|(watermark, _)| *watermark))
+                .min(),
+        )
     }
 
     fn wants_input(&self) -> bool {
@@ -860,7 +862,12 @@ mod tests {
                 .sum::<usize>(),
             3
         );
-        assert_eq!(op.watermark_hold(), Some(42));
+        let frontier = op.output_frontier(InputFrontier {
+            watermark: Some(100),
+            idle: true,
+        });
+        assert_eq!(frontier.watermark, Some(42));
+        assert!(!frontier.idle);
         assert!(!op.wants_input());
     }
 
