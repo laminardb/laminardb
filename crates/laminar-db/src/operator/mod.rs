@@ -247,7 +247,6 @@ pub(crate) mod interval_join;
 pub(crate) mod lookup_enrich;
 pub(crate) mod sql_query;
 pub(crate) mod temporal_filter;
-pub(crate) mod temporal_join;
 pub(crate) mod window_frame;
 
 pub(crate) async fn try_compile_post_projection(

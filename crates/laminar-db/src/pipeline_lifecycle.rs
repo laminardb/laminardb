@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
 use futures::FutureExt;
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{
@@ -3176,63 +3175,6 @@ impl LaminarDB {
         }
         graph.take_build_errors()?;
 
-        for tcfg in graph.temporal_join_configs() {
-            if self.lookup_registry.get_entry(&tcfg.right_table).is_none() {
-                let source = self.catalog.get_source(&tcfg.right_table).ok_or_else(|| {
-                    DbError::InvalidOperation(format!(
-                        "temporal right input '{}' is not a registered source",
-                        tcfg.right_table
-                    ))
-                })?;
-                let initial_batch = RecordBatch::new_empty(source.schema.clone());
-                let key_columns = vec![tcfg.right_key_column.clone()];
-                let key_indices = key_columns
-                    .iter()
-                    .map(|column| {
-                        initial_batch.schema().index_of(column).map_err(|error| {
-                            DbError::InvalidOperation(format!(
-                                "temporal right key '{}.{}': {error}",
-                                tcfg.right_table, column
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let version_col_idx = initial_batch
-                    .schema()
-                    .index_of(&tcfg.right_time_column)
-                    .map_err(|error| {
-                        DbError::InvalidOperation(format!(
-                            "temporal right version column '{}.{}': {error}",
-                            tcfg.right_table, tcfg.right_time_column
-                        ))
-                    })?;
-                let index = Arc::new(
-                    laminar_sql::datafusion::lookup_join_exec::VersionedIndex::build(
-                        &initial_batch,
-                        &key_indices,
-                        version_col_idx,
-                        usize::MAX,
-                    )
-                    .map_err(|error| {
-                        DbError::InvalidOperation(format!(
-                            "temporal right index '{}': {error}",
-                            tcfg.right_table
-                        ))
-                    })?,
-                );
-                self.lookup_registry.register_versioned(
-                    &tcfg.right_table,
-                    laminar_sql::datafusion::VersionedLookupState {
-                        batch: initial_batch,
-                        index,
-                        key_columns,
-                        version_column: tcfg.right_time_column.clone(),
-                        stream_time_column: tcfg.left_time_column.clone(),
-                        max_versions_per_key: usize::MAX,
-                    },
-                );
-            }
-        }
         Ok(graph)
     }
 
@@ -4006,21 +3948,6 @@ impl LaminarDB {
         tables_to_publish.dedup();
         for name in tables_to_publish {
             self.sync_table_to_datafusion(&name)?;
-            // Setup built the Versioned (temporal-join) state before the
-            // snapshot existed; rebuild it over the snapshot now instead of
-            // downgrading it to a plain Snapshot.
-            let entry = self.lookup_registry.get_entry(&name);
-            if let Some(laminar_sql::datafusion::RegisteredLookup::Versioned(v)) = &entry {
-                if let Some(batch) = self.table_store.read().to_record_batch(&name)? {
-                    if let Some(state) = crate::pipeline_callback::rebuild_versioned_state(v, batch)
-                    {
-                        self.lookup_registry.register_versioned(&name, state);
-                    }
-                }
-            } else if let Some(batch) = self.table_store.read().to_record_batch(&name)? {
-                self.lookup_registry
-                    .register(&name, laminar_sql::datafusion::LookupSnapshot { batch });
-            }
         }
 
         for (name, reg) in table_regs {

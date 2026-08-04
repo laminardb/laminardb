@@ -1947,13 +1947,9 @@ impl OperatorGraph {
             }
         }
 
-        if let Some(cfg) = temporal_config {
-            return Box::new(operator::temporal_join::TemporalJoinOperator::new(
-                name,
-                cfg.clone(),
-                projection_sql.map(Arc::from),
-                self.ctx.clone(),
-                self.lookup_registry.clone(),
+        if temporal_config.is_some() {
+            return Box::new(operator::temporal_filter::RejectingOperator::new(
+                "temporal joins require the managed two-input vnode operator; legacy lookup execution is disabled",
             ));
         }
 

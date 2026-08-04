@@ -5900,36 +5900,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 }
 
-/// Rebuild a versioned lookup state over `batch`, reusing the prior state's key
-/// and version columns. `None` if the version column is absent or the index
-/// fails to build.
-pub(crate) fn rebuild_versioned_state(
-    prior: &laminar_sql::datafusion::VersionedLookupState,
-    batch: RecordBatch,
-) -> Option<laminar_sql::datafusion::VersionedLookupState> {
-    let key_indices: Vec<usize> = prior
-        .key_columns
-        .iter()
-        .filter_map(|k| batch.schema().index_of(k).ok())
-        .collect();
-    let version_col_idx = batch.schema().index_of(&prior.version_column).ok()?;
-    let index = laminar_sql::datafusion::lookup_join_exec::VersionedIndex::build(
-        &batch,
-        &key_indices,
-        version_col_idx,
-        prior.max_versions_per_key,
-    )
-    .ok()?;
-    Some(laminar_sql::datafusion::VersionedLookupState {
-        batch,
-        index: Arc::new(index),
-        key_columns: prior.key_columns.clone(),
-        version_column: prior.version_column.clone(),
-        stream_time_column: prior.stream_time_column.clone(),
-        max_versions_per_key: prior.max_versions_per_key,
-    })
-}
-
 /// Encode an Arrow schema as a hex-encoded IPC flatbuffer.
 pub(crate) fn encode_arrow_schema(schema: &arrow_schema::Schema) -> String {
     laminar_connectors::config::encode_arrow_schema_ipc(schema)
