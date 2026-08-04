@@ -885,6 +885,47 @@ async fn cross_stage_drain_preserves_pre_frontier_data_as_one_cut() {
     assert_eq!(value.value(0), 20);
 }
 
+#[test]
+fn frontier_prefix_does_not_cross_a_reconnected_stream() {
+    let sender_incarnation = Uuid::from_u128(1);
+    let receiver_incarnation = Uuid::from_u128(2);
+    let mut staged = rustc_hash::FxHashMap::default();
+    staged.insert(
+        "stage".to_owned(),
+        vec![ReceivedBatch {
+            batch: one_row(10),
+            routed_vnodes: Arc::from([0_u32]),
+            reservation: None,
+            peer: 1,
+            sender_incarnation,
+            receiver_incarnation,
+            stream_id: Uuid::from_u128(10),
+            assignment_version: 1,
+            recovery_gen: 0,
+            checkpoint_sequence: 0,
+        }],
+    );
+    let frontier = ReceivedShuffle {
+        peer: 1,
+        message: ShuffleMessage::Frontier {
+            stage: "stage".into(),
+            watermark: Some(100),
+            idle: false,
+        },
+        reservation: None,
+        sender_incarnation,
+        receiver_incarnation,
+        stream_id: Uuid::from_u128(11),
+        assignment_version: 1,
+        assignment_digest: None,
+        recovery_gen: 0,
+        checkpoint_sequence: 1,
+    };
+
+    assert!(take_frontier_prefix(&mut staged, "stage", &frontier).is_empty());
+    assert_eq!(staged["stage"].len(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inbound_wire_rejects_noncanonical_barrier_before_publication() {
     use super::shuffle_v1::shuffle_transport_client::ShuffleTransportClient;

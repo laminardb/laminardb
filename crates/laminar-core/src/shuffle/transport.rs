@@ -597,6 +597,7 @@ fn take_frontier_prefix(
         batch.peer == frontier.peer
             && batch.sender_incarnation == frontier.sender_incarnation
             && batch.receiver_incarnation == frontier.receiver_incarnation
+            && batch.stream_id == frontier.stream_id
             && batch.assignment_version == frontier.assignment_version
             && batch.recovery_gen == frontier.recovery_gen
             && batch.checkpoint_sequence < frontier.checkpoint_sequence

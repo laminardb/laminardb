@@ -197,6 +197,21 @@ pub(crate) trait GraphOperator: Send {
         )))
     }
 
+    /// Apply one peer frontier after all earlier batches from that ordered stage were retained.
+    #[cfg(feature = "cluster")]
+    fn stage_checkpointed_shuffle_frontier(
+        &mut self,
+        stage: &str,
+        _peer: u64,
+        _frontier: InputFrontier,
+        _assignment_version: u64,
+        _recovery_gen: u64,
+    ) -> Result<(), DbError> {
+        Err(DbError::Pipeline(format!(
+            "operator does not accept ordered shuffle frontier stage '{stage}'"
+        )))
+    }
+
     /// Capture the requested vnode slots in canonical order. `None` is reserved for operators
     /// without vnode-managed state.
     fn checkpoint_vnodes(
@@ -1006,7 +1021,10 @@ impl OperatorGraph {
         let mut drain = FxHashSet::default();
         let mut pending = VecDeque::new();
         for (node_id, node) in self.nodes.iter().enumerate() {
-            if !node.removed && self.node_has_buffered_input(node_id) {
+            if !node.removed
+                && (self.node_has_buffered_input(node_id)
+                    || node.operator.checkpoint_aligned_replay_pending())
+            {
                 drain.insert(node_id);
                 pending.push_back(node_id);
             }
@@ -2756,6 +2774,14 @@ impl OperatorGraph {
             self.compute_topo_order();
         }
 
+        #[cfg(feature = "cluster")]
+        if let Err(error) = self.pump_ordered_shuffle_prefix(current_watermark) {
+            if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
+                self.poison_after_terminal_error();
+            }
+            return Err(error);
+        }
+
         self.register_source_tables(source_batches);
         self.prime_sources(source_batches, current_watermark, source_frontiers);
 
@@ -3135,21 +3161,31 @@ impl OperatorGraph {
     }
 
     #[cfg(feature = "cluster")]
+    fn shuffle_stage_node(&self, stage: &str) -> Result<usize, DbError> {
+        if let Some(idx) = self.find_node(stage) {
+            return Ok(idx);
+        }
+        let node_name = stage
+            .strip_suffix("::left")
+            .or_else(|| stage.strip_suffix("::right"));
+        node_name
+            .and_then(|name| (!name.is_empty()).then_some(name))
+            .and_then(|name| self.find_node(name))
+            .ok_or_else(|| {
+                DbError::ShuffleTerminal(format!(
+                    "shuffle frame targets unknown or removed stage '{stage}'"
+                ))
+            })
+    }
+
+    #[cfg(feature = "cluster")]
     fn stage_checkpointed_shuffle(
         &mut self,
         stage: &str,
         batch: RetainedBatch,
         watermark: i64,
     ) -> Result<(), DbError> {
-        let node_name = stage
-            .strip_suffix("::left")
-            .or_else(|| stage.strip_suffix("::right"))
-            .unwrap_or(stage);
-        let idx = self.find_node(node_name).ok_or_else(|| {
-            DbError::Pipeline(format!(
-                "shuffle frame targets unknown or removed stage '{stage}'"
-            ))
-        })?;
+        let idx = self.shuffle_stage_node(stage)?;
         let result = self.nodes[idx]
             .operator
             .stage_checkpointed_shuffle(stage, batch, watermark);
@@ -3157,6 +3193,188 @@ impl OperatorGraph {
             self.output_watermarks[idx] = self.output_watermarks[idx].min(watermark);
         }
         result
+    }
+
+    #[cfg(feature = "cluster")]
+    fn stage_checkpointed_shuffle_frontier(
+        &mut self,
+        stage: &str,
+        peer: u64,
+        frontier: InputFrontier,
+        assignment_version: u64,
+        recovery_gen: u64,
+    ) -> Result<(), DbError> {
+        let idx = self.shuffle_stage_node(stage)?;
+        self.nodes[idx]
+            .operator
+            .stage_checkpointed_shuffle_frontier(
+                stage,
+                peer,
+                frontier,
+                assignment_version,
+                recovery_gen,
+            )
+    }
+
+    #[cfg(feature = "cluster")]
+    fn validate_current_received_frontier(
+        &self,
+        cfg: &crate::operator::sql_query::ClusterShuffleConfig,
+        received: &laminar_core::shuffle::ReceivedShuffle,
+    ) -> Result<(), DbError> {
+        let laminar_core::shuffle::ShuffleMessage::Frontier {
+            stage, watermark, ..
+        } = received.message()
+        else {
+            return Err(DbError::ShuffleTerminal(
+                "non-frontier frame entered ordered shuffle frontier staging".into(),
+            ));
+        };
+        if stage.is_empty() || *watermark == Some(i64::MIN) {
+            return Err(DbError::ShuffleTerminal(
+                "shuffle frontier has a non-canonical stage or watermark".into(),
+            ));
+        }
+        let current_assignment = cfg.registry.assignment_version();
+        let current_recovery = cfg.receiver.recovery_gen();
+        if received.peer() == cfg.self_id.0
+            || received.stream_id().is_nil()
+            || received.receiver_incarnation() != cfg.receiver.incarnation()
+            || received.assignment_version() != current_assignment
+            || received.assignment_version() != cfg.sender.assignment_version()
+            || received.assignment_version() != cfg.receiver.assignment_version()
+            || received.recovery_gen() != current_recovery
+            || received.recovery_gen() != cfg.sender.recovery_gen()
+        {
+            return Err(DbError::Checkpoint(format!(
+                "shuffle frontier from peer {} is outside current assignment {current_assignment} recovery {current_recovery}",
+                received.peer()
+            )));
+        }
+        self.shuffle_stage_node(stage)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn validate_received_frontier_cuts(
+        &self,
+        cfg: &crate::operator::sql_query::ClusterShuffleConfig,
+        cuts: &[laminar_core::shuffle::ReceivedFrontierCut],
+    ) -> Result<(), DbError> {
+        for cut in cuts {
+            let frontier = cut.frontier();
+            self.validate_current_received_frontier(cfg, frontier)?;
+            for batch in cut.preceding() {
+                if batch.peer() != frontier.peer()
+                    || batch.sender_incarnation() != frontier.sender_incarnation()
+                    || batch.receiver_incarnation() != frontier.receiver_incarnation()
+                    || batch.stream_id() != frontier.stream_id()
+                    || batch.assignment_version() != frontier.assignment_version()
+                    || batch.recovery_gen() != frontier.recovery_gen()
+                    || batch.checkpoint_sequence() >= frontier.checkpoint_sequence()
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "shuffle frontier cut from peer {} is not one ordered stream prefix",
+                        frontier.peer()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn post_dequeue_shuffle_error(context: &str, error: DbError) -> DbError {
+        if error.requires_pipeline_halt() || error.requires_pipeline_recovery() {
+            error
+        } else {
+            DbError::StatefulOperatorPartialApply(format!("{context}: {error}"))
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn dispatch_received_frontier_cut(
+        &mut self,
+        cut: laminar_core::shuffle::ReceivedFrontierCut,
+        batch_watermark: i64,
+    ) -> Result<(), DbError> {
+        let (preceding, received) = cut.into_parts();
+        let peer = received.peer();
+        let assignment_version = received.assignment_version();
+        let recovery_gen = received.recovery_gen();
+        let laminar_core::shuffle::ShuffleMessage::Frontier {
+            stage,
+            watermark,
+            idle,
+        } = received.message()
+        else {
+            return Err(DbError::ShuffleTerminal(
+                "non-frontier frame entered ordered shuffle frontier dispatch".into(),
+            ));
+        };
+        for batch in preceding {
+            self.stage_checkpointed_shuffle(
+                stage,
+                RetainedBatch::from_received(batch),
+                batch_watermark,
+            )
+            .map_err(|error| {
+                Self::post_dequeue_shuffle_error("ordered shuffle batch staging", error)
+            })?;
+        }
+        self.stage_checkpointed_shuffle_frontier(
+            stage,
+            peer,
+            InputFrontier {
+                watermark: *watermark,
+                idle: *idle,
+            },
+            assignment_version,
+            recovery_gen,
+        )
+        .map_err(|error| {
+            Self::post_dequeue_shuffle_error("ordered shuffle frontier staging", error)
+        })
+    }
+
+    #[cfg(feature = "cluster")]
+    fn dispatch_validated_frontier_cuts(
+        &mut self,
+        cuts: Vec<laminar_core::shuffle::ReceivedFrontierCut>,
+        batch_watermark: i64,
+    ) -> Result<(), DbError> {
+        for cut in cuts {
+            self.dispatch_received_frontier_cut(cut, batch_watermark)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn pump_ordered_shuffle_prefix(&mut self, watermark: i64) -> Result<(), DbError> {
+        let Some(cfg) = self.cluster_shuffle.clone() else {
+            return Ok(());
+        };
+        Self::ensure_shuffle_delivery_intact(&cfg)
+            .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+
+        // The receiver stops at the first ordered control and caps this pass by its admitted
+        // holdover, so one graph cycle cannot chase an unbounded live queue.
+        let staged = cfg.receiver.drain_checkpointed_staged();
+        let cuts = cfg.receiver.drain_staged_frontiers();
+        for (stage, _) in &staged {
+            self.shuffle_stage_node(stage)?;
+        }
+        self.validate_received_frontier_cuts(&cfg, &cuts)?;
+
+        for (stage, batch) in staged {
+            self.stage_checkpointed_shuffle(&stage, RetainedBatch::from_received(batch), watermark)
+                .map_err(|error| {
+                    Self::post_dequeue_shuffle_error("checkpointed shuffle batch staging", error)
+                })?;
+        }
+        self.dispatch_validated_frontier_cuts(cuts, watermark)?;
+        Self::ensure_shuffle_delivery_intact(&cfg)
+            .map_err(|error| DbError::Checkpoint(error.to_string()))
     }
 
     #[cfg(feature = "cluster")]
@@ -3183,6 +3401,55 @@ impl OperatorGraph {
             RetainedBatch::admitted(batch, admission, assignment_version, uniform_vnode),
             watermark,
         )
+    }
+
+    #[cfg(feature = "cluster")]
+    fn stage_received_shuffle_frontier(
+        &mut self,
+        received: laminar_core::shuffle::ReceivedShuffle,
+    ) -> Result<(), DbError> {
+        let peer = received.peer();
+        let assignment_version = received.assignment_version();
+        let recovery_gen = received.recovery_gen();
+        let laminar_core::shuffle::ShuffleMessage::Frontier {
+            stage,
+            watermark,
+            idle,
+        } = received.message()
+        else {
+            return Err(DbError::Pipeline(
+                "non-frontier frame entered shuffle frontier staging".into(),
+            ));
+        };
+        self.stage_checkpointed_shuffle_frontier(
+            stage,
+            peer,
+            InputFrontier {
+                watermark: *watermark,
+                idle: *idle,
+            },
+            assignment_version,
+            recovery_gen,
+        )
+    }
+
+    #[cfg(feature = "cluster")]
+    fn stage_received_ordered_shuffle(
+        &mut self,
+        received: laminar_core::shuffle::ReceivedShuffle,
+        watermark: i64,
+    ) -> Result<(), DbError> {
+        match received.message() {
+            laminar_core::shuffle::ShuffleMessage::Data { .. } => {
+                self.stage_received_shuffle_data(received, watermark)
+            }
+            laminar_core::shuffle::ShuffleMessage::Frontier { .. } => {
+                self.stage_received_shuffle_frontier(received)
+            }
+            laminar_core::shuffle::ShuffleMessage::Barrier(_) => Err(DbError::Pipeline(
+                "barrier entered ordered shuffle data/frontier staging".into(),
+            )),
+        }
     }
 
     #[cfg(feature = "cluster")]
@@ -3488,7 +3755,10 @@ impl OperatorGraph {
                         assignment_fence,
                         recovery_gen,
                     )?;
-                    if matches!(received.message(), ShuffleMessage::Data { .. }) {
+                    if matches!(
+                        received.message(),
+                        ShuffleMessage::Data { .. } | ShuffleMessage::Frontier { .. }
+                    ) {
                         let peer = received.peer();
                         let sequence = received.checkpoint_sequence();
                         if let Some(cut) = barrier_cuts.get(&peer) {
@@ -3499,14 +3769,14 @@ impl OperatorGraph {
                             )
                             .await?
                             {
-                                self.stage_received_shuffle_data(received, watermark)?;
+                                self.stage_received_ordered_shuffle(received, watermark)?;
                                 return Ok(outcome);
                             }
                             return Err(DbError::Pipeline(format!(
-                                "shuffle data sequence {sequence} from peer {peer} arrived after its checkpoint barrier high-water {cut} while peers {remaining:?} were still outstanding"
+                                "shuffle ordered frame sequence {sequence} from peer {peer} arrived after its checkpoint barrier high-water {cut} while peers {remaining:?} were still outstanding"
                             )));
                         }
-                        self.stage_received_shuffle_data(received, watermark)?;
+                        self.stage_received_ordered_shuffle(received, watermark)?;
                         continue;
                     }
 
@@ -3683,10 +3953,19 @@ impl OperatorGraph {
 
             // Fan-out can cancel while waiting on admission. Keep holdover ownership in the
             // receiver until every failed peer has either accepted or explicitly left the scope.
+            let exposed_frontiers = cfg.receiver.drain_staged_frontiers();
+            self.validate_received_frontier_cuts(&cfg, &exposed_frontiers)?;
+            self.dispatch_validated_frontier_cuts(exposed_frontiers, watermark)?;
             let staged_batches = match cfg.receiver.drain_checkpointed_holdover() {
                 Ok(staged) => staged,
                 Err(error) if laminar_core::shuffle::is_scope_cancelled(&error) => {
                     return Ok(ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Err(DbError::Pipeline(
+                        "shuffle frontier holdover did not settle before checkpoint transfer"
+                            .into(),
+                    ));
                 }
                 Err(error) => {
                     return Err(DbError::Pipeline(format!(

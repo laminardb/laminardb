@@ -189,7 +189,7 @@ async fn all_idle_frontier_respects_legacy_watermark_hold() {
 
 #[cfg(feature = "cluster")]
 #[test]
-fn default_operator_rejects_checkpointed_shuffle() {
+fn default_operator_rejects_ordered_shuffle_staging() {
     let mut operator = SourcePassthrough;
 
     let error = operator
@@ -203,6 +203,22 @@ fn default_operator_rejects_checkpointed_shuffle() {
     assert!(error
         .to_string()
         .contains("does not accept checkpointed shuffle stage"));
+
+    let error = operator
+        .stage_checkpointed_shuffle_frontier(
+            "unadmitted-join-stage::right",
+            2,
+            InputFrontier {
+                watermark: Some(10),
+                idle: false,
+            },
+            1,
+            0,
+        )
+        .expect_err("operators without an ordered frontier path must fail closed");
+    assert!(error
+        .to_string()
+        .contains("does not accept ordered shuffle frontier stage"));
 }
 
 #[cfg(feature = "cluster")]
@@ -684,6 +700,71 @@ impl GraphOperator for RecordingOperator {
 }
 
 #[cfg(feature = "cluster")]
+#[derive(Debug, PartialEq, Eq)]
+enum OrderedShuffleEvent {
+    Batch(i64),
+    Frontier(String, u64, InputFrontier, u64, u64),
+}
+
+#[cfg(feature = "cluster")]
+struct OrderedShuffleProbe(Arc<parking_lot::Mutex<Vec<OrderedShuffleEvent>>>);
+
+#[cfg(feature = "cluster")]
+#[async_trait]
+impl GraphOperator for OrderedShuffleProbe {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn stage_checkpointed_shuffle(
+        &mut self,
+        _stage: &str,
+        batch: RetainedBatch,
+        _watermark: i64,
+    ) -> Result<(), DbError> {
+        let event_time = batch
+            .batch()
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        self.0.lock().push(OrderedShuffleEvent::Batch(event_time));
+        Ok(())
+    }
+
+    fn stage_checkpointed_shuffle_frontier(
+        &mut self,
+        stage: &str,
+        peer: u64,
+        frontier: InputFrontier,
+        assignment_version: u64,
+        recovery_gen: u64,
+    ) -> Result<(), DbError> {
+        self.0.lock().push(OrderedShuffleEvent::Frontier(
+            stage.to_owned(),
+            peer,
+            frontier,
+            assignment_version,
+            recovery_gen,
+        ));
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cluster")]
 struct AlignmentHarness {
     graph: OperatorGraph,
     local_receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
@@ -782,6 +863,195 @@ async fn alignment_harness() -> AlignmentHarness {
         fence,
         recorded,
     }
+}
+
+#[cfg(feature = "cluster")]
+fn ordered_batch(event_time: i64) -> RecordBatch {
+    RecordBatch::try_new(
+        test_schema(),
+        vec![
+            Arc::new(StringArray::from(vec!["AAPL"])),
+            Arc::new(Float64Array::from(vec![150.0])),
+            Arc::new(Int64Array::from(vec![event_time])),
+        ],
+    )
+    .unwrap()
+}
+
+#[cfg(feature = "cluster")]
+fn install_ordered_probe(
+    harness: &mut AlignmentHarness,
+) -> Arc<parking_lot::Mutex<Vec<OrderedShuffleEvent>>> {
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let budget = harness.graph.max_retractable_extremum_checkpoint_bytes;
+    harness.graph.nodes[0]
+        .replace_operator(Box::new(OrderedShuffleProbe(Arc::clone(&events))), budget);
+    events
+}
+
+#[cfg(feature = "cluster")]
+async fn send_remote(harness: &AlignmentHarness, message: laminar_core::shuffle::ShuffleMessage) {
+    harness.remote_sender.send_to(1, &message).await.unwrap();
+}
+
+#[cfg(feature = "cluster")]
+async fn execute_until_events(
+    harness: &mut AlignmentHarness,
+    events: &parking_lot::Mutex<Vec<OrderedShuffleEvent>>,
+    expected: usize,
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while events.lock().len() < expected {
+        harness
+            .graph
+            .execute_cycle(&FxHashMap::default(), 7, None)
+            .await
+            .unwrap();
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graph_dispatches_an_ordered_frontier_cut_before_later_data() {
+    use laminar_core::shuffle::ShuffleMessage;
+
+    let mut harness = alignment_harness().await;
+    let events = install_ordered_probe(&mut harness);
+    let stage = "out::right";
+    send_remote(
+        &harness,
+        ShuffleMessage::checkpointed(stage.into(), 0, ordered_batch(10)),
+    )
+    .await;
+    send_remote(
+        &harness,
+        ShuffleMessage::Frontier {
+            stage: stage.into(),
+            watermark: Some(20),
+            idle: true,
+        },
+    )
+    .await;
+    send_remote(
+        &harness,
+        ShuffleMessage::checkpointed(stage.into(), 0, ordered_batch(30)),
+    )
+    .await;
+
+    execute_until_events(&mut harness, &events, 2).await;
+    assert_eq!(
+        *events.lock(),
+        [
+            OrderedShuffleEvent::Batch(10),
+            OrderedShuffleEvent::Frontier(
+                stage.into(),
+                2,
+                InputFrontier {
+                    watermark: Some(20),
+                    idle: true,
+                },
+                harness.fence.assignment_version,
+                0,
+            ),
+        ]
+    );
+
+    execute_until_events(&mut harness, &events, 3).await;
+    assert_eq!(events.lock()[2], OrderedShuffleEvent::Batch(30));
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn graph_rejects_an_unknown_ordered_frontier_stage() {
+    let graph = test_graph();
+    let error = graph.shuffle_stage_node("missing::left").unwrap_err();
+    assert!(
+        error.to_string().contains("unknown or removed stage"),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn alignment_consumes_an_exposed_frontier_cut_before_holdover() {
+    use laminar_core::checkpoint::{CheckpointAttempt, CheckpointBarrier};
+    use laminar_core::shuffle::ShuffleMessage;
+
+    let mut harness = alignment_harness().await;
+    let events = install_ordered_probe(&mut harness);
+    let attempt = CheckpointAttempt::new(70, 70);
+    let stage = "out::left";
+    send_remote(
+        &harness,
+        ShuffleMessage::checkpointed(stage.into(), 0, ordered_batch(10)),
+    )
+    .await;
+    send_remote(
+        &harness,
+        ShuffleMessage::Frontier {
+            stage: stage.into(),
+            watermark: Some(20),
+            idle: false,
+        },
+    )
+    .await;
+    harness
+        .remote_sender
+        .fan_out_barrier(
+            &[1],
+            CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch),
+            &harness.fence,
+        )
+        .await
+        .unwrap();
+
+    let stage_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let _ = harness
+            .local_receiver
+            .drain_checkpointed_data_for("__frontier_probe");
+        match harness.local_receiver.drain_checkpointed_holdover() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Ok(staged) => {
+                for (received_stage, batch) in staged {
+                    harness
+                        .graph
+                        .stage_checkpointed_shuffle(
+                            &received_stage,
+                            RetainedBatch::from_received(batch),
+                            7,
+                        )
+                        .unwrap();
+                }
+            }
+            Err(error) => panic!("frontier staging failed: {error}"),
+        }
+        assert!(tokio::time::Instant::now() < stage_deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    harness
+        .graph
+        .align_shuffle_barriers(
+            attempt,
+            7,
+            &harness.fence,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            None,
+        )
+        .await
+        .unwrap();
+    let events = events.lock();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0], OrderedShuffleEvent::Batch(10));
+    assert!(matches!(
+        &events[1],
+        OrderedShuffleEvent::Frontier(received_stage, 2, frontier, _, 0)
+            if received_stage == stage
+                && *frontier == InputFrontier { watermark: Some(20), idle: false }
+    ));
 }
 
 #[cfg(feature = "cluster")]
