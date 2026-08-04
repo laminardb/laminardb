@@ -11,8 +11,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::row::{RowConverter, SortField};
 use laminar_connectors::connector::{
-    SourceMutation, SOURCE_ORDER_KEY_COLUMN as SOURCE_ORDER_COLUMN, SOURCE_PARTITION_COLUMN,
-    SOURCE_SUB_OFFSET_COLUMN,
+    SourceMutation, SourceMutationView, SOURCE_ORDER_KEY_COLUMN as SOURCE_ORDER_COLUMN,
+    SOURCE_PARTITION_COLUMN, SOURCE_SUB_OFFSET_COLUMN,
 };
 use laminar_core::serialization::{deserialize_batch_stream, serialize_batches_stream_bounded};
 use laminar_core::state::PartitionKeyCodecV1;
@@ -363,7 +363,7 @@ impl TemporalJoinVnodeState {
     pub(crate) fn apply_right_batch(
         &mut self,
         batch: &RecordBatch,
-        operations: Option<&[SourceMutation]>,
+        operations: Option<SourceMutationView<'_>>,
     ) -> Result<TemporalRightApplyStats, DbError> {
         self.validate_batch_schema(batch, false)?;
         if operations.is_some_and(|operations| operations.len() != batch.num_rows()) {
@@ -386,8 +386,8 @@ impl TemporalJoinVnodeState {
             if let Some(key) = key.as_deref() {
                 self.validate_vnode(key)?;
             }
-            let tombstone =
-                operations.is_some_and(|operations| operations[row] == SourceMutation::Tombstone);
+            let tombstone = operations.and_then(|operations| operations.get(row))
+                == Some(SourceMutation::Tombstone);
             let identity = MutationIdentity {
                 key: key.clone(),
                 event_time,
@@ -2665,7 +2665,10 @@ fn calculate_charge(state: &TemporalJoinVnodeState) -> Result<usize, DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{StringArray, TimestampMillisecondArray};
+    use arrow::array::{StringArray, TimestampMillisecondArray, UInt8Array};
+    use laminar_connectors::connector::{
+        schema_with_source_mutations_and_row_positions, source_mutations,
+    };
 
     fn schema(prefix: &str) -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -2703,6 +2706,24 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn mutation_metadata(batch: &RecordBatch, operations: &[SourceMutation]) -> RecordBatch {
+        let visible_columns = batch.num_columns() - POSITION_COLUMN_COUNT;
+        let visible_schema = Arc::new(Schema::new_with_metadata(
+            batch.schema().fields()[..visible_columns].to_vec(),
+            batch.schema().metadata().clone(),
+        ));
+        let schema = schema_with_source_mutations_and_row_positions(&visible_schema).unwrap();
+        let mut columns = batch.columns()[..visible_columns].to_vec();
+        columns.push(Arc::new(UInt8Array::from_iter_values(
+            operations.iter().map(|operation| match operation {
+                SourceMutation::Put => 0,
+                SourceMutation::Tombstone => 1,
+            }),
+        )));
+        columns.extend_from_slice(&batch.columns()[visible_columns..]);
+        RecordBatch::try_new(schema, columns).unwrap()
     }
 
     fn config(kind: TemporalJoinKind, schedule: TemporalProbeSchedule) -> TemporalJoinStateConfig {
@@ -2762,16 +2783,18 @@ mod tests {
             SourceMutation::Put,
             SourceMutation::Tombstone,
         ];
+        let metadata = mutation_metadata(&right, &operations);
+        let operations = source_mutations(&metadata).unwrap();
         assert_eq!(
             state
-                .apply_right_batch(&right, Some(&operations))
+                .apply_right_batch(&right, operations)
                 .unwrap()
                 .inserted,
             3
         );
         assert_eq!(
             state
-                .apply_right_batch(&right, Some(&operations))
+                .apply_right_batch(&right, operations)
                 .unwrap()
                 .duplicates,
             3
@@ -2779,7 +2802,7 @@ mod tests {
         state.advance_right_frontier(Some(1_000), false).unwrap();
         assert_eq!(
             state
-                .apply_right_batch(&right, Some(&operations))
+                .apply_right_batch(&right, operations)
                 .unwrap()
                 .duplicates,
             3
@@ -2792,7 +2815,7 @@ mod tests {
             vec![1, 2, 3],
         );
         assert!(state
-            .apply_right_batch(&changed, Some(&operations))
+            .apply_right_batch(&changed, operations)
             .unwrap_err()
             .to_string()
             .contains("replayed with different temporal data"));
