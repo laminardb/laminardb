@@ -163,3 +163,164 @@ fn is_window_tvf_case_insensitive() {
     assert!(is_window_tvf("SESSION"));
     assert!(!is_window_tvf("my_func"));
 }
+
+fn temporal_projection_config() -> TemporalJoinTranslatorConfig {
+    TemporalJoinTranslatorConfig {
+        left_table: "trades".into(),
+        right_table: "quotes".into(),
+        left_key_columns: vec!["symbol".into()],
+        right_key_columns: vec!["symbol".into()],
+        left_time_column: "trade_time".into(),
+        right_time_column: "quote_time".into(),
+        join_kind: laminar_sql::temporal::TemporalJoinKind::Left,
+        probe_schedule: laminar_sql::temporal::TemporalProbeSchedule::as_of(),
+        probe_alias: None,
+    }
+}
+
+const TEMPORAL_FROM: &str = "FROM trades t LEFT JOIN quotes \
+    FOR SYSTEM_TIME AS OF t.trade_time AS q ON t.symbol = q.symbol";
+
+#[test]
+fn temporal_projection_rewrites_supported_scalar_select_and_filter() {
+    let sql = format!(
+        "SELECT t.trade_id AS id, q.price * 2 AS doubled {TEMPORAL_FROM} \
+         WHERE q.price > 0 AND t.trade_id IN (1, 2)"
+    );
+    let projection = temporal_projection_sql(&sql, &temporal_projection_config()).unwrap();
+    assert_eq!(
+        projection,
+        "SELECT trade_id AS id, price_quotes * 2 AS doubled FROM __temporal_tmp \
+         WHERE price_quotes > 0 AND trade_id IN (1, 2)"
+    );
+
+    let mut probe_config = temporal_projection_config();
+    probe_config.probe_schedule =
+        laminar_sql::temporal::TemporalProbeSchedule::list(vec![5_000, 15_000]).unwrap();
+    probe_config.probe_alias = Some("probe".into());
+    let probe_sql = format!("SELECT probe.offset_ms, probe.probe_time, q.price {TEMPORAL_FROM}");
+    assert_eq!(
+        temporal_projection_sql(&probe_sql, &probe_config).unwrap(),
+        "SELECT offset_ms, probe_time, price_quotes FROM __temporal_tmp"
+    );
+}
+
+#[test]
+fn temporal_projection_matches_unquoted_qualifiers_case_insensitively() {
+    let sql = format!("SELECT T.trade_id, Q.price {TEMPORAL_FROM} WHERE Q.price > 0");
+    assert_eq!(
+        temporal_projection_sql(&sql, &temporal_projection_config()).unwrap(),
+        "SELECT trade_id, price_quotes FROM __temporal_tmp WHERE price_quotes > 0"
+    );
+}
+
+#[test]
+fn temporal_projection_rejects_probe_and_join_qualifier_collision() {
+    let mut config = temporal_projection_config();
+    config.probe_schedule =
+        laminar_sql::temporal::TemporalProbeSchedule::list(vec![5_000]).unwrap();
+    config.probe_alias = Some("Q".into());
+
+    let error =
+        temporal_projection_sql(&format!("SELECT q.price {TEMPORAL_FROM}"), &config).unwrap_err();
+    assert!(error.to_string().contains("qualifiers must be distinct"));
+}
+
+#[test]
+fn temporal_projection_rejects_unpreserved_sql_shapes() {
+    let cases = [
+        (
+            "distinct",
+            format!("SELECT DISTINCT t.trade_id {TEMPORAL_FROM}"),
+            "SELECT modifiers",
+        ),
+        (
+            "grouping",
+            format!(
+                "SELECT t.symbol, COUNT(q.price) {TEMPORAL_FROM} \
+                 GROUP BY t.symbol HAVING COUNT(q.price) > 1"
+            ),
+            "SELECT modifiers",
+        ),
+        (
+            "ordering and limit",
+            format!("SELECT t.trade_id {TEMPORAL_FROM} ORDER BY t.trade_id LIMIT 1"),
+            "WITH, ORDER BY",
+        ),
+        (
+            "fetch",
+            format!("SELECT t.trade_id {TEMPORAL_FROM} FETCH FIRST 1 ROW ONLY"),
+            "WITH, ORDER BY",
+        ),
+        (
+            "window function",
+            format!(
+                "SELECT ROW_NUMBER() OVER (PARTITION BY t.symbol ORDER BY t.trade_time) AS rn \
+                 {TEMPORAL_FROM}"
+            ),
+            "function calls",
+        ),
+        (
+            "qualify",
+            format!("SELECT t.trade_id {TEMPORAL_FROM} QUALIFY q.price > 0"),
+            "SELECT modifiers",
+        ),
+        (
+            "qualified wildcard",
+            format!("SELECT t.* {TEMPORAL_FROM}"),
+            "qualified wildcards",
+        ),
+        (
+            "wildcard modifier",
+            format!("SELECT * EXCLUDE (trade_time) {TEMPORAL_FROM}"),
+            "invalid SQL",
+        ),
+        (
+            "scalar function",
+            format!("SELECT ABS(q.price) {TEMPORAL_FROM}"),
+            "function calls",
+        ),
+        (
+            "unsupported expression",
+            format!("SELECT t.trade_id {TEMPORAL_FROM} WHERE q.symbol LIKE 'A%'"),
+            "expression form",
+        ),
+        (
+            "subquery",
+            format!("SELECT (SELECT 1) AS one {TEMPORAL_FROM}"),
+            "subqueries",
+        ),
+        (
+            "unqualified column",
+            format!("SELECT trade_id {TEMPORAL_FROM}"),
+            "unqualified column",
+        ),
+        (
+            "additional join",
+            format!(
+                "SELECT t.trade_id {TEMPORAL_FROM} \
+                 LEFT JOIN venues v ON q.venue = v.venue"
+            ),
+            "exactly one direct temporal join",
+        ),
+        (
+            "cte",
+            format!("WITH seed AS (SELECT 1) SELECT t.trade_id {TEMPORAL_FROM}"),
+            "WITH, ORDER BY",
+        ),
+        (
+            "multiple statements",
+            format!("SELECT t.trade_id {TEMPORAL_FROM}; SELECT 1"),
+            "exactly one SELECT statement",
+        ),
+    ];
+
+    let config = temporal_projection_config();
+    for (name, sql, expected) in cases {
+        let error = temporal_projection_sql(&sql, &config).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "{name}: expected {expected:?}, got {error}"
+        );
+    }
+}

@@ -340,7 +340,13 @@ impl TemporalJoinVnodeState {
         validate_output_names(&left_schema, &right_schema, &config)?;
         let left_row_codec = row_codec(&left_schema, "left")?;
         let right_row_codec = row_codec(&right_schema, "right")?;
-        let output_schema = output_schema(&left_schema, &right_schema, &config);
+        let output_schema = temporal_join_output_schema(
+            &left_schema,
+            &right_schema,
+            &config.right_name,
+            config.join_kind,
+            config.emit_probe_metadata,
+        )?;
         if BASE_STATE_CHARGE > config.limits.max_retained_bytes {
             return Err(DbError::ManagedStateBudgetExceeded {
                 context: format!("temporal join vnode {} base state", config.vnode),
@@ -2556,23 +2562,30 @@ fn expand_offsets(
     Ok(offsets)
 }
 
-fn output_schema(left: &Schema, right: &Schema, config: &TemporalJoinStateConfig) -> SchemaRef {
+pub(crate) fn temporal_join_output_schema(
+    left: &Schema,
+    right: &Schema,
+    right_name: &str,
+    join_kind: TemporalJoinKind,
+    emit_probe_metadata: bool,
+) -> Result<SchemaRef, DbError> {
+    validate_position_schema(left, "left")?;
+    validate_position_schema(right, "right")?;
     let left_visible = left.fields().len() - POSITION_COLUMN_COUNT;
     let right_visible = right.fields().len() - POSITION_COLUMN_COUNT;
     let mut fields = left.fields()[..left_visible].to_vec();
     fields.extend(right.fields()[..right_visible].iter().map(|field| {
-        let renamed =
-            field
-                .as_ref()
-                .clone()
-                .with_name(format!("{}_{}", field.name(), config.right_name));
-        Arc::new(if config.join_kind == TemporalJoinKind::Left {
+        let renamed = field
+            .as_ref()
+            .clone()
+            .with_name(format!("{}_{}", field.name(), right_name));
+        Arc::new(if join_kind == TemporalJoinKind::Left {
             renamed.with_nullable(true)
         } else {
             renamed
         })
     }));
-    if config.emit_probe_metadata {
+    if emit_probe_metadata {
         fields.push(Arc::new(Field::new("offset_ms", DataType::Int64, false)));
         fields.push(Arc::new(Field::new(
             "probe_time",
@@ -2580,7 +2593,7 @@ fn output_schema(left: &Schema, right: &Schema, config: &TemporalJoinStateConfig
             true,
         )));
     }
-    Arc::new(Schema::new(fields))
+    Ok(Arc::new(Schema::new(fields)))
 }
 
 fn extract_source_positions(batch: &RecordBatch) -> Result<Vec<TemporalSourcePosition>, DbError> {

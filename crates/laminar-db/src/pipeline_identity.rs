@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 
 use arrow_schema::{Field, Schema};
 use laminar_connectors::config::ConnectorConfig;
-use laminar_connectors::connector::SourceInputMode;
+use laminar_connectors::connector::{SourceInputMode, SourceRowPositionCapability};
 use laminar_connectors::registry::ConnectorRegistry;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
@@ -45,6 +45,7 @@ struct CanonicalSource {
     connector_type: String,
     options: BTreeMap<String, String>,
     input_mode: &'static str,
+    row_positions: &'static str,
     schema: Option<CanonicalSchema>,
     primary_key: Vec<String>,
     watermark_column: Option<String>,
@@ -60,6 +61,8 @@ struct CanonicalStream {
     window_config: String,
     order_config: String,
     join_config: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temporal_join_idle_history_retention_ms: Option<i64>,
     incremental: bool,
 }
 
@@ -169,7 +172,7 @@ pub(crate) fn compute(context: &PipelineIdentityContext<'_>) -> Result<PipelineI
             context.connector_registry,
             &context.registrations,
         )?,
-        streams: canonical_streams(&context.registrations),
+        streams: canonical_streams(context.config, &context.registrations)?,
         tables: canonical_tables(context.catalog, &context.registrations)?,
         sinks: canonical_sinks(context.config, &context.registrations)?,
     };
@@ -189,13 +192,14 @@ fn canonical_sources(
 ) -> Result<Vec<CanonicalSource>, DbError> {
     let mut sources = Vec::with_capacity(registrations.sources.len());
     for reg in registrations.sources.values() {
-        let (connector_type, options, input_mode) = if reg.connector_type.is_some() {
+        let (connector_type, options, input_mode, row_positions) = if reg.connector_type.is_some() {
             canonical_source_connector(&build_source_config(reg)?, connector_registry)?
         } else {
             (
                 "catalog-bridge".into(),
                 BTreeMap::new(),
                 SourceInputMode::AppendOnly,
+                SourceRowPositionCapability::Unavailable,
             )
         };
         let entry = catalog.get_source(&reg.name);
@@ -204,6 +208,7 @@ fn canonical_sources(
             connector_type,
             options,
             input_mode,
+            row_positions,
             entry.as_deref(),
         ));
     }
@@ -220,6 +225,7 @@ fn canonical_sources(
             "catalog-bridge".into(),
             BTreeMap::new(),
             SourceInputMode::AppendOnly,
+            SourceRowPositionCapability::Unavailable,
             entry.as_deref(),
         ));
     }
@@ -232,6 +238,7 @@ fn canonical_source(
     connector_type: String,
     options: BTreeMap<String, String>,
     input_mode: SourceInputMode,
+    row_positions: SourceRowPositionCapability,
     entry: Option<&SourceEntry>,
 ) -> CanonicalSource {
     CanonicalSource {
@@ -239,6 +246,7 @@ fn canonical_source(
         connector_type,
         options,
         input_mode: canonical_source_input_mode(input_mode),
+        row_positions: canonical_source_row_positions(row_positions),
         schema: entry.map(|entry| canonical_schema(&entry.schema)),
         primary_key: entry.map_or_else(Vec::new, |entry| entry.primary_key.clone()),
         watermark_column: entry.and_then(|entry| entry.watermark_column.clone()),
@@ -250,22 +258,46 @@ fn canonical_source(
     }
 }
 
-fn canonical_streams(registrations: &PipelineRegistrations<'_>) -> Vec<CanonicalStream> {
+fn canonical_streams(
+    config: &LaminarConfig,
+    registrations: &PipelineRegistrations<'_>,
+) -> Result<Vec<CanonicalStream>, DbError> {
     let mut streams: Vec<_> = registrations
         .streams
         .values()
-        .map(|reg| CanonicalStream {
-            name: reg.name.clone(),
-            query_sql: canonical_sql(&reg.query_sql),
-            emit_clause: format!("{:?}", reg.emit_clause),
-            window_config: format!("{:?}", reg.window_config),
-            order_config: format!("{:?}", reg.order_config),
-            join_config: format!("{:?}", reg.join_config),
-            incremental: reg.incremental,
+        .map(|reg| {
+            let is_temporal = reg.join_config.as_ref().is_some_and(|joins| {
+                joins.iter().any(|join| {
+                    matches!(
+                        join,
+                        laminar_sql::translator::JoinOperatorConfig::Temporal(_)
+                    )
+                })
+            });
+            let temporal_join_idle_history_retention_ms = is_temporal
+                .then(|| {
+                    crate::config::temporal_join_idle_history_retention_ms(
+                        config.temporal_join_idle_history_retention,
+                    )
+                    .map_err(|reason| {
+                        DbError::Config(format!("temporal stream '{}': {reason}", reg.name))
+                    })
+                })
+                .transpose()?;
+            Ok(CanonicalStream {
+                name: reg.name.clone(),
+                query_sql: canonical_sql(&reg.query_sql),
+                emit_clause: format!("{:?}", reg.emit_clause),
+                window_config: format!("{:?}", reg.window_config),
+                order_config: format!("{:?}", reg.order_config),
+                join_config: format!("{:?}", reg.join_config),
+                temporal_join_idle_history_retention_ms,
+                incremental: reg.incremental,
+            })
         })
-        .collect();
+        .collect::<Result<_, DbError>>()?;
     streams.sort_by(|left, right| left.name.cmp(&right.name));
-    streams
+    Ok(streams)
 }
 
 fn canonical_tables(
@@ -336,14 +368,21 @@ fn canonical_connector(config: &ConnectorConfig) -> (String, BTreeMap<String, St
 fn canonical_source_connector(
     config: &ConnectorConfig,
     connector_registry: &ConnectorRegistry,
-) -> Result<(String, BTreeMap<String, String>, SourceInputMode), DbError> {
+) -> Result<
+    (
+        String,
+        BTreeMap<String, String>,
+        SourceInputMode,
+        SourceRowPositionCapability,
+    ),
+    DbError,
+> {
     let source = connector_registry
         .create_source(config, None)
         .map_err(|error| DbError::Checkpoint(format!("source recovery identity: {error}")))?;
-    let input_mode = source
+    let contract = source
         .contract(config)
-        .map_err(|error| DbError::Checkpoint(format!("source contract identity: {error}")))?
-        .input_mode;
+        .map_err(|error| DbError::Checkpoint(format!("source contract identity: {error}")))?;
     let options = source
         .recovery_identity_options(config)
         .map_err(|error| DbError::Checkpoint(format!("source recovery identity: {error}")))?;
@@ -351,7 +390,12 @@ fn canonical_source_connector(
         || canonical_connector(config),
         |options| (config.connector_type().to_string(), options),
     );
-    Ok((connector_type, options, input_mode))
+    Ok((
+        connector_type,
+        options,
+        contract.input_mode,
+        contract.row_positions,
+    ))
 }
 
 const fn canonical_source_input_mode(input_mode: SourceInputMode) -> &'static str {
@@ -359,6 +403,13 @@ const fn canonical_source_input_mode(input_mode: SourceInputMode) -> &'static st
         SourceInputMode::AppendOnly => "append_only",
         SourceInputMode::KeyedUpsert => "keyed_upsert",
         SourceInputMode::FullChangelog => "full_changelog",
+    }
+}
+
+const fn canonical_source_row_positions(capability: SourceRowPositionCapability) -> &'static str {
+    match capability {
+        SourceRowPositionCapability::Unavailable => "unavailable",
+        SourceRowPositionCapability::OrderedDeterministic => "ordered_deterministic",
     }
 }
 
@@ -406,6 +457,36 @@ fn duration_millis(duration: std::time::Duration) -> u64 {
 mod tests {
     use super::*;
 
+    fn canonical_source_digest(
+        input_mode: SourceInputMode,
+        row_positions: SourceRowPositionCapability,
+    ) -> [u8; 32] {
+        let payload = CanonicalPipeline {
+            canonical_version: PIPELINE_IDENTITY_VERSION,
+            state_abi_version: STATE_ABI_VERSION,
+            partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
+            state_layout: STATE_LAYOUT,
+            vnode_count: 1,
+            delivery_guarantee: "at-least-once".into(),
+            sources: vec![CanonicalSource {
+                name: "events".into(),
+                connector_type: "test".into(),
+                options: BTreeMap::new(),
+                input_mode: canonical_source_input_mode(input_mode),
+                row_positions: canonical_source_row_positions(row_positions),
+                schema: None,
+                primary_key: Vec::new(),
+                watermark_column: None,
+                max_out_of_orderness_ms: None,
+                processing_time: false,
+            }],
+            streams: Vec::new(),
+            tables: Vec::new(),
+            sinks: Vec::new(),
+        };
+        Sha256::digest(serde_json::to_vec(&payload).unwrap()).into()
+    }
+
     #[test]
     fn canonical_identity_digest_changes_with_the_partitioning_abi() {
         let payload = |partitioning_abi_version| CanonicalPipeline {
@@ -434,37 +515,91 @@ mod tests {
     #[test]
     fn source_input_mode_changes_canonical_identity() {
         let digest = |input_mode| {
-            let payload = CanonicalPipeline {
-                canonical_version: PIPELINE_IDENTITY_VERSION,
-                state_abi_version: STATE_ABI_VERSION,
-                partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
-                state_layout: STATE_LAYOUT,
-                vnode_count: 1,
-                delivery_guarantee: "at-least-once".into(),
-                sources: vec![CanonicalSource {
-                    name: "events".into(),
-                    connector_type: "test".into(),
-                    options: BTreeMap::new(),
-                    input_mode: canonical_source_input_mode(input_mode),
-                    schema: None,
-                    primary_key: Vec::new(),
-                    watermark_column: None,
-                    max_out_of_orderness_ms: None,
-                    processing_time: false,
-                }],
-                streams: Vec::new(),
-                tables: Vec::new(),
-                sinks: Vec::new(),
-            };
-            Sha256::digest(serde_json::to_vec(&payload).unwrap())
+            canonical_source_digest(input_mode, SourceRowPositionCapability::Unavailable)
         };
-
         let append = digest(SourceInputMode::AppendOnly);
         let upsert = digest(SourceInputMode::KeyedUpsert);
         let changelog = digest(SourceInputMode::FullChangelog);
         assert_ne!(append, upsert);
         assert_ne!(append, changelog);
         assert_ne!(upsert, changelog);
+    }
+
+    #[test]
+    fn source_row_position_capability_changes_canonical_identity() {
+        assert_ne!(
+            canonical_source_digest(
+                SourceInputMode::AppendOnly,
+                SourceRowPositionCapability::Unavailable,
+            ),
+            canonical_source_digest(
+                SourceInputMode::AppendOnly,
+                SourceRowPositionCapability::OrderedDeterministic,
+            )
+        );
+    }
+
+    #[test]
+    fn temporal_retention_changes_only_temporal_stream_identity() {
+        let stream = |join_config| StreamRegistration {
+            name: "joined".into(),
+            query_sql: "SELECT * FROM trades".into(),
+            emit_clause: None,
+            window_config: None,
+            order_config: None,
+            join_config,
+            has_analytic: false,
+            has_frame: false,
+            incremental: false,
+        };
+        let temporal = stream(Some(vec![
+            laminar_sql::translator::JoinOperatorConfig::Temporal(
+                laminar_sql::translator::TemporalJoinTranslatorConfig {
+                    left_table: "trades".into(),
+                    right_table: "quotes".into(),
+                    left_key_columns: vec!["symbol".into()],
+                    right_key_columns: vec!["symbol".into()],
+                    left_time_column: "trade_time".into(),
+                    right_time_column: "quote_time".into(),
+                    join_kind: laminar_sql::temporal::TemporalJoinKind::Left,
+                    probe_schedule: laminar_sql::temporal::TemporalProbeSchedule::as_of(),
+                    probe_alias: None,
+                },
+            ),
+        ]));
+        let ordinary = stream(None);
+        let identity_for = |registration: &StreamRegistration, retention: std::time::Duration| {
+            let config = LaminarConfig {
+                temporal_join_idle_history_retention: Some(retention),
+                ..LaminarConfig::default()
+            };
+            let catalog =
+                SourceCatalog::new(8, laminar_core::streaming::BackpressureStrategy::Block);
+            let connector_registry = ConnectorRegistry::new();
+            let registrations = PipelineRegistrations::new(
+                std::iter::empty::<&SourceRegistration>(),
+                std::iter::empty::<&SinkRegistration>(),
+                std::iter::once(registration),
+                std::iter::empty::<&TableRegistration>(),
+            );
+            compute(&PipelineIdentityContext::new(
+                &config,
+                &catalog,
+                &connector_registry,
+                registrations,
+                1,
+            ))
+            .unwrap()
+        };
+
+        assert_ne!(
+            identity_for(&temporal, std::time::Duration::from_secs(60)),
+            identity_for(&temporal, std::time::Duration::from_secs(120))
+        );
+        assert_eq!(
+            identity_for(&ordinary, std::time::Duration::from_secs(60)),
+            identity_for(&ordinary, std::time::Duration::from_secs(120))
+        );
     }
 
     #[test]

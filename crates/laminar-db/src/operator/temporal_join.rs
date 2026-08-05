@@ -42,7 +42,8 @@ use crate::operator_graph::{
 #[cfg(feature = "cluster")]
 use crate::operator_graph::{ManagedVnodeTransition, ManagedVnodeTransitionMode};
 use crate::temporal_join_state::{
-    TemporalJoinStateConfig, TemporalJoinVnodeState, TemporalStateLimits,
+    temporal_join_output_schema, TemporalJoinStateConfig, TemporalJoinVnodeState,
+    TemporalStateLimits,
 };
 
 const ABSENT_VNODE: u8 = 0;
@@ -50,6 +51,10 @@ const PRESENT_VNODE: u8 = 1;
 const OPERATOR_CHECKPOINT_VERSION: u8 = 2;
 const PENDING_HOLD_ENTRY_CHARGE: usize = 64;
 const TEMPORAL_TMP_TABLE: &str = "__temporal_tmp";
+const MAX_PENDING_PROBES_PER_VNODE: usize = 1_000_000;
+const READY_PROBE_BUDGET: usize = 1_024;
+const HISTORY_GC_BUDGET: usize = 1_024;
+const MAINTENANCE_VNODE_BUDGET: usize = 64;
 #[cfg(feature = "cluster")]
 const REMOTE_EVENT_BUDGET_PER_SIDE: usize = 64;
 #[cfg(feature = "cluster")]
@@ -137,6 +142,24 @@ pub(crate) struct TemporalJoinExecutionLimits {
     pub(crate) ready_probe_budget: NonZeroUsize,
     pub(crate) history_gc_budget: NonZeroUsize,
     pub(crate) maintenance_vnode_budget: NonZeroUsize,
+}
+
+impl TemporalJoinExecutionLimits {
+    pub(crate) fn production(history_retention_ms: i64) -> Self {
+        debug_assert!(history_retention_ms > 0);
+        Self {
+            // Source watermarks already include configured out-of-orderness. Adding another
+            // allowance here would both admit rows behind that contract and delay final output.
+            left_allowed_lateness_ms: 0,
+            right_allowed_lateness_ms: 0,
+            history_retention_ms,
+            max_pending_probes: MAX_PENDING_PROBES_PER_VNODE,
+            ready_probe_budget: NonZeroUsize::new(READY_PROBE_BUDGET).expect("positive constant"),
+            history_gc_budget: NonZeroUsize::new(HISTORY_GC_BUDGET).expect("positive constant"),
+            maintenance_vnode_budget: NonZeroUsize::new(MAINTENANCE_VNODE_BUDGET)
+                .expect("positive constant"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,6 +320,7 @@ pub(crate) struct ManagedTemporalJoinOperator {
     limits: TemporalJoinExecutionLimits,
     left_schema: SchemaRef,
     right_schema: SchemaRef,
+    projection_input_schema: SchemaRef,
     left_key_indices: Vec<usize>,
     right_key_indices: Vec<usize>,
     key_codec: Arc<PartitionKeyCodecV1>,
@@ -418,6 +442,13 @@ impl ManagedTemporalJoinOperator {
             .ok_or_else(|| DbError::Config("temporal vnode count must be nonzero".into()))?;
         let local_assignment =
             VnodeRegistry::single_owner(vnode_count, LOCAL_NODE_ID).versioned_snapshot();
+        let projection_input_schema = temporal_join_output_schema(
+            &left_schema,
+            &right_schema,
+            &config.right_table,
+            config.join_kind,
+            config.probe_alias.is_some(),
+        )?;
         let operator = Self {
             name: Arc::from(name),
             projection: ProjectingJoinState::new(name, ctx, projection_sql, TEMPORAL_TMP_TABLE),
@@ -425,6 +456,7 @@ impl ManagedTemporalJoinOperator {
             limits,
             left_schema,
             right_schema,
+            projection_input_schema,
             left_key_indices,
             right_key_indices,
             key_codec,
@@ -3858,6 +3890,9 @@ impl GraphOperator for ManagedTemporalJoinOperator {
     }
 
     async fn initialize_managed_state(&mut self) -> Result<(), DbError> {
+        self.projection
+            .initialize(&self.projection_input_schema)
+            .await?;
         let accounted = self.checked_accounted_state_bytes()?;
         if accounted > self.max_managed_state_bytes {
             return Err(DbError::ManagedStateBudgetExceeded {
@@ -4971,6 +5006,7 @@ mod tests {
             8,
             Some("SELECT * FROM __temporal_tmp WHERE value_quotes = 'live'"),
         );
+        operator.initialize_managed_state().await.unwrap();
         let left = left_batch(&keys, &["X", "X"], &[100, 100], &[7, 8]);
         let right = right_batch(
             &keys,
@@ -5025,26 +5061,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_projection_failure_requires_recovery_after_state_admission() {
-        let key = key_for_vnode(0);
+    async fn invalid_post_projection_fails_initialization_before_state_admission() {
         let (mut operator, _, _) =
             operator_with_projection(8, Some("SELECT missing_column FROM __temporal_tmp"));
-        let left = left_batch(std::slice::from_ref(&key), &["X"], &[100], &[7]);
-        let right = right_batch(
-            std::slice::from_ref(&key),
-            &["X"],
-            &[90],
-            &["live"],
-            &[SourceMutation::Put],
-        );
 
-        let error = operator
-            .process_with_frontiers(&[vec![left], vec![right]], &frontier(200))
-            .await
-            .unwrap_err();
+        let error = operator.initialize_managed_state().await.unwrap_err();
 
-        assert!(matches!(error, DbError::StatefulOperatorPartialApply(_)));
-        assert!(operator.vnode_states.iter().any(Option::is_some));
+        assert!(matches!(error, DbError::Pipeline(_)));
+        assert!(operator.vnode_states.iter().all(Option::is_none));
     }
 
     #[tokio::test]

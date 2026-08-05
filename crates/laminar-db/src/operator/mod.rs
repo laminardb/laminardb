@@ -632,6 +632,40 @@ impl ProjectingJoinState {
         )
         .await
     }
+
+    pub(crate) async fn initialize(&mut self, input_schema: &SchemaRef) -> Result<(), DbError> {
+        let Some(projection_sql) = self.projection_sql.as_deref() else {
+            return Ok(());
+        };
+        if self.cache.compiled.is_some() || self.cache.sql_cache.is_some() {
+            return Ok(());
+        }
+        if !self.cache.compile_failed {
+            if let Some(compiled) = try_compile_post_projection(
+                &self.ctx,
+                projection_sql,
+                self.tmp_table_name,
+                input_schema,
+            )
+            .await
+            {
+                self.cache.compiled = Some(compiled);
+                return Ok(());
+            }
+            self.cache.compile_failed = true;
+        }
+        self.cache.sql_cache = Some(
+            LiveSqlCache::build(
+                &self.ctx,
+                self.tmp_table_name,
+                Arc::clone(input_schema),
+                projection_sql,
+                &self.op_name,
+            )
+            .await?,
+        );
+        Ok(())
+    }
 }
 
 pub(crate) async fn apply_post_projection(

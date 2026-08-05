@@ -411,6 +411,13 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Retain temporal right-side history across idle periods for at least this duration.
+    #[must_use]
+    pub fn temporal_join_idle_history_retention(mut self, retention: std::time::Duration) -> Self {
+        self.config.temporal_join_idle_history_retention = Some(retention);
+        self
+    }
+
     /// Backpressure policy (default `Backpressure`).
     #[must_use]
     pub fn pipeline_backpressure_policy(

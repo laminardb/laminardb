@@ -3086,6 +3086,9 @@ impl LaminarDB {
 
         let mut graph = OperatorGraph::new(ctx);
         graph.set_key_group_count(self.checkpoint_key_groups());
+        graph.set_temporal_join_idle_history_retention(
+            self.config.temporal_join_idle_history_retention,
+        );
         graph.set_lookup_registry(Arc::clone(&self.lookup_registry));
         graph.set_reference_tables(reference_table_names);
         if let Some(ref prom) = *self.engine_metrics.lock() {

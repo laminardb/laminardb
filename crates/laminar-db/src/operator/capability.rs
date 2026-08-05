@@ -237,10 +237,9 @@ impl OperatorCapability {
 
     /// Descriptor for the managed temporal operator while its DDL cutover remains closed.
     pub(crate) const fn managed_temporal_join() -> Self {
-        Self::rejected(
+        Self::ddl_guarded(
             OperatorImplementation::TemporalJoin,
             OperatorStateClass::VnodeKeyed,
-            "temporal state is DDL-closed until ordered cluster channels and recovery are certified",
         )
         .with_managed_state(ManagedStateContract::TemporalJoinV1)
     }

@@ -16,7 +16,7 @@ use crate::state::{
 pub const CHECKPOINT_MANIFEST_VERSION: u32 = 7;
 
 /// Canonical pipeline-identity payload version.
-pub const PIPELINE_IDENTITY_VERSION: u16 = 5;
+pub const PIPELINE_IDENTITY_VERSION: u16 = 6;
 
 /// Runtime envelope used for prepared sink descriptors.
 pub const PREPARED_SINK_DESCRIPTOR_VERSION: u16 = 1;

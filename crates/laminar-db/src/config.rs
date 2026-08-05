@@ -18,6 +18,20 @@ pub const DEFAULT_MAX_MANAGED_STATE_BYTES: usize = 256 * 1024 * 1024;
 /// It is a cached accumulator work proxy, not an encoded-payload or process-RSS limit.
 pub const DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES: usize = 1024 * 1024;
 
+pub(crate) fn temporal_join_idle_history_retention_ms(
+    retention: Option<std::time::Duration>,
+) -> Result<i64, &'static str> {
+    let retention = retention
+        .ok_or("temporal_join_idle_history_retention must be configured for temporal joins")?;
+    let retention_ms = i64::try_from(retention.as_millis()).map_err(|_| {
+        "temporal_join_idle_history_retention exceeds the supported millisecond range"
+    })?;
+    if retention_ms == 0 {
+        return Err("temporal_join_idle_history_retention must be at least 1ms");
+    }
+    Ok(retention_ms)
+}
+
 /// What to do when an operator's input buffer exceeds its cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackpressurePolicy {
@@ -120,6 +134,9 @@ pub struct LaminarConfig {
     /// This charge is not an encoded-payload or process-RSS limit. Database construction rejects
     /// zero.
     pub pipeline_max_retractable_extremum_checkpoint_bytes: Option<usize>,
+    /// Retention contract for right-side history while a temporal join input is idle.
+    /// Required only when the pipeline contains a temporal join.
+    pub temporal_join_idle_history_retention: Option<std::time::Duration>,
     /// Backpressure policy. See [`BackpressurePolicy`].
     pub pipeline_backpressure_policy: BackpressurePolicy,
     /// Auto-restart policy applied when supervision is enabled.
@@ -149,6 +166,7 @@ impl Default for LaminarConfig {
             pipeline_max_input_buf_bytes: None,
             pipeline_max_managed_state_bytes: None,
             pipeline_max_retractable_extremum_checkpoint_bytes: None,
+            temporal_join_idle_history_retention: None,
             pipeline_backpressure_policy: BackpressurePolicy::default(),
             restart_policy: RestartPolicy::default(),
             shared_source_isolation: false,

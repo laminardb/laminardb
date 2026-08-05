@@ -22,6 +22,44 @@ fn test_batch() -> RecordBatch {
     .unwrap()
 }
 
+fn temporal_source_schemas() -> (Arc<Schema>, Arc<Schema>) {
+    use arrow::datatypes::TimeUnit;
+
+    let left = Arc::new(Schema::new(vec![
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new(
+            "trade_time",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+        Field::new("trade_id", DataType::Int64, false),
+    ]));
+    let right = Arc::new(Schema::new(vec![
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new(
+            "quote_time",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+        Field::new("price", DataType::Int64, false),
+    ]));
+    (left, right)
+}
+
+fn temporal_join_config() -> TemporalJoinTranslatorConfig {
+    TemporalJoinTranslatorConfig {
+        left_table: "trades".into(),
+        right_table: "quotes".into(),
+        left_key_columns: vec!["symbol".into()],
+        right_key_columns: vec!["symbol".into()],
+        left_time_column: "trade_time".into(),
+        right_time_column: "quote_time".into(),
+        join_kind: laminar_sql::temporal::TemporalJoinKind::Left,
+        probe_schedule: laminar_sql::temporal::TemporalProbeSchedule::as_of(),
+        probe_alias: None,
+    }
+}
+
 struct RichFrontierProbe(Arc<parking_lot::Mutex<Vec<InputFrontier>>>);
 
 struct BatchProbe(Arc<parking_lot::Mutex<Vec<RecordBatch>>>);
@@ -2225,6 +2263,140 @@ async fn source_views_share_payloads_but_hide_positions_from_ordinary_queries() 
 }
 
 #[test]
+fn managed_temporal_operator_internal_construction_uses_two_positioned_inputs() {
+    let mut graph = test_graph();
+    graph.set_temporal_join_idle_history_retention(Some(std::time::Duration::from_secs(60)));
+    let (left_schema, right_schema) = temporal_source_schemas();
+    graph.register_source_schema("trades".into(), left_schema);
+    graph.register_source_schema("quotes".into(), right_schema);
+    let config = temporal_join_config();
+
+    let operator = graph
+        .create_operator(
+            "trade_quotes",
+            "SELECT * FROM trades",
+            None,
+            None,
+            Some(&config),
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+    graph.ensure_query_source_nodes(None, Some(&config), &FxHashSet::default());
+    let node = graph
+        .place_operator_node("trade_quotes", operator, 2)
+        .unwrap();
+    assert!(!graph.wire_query_edges(node, None, None, Some(&config), &FxHashSet::default()));
+    assert_eq!(
+        graph.nodes[node].capability,
+        OperatorCapability::managed_temporal_join()
+    );
+    assert_eq!(
+        graph.input_sources[node],
+        [
+            graph.positioned_source_map["trades"],
+            graph.positioned_source_map["quotes"],
+        ]
+    );
+}
+
+#[test]
+fn temporal_internal_construction_fails_closed_without_schemas_and_public_admission_stays_closed() {
+    use laminar_sql::translator::JoinOperatorConfig;
+
+    let config = temporal_join_config();
+    let mut missing_schema = test_graph();
+    missing_schema
+        .set_temporal_join_idle_history_retention(Some(std::time::Duration::from_secs(60)));
+    let error = missing_schema
+        .create_operator(
+            "trade_quotes",
+            "SELECT * FROM trades",
+            None,
+            None,
+            Some(&config),
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .err()
+        .expect("temporal construction without source schemas must fail");
+    assert!(error
+        .to_string()
+        .contains("no registered schema for left source"));
+
+    let mut graph = test_graph();
+    let (left_schema, right_schema) = temporal_source_schemas();
+    graph.register_source_schema("trades".into(), left_schema);
+    graph.register_source_schema("quotes".into(), right_schema);
+    graph.add_query(
+        "trade_quotes".into(),
+        "SELECT * FROM trades".into(),
+        None,
+        None,
+        None,
+        Some(vec![JoinOperatorConfig::Temporal(config)]),
+        false,
+    );
+    assert!(!graph.has_query("trade_quotes"));
+    assert!(graph.nodes.is_empty());
+    assert!(graph
+        .take_build_errors()
+        .unwrap_err()
+        .to_string()
+        .contains("temporal joins require the managed two-input vnode operator"));
+}
+
+#[test]
+fn temporal_internal_construction_requires_supported_idle_history_retention() {
+    let config = temporal_join_config();
+    let cases = [
+        (
+            None,
+            "temporal_join_idle_history_retention must be configured",
+        ),
+        (
+            Some(std::time::Duration::ZERO),
+            "temporal_join_idle_history_retention must be at least 1ms",
+        ),
+        (
+            Some(std::time::Duration::from_millis(i64::MAX as u64 + 1)),
+            "temporal_join_idle_history_retention exceeds the supported millisecond range",
+        ),
+    ];
+
+    for (retention, expected) in cases {
+        let mut graph = test_graph();
+        graph.set_temporal_join_idle_history_retention(retention);
+        let (left_schema, right_schema) = temporal_source_schemas();
+        graph.register_source_schema("trades".into(), left_schema);
+        graph.register_source_schema("quotes".into(), right_schema);
+
+        let error = graph
+            .create_operator(
+                "trade_quotes",
+                "SELECT * FROM trades",
+                None,
+                None,
+                Some(&config),
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .err()
+            .expect("invalid temporal retention must fail before operator construction");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+}
+
+#[test]
 fn test_graph_construction() {
     let ctx = laminar_sql::create_session_context();
     let mut graph = OperatorGraph::new(ctx);
@@ -2337,26 +2509,10 @@ fn test_remove_query() {
     assert!(graph.output_map.contains_key("q1"));
     let original_node = graph.output_map["q1"];
     graph.ensure_live_provider("q1", &test_schema());
-    let temporal_config = TemporalJoinTranslatorConfig {
-        left_table: "trades".to_string(),
-        right_table: "versions".to_string(),
-        left_key_columns: vec!["symbol".to_string()],
-        right_key_columns: vec!["symbol".to_string()],
-        left_time_column: "ts".to_string(),
-        right_time_column: "valid_from".to_string(),
-        join_kind: laminar_sql::translator::TemporalJoinKind::Inner,
-        probe_schedule: laminar_sql::translator::TemporalProbeSchedule::as_of(),
-        probe_alias: None,
-    };
-    graph
-        .temporal_configs
-        .push(("q1".to_string(), temporal_config.clone()));
-
     graph.remove_query("q1");
     assert!(!graph.output_map.contains_key("q1"));
     assert!(graph.nodes[1].removed); // node 0 = source, node 1 = q1
     assert!(!graph.incremental_tables.contains("q1"));
-    assert!(graph.temporal_configs.is_empty());
     assert!(!graph.live_handles.contains_key("q1"));
 
     graph.add_query(
@@ -2383,17 +2539,10 @@ fn test_remove_query() {
     assert!(graph.live_handles.contains_key("q1"));
 
     graph.incremental_tables.insert("metadata_only".to_string());
-    graph
-        .temporal_configs
-        .push(("metadata_only".to_string(), temporal_config));
     graph.ensure_live_provider("metadata_only", &test_schema());
     assert!(!graph.output_map.contains_key("metadata_only"));
     graph.remove_query("metadata_only");
     assert!(!graph.incremental_tables.contains("metadata_only"));
-    assert!(graph
-        .temporal_configs
-        .iter()
-        .all(|(query_name, _)| query_name != "metadata_only"));
     assert!(!graph.live_handles.contains_key("metadata_only"));
 }
 
@@ -2457,10 +2606,6 @@ fn rejected_control_add_removes_all_query_artifacts() {
     assert!(!graph.output_map.contains_key("rejected"));
     assert!(!graph.incremental_tables.contains("rejected"));
     assert!(!graph.live_handles.contains_key("rejected"));
-    assert!(graph
-        .temporal_configs
-        .iter()
-        .all(|(query_name, _)| query_name != "rejected"));
     let rejected_nodes: FxHashSet<_> = graph
         .nodes
         .iter()

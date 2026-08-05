@@ -8,7 +8,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
-use laminar_connectors::connector::strip_source_row_positions;
+use laminar_connectors::connector::{schema_with_source_row_positions, strip_source_row_positions};
 use laminar_core::state::{KeyGroupCount, DEFAULT_KEY_GROUP_COUNT};
 use laminar_sql::datafusion::live_source::{LiveSourceHandle, LiveSourceProvider};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -805,6 +805,7 @@ pub(crate) struct OperatorGraph {
     // Per aggregate-operator capture charge allowed before retractable MIN/MAX multisets are
     // materialized. Runtime construction replaces the public default with the resolved setting.
     max_retractable_extremum_checkpoint_bytes: usize,
+    temporal_join_idle_history_retention: Option<std::time::Duration>,
     // Since-last-sample high watermarks make synchronous prepare/publish/finish ownership visible
     // without invoking Prometheus inside the vnode publication section. Indices mirror `nodes`.
     managed_state_accounting_peaks: Vec<ManagedStateAccountingSnapshot>,
@@ -813,7 +814,6 @@ pub(crate) struct OperatorGraph {
     prom: Option<Arc<EngineMetrics>>,
     lookup_registry: Option<Arc<laminar_sql::datafusion::LookupTableRegistry>>,
     source_schemas: FxHashMap<String, SchemaRef>,
-    temporal_configs: Vec<(String, TemporalJoinTranslatorConfig)>,
     depends_on_stream: FxHashSet<usize>,
     order_configs: FxHashMap<usize, OrderOperatorConfig>,
     // Covers source tables and intermediates (lazily created on first operator output).
@@ -891,6 +891,7 @@ impl OperatorGraph {
             max_managed_state_bytes: usize::MAX,
             max_retractable_extremum_checkpoint_bytes:
                 crate::config::DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES,
+            temporal_join_idle_history_retention: None,
             managed_state_accounting_peaks: Vec::new(),
             key_group_count: DEFAULT_KEY_GROUP_COUNT,
             #[cfg(feature = "cluster")]
@@ -911,7 +912,6 @@ impl OperatorGraph {
             prom: None,
             lookup_registry: None,
             source_schemas: FxHashMap::default(),
-            temporal_configs: Vec::new(),
             depends_on_stream: FxHashSet::default(),
             order_configs: FxHashMap::default(),
             live_handles: FxHashMap::default(),
@@ -1010,6 +1010,13 @@ impl OperatorGraph {
             node.operator
                 .set_retractable_extremum_checkpoint_budget(bytes);
         }
+    }
+
+    pub(crate) fn set_temporal_join_idle_history_retention(
+        &mut self,
+        retention: Option<std::time::Duration>,
+    ) {
+        self.temporal_join_idle_history_retention = retention;
     }
 
     pub fn set_metrics(&mut self, m: Arc<EngineMetrics>) {
@@ -1526,13 +1533,6 @@ impl OperatorGraph {
         self.live_handles.insert(name.to_string(), handle);
     }
 
-    pub fn temporal_join_configs(&self) -> Vec<TemporalJoinTranslatorConfig> {
-        self.temporal_configs
-            .iter()
-            .map(|(_, config)| config.clone())
-            .collect()
-    }
-
     fn find_node(&self, name: &str) -> Option<usize> {
         self.nodes
             .iter()
@@ -1819,9 +1819,16 @@ impl OperatorGraph {
                     _ => None,
                 })
         };
-        let temporal_projection_sql = temporal_config
-            .as_ref()
-            .and_then(|config| temporal_projection_sql(&sql, config));
+        let temporal_projection_sql = match temporal_config.as_ref() {
+            Some(config) => match temporal_projection_sql(&sql, config) {
+                Ok(projection) => Some(projection),
+                Err(error) => {
+                    self.build_errors.push(error);
+                    return;
+                }
+            },
+            None => None,
+        };
         let needs_stream_detection = join_config.as_ref().is_none_or(|configs| {
             configs
                 .iter()
@@ -1914,7 +1921,7 @@ impl OperatorGraph {
             table_refs.retain(|t| t == &cfg.changelog_table);
         }
 
-        let operator: Box<dyn GraphOperator> = self.create_operator(
+        let operator = match self.create_operator(
             &name,
             &sql,
             emit_clause.as_ref(),
@@ -1925,7 +1932,13 @@ impl OperatorGraph {
             projection_sql.as_deref(),
             incremental,
             changelog_enrich_config,
-        );
+        ) {
+            Ok(operator) => operator,
+            Err(error) => {
+                self.build_errors.push(error);
+                return;
+            }
+        };
         let input_port_count = if stream_join_config.is_some() || temporal_config.is_some() {
             2
         } else {
@@ -1954,9 +1967,6 @@ impl OperatorGraph {
         self.output_map.insert(Arc::from(name.as_str()), node_id);
         if incremental {
             self.incremental_tables.insert(name.clone());
-        }
-        if let Some(ref tc) = temporal_config {
-            self.temporal_configs.push((name.clone(), tc.clone()));
         }
         self.topo_dirty = true;
     }
@@ -2126,16 +2136,16 @@ impl OperatorGraph {
         projection_sql: Option<&str>,
         incremental: bool,
         changelog_enrich_config: Option<crate::sql_analysis::ChangelogEnrichConfig>,
-    ) -> Box<dyn GraphOperator> {
+    ) -> Result<Box<dyn GraphOperator>, DbError> {
         use crate::operator;
 
         // `changelog ⋈ static dim` — consume the changelog, join against the dimension (in the
         // graph context), preserve `__weight` → joined changelog.
         if let Some(cfg) = changelog_enrich_config {
-            return Box::new(ChangelogEnrichOperator::new(
+            return Ok(Box::new(ChangelogEnrichOperator::new(
                 self.ctx.clone(),
                 cfg.projection_sql,
-            ));
+            )));
         }
 
         // Falls through to the DataFusion lookup path if the registry/handle is absent.
@@ -2150,14 +2160,60 @@ impl OperatorGraph {
                     handle.clone(),
                     self.prom.clone(),
                 );
-                return Box::new(op);
+                return Ok(Box::new(op));
             }
         }
 
-        if temporal_config.is_some() {
-            return Box::new(operator::temporal_filter::RejectingOperator::new(
-                "temporal joins require the managed two-input vnode operator; lookup execution is unsupported",
-            ));
+        if let Some(cfg) = temporal_config {
+            let retention_ms = crate::config::temporal_join_idle_history_retention_ms(
+                self.temporal_join_idle_history_retention,
+            )
+            .map_err(|reason| DbError::Config(format!("temporal join [{name}]: {reason}")))?;
+            let limits =
+                operator::temporal_join::TemporalJoinExecutionLimits::production(retention_ms);
+            let left_schema = self.source_schemas.get(&cfg.left_table).ok_or_else(|| {
+                DbError::Config(format!(
+                    "temporal join [{name}] has no registered schema for left source '{}'",
+                    cfg.left_table
+                ))
+            })?;
+            let right_schema = self.source_schemas.get(&cfg.right_table).ok_or_else(|| {
+                DbError::Config(format!(
+                    "temporal join [{name}] has no registered schema for right source '{}'",
+                    cfg.right_table
+                ))
+            })?;
+            let left_schema = schema_with_source_row_positions(left_schema).map_err(|error| {
+                DbError::Config(format!(
+                    "temporal join [{name}] left source-position schema: {error}"
+                ))
+            })?;
+            let right_schema = schema_with_source_row_positions(right_schema).map_err(|error| {
+                DbError::Config(format!(
+                    "temporal join [{name}] right source-position schema: {error}"
+                ))
+            })?;
+            let op = operator::temporal_join::ManagedTemporalJoinOperator::try_new(
+                name,
+                cfg.clone(),
+                projection_sql.map(Arc::from),
+                self.ctx.clone(),
+                left_schema,
+                right_schema,
+                self.key_group_count,
+                limits,
+            )?;
+            #[cfg(feature = "cluster")]
+            let mut op = op;
+            #[cfg(feature = "cluster")]
+            if let Some(scope) = &self.cluster_shuffle {
+                debug_assert_eq!(
+                    scope.registry.vnode_count(),
+                    u32::from(self.key_group_count)
+                );
+                op.attach_cluster_shuffle(scope.clone());
+            }
+            return Ok(Box::new(op));
         }
 
         if let Some(cfg) = stream_join_config {
@@ -2182,7 +2238,7 @@ impl OperatorGraph {
                 );
                 op.attach_cluster_shuffle(scope.clone());
             }
-            return Box::new(op);
+            return Ok(Box::new(op));
         }
 
         // Non-windowed now() is only valid as a retracting temporal filter under EMIT CHANGES;
@@ -2195,27 +2251,29 @@ impl OperatorGraph {
                     let emit_changes =
                         emit_clause.is_some_and(|ec| matches!(ec, EmitClause::Changes));
                     if emit_changes {
-                        return Box::new(operator::temporal_filter::TemporalFilterOperator::new(
-                            name,
-                            sql,
-                            *cfg,
-                            self.prom.clone(),
+                        return Ok(Box::new(
+                            operator::temporal_filter::TemporalFilterOperator::new(
+                                name,
+                                sql,
+                                *cfg,
+                                self.prom.clone(),
+                            ),
                         ));
                     }
-                    return Box::new(operator::temporal_filter::RejectingOperator::new(
+                    return Ok(Box::new(operator::temporal_filter::RejectingOperator::new(
                         "[LDB-1001] a retracting temporal filter (time_col vs \
                          now() ± INTERVAL) must be declared `EMIT CHANGES`; \
                          append-only / EMIT ON WINDOW CLOSE / text SUBSCRIBE \
                          consumers cannot consume retractions",
-                    ));
+                    )));
                 }
                 Tfa::PresentUnrecognized => {
-                    return Box::new(operator::temporal_filter::RejectingOperator::new(
+                    return Ok(Box::new(operator::temporal_filter::RejectingOperator::new(
                         "[LDB-1001] now()/current_timestamp() in a non-windowed \
                          query is only supported as a retracting temporal filter \
                          `SELECT * FROM <src> WHERE time_col {>|>=|<|<=} now() ± \
                          INTERVAL` (or BETWEEN) declared `EMIT CHANGES`",
-                    ));
+                    )));
                 }
             }
         }
@@ -2238,7 +2296,7 @@ impl OperatorGraph {
             if let Some(ref scope) = self.cluster_shuffle {
                 op.attach_cluster_scope(scope.clone());
             }
-            return Box::new(op);
+            return Ok(Box::new(op));
         }
 
         // `EMIT CHANGES` is an explicit changelog; `incremental` drives the same dirty-only emit
@@ -2261,7 +2319,7 @@ impl OperatorGraph {
             debug_assert_eq!(cfg.registry.vnode_count(), u32::from(self.key_group_count));
             op.attach_cluster_shuffle(cfg.clone());
         }
-        Box::new(op)
+        Ok(Box::new(op))
     }
 
     pub fn remove_query(&mut self, name: &str) {
@@ -2317,8 +2375,6 @@ impl OperatorGraph {
 
         self.output_map.remove(name);
         self.incremental_tables.remove(name);
-        self.temporal_configs
-            .retain(|(query_name, _)| query_name != name);
         self.live_handles.remove(name);
         if !ids_to_remove.is_empty() {
             self.topo_dirty = true;
