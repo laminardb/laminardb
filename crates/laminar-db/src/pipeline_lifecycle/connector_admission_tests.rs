@@ -25,6 +25,7 @@ use laminar_connectors::connector::{
 use laminar_connectors::error::ConnectorError;
 use laminar_core::checkpoint::object_store_builder::CheckpointStorageScope;
 use laminar_core::checkpoint::ConnectorCheckpoint;
+use laminar_core::streaming::StreamCheckpointConfig;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -45,6 +46,27 @@ async fn temporal_test_db() -> (
         .await
         .unwrap();
     (db, control)
+}
+
+async fn persistent_temporal_alo_test_db(
+    storage_dir: &std::path::Path,
+    control: &crate::temporal_test_source::TemporalTestSourceControl,
+) -> Arc<LaminarDB> {
+    let registration_control = control.clone();
+    LaminarDB::builder()
+        .storage_dir(storage_dir)
+        .checkpoint(StreamCheckpointConfig {
+            interval_ms: None,
+            ..StreamCheckpointConfig::default()
+        })
+        .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+        .temporal_join_idle_history_retention(Duration::from_secs(60))
+        .register_connector(move |registry| {
+            crate::temporal_test_source::register(registry, &registration_control)
+        })
+        .build()
+        .await
+        .unwrap()
 }
 
 async fn create_temporal_test_inputs(db: &LaminarDB) -> Result<(), DbError> {
@@ -73,6 +95,33 @@ async fn create_temporal_test_stream(db: &LaminarDB, name: &str) -> Result<(), D
     ))
     .await?;
     Ok(())
+}
+
+async fn next_temporal_output(
+    subscription: &mut crate::subscription::SubscriptionPortal,
+) -> RecordBatch {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match subscription.next_frame().await {
+                Some(crate::subscription::PortalFrame::Batch { batch, .. })
+                    if batch.num_rows() != 0 =>
+                {
+                    break batch;
+                }
+                Some(crate::subscription::PortalFrame::Batch { .. })
+                | Some(crate::subscription::PortalFrame::Barrier { .. }) => {}
+                Some(crate::subscription::PortalFrame::Lagged(skipped)) => {
+                    panic!("temporal test subscription lagged by {skipped} entries");
+                }
+                Some(crate::subscription::PortalFrame::Error { message }) => {
+                    panic!("temporal test subscription failed: {message}");
+                }
+                None => panic!("temporal test subscription closed before output"),
+            }
+        }
+    })
+    .await
+    .expect("managed temporal output timed out")
 }
 
 struct RetiringQuiesceSink {
@@ -1129,29 +1178,7 @@ async fn managed_temporal_stream_starts_and_emits_with_positioned_microsecond_so
         .await
         .unwrap();
     control.release();
-
-    let batch = tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            match subscription.next_frame().await {
-                Some(crate::subscription::PortalFrame::Batch { batch, .. })
-                    if batch.num_rows() != 0 =>
-                {
-                    break batch;
-                }
-                Some(crate::subscription::PortalFrame::Batch { .. })
-                | Some(crate::subscription::PortalFrame::Barrier { .. }) => {}
-                Some(crate::subscription::PortalFrame::Lagged(skipped)) => {
-                    panic!("temporal test subscription lagged by {skipped} entries");
-                }
-                Some(crate::subscription::PortalFrame::Error { message }) => {
-                    panic!("temporal test subscription failed: {message}");
-                }
-                None => panic!("temporal test subscription closed before output"),
-            }
-        }
-    })
-    .await
-    .expect("managed temporal output timed out");
+    let batch = next_temporal_output(&mut subscription).await;
 
     assert_eq!(batch.num_rows(), 1);
     assert_eq!(batch.schema().field(0).name(), "id");
@@ -1183,6 +1210,72 @@ async fn managed_temporal_stream_starts_and_emits_with_positioned_microsecond_so
             .unwrap()
             .value(0),
         7
+    );
+    db.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_temporal_alo_clean_reopen_recovers_history_and_source_positions() {
+    let storage = tempfile::tempdir().unwrap();
+    let control = crate::temporal_test_source::TemporalTestSourceControl::new();
+
+    let db = persistent_temporal_alo_test_db(storage.path(), &control).await;
+    create_temporal_test_inputs(&db).await.unwrap();
+    create_temporal_test_stream(&db, "matched").await.unwrap();
+    db.start().await.unwrap();
+    let mut subscription = db
+        .open_subscription("matched", None, crate::subscription::SubscribeStart::Tail)
+        .await
+        .unwrap();
+    control.release();
+    let initial = next_temporal_output(&mut subscription).await;
+    assert_eq!(
+        initial
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        7
+    );
+    let checkpoint = db.checkpoint().await.unwrap();
+    assert!(
+        checkpoint.success && checkpoint.error.is_none(),
+        "temporal checkpoint did not commit cleanly: {checkpoint:?}"
+    );
+    db.shutdown().await.unwrap();
+
+    let db = persistent_temporal_alo_test_db(storage.path(), &control).await;
+    create_temporal_test_inputs(&db).await.unwrap();
+    create_temporal_test_stream(&db, "matched").await.unwrap();
+    db.start().await.unwrap();
+    assert_eq!(control.start_cursor("left_events"), Some(1));
+    assert_eq!(control.start_cursor("right_events"), Some(1));
+    let mut subscription = db
+        .open_subscription("matched", None, crate::subscription::SubscribeStart::Tail)
+        .await
+        .unwrap();
+    control.release();
+    let recovered = next_temporal_output(&mut subscription).await;
+    assert_eq!(recovered.num_rows(), 1);
+    assert_eq!(
+        recovered
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        11
+    );
+    assert_eq!(
+        recovered
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        9,
+        "the post-restart probe must match history restored from the checkpoint"
     );
     db.shutdown().await.unwrap();
 }

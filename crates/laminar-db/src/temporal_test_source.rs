@@ -15,22 +15,30 @@ use laminar_connectors::registry::ConnectorRegistry;
 /// Connector name shared by temporal runtime tests.
 pub(crate) const CONNECTOR_NAME: &str = "temporal-positioned-test";
 
-/// Release handle that keeps test sources idle until observers are attached.
+/// Release handle that exposes one deterministic input cut at a time.
 #[derive(Clone)]
 pub(crate) struct TemporalTestSourceControl {
-    ready: tokio::sync::watch::Sender<bool>,
+    ready: tokio::sync::watch::Sender<usize>,
+    start_cursors: Arc<parking_lot::Mutex<std::collections::HashMap<Vec<u8>, usize>>>,
 }
 
 impl TemporalTestSourceControl {
-    /// Create a closed source gate.
+    /// Create a source with no released input cuts.
     pub(crate) fn new() -> Self {
-        let (ready, _) = tokio::sync::watch::channel(false);
-        Self { ready }
+        let (ready, _) = tokio::sync::watch::channel(0);
+        Self {
+            ready,
+            start_cursors: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        }
     }
 
-    /// Allow every connector instance to emit its deterministic batch.
+    /// Allow every connector instance to emit its next deterministic batch.
     pub(crate) fn release(&self) {
-        let _ = self.ready.send(true);
+        self.ready.send_modify(|cut| *cut += 1);
+    }
+
+    pub(crate) fn start_cursor(&self, source: &str) -> Option<usize> {
+        self.start_cursors.lock().get(source.as_bytes()).copied()
     }
 }
 
@@ -53,6 +61,7 @@ pub(crate) fn register(
     control: &TemporalTestSourceControl,
 ) -> Result<(), ConnectorError> {
     let ready = control.ready.subscribe();
+    let start_cursors = Arc::clone(&control.start_cursors);
     registry.register_source(
         CONNECTOR_NAME,
         ConnectorInfo {
@@ -67,7 +76,12 @@ pub(crate) fn register(
                 "append",
             )],
         },
-        Arc::new(move |_| Ok(Box::new(TemporalTestSource::new(ready.clone())))),
+        Arc::new(move |_| {
+            Ok(Box::new(TemporalTestSource::new(
+                ready.clone(),
+                Arc::clone(&start_cursors),
+            )))
+        }),
     )
 }
 
@@ -100,25 +114,35 @@ struct TemporalTestSource {
     schema: SchemaRef,
     mode: TestInputMode,
     source_identity: Vec<u8>,
-    emitted: bool,
-    ready: tokio::sync::watch::Receiver<bool>,
+    cursor: usize,
+    ready: tokio::sync::watch::Receiver<usize>,
+    start_cursors: Arc<parking_lot::Mutex<std::collections::HashMap<Vec<u8>, usize>>>,
 }
 
 impl TemporalTestSource {
-    fn new(ready: tokio::sync::watch::Receiver<bool>) -> Self {
+    fn new(
+        ready: tokio::sync::watch::Receiver<usize>,
+        start_cursors: Arc<parking_lot::Mutex<std::collections::HashMap<Vec<u8>, usize>>>,
+    ) -> Self {
         Self {
             schema: schema(),
             mode: TestInputMode::Append,
             source_identity: CONNECTOR_NAME.as_bytes().to_vec(),
-            emitted: false,
+            cursor: 0,
             ready,
+            start_cursors,
         }
     }
 
-    fn batch(&self) -> Result<SourceBatch, ConnectorError> {
-        let (ids, times, values) = match self.mode {
-            TestInputMode::Append => (vec![1], vec![2_000], vec![10]),
-            TestInputMode::Upsert => (vec![1, 1], vec![1_000, 3_000], vec![7, 9]),
+    fn batch(&self) -> Result<Option<SourceBatch>, ConnectorError> {
+        let Some((ids, times, values)) = (match (self.mode, self.cursor) {
+            (TestInputMode::Append, 0) => Some((vec![1], vec![2_000], vec![10])),
+            (TestInputMode::Append, 1) => Some((vec![1], vec![4_000], vec![11])),
+            (TestInputMode::Upsert, 0) => Some((vec![1, 1], vec![1_000, 3_000], vec![7, 9])),
+            (TestInputMode::Upsert, 1) => Some((vec![1], vec![5_000], vec![12])),
+            _ => None,
+        }) else {
+            return Ok(None);
         };
         let rows = ids.len();
         let records = RecordBatch::try_new(
@@ -131,7 +155,11 @@ impl TemporalTestSource {
         )
         .map_err(|error| ConnectorError::ReadError(error.to_string()))?;
         let order_values = (0..rows)
-            .map(|row| u64::try_from(row).unwrap().to_be_bytes())
+            .map(|row| {
+                u64::try_from(self.cursor * 2 + row)
+                    .expect("the two-cut test cursor fits u64")
+                    .to_be_bytes()
+            })
             .collect::<Vec<_>>();
         let positions = SourceRowPositions::try_new(
             BinaryArray::from(vec![self.source_identity.as_slice(); rows]),
@@ -143,7 +171,7 @@ impl TemporalTestSource {
             ),
             UInt32Array::from(vec![0; rows]),
         )?;
-        SourceBatch::positioned(records, positions)
+        SourceBatch::positioned(records, positions).map(Some)
     }
 }
 
@@ -176,18 +204,21 @@ impl SourceConnector for TemporalTestSource {
             .unwrap_or(CONNECTOR_NAME)
             .as_bytes()
             .to_vec();
-        self.emitted = match position {
-            SourcePosition::Initial => false,
-            SourcePosition::Resume { checkpoint, .. } => match checkpoint.get_offset("emitted") {
-                Some("0") => false,
-                Some("1") => true,
-                _ => {
-                    return Err(ConnectorError::ConfigurationError(
-                        "temporal test checkpoint has no valid emitted cursor".into(),
-                    ));
-                }
-            },
+        self.cursor = match position {
+            SourcePosition::Initial => 0,
+            SourcePosition::Resume { checkpoint, .. } => checkpoint
+                .get_offset("cursor")
+                .and_then(|cursor| cursor.parse::<usize>().ok())
+                .filter(|cursor| *cursor <= 2)
+                .ok_or_else(|| {
+                    ConnectorError::ConfigurationError(
+                        "temporal test checkpoint has no valid cursor".into(),
+                    )
+                })?,
         };
+        self.start_cursors
+            .lock()
+            .insert(self.source_identity.clone(), self.cursor);
         Ok(())
     }
 
@@ -195,20 +226,13 @@ impl SourceConnector for TemporalTestSource {
         &mut self,
         _max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError> {
-        if self.emitted {
+        if *self.ready.borrow() <= self.cursor {
             return Ok(None);
         }
-        while !*self.ready.borrow() {
-            self.ready
-                .changed()
-                .await
-                .map_err(|_| ConnectorError::InvalidState {
-                    expected: "a live temporal test release control".into(),
-                    actual: "the release control was dropped".into(),
-                })?;
-        }
-        let batch = self.batch()?;
-        self.emitted = true;
+        let Some(batch) = self.batch()? else {
+            return Ok(None);
+        };
+        self.cursor += 1;
         Ok(Some(batch))
     }
 
@@ -218,7 +242,7 @@ impl SourceConnector for TemporalTestSource {
 
     fn checkpoint(&self) -> SourceCheckpoint {
         let mut checkpoint = SourceCheckpoint::new();
-        checkpoint.set_offset("emitted", if self.emitted { "1" } else { "0" });
+        checkpoint.set_offset("cursor", self.cursor.to_string());
         checkpoint
     }
 
