@@ -5,8 +5,6 @@
 
 /// Analytic window function operator configuration builder
 pub mod analytic_translator;
-/// HAVING clause filter configuration
-pub mod having_translator;
 mod join_translator;
 /// ORDER BY operator configuration builder
 pub mod order_translator;
@@ -19,7 +17,6 @@ pub use crate::temporal::{TemporalJoinKind, TemporalProbeSchedule};
 pub use analytic_translator::{
     AnalyticFunctionConfig, AnalyticWindowConfig, WindowFrameConfig, WindowFrameFunctionConfig,
 };
-pub use having_translator::HavingFilterConfig;
 pub use join_translator::{
     JoinOperatorConfig, LookupJoinConfig, LookupJoinType, StreamJoinConfig,
     TemporalJoinTranslatorConfig,

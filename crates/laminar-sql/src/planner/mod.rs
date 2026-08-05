@@ -34,8 +34,8 @@ use crate::parser::{
 };
 use crate::temporal::temporal_table_version_count;
 use crate::translator::{
-    AnalyticWindowConfig, HavingFilterConfig, JoinOperatorConfig, OrderOperatorConfig,
-    WindowFrameConfig, WindowOperatorConfig,
+    AnalyticWindowConfig, JoinOperatorConfig, OrderOperatorConfig, WindowFrameConfig,
+    WindowOperatorConfig,
 };
 
 /// Information about a registered lookup table.
@@ -150,8 +150,6 @@ pub struct QueryPlan {
     pub order_config: Option<OrderOperatorConfig>,
     /// Analytic window function configuration (LAG/LEAD/etc.)
     pub analytic_config: Option<AnalyticWindowConfig>,
-    /// HAVING clause filter configuration
-    pub having_config: Option<HavingFilterConfig>,
     /// Window frame configuration (ROWS BETWEEN / RANGE BETWEEN)
     pub frame_config: Option<WindowFrameConfig>,
     /// Emit strategy
@@ -461,7 +459,6 @@ impl StreamingPlanner {
             join_config: query_plan.join_config,
             order_config: query_plan.order_config,
             analytic_config: query_plan.analytic_config,
-            having_config: query_plan.having_config,
             frame_config: query_plan.frame_config,
             emit_clause: emit_clause.cloned(),
             statement: Box::new(stmt),
@@ -519,9 +516,7 @@ impl StreamingPlanner {
                 let analytic_config =
                     analytic_analysis.map(|a| AnalyticWindowConfig::from_analysis(&a));
 
-                // Check for HAVING clause
-                let agg_analysis = analyze_aggregates(stmt);
-                let having_config = agg_analysis.having_expr.map(HavingFilterConfig::new);
+                let has_having = analyze_aggregates(stmt).has_having;
 
                 // Check for window frame functions (ROWS BETWEEN / RANGE BETWEEN)
                 let frame_analysis = analyze_window_frames(stmt);
@@ -545,7 +540,7 @@ impl StreamingPlanner {
                     || join_analysis.is_some()
                     || order_config.is_some()
                     || analytic_config.is_some()
-                    || having_config.is_some()
+                    || has_having
                     || frame_config.is_some();
 
                 if has_streaming_features {
@@ -568,7 +563,6 @@ impl StreamingPlanner {
                         join_config,
                         order_config,
                         analytic_config,
-                        having_config,
                         frame_config,
                         emit_clause: None,
                         statement: Box::new(stmt.clone()),
@@ -651,10 +645,6 @@ impl StreamingPlanner {
         if let Some(analytic) = analyze_analytic_functions(stmt) {
             analysis.analytic_config = Some(AnalyticWindowConfig::from_analysis(&analytic));
         }
-
-        // Extract HAVING clause
-        let agg_analysis = analyze_aggregates(stmt);
-        analysis.having_config = agg_analysis.having_expr.map(HavingFilterConfig::new);
 
         // Extract window frame functions (ROWS BETWEEN / RANGE BETWEEN)
         if let Some(frame_analysis) = analyze_window_frames(stmt) {
@@ -920,7 +910,6 @@ struct QueryAnalysis {
     join_config: Option<Vec<JoinOperatorConfig>>,
     order_config: Option<OrderOperatorConfig>,
     analytic_config: Option<AnalyticWindowConfig>,
-    having_config: Option<HavingFilterConfig>,
     frame_config: Option<WindowFrameConfig>,
 }
 
@@ -1511,32 +1500,8 @@ mod tests {
         match plan {
             StreamingPlan::Query(query_plan) => {
                 assert!(query_plan.window_config.is_some());
-                assert!(query_plan.having_config.is_some());
-                let config = query_plan.having_config.unwrap();
-                assert!(
-                    config.predicate().contains("COUNT(*)"),
-                    "predicate was: {}",
-                    config.predicate()
-                );
             }
-            _ => panic!("Expected Query plan with having config"),
-        }
-    }
-
-    #[test]
-    fn test_plan_query_without_having() {
-        let mut planner = StreamingPlanner::new();
-        let statements = StreamingParser::parse_sql(
-            "SELECT COUNT(*) FROM events GROUP BY TUMBLE(event_time, INTERVAL '5' MINUTE)",
-        )
-        .unwrap();
-
-        let plan = planner.plan(&statements[0]).unwrap();
-        match plan {
-            StreamingPlan::Query(query_plan) => {
-                assert!(query_plan.having_config.is_none());
-            }
-            _ => panic!("Expected Query plan"),
+            _ => panic!("Expected windowed Query plan"),
         }
     }
 
@@ -1552,31 +1517,9 @@ mod tests {
         let plan = planner.plan(&statements[0]).unwrap();
         match plan {
             StreamingPlan::Query(query_plan) => {
-                assert!(query_plan.having_config.is_some());
                 assert!(query_plan.window_config.is_none());
             }
             _ => panic!("Expected Query plan for HAVING-only query"),
-        }
-    }
-
-    #[test]
-    fn test_plan_having_compound_predicate() {
-        let mut planner = StreamingPlanner::new();
-        let statements = StreamingParser::parse_sql(
-            "SELECT symbol, COUNT(*) AS cnt, SUM(vol) AS total \
-             FROM trades GROUP BY symbol \
-             HAVING COUNT(*) >= 5 AND SUM(vol) > 10000",
-        )
-        .unwrap();
-
-        let plan = planner.plan(&statements[0]).unwrap();
-        match plan {
-            StreamingPlan::Query(query_plan) => {
-                let config = query_plan.having_config.unwrap();
-                let pred = config.predicate();
-                assert!(pred.contains("AND"), "predicate was: {pred}");
-            }
-            _ => panic!("Expected Query plan"),
         }
     }
 

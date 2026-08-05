@@ -22,7 +22,7 @@ use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
 use crate::aggregate_state::{
-    compile_having_filter, expr_to_sql, extract_clauses, find_aggregate,
+    apply_compiled_having, compile_having_filter, extract_clauses, find_aggregate,
     query_fingerprint_with_config, AggFuncSpec, CompiledProjection, GroupCheckpoint, PreAggBuilder,
     WindowCheckpoint,
 };
@@ -248,7 +248,6 @@ pub(crate) struct CoreWindowState {
     pre_agg_sql: String,
     time_col_index: usize,
     output_schema: SchemaRef,
-    having_sql: Option<String>,
     compiled_projection: Option<CompiledProjection>,
     // Built once; LiveSourceExec leaves carry fresh data per execute.
     cached_pre_agg_physical: Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
@@ -264,7 +263,6 @@ pub(crate) struct CoreWindowState {
     high_watermark_ms: i64,
     post_projection: Option<PostProjection>,
     prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
-    having_sql_cache: Option<crate::operator::HavingSqlCache>,
     scratch_nogroup: FxHashMap<i64, Vec<u32>>,
     // Group ids are dense within a batch and index into scratch_group_keys.
     scratch_grouped: FxHashMap<(i64, u32), Vec<u32>>,
@@ -357,6 +355,7 @@ impl CoreWindowState {
         let group_exprs = agg_info.group_exprs;
         let aggr_exprs = agg_info.aggr_exprs;
         let agg_schema = agg_info.schema;
+        let agg_df_schema = agg_info.df_schema;
         let input_schema = agg_info.input_schema;
         let having_predicate = agg_info.having_predicate;
 
@@ -581,12 +580,7 @@ impl CoreWindowState {
             None
         };
 
-        let having_filter = compile_having_filter(ctx, having_predicate.as_ref(), &output_schema);
-        let having_sql = if having_filter.is_none() {
-            having_predicate.as_ref().map(expr_to_sql)
-        } else {
-            None
-        };
+        let having_filter = compile_having_filter(ctx, having_predicate.as_ref(), &agg_df_schema)?;
 
         let cached_pre_agg_physical = if compiled_projection.is_none() {
             let df = ctx
@@ -635,7 +629,6 @@ impl CoreWindowState {
             pre_agg_sql,
             output_schema,
             time_col_index,
-            having_sql,
             compiled_projection,
             cached_pre_agg_physical,
             now_where,
@@ -651,7 +644,6 @@ impl CoreWindowState {
             high_watermark_ms: i64::MIN,
             post_projection,
             prom: None,
-            having_sql_cache: None,
             scratch_nogroup: FxHashMap::default(),
             scratch_grouped: FxHashMap::default(),
             scratch_group_keys: indexmap::IndexSet::default(),
@@ -1200,6 +1192,11 @@ impl CoreWindowState {
             CoreWindowAssigner::Hopping(a) => self.close_fixed_windows(watermark_ms, a.size_ms()),
             CoreWindowAssigner::Session { .. } => self.close_session_windows(watermark_ms),
         }?;
+        let batches = if let Some(filter) = &self.having_filter {
+            apply_compiled_having(&batches, filter)?
+        } else {
+            batches
+        };
         self.apply_post_projection(batches)
     }
 
@@ -1424,17 +1421,8 @@ impl CoreWindowState {
     }
 
     #[cfg(test)]
-    #[cfg(test)]
     fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
-    }
-
-    pub fn having_sql(&self) -> Option<&str> {
-        self.having_sql.as_deref()
-    }
-
-    pub fn having_filter(&self) -> Option<&Arc<dyn PhysicalExpr>> {
-        self.having_filter.as_ref()
     }
 
     pub fn compiled_projection(&self) -> Option<&CompiledProjection> {
@@ -1445,10 +1433,6 @@ impl CoreWindowState {
         &self,
     ) -> Option<&Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         self.cached_pre_agg_physical.as_ref()
-    }
-
-    pub(crate) fn having_sql_cache_mut(&mut self) -> &mut Option<crate::operator::HavingSqlCache> {
-        &mut self.having_sql_cache
     }
 
     /// Apply the `now()` WHERE predicate with `now()` bound to the watermark
@@ -2096,7 +2080,6 @@ mod tests {
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
-            having_sql: None,
             compiled_projection: None,
             cached_pre_agg_physical: None,
             now_where: None,
@@ -2107,7 +2090,6 @@ mod tests {
             high_watermark_ms: i64::MIN,
             post_projection: None,
             prom: None,
-            having_sql_cache: None,
             scratch_nogroup: FxHashMap::default(),
             scratch_grouped: FxHashMap::default(),
             scratch_group_keys: indexmap::IndexSet::default(),
@@ -2167,7 +2149,6 @@ mod tests {
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
-            having_sql: None,
             compiled_projection: None,
             cached_pre_agg_physical: None,
             now_where: None,
@@ -2178,7 +2159,6 @@ mod tests {
             high_watermark_ms: i64::MIN,
             post_projection: None,
             prom: None,
-            having_sql_cache: None,
             scratch_nogroup: FxHashMap::default(),
             scratch_grouped: FxHashMap::default(),
             scratch_group_keys: indexmap::IndexSet::default(),
@@ -2226,7 +2206,6 @@ mod tests {
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
-            having_sql: None,
             compiled_projection: None,
             cached_pre_agg_physical: None,
             now_where: None,
@@ -2237,7 +2216,6 @@ mod tests {
             high_watermark_ms: i64::MIN,
             post_projection: None,
             prom: None,
-            having_sql_cache: None,
             scratch_nogroup: FxHashMap::default(),
             scratch_grouped: FxHashMap::default(),
             scratch_group_keys: indexmap::IndexSet::default(),
@@ -2283,7 +2261,6 @@ mod tests {
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
-            having_sql: None,
             compiled_projection: None,
             cached_pre_agg_physical: None,
             now_where: None,
@@ -2294,7 +2271,6 @@ mod tests {
             high_watermark_ms: i64::MIN,
             post_projection: None,
             prom: None,
-            having_sql_cache: None,
             scratch_nogroup: FxHashMap::default(),
             scratch_grouped: FxHashMap::default(),
             scratch_group_keys: indexmap::IndexSet::default(),
@@ -2332,11 +2308,14 @@ mod tests {
             late_data_side_output: None,
         };
 
-        let sql = "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol";
+        let sql = "SELECT symbol, SUM(price) AS total FROM trades \
+                   GROUP BY symbol HAVING SUM(price) > 100";
         let result = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None)
             .await
             .unwrap();
         assert!(result.is_some(), "Tumbling aggregate should return Some");
+        let state = result.unwrap();
+        assert!(state.having_filter.is_some());
     }
 
     #[tokio::test]
@@ -3210,7 +3189,8 @@ mod tests {
             &ctx,
             "SELECT symbol, SUM(a) / SUM(b) AS ratio \
              FROM events GROUP BY symbol, \
-             TUMBLE(ts, INTERVAL '10' SECOND)",
+             TUMBLE(ts, INTERVAL '10' SECOND) \
+             HAVING SUM(a) > 0 AND SUM(b) > 0",
             &config,
             Some(&laminar_sql::parser::EmitClause::OnWindowClose),
         )

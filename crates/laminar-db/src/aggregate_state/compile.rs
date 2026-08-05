@@ -6,8 +6,10 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
+use datafusion_common::tree_node::TreeNode;
 use datafusion_common::{DFSchema, ScalarValue};
 use datafusion_expr::LogicalPlan;
+use datafusion_optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 
 use super::AggFuncSpec;
 use crate::error::DbError;
@@ -16,6 +18,7 @@ pub(crate) struct AggregateInfo {
     pub(crate) group_exprs: Vec<datafusion_expr::Expr>,
     pub(crate) aggr_exprs: Vec<datafusion_expr::Expr>,
     pub(crate) schema: Arc<Schema>,
+    pub(crate) df_schema: Arc<DFSchema>,
     pub(crate) input_schema: Arc<Schema>,
     pub(crate) having_predicate: Option<datafusion_expr::Expr>,
     pub(crate) input_df_schema: Arc<DFSchema>,
@@ -261,6 +264,7 @@ fn find_aggregate_inner(
     match plan {
         LogicalPlan::Aggregate(agg) => {
             let schema = Arc::new(agg.schema.as_arrow().clone());
+            let df_schema = Arc::clone(&agg.schema);
             let input_schema = Arc::new(agg.input.schema().as_arrow().clone());
             let input_df_schema = Arc::clone(agg.input.schema());
             let where_predicate = extract_where_predicate(&agg.input);
@@ -268,6 +272,7 @@ fn find_aggregate_inner(
                 group_exprs: agg.group_expr.clone(),
                 aggr_exprs: agg.aggr_expr.clone(),
                 schema,
+                df_schema,
                 input_schema,
                 having_predicate: parent_filter.cloned(),
                 input_df_schema,
@@ -568,13 +573,22 @@ pub(crate) fn apply_compiled_having(
 pub(crate) fn compile_having_filter(
     ctx: &SessionContext,
     having_predicate: Option<&datafusion_expr::Expr>,
-    output_schema: &SchemaRef,
-) -> Option<Arc<dyn PhysicalExpr>> {
-    let having_pred = having_predicate?;
-    let df_schema = DFSchema::try_from(output_schema.as_ref().clone()).ok()?;
+    aggregate_schema: &DFSchema,
+) -> Result<Option<Arc<dyn PhysicalExpr>>, DbError> {
+    let Some(having_pred) = having_predicate else {
+        return Ok(None);
+    };
+    let mut coercer = TypeCoercionRewriter::new(aggregate_schema);
+    let having_pred = having_pred
+        .clone()
+        .rewrite(&mut coercer)
+        .map_err(|e| DbError::Pipeline(format!("HAVING type coercion: {e}")))?
+        .data;
     let state = ctx.state();
     let props = state.execution_props();
-    create_physical_expr(having_pred, &df_schema, props).ok()
+    create_physical_expr(&having_pred, aggregate_schema, props)
+        .map(Some)
+        .map_err(|e| DbError::Pipeline(format!("HAVING compilation: {e}")))
 }
 
 pub(crate) struct SqlClauses {

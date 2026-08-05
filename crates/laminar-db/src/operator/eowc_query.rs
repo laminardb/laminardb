@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
 
-use crate::aggregate_state::apply_compiled_having;
 #[cfg(feature = "cluster")]
 use crate::core_window_state::PreparedCoreWindowTransition;
 use crate::core_window_state::{CoreWindowCheckpoint, CoreWindowState};
@@ -243,35 +242,13 @@ impl EowcQueryOperator {
             }
         }
 
-        let having_filter = cw.having_filter().cloned();
-        let having_sql = cw.having_sql().map(String::from);
-        let mut batches = cw.close_windows(watermark).map_err(|error| {
+        let batches = cw.close_windows(watermark).map_err(|error| {
             if recovery_fenced {
                 Self::core_window_apply_error(op_name, "window close", error)
             } else {
                 error
             }
         })?;
-
-        if let Some(ref filter) = having_filter {
-            batches = apply_compiled_having(&batches, filter).map_err(|error| {
-                if recovery_fenced {
-                    Self::core_window_apply_error(op_name, "HAVING evaluation", error)
-                } else {
-                    error
-                }
-            })?;
-        } else if let Some(ref sql) = having_sql {
-            batches = apply_having_via_sql(ctx, op_name, &batches, sql, cw.having_sql_cache_mut())
-                .await
-                .map_err(|error| {
-                    if recovery_fenced {
-                        Self::core_window_apply_error(op_name, "HAVING execution", error)
-                    } else {
-                        error
-                    }
-                })?;
-        }
 
         Ok(batches)
     }
@@ -606,30 +583,6 @@ impl GraphOperator for EowcQueryOperator {
     fn finish_vnode_transition(&mut self) {
         drop(self.vnode_transition_cleanup.take());
     }
-}
-
-/// Apply a HAVING predicate via SQL using a cached physical plan.
-async fn apply_having_via_sql(
-    ctx: &SessionContext,
-    query_name: &str,
-    batches: &[RecordBatch],
-    having_sql: &str,
-    cache: &mut Option<super::HavingSqlCache>,
-) -> Result<Vec<RecordBatch>, DbError> {
-    if batches.is_empty() {
-        return Ok(Vec::new());
-    }
-    if cache.is_none() {
-        let temp_name = format!("_having_{}", query_name.replace(['-', ' '], "_"));
-        *cache = Some(
-            super::HavingSqlCache::build(ctx, &temp_name, batches[0].schema(), having_sql).await?,
-        );
-    }
-    cache
-        .as_ref()
-        .expect("just initialized")
-        .apply(query_name, batches.to_vec())
-        .await
 }
 
 #[cfg(test)]

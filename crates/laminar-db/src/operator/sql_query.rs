@@ -253,7 +253,6 @@ pub(crate) struct SqlQueryOperator {
     prom: Option<Arc<EngineMetrics>>,
     max_retractable_extremum_checkpoint_bytes: usize,
     execution_path_logged: bool,
-    having_cache: Option<super::HavingSqlCache>,
     emit_changelog: bool,
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<ClusterShuffleConfig>,
@@ -319,7 +318,6 @@ impl SqlQueryOperator {
             max_retractable_extremum_checkpoint_bytes:
                 crate::config::DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES,
             execution_path_logged: false,
-            having_cache: None,
             emit_changelog,
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
@@ -343,57 +341,45 @@ impl SqlQueryOperator {
 
     #[allow(clippy::too_many_lines)]
     async fn lazy_init(&mut self) -> Result<(), DbError> {
-        match IncrementalAggState::try_from_sql(
+        if let Some(mut agg_state) = IncrementalAggState::try_from_sql(
             &self.ctx,
             &self.sql,
             self.emit_changelog,
             self.key_group_count,
         )
-        .await
+        .await?
         {
-            Ok(Some(mut agg_state)) => {
-                if self.emit_changelog
-                    && (agg_state.having_filter().is_some() || agg_state.having_sql().is_some())
+            if self.emit_changelog && agg_state.having_filter().is_some() {
+                return Err(DbError::Pipeline(format!(
+                    "aggregate '{}' cannot use HAVING with changelog output until transition-aware HAVING retractions are implemented",
+                    self.op_name
+                )));
+            }
+            agg_state.set_max_retractable_extremum_checkpoint_bytes(
+                self.max_retractable_extremum_checkpoint_bytes,
+            );
+            #[cfg(feature = "cluster")]
+            if self.cluster_shuffle.is_some() {
+                let expected_state_class = if agg_state.num_group_cols() == 0 {
+                    OperatorStateClass::GlobalSingleton
+                } else {
+                    OperatorStateClass::VnodeKeyed
+                };
+                if self.capability.managed_state != Some(ManagedStateContract::SqlAggregateV1)
+                    || self.capability.state_class != expected_state_class
                 {
                     return Err(DbError::Pipeline(format!(
-                        "aggregate '{}' cannot use HAVING with changelog output until transition-aware HAVING retractions are implemented",
-                        self.op_name
+                        "[{}] query '{}': initialized aggregate state does not match its immutable cluster capability ({:?}, {:?})",
+                        laminar_core::error_codes::CLUSTER_STATE_LIFECYCLE_UNSUPPORTED,
+                        self.op_name,
+                        self.capability.state_class,
+                        self.capability.managed_state
                     )));
                 }
-                agg_state.set_max_retractable_extremum_checkpoint_bytes(
-                    self.max_retractable_extremum_checkpoint_bytes,
-                );
-                #[cfg(feature = "cluster")]
-                if self.cluster_shuffle.is_some() {
-                    let expected_state_class = if agg_state.num_group_cols() == 0 {
-                        OperatorStateClass::GlobalSingleton
-                    } else {
-                        OperatorStateClass::VnodeKeyed
-                    };
-                    if self.capability.managed_state != Some(ManagedStateContract::SqlAggregateV1)
-                        || self.capability.state_class != expected_state_class
-                    {
-                        return Err(DbError::Pipeline(format!(
-                            "[{}] query '{}': initialized aggregate state does not match its immutable cluster capability ({:?}, {:?})",
-                            laminar_core::error_codes::CLUSTER_STATE_LIFECYCLE_UNSUPPORTED,
-                            self.op_name,
-                            self.capability.state_class,
-                            self.capability.managed_state
-                        )));
-                    }
-                }
-                self.log_execution_path(agg_state.compiled_projection().is_some());
-                self.state = QueryState::Agg(Box::new(agg_state));
-                return Ok(());
             }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::debug!(
-                    query = %self.op_name,
-                    error = %e,
-                    "Could not introspect query plan for aggregate detection, using cached plan"
-                );
-            }
+            self.log_execution_path(agg_state.compiled_projection().is_some());
+            self.state = QueryState::Agg(Box::new(agg_state));
+            return Ok(());
         }
 
         let df = self
@@ -403,12 +389,10 @@ impl SqlQueryOperator {
             .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
         let plan = df.logical_plan().clone();
 
-        #[cfg(feature = "cluster")]
-        if self.cluster_shuffle.is_some() && crate::aggregate_state::find_aggregate(&plan).is_some()
-        {
-            return Err(DbError::Pipeline(format!(
-                "[{}] query '{}': cluster aggregate cannot use a node-local DataFusion fallback; the exact incremental execution path was not constructed",
-                laminar_core::error_codes::CLUSTER_STATE_LIFECYCLE_UNSUPPORTED,
+        if crate::aggregate_state::find_aggregate(&plan).is_some() {
+            return Err(DbError::Unsupported(format!(
+                "[{}] query '{}': aggregate cannot use the generic DataFusion path; the incremental execution path was not constructed",
+                laminar_core::error_codes::SQL_UNSUPPORTED,
                 self.op_name
             )));
         }
@@ -634,7 +618,7 @@ impl SqlQueryOperator {
                 })?;
             }
         }
-        let output = self.emit_agg_output().await;
+        let output = self.emit_agg_output();
         output.map_err(|error| {
             stateful_apply_outcome_unknown(&self.op_name, "output construction", error)
         })
@@ -685,7 +669,7 @@ impl SqlQueryOperator {
                     self.op_name
                 ))
             })?;
-        let output = self.emit_agg_output().await.map_err(|error| {
+        let output = self.emit_agg_output().map_err(|error| {
             DbError::Checkpoint(format!(
                 "aggregate '{}' aligned shuffle replay emission failed and requires recovery: {error}",
                 self.op_name
@@ -700,7 +684,7 @@ impl SqlQueryOperator {
         Ok(output)
     }
 
-    async fn emit_agg_output(&mut self) -> Result<Vec<RecordBatch>, DbError> {
+    fn emit_agg_output(&mut self) -> Result<Vec<RecordBatch>, DbError> {
         let QueryState::Agg(ref mut agg_state) = self.state else {
             return Err(DbError::Pipeline(
                 "internal: emit_agg_output on non-agg".into(),
@@ -709,46 +693,11 @@ impl SqlQueryOperator {
 
         let mut batches = agg_state.emit()?;
 
-        let having_filter = agg_state.having_filter().cloned();
-        let having_sql = agg_state.having_sql().map(String::from);
-        if let Some(ref filter) = having_filter {
+        if let Some(filter) = agg_state.having_filter() {
             batches = apply_compiled_having(&batches, filter)?;
-        } else if let Some(ref having_sql) = having_sql {
-            batches = self.apply_having_sql(&batches, having_sql).await?;
         }
 
         Ok(batches)
-    }
-
-    async fn apply_having_sql(
-        &mut self,
-        batches: &[RecordBatch],
-        having_sql: &str,
-    ) -> Result<Vec<RecordBatch>, DbError> {
-        if batches.is_empty() {
-            return Ok(Vec::new());
-        }
-        if self.having_cache.is_none() {
-            tracing::warn!(
-                query = %self.op_name,
-                "HAVING filter compiled to PhysicalExpr failed -- using cached SQL plan"
-            );
-            let table_name = format!("__having_{}", self.op_name);
-            self.having_cache = Some(
-                super::HavingSqlCache::build(
-                    &self.ctx,
-                    &table_name,
-                    batches[0].schema(),
-                    having_sql,
-                )
-                .await?,
-            );
-        }
-        self.having_cache
-            .as_ref()
-            .expect("just initialized")
-            .apply(&self.op_name, batches.to_vec())
-            .await
     }
 }
 
@@ -912,9 +861,8 @@ impl GraphOperator for SqlQueryOperator {
         if matches!(self.state, QueryState::Agg(_)) {
             return Ok(());
         }
-        // The immutable AST classifier deliberately over-approximates direct aggregates. Local
-        // execution may legitimately resolve a derived aggregate to DataFusion instead of the
-        // incremental state table. Cluster execution rejects that fallback inside `lazy_init`.
+        // The immutable AST classifier can over-approximate function syntax. Only an initialized
+        // incremental aggregate owns managed state.
         self.capability.managed_state = None;
         Ok(())
     }
@@ -1508,7 +1456,7 @@ mod checkpoint_tests {
     }
 
     #[tokio::test]
-    async fn local_derived_aggregate_retains_datafusion_fallback() {
+    async fn derived_aggregate_requires_incremental_execution() {
         let (context, _) = context_and_batch();
         let mut operator = SqlQueryOperator::new(
             "ratio",
@@ -1518,9 +1466,9 @@ mod checkpoint_tests {
             false,
         );
 
-        operator.initialize_managed_state().await.unwrap();
-        assert!(matches!(operator.state, QueryState::CachedPlan(_)));
-        assert_eq!(operator.capability.managed_state, None);
+        let error = operator.initialize_managed_state().await.unwrap_err();
+        assert!(matches!(error, DbError::Unsupported(_)));
+        assert!(format!("{error}").contains(laminar_core::error_codes::SQL_UNSUPPORTED));
     }
 
     #[test]

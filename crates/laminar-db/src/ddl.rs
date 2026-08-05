@@ -2776,7 +2776,7 @@ impl LaminarDB {
                 Ok(Some(aggregate)) => aggregate,
                 Ok(None) => {
                     return reject(
-                        "aggregate cannot be constructed on the exact incremental execution path; node-local DataFusion fallback would produce partial cluster results",
+                        "aggregate cannot be constructed on the exact incremental execution path",
                     );
                 }
                 Err(error) => {

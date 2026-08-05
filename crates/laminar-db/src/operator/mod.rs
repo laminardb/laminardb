@@ -351,37 +351,6 @@ impl LiveSqlCache {
     }
 }
 
-/// `LiveSqlCache` wrapping HAVING SQL; used when the predicate can't compile to a `PhysicalExpr`.
-pub(crate) struct HavingSqlCache(LiveSqlCache);
-
-impl HavingSqlCache {
-    pub(crate) async fn build(
-        ctx: &SessionContext,
-        table_name: &str,
-        schema: SchemaRef,
-        having_sql: &str,
-    ) -> Result<Self, DbError> {
-        let col_list = schema
-            .fields()
-            .iter()
-            .map(|f| format!("\"{}\"", f.name()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!("SELECT {col_list} FROM \"{table_name}\" WHERE {having_sql}");
-        LiveSqlCache::build(ctx, table_name, schema, &sql, "HAVING")
-            .await
-            .map(Self)
-    }
-
-    pub(crate) async fn apply(
-        &self,
-        op_name: &str,
-        batches: Vec<RecordBatch>,
-    ) -> Result<Vec<RecordBatch>, DbError> {
-        self.0.apply(op_name, batches).await
-    }
-}
-
 pub(crate) mod ai_inference;
 pub(crate) mod eowc_query;
 pub(crate) mod interval_join;

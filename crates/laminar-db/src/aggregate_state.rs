@@ -32,8 +32,10 @@ pub(crate) use checkpoints::{
     query_fingerprint, query_fingerprint_with_config, AggStateCheckpoint, EmittedCheckpoint,
     GroupCheckpoint, WindowCheckpoint,
 };
+#[cfg(test)]
+pub(crate) use compile::expr_to_sql;
 pub(crate) use compile::{
-    apply_compiled_having, compile_having_filter, expr_to_sql, extract_clauses, find_aggregate,
+    apply_compiled_having, compile_having_filter, extract_clauses, find_aggregate,
     CompiledProjection, PreAggBuilder,
 };
 pub(crate) use keys::{
@@ -497,7 +499,6 @@ pub(crate) struct IncrementalAggState {
     compiled_projection: Option<CompiledProjection>,
     cached_pre_agg_physical: Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
     having_filter: Option<Arc<dyn PhysicalExpr>>,
-    having_sql: Option<String>,
     max_groups: usize,
     max_retractable_extremum_checkpoint_bytes: usize,
     emit_changelog: bool,
@@ -930,6 +931,7 @@ impl IncrementalAggState {
         let group_exprs = agg_info.group_exprs;
         let aggr_exprs = agg_info.aggr_exprs;
         let agg_schema = agg_info.schema;
+        let agg_df_schema = agg_info.df_schema;
         let input_schema = agg_info.input_schema;
         let having_predicate = agg_info.having_predicate;
 
@@ -1105,12 +1107,7 @@ impl IncrementalAggState {
         }
         let output_schema = Arc::new(Schema::new(output_fields));
 
-        let having_filter = compile_having_filter(ctx, having_predicate.as_ref(), &output_schema);
-        let having_sql = if having_filter.is_none() {
-            having_predicate.as_ref().map(expr_to_sql)
-        } else {
-            None
-        };
+        let having_filter = compile_having_filter(ctx, having_predicate.as_ref(), &agg_df_schema)?;
 
         // Plan once at init; LiveSourceProvider leaves carry fresh data per execute.
         let cached_pre_agg_physical =
@@ -1150,7 +1147,6 @@ impl IncrementalAggState {
             compiled_projection,
             cached_pre_agg_physical,
             having_filter,
-            having_sql,
             max_groups: 1_000_000,
             max_retractable_extremum_checkpoint_bytes:
                 crate::config::DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES,
@@ -1704,10 +1700,6 @@ impl IncrementalAggState {
 
     pub fn having_filter(&self) -> Option<&Arc<dyn PhysicalExpr>> {
         self.having_filter.as_ref()
-    }
-
-    pub fn having_sql(&self) -> Option<&str> {
-        self.having_sql.as_deref()
     }
 
     pub fn compiled_projection(&self) -> Option<&CompiledProjection> {

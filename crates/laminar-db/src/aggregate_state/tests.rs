@@ -902,7 +902,7 @@ async fn test_filter_clause_applied() {
 }
 
 #[tokio::test]
-async fn test_having_clause_detected() {
+async fn aliased_having_filters_emitted_batch() {
     let ctx = laminar_sql::create_session_context();
     let schema = Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, false),
@@ -922,16 +922,36 @@ async fn test_having_clause_detected() {
 
     let state = try_from_sql_local(
         &ctx,
-        "SELECT name, SUM(value) as total FROM events GROUP BY name HAVING SUM(value) > 100",
+        "SELECT name, COUNT(*) AS row_count, COUNT(value) AS value_count, \
+         SUM(value) AS total FROM events GROUP BY name \
+         HAVING name = 'high' AND COUNT(*) = 2 \
+         AND COUNT(value) = 2 AND SUM(value) > 100",
         false,
     )
     .await
     .unwrap()
     .expect("expected aggregate state");
-    assert!(
-        state.having_sql.is_some(),
-        "HAVING predicate should be extracted"
-    );
+    assert!(state.having_filter().is_some());
+
+    let emitted = RecordBatch::try_new(
+        Arc::clone(&state.output_schema),
+        vec![
+            Arc::new(arrow::array::StringArray::from(vec!["low", "high"])),
+            Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
+            Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
+            Arc::new(arrow::array::Float64Array::from(vec![50.0, 150.0])),
+        ],
+    )
+    .unwrap();
+    let filtered = apply_compiled_having(&[emitted], state.having_filter().unwrap()).unwrap();
+
+    assert_eq!(filtered.len(), 1);
+    let names = filtered[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "high");
 }
 
 #[tokio::test]
@@ -1260,7 +1280,6 @@ fn test_expr_to_sql_like() {
 
 #[test]
 fn test_expr_to_sql_aggregate_function() {
-    // AggregateFunction in expr_to_sql is used for HAVING
     use datafusion_expr::Expr;
     let sum_udf = datafusion::functions_aggregate::sum::sum_udaf();
     let e = Expr::AggregateFunction(datafusion_expr::expr::AggregateFunction {
