@@ -1,5 +1,6 @@
 //! Vnode-local state for event-time temporal joins.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
@@ -18,11 +19,11 @@ use laminar_core::serialization::{deserialize_batch_stream, serialize_batches_st
 use laminar_core::state::PartitionKeyCodecV1;
 use laminar_sql::temporal::{TemporalJoinKind, TemporalProbeSchedule};
 use rustc_hash::{FxHashMap, FxHashSet};
-use sha2::{Digest, Sha256};
+use xxhash_rust::xxh3::xxh3_128;
 
 use crate::error::DbError;
 
-const FORMAT_VERSION: u8 = 2;
+const FORMAT_VERSION: u8 = 3;
 const CHECKPOINT_ALIGNMENT: usize = rkyv::util::AlignedVec::<16>::ALIGNMENT;
 const MAP_ENTRY_CHARGE: usize = 128;
 const VERSION_ENTRY_CHARGE: usize = 256;
@@ -125,7 +126,46 @@ struct MutationIdentity {
     key: Option<Box<[u8]>>,
     event_time: Option<i64>,
     tombstone: bool,
-    payload_fingerprint: [u8; 32],
+    payload_fingerprint: [u8; 16],
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct LeftRowIdentity {
+    key: Option<Box<[u8]>>,
+    event_time: Option<i64>,
+    payload_fingerprint: [u8; 16],
+}
+
+struct ReplayCursor {
+    order: Box<[u8]>,
+    sub_offset: u32,
+}
+
+impl ReplayCursor {
+    fn from_source(source: &TemporalSourcePosition) -> Self {
+        Self {
+            order: source.order.clone().into_boxed_slice(),
+            sub_offset: source.sub_offset,
+        }
+    }
+
+    fn compare(&self, source: &TemporalSourcePosition) -> Ordering {
+        source
+            .order
+            .as_slice()
+            .cmp(self.order.as_ref())
+            .then_with(|| source.sub_offset.cmp(&self.sub_offset))
+    }
+}
+
+struct RightReplayFrontier {
+    cursor: ReplayCursor,
+    identity: MutationIdentity,
+}
+
+struct LeftReplayFrontier {
+    cursor: ReplayCursor,
+    identity: LeftRowIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -141,14 +181,7 @@ struct PendingProbe {
     left_event_time: i64,
     probe_time: i64,
     deadline: i64,
-    payload_fingerprint: [u8; 32],
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct FinalizedProbe {
-    key: Option<Box<[u8]>>,
-    left_event_time: Option<i64>,
-    payload_fingerprint: [u8; 32],
+    payload_fingerprint: [u8; 16],
 }
 
 struct OutputRow {
@@ -187,12 +220,24 @@ struct CheckpointConfig {
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-struct CheckpointMutationIdentity {
-    source: TemporalSourcePosition,
+struct CheckpointRightReplayFrontier {
+    partition: Vec<u8>,
+    order: Vec<u8>,
+    sub_offset: u32,
     key: Option<Vec<u8>>,
     event_time: Option<i64>,
     tombstone: bool,
-    payload_fingerprint: [u8; 32],
+    payload_fingerprint: [u8; 16],
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct CheckpointLeftReplayFrontier {
+    partition: Vec<u8>,
+    order: Vec<u8>,
+    sub_offset: u32,
+    key: Option<Vec<u8>>,
+    event_time: Option<i64>,
+    payload_fingerprint: [u8; 16],
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -213,16 +258,7 @@ struct CheckpointProbe {
     left_event_time: i64,
     probe_time: i64,
     deadline: i64,
-    payload_fingerprint: [u8; 32],
-}
-
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-struct CheckpointFinalizedProbe {
-    source: TemporalSourcePosition,
-    offset_ms: i64,
-    key: Option<Vec<u8>>,
-    left_event_time: Option<i64>,
-    payload_fingerprint: [u8; 32],
+    payload_fingerprint: [u8; 16],
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -239,10 +275,10 @@ struct TemporalJoinCheckpoint {
     history_gc_sweep_end: u64,
     history_gc_active_cutoff: Option<i64>,
     history_gc_completed_cutoff: Option<i64>,
-    applied_right: Vec<CheckpointMutationIdentity>,
+    right_replay_frontiers: Vec<CheckpointRightReplayFrontier>,
+    left_replay_frontiers: Vec<CheckpointLeftReplayFrontier>,
     versions: Vec<CheckpointVersion>,
     pending: Vec<CheckpointProbe>,
-    finalized: Vec<CheckpointFinalizedProbe>,
     right_rows_ipc: Vec<u8>,
     left_rows_ipc: Vec<u8>,
 }
@@ -259,12 +295,12 @@ pub(crate) struct TemporalJoinVnodeState {
     right_row_codec: RowConverter,
     history: VnodeHistory,
     history_key_roster: Vec<Box<[u8]>>,
-    applied_right: FxHashMap<TemporalSourcePosition, MutationIdentity>,
+    right_replay_frontiers: FxHashMap<Box<[u8]>, RightReplayFrontier>,
     right_batches: FxHashMap<u64, RetainedBatch>,
     pending: FxHashMap<ProbeIdentity, PendingProbe>,
     timers: BTreeMap<i64, BTreeSet<ProbeIdentity>>,
     left_batches: FxHashMap<u64, RetainedBatch>,
-    finalized: FxHashMap<ProbeIdentity, FinalizedProbe>,
+    left_replay_frontiers: FxHashMap<Box<[u8]>, LeftReplayFrontier>,
     next_batch_id: u64,
     left_frontier: Option<i64>,
     left_idle: bool,
@@ -324,12 +360,12 @@ impl TemporalJoinVnodeState {
             right_row_codec,
             history: FxHashMap::default(),
             history_key_roster: Vec::new(),
-            applied_right: FxHashMap::default(),
+            right_replay_frontiers: FxHashMap::default(),
             right_batches: FxHashMap::default(),
             pending: FxHashMap::default(),
             timers: BTreeMap::new(),
             left_batches: FxHashMap::default(),
-            finalized: FxHashMap::default(),
+            left_replay_frontiers: FxHashMap::default(),
             next_batch_id: 1,
             left_frontier: None,
             left_idle: false,
@@ -342,10 +378,6 @@ impl TemporalJoinVnodeState {
             history_gc_completed_cutoff: None,
             charged_bytes: BASE_STATE_CHARGE,
         })
-    }
-
-    pub(crate) fn output_schema(&self) -> SchemaRef {
-        Arc::clone(&self.output_schema)
     }
 
     pub(crate) fn retained_versions(&self) -> usize {
@@ -421,13 +453,22 @@ impl TemporalJoinVnodeState {
             return Err(self.pipeline_error("right CDC operation count does not match row count"));
         }
         let positions = extract_source_positions(batch)?;
+        if positions.iter().all(|source| {
+            self.right_replay_frontiers
+                .get(source.partition.as_slice())
+                .is_some_and(|frontier| frontier.cursor.compare(source) == Ordering::Less)
+        }) {
+            return Ok(TemporalRightApplyStats {
+                duplicates: positions.len(),
+                ..TemporalRightApplyStats::default()
+            });
+        }
         let times = extract_times(batch, self.config.right_time_index, "right")?;
         let fingerprints = fingerprint_rows(&self.right_row_codec, batch, "right")?;
         let key_columns = self.key_columns(batch, false);
         let mut stats = TemporalRightApplyStats::default();
         let mut candidates = Vec::new();
-        let mut batch_positions: FxHashMap<TemporalSourcePosition, MutationIdentity> =
-            FxHashMap::default();
+        let mut staged_frontiers: FxHashMap<Box<[u8]>, RightReplayFrontier> = FxHashMap::default();
 
         for (row, source_position) in positions.iter().enumerate() {
             let null_key = key_columns.iter().any(|column| column.is_null(row));
@@ -447,35 +488,62 @@ impl TemporalJoinVnodeState {
                 tombstone,
                 payload_fingerprint: fingerprints[row],
             };
+            if let Some(current) = staged_frontiers.get(source_position.partition.as_slice()) {
+                match current.cursor.compare(source_position) {
+                    Ordering::Less => {
+                        return Err(self.pipeline_error(
+                            "right source positions regressed within one input batch",
+                        ));
+                    }
+                    Ordering::Equal => {
+                        if current.identity != identity {
+                            return Err(self.pipeline_error(
+                                "a right source position was replayed with different temporal data",
+                            ));
+                        }
+                        stats.duplicates += 1;
+                        continue;
+                    }
+                    Ordering::Greater => {}
+                }
+            } else if let Some(current) = self
+                .right_replay_frontiers
+                .get(source_position.partition.as_slice())
+            {
+                match current.cursor.compare(source_position) {
+                    Ordering::Less => {
+                        stats.duplicates += 1;
+                        continue;
+                    }
+                    Ordering::Equal => {
+                        if current.identity != identity {
+                            return Err(self.pipeline_error(
+                                "a right source position was replayed with different temporal data",
+                            ));
+                        }
+                        stats.duplicates += 1;
+                        continue;
+                    }
+                    Ordering::Greater => {}
+                }
+            }
+            staged_frontiers.insert(
+                source_position.partition.clone().into_boxed_slice(),
+                RightReplayFrontier {
+                    cursor: ReplayCursor::from_source(source_position),
+                    identity,
+                },
+            );
             let source = source_position.clone();
-            if let Some(previous) = self.applied_right.get(&source) {
-                if previous != &identity {
-                    return Err(self.pipeline_error(
-                        "a right source position was replayed with different temporal data",
-                    ));
-                }
-                stats.duplicates += 1;
-                continue;
-            }
-            if let Some(previous) = batch_positions.get(&source) {
-                if previous != &identity {
-                    return Err(self.pipeline_error(
-                        "a right batch reused one source position for different temporal data",
-                    ));
-                }
-                stats.duplicates += 1;
-                continue;
-            }
-            batch_positions.insert(source.clone(), identity.clone());
             let row = u32::try_from(row)
                 .map_err(|_| self.pipeline_error("right batch exceeds the supported row count"))?;
             let (Some(key), Some(event_time)) = (key, event_time) else {
                 stats.ignored_nulls += 1;
-                candidates.push((None, source, identity, row));
+                candidates.push((None, source, row));
                 continue;
             };
             self.reject_late_input(event_time, "right")?;
-            candidates.push((Some((key, event_time, tombstone)), source, identity, row));
+            candidates.push((Some((key, event_time, tombstone)), source, row));
         }
 
         if candidates.is_empty() {
@@ -486,15 +554,21 @@ impl TemporalJoinVnodeState {
             .filter(|entry| entry.0.as_ref().is_some_and(|entry| !entry.2))
             .count();
         let mut growth = 0usize;
-        let mut new_history_keys: FxHashSet<&[u8]> = FxHashSet::default();
-        for (version, source, identity, _) in &candidates {
-            let applied = MAP_ENTRY_CHARGE
-                .checked_add(source.heap_bytes())
-                .and_then(|value| value.checked_add(identity.key.as_deref().map_or(0, <[u8]>::len)))
-                .ok_or_else(|| self.pipeline_error("right dedup accounting overflow"))?;
+        let mut released = 0usize;
+        for (partition, frontier) in &staged_frontiers {
             growth = growth
-                .checked_add(applied)
+                .checked_add(self.right_replay_frontier_charge(partition, frontier)?)
                 .ok_or_else(|| self.pipeline_error("right retained-state accounting overflow"))?;
+            if let Some(previous) = self.right_replay_frontiers.get(partition.as_ref()) {
+                released = released
+                    .checked_add(self.right_replay_frontier_charge(partition, previous)?)
+                    .ok_or_else(|| {
+                        self.pipeline_error("right retained-state accounting overflow")
+                    })?;
+            }
+        }
+        let mut new_history_keys: FxHashSet<&[u8]> = FxHashSet::default();
+        for (version, source, _) in &candidates {
             if let Some((key, _, _)) = version {
                 let version_charge = VERSION_ENTRY_CHARGE
                     .checked_add(source.heap_bytes())
@@ -524,7 +598,8 @@ impl TemporalJoinVnodeState {
                 })?)
                 .ok_or_else(|| self.pipeline_error("right retained-state accounting overflow"))?;
         }
-        let admitted_charge = self.admitted_charge(growth, "right version admission")?;
+        let admitted_charge =
+            self.admitted_replacement_charge(growth, released, "right version admission")?;
         let batch_id = if live_count == 0 {
             None
         } else {
@@ -539,7 +614,7 @@ impl TemporalJoinVnodeState {
                 },
             );
         }
-        for (version, source, identity, row) in candidates {
+        for (version, source, row) in candidates {
             if let Some((key, event_time, tombstone)) = version {
                 let order = (event_time, source.clone());
                 let version = Version {
@@ -557,7 +632,9 @@ impl TemporalJoinVnodeState {
                 debug_assert!(replaced.is_none());
                 stats.inserted += 1;
             }
-            self.applied_right.insert(source, identity);
+        }
+        for (partition, frontier) in staged_frontiers {
+            self.right_replay_frontiers.insert(partition, frontier);
         }
         self.charged_bytes = admitted_charge;
         Ok(stats)
@@ -594,13 +671,21 @@ impl TemporalJoinVnodeState {
         u32::try_from(expanded_rows)
             .map_err(|_| self.pipeline_error("temporal probe expansion exceeds the row limit"))?;
         let positions = extract_source_positions(batch)?;
+        if positions.iter().all(|source| {
+            self.left_replay_frontiers
+                .get(source.partition.as_slice())
+                .is_some_and(|frontier| frontier.cursor.compare(source) == Ordering::Less)
+                && !self.has_pending_left_source(source)
+        }) {
+            return Ok(RecordBatch::new_empty(Arc::clone(&self.output_schema)));
+        }
         let times = extract_times(batch, self.config.left_time_index, "left")?;
         let fingerprints = fingerprint_rows(&self.left_row_codec, batch, "left")?;
         let key_columns = self.key_columns(batch, true);
         let input = Arc::new(batch.clone());
         let mut outputs = Vec::new();
         let mut planned = Vec::new();
-        let mut seen: FxHashMap<ProbeIdentity, FinalizedProbe> = FxHashMap::default();
+        let mut staged_frontiers: FxHashMap<Box<[u8]>, LeftReplayFrontier> = FxHashMap::default();
 
         for (row, source_position) in positions.iter().enumerate() {
             outputs
@@ -620,50 +705,60 @@ impl TemporalJoinVnodeState {
             }
             let row = u32::try_from(row)
                 .map_err(|_| self.pipeline_error("left batch exceeds the supported row count"))?;
-            let fingerprint = FinalizedProbe {
+            let row_identity = LeftRowIdentity {
                 key: key.clone(),
-                left_event_time: event_time,
+                event_time,
                 payload_fingerprint: fingerprints[row as usize],
             };
-            let mut lateness_checked = false;
+            if let Some(current) = staged_frontiers.get(source_position.partition.as_slice()) {
+                match current.cursor.compare(source_position) {
+                    Ordering::Less => {
+                        return Err(self.pipeline_error(
+                            "left source positions regressed within one input batch",
+                        ));
+                    }
+                    Ordering::Equal => {
+                        if current.identity != row_identity {
+                            return Err(self.pipeline_error(
+                                "a left source position was replayed with different temporal data",
+                            ));
+                        }
+                        continue;
+                    }
+                    Ordering::Greater => {}
+                }
+            } else if let Some(current) = self
+                .left_replay_frontiers
+                .get(source_position.partition.as_slice())
+            {
+                match current.cursor.compare(source_position) {
+                    Ordering::Less => {
+                        self.validate_replayed_pending_left(source_position, &row_identity)?;
+                        continue;
+                    }
+                    Ordering::Equal => {
+                        if current.identity != row_identity {
+                            return Err(self.pipeline_error(
+                                "a left source position was replayed with different temporal data",
+                            ));
+                        }
+                        continue;
+                    }
+                    Ordering::Greater => {}
+                }
+            }
+            if let Some(event_time) = event_time {
+                self.reject_late_input(event_time, "left")?;
+            }
             for &offset_ms in &self.offsets {
                 let identity = ProbeIdentity {
                     source: source_position.clone(),
                     offset_ms,
                 };
-                if let Some(previous) = seen.get(&identity) {
-                    if previous != &fingerprint {
-                        return Err(self.pipeline_error(
-                            "a left batch reused one source position for different temporal data",
-                        ));
-                    }
-                    continue;
-                }
-                seen.insert(identity.clone(), fingerprint.clone());
-                if let Some(previous) = self.finalized.get(&identity) {
-                    if previous != &fingerprint {
-                        return Err(self.pipeline_error(
-                            "a left source position was replayed with different temporal data",
-                        ));
-                    }
-                    continue;
-                }
-                if let Some(previous) = self.pending.get(&identity) {
-                    if previous.left_event_time != event_time.unwrap_or(i64::MIN)
-                        || Some(previous.key.as_ref()) != key.as_deref()
-                        || previous.payload_fingerprint != fingerprint.payload_fingerprint
-                    {
-                        return Err(self.pipeline_error(
-                            "a pending left source position was replayed with different temporal data",
-                        ));
-                    }
-                    continue;
-                }
-                if !lateness_checked {
-                    if let Some(event_time) = event_time {
-                        self.reject_late_input(event_time, "left")?;
-                    }
-                    lateness_checked = true;
+                if self.pending.contains_key(&identity) {
+                    return Err(
+                        self.pipeline_error("a pending left probe is ahead of its replay frontier")
+                    );
                 }
                 let left = RowRef {
                     batch: Arc::clone(&input),
@@ -682,7 +777,6 @@ impl TemporalJoinVnodeState {
                     (key.clone(), event_time, probe_time)
                 else {
                     self.push_final_output(&mut outputs, left, None, offset_ms, probe_time);
-                    planned.push((identity, fingerprint.clone(), None));
                     continue;
                 };
                 self.reject_evicted_probe(probe_time)?;
@@ -700,19 +794,28 @@ impl TemporalJoinVnodeState {
                 {
                     let right = self.lookup(&key, probe_time)?;
                     self.push_final_output(&mut outputs, left, right, offset_ms, Some(probe_time));
-                    planned.push((identity, fingerprint.clone(), None));
                 } else {
                     planned.push((
                         identity,
-                        fingerprint.clone(),
-                        Some((key, event_time, probe_time, deadline, row)),
+                        key,
+                        event_time,
+                        probe_time,
+                        deadline,
+                        row,
+                        row_identity.payload_fingerprint,
                     ));
                 }
             }
+            staged_frontiers.insert(
+                source_position.partition.clone().into_boxed_slice(),
+                LeftReplayFrontier {
+                    cursor: ReplayCursor::from_source(source_position),
+                    identity: row_identity,
+                },
+            );
         }
 
-        let new_pending = planned.iter().filter(|entry| entry.2.is_some()).count();
-        let new_finalized = planned.len().saturating_sub(new_pending);
+        let new_pending = planned.len();
         let pending_total = self
             .pending
             .len()
@@ -725,19 +828,26 @@ impl TemporalJoinVnodeState {
             )));
         }
         let mut growth = 0usize;
-        for (identity, fingerprint, pending) in &planned {
-            let entry_charge = if let Some((key, _, _, _, _)) = pending {
-                VERSION_ENTRY_CHARGE
-                    .checked_add(TIMER_ENTRY_CHARGE)
-                    .and_then(|value| value.checked_add(key.len()))
-                    .and_then(|value| value.checked_add(identity.source.heap_bytes()))
-                    .and_then(|value| value.checked_add(identity.source.heap_bytes()))
-            } else {
-                MAP_ENTRY_CHARGE
-                    .checked_add(fingerprint.key.as_deref().map_or(0, <[u8]>::len))
-                    .and_then(|value| value.checked_add(identity.source.heap_bytes()))
+        let mut released = 0usize;
+        for (partition, frontier) in &staged_frontiers {
+            growth = growth
+                .checked_add(self.left_replay_frontier_charge(partition, frontier)?)
+                .ok_or_else(|| self.pipeline_error("left temporal state accounting overflow"))?;
+            if let Some(previous) = self.left_replay_frontiers.get(partition.as_ref()) {
+                released = released
+                    .checked_add(self.left_replay_frontier_charge(partition, previous)?)
+                    .ok_or_else(|| {
+                        self.pipeline_error("left temporal state accounting overflow")
+                    })?;
             }
-            .ok_or_else(|| self.pipeline_error("left temporal state accounting overflow"))?;
+        }
+        for (identity, key, _, _, _, _, _) in &planned {
+            let entry_charge = VERSION_ENTRY_CHARGE
+                .checked_add(TIMER_ENTRY_CHARGE)
+                .and_then(|value| value.checked_add(key.len()))
+                .and_then(|value| value.checked_add(identity.source.heap_bytes()))
+                .and_then(|value| value.checked_add(identity.source.heap_bytes()))
+                .ok_or_else(|| self.pipeline_error("left temporal state accounting overflow"))?;
             growth = growth
                 .checked_add(entry_charge)
                 .ok_or_else(|| self.pipeline_error("left temporal state accounting overflow"))?;
@@ -749,8 +859,8 @@ impl TemporalJoinVnodeState {
                 })?)
                 .ok_or_else(|| self.pipeline_error("left temporal state accounting overflow"))?;
         }
-        debug_assert_eq!(planned.len(), new_pending + new_finalized);
-        let admitted_charge = self.admitted_charge(growth, "left probe admission")?;
+        let admitted_charge =
+            self.admitted_replacement_charge(growth, released, "left probe admission")?;
         let output = self.build_output(&outputs)?;
         let left_batch_id = if new_pending == 0 {
             None
@@ -766,29 +876,30 @@ impl TemporalJoinVnodeState {
                 },
             );
         }
-        for (identity, fingerprint, pending) in planned {
-            if let Some((key, left_event_time, probe_time, deadline, row)) = pending {
-                let inserted = self
-                    .timers
-                    .entry(deadline)
-                    .or_default()
-                    .insert(identity.clone());
-                debug_assert!(inserted);
-                self.pending.insert(
-                    identity,
-                    PendingProbe {
-                        left_batch: left_batch_id.expect("pending batch exists"),
-                        left_row: row,
-                        key,
-                        left_event_time,
-                        probe_time,
-                        deadline,
-                        payload_fingerprint: fingerprint.payload_fingerprint,
-                    },
-                );
-            } else {
-                self.finalized.insert(identity, fingerprint);
-            }
+        for (identity, key, left_event_time, probe_time, deadline, row, payload_fingerprint) in
+            planned
+        {
+            let inserted = self
+                .timers
+                .entry(deadline)
+                .or_default()
+                .insert(identity.clone());
+            debug_assert!(inserted);
+            self.pending.insert(
+                identity,
+                PendingProbe {
+                    left_batch: left_batch_id.expect("pending batch exists"),
+                    left_row: row,
+                    key,
+                    left_event_time,
+                    probe_time,
+                    deadline,
+                    payload_fingerprint,
+                },
+            );
+        }
+        for (partition, frontier) in staged_frontiers {
+            self.left_replay_frontiers.insert(partition, frontier);
         }
         self.charged_bytes = admitted_charge;
         Ok(output)
@@ -801,10 +912,10 @@ impl TemporalJoinVnodeState {
     ) -> Result<(), DbError> {
         validate_frontier(self.left_frontier, frontier, "left")?;
         if let Some(frontier) = frontier {
-            self.schedule_history_gc(Some(frontier), self.right_frontier);
             self.left_frontier = Some(frontier);
         }
         self.left_idle = idle;
+        self.schedule_history_gc(self.left_frontier, self.right_frontier);
         Ok(())
     }
 
@@ -815,10 +926,10 @@ impl TemporalJoinVnodeState {
     ) -> Result<(), DbError> {
         validate_frontier(self.right_frontier, frontier, "right")?;
         if let Some(frontier) = frontier {
-            self.schedule_history_gc(self.left_frontier, Some(frontier));
             self.right_frontier = Some(frontier);
         }
         self.right_idle = idle;
+        self.schedule_history_gc(self.left_frontier, self.right_frontier);
         Ok(())
     }
 
@@ -867,11 +978,9 @@ impl TemporalJoinVnodeState {
         }
 
         let mut outputs = Vec::new();
-        let mut finalized = Vec::with_capacity(ready.len());
         let mut seen = FxHashSet::default();
         let mut batch_releases: FxHashMap<u64, usize> = FxHashMap::default();
         let mut removed_charge = 0usize;
-        let mut added_charge = 0usize;
         for (deadline, identity) in &ready {
             if !seen.insert(identity.clone()) {
                 return Err(self.pipeline_error("temporal timer contains a duplicate probe"));
@@ -882,9 +991,6 @@ impl TemporalJoinVnodeState {
             if probe.deadline != *deadline {
                 return Err(self.pipeline_error("temporal timer deadline disagrees with probe"));
             }
-            if self.finalized.contains_key(identity) {
-                return Err(self.pipeline_error("temporal probe is both pending and finalized"));
-            }
             let left = self.left_row(probe.left_batch, probe.left_row)?;
             let right = self.lookup(&probe.key, probe.probe_time)?;
             self.push_final_output(
@@ -894,22 +1000,13 @@ impl TemporalJoinVnodeState {
                 identity.offset_ms,
                 Some(probe.probe_time),
             );
-            let value = FinalizedProbe {
-                key: Some(probe.key.clone()),
-                left_event_time: Some(probe.left_event_time),
-                payload_fingerprint: probe.payload_fingerprint,
-            };
             removed_charge = removed_charge
                 .checked_add(self.pending_probe_charge(identity, probe)?)
                 .ok_or_else(|| self.pipeline_error("ready-probe accounting overflow"))?;
-            added_charge = added_charge
-                .checked_add(self.finalized_probe_charge(identity, &value)?)
-                .ok_or_else(|| self.pipeline_error("finalized-probe accounting overflow"))?;
             let releases = batch_releases.entry(probe.left_batch).or_default();
             *releases = releases
                 .checked_add(1)
                 .ok_or_else(|| self.pipeline_error("ready-probe reference overflow"))?;
-            finalized.push((identity.clone(), value));
         }
         for (&batch_id, &release_count) in &batch_releases {
             let retained = self.left_batches.get(&batch_id).ok_or_else(|| {
@@ -931,18 +1028,10 @@ impl TemporalJoinVnodeState {
         let next_charge = self
             .charged_bytes
             .checked_sub(removed_charge)
-            .and_then(|value| value.checked_add(added_charge))
             .ok_or_else(|| self.pipeline_error("ready-probe accounting underflowed"))?;
-        if next_charge > self.config.limits.max_retained_bytes {
-            return Err(DbError::ManagedStateBudgetExceeded {
-                context: format!("temporal join vnode {} finalized probes", self.config.vnode),
-                accounted_bytes: next_charge,
-                limit_bytes: self.config.limits.max_retained_bytes,
-            });
-        }
         let output = self.build_output(&outputs)?;
 
-        for ((deadline, identity), (_, value)) in ready.iter().zip(finalized) {
+        for (deadline, identity) in &ready {
             let remove_deadline = {
                 let identities = self
                     .timers
@@ -957,8 +1046,6 @@ impl TemporalJoinVnodeState {
             }
             let removed = self.pending.remove(identity);
             debug_assert!(removed.is_some());
-            let replaced = self.finalized.insert(identity.clone(), value);
-            debug_assert!(replaced.is_none());
         }
         for (batch_id, release_count) in batch_releases {
             let remove_batch = {
@@ -998,27 +1085,33 @@ impl TemporalJoinVnodeState {
             max_encoded_bytes,
         )
         .map_err(|error| DbError::Checkpoint(format!("temporal left IPC: {error}")))?;
-        let finalized = self
-            .sorted_finalized()
+        let mut right_replay_frontiers: Vec<_> = self.right_replay_frontiers.iter().collect();
+        right_replay_frontiers
+            .sort_unstable_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
+        let right_replay_frontiers = right_replay_frontiers
             .into_iter()
-            .map(|(identity, value)| CheckpointFinalizedProbe {
-                source: identity.source.clone(),
-                offset_ms: identity.offset_ms,
-                key: value.key.as_deref().map(<[u8]>::to_vec),
-                left_event_time: value.left_event_time,
-                payload_fingerprint: value.payload_fingerprint,
+            .map(|(partition, frontier)| CheckpointRightReplayFrontier {
+                partition: partition.to_vec(),
+                order: frontier.cursor.order.to_vec(),
+                sub_offset: frontier.cursor.sub_offset,
+                key: frontier.identity.key.as_deref().map(<[u8]>::to_vec),
+                event_time: frontier.identity.event_time,
+                tombstone: frontier.identity.tombstone,
+                payload_fingerprint: frontier.identity.payload_fingerprint,
             })
             .collect();
-        let mut applied_right: Vec<_> = self.applied_right.iter().collect();
-        applied_right.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-        let applied_right = applied_right
+        let mut left_replay_frontiers: Vec<_> = self.left_replay_frontiers.iter().collect();
+        left_replay_frontiers
+            .sort_unstable_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
+        let left_replay_frontiers = left_replay_frontiers
             .into_iter()
-            .map(|(source, identity)| CheckpointMutationIdentity {
-                source: source.clone(),
-                key: identity.key.as_deref().map(<[u8]>::to_vec),
-                event_time: identity.event_time,
-                tombstone: identity.tombstone,
-                payload_fingerprint: identity.payload_fingerprint,
+            .map(|(partition, frontier)| CheckpointLeftReplayFrontier {
+                partition: partition.to_vec(),
+                order: frontier.cursor.order.to_vec(),
+                sub_offset: frontier.cursor.sub_offset,
+                key: frontier.identity.key.as_deref().map(<[u8]>::to_vec),
+                event_time: frontier.identity.event_time,
+                payload_fingerprint: frontier.identity.payload_fingerprint,
             })
             .collect();
         let history_gc_cursor = u64::try_from(self.history_gc_cursor)
@@ -1042,10 +1135,10 @@ impl TemporalJoinVnodeState {
             history_gc_sweep_end,
             history_gc_active_cutoff: self.history_gc_active_cutoff,
             history_gc_completed_cutoff: self.history_gc_completed_cutoff,
-            applied_right,
+            right_replay_frontiers,
+            left_replay_frontiers,
             versions,
             pending,
-            finalized,
             right_rows_ipc,
             left_rows_ipc,
         };
@@ -1099,12 +1192,11 @@ impl TemporalJoinVnodeState {
             .map_err(|error| DbError::Checkpoint(format!("temporal right IPC: {error}")))?;
         let left_rows = deserialize_batch_stream(&checkpoint.left_rows_ipc)
             .map_err(|error| DbError::Checkpoint(format!("temporal left IPC: {error}")))?;
-        state.restore_applied_right(checkpoint.applied_right)?;
+        state.restore_right_replay_frontiers(checkpoint.right_replay_frontiers)?;
+        state.restore_left_replay_frontiers(checkpoint.left_replay_frontiers)?;
         state.restore_versions(checkpoint.versions, right_rows)?;
         state.restore_history_gc_roster(history_key_roster)?;
         state.restore_pending(checkpoint.pending, left_rows)?;
-        state.restore_finalized(checkpoint.finalized)?;
-        state.validate_restored_history_anchor()?;
         state.validate_restored_probe_consistency()?;
         state.restore_charge()?;
         Ok(state)
@@ -1277,20 +1369,8 @@ impl TemporalJoinVnodeState {
         }
         let left: Vec<Option<RowRef>> = rows.iter().map(|row| Some(row.left.clone())).collect();
         let right: Vec<Option<RowRef>> = rows.iter().map(|row| row.right.clone()).collect();
-        let mut columns = interleave_rows(
-            &self.left_schema,
-            &left,
-            self.left_schema.fields().len(),
-            false,
-            "left",
-        )?;
-        let mut positions =
-            columns.split_off(self.left_schema.fields().len() - POSITION_COLUMN_COUNT);
-        let orders = rows
-            .iter()
-            .map(|row| derived_probe_order(&row.left, &self.config.operator_name, row.offset_ms))
-            .collect::<Result<Vec<_>, _>>()?;
-        positions[1] = Arc::new(BinaryArray::from_iter_values(orders));
+        let left_visible = self.left_schema.fields().len() - POSITION_COLUMN_COUNT;
+        let mut columns = interleave_rows(&self.left_schema, &left, left_visible, false, "left")?;
         let right_columns = interleave_rows(
             &self.right_schema,
             &right,
@@ -1307,37 +1387,44 @@ impl TemporalJoinVnodeState {
                 rows.iter().map(|row| row.probe_time).collect::<Vec<_>>(),
             )));
         }
-        columns.extend(positions);
         RecordBatch::try_new(Arc::clone(&self.output_schema), columns).map_err(|error| {
             self.pipeline_error(&format!("could not build temporal output: {error}"))
         })
     }
 
     fn schedule_history_gc(&mut self, left_frontier: Option<i64>, right_frontier: Option<i64>) {
-        let (Some(right_frontier), Some(left_frontier)) = (right_frontier, left_frontier) else {
+        let Some(right_frontier) = right_frontier else {
             return;
         };
         let retention_cutoff = right_frontier
             .checked_sub(self.config.history_retention_ms)
             .unwrap_or(i64::MIN);
-        let Some(earliest_future_event) =
-            left_frontier.checked_sub(self.config.left_allowed_lateness_ms)
-        else {
-            return;
-        };
-        let Some(earliest_future_probe) = earliest_future_event.checked_add(self.minimum_offset)
-        else {
-            return;
+        let future_probe_cutoff = if self.left_idle {
+            retention_cutoff
+        } else {
+            let Some(left_frontier) = left_frontier else {
+                return;
+            };
+            let Some(earliest_future_event) =
+                left_frontier.checked_sub(self.config.left_allowed_lateness_ms)
+            else {
+                return;
+            };
+            let Some(earliest_future_probe) =
+                earliest_future_event.checked_add(self.minimum_offset)
+            else {
+                return;
+            };
+            retention_cutoff.min(earliest_future_probe)
         };
         let oldest_pending = self.timers.first_key_value().map(|(deadline, _)| {
             deadline
                 .checked_sub(self.config.right_allowed_lateness_ms)
                 .expect("validated temporal timer deadline cannot underflow")
         });
-        let cutoff = oldest_pending
-            .map_or(retention_cutoff.min(earliest_future_probe), |pending| {
-                retention_cutoff.min(earliest_future_probe).min(pending)
-            });
+        let cutoff = oldest_pending.map_or(future_probe_cutoff, |pending| {
+            future_probe_cutoff.min(pending)
+        });
         if cutoff == i64::MIN {
             return;
         }
@@ -1540,10 +1627,16 @@ impl TemporalJoinVnodeState {
         Ok(id)
     }
 
-    fn admitted_charge(&self, growth: usize, context: &str) -> Result<usize, DbError> {
+    fn admitted_replacement_charge(
+        &self,
+        growth: usize,
+        released: usize,
+        context: &str,
+    ) -> Result<usize, DbError> {
         let accounted = self
             .charged_bytes
-            .checked_add(growth)
+            .checked_sub(released)
+            .and_then(|value| value.checked_add(growth))
             .ok_or_else(|| self.pipeline_error("temporal retained-state accounting overflow"))?;
         if accounted > self.config.limits.max_retained_bytes {
             return Err(DbError::ManagedStateBudgetExceeded {
@@ -1553,6 +1646,70 @@ impl TemporalJoinVnodeState {
             });
         }
         Ok(accounted)
+    }
+
+    fn right_replay_frontier_charge(
+        &self,
+        partition: &[u8],
+        frontier: &RightReplayFrontier,
+    ) -> Result<usize, DbError> {
+        MAP_ENTRY_CHARGE
+            .checked_add(partition.len())
+            .and_then(|value| value.checked_add(frontier.cursor.order.len()))
+            .and_then(|value| {
+                value.checked_add(frontier.identity.key.as_deref().map_or(0, <[u8]>::len))
+            })
+            .ok_or_else(|| self.pipeline_error("right replay-frontier accounting overflow"))
+    }
+
+    fn left_replay_frontier_charge(
+        &self,
+        partition: &[u8],
+        frontier: &LeftReplayFrontier,
+    ) -> Result<usize, DbError> {
+        MAP_ENTRY_CHARGE
+            .checked_add(partition.len())
+            .and_then(|value| value.checked_add(frontier.cursor.order.len()))
+            .and_then(|value| {
+                value.checked_add(frontier.identity.key.as_deref().map_or(0, <[u8]>::len))
+            })
+            .ok_or_else(|| self.pipeline_error("left replay-frontier accounting overflow"))
+    }
+
+    fn validate_replayed_pending_left(
+        &self,
+        source: &TemporalSourcePosition,
+        identity: &LeftRowIdentity,
+    ) -> Result<(), DbError> {
+        for &offset_ms in &self.offsets {
+            let probe_identity = ProbeIdentity {
+                source: source.clone(),
+                offset_ms,
+            };
+            let Some(probe) = self.pending.get(&probe_identity) else {
+                continue;
+            };
+            if identity.key.as_deref() != Some(probe.key.as_ref())
+                || identity.event_time != Some(probe.left_event_time)
+                || identity.payload_fingerprint != probe.payload_fingerprint
+            {
+                return Err(self.pipeline_error(
+                    "a replayed left source position disagrees with its pending temporal probes",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn has_pending_left_source(&self, source: &TemporalSourcePosition) -> bool {
+        let mut identity = ProbeIdentity {
+            source: source.clone(),
+            offset_ms: 0,
+        };
+        self.offsets.iter().any(|&offset_ms| {
+            identity.offset_ms = offset_ms;
+            self.pending.contains_key(&identity)
+        })
     }
 
     fn restore_charge(&mut self) -> Result<(), DbError> {
@@ -1578,17 +1735,6 @@ impl TemporalJoinVnodeState {
             .and_then(|value| value.checked_add(identity.source.heap_bytes()))
             .and_then(|value| value.checked_add(identity.source.heap_bytes()))
             .ok_or_else(|| self.pipeline_error("pending-probe accounting overflow"))
-    }
-
-    fn finalized_probe_charge(
-        &self,
-        identity: &ProbeIdentity,
-        probe: &FinalizedProbe,
-    ) -> Result<usize, DbError> {
-        MAP_ENTRY_CHARGE
-            .checked_add(probe.key.as_deref().map_or(0, <[u8]>::len))
-            .and_then(|value| value.checked_add(identity.source.heap_bytes()))
-            .ok_or_else(|| self.pipeline_error("probe dedup accounting overflow"))
     }
 
     fn pipeline_error(&self, message: &str) -> DbError {
@@ -1673,17 +1819,12 @@ impl TemporalJoinVnodeState {
             .saturating_add(1);
         if checkpoint.pending.len() > self.config.limits.max_pending_probes
             || checkpoint.versions.len() > entry_limit
-            || checkpoint.applied_right.len() > entry_limit
-            || checkpoint.finalized.len() > entry_limit
+            || checkpoint.right_replay_frontiers.len() > entry_limit
+            || checkpoint.left_replay_frontiers.len() > entry_limit
             || checkpoint.history_key_roster.len() > entry_limit
         {
             return Err(DbError::Checkpoint(
                 "temporal checkpoint exceeds configured state limits".into(),
-            ));
-        }
-        if checkpoint.versions.len() > checkpoint.applied_right.len() {
-            return Err(DbError::Checkpoint(
-                "temporal checkpoint versions exceed its right dedup entries".into(),
             ));
         }
         if checkpoint.history_evicted_before.is_some_and(|floor| {
@@ -1737,28 +1878,67 @@ impl TemporalJoinVnodeState {
         Ok(())
     }
 
-    fn restore_applied_right(
+    fn restore_right_replay_frontiers(
         &mut self,
-        applied: Vec<CheckpointMutationIdentity>,
+        frontiers: Vec<CheckpointRightReplayFrontier>,
     ) -> Result<(), DbError> {
-        for mutation in applied {
-            if let Some(key) = mutation.key.as_deref() {
+        for frontier in frontiers {
+            if let Some(key) = frontier.key.as_deref() {
                 self.validate_vnode(key)
                     .map_err(|error| DbError::Checkpoint(error.to_string()))?;
             }
-            let identity = MutationIdentity {
-                key: mutation.key.map(Vec::into_boxed_slice),
-                event_time: mutation.event_time,
-                tombstone: mutation.tombstone,
-                payload_fingerprint: mutation.payload_fingerprint,
+            let value = RightReplayFrontier {
+                cursor: ReplayCursor {
+                    order: frontier.order.into_boxed_slice(),
+                    sub_offset: frontier.sub_offset,
+                },
+                identity: MutationIdentity {
+                    key: frontier.key.map(Vec::into_boxed_slice),
+                    event_time: frontier.event_time,
+                    tombstone: frontier.tombstone,
+                    payload_fingerprint: frontier.payload_fingerprint,
+                },
             };
             if self
-                .applied_right
-                .insert(mutation.source, identity)
+                .right_replay_frontiers
+                .insert(frontier.partition.into_boxed_slice(), value)
                 .is_some()
             {
                 return Err(DbError::Checkpoint(
-                    "duplicate right source position in temporal checkpoint".into(),
+                    "duplicate right replay partition in temporal checkpoint".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_left_replay_frontiers(
+        &mut self,
+        frontiers: Vec<CheckpointLeftReplayFrontier>,
+    ) -> Result<(), DbError> {
+        for frontier in frontiers {
+            if let Some(key) = frontier.key.as_deref() {
+                self.validate_vnode(key)
+                    .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+            }
+            let value = LeftReplayFrontier {
+                cursor: ReplayCursor {
+                    order: frontier.order.into_boxed_slice(),
+                    sub_offset: frontier.sub_offset,
+                },
+                identity: LeftRowIdentity {
+                    key: frontier.key.map(Vec::into_boxed_slice),
+                    event_time: frontier.event_time,
+                    payload_fingerprint: frontier.payload_fingerprint,
+                },
+            };
+            if self
+                .left_replay_frontiers
+                .insert(frontier.partition.into_boxed_slice(), value)
+                .is_some()
+            {
+                return Err(DbError::Checkpoint(
+                    "duplicate left replay partition in temporal checkpoint".into(),
                 ));
             }
         }
@@ -1825,13 +2005,6 @@ impl TemporalJoinVnodeState {
         Ok((pending_out, compact_rows(&self.left_schema, &rows, "left")?))
     }
 
-    fn sorted_finalized(&self) -> Vec<(&ProbeIdentity, &FinalizedProbe)> {
-        let mut values: Vec<_> = self.finalized.iter().collect();
-        #[allow(clippy::unnecessary_sort_by)]
-        values.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-        values
-    }
-
     fn restore_versions(
         &mut self,
         versions: Vec<CheckpointVersion>,
@@ -1892,15 +2065,27 @@ impl TemporalJoinVnodeState {
                     "temporal right checkpoint row is out of bounds".into(),
                 ));
             }
-            let identity = self.applied_right.get(&version.source).ok_or_else(|| {
-                DbError::Checkpoint("temporal version is missing its right dedup identity".into())
-            })?;
-            if identity.key.as_deref() != Some(version.key.as_slice())
-                || identity.event_time != Some(version.event_time)
-                || identity.tombstone != version.tombstone
+            let frontier = self
+                .right_replay_frontiers
+                .get(version.source.partition.as_slice())
+                .ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "temporal version is missing its right replay frontier".into(),
+                    )
+                })?;
+            let frontier_order = frontier.cursor.compare(&version.source);
+            if frontier_order == Ordering::Greater {
+                return Err(DbError::Checkpoint(
+                    "temporal version is ahead of its right replay frontier".into(),
+                ));
+            }
+            if frontier_order == Ordering::Equal
+                && (frontier.identity.key.as_deref() != Some(version.key.as_slice())
+                    || frontier.identity.event_time != Some(version.event_time)
+                    || frontier.identity.tombstone != version.tombstone)
             {
                 return Err(DbError::Checkpoint(
-                    "temporal version disagrees with its right dedup identity".into(),
+                    "temporal version disagrees with its right replay frontier".into(),
                 ));
             }
             if let Some(row) = version.right_row {
@@ -1915,7 +2100,8 @@ impl TemporalJoinVnodeState {
                     || row_times.is_null(row)
                     || row_keys.row(row).as_ref() != version.key
                     || row_times.value(row) != version.event_time
-                    || row_fingerprints[row] != identity.payload_fingerprint
+                    || (frontier_order == Ordering::Equal
+                        && row_fingerprints[row] != frontier.identity.payload_fingerprint)
                 {
                     return Err(DbError::Checkpoint(
                         "temporal right checkpoint row disagrees with version metadata".into(),
@@ -1940,19 +2126,6 @@ impl TemporalJoinVnodeState {
             return Err(DbError::Checkpoint(
                 "temporal right checkpoint contains an unreferenced row".into(),
             ));
-        }
-        for (source, identity) in &self.applied_right {
-            if let (Some(_), Some(event_time)) = (&identity.key, identity.event_time) {
-                if !retained_sources.contains(source)
-                    && self
-                        .history_evicted_before
-                        .is_none_or(|floor| event_time >= floor)
-                {
-                    return Err(DbError::Checkpoint(
-                        "temporal right dedup entry is missing a retained version".into(),
-                    ));
-                }
-            }
         }
         Ok(())
     }
@@ -2105,6 +2278,31 @@ impl TemporalJoinVnodeState {
                     "temporal pending checkpoint row disagrees with probe metadata".into(),
                 ));
             }
+            let frontier = self
+                .left_replay_frontiers
+                .get(probe.source.partition.as_slice())
+                .ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "temporal pending probe is missing its left replay frontier".into(),
+                    )
+                })?;
+            match frontier.cursor.compare(&probe.source) {
+                Ordering::Greater => {
+                    return Err(DbError::Checkpoint(
+                        "temporal pending probe is ahead of its left replay frontier".into(),
+                    ));
+                }
+                Ordering::Equal
+                    if frontier.identity.key.as_deref() != Some(probe.key.as_slice())
+                        || frontier.identity.event_time != Some(probe.left_event_time)
+                        || frontier.identity.payload_fingerprint != probe.payload_fingerprint =>
+                {
+                    return Err(DbError::Checkpoint(
+                        "temporal pending probe disagrees with its left replay frontier".into(),
+                    ));
+                }
+                Ordering::Less | Ordering::Equal => {}
+            }
             let identity = ProbeIdentity {
                 source: probe.source,
                 offset_ms: probe.offset_ms,
@@ -2148,127 +2346,25 @@ impl TemporalJoinVnodeState {
         Ok(())
     }
 
-    fn restore_finalized(
-        &mut self,
-        finalized: Vec<CheckpointFinalizedProbe>,
-    ) -> Result<(), DbError> {
-        for probe in finalized {
-            if !self.offsets.contains(&probe.offset_ms) {
-                return Err(DbError::Checkpoint(
-                    "temporal finalized probe uses an unplanned offset".into(),
-                ));
-            }
-            if let Some(key) = probe.key.as_deref() {
-                self.validate_vnode(key)
-                    .map_err(|error| DbError::Checkpoint(error.to_string()))?;
-            }
-            if let Some(event_time) = probe.left_event_time {
-                event_time.checked_add(probe.offset_ms).ok_or_else(|| {
-                    DbError::Checkpoint("temporal finalized-probe timing overflowed".into())
-                })?;
-            }
-            let identity = ProbeIdentity {
-                source: probe.source,
-                offset_ms: probe.offset_ms,
-            };
-            if self.pending.contains_key(&identity) {
-                return Err(DbError::Checkpoint(
-                    "temporal probe is both pending and finalized in checkpoint".into(),
-                ));
-            }
-            if self
-                .finalized
-                .insert(
-                    identity,
-                    FinalizedProbe {
-                        key: probe.key.map(Vec::into_boxed_slice),
-                        left_event_time: probe.left_event_time,
-                        payload_fingerprint: probe.payload_fingerprint,
-                    },
-                )
-                .is_some()
-            {
-                return Err(DbError::Checkpoint(
-                    "duplicate finalized probe in temporal checkpoint".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_restored_history_anchor(&self) -> Result<(), DbError> {
-        let Some(floor) = self.history_evicted_before else {
-            return Ok(());
-        };
-        let mut expected = FxHashMap::<Box<[u8]>, (i64, TemporalSourcePosition)>::default();
-        for (source, identity) in &self.applied_right {
-            let (Some(key), Some(event_time)) = (&identity.key, identity.event_time) else {
-                continue;
-            };
-            if event_time >= floor {
-                continue;
-            }
-            let order = (event_time, source.clone());
-            match expected.entry(key.clone()) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    if order > *entry.get() {
-                        entry.insert(order);
-                    }
-                }
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(order);
-                }
-            }
-        }
-        for (key, order) in expected {
-            if self
-                .history
-                .get(key.as_ref())
-                .is_none_or(|versions| !versions.contains_key(&order))
-            {
-                return Err(DbError::Checkpoint(
-                    "temporal checkpoint is missing a predecessor history anchor".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
     fn validate_restored_probe_consistency(&self) -> Result<(), DbError> {
-        let mut by_source: FxHashMap<TemporalSourcePosition, (FinalizedProbe, FxHashSet<i64>)> =
+        let mut by_source: FxHashMap<TemporalSourcePosition, LeftRowIdentity> =
             FxHashMap::default();
         for (identity, probe) in &self.pending {
-            let fingerprint = FinalizedProbe {
+            let row = LeftRowIdentity {
                 key: Some(probe.key.clone()),
-                left_event_time: Some(probe.left_event_time),
+                event_time: Some(probe.left_event_time),
                 payload_fingerprint: probe.payload_fingerprint,
             };
-            let entry = by_source
-                .entry(identity.source.clone())
-                .or_insert_with(|| (fingerprint.clone(), FxHashSet::default()));
-            if entry.0 != fingerprint || !entry.1.insert(identity.offset_ms) {
-                return Err(DbError::Checkpoint(
-                    "temporal pending horizons disagree on their left source row".into(),
-                ));
-            }
-        }
-        for (identity, probe) in &self.finalized {
-            let entry = by_source
-                .entry(identity.source.clone())
-                .or_insert_with(|| (probe.clone(), FxHashSet::default()));
-            if entry.0 != *probe || !entry.1.insert(identity.offset_ms) {
-                return Err(DbError::Checkpoint(
-                    "temporal probe horizons disagree on their left source row".into(),
-                ));
-            }
-        }
-        for (_, horizons) in by_source.values() {
-            if horizons.len() != self.offsets.len()
-                || self.offsets.iter().any(|offset| !horizons.contains(offset))
-            {
-                return Err(DbError::Checkpoint(
-                    "temporal checkpoint is missing a planned probe horizon".into(),
-                ));
+            match by_source.entry(identity.source.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) if entry.get() != &row => {
+                    return Err(DbError::Checkpoint(
+                        "temporal pending horizons disagree on their left source row".into(),
+                    ));
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(row);
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
             }
         }
         Ok(())
@@ -2429,17 +2525,6 @@ fn validate_output_names(
             }
         }
     }
-    for name in [
-        SOURCE_PARTITION_COLUMN,
-        SOURCE_ORDER_COLUMN,
-        SOURCE_SUB_OFFSET_COLUMN,
-    ] {
-        if !names.insert(name.to_ascii_lowercase()) {
-            return Err(DbError::Config(format!(
-                "temporal output column name collision: {name}"
-            )));
-        }
-    }
     Ok(())
 }
 
@@ -2495,7 +2580,6 @@ fn output_schema(left: &Schema, right: &Schema, config: &TemporalJoinStateConfig
             true,
         )));
     }
-    fields.extend(left.fields()[left_visible..].iter().cloned());
     Arc::new(Schema::new(fields))
 }
 
@@ -2566,52 +2650,15 @@ fn fingerprint_rows(
     codec: &RowConverter,
     batch: &RecordBatch,
     side: &str,
-) -> Result<Vec<[u8; 32]>, DbError> {
+) -> Result<Vec<[u8; 16]>, DbError> {
     let rows = codec.convert_columns(batch.columns()).map_err(|error| {
         DbError::Pipeline(format!(
             "temporal {side} rows cannot be deterministically encoded: {error}"
         ))
     })?;
     Ok((0..batch.num_rows())
-        .map(|row| {
-            let mut hasher = Sha256::new();
-            hasher.update(b"laminardb/temporal-row/v1");
-            hasher.update(rows.row(row).as_ref());
-            hasher.finalize().into()
-        })
+        .map(|row| xxh3_128(rows.row(row).as_ref()).to_le_bytes())
         .collect())
-}
-
-fn derived_probe_order(
-    left: &RowRef,
-    operator_name: &str,
-    offset_ms: i64,
-) -> Result<Vec<u8>, DbError> {
-    let order = left
-        .batch
-        .column_by_name(SOURCE_ORDER_COLUMN)
-        .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
-        .ok_or_else(|| DbError::Pipeline("temporal left source-order column is invalid".into()))?;
-    let order = order.value(left.row as usize);
-    let length = u32::try_from(order.len()).map_err(|_| {
-        DbError::Pipeline("temporal source-order value exceeds the encoding limit".into())
-    })?;
-    let operator_length = u32::try_from(operator_name.len()).map_err(|_| {
-        DbError::Pipeline("temporal operator name exceeds the identity encoding limit".into())
-    })?;
-    let capacity = order
-        .len()
-        .checked_add(operator_name.len())
-        .and_then(|size| size.checked_add(17))
-        .ok_or_else(|| DbError::Pipeline("temporal probe identity is too large".into()))?;
-    let mut derived = Vec::with_capacity(capacity);
-    derived.push(1);
-    derived.extend_from_slice(&operator_length.to_be_bytes());
-    derived.extend_from_slice(operator_name.as_bytes());
-    derived.extend_from_slice(&length.to_be_bytes());
-    derived.extend_from_slice(order);
-    derived.extend_from_slice(&offset_ms.to_be_bytes());
-    Ok(derived)
 }
 
 fn validate_frontier(previous: Option<i64>, next: Option<i64>, side: &str) -> Result<(), DbError> {
@@ -2723,15 +2770,15 @@ fn calculate_charge(state: &TemporalJoinVnodeState) -> Result<usize, DbError> {
                 .ok_or_else(|| state.pipeline_error("history accounting overflow"))?;
         }
     }
-    for (source, identity) in &state.applied_right {
+    for (partition, frontier) in &state.right_replay_frontiers {
         bytes = bytes
-            .checked_add(
-                MAP_ENTRY_CHARGE
-                    .checked_add(identity.key.as_deref().map_or(0, <[u8]>::len))
-                    .and_then(|value| value.checked_add(source.heap_bytes()))
-                    .ok_or_else(|| state.pipeline_error("right dedup accounting overflow"))?,
-            )
-            .ok_or_else(|| state.pipeline_error("right dedup accounting overflow"))?;
+            .checked_add(state.right_replay_frontier_charge(partition, frontier)?)
+            .ok_or_else(|| state.pipeline_error("right replay-frontier accounting overflow"))?;
+    }
+    for (partition, frontier) in &state.left_replay_frontiers {
+        bytes = bytes
+            .checked_add(state.left_replay_frontier_charge(partition, frontier)?)
+            .ok_or_else(|| state.pipeline_error("left replay-frontier accounting overflow"))?;
     }
     for key in &state.history_key_roster {
         bytes = bytes
@@ -2758,11 +2805,6 @@ fn calculate_charge(state: &TemporalJoinVnodeState) -> Result<usize, DbError> {
         bytes = bytes
             .checked_add(state.pending_probe_charge(identity, probe)?)
             .ok_or_else(|| state.pipeline_error("pending-probe accounting overflow"))?;
-    }
-    for (identity, probe) in &state.finalized {
-        bytes = bytes
-            .checked_add(state.finalized_probe_charge(identity, probe)?)
-            .ok_or_else(|| state.pipeline_error("probe dedup accounting overflow"))?;
     }
     Ok(bytes)
 }
@@ -2829,6 +2871,12 @@ mod tests {
         )));
         columns.extend_from_slice(&batch.columns()[visible_columns..]);
         RecordBatch::try_new(schema, columns).unwrap()
+    }
+
+    fn with_values(batch: &RecordBatch, values: Vec<Option<i64>>) -> RecordBatch {
+        let mut columns = batch.columns().to_vec();
+        columns[1] = Arc::new(Int64Array::from(values));
+        RecordBatch::try_new(batch.schema(), columns).unwrap()
     }
 
     fn config(kind: TemporalJoinKind, schedule: TemporalProbeSchedule) -> TemporalJoinStateConfig {
@@ -2916,7 +2964,7 @@ mod tests {
         let changed = batch(
             schema("right"),
             vec![Some("A"), Some("A"), Some("A")],
-            vec![Some(99), Some(11), None],
+            vec![Some(10), Some(11), Some(99)],
             vec![Some(100), Some(100), Some(200)],
             vec![1, 2, 3],
         );
@@ -2937,6 +2985,189 @@ mod tests {
     }
 
     #[test]
+    fn compact_replay_frontiers_plateau_with_lifetime_records() {
+        let mut state = state(TemporalJoinKind::Left, TemporalProbeSchedule::as_of());
+        let mut plateau = None;
+        for order in 1..=64_u8 {
+            let right = batch(
+                schema("right"),
+                vec![None],
+                vec![Some(1)],
+                vec![None],
+                vec![order],
+            );
+            assert_eq!(
+                state.apply_right_batch(&right, None).unwrap().ignored_nulls,
+                1
+            );
+            let left = batch(
+                schema("left"),
+                vec![None],
+                vec![Some(1)],
+                vec![None],
+                vec![order],
+            );
+            assert_eq!(state.probe_left_batch(&left).unwrap().num_rows(), 1);
+            let charged = state.accounted_state_bytes();
+            if let Some(expected) = plateau {
+                assert_eq!(charged, expected);
+            } else {
+                plateau = Some(charged);
+            }
+        }
+        assert_eq!(state.right_replay_frontiers.len(), 1);
+        assert_eq!(state.left_replay_frontiers.len(), 1);
+        assert_eq!(state.retained_versions(), 0);
+        assert_eq!(state.pending_probes(), 0);
+        assert_eq!(
+            state.accounted_state_bytes(),
+            calculate_charge(&state).unwrap()
+        );
+    }
+
+    #[test]
+    fn replay_frontier_validates_current_and_skips_older_cursor() {
+        let mut state = state(TemporalJoinKind::Left, TemporalProbeSchedule::as_of());
+        let right = batch(
+            schema("right"),
+            vec![Some("A"), Some("A")],
+            vec![Some(1), Some(2)],
+            vec![Some(10), Some(20)],
+            vec![1, 2],
+        );
+        state.apply_right_batch(&right, None).unwrap();
+        let older_changed = with_values(&right.slice(0, 1), vec![Some(99)]);
+        assert_eq!(
+            state
+                .apply_right_batch(&older_changed, None)
+                .unwrap()
+                .duplicates,
+            1
+        );
+        let current = right.slice(1, 1);
+        assert_eq!(
+            state.apply_right_batch(&current, None).unwrap().duplicates,
+            1
+        );
+        let current_changed = with_values(&current, vec![Some(99)]);
+        assert!(state
+            .apply_right_batch(&current_changed, None)
+            .unwrap_err()
+            .to_string()
+            .contains("replayed with different temporal data"));
+
+        state.advance_right_frontier(Some(1_000), false).unwrap();
+        let left = batch(
+            schema("left"),
+            vec![Some("A"), Some("A")],
+            vec![Some(1), Some(2)],
+            vec![Some(10), Some(20)],
+            vec![3, 4],
+        );
+        assert_eq!(state.probe_left_batch(&left).unwrap().num_rows(), 2);
+        assert_eq!(
+            state
+                .probe_left_batch(&with_values(&left.slice(0, 1), vec![Some(99)]))
+                .unwrap()
+                .num_rows(),
+            0
+        );
+        let current = left.slice(1, 1);
+        assert_eq!(state.probe_left_batch(&current).unwrap().num_rows(), 0);
+        assert!(state
+            .probe_left_batch(&with_values(&current, vec![Some(99)]))
+            .unwrap_err()
+            .to_string()
+            .contains("replayed with different temporal data"));
+    }
+
+    #[test]
+    fn older_left_replay_validates_retained_pending_horizons() {
+        let mut state = state(TemporalJoinKind::Left, TemporalProbeSchedule::as_of());
+        let left = batch(
+            schema("left"),
+            vec![Some("A"), Some("A")],
+            vec![Some(1), Some(2)],
+            vec![Some(10), Some(20)],
+            vec![1, 2],
+        );
+        assert_eq!(state.probe_left_batch(&left).unwrap().num_rows(), 0);
+        assert_eq!(state.pending_probes(), 2);
+        assert_eq!(
+            state
+                .probe_left_batch(&left.slice(0, 1))
+                .unwrap()
+                .num_rows(),
+            0
+        );
+        assert!(state
+            .probe_left_batch(&with_values(&left.slice(0, 1), vec![Some(99)]))
+            .unwrap_err()
+            .to_string()
+            .contains("disagrees with its pending temporal probes"));
+        assert_eq!(state.pending_probes(), 2);
+    }
+
+    #[test]
+    fn source_order_regression_within_batch_is_atomic() {
+        let mut state = state(TemporalJoinKind::Left, TemporalProbeSchedule::as_of());
+        let right = batch(
+            schema("right"),
+            vec![Some("A"), Some("A")],
+            vec![Some(1), Some(2)],
+            vec![Some(10), Some(20)],
+            vec![2, 1],
+        );
+        assert!(state
+            .apply_right_batch(&right, None)
+            .unwrap_err()
+            .to_string()
+            .contains("regressed within one input batch"));
+        assert!(state.right_replay_frontiers.is_empty());
+        assert_eq!(state.retained_versions(), 0);
+        assert_eq!(state.accounted_state_bytes(), BASE_STATE_CHARGE);
+    }
+
+    #[test]
+    fn idle_left_uses_finite_retention_and_rejects_old_revival_probe() {
+        let mut cfg = config(TemporalJoinKind::Left, TemporalProbeSchedule::as_of());
+        cfg.history_retention_ms = 50;
+        let mut state =
+            TemporalJoinVnodeState::try_new(schema("left"), schema("right"), cfg).unwrap();
+        let right = batch(
+            schema("right"),
+            vec![Some("A"), Some("A"), Some("A")],
+            vec![Some(1), Some(2), Some(3)],
+            vec![Some(10), Some(20), Some(100)],
+            vec![1, 2, 3],
+        );
+        state.apply_right_batch(&right, None).unwrap();
+        state.advance_left_frontier(Some(20), true).unwrap();
+        state.advance_right_frontier(Some(200), false).unwrap();
+        assert_eq!(state.history_evicted_before, Some(150));
+        while state.has_history_gc_work() {
+            state
+                .drain_history_gc(NonZeroUsize::new(16).unwrap())
+                .unwrap();
+        }
+        assert_eq!(state.retained_versions(), 1);
+
+        let revival = batch(
+            schema("left"),
+            vec![Some("A")],
+            vec![Some(1)],
+            vec![Some(140)],
+            vec![10],
+        );
+        assert!(state
+            .probe_left_batch(&revival)
+            .unwrap_err()
+            .to_string()
+            .contains("older than retained history"));
+        assert!(state.left_replay_frontiers.is_empty());
+    }
+
+    #[test]
     fn inner_join_omits_nulls_and_missing_versions() {
         let mut state = state(TemporalJoinKind::Inner, TemporalProbeSchedule::as_of());
         state.advance_right_frontier(Some(1_000), false).unwrap();
@@ -2951,7 +3182,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_horizon_null_key_keeps_probe_time_and_unique_position() {
+    fn multi_horizon_null_key_keeps_probe_time_without_hidden_positions() {
         let mut state = state(
             TemporalJoinKind::Left,
             TemporalProbeSchedule::list(vec![0, 5]).unwrap(),
@@ -2973,27 +3204,9 @@ mod tests {
             .iter()
             .collect::<Vec<_>>();
         assert_eq!(probe_times, vec![Some(100), Some(105)]);
-        let orders = output
-            .column_by_name(SOURCE_ORDER_COLUMN)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .unwrap();
-        assert_ne!(orders.value(0), orders.value(1));
-        let visible = laminar_connectors::connector::strip_source_row_positions(&output).unwrap();
-        assert!(visible.column_by_name(SOURCE_PARTITION_COLUMN).is_none());
-        assert_eq!(
-            visible.num_columns() + POSITION_COLUMN_COUNT,
-            output.num_columns()
-        );
-        let row = RowRef {
-            batch: Arc::new(left),
-            row: 0,
-        };
-        assert_ne!(
-            derived_probe_order(&row, "operator-a", 0).unwrap(),
-            derived_probe_order(&row, "operator-b", 0).unwrap()
-        );
+        assert!(output.column_by_name(SOURCE_PARTITION_COLUMN).is_none());
+        assert!(output.column_by_name(SOURCE_ORDER_COLUMN).is_none());
+        assert!(output.column_by_name(SOURCE_SUB_OFFSET_COLUMN).is_none());
     }
 
     #[test]
@@ -3221,7 +3434,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_restores_finalized_probe_older_than_history_floor() {
+    fn checkpoint_restores_compact_replay_frontier_across_history_gc() {
         let mut cfg = config(TemporalJoinKind::Left, TemporalProbeSchedule::as_of());
         cfg.history_retention_ms = 50;
         let mut state =
@@ -3251,6 +3464,8 @@ mod tests {
         let mut restored =
             TemporalJoinVnodeState::restore(schema("left"), schema("right"), cfg, &checkpoint)
                 .unwrap();
+        assert_eq!(restored.probe_left_batch(&left).unwrap().num_rows(), 0);
+        assert_eq!(restored.left_replay_frontiers.len(), 1);
         assert_eq!(restored.retained_versions(), 2);
         assert!(restored.has_history_gc_work());
         let first = restored
@@ -3291,22 +3506,19 @@ mod tests {
         ));
         assert!(!encoded.row(0).as_ref().is_empty());
         assert_eq!(state.pending_probes(), 0);
-        assert!(state.finalized.is_empty());
+        assert!(state.left_replay_frontiers.is_empty());
         assert!(state.timers.is_empty());
         assert_eq!(state.accounted_state_bytes(), before);
     }
 
     #[test]
-    fn restore_rejects_missing_probe_horizon() {
-        let cfg = config(
-            TemporalJoinKind::Left,
-            TemporalProbeSchedule::list(vec![0, 5]).unwrap(),
-        );
+    fn restore_rejects_pending_probe_ahead_of_left_replay_frontier() {
+        let cfg = config(TemporalJoinKind::Left, TemporalProbeSchedule::as_of());
         let mut state =
             TemporalJoinVnodeState::try_new(schema("left"), schema("right"), cfg.clone()).unwrap();
         let left = batch(
             schema("left"),
-            vec![None],
+            vec![Some("A")],
             vec![Some(1)],
             vec![Some(100)],
             vec![1],
@@ -3315,7 +3527,7 @@ mod tests {
         let bytes = state.checkpoint(4 * 1024 * 1024).unwrap();
         let mut decoded =
             rkyv::from_bytes::<TemporalJoinCheckpoint, rkyv::rancor::Error>(&bytes).unwrap();
-        decoded.finalized.pop();
+        decoded.left_replay_frontiers[0].order.clear();
         let writer = rkyv::ser::writer::IoWriter::new(
             laminar_core::serialization::BoundedBytesWriter::new(4 * 1024 * 1024),
         );
@@ -3329,7 +3541,7 @@ mod tests {
                 .err()
                 .unwrap()
                 .to_string()
-                .contains("missing a planned probe horizon")
+                .contains("pending probe is ahead of its left replay frontier")
         );
     }
 
@@ -3365,9 +3577,17 @@ mod tests {
             TemporalJoinVnodeState::restore(schema("left"), schema("right"), cfg, &checkpoint)
                 .unwrap();
         assert_eq!(restored.retained_versions(), 1);
+        assert_eq!(restored.right_replay_frontiers.len(), 1);
+        assert_eq!(restored.left_replay_frontiers.len(), 1);
         assert_eq!(restored.pending_probes(), 1);
         assert_eq!(restored.pending_watermark_hold(), Some(100));
         assert!(restored.has_ready_probes());
+        assert_eq!(
+            restored.apply_right_batch(&right, None).unwrap().duplicates,
+            1
+        );
+        assert_eq!(restored.probe_left_batch(&left).unwrap().num_rows(), 0);
+        assert_eq!(restored.pending_probes(), 1);
         let drained = restored
             .drain_ready_probes(NonZeroUsize::new(1).unwrap())
             .unwrap();

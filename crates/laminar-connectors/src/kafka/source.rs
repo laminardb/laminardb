@@ -4158,7 +4158,7 @@ impl SourceConnector for KafkaSource {
             SourceTopology::Splittable,
             input_mode,
         )
-        .with_row_positions(SourceRowPositionCapability::Deterministic)
+        .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
         .with_exact_delivery_certification())
     }
 

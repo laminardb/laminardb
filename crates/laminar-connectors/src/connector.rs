@@ -117,14 +117,17 @@ pub enum SourceInputMode {
     FullChangelog,
 }
 
-/// Whether a source emits a deterministic position for every decoded row.
+/// Whether a source emits an ordered deterministic position for every decoded row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SourceRowPositionCapability {
     /// The source does not provide row positions.
     #[default]
     Unavailable,
-    /// Every emitted row carries a deterministic replay position.
-    Deterministic,
+    /// Every emitted row carries a replay position. Within one source run, `(order_key,
+    /// sub_offset)` is nondecreasing per partition across batches; recovery may restart from an
+    /// earlier position. Replaying an equal position must produce the same logical row and
+    /// mutation.
+    OrderedDeterministic,
 }
 
 /// Complete source admission contract for a concrete connector configuration.
@@ -913,12 +916,12 @@ impl SourceBatch {
                 "source emitted state metadata without declaring deterministic row positions"
                     .into(),
             )),
-            (SourceRowPositionCapability::Deterministic, None) => {
+            (SourceRowPositionCapability::OrderedDeterministic, None) => {
                 Err(ConnectorError::SchemaMismatch(
                     "source declared deterministic row positions but omitted the sidecar".into(),
                 ))
             }
-            (SourceRowPositionCapability::Deterministic, Some(positions)) => {
+            (SourceRowPositionCapability::OrderedDeterministic, Some(positions)) => {
                 let schema = if mutations.is_some() {
                     mutation_schema
                 } else {
@@ -2162,7 +2165,7 @@ mod tests {
             .with_mutations(vec![SourceMutation::Put, SourceMutation::Tombstone])
             .unwrap()
             .into_records_with_metadata(
-                SourceRowPositionCapability::Deterministic,
+                SourceRowPositionCapability::OrderedDeterministic,
                 &positioned_schema,
                 &mutation_schema,
             )
@@ -2204,7 +2207,7 @@ mod tests {
             .with_mutations(vec![SourceMutation::Put; 2])
             .unwrap()
             .into_records_with_metadata(
-                SourceRowPositionCapability::Deterministic,
+                SourceRowPositionCapability::OrderedDeterministic,
                 &positioned_schema,
                 &mutation_schema,
             )
@@ -2239,7 +2242,7 @@ mod tests {
             .with_mutations(vec![SourceMutation::Put, SourceMutation::Tombstone])
             .unwrap()
             .into_records_with_metadata(
-                SourceRowPositionCapability::Deterministic,
+                SourceRowPositionCapability::OrderedDeterministic,
                 &positioned_schema,
                 &mutation_schema,
             )

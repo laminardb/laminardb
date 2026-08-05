@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
 use laminar_connectors::connector::{
     source_mutations, source_mutations_routed, strip_source_mutations,
-    strip_source_mutations_routed, strip_source_row_positions,
+    strip_source_mutations_routed,
 };
 #[cfg(feature = "cluster")]
 use laminar_core::checkpoint::CheckpointAssignmentFence;
@@ -2827,14 +2827,15 @@ impl ManagedTemporalJoinOperator {
         Ok((changed, output))
     }
 
-    fn output_watermark_ceiling_for(&self, left: InputFrontier) -> Option<i64> {
-        left.watermark.map(|watermark| {
-            let left_floor = watermark.saturating_sub(self.limits.left_allowed_lateness_ms);
-            left_floor.min(left_floor.saturating_add(self.minimum_probe_offset))
-        })
+    fn output_watermark_ceiling_for(&self, left: InputFrontier) -> i64 {
+        let Some(watermark) = left.watermark else {
+            return i64::MIN;
+        };
+        let left_floor = watermark.saturating_sub(self.limits.left_allowed_lateness_ms);
+        left_floor.min(left_floor.saturating_add(self.minimum_probe_offset))
     }
 
-    fn output_watermark_ceiling(&self) -> Option<i64> {
+    fn output_watermark_ceiling(&self) -> i64 {
         self.output_watermark_ceiling_for(self.frontiers[0])
     }
 
@@ -2844,7 +2845,7 @@ impl ManagedTemporalJoinOperator {
         published: Option<InputFrontier>,
     ) -> Result<(), DbError> {
         let maximum = merge_input_frontiers(&frontiers, i64::MIN)
-            .with_watermark_ceiling(self.output_watermark_ceiling_for(frontiers[0]))
+            .with_watermark_ceiling(Some(self.output_watermark_ceiling_for(frontiers[0])))
             .watermark;
         if published
             .and_then(|frontier| frontier.watermark)
@@ -2885,7 +2886,7 @@ impl ManagedTemporalJoinOperator {
 
     fn derive_output_frontier(&self, input: InputFrontier) -> InputFrontier {
         let mut output = input
-            .with_watermark_ceiling(self.output_watermark_ceiling())
+            .with_watermark_ceiling(Some(self.output_watermark_ceiling()))
             .held_at(self.pending_output_hold());
         if self.maintenance_pending {
             output.idle = false;
@@ -3086,18 +3087,7 @@ impl ManagedTemporalJoinOperator {
         &mut self,
         join_result: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        let visible = join_result
-            .iter()
-            .map(|batch| {
-                strip_source_row_positions(batch).map_err(|error| {
-                    DbError::SchemaMismatch(format!(
-                        "temporal join [{}] produced invalid hidden metadata: {error}",
-                        self.name
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        self.projection.apply(visible).await
+        self.projection.apply(join_result).await
     }
 
     async fn process_and_project(
@@ -4665,7 +4655,7 @@ mod tests {
         SourceBatch::positioned(rows, positions(keys.len(), 100))
             .unwrap()
             .into_records_with_metadata(
-                SourceRowPositionCapability::Deterministic,
+                SourceRowPositionCapability::OrderedDeterministic,
                 &positioned,
                 &mutations,
             )
@@ -4708,7 +4698,7 @@ mod tests {
             .with_mutations(mutations.to_vec())
             .unwrap()
             .into_records_with_metadata(
-                SourceRowPositionCapability::Deterministic,
+                SourceRowPositionCapability::OrderedDeterministic,
                 &positioned,
                 &mutation_schema,
             )
@@ -4898,6 +4888,79 @@ mod tests {
                 watermark: Some(50),
                 idle: false,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn uninitialized_idle_left_holds_output_watermark_until_revival() {
+        let key = key_for_vnode(0);
+        let (mut operator, _, _) = operator(8);
+        let right = right_batch(
+            std::slice::from_ref(&key),
+            &["X"],
+            &[12_000],
+            &["live"],
+            &[SourceMutation::Put],
+        );
+        let idle_left = [
+            InputFrontier {
+                watermark: None,
+                idle: true,
+            },
+            InputFrontier {
+                watermark: Some(20_000),
+                idle: false,
+            },
+        ];
+
+        assert!(operator
+            .process_with_frontiers(&[Vec::new(), vec![right]], &idle_left)
+            .await
+            .unwrap()
+            .is_empty());
+        while !operator.wants_input() {
+            assert!(operator
+                .process_with_frontiers(&[], &idle_left)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        assert_eq!(
+            operator
+                .published_output_frontier
+                .and_then(|frontier| frontier.watermark),
+            None
+        );
+
+        let left = left_batch(std::slice::from_ref(&key), &["X"], &[15_000], &[7]);
+        let revived = [
+            InputFrontier {
+                watermark: Some(16_000),
+                idle: false,
+            },
+            idle_left[1],
+        ];
+        let output = operator
+            .process_with_frontiers(&[vec![left], Vec::new()], &revived)
+            .await
+            .unwrap();
+
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert_eq!(
+            output[0]
+                .column_by_name("value_quotes")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "live"
+        );
+        assert_eq!(
+            operator
+                .published_output_frontier
+                .and_then(|frontier| frontier.watermark),
+            Some(16_000)
         );
     }
 

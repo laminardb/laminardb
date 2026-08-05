@@ -165,7 +165,7 @@ impl SourceConnector for GeneratorSource {
             SourceTopology::Singleton,
             SourceInputMode::AppendOnly,
         )
-        .with_row_positions(SourceRowPositionCapability::Deterministic)
+        .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
         .with_exact_delivery_certification())
     }
 
@@ -318,7 +318,7 @@ mod tests {
         assert_eq!(contract.topology, SourceTopology::Singleton);
         assert_eq!(
             contract.row_positions,
-            SourceRowPositionCapability::Deterministic
+            SourceRowPositionCapability::OrderedDeterministic
         );
         assert!(contract.is_exact_delivery_certified());
     }

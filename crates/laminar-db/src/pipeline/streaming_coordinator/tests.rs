@@ -42,7 +42,7 @@ fn append_only_metadata_stays_row_aligned_through_late_filtering() {
         &mutation_schema,
         &[],
         &[],
-        SourceRowPositionCapability::Deterministic,
+        SourceRowPositionCapability::OrderedDeterministic,
         SourceBatch::positioned(records, positions).unwrap(),
     )
     .unwrap();
@@ -219,7 +219,7 @@ fn positioned_source_batches_fail_closed_on_misalignment_and_name_collision() {
         &mutation_schema,
         &[],
         &[],
-        SourceRowPositionCapability::Deterministic,
+        SourceRowPositionCapability::OrderedDeterministic,
         malformed,
     )
     .is_err());

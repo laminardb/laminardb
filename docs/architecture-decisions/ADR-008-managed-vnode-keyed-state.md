@@ -22,7 +22,8 @@ The only durability mechanism is a checkpoint written through the `object_store`
 concatenates its dirty-vnode chunks into one checkpoint data object. The manifest indexes every
 vnode by byte range and records the state required for exact recovery: window panes and open
 windows, sessions, aggregate accumulators, bounded join buffers, temporal ASOF history, versioned
-reference-table history, channel watermarks, idle flags, timers, and source offsets.
+reference-table history, bounded per-source-partition replay frontiers, channel watermarks, idle
+flags, timers, and source offsets.
 
 Node data is created before its immutable manifest; the manifest is created last as the participant
 readiness marker. Recovery restores the latest committed checkpoint and replays sources from its

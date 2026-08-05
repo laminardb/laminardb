@@ -492,7 +492,7 @@ impl Drop for GraphExecutionAttemptGuard {
 const STATS_SAMPLE_INTERVAL: u64 = 32;
 
 /// Logical ABI for independently checksummed operator and vnode frames.
-pub(crate) const STATE_FRAME_ABI_VERSION: u32 = 1;
+pub(crate) const STATE_FRAME_ABI_VERSION: u32 = 2;
 
 #[derive(Debug)]
 pub(crate) struct CapturedWholeState {

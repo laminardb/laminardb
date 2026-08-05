@@ -1005,7 +1005,7 @@ impl TrackedSourceRegistration {
         let positioned = schema_with_source_row_positions(expected_schema).map_err(map_error)?;
         let mutations =
             schema_with_source_mutations_and_row_positions(expected_schema).map_err(map_error)?;
-        if contract.row_positions == SourceRowPositionCapability::Deterministic {
+        if contract.row_positions == SourceRowPositionCapability::OrderedDeterministic {
             Ok((positioned, mutations))
         } else {
             Ok((Arc::clone(expected_schema), Arc::clone(expected_schema)))

@@ -2145,7 +2145,7 @@ async fn source_views_share_payloads_but_hide_positions_from_ordinary_queries() 
     let positioned_batch = SourceBatch::positioned(visible_batch, positions)
         .unwrap()
         .into_records_with_metadata(
-            SourceRowPositionCapability::Deterministic,
+            SourceRowPositionCapability::OrderedDeterministic,
             &positioned_schema,
             &mutation_schema,
         )

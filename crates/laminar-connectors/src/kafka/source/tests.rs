@@ -539,7 +539,7 @@ fn source_contract_is_replayable_and_splittable() {
     assert_eq!(contract.input_mode, SourceInputMode::AppendOnly);
     assert_eq!(
         contract.row_positions,
-        SourceRowPositionCapability::Deterministic
+        SourceRowPositionCapability::OrderedDeterministic
     );
     assert!(contract.is_exact_delivery_certified());
 }
