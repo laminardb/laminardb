@@ -394,6 +394,12 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     if config.checkpoint.max_node_data_bytes == Some(0) {
         errors.push("checkpoint.max_node_data_bytes must be > 0".to_string());
     }
+    if let Err(error) = config
+        .server
+        .validated_temporal_join_idle_history_retention()
+    {
+        errors.push(format!("server.{error}"));
+    }
     // 0 prunes every prior timestamp, so the restart-rate budget never trips (unbounded restart loop).
     if config.supervision.window_secs == Some(0) {
         errors.push("supervision.window_secs must be > 0".to_string());
@@ -491,6 +497,9 @@ pub struct ServerSection {
     /// Query execution policy for keyed running aggregates; independent of checkpoint storage.
     #[serde(default = "default_incremental_emit")]
     pub incremental_emit: bool,
+    /// Right-side history retained while a temporal join input is idle.
+    #[serde(default, with = "humantime_serde")]
+    pub temporal_join_idle_history_retention: Option<Duration>,
     /// Postgres wire bind address; `None` disables it.
     #[serde(default)]
     pub pgwire_bind: Option<String>,
@@ -549,6 +558,7 @@ impl Default for ServerSection {
             bind: default_bind(),
             delivery: default_delivery(),
             incremental_emit: default_incremental_emit(),
+            temporal_join_idle_history_retention: None,
             pgwire_bind: None,
             pgwire_users: std::collections::HashMap::new(),
             pgwire_allow_remote: false,
@@ -570,6 +580,21 @@ impl ServerSection {
     #[must_use]
     pub(crate) fn resolved_key_groups(&self) -> KeyGroupCount {
         self.key_groups.unwrap_or(DEFAULT_KEY_GROUP_COUNT)
+    }
+
+    pub(crate) fn validated_temporal_join_idle_history_retention(
+        &self,
+    ) -> Result<Option<Duration>, &'static str> {
+        let Some(retention) = self.temporal_join_idle_history_retention else {
+            return Ok(None);
+        };
+        let retention_ms = i64::try_from(retention.as_millis()).map_err(|_| {
+            "temporal_join_idle_history_retention exceeds the supported millisecond range"
+        })?;
+        if retention_ms == 0 {
+            return Err("temporal_join_idle_history_retention must be at least 1ms");
+        }
+        Ok(Some(retention))
     }
 }
 
@@ -2372,6 +2397,40 @@ alice = "wonderland-key"
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert_eq!(config.checkpoint.interval, Duration::from_secs(10));
         assert_eq!(config.checkpoint.timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn temporal_join_idle_history_retention_uses_engine_millisecond_bounds() {
+        let parsed: ServerConfig =
+            toml::from_str("[server]\ntemporal_join_idle_history_retention = \"24h\"\n").unwrap();
+        assert_eq!(
+            parsed.server.temporal_join_idle_history_retention,
+            Some(Duration::from_secs(24 * 60 * 60))
+        );
+        validate_config(&parsed).unwrap();
+
+        let default: ServerConfig = toml::from_str("").unwrap();
+        assert_eq!(default.server.temporal_join_idle_history_retention, None);
+
+        for (retention, expected) in [
+            (
+                Duration::ZERO,
+                "temporal_join_idle_history_retention must be at least 1ms",
+            ),
+            (
+                Duration::from_nanos(999_999),
+                "temporal_join_idle_history_retention must be at least 1ms",
+            ),
+            (
+                Duration::from_millis((i64::MAX as u64) + 1),
+                "temporal_join_idle_history_retention exceeds the supported millisecond range",
+            ),
+        ] {
+            let mut config: ServerConfig = toml::from_str("").unwrap();
+            config.server.temporal_join_idle_history_retention = Some(retention);
+            let error = validate_config(&config).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[test]

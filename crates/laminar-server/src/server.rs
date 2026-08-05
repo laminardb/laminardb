@@ -180,6 +180,10 @@ pub async fn run_server(
     // TOML validator entirely.
     crate::config::validate_http_auth(&config)
         .map_err(|error| ServerError::Build(format!("HTTP authentication: {error}")))?;
+    let temporal_join_idle_history_retention = config
+        .server
+        .validated_temporal_join_idle_history_retention()
+        .map_err(|error| ServerError::Build(format!("server.{error}")))?;
     resolved_checkpoint_node_data_bytes(&config.checkpoint)
         .map_err(|error| ServerError::Build(format!("checkpoint.max_node_data_bytes: {error}")))?;
 
@@ -214,6 +218,9 @@ pub async fn run_server(
     }
     builder = builder.restart_policy(config.supervision.to_policy());
     builder = builder.incremental_emit(config.server.incremental_emit);
+    if let Some(retention) = temporal_join_idle_history_retention {
+        builder = builder.temporal_join_idle_history_retention(retention);
+    }
     builder = apply_local_checkpoint_config(builder, &config.checkpoint.url, &config.checkpoint)
         .map_err(|error| ServerError::Build(format!("checkpoint storage: {error}")))?;
 
@@ -898,6 +905,27 @@ mod tests {
             };
             assert!(
                 error.to_string().contains("checkpoint.max_node_data_bytes"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn server_entry_rejects_invalid_temporal_retention_in_both_modes() {
+        for mode in [ServerMode::Single, ServerMode::Cluster] {
+            let mut config: ServerConfig = toml::from_str("").unwrap();
+            config.server.mode = mode;
+            config.server.temporal_join_idle_history_retention =
+                Some(std::time::Duration::from_nanos(999_999));
+
+            let result = run_server(config, PathBuf::from("unused.toml")).await;
+            let Err(error) = result else {
+                panic!("invalid temporal retention was admitted in {mode:?} mode");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("temporal_join_idle_history_retention must be at least 1ms"),
                 "{error}"
             );
         }

@@ -1,5 +1,36 @@
 use super::*;
 
+#[tokio::test]
+async fn cluster_entry_rejects_invalid_temporal_retention_before_discovery() {
+    let mut config: ServerConfig = toml::from_str(
+        r#"
+node_id = "node-a"
+
+[server]
+mode = "cluster"
+
+[discovery]
+strategy = "static"
+seeds = ["node-a:7946"]
+"#,
+    )
+    .unwrap();
+    config.server.temporal_join_idle_history_retention =
+        Some(std::time::Duration::from_nanos(999_999));
+    let cluster_config = ClusterConfig::from_server_config(&config).unwrap().unwrap();
+
+    let error = match start_cluster(config, cluster_config, PathBuf::from("unused.toml")).await {
+        Ok(_) => panic!("invalid temporal retention reached cluster discovery"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("temporal_join_idle_history_retention must be at least 1ms"),
+        "{error}"
+    );
+}
+
 struct DelayedControlPutStore {
     inner: Arc<dyn object_store::ObjectStore>,
     blocked_path: parking_lot::Mutex<Option<object_store::path::Path>>,

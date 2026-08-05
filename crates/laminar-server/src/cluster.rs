@@ -1043,6 +1043,10 @@ pub async fn start_cluster(
     cluster_cfg: ClusterConfig,
     config_path: PathBuf,
 ) -> Result<ClusterHandle, ClusterStartupError> {
+    let temporal_join_idle_history_retention = config
+        .server
+        .validated_temporal_join_idle_history_retention()
+        .map_err(|error| ClusterStartupError::EngineConstruction(format!("server.{error}")))?;
     let node_id_str = cluster_cfg.node_id.as_str().to_string();
     let node_id_num = numeric_node_id(&node_id_str);
     let node_id = NodeId(node_id_num);
@@ -1509,6 +1513,9 @@ pub async fn start_cluster(
 
     // LaminarDB derives the participant namespace from the installed controller.
     builder = builder.incremental_emit(config.server.incremental_emit);
+    if let Some(retention) = temporal_join_idle_history_retention {
+        builder = builder.temporal_join_idle_history_retention(retention);
+    }
     builder = server::apply_verified_cluster_checkpoint_config(
         builder,
         &config.checkpoint,
