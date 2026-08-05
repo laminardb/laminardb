@@ -1479,6 +1479,7 @@ async fn explicit_reload_commits_live_sections_but_retains_mixed_restart_only_ch
         format: "json".to_string(),
         properties: toml::Table::new(),
         schema: vec![],
+        primary_key: vec![],
         watermark: None,
     });
     let original_server = current.server.clone();

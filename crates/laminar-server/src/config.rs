@@ -908,6 +908,8 @@ pub struct SourceConfig {
     pub properties: toml::Table,
     #[serde(default)]
     pub schema: Vec<ColumnDef>,
+    #[serde(default)]
+    pub primary_key: Vec<String>,
     pub watermark: Option<WatermarkConfig>,
 }
 
@@ -2564,6 +2566,7 @@ interval = "10s"
 [[source]]
 name = "test"
 connector = "kafka"
+primary_key = ["id"]
 [[source.schema]]
 name = "id"
 type = "BIGINT"
@@ -2578,6 +2581,7 @@ type = "VARCHAR"
         assert!(!config.sources[0].schema[0].nullable);
         assert_eq!(config.sources[0].schema[1].data_type, "VARCHAR");
         assert!(config.sources[0].schema[1].nullable); // default
+        assert_eq!(config.sources[0].primary_key, ["id"]);
     }
 
     #[test]

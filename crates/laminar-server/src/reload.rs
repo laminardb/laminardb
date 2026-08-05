@@ -444,6 +444,7 @@ mod tests {
             format: "json".to_string(),
             properties: toml::Table::new(),
             schema: vec![],
+            primary_key: vec![],
             watermark: None,
         }
     }
@@ -747,6 +748,7 @@ mod tests {
                 data_type: "BIGINT".to_string(),
                 nullable: false,
             }],
+            primary_key: vec![],
             watermark: None,
         });
         let result = apply_reload(&db, &diff).await;

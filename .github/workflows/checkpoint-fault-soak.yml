@@ -92,42 +92,42 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: Single-node ALO bounded join
+          - label: Single-node ALO stateful joins
             test: single_node_alo_join_kill9_soak
             features: cluster,kafka
             delivery: alo
             topology: single
             discovery: gossip
             emulator: "0"
-          - label: Single-node EO bounded join
+          - label: Single-node EO stateful joins
             test: single_node_eo_join_kill9_soak
             features: cluster,kafka,delta-lake-s3
             delivery: eo
             topology: single
             discovery: gossip
             emulator: "1"
-          - label: Cluster ALO bounded join (gossip)
+          - label: Cluster ALO stateful joins (gossip)
             test: three_node_alo_join_kill9_soak
             features: cluster,aws,kafka
             delivery: alo
             topology: cluster
             discovery: gossip
             emulator: "0"
-          - label: Cluster ALO bounded join (static)
+          - label: Cluster ALO stateful joins (static)
             test: three_node_alo_join_kill9_soak
             features: cluster,aws,kafka
             delivery: alo
             topology: cluster
             discovery: static
             emulator: "0"
-          - label: Cluster EO bounded join (gossip)
+          - label: Cluster EO stateful joins (gossip)
             test: three_node_eo_join_kill9_soak
             features: cluster,aws,kafka,delta-lake-s3
             delivery: eo
             topology: cluster
             discovery: gossip
             emulator: "1"
-          - label: Cluster EO bounded join (static)
+          - label: Cluster EO stateful joins (static)
             test: three_node_eo_join_kill9_soak
             features: cluster,aws,kafka,delta-lake-s3
             delivery: eo
@@ -169,7 +169,7 @@ jobs:
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
           LAMINAR_KAFKA_BROKERS: 127.0.0.1:19092
 
-      - name: Run retained join validity soak
+      - name: Run stateful join validity soak
         shell: bash
         run: |
           set -euo pipefail
@@ -187,6 +187,8 @@ jobs:
           LAMINAR_SOAK_JOIN_KEYS: "65536"
           LAMINAR_SOAK_ZIPF_MILLI: "800"
           LAMINAR_SOAK_RPS: "400"
+          LAMINAR_SOAK_HOT_P50_MS: "5"
+          LAMINAR_SOAK_HOT_P95_MS: "10"
           LAMINAR_SOAK_HOT_P99_MS: "50"
           LAMINAR_SOAK_MAX_RECOVERY_MS: ${{ github.event.inputs.recovery_ms || '90000' }}
           LAMINAR_SOAK_MIN_LIVE_STATE_BYTES: "8388608"
@@ -275,6 +277,8 @@ jobs:
           LAMINAR_SOAK_JOIN_KEYS: "65536"
           LAMINAR_SOAK_ZIPF_MILLI: "800"
           LAMINAR_SOAK_RPS: "400"
+          LAMINAR_SOAK_HOT_P50_MS: "5"
+          LAMINAR_SOAK_HOT_P95_MS: "10"
           LAMINAR_SOAK_HOT_P99_MS: "50"
           LAMINAR_SOAK_MAX_RECOVERY_MS: ${{ github.event.inputs.recovery_ms || '90000' }}
           LAMINAR_SOAK_MIN_LIVE_STATE_BYTES: "8388608"

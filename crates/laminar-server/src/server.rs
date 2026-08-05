@@ -671,6 +671,9 @@ pub fn source_to_ddl(source: &SourceConfig) -> String {
             format!("{} {}{}", c.name, c.data_type, nullability)
         })
         .collect();
+    if !source.primary_key.is_empty() {
+        col_defs.push(format!("PRIMARY KEY ({})", source.primary_key.join(", ")));
+    }
 
     // Watermark clause
     if let Some(wm) = &source.watermark {
@@ -1078,6 +1081,7 @@ mod tests {
                     nullable: true,
                 },
             ],
+            primary_key: vec![],
             watermark: None,
         }
     }
@@ -1161,11 +1165,13 @@ mod tests {
 
     #[test]
     fn test_source_to_ddl_basic() {
-        let source = make_source("events", "kafka");
+        let mut source = make_source("events", "kafka");
+        source.primary_key = vec!["id".to_string()];
         let ddl = source_to_ddl(&source);
         assert!(ddl.starts_with("CREATE SOURCE events"));
         assert!(ddl.contains("id BIGINT NOT NULL"));
         assert!(ddl.contains("name VARCHAR"));
+        assert!(ddl.contains("PRIMARY KEY (id)"));
         assert!(ddl.contains("FROM KAFKA FORMAT JSON"));
         assert!(!ddl.contains("format ="));
     }
@@ -1182,6 +1188,7 @@ mod tests {
             format: "json".to_string(),
             properties: toml::Table::new(),
             schema: vec![],
+            primary_key: vec![],
             watermark: Some(WatermarkConfig {
                 column: "_laminar_received_at".to_string(),
                 max_out_of_orderness: std::time::Duration::from_secs(10),

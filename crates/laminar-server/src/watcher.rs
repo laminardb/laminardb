@@ -247,6 +247,7 @@ mod tests {
             format: "json".to_string(),
             properties: toml::Table::new(),
             schema: vec![],
+            primary_key: vec![],
             watermark: None,
         });
         let original_server = original.server.clone();

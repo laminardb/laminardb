@@ -8,7 +8,7 @@
 //! Real-binary checkpoint soaks with `kill -9` fault injection.
 //!
 //! Spawns three `laminardb` processes in cluster mode (real gRPC control plane) against a shared
-//! checkpoint store, runs a bounded two-input watermarked interval join under skew, and repeatedly
+//! checkpoint store, runs bounded interval and temporal ASOF joins under skew, and repeatedly
 //! hard-kills the leader and a follower mid-epoch. A small filtered probe crosses all eight bounded
 //! join kinds with ordered composite keys and a named join-to-keyed-aggregate stage in the same
 //! checkpoint graph. After every fault it asserts the survivors keep committing, observed committed
@@ -51,7 +51,8 @@
 //! - `LAMINAR_SOAK_JOIN_INTERVAL_MS`  retained join horizon (default 100)
 //! - `LAMINAR_SOAK_JOIN_KEYS` / `LAMINAR_SOAK_ZIPF_MILLI`  key count and Zipf exponent × 1000
 //! - `LAMINAR_SOAK_MIN_LIVE_STATE_BYTES`  optional retained-state high-water gate
-//! - `LAMINAR_SOAK_HOT_P99_MS` / `LAMINAR_SOAK_HOT_MIN_CYCLES`  hot-cycle latency gate
+//! - `LAMINAR_SOAK_HOT_P50_MS` / `_P95_MS` / `_P99_MS`  hot-cycle latency gates
+//! - `LAMINAR_SOAK_HOT_MIN_CYCLES`  minimum latency sample count
 //! - `LAMINAR_SOAK_KEY_GROUPS`  stable cluster key-group count (default 64)
 //! - `LAMINAR_SOAK_FAULT_INJECT_ROLE`  trigger one fatal cycle fault after steady state on the
 //!   observed `leader` or a `follower`
@@ -167,6 +168,10 @@ const DEFAULT_JOIN_KEYS: u64 = 4_096;
 #[cfg(feature = "kafka")]
 const DEFAULT_ZIPF_MILLI: u64 = 1_200;
 #[cfg(feature = "kafka")]
+const DEFAULT_HOT_PATH_P50_MS: u64 = 5;
+#[cfg(feature = "kafka")]
+const DEFAULT_HOT_PATH_P95_MS: u64 = 10;
+#[cfg(feature = "kafka")]
 const DEFAULT_HOT_PATH_P99_MS: u64 = 50;
 #[cfg(feature = "kafka")]
 const DEFAULT_HOT_PATH_MIN_CYCLES: u64 = 100;
@@ -174,6 +179,14 @@ const DEFAULT_HOT_PATH_MIN_CYCLES: u64 = 100;
 const MAX_EXPECTED_JOIN_PAIRS: usize = 10_000_000;
 #[cfg(feature = "kafka")]
 const SINGLE_JOIN_PORT: u16 = 19_410;
+#[cfg(feature = "kafka")]
+const TEMPORAL_RECOVERY_LEFT_ID: u64 = 8_000_000_000_000_001;
+#[cfg(feature = "kafka")]
+const TEMPORAL_RECOVERY_RIGHT_ID: u64 = 8_000_000_000_000_002;
+#[cfg(feature = "kafka")]
+const TEMPORAL_FUTURE_RIGHT_ID: u64 = 8_000_000_000_000_003;
+#[cfg(feature = "kafka")]
+const TEMPORAL_WATERMARK_ADVANCE_MS: u64 = 5_001;
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 const DEFAULT_EO_VISIBILITY_MS: u64 = 10_000;
 
@@ -999,6 +1012,7 @@ fn prometheus_histogram_bucket_value(body: &str, metric: &str, upper_bound: f64)
 struct HotPathLatencySnapshot {
     observations: u64,
     p50_upper_seconds: f64,
+    p95_upper_seconds: f64,
     p99_upper_seconds: f64,
 }
 
@@ -1088,6 +1102,7 @@ fn prometheus_histogram_latency(
     Ok(HotPathLatencySnapshot {
         observations,
         p50_upper_seconds: quantile(50)?,
+        p95_upper_seconds: quantile(95)?,
         p99_upper_seconds: quantile(99)?,
     })
 }
@@ -1891,10 +1906,30 @@ struct JoinInput {
 }
 
 #[cfg(feature = "kafka")]
+#[derive(Clone, Copy)]
+struct TemporalSoakRecord {
+    partition: i32,
+    id: u64,
+    key: i64,
+    event_time_ms: u64,
+    temporal_time_ms: u64,
+}
+
+#[cfg(feature = "kafka")]
+struct TemporalRecoverySeed {
+    key: i64,
+    event_time_ms: u64,
+    temporal_time_ms: u64,
+    input_boundary: Vec<i64>,
+}
+
+#[cfg(feature = "kafka")]
 struct ProducedPrefix {
     count: u64,
     end_offsets: Vec<i64>,
     expected_pairs: BTreeSet<(u64, u64)>,
+    last_event_time_ms: u64,
+    last_temporal_time_ms: u64,
     elapsed: Duration,
     broker_acked_at: Instant,
 }
@@ -1952,6 +1987,11 @@ const fn splitmix64(mut value: u64) -> u64 {
 #[cfg(feature = "kafka")]
 fn expected_join_pairs(inputs: &[JoinInput]) -> BTreeSet<(u64, u64)> {
     expected_join_pairs_for_interval(inputs, join_interval_ms())
+}
+
+#[cfg(feature = "kafka")]
+fn expected_temporal_pairs(produced_count: u64) -> BTreeSet<(u64, u64)> {
+    (0..produced_count).map(|id| (id, id)).collect()
 }
 
 #[cfg(feature = "kafka")]
@@ -3508,6 +3548,7 @@ impl ProducerGuard {
         rps: u64,
         key_count: u64,
         zipf_milli: u64,
+        timestamp_floor_ms: u64,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let enqueued = Arc::new(AtomicU64::new(0));
@@ -3522,6 +3563,7 @@ impl ProducerGuard {
                 rps,
                 key_count,
                 zipf_milli,
+                timestamp_floor_ms,
                 &producer_stop,
                 &producer_enqueued,
             )
@@ -4059,7 +4101,7 @@ impl KafkaOutputOracle {
             let pair = (left_id, right_id);
             assert!(
                 expected.contains(&pair),
-                "Kafka output contains impossible bounded-join pair {pair:?}"
+                "Kafka output contains impossible join pair {pair:?}"
             );
             if !self.seen.insert(pair) {
                 self.duplicates += 1;
@@ -4093,10 +4135,7 @@ fn assert_final_outputs(
     window: Duration,
 ) {
     assert!(produced_count > 0, "soak producer emitted no input records");
-    assert!(
-        !expected.is_empty(),
-        "bounded join oracle expected no output pairs"
-    );
+    assert!(!expected.is_empty(), "join oracle expected no output pairs");
     let start = Instant::now();
     let mut quiet_since = None;
     while start.elapsed() < window {
@@ -4156,6 +4195,36 @@ fn assert_final_outputs(
     }
     panic!(
         "soak: frozen Kafka output boundaries did not remain drained and stable for {OUTPUT_BOUNDARY_STABILITY:?}"
+    );
+}
+
+#[cfg(feature = "kafka")]
+fn assert_frozen_kafka_outputs(
+    nodes: &mut [Node],
+    output: &mut KafkaOutputOracle,
+    produced_count: u64,
+    expected: &BTreeSet<(u64, u64)>,
+    window: Duration,
+    label: &str,
+) {
+    let deadline = Instant::now() + window;
+    let mut boundary = None;
+    wait_for(
+        &format!("{label} Kafka output high-watermark snapshot"),
+        remaining_progress_window(deadline, label),
+        || {
+            assert_running_nodes(nodes);
+            boundary = output.high_watermarks();
+            boundary.is_some()
+        },
+    );
+    assert_final_outputs(
+        nodes,
+        output,
+        produced_count,
+        expected,
+        &boundary.expect("Kafka output boundary wait completed without a value"),
+        remaining_progress_window(deadline, label),
     );
 }
 
@@ -4952,106 +5021,186 @@ fn assert_delta_matrix_aggregates(
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
-fn assert_delta_exact_outputs(
-    nodes: &mut [Node],
-    output: &DeltaOutputOracle,
-    produced_count: u64,
-    expected: &BTreeSet<(u64, u64)>,
+struct DeltaExactOutput<'a> {
+    oracle: &'a DeltaOutputOracle,
+    expected: &'a BTreeSet<(u64, u64)>,
     frozen_input_at: Instant,
-    window: Duration,
-    label: &str,
-) {
-    assert!(produced_count > 0, "soak producer emitted no input records");
-    assert!(
-        !expected.is_empty(),
-        "bounded join oracle expected no output pairs"
-    );
-    let deadline = Instant::now() + window;
-    let completed = loop {
-        assert_running_nodes(nodes);
-        let observation = match output.snapshot() {
-            Ok(snapshot) => {
-                assert_eq!(
-                    snapshot.duplicate_rows, 0,
-                    "{label} Delta snapshot version {} contains {} duplicate rows; first duplicate {:?}",
-                    snapshot.version, snapshot.duplicate_rows, snapshot.first_duplicate
-                );
-                if let Some(pair) = snapshot.pairs.iter().find(|pair| !expected.contains(pair)) {
-                    panic!(
-                        "{label} Delta snapshot version {} contains impossible bounded-join pair {pair:?}",
-                        snapshot.version
-                    );
-                }
-                if snapshot.rows == expected.len() && snapshot.pairs.len() == expected.len() {
-                    break snapshot;
-                }
-                let missing = expected
-                    .iter()
-                    .filter(|pair| !snapshot.pairs.contains(pair))
-                    .take(16)
-                    .copied()
-                    .collect::<Vec<_>>();
-                format!(
-                    "version {} exposed {}/{} exact pairs; first missing {missing:?}",
-                    snapshot.version,
-                    snapshot.pairs.len(),
-                    expected.len()
-                )
-            }
-            Err(error) => error,
-        };
-        assert!(
-            Instant::now() < deadline,
-            "{label} Delta output did not expose the exact frozen input cut: {observation}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    label: &'a str,
+}
 
-    let visibility = frozen_input_at.elapsed();
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn delta_exact_snapshot(
+    output: &DeltaExactOutput<'_>,
+) -> Result<(DeltaJoinSnapshot, Instant), String> {
+    let snapshot = output.oracle.snapshot()?;
+    let observed_at = Instant::now();
+    assert_eq!(
+        snapshot.duplicate_rows, 0,
+        "{} Delta snapshot version {} contains {} duplicate rows; first duplicate {:?}",
+        output.label, snapshot.version, snapshot.duplicate_rows, snapshot.first_duplicate
+    );
+    if let Some(pair) = snapshot
+        .pairs
+        .iter()
+        .find(|pair| !output.expected.contains(pair))
+    {
+        panic!(
+            "{} Delta snapshot version {} contains impossible join pair {pair:?}",
+            output.label, snapshot.version
+        );
+    }
+    if snapshot.rows == output.expected.len() && snapshot.pairs.len() == output.expected.len() {
+        return Ok((snapshot, observed_at));
+    }
+    let missing = output
+        .expected
+        .iter()
+        .filter(|pair| !snapshot.pairs.contains(pair))
+        .take(16)
+        .copied()
+        .collect::<Vec<_>>();
+    Err(format!(
+        "version {} exposed {}/{} exact pairs; first missing {missing:?}",
+        snapshot.version,
+        snapshot.pairs.len(),
+        output.expected.len()
+    ))
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn wait_delta_exact_outputs(
+    nodes: &mut [Node],
+    outputs: &[DeltaExactOutput<'_>],
+    window: Duration,
+) -> Vec<DeltaJoinSnapshot> {
+    assert!(
+        !outputs.is_empty(),
+        "Delta exact-output check has no outputs"
+    );
+    for output in outputs {
+        assert!(
+            !output.expected.is_empty(),
+            "{} join oracle expected no output pairs",
+            output.label
+        );
+    }
+    let deadline = Instant::now() + window;
     let visibility_slo = Duration::from_millis(env_u64(
         "LAMINAR_SOAK_EO_VISIBILITY_MS",
         DEFAULT_EO_VISIBILITY_MS,
     ));
-    assert!(
-        visibility <= visibility_slo,
-        "{label} frozen input cut took {visibility:?} to become exactly visible in Delta; SLO is {visibility_slo:?}"
-    );
-    eprintln!(
-        "soak: PROFILE {label} exact Delta visibility_ms={:.3} rows={} table_version={}",
-        visibility.as_secs_f64() * 1_000.0,
-        completed.rows,
-        completed.version
-    );
+    let mut completed = (0..outputs.len()).map(|_| None).collect::<Vec<_>>();
+    let mut observations = vec![String::new(); outputs.len()];
+    while completed.iter().any(Option::is_none) {
+        assert_running_nodes(nodes);
+        let polled = std::thread::scope(|scope| {
+            let workers = outputs
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| completed[*index].is_none())
+                .map(|(index, output)| (index, scope.spawn(move || delta_exact_snapshot(output))))
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|(index, worker)| {
+                    let result = worker
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    (index, result)
+                })
+                .collect::<Vec<_>>()
+        });
+        for (index, result) in polled {
+            let output = &outputs[index];
+            match result {
+                Ok((snapshot, observed_at)) => {
+                    let visibility = observed_at.saturating_duration_since(output.frozen_input_at);
+                    assert!(
+                        visibility <= visibility_slo,
+                        "{} frozen input cut took {visibility:?} to become exactly visible in Delta; SLO is {visibility_slo:?}",
+                        output.label
+                    );
+                    eprintln!(
+                        "soak: PROFILE {} exact Delta visibility_ms={:.3} rows={} table_version={}",
+                        output.label,
+                        visibility.as_secs_f64() * 1_000.0,
+                        snapshot.rows,
+                        snapshot.version
+                    );
+                    completed[index] = Some(snapshot);
+                }
+                Err(observation) => observations[index] = observation,
+            }
+        }
+        if completed.iter().any(Option::is_none) {
+            assert!(
+                Instant::now() < deadline,
+                "Delta outputs did not expose every exact frozen input cut: {:?}",
+                outputs
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| completed[*index].is_none())
+                    .map(|(index, output)| (output.label, observations[index].as_str()))
+                    .collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    completed
+        .into_iter()
+        .map(|snapshot| snapshot.expect("every Delta output completed"))
+        .collect()
+}
 
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn assert_delta_exact_outputs_stable(
+    nodes: &mut [Node],
+    outputs: &[DeltaExactOutput<'_>],
+    completed: &[DeltaJoinSnapshot],
+) {
+    assert!(!outputs.is_empty(), "Delta stability check has no outputs");
+    assert_eq!(
+        outputs.len(),
+        completed.len(),
+        "Delta stability snapshots do not match the checked outputs"
+    );
     let quiet_deadline = Instant::now() + OUTPUT_BOUNDARY_STABILITY;
     while Instant::now() < quiet_deadline {
         assert_running_nodes(nodes);
         std::thread::sleep(Duration::from_millis(100));
     }
-    let stable = output
-        .snapshot()
-        .unwrap_or_else(|error| panic!("{label} Delta quiet re-read failed: {error}"));
-    assert!(
-        stable.version >= completed.version,
-        "{label} Delta version regressed from {} to {}",
-        completed.version,
-        stable.version
-    );
-    assert_eq!(
-        stable.rows, completed.rows,
-        "{label} Delta row count changed during the quiet re-read"
-    );
-    assert_eq!(
-        stable.duplicate_rows, 0,
-        "{label} Delta quiet re-read contains duplicate rows"
-    );
-    assert_eq!(
-        stable.pairs, completed.pairs,
-        "{label} Delta pair multiset changed during the quiet re-read"
-    );
-    eprintln!(
-        "soak: {label} Delta snapshot remained exact and stable for {OUTPUT_BOUNDARY_STABILITY:?}"
-    );
+    for (output, completed) in outputs.iter().zip(completed) {
+        let stable = output
+            .oracle
+            .snapshot()
+            .unwrap_or_else(|error| panic!("{} Delta quiet re-read failed: {error}", output.label));
+        assert!(
+            stable.version >= completed.version,
+            "{} Delta version regressed from {} to {}",
+            output.label,
+            completed.version,
+            stable.version
+        );
+        assert_eq!(
+            stable.rows, completed.rows,
+            "{} Delta row count changed during the quiet re-read",
+            output.label
+        );
+        assert_eq!(
+            stable.duplicate_rows, 0,
+            "{} Delta quiet re-read contains duplicate rows",
+            output.label
+        );
+        assert_eq!(
+            stable.pairs, completed.pairs,
+            "{} Delta pair multiset changed during the quiet re-read",
+            output.label
+        );
+        eprintln!(
+            "soak: {} Delta snapshot remained exact and stable for {OUTPUT_BOUNDARY_STABILITY:?}",
+            output.label
+        );
+    }
 }
 
 #[cfg(feature = "kafka")]
@@ -5592,6 +5741,23 @@ topic = "{output_topic}"
 }
 
 #[cfg(feature = "kafka")]
+fn kafka_temporal_sink_config(brokers: &str, output_topic: &str) -> String {
+    format!(
+        r#"
+[[sink]]
+name = "soak_temporal_output"
+pipeline = "soak_temporal"
+connector = "kafka"
+format = "json"
+[sink.properties]
+"bootstrap.servers" = "{brokers}"
+topic = "{output_topic}"
+"key.column" = "left_id"
+"#,
+    )
+}
+
+#[cfg(feature = "kafka")]
 fn kafka_matrix_sink_config(brokers: &str, output_topic: &str) -> String {
     MATRIX_OUTPUT_PIPELINES
         .iter()
@@ -5668,6 +5834,11 @@ connector = "delta-lake"
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 fn delta_join_sink_config(table_uri: &str, storage: &DeltaSoakStorage) -> String {
     delta_append_sink_config("soak_output", "soak_join", table_uri, storage)
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn delta_temporal_sink_config(table_uri: &str, storage: &DeltaSoakStorage) -> String {
+    delta_append_sink_config("soak_temporal_output", "soak_temporal", table_uri, storage)
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
@@ -5869,6 +6040,56 @@ HAVING COUNT(*) = {row_count}
 }
 
 #[cfg(feature = "kafka")]
+fn temporal_join_source_config(
+    brokers: &str,
+    left_topic: &str,
+    right_topic: &str,
+    consumer_group: &str,
+) -> String {
+    [
+        ("temporal_left", left_topic, false),
+        ("temporal_right", right_topic, true),
+    ]
+    .into_iter()
+    .map(|(name, topic, primary_key)| {
+        let side = name.trim_start_matches("temporal_");
+        let primary_key = primary_key
+            .then_some("primary_key = [\"join_key\"]\n")
+            .unwrap_or_default();
+        format!(
+            r#"
+[[source]]
+name = "{name}"
+connector = "kafka"
+format = "json"
+{primary_key}[source.properties]
+"bootstrap.servers" = "{brokers}"
+topic = "{topic}"
+"group.id" = "{consumer_group}-temporal-{side}"
+"startup.mode" = "earliest"
+"json.column.temporal_time.epoch_unit" = "millis"
+[[source.schema]]
+name = "id"
+type = "BIGINT"
+nullable = false
+[[source.schema]]
+name = "join_key"
+type = "BIGINT"
+nullable = false
+[[source.schema]]
+name = "temporal_time"
+type = "TIMESTAMP"
+nullable = false
+[source.watermark]
+column = "temporal_time"
+max_out_of_orderness = "2s"
+"#,
+        )
+    })
+    .collect()
+}
+
+#[cfg(feature = "kafka")]
 fn kafka_join_workload_config(
     brokers: &str,
     left_topic: &str,
@@ -5881,6 +6102,8 @@ fn kafka_join_workload_config(
     matrix_sinks: &str,
 ) -> String {
     let join_interval_ms = join_interval_ms();
+    let temporal_sources =
+        temporal_join_source_config(brokers, left_topic, right_topic, consumer_group);
     let matrix = bounded_join_matrix_workload_config(
         brokers,
         matrix_left_topic,
@@ -5942,6 +6165,8 @@ nullable = false
 column = "event_time"
 max_out_of_orderness = "2s"
 
+{temporal_sources}
+
 [[pipeline]]
 name = "soak_join"
 # This canonical BETWEEN clause admits right-side rows from the left timestamp
@@ -5954,6 +6179,17 @@ JOIN join_right r
 AND r.event_time BETWEEN l.event_time
                       AND l.event_time + INTERVAL '{join_interval_ms}' MILLISECOND
 WHERE l.join_key >= 0 AND r.join_key >= 0
+"""
+
+[[pipeline]]
+name = "soak_temporal"
+sql = """
+SELECT l.id AS left_id, r.id AS right_id
+FROM temporal_left l
+LEFT JOIN temporal_right
+FOR SYSTEM_TIME AS OF l.temporal_time AS r
+  ON l.join_key = r.join_key
+WHERE l.join_key >= 0
 """
 
 {sink}
@@ -6019,6 +6255,7 @@ bind = "127.0.0.1:{http}"
 delivery = "{delivery}"
 key_groups = {key_groups}
 console_token = "{SOAK_CONSOLE_TOKEN}"
+temporal_join_idle_history_retention = "5m"
 [discovery]
 strategy = "{discovery}"
 seeds = [{seeds}]
@@ -6099,6 +6336,7 @@ mode = "single"
 bind = "127.0.0.1:{SINGLE_JOIN_PORT}"
 delivery = "{delivery}"
 console_token = "{SOAK_CONSOLE_TOKEN}"
+temporal_join_idle_history_retention = "5m"
 
 [checkpoint]
 url = "{checkpoint_url}"
@@ -6606,25 +6844,35 @@ fn cluster_commits(nodes: &[Node]) -> f64 {
 }
 
 #[cfg(feature = "kafka")]
-fn observe_live_join_state(nodes: &[Node], high_water: &mut Option<f64>) {
-    let mut current = 0.0;
-    let mut live = 0usize;
-    for node in nodes.iter().filter(|node| node.child.is_some()) {
-        current += node
-            .metric_with_labels(
-                "laminardb_managed_state_accounted_bytes",
-                &["operator=\"soak_join\"", "phase=\"live\""],
-            )
-            .unwrap_or_else(|| {
-                panic!(
-                    "node{} did not expose live managed-state accounting for soak_join",
-                    node.id
+fn observe_live_join_state(
+    nodes: &[Node],
+    join_high_water: &mut Option<f64>,
+    temporal_high_water: &mut Option<f64>,
+) {
+    for (operator, high_water) in [
+        ("soak_join", join_high_water),
+        ("soak_temporal", temporal_high_water),
+    ] {
+        let operator_label = format!("operator=\"{operator}\"");
+        let mut current = 0.0;
+        let mut live = 0usize;
+        for node in nodes.iter().filter(|node| node.child.is_some()) {
+            current += node
+                .metric_with_labels(
+                    "laminardb_managed_state_accounted_bytes",
+                    &[&operator_label, "phase=\"live\""],
                 )
-            });
-        live += 1;
+                .unwrap_or_else(|| {
+                    panic!(
+                        "node{} did not expose live managed-state accounting for {operator}",
+                        node.id
+                    )
+                });
+            live += 1;
+        }
+        assert!(live > 0, "soak has no live node for state accounting");
+        *high_water = Some(high_water.unwrap_or(0.0).max(current));
     }
-    assert!(live > 0, "soak has no live node for state accounting");
-    *high_water = Some(high_water.unwrap_or(0.0).max(current));
 }
 
 #[cfg(feature = "kafka")]
@@ -6642,21 +6890,40 @@ fn validate_retained_state_profile(soak_secs: u64, interval_ms: u64, minimum_byt
 }
 
 #[cfg(feature = "kafka")]
-fn assert_live_join_state_high_water(high_water: Option<f64>, minimum_bytes: u64, label: &str) {
+fn assert_live_join_state_high_water(
+    high_water: Option<f64>,
+    minimum_bytes: u64,
+    node_count: usize,
+    label: &str,
+) {
     let high_water = high_water.unwrap_or_else(|| panic!("{label}: no live-state sample"));
-    eprintln!("soak: PROFILE {label} live managed-state high-water={high_water:.0} bytes");
+    let maximum_bytes = laminar_db::DEFAULT_MAX_MANAGED_STATE_BYTES
+        .checked_mul(node_count)
+        .expect("managed-state accounting bound overflow");
+    eprintln!(
+        "soak: PROFILE {label} accounted-state high-water={high_water:.0} bytes, aggregate operator ceiling={maximum_bytes} bytes"
+    );
     assert!(
         high_water >= minimum_bytes as f64,
         "{label}: live managed-state high-water {high_water:.0} bytes is below required {minimum_bytes} bytes"
+    );
+    assert!(
+        high_water <= maximum_bytes as f64,
+        "{label}: accounted-state high-water {high_water:.0} bytes exceeds the {maximum_bytes}-byte aggregate operator ceiling"
     );
 }
 
 #[cfg(feature = "kafka")]
 fn assert_hot_path_latency(nodes: &[Node], label: &str) {
     let minimum = env_u64("LAMINAR_SOAK_HOT_MIN_CYCLES", DEFAULT_HOT_PATH_MIN_CYCLES);
+    let p50_limit_ms = env_u64("LAMINAR_SOAK_HOT_P50_MS", DEFAULT_HOT_PATH_P50_MS);
+    let p95_limit_ms = env_u64("LAMINAR_SOAK_HOT_P95_MS", DEFAULT_HOT_PATH_P95_MS);
     let p99_limit_ms = env_u64("LAMINAR_SOAK_HOT_P99_MS", DEFAULT_HOT_PATH_P99_MS);
     assert!(minimum > 0, "LAMINAR_SOAK_HOT_MIN_CYCLES must be positive");
-    assert!(p99_limit_ms > 0, "LAMINAR_SOAK_HOT_P99_MS must be positive");
+    assert!(
+        p50_limit_ms > 0 && p50_limit_ms <= p95_limit_ms && p95_limit_ms <= p99_limit_ms,
+        "hot-path latency limits must be positive and ordered p50 <= p95 <= p99"
+    );
     for node in nodes.iter().filter(|node| node.child.is_some()) {
         let latency = node
             .hot_path_latency()
@@ -6668,10 +6935,21 @@ fn assert_hot_path_latency(nodes: &[Node], label: &str) {
             latency.observations,
         );
         let p50_ms = latency.p50_upper_seconds * 1_000.0;
+        let p95_ms = latency.p95_upper_seconds * 1_000.0;
         let p99_ms = latency.p99_upper_seconds * 1_000.0;
         eprintln!(
-            "soak: HOT PATH {label} node{} p50<={p50_ms:.3}ms p99<={p99_ms:.3}ms over {} cycles",
+            "soak: HOT PATH {label} node{} p50<={p50_ms:.3}ms p95<={p95_ms:.3}ms p99<={p99_ms:.3}ms over {} cycles",
             node.id, latency.observations
+        );
+        assert!(
+            p50_ms <= p50_limit_ms as f64,
+            "{label}: node{} hot-path p50 bucket upper bound {p50_ms:.3}ms exceeds {p50_limit_ms}ms",
+            node.id,
+        );
+        assert!(
+            p95_ms <= p95_limit_ms as f64,
+            "{label}: node{} hot-path p95 bucket upper bound {p95_ms:.3}ms exceeds {p95_limit_ms}ms",
+            node.id,
         );
         assert!(
             p99_ms <= p99_limit_ms as f64,
@@ -6894,6 +7172,27 @@ fn assert_final_input_cut(
     window: Duration,
     previous_checkpoint: DurableCheckpointStatus,
 ) -> DurableCheckpointStatus {
+    assert_final_input_cuts(
+        nodes,
+        &[commit_oracle],
+        input_boundary,
+        window,
+        previous_checkpoint,
+    )
+}
+
+#[cfg(feature = "kafka")]
+fn assert_final_input_cuts(
+    nodes: &mut [Node],
+    commit_oracles: &[&KafkaJoinCommitOracle],
+    input_boundary: &[i64],
+    window: Duration,
+    previous_checkpoint: DurableCheckpointStatus,
+) -> DurableCheckpointStatus {
+    assert!(
+        !commit_oracles.is_empty(),
+        "final input cut requires at least one source commit oracle"
+    );
     let deadline = Instant::now() + window;
     assert_running_nodes(nodes);
     let checkpoint_target = cluster_commits(nodes) + 2.0;
@@ -6904,7 +7203,9 @@ fn assert_final_input_cut(
             assert_running_nodes(nodes);
             try_cluster_metric(nodes, "laminardb_checkpoints_completed_total")
                 .is_some_and(|commits| commits >= checkpoint_target)
-                && commit_oracle.covers(input_boundary)
+                && commit_oracles
+                    .iter()
+                    .all(|oracle| oracle.covers(input_boundary))
         },
     );
     wait_for_converged_durable_checkpoint(
@@ -7233,6 +7534,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     let matrix_left_topic = format!("soak-single-matrix-left-{run_id}");
     let matrix_right_topic = format!("soak-single-matrix-right-{run_id}");
     let output_topic = format!("soak-single-out-{run_id}");
+    let temporal_output_topic = format!("soak-single-temporal-{run_id}");
     let matrix_output_topic = format!("soak-single-matrix-{run_id}");
     let matrix_aggregate_topic = format!("soak-single-matrix-aggregate-{run_id}");
     let consumer_group = format!("soak-single-{run_id}");
@@ -7244,10 +7546,13 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     let (matrix_input_boundary, matrix_pre_fault_event_time) =
         produce_matrix_pre_fault_inputs(&brokers, &matrix_left_topic, &matrix_right_topic);
     let mut output_oracle = None;
+    let mut temporal_output_oracle = None;
     let mut matrix_output_oracle = None;
     let mut matrix_aggregate_oracle = None;
     #[cfg(feature = "delta-lake-s3")]
     let mut delta_output_oracle = None;
+    #[cfg(feature = "delta-lake-s3")]
+    let mut delta_temporal_output_oracle = None;
     #[cfg(feature = "delta-lake-s3")]
     let mut delta_matrix_output_oracles = None;
     #[cfg(feature = "delta-lake-s3")]
@@ -7255,11 +7560,17 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     let (sink_config, matrix_sink_config) = match delivery {
         JoinDelivery::AtLeastOnce => {
             kafka_create_topic(&brokers, &output_topic, OUTPUT_TOPIC_PARTITIONS);
+            kafka_create_topic(&brokers, &temporal_output_topic, OUTPUT_TOPIC_PARTITIONS);
             kafka_create_topic(&brokers, &matrix_output_topic, OUTPUT_TOPIC_PARTITIONS);
             kafka_create_topic(&brokers, &matrix_aggregate_topic, OUTPUT_TOPIC_PARTITIONS);
             output_oracle = Some(KafkaOutputOracle::new(
                 &brokers,
                 &output_topic,
+                OUTPUT_TOPIC_PARTITIONS,
+            ));
+            temporal_output_oracle = Some(KafkaOutputOracle::new(
+                &brokers,
+                &temporal_output_topic,
                 OUTPUT_TOPIC_PARTITIONS,
             ));
             matrix_output_oracle = Some(KafkaMatrixOracle::new(&brokers, &matrix_output_topic));
@@ -7268,7 +7579,11 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
                 &matrix_aggregate_topic,
             ));
             (
-                kafka_join_sink_config(&brokers, &output_topic),
+                format!(
+                    "{}{}",
+                    kafka_join_sink_config(&brokers, &output_topic),
+                    kafka_temporal_sink_config(&brokers, &temporal_output_topic)
+                ),
                 format!(
                     "{}{}",
                     kafka_matrix_sink_config(&brokers, &matrix_output_topic),
@@ -7280,8 +7595,11 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
             #[cfg(feature = "delta-lake-s3")]
             {
                 let table_uri = delta_soak_table_uri(&run_id, "single");
+                let temporal_table_uri = delta_soak_table_uri(&run_id, "single-temporal");
                 let storage = DeltaSoakStorage::from_environment();
                 delta_output_oracle = Some(DeltaOutputOracle::new(table_uri.clone(), &storage));
+                delta_temporal_output_oracle =
+                    Some(DeltaOutputOracle::new(temporal_table_uri.clone(), &storage));
                 let matrix_uris = delta_matrix_output_table_uris(&run_id, "single");
                 let matrix_sinks = delta_matrix_output_sink_config(&matrix_uris, &storage);
                 delta_matrix_output_oracles = Some(
@@ -7299,7 +7617,11 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
                         .collect::<BTreeMap<_, _>>(),
                 );
                 (
-                    delta_join_sink_config(&table_uri, &storage),
+                    format!(
+                        "{}{}",
+                        delta_join_sink_config(&table_uri, &storage),
+                        delta_temporal_sink_config(&temporal_table_uri, &storage)
+                    ),
                     format!("{matrix_sinks}{aggregate_sinks}"),
                 )
             }
@@ -7310,6 +7632,13 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     let commit_oracle = KafkaJoinCommitOracle::new(
         &brokers,
         &consumer_group,
+        &left_topic,
+        &right_topic,
+        kafka_partitions,
+    );
+    let temporal_commit_oracle = KafkaJoinCommitOracle::new(
+        &brokers,
+        &format!("{consumer_group}-temporal"),
         &left_topic,
         &right_topic,
         kafka_partitions,
@@ -7329,6 +7658,8 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         "soak: PROFILE mode=single delivery={} seconds={soak_secs} checkpoint_ms={interval_ms} join_interval_ms={retained_interval_ms} rps={source_rps} keys={join_keys} zipf_milli={zipf_milli} kills={kills} min_live_state_bytes={minimum_live_state_bytes}",
         delivery.label()
     );
+    let temporal_recovery_seed =
+        produce_temporal_pre_fault_input(&brokers, &right_topic, kafka_partitions, join_keys);
     let mut producer = ProducerGuard::spawn(
         brokers.clone(),
         left_topic.clone(),
@@ -7337,6 +7668,10 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         source_rps,
         join_keys,
         zipf_milli,
+        temporal_recovery_seed
+            .temporal_time_ms
+            .checked_add(1)
+            .expect("temporal producer timestamp floor overflow"),
     );
 
     let dir = tempfile::tempdir().expect("single-node join tempdir");
@@ -7371,6 +7706,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         checkpoint_gate_path: Some(dir.path().join("checkpoint-single-join.arm")),
     }];
     let mut live_state_high_water = None;
+    let mut temporal_state_high_water = None;
     let initial_spawn = nodes[0].verify_executable_for_spawn();
     nodes[0].spawn(initial_spawn);
     wait_for(
@@ -7390,7 +7726,21 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         &format!("single {delivery_label} initial bounded-join progress"),
         None,
     );
-    observe_live_join_state(&nodes, &mut live_state_high_water);
+    observe_live_join_state(
+        &nodes,
+        &mut live_state_high_water,
+        &mut temporal_state_high_water,
+    );
+    latest_checkpoint = assert_final_input_cut(
+        &mut nodes,
+        &temporal_commit_oracle,
+        &temporal_recovery_seed.input_boundary,
+        recovery_ceiling,
+        latest_checkpoint,
+    );
+    eprintln!(
+        "soak: single {delivery_label} temporal right history is durable before fault injection"
+    );
     latest_checkpoint = assert_final_input_cut(
         &mut nodes,
         &matrix_commit_oracle,
@@ -7458,7 +7808,11 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
             recovery_ceiling,
             &format!("single {delivery_label} kill-to-durable-join progress"),
         );
-        observe_live_join_state(&nodes, &mut live_state_high_water);
+        observe_live_join_state(
+            &nodes,
+            &mut live_state_high_water,
+            &mut temporal_state_high_water,
+        );
     }
 
     let steady_deadline = Instant::now() + Duration::from_secs(soak_secs);
@@ -7475,7 +7829,11 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
             &format!("single {delivery_label} steady bounded-join progress"),
             Some(latest_checkpoint),
         );
-        observe_live_join_state(&nodes, &mut live_state_high_water);
+        observe_live_join_state(
+            &nodes,
+            &mut live_state_high_water,
+            &mut temporal_state_high_water,
+        );
         if let Some(remaining) = remaining_at(steady_deadline, Instant::now()) {
             std::thread::sleep(remaining.min(Duration::from_secs(2)));
         }
@@ -7510,8 +7868,12 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         source_rps,
         recovery_ceiling,
     );
-    observe_live_join_state(&nodes, &mut live_state_high_water);
-    let (produced_prefix, _frozen_input_at) = producer.stop();
+    observe_live_join_state(
+        &nodes,
+        &mut live_state_high_water,
+        &mut temporal_state_high_water,
+    );
+    let (mut produced_prefix, _bounded_frozen_input_at) = producer.stop();
     let produced_count = produced_prefix.count;
     assert!(
         produced_count > 0,
@@ -7535,41 +7897,56 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         "single {delivery_label} producer did not write every join-input partition: {:?}",
         produced_prefix.end_offsets
     );
-    latest_checkpoint = assert_final_input_cut(
+    let (temporal_post_boundary, _temporal_frozen_input_at) = produce_temporal_post_fault_inputs(
+        &brokers,
+        &left_topic,
+        &right_topic,
+        kafka_partitions,
+        &temporal_recovery_seed,
+        &produced_prefix,
+    );
+    merge_offset_boundary(
+        &mut produced_prefix.end_offsets,
+        &temporal_recovery_seed.input_boundary,
+    );
+    merge_offset_boundary(&mut produced_prefix.end_offsets, &temporal_post_boundary);
+    let mut temporal_pairs = expected_temporal_pairs(produced_count);
+    assert!(temporal_pairs.insert((TEMPORAL_RECOVERY_LEFT_ID, TEMPORAL_RECOVERY_RIGHT_ID,)));
+    let temporal_input_count = produced_count
+        .checked_add(1)
+        .expect("temporal input count overflow");
+    latest_checkpoint = assert_final_input_cuts(
         &mut nodes,
-        &commit_oracle,
+        &[&commit_oracle, &temporal_commit_oracle],
         &produced_prefix.end_offsets,
         recovery_ceiling,
         latest_checkpoint,
     );
     eprintln!(
-        "soak: single {delivery_label} frozen input prefix is durable through checkpoint {}",
+        "soak: single {delivery_label} frozen bounded and temporal input prefix is durable through checkpoint {}",
         latest_checkpoint.checkpoint_id
     );
     match delivery {
         JoinDelivery::AtLeastOnce => {
-            let output_oracle = output_oracle
-                .as_mut()
-                .expect("single ALO Kafka output oracle");
-            let boundary_deadline = Instant::now() + recovery_ceiling;
-            let mut output_boundary = None;
-            wait_for(
-                "single ALO Kafka output high-watermark snapshot",
-                remaining_progress_window(boundary_deadline, "single ALO output boundary"),
-                || {
-                    assert_running_nodes(&mut nodes);
-                    output_boundary = output_oracle.high_watermarks();
-                    output_boundary.is_some()
-                },
-            );
-            assert_final_outputs(
+            assert_frozen_kafka_outputs(
                 &mut nodes,
-                output_oracle,
+                output_oracle
+                    .as_mut()
+                    .expect("single ALO Kafka output oracle"),
                 produced_count,
                 &produced_prefix.expected_pairs,
-                &output_boundary
-                    .expect("single ALO output boundary wait completed without a value"),
-                remaining_progress_window(boundary_deadline, "single ALO output validation"),
+                recovery_ceiling,
+                "single-node ALO bounded join",
+            );
+            assert_frozen_kafka_outputs(
+                &mut nodes,
+                temporal_output_oracle
+                    .as_mut()
+                    .expect("single ALO temporal Kafka output oracle"),
+                temporal_input_count,
+                &temporal_pairs,
+                recovery_ceiling,
+                "single-node ALO matched temporal ASOF history canary",
             );
             assert_kafka_matrix_outputs(
                 &mut nodes,
@@ -7591,17 +7968,29 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         JoinDelivery::ExactlyOnce => {
             #[cfg(feature = "delta-lake-s3")]
             {
-                assert_delta_exact_outputs(
-                    &mut nodes,
-                    delta_output_oracle
-                        .as_ref()
-                        .expect("single EO Delta output oracle"),
-                    produced_count,
-                    &produced_prefix.expected_pairs,
-                    _frozen_input_at,
-                    recovery_ceiling,
-                    "single-node EO bounded join",
-                );
+                let bounded_output = delta_output_oracle
+                    .as_ref()
+                    .expect("single EO Delta output oracle");
+                let temporal_output = delta_temporal_output_oracle
+                    .as_ref()
+                    .expect("single EO temporal Delta output oracle");
+                let exact_outputs = [
+                    DeltaExactOutput {
+                        oracle: bounded_output,
+                        expected: &produced_prefix.expected_pairs,
+                        frozen_input_at: _bounded_frozen_input_at,
+                        label: "single-node EO bounded join",
+                    },
+                    DeltaExactOutput {
+                        oracle: temporal_output,
+                        expected: &temporal_pairs,
+                        frozen_input_at: _temporal_frozen_input_at,
+                        label: "single-node EO matched temporal ASOF history canary",
+                    },
+                ];
+                let completed =
+                    wait_delta_exact_outputs(&mut nodes, &exact_outputs, recovery_ceiling);
+                assert_delta_exact_outputs_stable(&mut nodes, &exact_outputs, &completed);
                 assert_delta_matrix_outputs(
                     &mut nodes,
                     delta_matrix_output_oracles
@@ -7638,7 +8027,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         checkpoint_latency.pipeline_stall_observations as u64,
     );
     checkpoint_latency
-        .validate_pipeline_stall_slo(&format!("single-node {delivery_label} bounded join"))
+        .validate_pipeline_stall_slo(&format!("single-node {delivery_label} stateful joins"))
         .unwrap_or_else(|error| panic!("{error}"));
     eprintln!(
         "soak: PROFILE single-node {delivery_label} checkpoint stall {}",
@@ -7646,12 +8035,19 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     );
     assert_hot_path_latency(
         &nodes,
-        &format!("single-node {delivery_label} bounded join"),
+        &format!("single-node {delivery_label} stateful joins"),
     );
     assert_live_join_state_high_water(
         live_state_high_water,
         minimum_live_state_bytes,
+        nodes.len(),
         &format!("single-node {delivery_label} bounded join"),
+    );
+    assert_live_join_state_high_water(
+        temporal_state_high_water,
+        1,
+        nodes.len(),
+        &format!("single-node {delivery_label} temporal ASOF join"),
     );
 }
 
@@ -7719,6 +8115,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     let matrix_left_topic = format!("soak-cluster-matrix-left-{run_id}");
     let matrix_right_topic = format!("soak-cluster-matrix-right-{run_id}");
     let output_topic = format!("soak-cluster-out-{run_id}");
+    let temporal_output_topic = format!("soak-cluster-temporal-{run_id}");
     let matrix_output_topic = format!("soak-cluster-matrix-{run_id}");
     let matrix_aggregate_topic = format!("soak-cluster-matrix-aggregate-{run_id}");
     let consumer_group = format!("soak-cluster-{run_id}");
@@ -7733,10 +8130,13 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     let (matrix_input_boundary, matrix_pre_fault_event_time) =
         produce_matrix_pre_fault_inputs(&brokers, &matrix_left_topic, &matrix_right_topic);
     let mut output_oracle = None;
+    let mut temporal_output_oracle = None;
     let mut matrix_output_oracle = None;
     let mut matrix_aggregate_oracle = None;
     #[cfg(feature = "delta-lake-s3")]
     let mut delta_output_oracle = None;
+    #[cfg(feature = "delta-lake-s3")]
+    let mut delta_temporal_output_oracle = None;
     #[cfg(feature = "delta-lake-s3")]
     let mut delta_matrix_output_oracles = None;
     #[cfg(feature = "delta-lake-s3")]
@@ -7744,11 +8144,17 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     let (sink_config, matrix_sink_config) = match delivery {
         JoinDelivery::AtLeastOnce => {
             kafka_create_topic(&brokers, &output_topic, OUTPUT_TOPIC_PARTITIONS);
+            kafka_create_topic(&brokers, &temporal_output_topic, OUTPUT_TOPIC_PARTITIONS);
             kafka_create_topic(&brokers, &matrix_output_topic, OUTPUT_TOPIC_PARTITIONS);
             kafka_create_topic(&brokers, &matrix_aggregate_topic, OUTPUT_TOPIC_PARTITIONS);
             output_oracle = Some(KafkaOutputOracle::new(
                 &brokers,
                 &output_topic,
+                OUTPUT_TOPIC_PARTITIONS,
+            ));
+            temporal_output_oracle = Some(KafkaOutputOracle::new(
+                &brokers,
+                &temporal_output_topic,
                 OUTPUT_TOPIC_PARTITIONS,
             ));
             matrix_output_oracle = Some(KafkaMatrixOracle::new(&brokers, &matrix_output_topic));
@@ -7757,7 +8163,11 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
                 &matrix_aggregate_topic,
             ));
             (
-                kafka_join_sink_config(&brokers, &output_topic),
+                format!(
+                    "{}{}",
+                    kafka_join_sink_config(&brokers, &output_topic),
+                    kafka_temporal_sink_config(&brokers, &temporal_output_topic)
+                ),
                 format!(
                     "{}{}",
                     kafka_matrix_sink_config(&brokers, &matrix_output_topic),
@@ -7769,8 +8179,11 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
             #[cfg(feature = "delta-lake-s3")]
             {
                 let table_uri = delta_soak_table_uri(&run_id, "cluster");
+                let temporal_table_uri = delta_soak_table_uri(&run_id, "cluster-temporal");
                 let storage = DeltaSoakStorage::from_environment();
                 delta_output_oracle = Some(DeltaOutputOracle::new(table_uri.clone(), &storage));
+                delta_temporal_output_oracle =
+                    Some(DeltaOutputOracle::new(temporal_table_uri.clone(), &storage));
                 let matrix_uris = delta_matrix_output_table_uris(&run_id, "cluster");
                 let matrix_sinks = delta_matrix_output_sink_config(&matrix_uris, &storage);
                 delta_matrix_output_oracles = Some(
@@ -7788,7 +8201,11 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
                         .collect::<BTreeMap<_, _>>(),
                 );
                 (
-                    delta_join_sink_config(&table_uri, &storage),
+                    format!(
+                        "{}{}",
+                        delta_join_sink_config(&table_uri, &storage),
+                        delta_temporal_sink_config(&temporal_table_uri, &storage)
+                    ),
                     format!("{matrix_sinks}{aggregate_sinks}"),
                 )
             }
@@ -7799,6 +8216,13 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     let commit_oracle = KafkaJoinCommitOracle::new(
         &brokers,
         &consumer_group,
+        &left_topic,
+        &right_topic,
+        kafka_partitions,
+    );
+    let temporal_commit_oracle = KafkaJoinCommitOracle::new(
+        &brokers,
+        &format!("{consumer_group}-temporal"),
         &left_topic,
         &right_topic,
         kafka_partitions,
@@ -7818,6 +8242,8 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         "soak: PROFILE mode=cluster delivery={} seconds={soak_secs} checkpoint_ms={interval_ms} join_interval_ms={retained_interval_ms} rps={source_rps} keys={join_keys} zipf_milli={zipf_milli} kills={max_kills} min_live_state_bytes={minimum_live_state_bytes}",
         delivery.label()
     );
+    let temporal_recovery_seed =
+        produce_temporal_pre_fault_input(&brokers, &right_topic, kafka_partitions, join_keys);
     let mut producer = ProducerGuard::spawn(
         brokers.clone(),
         left_topic.clone(),
@@ -7826,6 +8252,10 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         source_rps,
         join_keys,
         zipf_milli,
+        temporal_recovery_seed
+            .temporal_time_ms
+            .checked_add(1)
+            .expect("temporal producer timestamp floor overflow"),
     );
 
     // Node logs under target/ (not the tempdir) so they survive a failed run for post-mortem.
@@ -7869,6 +8299,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     let mut exact_timing_evidence =
         CheckpointBarrierTimingEvidence::with_artifact_directory(log_dir.clone());
     let mut live_state_high_water = None;
+    let mut temporal_state_high_water = None;
     for n in &mut nodes {
         let initial_spawn = n.verify_executable_for_spawn();
         n.spawn(initial_spawn);
@@ -7937,7 +8368,11 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         "startup progress",
     );
     assert_every_node_ingests(&mut nodes, &mut producer, Duration::from_secs(60));
-    observe_live_join_state(&nodes, &mut live_state_high_water);
+    observe_live_join_state(
+        &nodes,
+        &mut live_state_high_water,
+        &mut temporal_state_high_water,
+    );
     let all_live_nodes: BTreeSet<usize> = (0..NODES).collect();
     let mut local_convergence = wait_for_local_assignment_convergence(
         &mut nodes,
@@ -7950,6 +8385,16 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         &local_convergence,
         Instant::now() + Duration::from_secs(10),
         "stable startup",
+    );
+    latest_checkpoint = assert_final_input_cut(
+        &mut nodes,
+        &temporal_commit_oracle,
+        &temporal_recovery_seed.input_boundary,
+        recovery_ceiling,
+        latest_checkpoint,
+    );
+    eprintln!(
+        "soak: three-node {delivery_label} temporal right history is durable before fault injection"
     );
     latest_checkpoint = assert_final_input_cut(
         &mut nodes,
@@ -8349,7 +8794,11 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
             "soak round {round}: node {victim} rejoined and resumed durable work with exact local assignment evidence in {rejoin_elapsed:?}"
         );
         local_convergence = rejoined_convergence;
-        observe_live_join_state(&nodes, &mut live_state_high_water);
+        observe_live_join_state(
+            &nodes,
+            &mut live_state_high_water,
+            &mut temporal_state_high_water,
+        );
     }
     assert_eq!(
         kills, max_kills,
@@ -8387,7 +8836,11 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
             Instant::now() + Duration::from_secs(10),
             &format!("steady round {round}"),
         );
-        observe_live_join_state(&nodes, &mut live_state_high_water);
+        observe_live_join_state(
+            &nodes,
+            &mut live_state_high_water,
+            &mut temporal_state_high_water,
+        );
         if let Some(remaining) = remaining_at(steady_deadline, Instant::now()) {
             std::thread::sleep(remaining.min(Duration::from_secs(5)));
         }
@@ -8427,7 +8880,11 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         source_rps,
         recovery_ceiling,
     );
-    observe_live_join_state(&nodes, &mut live_state_high_water);
+    observe_live_join_state(
+        &nodes,
+        &mut live_state_high_water,
+        &mut temporal_state_high_water,
+    );
     exact_timing_evidence.capture_nodes_bound(
         &nodes,
         &local_convergence,
@@ -8439,8 +8896,12 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     }
 
     // Freeze the exact broker-acknowledged input offsets and require source commits to cover them.
-    observe_live_join_state(&nodes, &mut live_state_high_water);
-    let (produced_prefix, _frozen_input_at) = producer.stop();
+    observe_live_join_state(
+        &nodes,
+        &mut live_state_high_water,
+        &mut temporal_state_high_water,
+    );
+    let (mut produced_prefix, _bounded_frozen_input_at) = producer.stop();
     let produced_count = produced_prefix.count;
     assert!(produced_count > 0, "soak producer emitted no input records");
     let achieved_rps = produced_count as f64 / produced_prefix.elapsed.as_secs_f64();
@@ -8468,15 +8929,33 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         "producer did not write every input partition: {:?}",
         produced_prefix.end_offsets
     );
-    latest_checkpoint = assert_final_input_cut(
+    let (temporal_post_boundary, _temporal_frozen_input_at) = produce_temporal_post_fault_inputs(
+        &brokers,
+        &left_topic,
+        &right_topic,
+        kafka_partitions,
+        &temporal_recovery_seed,
+        &produced_prefix,
+    );
+    merge_offset_boundary(
+        &mut produced_prefix.end_offsets,
+        &temporal_recovery_seed.input_boundary,
+    );
+    merge_offset_boundary(&mut produced_prefix.end_offsets, &temporal_post_boundary);
+    let mut temporal_pairs = expected_temporal_pairs(produced_count);
+    assert!(temporal_pairs.insert((TEMPORAL_RECOVERY_LEFT_ID, TEMPORAL_RECOVERY_RIGHT_ID,)));
+    let temporal_input_count = produced_count
+        .checked_add(1)
+        .expect("temporal input count overflow");
+    latest_checkpoint = assert_final_input_cuts(
         &mut nodes,
-        &commit_oracle,
+        &[&commit_oracle, &temporal_commit_oracle],
         &produced_prefix.end_offsets,
         recovery_ceiling,
         latest_checkpoint,
     );
     eprintln!(
-        "soak: frozen input prefix is durable through checkpoint {} epoch {}",
+        "soak: frozen bounded and temporal input prefix is durable through checkpoint {} epoch {}",
         latest_checkpoint.checkpoint_id, latest_checkpoint.epoch
     );
     exact_timing_evidence.capture_nodes_bound(
@@ -8488,29 +8967,25 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
 
     match delivery {
         JoinDelivery::AtLeastOnce => {
-            let output_oracle = output_oracle
-                .as_mut()
-                .expect("cluster ALO Kafka output oracle");
-            let boundary_deadline = Instant::now() + recovery_ceiling;
-            let mut output_boundary = None;
-            wait_for(
-                "Kafka output high-watermark snapshots after the durable input cut",
-                remaining_progress_window(boundary_deadline, "output boundary snapshot"),
-                || {
-                    assert_running_nodes(&mut nodes);
-                    output_boundary = output_oracle.high_watermarks();
-                    output_boundary.is_some()
-                },
-            );
-            let output_boundary =
-                output_boundary.expect("output boundary wait completed without a value");
-            assert_final_outputs(
+            assert_frozen_kafka_outputs(
                 &mut nodes,
-                output_oracle,
+                output_oracle
+                    .as_mut()
+                    .expect("cluster ALO Kafka output oracle"),
                 produced_count,
                 &produced_prefix.expected_pairs,
-                &output_boundary,
-                remaining_progress_window(boundary_deadline, "frozen output validation"),
+                recovery_ceiling,
+                "three-node ALO bounded join",
+            );
+            assert_frozen_kafka_outputs(
+                &mut nodes,
+                temporal_output_oracle
+                    .as_mut()
+                    .expect("cluster ALO temporal Kafka output oracle"),
+                temporal_input_count,
+                &temporal_pairs,
+                recovery_ceiling,
+                "three-node ALO matched temporal ASOF history canary",
             );
             assert_kafka_matrix_outputs(
                 &mut nodes,
@@ -8532,17 +9007,29 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         JoinDelivery::ExactlyOnce => {
             #[cfg(feature = "delta-lake-s3")]
             {
-                assert_delta_exact_outputs(
-                    &mut nodes,
-                    delta_output_oracle
-                        .as_ref()
-                        .expect("cluster EO Delta output oracle"),
-                    produced_count,
-                    &produced_prefix.expected_pairs,
-                    _frozen_input_at,
-                    recovery_ceiling,
-                    "three-node EO bounded join",
-                );
+                let bounded_output = delta_output_oracle
+                    .as_ref()
+                    .expect("cluster EO Delta output oracle");
+                let temporal_output = delta_temporal_output_oracle
+                    .as_ref()
+                    .expect("cluster EO temporal Delta output oracle");
+                let exact_outputs = [
+                    DeltaExactOutput {
+                        oracle: bounded_output,
+                        expected: &produced_prefix.expected_pairs,
+                        frozen_input_at: _bounded_frozen_input_at,
+                        label: "three-node EO bounded join",
+                    },
+                    DeltaExactOutput {
+                        oracle: temporal_output,
+                        expected: &temporal_pairs,
+                        frozen_input_at: _temporal_frozen_input_at,
+                        label: "three-node EO matched temporal ASOF history canary",
+                    },
+                ];
+                let completed =
+                    wait_delta_exact_outputs(&mut nodes, &exact_outputs, recovery_ceiling);
+                assert_delta_exact_outputs_stable(&mut nodes, &exact_outputs, &completed);
                 assert_delta_matrix_outputs(
                     &mut nodes,
                     delta_matrix_output_oracles
@@ -8603,11 +9090,21 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         });
     exact_timing_evidence.report();
     latency_evidence.report();
-    assert_hot_path_latency(&nodes, &format!("three-node {delivery_label} bounded join"));
+    assert_hot_path_latency(
+        &nodes,
+        &format!("three-node {delivery_label} stateful joins"),
+    );
     assert_live_join_state_high_water(
         live_state_high_water,
         minimum_live_state_bytes,
+        nodes.len(),
         &format!("three-node {delivery_label} bounded join"),
+    );
+    assert_live_join_state_high_water(
+        temporal_state_high_water,
+        1,
+        nodes.len(),
+        &format!("three-node {delivery_label} temporal ASOF join"),
     );
 }
 
@@ -8769,6 +9266,172 @@ fn produce_matrix_post_fault_inputs(
     produce_matrix_phase(brokers, left_topic, right_topic, &left, &right)
 }
 
+#[cfg(feature = "kafka")]
+fn produce_temporal_records(
+    brokers: &str,
+    topic: &str,
+    partitions: i32,
+    records: &[TemporalSoakRecord],
+) -> (Vec<i64>, Instant) {
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+
+    let producer: FutureProducer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("message.timeout.ms", "10000")
+        .set("enable.idempotence", "true")
+        .create()
+        .expect("temporal probe producer");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("temporal probe producer runtime");
+    runtime.block_on(async {
+        let mut boundaries =
+            vec![0; usize::try_from(partitions).expect("Kafka partition count fits usize")];
+        for record in records {
+            let payload = format!(
+                r#"{{"id":{},"join_key":{},"event_time":{},"temporal_time":{}}}"#,
+                record.id, record.key, record.event_time_ms, record.temporal_time_ms
+            );
+            let key = record.key.to_string();
+            let delivery = producer
+                .send_result(
+                    FutureRecord::to(topic)
+                        .payload(&payload)
+                        .key(&key)
+                        .partition(record.partition),
+                )
+                .unwrap_or_else(|(error, _)| panic!("temporal Kafka enqueue failed: {error}"))
+                .await
+                .expect("temporal Kafka delivery future was cancelled")
+                .unwrap_or_else(|(error, _)| panic!("temporal Kafka delivery failed: {error}"));
+            let partition = usize::try_from(delivery.partition)
+                .expect("Kafka returned a negative temporal partition");
+            let boundary = boundaries
+                .get_mut(partition)
+                .expect("Kafka returned an out-of-range temporal partition");
+            *boundary = (*boundary).max(delivery.offset.saturating_add(1));
+        }
+        (boundaries, Instant::now())
+    })
+}
+
+#[cfg(feature = "kafka")]
+fn produce_temporal_pre_fault_input(
+    brokers: &str,
+    right_topic: &str,
+    partitions: i32,
+    join_keys: u64,
+) -> TemporalRecoverySeed {
+    let key = i64::try_from(join_keys).expect("LAMINAR_SOAK_JOIN_KEYS must fit BIGINT");
+    let event_time_ms = matrix_event_time_ms();
+    let temporal_time_ms = event_time_ms;
+    let records = (0..partitions)
+        .map(|partition| TemporalSoakRecord {
+            partition,
+            id: if partition == 0 {
+                TEMPORAL_RECOVERY_RIGHT_ID
+            } else {
+                TEMPORAL_FUTURE_RIGHT_ID
+                    .checked_add(u64::try_from(partition).expect("positive Kafka partition"))
+                    .expect("temporal filler id overflow")
+            },
+            key: if partition == 0 {
+                key
+            } else {
+                -i64::from(partition)
+            },
+            event_time_ms,
+            temporal_time_ms,
+        })
+        .collect::<Vec<_>>();
+    let (right_boundary, _) = produce_temporal_records(brokers, right_topic, partitions, &records);
+    assert!(
+        right_boundary.iter().all(|offset| *offset > 0),
+        "temporal pre-fault seed did not cover every right partition"
+    );
+    let mut input_boundary =
+        vec![0; usize::try_from(partitions).expect("Kafka partition count fits usize")];
+    input_boundary.extend(right_boundary);
+    TemporalRecoverySeed {
+        key,
+        event_time_ms,
+        temporal_time_ms,
+        input_boundary,
+    }
+}
+
+#[cfg(feature = "kafka")]
+fn produce_temporal_post_fault_inputs(
+    brokers: &str,
+    left_topic: &str,
+    right_topic: &str,
+    partitions: i32,
+    seed: &TemporalRecoverySeed,
+    produced: &ProducedPrefix,
+) -> (Vec<i64>, Instant) {
+    let left_event_time_ms = produced
+        .last_event_time_ms
+        .max(seed.event_time_ms)
+        .checked_add(1)
+        .expect("temporal recovery event time overflow");
+    let right_event_time_ms = left_event_time_ms
+        .checked_add(join_interval_ms())
+        .and_then(|time| time.checked_add(1))
+        .expect("temporal future-version event time overflow");
+    let left_temporal_time_ms = produced
+        .last_temporal_time_ms
+        .max(seed.temporal_time_ms)
+        .checked_add(1)
+        .expect("temporal recovery probe time overflow");
+    let right_temporal_time_ms = left_temporal_time_ms
+        .checked_add(TEMPORAL_WATERMARK_ADVANCE_MS)
+        .expect("temporal watermark sentinel time overflow");
+    let left = [TemporalSoakRecord {
+        partition: 0,
+        id: TEMPORAL_RECOVERY_LEFT_ID,
+        key: seed.key,
+        event_time_ms: left_event_time_ms,
+        temporal_time_ms: left_temporal_time_ms,
+    }];
+    let right = (0..partitions)
+        .map(|partition| TemporalSoakRecord {
+            partition,
+            id: if partition == 0 {
+                TEMPORAL_FUTURE_RIGHT_ID
+            } else {
+                TEMPORAL_FUTURE_RIGHT_ID
+                    .checked_add(u64::try_from(partition).expect("positive Kafka partition"))
+                    .expect("temporal sentinel id overflow")
+            },
+            key: if partition == 0 {
+                seed.key
+            } else {
+                -i64::from(partition)
+            },
+            event_time_ms: right_event_time_ms,
+            temporal_time_ms: right_temporal_time_ms,
+        })
+        .collect::<Vec<_>>();
+    let (mut boundary, _) = produce_temporal_records(brokers, left_topic, partitions, &left);
+    let (right_boundary, frozen_input_at) =
+        produce_temporal_records(brokers, right_topic, partitions, &right);
+    boundary.extend(right_boundary);
+    (boundary, frozen_input_at)
+}
+
+#[cfg(feature = "kafka")]
+fn merge_offset_boundary(boundary: &mut [i64], update: &[i64]) {
+    assert_eq!(
+        boundary.len(),
+        update.len(),
+        "Kafka input boundary partition count changed"
+    );
+    for (boundary, update) in boundary.iter_mut().zip(update) {
+        *boundary = (*boundary).max(*update);
+    }
+}
+
 /// Produce one deterministically identified row on each join side, paced near `rps`, until stopped.
 /// Explicit round-robin Kafka partitions cover every external partition; LaminarDB independently
 /// shuffles the Zipf-distributed logical join key to its canonical vnode.
@@ -8781,6 +9444,7 @@ fn produce_join_inputs(
     rps: u64,
     key_count: u64,
     zipf_milli: u64,
+    timestamp_floor_ms: u64,
     stop: &AtomicBool,
     enqueued_count: &AtomicU64,
 ) -> ProducedPrefix {
@@ -8827,7 +9491,8 @@ fn produce_join_inputs(
                 .expect("system clock is before the Unix epoch")
                 .as_millis(),
         )
-        .expect("wall-clock milliseconds fit u64");
+        .expect("wall-clock milliseconds fit u64")
+        .max(timestamp_floor_ms);
         let sampler = ZipfSampler::new(key_count, zipf_milli);
         let mut n = 0u64;
         let partition_count = u64::try_from(partitions).expect("positive partition count");
@@ -8890,8 +9555,12 @@ fn produce_join_inputs(
             let event_time_ms = event_time_base
                 .checked_add(n.checked_mul(1_000).expect("event-time numerator overflow") / rps)
                 .expect("event-time timestamp overflow");
-            let payload =
-                format!(r#"{{"id":{n},"join_key":{join_key},"event_time":{event_time_ms}}}"#);
+            let temporal_time_ms = event_time_base
+                .checked_add(n)
+                .expect("temporal timestamp overflow");
+            let payload = format!(
+                r#"{{"id":{n},"join_key":{join_key},"event_time":{event_time_ms},"temporal_time":{temporal_time_ms}}}"#
+            );
             let key = join_key.to_string();
             let partition =
                 i32::try_from(n % partition_count).expect("round-robin partition fits i32");
@@ -8935,6 +9604,7 @@ fn produce_join_inputs(
             right_acknowledged, n,
             "right producer stopped before every enqueued record was acknowledged"
         );
+        assert!(n > 0, "soak producer emitted no input records");
         let broker_acked_at = Instant::now();
         let elapsed = start.elapsed();
         left_end_offsets.extend(right_end_offsets);
@@ -8942,6 +9612,17 @@ fn produce_join_inputs(
             count: n,
             end_offsets: left_end_offsets,
             expected_pairs: expected_join_pairs(&inputs),
+            last_event_time_ms: event_time_base
+                .checked_add(
+                    (n - 1)
+                        .checked_mul(1_000)
+                        .expect("last event-time numerator overflow")
+                        / rps,
+                )
+                .expect("last event-time timestamp overflow"),
+            last_temporal_time_ms: event_time_base
+                .checked_add(n - 1)
+                .expect("last temporal timestamp overflow"),
             elapsed,
             broker_acked_at,
         }

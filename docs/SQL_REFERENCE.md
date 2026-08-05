@@ -142,10 +142,9 @@ GROUP BY account_id, SESSION(ts, INTERVAL '2' SECOND)
 
 ## Joins
 
-Local and cluster execution use one bounded append-only event-time join and the same vnode state,
-checkpoint, recovery, and rebalance lifecycle under at-least-once and exactly-once delivery. The
-supported directional kinds are `INNER`, `LEFT`, `RIGHT`, `FULL`, `LEFT SEMI`, `RIGHT SEMI`,
-`LEFT ANTI`, and `RIGHT ANTI`.
+Local and cluster joins use the same vnode state, checkpoint, recovery, and rebalance lifecycle
+under at-least-once and exactly-once delivery. The bounded append-only path supports `INNER`,
+`LEFT`, `RIGHT`, `FULL`, `LEFT SEMI`, `RIGHT SEMI`, `LEFT ANTI`, and `RIGHT ANTI`.
 
 ### Bounded event-time join
 
@@ -179,9 +178,9 @@ AND o.ts BETWEEN t.ts AND t.ts + INTERVAL '10' SECOND;
 - Outer and anti unmatched rows become final only when the opposite input watermark closes their
   possible match interval.
 - Cross, unbounded, general non-equality, intermediate-input, and multi-way joins fail closed on
-  this bounded stream-stream path. `FOR SYSTEM_TIME AS OF` and lookup joins are separate local-only
-  enrichment paths. `ASOF JOIN` and `TEMPORAL PROBE JOIN` are not admitted; the distributed-state
-  plan will unify the versioned forms before enabling them in cluster mode.
+  this bounded stream-stream path. `FOR SYSTEM_TIME AS OF` and `TEMPORAL PROBE JOIN` use the
+  separate managed vnode-keyed temporal path for one direct `INNER` or `LEFT` join in single-node
+  and cluster mode. `ASOF JOIN` is not an alias; use `FOR SYSTEM_TIME AS OF`.
 
 To aggregate rows from any of the eight kinds, name the join output and create a separate keyed
 aggregate stage:
@@ -203,6 +202,22 @@ GROUP BY account_id;
 Fusing the join and `GROUP BY` in one statement is unsupported. A cycle that would exceed 262,144
 output rows or 64 MiB causes a terminal controlled failure; operators cannot resume or spill that
 fanout.
+
+### Temporal ASOF join
+
+```sql
+CREATE STREAM valued_trades AS
+SELECT t.trade_id AS trade_id, q.price AS quote_price
+FROM trades t
+LEFT JOIN quotes FOR SYSTEM_TIME AS OF t.ts AS q
+  ON t.symbol = q.symbol;
+```
+
+This direct two-input path supports `INNER` and `LEFT`. The left source must be append-only; the
+right source must declare its equality keys as a primary key and may be append-only or keyed-upsert.
+Both event-time columns require watermarks. A result becomes final only after the right watermark
+passes its probe time. Configure `server.temporal_join_idle_history_retention` to bound version
+history when an input idles. The same rules apply in single-node and cluster mode.
 
 ---
 
