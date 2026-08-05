@@ -123,7 +123,7 @@ impl PendingVnodeTransition {
         };
         let target_owned = owned_vnodes(target_owners, participant.node_id)?;
         let acquired = sorted_difference(&target_owned, &predecessor_owned);
-        validate_state_frames(&state_frames, &acquired, predecessor_owners)?;
+        validate_recovered_transition_frames(&state_frames, &acquired, predecessor_owners)?;
         let revoked_vnodes = sorted_difference(&predecessor_owned, &target_owned);
         let kind = match (
             target_owned.is_empty(),
@@ -238,7 +238,7 @@ impl PendingVnodeTransition {
     }
 }
 
-fn validate_state_frames(
+pub(crate) fn validate_recovered_transition_frames(
     frames: &[RecoveredStateFrame],
     acquired: &[u32],
     predecessor_owners: &[NodeId],

@@ -1,7 +1,7 @@
 # ADR-008: In-memory vnode state with object-store checkpoints
 
 - **Status:** accepted; production validation pending
-- **Updated:** 2026-08-03
+- **Updated:** 2026-08-04
 - **Current status:** [distributed state](../DISTRIBUTED_STATE.md)
 
 ## Decision
@@ -9,8 +9,9 @@
 LaminarDB keeps authoritative working state in concrete per-vnode `FxHashMap` layouts. Vnodes are
 the unit of routing, ownership, checkpointing, restore, and rescale for joins, aggregations,
 windows, sessions, timers, temporal history, and materialized views. Keyed aggregates and supported
-interval joins implement this layout now. Remaining whole-node materialized-view and reference
-frames must be converted before their cluster plans can be admitted.
+interval joins implement this layout now; the managed temporal ASOF operator uses it internally
+while SQL admission remains closed. Remaining whole-node materialized-view and reference frames
+must be converted before their cluster plans can be admitted.
 
 Embedded and single-node deployments use one node that owns every vnode and routes shuffles over
 local channels. Cluster deployments run the same stateful operators with vnodes spread across nodes.
@@ -20,16 +21,16 @@ tier, or runtime selector.
 The only durability mechanism is a checkpoint written through the `object_store` crate. Each node
 concatenates its dirty-vnode chunks into one checkpoint data object. The manifest indexes every
 vnode by byte range and records the state required for exact recovery: window panes and open
-windows, sessions, aggregate accumulators, bounded join buffers, versioned reference-table history,
-channel watermarks, idle flags, timers, and source offsets. Any future ASOF execution must use the
-same vnode frames and include its retained history.
+windows, sessions, aggregate accumulators, bounded join buffers, temporal ASOF history, versioned
+reference-table history, channel watermarks, idle flags, timers, and source offsets.
 
 Node data is created before its immutable manifest; the manifest is created last as the participant
 readiness marker. Recovery restores the latest committed checkpoint and replays sources from its
-offsets. Range GETs load only the vnodes assigned to the recovering node. Retention keeps that one
-complete recovery cut and retires exact predecessors through a crash-resumable data-then-metadata
-cursor. Validated manifest chunk counts and frame references drive deletion; object listing is
-never used to infer references.
+offsets. Range GETs load only the vnodes assigned to the recovering node. After an assignment
+handoff, restart may use only the exact authority-pinned predecessor cut and only for its direct
+successor; assignment chains fail closed. Retention keeps that one complete recovery cut and
+retires exact predecessors through a crash-resumable data-then-metadata cursor. Validated manifest
+chunk counts and frame references drive deletion; object listing is never used to infer references.
 
 Checkpoint configuration is a provider-neutral URL. S3, GCS, Azure Blob, S3-compatible R2 and
 MinIO, and local filesystem storage use the same `object_store` path. LaminarDB does not add

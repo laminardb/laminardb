@@ -8,15 +8,15 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
     publish_cluster_execution_poison, ManagedVnodeRestore, ManagedVnodeTransition,
-    ManagedWholeRestore, OperatorGraph,
+    ManagedVnodeTransitionMode, ManagedWholeRestore, OperatorGraph,
 };
 use crate::error::DbError;
 use crate::operator::capability::{ManagedStateContract, OperatorStateClass};
 use crate::operator::sql_query::ClusterShuffleConfig;
 use crate::recovery_manager::RecoveredStateFrame;
 use crate::vnode_transition_staging::{
-    InstalledVnodeStateBinding, InstalledVnodeStateHandle, PendingVnodeTransition,
-    PendingVnodeTransitionHandle, VnodeTransitionKind,
+    validate_recovered_transition_frames, InstalledVnodeStateBinding, InstalledVnodeStateHandle,
+    PendingVnodeTransition, PendingVnodeTransitionHandle, VnodeTransitionKind,
 };
 
 struct VnodeTransitionAuthoritySnapshot {
@@ -25,7 +25,7 @@ struct VnodeTransitionAuthoritySnapshot {
     assignment: laminar_core::state::VnodeAssignmentSnapshot,
     sender: Arc<laminar_core::shuffle::ShuffleSender>,
     receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
-    transport_digest: [u8; 32],
+    transport_digest: Option<[u8; 32]>,
 }
 
 #[derive(Default)]
@@ -45,29 +45,50 @@ impl VnodeTransitionAuthoritySnapshot {
             || !target.matches_owner_map(&owners)
             || config.sender.local_id() != config.self_id.0
             || config.receiver.local_id() != config.self_id.0
-            || target.participant_incarnation(config.self_id.0) != Some(config.sender.incarnation())
             || config.sender.incarnation() != config.receiver.incarnation()
-            || config.sender.assignment_version() != assignment.version()
-            || config.receiver.assignment_version() != assignment.version()
         {
             return Err(DbError::ShuffleNotReady(format!(
                 "[LDB-6051] vnode transition target/process does not match assignment {}",
                 assignment.version()
             )));
         }
-        let transport_digest = match (
-            config.sender.active_assignment_digest(),
-            config.receiver.active_assignment_digest(),
-        ) {
-            (Some(sender), Some(receiver)) if sender == receiver && sender == target.digest() => {
-                sender
+        let transport_digest = if target.contains(config.self_id.0) {
+            match (
+                config.sender.assignment_version(),
+                config.receiver.assignment_version(),
+                config.sender.active_assignment_digest(),
+                config.receiver.active_assignment_digest(),
+            ) {
+                (sender_version, receiver_version, Some(sender), Some(receiver))
+                    if target.participant_incarnation(config.self_id.0)
+                        == Some(config.sender.incarnation())
+                        && sender_version == assignment.version()
+                        && receiver_version == assignment.version()
+                        && sender == receiver
+                        && sender == target.digest() =>
+                {
+                    Some(sender)
+                }
+                _ => {
+                    return Err(DbError::ShuffleNotReady(
+                        "[LDB-6051] vnode transition requires matching active sender and receiver assignment certificates"
+                            .into(),
+                    ));
+                }
             }
-            _ => {
+        } else {
+            if target.participant_incarnation(config.self_id.0).is_some()
+                || config.sender.assignment_version() != 0
+                || config.receiver.assignment_version() != 0
+                || config.sender.active_assignment_digest().is_some()
+                || config.receiver.active_assignment_digest().is_some()
+            {
                 return Err(DbError::ShuffleNotReady(
-                    "[LDB-6051] vnode transition requires matching active sender and receiver assignment certificates"
+                    "[LDB-6051] zero-owner vnode transition requires inactive shuffle endpoints"
                         .into(),
                 ));
             }
+            None
         };
         Ok(Self {
             registry: Arc::clone(&config.registry),
@@ -88,11 +109,21 @@ impl VnodeTransitionAuthoritySnapshot {
     }
 
     fn revalidate_for_publication(&self) -> Result<(), DbError> {
-        if self.sender.assignment_version() != self.assignment.version()
-            || self.receiver.assignment_version() != self.assignment.version()
-            || self.sender.active_assignment_digest() != Some(self.transport_digest)
-            || self.receiver.active_assignment_digest() != Some(self.transport_digest)
-        {
+        let transport_matches = self.transport_digest.map_or_else(
+            || {
+                self.sender.assignment_version() == 0
+                    && self.receiver.assignment_version() == 0
+                    && self.sender.active_assignment_digest().is_none()
+                    && self.receiver.active_assignment_digest().is_none()
+            },
+            |digest| {
+                self.sender.assignment_version() == self.assignment.version()
+                    && self.receiver.assignment_version() == self.assignment.version()
+                    && self.sender.active_assignment_digest() == Some(digest)
+                    && self.receiver.active_assignment_digest() == Some(digest)
+            },
+        );
+        if !transport_matches {
             return Err(DbError::ShuffleNotReady(
                 "[LDB-6051] shuffle assignment certificate changed before vnode-state publication"
                     .into(),
@@ -228,7 +259,7 @@ struct PreparedVnodeTransition {
     pending: Arc<PendingVnodeTransition>,
     revoked: FxHashSet<u32>,
     installed_state: InstalledVnodeStateHandle,
-    installed_binding: InstalledVnodeStateBinding,
+    installed_binding: Option<InstalledVnodeStateBinding>,
 }
 
 struct PreparedFinalOwnerExit {
@@ -382,6 +413,7 @@ impl OperatorGraph {
             &transition.revoked,
             transition.pending.acquired_vnodes(),
             transition.pending.state_frames(),
+            ManagedVnodeTransitionMode::Live,
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -409,6 +441,77 @@ impl OperatorGraph {
         self.publish_vnode_transition(transition, &prepared, callbacks_mutated_state)
     }
 
+    pub(crate) fn restore_reassigned_vnode_state(
+        mut self,
+        predecessor: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        predecessor_owners: &[laminar_core::state::NodeId],
+        target: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        state_frames: &[RecoveredStateFrame],
+    ) -> Result<(Self, usize), DbError> {
+        if !self.whole_restore_open {
+            return Err(DbError::Checkpoint(
+                "[LDB-6051] reassigned checkpoint restore requires a pristine graph".into(),
+            ));
+        }
+        let predecessor_owner_ids = predecessor_owners
+            .iter()
+            .map(|owner| owner.0)
+            .collect::<Vec<_>>();
+        if predecessor.assignment_version.checked_add(1) != Some(target.assignment_version)
+            || predecessor.vnode_count != u32::from(self.key_group_count)
+            || target.vnode_count != predecessor.vnode_count
+            || !predecessor.is_canonical()
+            || !predecessor.matches_owner_map(&predecessor_owner_ids)
+        {
+            return Err(DbError::Checkpoint(
+                "[LDB-6051] reassigned checkpoint restore is not an exact adjacent predecessor cut"
+                    .into(),
+            ));
+        }
+        let config = self.cluster_shuffle.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6051] reassigned checkpoint restore has no cluster ownership scope".into(),
+            )
+        })?;
+        let authority = VnodeTransitionAuthoritySnapshot::capture(config, target)?;
+        let acquired = authority
+            .assignment
+            .owners()
+            .iter()
+            .enumerate()
+            .filter_map(|(vnode, owner)| {
+                (*owner == authority.self_id)
+                    .then_some(u32::try_from(vnode).expect("vnode count is represented by u32"))
+            })
+            .collect::<Vec<_>>();
+        if acquired.is_empty() {
+            return Err(DbError::Checkpoint(
+                "[LDB-6051] reassigned checkpoint bootstrap has no target-owned vnode".into(),
+            ));
+        }
+        validate_recovered_transition_frames(state_frames, &acquired, predecessor_owners)?;
+
+        let revoked = FxHashSet::default();
+        let prepared = self.prepare_managed_operators(
+            predecessor,
+            target,
+            &revoked,
+            &acquired,
+            state_frames,
+            ManagedVnodeTransitionMode::CheckpointBootstrap { predecessor_owners },
+        )?;
+        if let Err(error) = authority.revalidate_for_publication() {
+            self.abort_and_finish_managed_operators(&prepared);
+            return Err(error);
+        }
+        self.publish_managed_operators(&prepared);
+        self.observe_managed_state_accounting(&prepared.node_indices);
+        self.finish_managed_operators(&prepared);
+        self.whole_restore_open = false;
+        self.validate_managed_state_budget("reassigned checkpoint restore")?;
+        Ok((self, state_frames.len()))
+    }
+
     pub(super) fn apply_committed_final_owner_exit(&mut self) -> Result<(), DbError> {
         let transition = self.prepare_final_owner_exit()?;
         let mut unwind = VnodeTransitionUnwindGuard::armed(
@@ -423,6 +526,7 @@ impl OperatorGraph {
             &transition.revoked,
             &[],
             &[],
+            ManagedVnodeTransitionMode::Live,
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -600,10 +704,16 @@ impl OperatorGraph {
         }
         let installed_state = self.installed_state_handle()?;
         Self::validate_installed_predecessor(&pending, &installed_state)?;
-        let installed_binding = InstalledVnodeStateBinding::new(
-            pending.target().clone(),
-            pending.pipeline_identity().clone(),
-        )?;
+        let installed_binding = pending
+            .target()
+            .contains(config.self_id.0)
+            .then(|| {
+                InstalledVnodeStateBinding::new(
+                    pending.target().clone(),
+                    pending.pipeline_identity().clone(),
+                )
+            })
+            .transpose()?;
         Ok(Some(PreparedVnodeTransition {
             authority,
             pending_handle,
@@ -801,6 +911,7 @@ impl OperatorGraph {
         revoked: &FxHashSet<u32>,
         acquired: &[u32],
         state_frames: &[RecoveredStateFrame],
+        mode: ManagedVnodeTransitionMode<'_>,
     ) -> Result<PreparedManagedOperators, DbError> {
         let payload_bytes = self.transition_payload_bytes(state_frames)?;
         self.validate_transition_state_budget(payload_bytes, "vnode transition staged payload")?;
@@ -882,6 +993,7 @@ impl OperatorGraph {
                 revoked: &relevant_revoked,
                 restores: &frames.restores,
                 whole_restores: &frames.whole_restores,
+                mode,
             };
             if let Err(error) = self.nodes[node_idx]
                 .operator
@@ -1072,7 +1184,7 @@ impl OperatorGraph {
 
         publication.arm();
         self.publish_managed_operators(prepared);
-        let retired = installed.replace(installed_binding);
+        let retired = std::mem::replace(&mut *installed, installed_binding);
         *pending_slot = None;
         drop(installed);
         drop(pending_slot);

@@ -1469,6 +1469,8 @@ pub struct CheckpointCoordinator {
     local_watermark: laminar_core::checkpoint::CheckpointWatermark,
     #[cfg(feature = "cluster")]
     cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    #[cfg(feature = "cluster")]
+    recovery_graph_payload_limit: usize,
     checkpoints_completed: u64,
     checkpoints_failed: u64,
     last_checkpoint_duration: Option<Duration>,
@@ -1498,6 +1500,9 @@ impl CheckpointCoordinator {
             ));
         }
         let vnode_count = store.key_group_count().get();
+        #[cfg(feature = "cluster")]
+        let recovery_graph_payload_limit =
+            usize::try_from(config.max_node_data_bytes).unwrap_or(usize::MAX);
         let store: Arc<dyn CheckpointStore> = Arc::from(store);
         let (gc_requests, gc_receiver) = tokio::sync::watch::channel(None);
         let gc_task = tokio::spawn(run_gc_worker(Arc::clone(&store), gc_receiver));
@@ -1521,6 +1526,8 @@ impl CheckpointCoordinator {
             local_watermark: laminar_core::checkpoint::CheckpointWatermark::Uninitialized,
             #[cfg(feature = "cluster")]
             cluster_controller: None,
+            #[cfg(feature = "cluster")]
+            recovery_graph_payload_limit,
             checkpoints_completed: 0,
             checkpoints_failed: 0,
             last_checkpoint_duration: None,
@@ -1818,6 +1825,12 @@ impl CheckpointCoordinator {
     #[must_use]
     pub fn config(&self) -> &CheckpointConfig {
         &self.config
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn set_recovery_graph_payload_limit(&mut self, bytes: usize) {
+        debug_assert_ne!(bytes, 0);
+        self.recovery_graph_payload_limit = bytes;
     }
 
     #[must_use]
@@ -2123,16 +2136,89 @@ impl CheckpointCoordinator {
     ) -> Result<crate::recovery_manager::RecoveredState, DbError> {
         let pipeline_identity = self.expected_pipeline_identity()?;
         let deployment_id = self.expected_deployment_id()?.to_owned();
+        let recovery_scope = self.recovery_scope();
+        #[cfg(feature = "cluster")]
+        let cluster_target = if recovery_scope == CheckpointScope::Cluster {
+            let controller = self.cluster_controller.as_ref().ok_or_else(|| {
+                DbError::Checkpoint("cluster recovery has no cluster controller".into())
+            })?;
+            let assignment = controller
+                .checkpoint_assignment_fence(self.assignment_version)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "cluster recovery has no active assignment fence for version {}",
+                        self.assignment_version
+                    ))
+                })?;
+            Some(crate::recovery_manager::ClusterRecoveryTarget {
+                assignment,
+                owned_vnodes: self.owned_vnodes.clone(),
+                max_graph_payload_bytes: self.recovery_graph_payload_limit,
+            })
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cluster"))]
+        let cluster_target = None;
+        #[cfg(feature = "cluster")]
+        if let Some(target) = cluster_target.as_ref() {
+            let predecessor = committed.assignment_fence.as_ref().ok_or_else(|| {
+                DbError::Checkpoint("cluster recovery checkpoint has no assignment fence".into())
+            })?;
+            if predecessor != &target.assignment {
+                if predecessor.assignment_version.checked_add(1)
+                    != Some(target.assignment.assignment_version)
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "recovery target assignment {} is not adjacent to committed assignment {}",
+                        target.assignment.assignment_version, predecessor.assignment_version
+                    )));
+                }
+                let expected = outcome.committed_checkpoint.as_ref().ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "cluster Commit outcome has no committed checkpoint reference".into(),
+                    )
+                })?;
+                let controller = self.cluster_controller.as_ref().ok_or_else(|| {
+                    DbError::Checkpoint("cluster recovery has no cluster controller".into())
+                })?;
+                let authority = controller.checkpoint_authority().map_err(|error| {
+                    DbError::Checkpoint(format!("cluster checkpoint authority: {error}"))
+                })?;
+                let pinned = tokio::time::timeout_at(
+                    deadline,
+                    authority.assignment_handoff_checkpoint(&target.assignment),
+                )
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint("assignment handoff checkpoint lookup timed out".into())
+                })?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "assignment handoff checkpoint lookup failed: {error}"
+                    ))
+                })?;
+                if pinned.as_ref() != Some(expected) {
+                    return Err(DbError::Checkpoint(
+                        "recovery checkpoint is not the durable handoff pin for the active assignment"
+                            .into(),
+                    ));
+                }
+            }
+        }
         let recovered = {
             let manager = crate::recovery_manager::RecoveryManager::new(
                 self.store.as_ref(),
                 &pipeline_identity,
                 &deployment_id,
-                self.recovery_scope(),
+                recovery_scope,
             );
-            tokio::time::timeout_at(deadline, manager.recover_committed(&outcome, &committed))
-                .await
-                .map_err(|_| DbError::Checkpoint("checkpoint recovery timed out".into()))??
+            tokio::time::timeout_at(
+                deadline,
+                manager.recover_committed_for_target(&outcome, &committed, cluster_target),
+            )
+            .await
+            .map_err(|_| DbError::Checkpoint("checkpoint recovery timed out".into()))??
         };
 
         #[cfg(feature = "cluster")]
@@ -2177,12 +2263,16 @@ impl CheckpointCoordinator {
         let reference = outcome.committed_checkpoint.clone().ok_or_else(|| {
             DbError::Checkpoint("Commit outcome has no committed checkpoint reference".into())
         })?;
-        let local_manifest = recovered
-            .manifests
-            .iter()
-            .find(|manifest| manifest.participant_id == self.store.participant_id())
-            .cloned()
-            .map(Arc::new);
+        let local_manifest = (!recovered.reassigned)
+            .then(|| {
+                recovered
+                    .manifests
+                    .iter()
+                    .find(|manifest| manifest.participant_id == self.store.participant_id())
+                    .cloned()
+                    .map(Arc::new)
+            })
+            .flatten();
         self.local_watermark = Self::manifest_watermark(local_manifest.as_deref())?;
         self.last_committed_manifest = local_manifest;
         self.last_committed_ref = Some(reference);

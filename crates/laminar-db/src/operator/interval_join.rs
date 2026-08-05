@@ -30,7 +30,7 @@ use crate::operator_graph::{GraphOperator, ManagedStateAccountingSnapshot, Opera
 #[cfg(feature = "cluster")]
 use crate::operator::sql_query::ClusterShuffleConfig;
 #[cfg(feature = "cluster")]
-use crate::operator_graph::ManagedVnodeTransition;
+use crate::operator_graph::{ManagedVnodeTransition, ManagedVnodeTransitionMode};
 
 const OPERATOR_CHECKPOINT_VERSION: u8 = 1;
 
@@ -339,13 +339,18 @@ impl IntervalJoinOperator {
         }
         let mut donors = std::collections::BTreeSet::new();
         for restore in transition.restores {
-            if !transition.predecessor.contains(restore.participant_id)
-                || self
+            let predecessor_owner = match transition.mode {
+                ManagedVnodeTransitionMode::Live => self
                     .local_assignment
                     .owners()
                     .get(restore.vnode as usize)
-                    .map(|owner| owner.0)
-                    != Some(restore.participant_id)
+                    .copied(),
+                ManagedVnodeTransitionMode::CheckpointBootstrap { predecessor_owners } => {
+                    predecessor_owners.get(restore.vnode as usize).copied()
+                }
+            };
+            if !transition.predecessor.contains(restore.participant_id)
+                || predecessor_owner.map(|owner| owner.0) != Some(restore.participant_id)
             {
                 return Err(DbError::Checkpoint(format!(
                     "interval join [{}] vnode {} restore has invalid donor {}",
@@ -1609,12 +1614,31 @@ impl GraphOperator for IntervalJoinOperator {
         })?;
         let assignment = config.registry.versioned_snapshot();
         let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
-        let predecessor_owners: Vec<u64> = self
+        let installed_owners: Vec<u64> = self
             .local_assignment
             .owners()
             .iter()
             .map(|owner| owner.0)
             .collect();
+        let checkpoint_bootstrap = match transition.mode {
+            ManagedVnodeTransitionMode::Live => false,
+            ManagedVnodeTransitionMode::CheckpointBootstrap { predecessor_owners } => {
+                let predecessor_owner_ids = predecessor_owners
+                    .iter()
+                    .map(|owner| owner.0)
+                    .collect::<Vec<_>>();
+                if !transition
+                    .predecessor
+                    .matches_owner_map(&predecessor_owner_ids)
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "interval join [{}] checkpoint bootstrap has an invalid predecessor owner map",
+                        self.projection.op_name
+                    )));
+                }
+                true
+            }
+        };
         let target_contains_self = assignment.owners().contains(&config.self_id);
         let endpoints_match_process = config.sender.local_id() == config.self_id.0
             && config.receiver.local_id() == config.self_id.0
@@ -1639,12 +1663,21 @@ impl GraphOperator for IntervalJoinOperator {
             || target_contains_self != transition.target.contains(config.self_id.0)
             || (target_contains_self && !active_transport)
             || (!target_contains_self && !inactive_transport)
-            || transition.predecessor.assignment_version != self.local_assignment.version()
             || transition.predecessor.assignment_version.checked_add(1)
                 != Some(transition.target.assignment_version)
-            || !transition
-                .predecessor
-                .matches_owner_map(&predecessor_owners)
+            || if checkpoint_bootstrap {
+                self.local_assignment.version() != assignment.version()
+                    || self.local_assignment.owners() != assignment.owners()
+                    || self.vnode_states.iter().any(Option::is_some)
+                    || self.applied_left_watermark != i64::MIN
+                    || self.applied_right_watermark != i64::MIN
+                    || self.applied_left_idle
+                    || self.applied_right_idle
+                    || !self.aligned_replay.is_empty()
+            } else {
+                transition.predecessor.assignment_version != self.local_assignment.version()
+                    || !transition.predecessor.matches_owner_map(&installed_owners)
+            }
         {
             return Err(DbError::Checkpoint(format!(
                 "interval join [{}] transition target does not match assignment {}",
@@ -1653,10 +1686,12 @@ impl GraphOperator for IntervalJoinOperator {
             )));
         }
 
-        let fresh_acquirer = transition
-            .predecessor
-            .participant_incarnation(config.self_id.0)
-            != Some(config.sender.incarnation());
+        let fresh_acquirer = target_contains_self
+            && (checkpoint_bootstrap
+                || transition
+                    .predecessor
+                    .participant_incarnation(config.self_id.0)
+                    != Some(config.sender.incarnation()));
         if fresh_acquirer {
             let target_owned = assignment
                 .owners()
@@ -2658,7 +2693,7 @@ mod tests {
             None,
             laminar_sql::create_session_context(),
         );
-        target.attach_cluster_shuffle(scope);
+        target.attach_cluster_shuffle(scope.clone());
         let predecessor_version = target_fence.assignment_version - 1;
         let predecessor_owners = [2_u64, 3];
         let predecessor = CheckpointAssignmentFence::from_owner_map(
@@ -2754,6 +2789,7 @@ mod tests {
                 revoked: &rustc_hash::FxHashSet::default(),
                 restores: &restores,
                 whole_restores: &disagreeing,
+                mode: ManagedVnodeTransitionMode::Live,
             })
             .unwrap_err();
         assert_eq!(target.applied_left_watermark, i64::MIN);
@@ -2812,6 +2848,7 @@ mod tests {
                 revoked: &rustc_hash::FxHashSet::default(),
                 restores: &stale_restores,
                 whole_restores: &whole_restores,
+                mode: ManagedVnodeTransitionMode::Live,
             })
             .unwrap_err();
         assert!(target.vnode_states.iter().all(Option::is_none));
@@ -2823,6 +2860,7 @@ mod tests {
                 revoked: &rustc_hash::FxHashSet::default(),
                 restores: &restores,
                 whole_restores: &whole_restores,
+                mode: ManagedVnodeTransitionMode::Live,
             })
             .unwrap();
         assert_eq!(target.applied_left_watermark, i64::MIN);
@@ -2832,6 +2870,93 @@ mod tests {
         assert!(!target.applied_left_idle);
         assert!(!target.applied_right_idle);
         target.finish_vnode_transition();
+
+        let predecessor_nodes = predecessor_owners.map(NodeId);
+        let mut bootstrap = IntervalJoinOperator::new(
+            "test_interval",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+        );
+        bootstrap.attach_cluster_shuffle(scope);
+        bootstrap
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &target_fence,
+                revoked: &rustc_hash::FxHashSet::default(),
+                restores: &restores,
+                whole_restores: &whole_restores,
+                mode: ManagedVnodeTransitionMode::CheckpointBootstrap {
+                    predecessor_owners: &predecessor_nodes,
+                },
+            })
+            .unwrap();
+        bootstrap.publish_vnode_transition();
+        assert_eq!(bootstrap.applied_left_watermark, 300);
+        assert_eq!(bootstrap.applied_right_watermark, 250);
+        assert!(bootstrap.vnode_states.iter().all(Option::is_some));
+        bootstrap.finish_vnode_transition();
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn zero_owner_topology_transition_is_not_an_acquisition() {
+        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+        use laminar_core::state::{NodeId, VnodeRegistry};
+
+        let (scope, current) = single_owner_shuffle(1).await;
+        let predecessor_version = current.assignment_version;
+        let target_version = predecessor_version + 1;
+        let predecessor = CheckpointAssignmentFence::from_owner_map(
+            predecessor_version,
+            &[2],
+            vec![CheckpointParticipant {
+                node_id: 2,
+                boot_incarnation: uuid::Uuid::from_u128(2),
+            }],
+        )
+        .unwrap();
+        let target = CheckpointAssignmentFence::from_owner_map(
+            target_version,
+            &[3],
+            vec![CheckpointParticipant {
+                node_id: 3,
+                boot_incarnation: uuid::Uuid::from_u128(3),
+            }],
+        )
+        .unwrap();
+        scope
+            .registry
+            .set_assignment_and_version(Arc::from([NodeId(3)]), target_version);
+        scope.sender.invalidate_assignment_fence();
+        scope.receiver.invalidate_assignment_fence();
+
+        let mut operator = IntervalJoinOperator::new(
+            "test_interval",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+        );
+        operator.attach_cluster_shuffle(scope);
+        let predecessor_registry = VnodeRegistry::new_unassigned(1);
+        predecessor_registry
+            .set_assignment_and_version(Arc::from([NodeId(2)]), predecessor_version);
+        operator.local_assignment = predecessor_registry.versioned_snapshot();
+
+        operator
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &target,
+                revoked: &rustc_hash::FxHashSet::default(),
+                restores: &[],
+                whole_restores: &[],
+                mode: ManagedVnodeTransitionMode::Live,
+            })
+            .unwrap();
+        operator.publish_vnode_transition();
+
+        assert_eq!(operator.local_assignment.version(), target_version);
+        assert_eq!(operator.local_assignment.owners(), &[NodeId(3)]);
     }
 
     #[cfg(feature = "cluster")]
@@ -2870,6 +2995,7 @@ mod tests {
                 revoked: &rustc_hash::FxHashSet::default(),
                 restores: &[],
                 whole_restores: &[],
+                mode: ManagedVnodeTransitionMode::Live,
             })
             .unwrap();
         restored.publish_vnode_transition();
@@ -2950,6 +3076,7 @@ mod tests {
                 revoked: &rustc_hash::FxHashSet::default(),
                 restores: &restores,
                 whole_restores: &[],
+                mode: ManagedVnodeTransitionMode::Live,
             })
             .unwrap();
         let prepared = restored.managed_state_accounting().unwrap();
@@ -2971,6 +3098,7 @@ mod tests {
                 revoked: &rustc_hash::FxHashSet::default(),
                 restores: &restores,
                 whole_restores: &[],
+                mode: ManagedVnodeTransitionMode::Live,
             })
             .unwrap();
         restored.publish_vnode_transition();

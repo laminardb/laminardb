@@ -1,17 +1,18 @@
 //! Exact-cut recovery from committed v7 checkpoint manifests.
 #![allow(clippy::disallowed_types)] // bounded recovery metadata
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use laminar_core::checkpoint::CheckpointStore;
 use laminar_core::checkpoint::{
-    checkpoint_manifest_bytes, checkpoint_sha256, ByteRange, ChannelProgress, CheckpointManifest,
-    CheckpointScope, CommittedCheckpointIndex, ConnectorCheckpoint, PipelineIdentity, StateChunkId,
-    StateFrame, StateFrameKey,
+    checkpoint_manifest_bytes, checkpoint_sha256, ByteRange, ChannelProgress,
+    CheckpointAssignmentFence, CheckpointManifest, CheckpointScope, CommittedCheckpointIndex,
+    ConnectorCheckpoint, PipelineIdentity, StateChunkId, StateFrame, StateFrameKey,
 };
 use laminar_core::checkpoint_decision::{CheckpointOutcome, CheckpointVerdict};
+use laminar_core::state::NodeId;
 
 use crate::error::DbError;
 
@@ -38,8 +39,14 @@ pub struct RecoveredState {
     pub committed: CommittedCheckpointIndex,
     /// Exact participant manifests, ordered by participant id.
     pub manifests: Vec<CheckpointManifest>,
-    /// Verified frame inventory for this node's participant, ordered by logical key.
+    /// Verified frame inventory selected for the active runtime assignment.
     pub state_frames: Vec<RecoveredStateFrame>,
+    /// Whether the active assignment is the committed assignment's direct successor.
+    pub(crate) reassigned: bool,
+    /// Committed owner of every vnode, in vnode order.
+    pub(crate) predecessor_owners: Vec<NodeId>,
+    /// Vnodes owned by this participant in the active assignment.
+    pub(crate) target_vnodes: Vec<u32>,
 }
 
 impl RecoveredState {
@@ -74,6 +81,20 @@ pub struct RecoveryManager<'a> {
     pipeline_identity: PipelineIdentity,
     deployment_id: String,
     scope: CheckpointScope,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClusterRecoveryTarget {
+    pub(crate) assignment: CheckpointAssignmentFence,
+    pub(crate) owned_vnodes: Vec<u32>,
+    pub(crate) max_graph_payload_bytes: usize,
+}
+
+struct RecoveryFrameSelection {
+    plans: Vec<VerifiedStateFramePlan>,
+    reassigned: bool,
+    predecessor_owners: Vec<NodeId>,
+    target_vnodes: Vec<u32>,
 }
 
 #[derive(Debug)]
@@ -192,6 +213,16 @@ impl<'a> RecoveryManager<'a> {
         outcome: &CheckpointOutcome,
         committed: &CommittedCheckpointIndex,
     ) -> Result<RecoveredState, DbError> {
+        self.recover_committed_for_target(outcome, committed, None)
+            .await
+    }
+
+    pub(crate) async fn recover_committed_for_target(
+        &self,
+        outcome: &CheckpointOutcome,
+        committed: &CommittedCheckpointIndex,
+        cluster_target: Option<ClusterRecoveryTarget>,
+    ) -> Result<RecoveredState, DbError> {
         self.validate_cut(outcome, committed)?;
 
         let checkpoint_id = committed.checkpoint_id;
@@ -227,23 +258,171 @@ impl<'a> RecoveryManager<'a> {
         manifests.sort_unstable_by_key(|manifest| manifest.participant_id);
 
         self.validate_manifests(committed, &manifests)?;
-        let local_participant = self.store.participant_id();
-        let local_manifest = manifests
-            .iter()
-            .find(|manifest| manifest.participant_id == local_participant)
-            .ok_or_else(|| {
-                checkpoint_error(format!(
-                    "local participant {local_participant} is absent from the committed checkpoint"
-                ))
-            })?;
-        let plan = VerifiedStateFramePlan::new(local_manifest, &local_manifest.state_frames)?;
-        let state_frames = load_verified_state_frames(self.store, vec![plan]).await?;
+        let selection = self.select_state_frames(committed, &manifests, cluster_target.as_ref())?;
+        let state_frames = load_verified_state_frames(self.store, selection.plans).await?;
 
         Ok(RecoveredState {
             outcome: outcome.clone(),
             committed: committed.clone(),
             manifests,
             state_frames,
+            reassigned: selection.reassigned,
+            predecessor_owners: selection.predecessor_owners,
+            target_vnodes: selection.target_vnodes,
+        })
+    }
+
+    fn select_state_frames(
+        &self,
+        committed: &CommittedCheckpointIndex,
+        manifests: &[CheckpointManifest],
+        cluster_target: Option<&ClusterRecoveryTarget>,
+    ) -> Result<RecoveryFrameSelection, DbError> {
+        let local_participant = self.store.participant_id();
+        let Some(target) = cluster_target else {
+            let local_manifest = manifests
+                .iter()
+                .find(|manifest| manifest.participant_id == local_participant)
+                .ok_or_else(|| {
+                    checkpoint_error(format!(
+                        "local participant {local_participant} is absent from the committed checkpoint"
+                    ))
+                })?;
+            return Ok(RecoveryFrameSelection {
+                plans: vec![VerifiedStateFramePlan::new(
+                    local_manifest,
+                    &local_manifest.state_frames,
+                )?],
+                reassigned: false,
+                predecessor_owners: Vec::new(),
+                target_vnodes: Vec::new(),
+            });
+        };
+        if self.scope != CheckpointScope::Cluster {
+            return Err(checkpoint_error(
+                "a cluster recovery target cannot be used for local recovery",
+            ));
+        }
+
+        let predecessor = committed.assignment_fence.as_ref().ok_or_else(|| {
+            checkpoint_error("cluster checkpoint has no committed assignment fence")
+        })?;
+        validate_cluster_target(target, local_participant, predecessor.vnode_count)?;
+        let predecessor_owners = predecessor_owner_map(manifests, predecessor)?;
+
+        if target.assignment.assignment_version == predecessor.assignment_version {
+            if target.assignment != *predecessor {
+                return Err(checkpoint_error(
+                    "same-version recovery target differs from the committed assignment",
+                ));
+            }
+            let local_manifest = manifests
+                .iter()
+                .find(|manifest| manifest.participant_id == local_participant);
+            let plans = match (target.owned_vnodes.is_empty(), local_manifest) {
+                (true, None) => Vec::new(),
+                (false, Some(manifest))
+                    if manifest
+                        .owned_vnodes
+                        .iter()
+                        .copied()
+                        .map(u32::from)
+                        .eq(target.owned_vnodes.iter().copied()) =>
+                {
+                    enforce_graph_payload_limit(
+                        selected_graph_payload_bytes(
+                            &manifest.state_frames,
+                            target.max_graph_payload_bytes,
+                        )?,
+                        target.max_graph_payload_bytes,
+                    )?;
+                    vec![VerifiedStateFramePlan::new(
+                        manifest,
+                        &manifest.state_frames,
+                    )?]
+                }
+                _ => {
+                    return Err(checkpoint_error(
+                        "local vnode roster does not match the committed assignment",
+                    ));
+                }
+            };
+            return Ok(RecoveryFrameSelection {
+                plans,
+                reassigned: false,
+                predecessor_owners,
+                target_vnodes: target.owned_vnodes.clone(),
+            });
+        }
+
+        if predecessor.assignment_version.checked_add(1)
+            != Some(target.assignment.assignment_version)
+        {
+            return Err(checkpoint_error(format!(
+                "recovery target assignment {} is not the direct successor of committed assignment {}",
+                target.assignment.assignment_version, predecessor.assignment_version
+            )));
+        }
+
+        let donor_ids = target
+            .owned_vnodes
+            .iter()
+            .map(|vnode| predecessor_owner(&predecessor_owners, *vnode).map(|owner| owner.0))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let mut plans = Vec::new();
+        let mut graph_payload_bytes = 0usize;
+        for manifest in manifests {
+            let contributes_graph_state = donor_ids.contains(&manifest.participant_id);
+            let is_local = manifest.participant_id == local_participant;
+            let mut selected = Vec::new();
+            for frame in &manifest.state_frames {
+                match &frame.key {
+                    StateFrameKey::OperatorWhole { operator_id } => {
+                        let graph_state = graph_operator(operator_id)?;
+                        if (graph_state && contributes_graph_state) || (!graph_state && is_local) {
+                            selected.push(frame.clone());
+                        }
+                    }
+                    StateFrameKey::Vnode { operator_id, vnode } => {
+                        if !graph_operator(operator_id)? {
+                            return Err(checkpoint_error(format!(
+                                "vnode state frame '{operator_id}' is not graph-managed"
+                            )));
+                        }
+                        let vnode = u32::from(*vnode);
+                        if target.owned_vnodes.binary_search(&vnode).is_ok() {
+                            let expected_owner = predecessor_owner(&predecessor_owners, vnode)?.0;
+                            if expected_owner != manifest.participant_id {
+                                return Err(checkpoint_error(format!(
+                                    "vnode {vnode} state is declared by participant {}, expected {expected_owner}",
+                                    manifest.participant_id
+                                )));
+                            }
+                            selected.push(frame.clone());
+                        }
+                    }
+                }
+            }
+            if !selected.is_empty() {
+                graph_payload_bytes = graph_payload_bytes
+                    .checked_add(selected_graph_payload_bytes(
+                        &selected,
+                        target.max_graph_payload_bytes,
+                    )?)
+                    .ok_or_else(|| DbError::ManagedStateBudgetExceeded {
+                        context: "checkpoint recovery graph payload".into(),
+                        accounted_bytes: usize::MAX,
+                        limit_bytes: target.max_graph_payload_bytes,
+                    })?;
+                enforce_graph_payload_limit(graph_payload_bytes, target.max_graph_payload_bytes)?;
+                plans.push(VerifiedStateFramePlan::new(manifest, &selected)?);
+            }
+        }
+        Ok(RecoveryFrameSelection {
+            plans,
+            reassigned: true,
+            predecessor_owners,
+            target_vnodes: target.owned_vnodes.clone(),
         })
     }
 
@@ -363,6 +542,134 @@ impl<'a> RecoveryManager<'a> {
     }
 }
 
+fn validate_cluster_target(
+    target: &ClusterRecoveryTarget,
+    local_participant: u64,
+    vnode_count: u32,
+) -> Result<(), DbError> {
+    if !target.assignment.is_canonical() || target.assignment.vnode_count != vnode_count {
+        return Err(checkpoint_error(
+            "cluster recovery target is not canonical or has an incompatible vnode count",
+        ));
+    }
+    if target
+        .owned_vnodes
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+        || target
+            .owned_vnodes
+            .iter()
+            .any(|vnode| *vnode >= vnode_count)
+    {
+        return Err(checkpoint_error(
+            "cluster recovery target vnode roster is not canonical",
+        ));
+    }
+    if target.assignment.contains(local_participant) != !target.owned_vnodes.is_empty() {
+        return Err(checkpoint_error(
+            "cluster recovery target participant roster disagrees with local vnode ownership",
+        ));
+    }
+    if target.max_graph_payload_bytes == 0 {
+        return Err(checkpoint_error(
+            "cluster recovery graph payload limit must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn predecessor_owner_map(
+    manifests: &[CheckpointManifest],
+    predecessor: &CheckpointAssignmentFence,
+) -> Result<Vec<NodeId>, DbError> {
+    let vnode_count = usize::try_from(predecessor.vnode_count)
+        .map_err(|_| checkpoint_error("committed vnode count does not fit this runtime"))?;
+    let mut owners = vec![NodeId::UNASSIGNED; vnode_count];
+    for manifest in manifests {
+        for vnode in &manifest.owned_vnodes {
+            let owner = owners.get_mut(usize::from(*vnode)).ok_or_else(|| {
+                checkpoint_error(format!(
+                    "participant {} owns out-of-range vnode {vnode}",
+                    manifest.participant_id
+                ))
+            })?;
+            if !owner.is_unassigned() {
+                return Err(checkpoint_error(format!(
+                    "vnode {vnode} has more than one committed owner"
+                )));
+            }
+            *owner = NodeId(manifest.participant_id);
+        }
+    }
+    if owners.iter().any(NodeId::is_unassigned) {
+        return Err(checkpoint_error(
+            "committed manifests do not cover every vnode",
+        ));
+    }
+    let owner_ids = owners.iter().map(|owner| owner.0).collect::<Vec<_>>();
+    if !predecessor.matches_owner_map(&owner_ids) {
+        return Err(checkpoint_error(
+            "committed manifests do not reconstruct the assignment fence",
+        ));
+    }
+    Ok(owners)
+}
+
+fn predecessor_owner(owners: &[NodeId], vnode: u32) -> Result<NodeId, DbError> {
+    let index = usize::try_from(vnode)
+        .map_err(|_| checkpoint_error(format!("vnode {vnode} does not fit this runtime")))?;
+    owners
+        .get(index)
+        .copied()
+        .ok_or_else(|| checkpoint_error(format!("vnode {vnode} is out of range")))
+}
+
+fn graph_operator(operator_id: &str) -> Result<bool, DbError> {
+    match operator_id.strip_prefix("graph:") {
+        Some("") => Err(checkpoint_error(
+            "graph state frame has an empty operator identity",
+        )),
+        Some(_) => Ok(true),
+        None => Ok(false),
+    }
+}
+
+fn selected_graph_payload_bytes(frames: &[StateFrame], limit: usize) -> Result<usize, DbError> {
+    frames.iter().try_fold(0usize, |total, frame| {
+        let operator_id = match &frame.key {
+            StateFrameKey::OperatorWhole { operator_id }
+            | StateFrameKey::Vnode { operator_id, .. } => operator_id,
+        };
+        if !operator_id.starts_with("graph:") {
+            return Ok(total);
+        }
+        let length = usize::try_from(frame.range.length).map_err(|_| {
+            checkpoint_error(format!(
+                "graph state frame {:?} length does not fit this runtime",
+                frame.key
+            ))
+        })?;
+        total
+            .checked_add(length)
+            .ok_or_else(|| DbError::ManagedStateBudgetExceeded {
+                context: "checkpoint recovery graph payload".into(),
+                accounted_bytes: usize::MAX,
+                limit_bytes: limit,
+            })
+    })
+}
+
+fn enforce_graph_payload_limit(bytes: usize, limit: usize) -> Result<(), DbError> {
+    if bytes > limit {
+        return Err(DbError::ManagedStateBudgetExceeded {
+            context: "checkpoint recovery graph payload".into(),
+            accounted_bytes: bytes,
+            limit_bytes: limit,
+        });
+    }
+    Ok(())
+}
+
 pub(crate) async fn load_verified_state_frames(
     store: &dyn CheckpointStore,
     plans: Vec<VerifiedStateFramePlan>,
@@ -428,7 +735,7 @@ pub(crate) async fn load_verified_state_frames(
                     Ok(RecoveredStateFrame {
                         participant_id: request.participant_id,
                         key: request.key,
-                        payload: Bytes::copy_from_slice(&payload),
+                        payload,
                     })
                 })
                 .collect::<Result<Vec<_>, DbError>>()

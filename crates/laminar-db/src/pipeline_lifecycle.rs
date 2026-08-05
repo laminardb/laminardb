@@ -3645,19 +3645,33 @@ impl LaminarDB {
 
         let mut graph_whole = Vec::new();
         let mut graph_vnodes = Vec::new();
+        #[cfg(feature = "cluster")]
+        let mut reassigned_graph = Vec::new();
         let mut mv_states = HashMap::new();
         let mut reference_tables = None;
 
-        for frame in recovered
-            .state_frames
-            .iter()
-            .filter(|frame| frame.participant_id == participant_id)
-        {
+        for frame in &recovered.state_frames {
             match &frame.key {
                 StateFrameKey::OperatorWhole { operator_id } => {
                     if let Some(name) = operator_id.strip_prefix("graph:") {
+                        #[cfg(feature = "cluster")]
+                        if recovered.reassigned {
+                            reassigned_graph.push(frame.clone());
+                            continue;
+                        }
+                        if frame.participant_id != participant_id {
+                            return Err(DbError::Checkpoint(
+                                "checkpoint selected remote graph state without reassignment"
+                                    .into(),
+                            ));
+                        }
                         graph_whole.push((name.to_owned(), frame.payload.clone()));
                     } else if operator_id == crate::table_store::REFERENCE_TABLE_CHECKPOINT_KEY {
+                        if frame.participant_id != participant_id {
+                            return Err(DbError::Checkpoint(
+                                "checkpoint selected a remote reference-table image".into(),
+                            ));
+                        }
                         if reference_tables.replace(frame.payload.clone()).is_some() {
                             return Err(DbError::Checkpoint(
                                 "checkpoint repeats reference-table state".into(),
@@ -3666,6 +3680,11 @@ impl LaminarDB {
                     } else if let Some(name) =
                         operator_id.strip_prefix(crate::mv_store::CHECKPOINT_KEY_PREFIX)
                     {
+                        if frame.participant_id != participant_id {
+                            return Err(DbError::Checkpoint(
+                                "checkpoint selected a remote materialized-view image".into(),
+                            ));
+                        }
                         if mv_states
                             .insert(name.to_owned(), frame.payload.to_vec())
                             .is_some()
@@ -3686,6 +3705,16 @@ impl LaminarDB {
                             "checkpoint contains unknown vnode state frame '{operator_id}'"
                         ))
                     })?;
+                    #[cfg(feature = "cluster")]
+                    if recovered.reassigned {
+                        reassigned_graph.push(frame.clone());
+                        continue;
+                    }
+                    if frame.participant_id != participant_id {
+                        return Err(DbError::Checkpoint(
+                            "checkpoint selected remote vnode state without reassignment".into(),
+                        ));
+                    }
                     graph_vnodes.push((name.to_owned(), u32::from(*vnode), frame.payload.clone()));
                 }
             }
@@ -3695,6 +3724,75 @@ impl LaminarDB {
         graph_vnodes.sort_unstable_by(|left, right| {
             left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
         });
+        #[cfg(feature = "cluster")]
+        if recovered.reassigned
+            && recovered.target_vnodes.is_empty()
+            && !reassigned_graph.is_empty()
+        {
+            return Err(DbError::Checkpoint(
+                "zero-owner recovery selected graph state".into(),
+            ));
+        }
+        #[cfg(feature = "cluster")]
+        let (graph, restored_graph_frames) = if recovered.reassigned
+            && !recovered.target_vnodes.is_empty()
+        {
+            let registry = self.vnode_registry.lock().clone().ok_or_else(|| {
+                DbError::Checkpoint(
+                    "reassigned checkpoint restore has no active vnode registry".into(),
+                )
+            })?;
+            let assignment = registry.versioned_snapshot();
+            let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
+                DbError::Checkpoint(
+                    "reassigned checkpoint restore has no cluster controller".into(),
+                )
+            })?;
+            let target = controller
+                .checkpoint_assignment_fence(assignment.version())
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "reassigned checkpoint restore has no certified assignment {}",
+                        assignment.version()
+                    ))
+                })?;
+            let current_owned = assignment
+                .owners()
+                .iter()
+                .enumerate()
+                .filter_map(|(vnode, owner)| {
+                    (*owner == laminar_core::state::NodeId(participant_id))
+                        .then_some(u32::try_from(vnode).expect("vnode count fits u32"))
+                })
+                .collect::<Vec<_>>();
+            if current_owned != recovered.target_vnodes {
+                return Err(DbError::Checkpoint(
+                    "reassigned checkpoint target vnode roster changed before graph restore".into(),
+                ));
+            }
+            let predecessor = recovered
+                .committed
+                .assignment_fence
+                .as_ref()
+                .ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "reassigned checkpoint restore has no predecessor assignment".into(),
+                    )
+                })?;
+            graph.restore_reassigned_vnode_state(
+                predecessor,
+                &recovered.predecessor_owners,
+                &target,
+                &reassigned_graph,
+            )?
+        } else {
+            graph.restore_state_frames(
+                &graph_whole,
+                &graph_vnodes,
+                u32::from(recovered.committed.vnode_count),
+            )?
+        };
+        #[cfg(not(feature = "cluster"))]
         let (graph, restored_graph_frames) = graph.restore_state_frames(
             &graph_whole,
             &graph_vnodes,
@@ -3775,6 +3873,12 @@ impl LaminarDB {
                 self.validate_fresh_cluster_vnode_start()?;
             }
             if let Some(ref mut coord) = *guard {
+                #[cfg(feature = "cluster")]
+                coord.set_recovery_graph_payload_limit(
+                    self.config
+                        .pipeline_max_managed_state_bytes
+                        .expect("managed-state budget is resolved at database construction"),
+                );
                 // Restore to the cluster-agreed epoch if one was armed, else the local
                 // latest. Take it owned first so the guard isn't held across the await.
                 #[cfg(feature = "cluster")]
@@ -3846,6 +3950,29 @@ impl LaminarDB {
 
                         recovered_watermark_frontier = recovered.checkpoint_watermark();
                         let participant_id = coord.store().participant_id();
+                        #[cfg(feature = "cluster")]
+                        if runtime_mode == RuntimeMode::Cluster && recovered.reassigned {
+                            if let Some(watermark) = recovered.checkpoint_watermark() {
+                                for source in sources.iter() {
+                                    recovered_source_wms.insert(source.name.clone(), watermark);
+                                    recovered_source_idle.insert(source.name.clone(), false);
+                                }
+                            }
+                        } else {
+                            for channel in recovered
+                                .channel_progress()
+                                .iter()
+                                .filter(|channel| channel.participant_id == participant_id)
+                            {
+                                if let Some(watermark) = channel.watermark {
+                                    recovered_source_wms
+                                        .insert(channel.channel_id.clone(), watermark);
+                                }
+                                recovered_source_idle
+                                    .insert(channel.channel_id.clone(), channel.idle);
+                            }
+                        }
+                        #[cfg(not(feature = "cluster"))]
                         for channel in recovered
                             .channel_progress()
                             .iter()

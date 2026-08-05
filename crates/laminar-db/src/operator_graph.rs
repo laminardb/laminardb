@@ -363,6 +363,17 @@ pub(crate) struct ManagedWholeRestore<'a> {
     pub(crate) state: &'a [u8],
 }
 
+/// Whether a managed transition advances live state or initializes a new graph from the
+/// immediately preceding committed assignment.
+#[cfg(feature = "cluster")]
+#[derive(Clone, Copy)]
+pub(crate) enum ManagedVnodeTransitionMode<'a> {
+    Live,
+    CheckpointBootstrap {
+        predecessor_owners: &'a [laminar_core::state::NodeId],
+    },
+}
+
 /// Exact operator-local projection of one graph vnode transition.
 #[cfg(feature = "cluster")]
 pub(crate) struct ManagedVnodeTransition<'a> {
@@ -371,6 +382,7 @@ pub(crate) struct ManagedVnodeTransition<'a> {
     pub(crate) revoked: &'a FxHashSet<u32>,
     pub(crate) restores: &'a [ManagedVnodeRestore<'a>],
     pub(crate) whole_restores: &'a [ManagedWholeRestore<'a>],
+    pub(crate) mode: ManagedVnodeTransitionMode<'a>,
 }
 
 pub(crate) struct OperatorCheckpoint {
@@ -2780,16 +2792,31 @@ impl OperatorGraph {
             let execution_assignment_version = if final_owner_exit {
                 None
             } else if let Some(config) = &self.cluster_shuffle {
-                let version = config.registry.versioned_snapshot().version();
-                if config.sender.assignment_version() != version
-                    || config.receiver.assignment_version() != version
-                {
-                    return Err(DbError::ShuffleNotReady(format!(
-                        "shuffle transport assignment does not match execution assignment \
-                         {version}"
-                    )));
+                let assignment = config.registry.versioned_snapshot();
+                let version = assignment.version();
+                if assignment.owners().contains(&config.self_id) {
+                    if config.sender.assignment_version() != version
+                        || config.receiver.assignment_version() != version
+                    {
+                        return Err(DbError::ShuffleNotReady(format!(
+                            "shuffle transport assignment does not match execution assignment \
+                             {version}"
+                        )));
+                    }
+                    Some(version)
+                } else {
+                    if config.sender.assignment_version() != 0
+                        || config.receiver.assignment_version() != 0
+                        || config.sender.active_assignment_digest().is_some()
+                        || config.receiver.active_assignment_digest().is_some()
+                    {
+                        return Err(DbError::ShuffleNotReady(
+                            "zero-owner vnode transition requires inactive shuffle transport"
+                                .into(),
+                        ));
+                    }
+                    None
                 }
-                Some(version)
             } else {
                 None
             };

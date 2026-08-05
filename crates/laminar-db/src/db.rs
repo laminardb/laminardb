@@ -866,7 +866,7 @@ fn owned_vnode_indices(
 }
 
 #[cfg(feature = "cluster")]
-fn local_state_requires_full_restore(
+fn local_state_lacks_exact_predecessor_binding(
     observed_assignment_version: u64,
     predecessor: Option<&laminar_core::checkpoint::CheckpointAssignmentFence>,
     pipeline_identity: Option<&laminar_core::checkpoint::PipelineIdentity>,
@@ -883,10 +883,10 @@ fn local_state_requires_full_restore(
 
 #[cfg(feature = "cluster")]
 const fn predecessor_readiness_withdrawal_required(
-    has_pending_transition: bool,
+    requires_predecessor_binding: bool,
     observed_assignment_version: u64,
 ) -> bool {
-    has_pending_transition && observed_assignment_version != 0
+    requires_predecessor_binding && observed_assignment_version != 0
 }
 
 impl LaminarDB {
@@ -2200,12 +2200,12 @@ impl LaminarDB {
         Ok(Some(manifest))
     }
 
-    /// Adopt one authority-audited assignment. Live vnode acquisition fails closed until direct
-    /// committed-frame transfer is available; startup recovery restores before graph launch.
+    /// Adopt one authority-audited assignment, staging exact committed frames for live vnode
+    /// acquisition. Startup recovery still restores the complete graph before launch.
     ///
     /// # Errors
-    /// Returns a checkpoint error when the deadline expires or the assignment would acquire live
-    /// state. The assignment is not published in that case.
+    /// Returns a checkpoint error when authority, state, or the deadline changes before atomic
+    /// publication. The assignment is not published in that case.
     #[cfg(feature = "cluster")]
     pub async fn adopt_assignment_snapshot(
         &self,
@@ -2490,53 +2490,92 @@ impl LaminarDB {
                 snapshot.version
             )));
         }
+        let prepared_db_state = DbState::load(&self.state);
+        let prepared_runtime_shutdown = self.runtime_shutdown.read().clone();
         let prepared_installed_state = self.installed_vnode_state.lock().clone();
-        let force_local_restore = local_state_requires_full_restore(
+        let predecessor_binding_missing = local_state_lacks_exact_predecessor_binding(
             observed_version,
             predecessor_fence.as_ref(),
             prepared_pipeline_identity.as_ref(),
-            (DbState::load(&self.state) == DbState::Running)
+            (prepared_db_state == DbState::Running)
                 .then_some(prepared_installed_state.as_ref())
                 .flatten(),
         );
-        let retained_installed_state = (observed_version != 0 && !force_local_restore)
-            .then_some(prepared_installed_state)
-            .flatten();
         let old_owned = effective_predecessor_owned;
+        if predecessor_binding_missing && !old_owned.is_empty() {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6053] assignment {} cannot reuse retained vnode memory without its exact predecessor binding; coordinated recovery is required",
+                snapshot.version
+            )));
+        }
+        if old_owned.is_empty() && prepared_installed_state.is_some() {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6053] assignment {} found installed vnode state without current-process predecessor ownership; coordinated recovery is required",
+                snapshot.version
+            )));
+        }
         let old_set: rustc_hash::FxHashSet<u32> = old_owned.iter().copied().collect();
         let new_owned = preflight_new_owned;
-        // Compute from the new assignment before publishing it so unsupported acquisition is
-        // rejected before the ownership flip.
-        let vnodes_requiring_restore: Vec<u32> = (0..vnode_count)
-            .filter(|&v| {
-                new_assignment.get(v as usize).copied() == Some(self_id)
-                    && (force_local_restore || !old_set.contains(&v))
-            })
+        // Compute from the new assignment before reading state or publishing ownership.
+        let vnodes_requiring_restore: Vec<u32> = new_owned
+            .iter()
+            .copied()
+            .filter(|vnode| !old_set.contains(vnode))
             .collect();
-        // Startup installs the exact committed assignment before the lifecycle restores its
-        // complete graph. A live graph, however, must not acquire even one vnode until committed
-        // range and replay/frontier state can be installed together. Reject before publishing
-        // ownership and never reinterpret a missing frame as empty state.
+        // Startup installs the committed assignment before the lifecycle restores its complete
+        // graph. A live graph loads only its acquired vnode ranges at this fenced boundary.
         let startup_restore_deferred = observed_version == 0
-            && DbState::load(&self.state) != DbState::Running
+            && prepared_db_state != DbState::Running
             && predecessor_snapshot.is_none();
-        if !vnodes_requiring_restore.is_empty() && !startup_restore_deferred {
+        let state_frames = if !vnodes_requiring_restore.is_empty() && !startup_restore_deferred {
             let handoff = committed_handoff_checkpoint.as_ref().ok_or_else(|| {
                 DbError::Checkpoint(format!(
                     "[LDB-6050] assignment {} has no exact committed checkpoint authority for vnode acquisition",
                     snapshot.version
                 ))
             })?;
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6050] committed-frame vnode reassignment from checkpoint {} is not implemented; refusing assignment {} before acquiring vnodes {:?}",
-                handoff.checkpoint_id, snapshot.version, vnodes_requiring_restore
-            )));
-        }
+            let predecessor = predecessor_fence.as_ref().ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6050] assignment {} has no predecessor certificate for vnode acquisition",
+                    snapshot.version
+                ))
+            })?;
+            let coordinator = guard.as_ref().ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6050] assignment {} has no checkpoint coordinator for vnode acquisition",
+                    snapshot.version
+                ))
+            })?;
+            let max_payload_bytes = self
+                .config
+                .pipeline_max_managed_state_bytes
+                .unwrap_or(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES);
+            tokio::select! {
+                biased;
+                () = self.assignment_restore_shutdown.cancelled() => {
+                    return Err(DbError::Shutdown);
+                }
+                () = prepared_runtime_shutdown.cancelled() => {
+                    return Err(DbError::Shutdown);
+                }
+                result = coordinator.load_handoff_state_frames(
+                    handoff,
+                    predecessor,
+                    observed_assignment.owners(),
+                    &vnodes_requiring_restore,
+                    old_owned.is_empty(),
+                    max_payload_bytes,
+                    deadline,
+                ) => result?,
+            }
+        } else {
+            Vec::new()
+        };
 
         drop(guard);
 
         // Re-acquire the epoch boundary and discard the prepared adoption if another rotation won,
-        // the coordinator namespace changed, or a newer durable cut appeared during the reads.
+        // the bound pipeline changed, or a newer durable cut appeared during the reads.
         let _execution_guard = Arc::clone(&self.rotation_execution_fence)
             .write_owned()
             .await;
@@ -2571,14 +2610,16 @@ impl LaminarDB {
                 snapshot.version
             )));
         }
-        let new_set: rustc_hash::FxHashSet<u32> = new_owned.iter().copied().collect();
-        let revoked: rustc_hash::FxHashSet<u32> = old_set.difference(&new_set).copied().collect();
         let adoption = SnapshotAdoption {
             adopted: true,
             version: snapshot.version,
         };
-        // Stateful joins cache routing and peer topology even when local ownership is unchanged.
-        let has_local_transition = !old_owned.is_empty();
+        // A resident graph advances every adjacent topology generation, including zero-owner
+        // generations, so a later acquisition is based on the exact predecessor assignment.
+        let has_local_transition = !startup_restore_deferred
+            && (!old_owned.is_empty()
+                || !vnodes_requiring_restore.is_empty()
+                || (observed_version != 0 && prepared_db_state == DbState::Running));
         let pending_transition = if has_local_transition {
             guard.as_ref().ok_or_else(|| {
                 DbError::Checkpoint(format!(
@@ -2605,14 +2646,12 @@ impl LaminarDB {
                     &new_assignment,
                     local_participant,
                     pipeline_identity,
-                    Vec::new(),
+                    state_frames,
                     final_owner_exit,
                 )?;
-            let transition_revoked: rustc_hash::FxHashSet<u32> =
-                transition.revoked_vnodes().iter().copied().collect();
-            if transition_revoked != revoked {
+            if transition.acquired_vnodes() != vnodes_requiring_restore {
                 return Err(DbError::Checkpoint(format!(
-                    "[LDB-6053] assignment {} transition rosters changed between preparation and publication",
+                    "[LDB-6053] assignment {} transition acquisition roster changed during preparation",
                     snapshot.version
                 )));
             }
@@ -2620,26 +2659,30 @@ impl LaminarDB {
         } else {
             None
         };
-        let installed_after_publication =
-            if pending_transition.is_none() && vnodes_requiring_restore.is_empty() {
-                current_pipeline_identity
-                    .clone()
-                    .map(|pipeline_identity| {
-                        crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
-                            target_fence.clone(),
-                            pipeline_identity,
-                        )
-                    })
-                    .transpose()?
-            } else {
-                None
-            };
+        let installed_after_publication = if !new_owned.is_empty()
+            && pending_transition.is_none()
+            && vnodes_requiring_restore.is_empty()
+        {
+            current_pipeline_identity
+                .clone()
+                .map(|pipeline_identity| {
+                    crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
+                        target_fence.clone(),
+                        pipeline_identity,
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
 
         // Assignment zero is intentionally noncanonical and can never have published a readiness
         // report. Replacement processes therefore stage their first target restore without an
         // impossible predecessor withdrawal; the watcher publishes target=false after adoption.
         if predecessor_readiness_withdrawal_required(
-            pending_transition.is_some(),
+            pending_transition
+                .as_ref()
+                .is_some_and(|pending| pending.requires_predecessor_binding()),
             observed_assignment.version(),
         ) {
             tokio::time::timeout_at(
@@ -2658,6 +2701,16 @@ impl LaminarDB {
         // Publish one complete immutable transition while the compute-cycle write fence is held,
         // then publish ownership before releasing its slot. The next cycle therefore observes
         // either the old assignment or the exact target-bound transition, never split half-state.
+        // Close and pipeline stop cancel under the write side of this lock. Holding the read side
+        // through publication prevents shutdown from landing between this check and the registry.
+        let runtime_shutdown = self.runtime_shutdown.read();
+        if self.is_closed()
+            || runtime_shutdown.is_cancelled()
+            || self.assignment_restore_shutdown.is_cancelled()
+            || prepared_runtime_shutdown.is_cancelled()
+        {
+            return Err(DbError::Shutdown);
+        }
         let mut pending_slot = self.pending_vnode_transition.lock();
         if pending_slot.is_some() {
             return Err(DbError::Checkpoint(format!(
@@ -2666,12 +2719,11 @@ impl LaminarDB {
             )));
         }
         let mut installed_state = self.installed_vnode_state.lock();
-        if retained_installed_state.as_ref().is_some_and(|expected| {
-            DbState::load(&self.state) != DbState::Running
-                || installed_state.as_ref() != Some(expected)
-        }) {
+        if DbState::load(&self.state) != prepared_db_state
+            || installed_state.as_ref() != prepared_installed_state.as_ref()
+        {
             return Err(DbError::Checkpoint(format!(
-                "[LDB-6053] installed predecessor state retired while preparing assignment {}; retrying with a full committed restore",
+                "[LDB-6053] local execution state changed while preparing assignment {}; retrying from the current state",
                 snapshot.version
             )));
         }
@@ -2687,6 +2739,7 @@ impl LaminarDB {
         drop(installed_state);
         drop(pending_slot);
         drop(guard);
+        drop(runtime_shutdown);
 
         tracing::info!(version = snapshot.version, "adopted assignment snapshot",);
         Ok(adoption)

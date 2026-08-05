@@ -15,7 +15,7 @@ use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{ObjectStoreExt, PutPayload};
 
-use super::RecoveryManager;
+use super::{ClusterRecoveryTarget, RecoveryManager};
 
 const DEPLOYMENT_ID: &str = "00000000-0000-0000-0000-000000000001";
 
@@ -136,18 +136,24 @@ async fn exact_commit_restores_complete_checked_frames_and_progress() {
         "41"
     );
     assert_eq!(recovered.checkpoint_watermark(), Some(1_000));
+    assert!(!recovered.reassigned);
+    assert!(recovered.predecessor_owners.is_empty());
+    assert!(recovered.target_vnodes.is_empty());
 }
 
 #[tokio::test]
-async fn cluster_recovery_reads_only_the_local_participant_node_object() {
+async fn cluster_recovery_selects_exact_and_adjacent_target_frames() {
     let key_groups = KeyGroupCount::try_from(2_u16).unwrap();
     let objects = Arc::new(InMemory::new());
     let local_store = ObjectStoreCheckpointStore::new(objects.clone(), "cluster-recovery")
         .with_key_group_count(key_groups)
         .with_participant_id(1);
-    let remote_store = ObjectStoreCheckpointStore::new(objects, "cluster-recovery")
+    let remote_store = ObjectStoreCheckpointStore::new(objects.clone(), "cluster-recovery")
         .with_key_group_count(key_groups)
         .with_participant_id(2);
+    let fresh_store = ObjectStoreCheckpointStore::new(objects, "cluster-recovery")
+        .with_key_group_count(key_groups)
+        .with_participant_id(3);
     let local_boot = uuid::Uuid::from_u128(1);
     let remote_boot = uuid::Uuid::from_u128(2);
     let fence = CheckpointAssignmentFence::from_owner_map(
@@ -170,47 +176,73 @@ async fn cluster_recovery_reads_only_the_local_participant_node_object() {
     local.deployment_id = DEPLOYMENT_ID.into();
     local.assignment_fence = Some(fence.clone());
     local.owned_vnodes = vec![0];
-    local.node_data.object_length = 5;
-    local.node_data.sha256 = checkpoint_sha256(b"local");
-    local.state_frames = vec![StateFrame {
-        key: StateFrameKey::Vnode {
-            operator_id: "join".into(),
-            vnode: 0,
+    local.node_data.object_length = 11;
+    local.node_data.sha256 = checkpoint_sha256(b"whole1local");
+    local.state_frames = vec![
+        StateFrame {
+            key: StateFrameKey::OperatorWhole {
+                operator_id: "graph:join".into(),
+            },
+            chunk: local.node_data.chunk,
+            range: laminar_core::checkpoint::ByteRange {
+                offset: 0,
+                length: 6,
+            },
+            sha256: checkpoint_sha256(b"whole1"),
         },
-        chunk: local.node_data.chunk,
-        range: laminar_core::checkpoint::ByteRange {
-            offset: 0,
-            length: 5,
+        StateFrame {
+            key: StateFrameKey::Vnode {
+                operator_id: "graph:join".into(),
+                vnode: 0,
+            },
+            chunk: local.node_data.chunk,
+            range: laminar_core::checkpoint::ByteRange {
+                offset: 6,
+                length: 5,
+            },
+            sha256: checkpoint_sha256(b"local"),
         },
-        sha256: checkpoint_sha256(b"local"),
-    }];
+    ];
 
     let mut remote = CheckpointManifest::new_with_key_group_count(1, 1, key_groups);
     remote.bind_participant(2);
     remote.deployment_id = DEPLOYMENT_ID.into();
     remote.assignment_fence = Some(fence.clone());
     remote.owned_vnodes = vec![1];
-    remote.node_data.object_length = 6;
-    remote.node_data.sha256 = checkpoint_sha256(b"remote");
-    remote.state_frames = vec![StateFrame {
-        key: StateFrameKey::Vnode {
-            operator_id: "join".into(),
-            vnode: 1,
+    remote.node_data.object_length = 12;
+    remote.node_data.sha256 = checkpoint_sha256(b"whole2remote");
+    remote.state_frames = vec![
+        StateFrame {
+            key: StateFrameKey::OperatorWhole {
+                operator_id: "graph:join".into(),
+            },
+            chunk: remote.node_data.chunk,
+            range: laminar_core::checkpoint::ByteRange {
+                offset: 0,
+                length: 6,
+            },
+            sha256: checkpoint_sha256(b"whole2"),
         },
-        chunk: remote.node_data.chunk,
-        range: laminar_core::checkpoint::ByteRange {
-            offset: 0,
-            length: 6,
+        StateFrame {
+            key: StateFrameKey::Vnode {
+                operator_id: "graph:join".into(),
+                vnode: 1,
+            },
+            chunk: remote.node_data.chunk,
+            range: laminar_core::checkpoint::ByteRange {
+                offset: 6,
+                length: 6,
+            },
+            sha256: checkpoint_sha256(b"remote"),
         },
-        sha256: checkpoint_sha256(b"remote"),
-    }];
+    ];
 
     local_store
-        .save_checkpoint(&local, &[Bytes::from_static(b"local")])
+        .save_checkpoint(&local, &[Bytes::from_static(b"whole1local")])
         .await
         .unwrap();
     remote_store
-        .save_checkpoint(&remote, &[Bytes::from_static(b"remote")])
+        .save_checkpoint(&remote, &[Bytes::from_static(b"whole2remote")])
         .await
         .unwrap();
 
@@ -244,7 +276,7 @@ async fn cluster_recovery_reads_only_the_local_participant_node_object() {
         epoch: 1,
         checkpoint_id: 1,
         deployment_id: DEPLOYMENT_ID.into(),
-        assignment_fence: Some(fence),
+        assignment_fence: Some(fence.clone()),
         leader_proof: Some(LeaderProof {
             owner: LeaderProofOwner {
                 node_id: 1,
@@ -257,6 +289,100 @@ async fn cluster_recovery_reads_only_the_local_participant_node_object() {
         verdict: CheckpointVerdict::Commit,
     };
 
+    let fresh_manager = RecoveryManager::new(
+        &fresh_store,
+        &local.pipeline_identity,
+        DEPLOYMENT_ID,
+        CheckpointScope::Cluster,
+    );
+    let zero_owner = fresh_manager
+        .recover_committed_for_target(
+            &outcome,
+            &committed,
+            Some(ClusterRecoveryTarget {
+                assignment: fence.clone(),
+                owned_vnodes: Vec::new(),
+                max_graph_payload_bytes: 64,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(zero_owner.state_frames.is_empty());
+    assert!(!zero_owner.reassigned);
+
+    let successor = CheckpointAssignmentFence::from_owner_map(
+        2,
+        &[3, 3],
+        vec![CheckpointParticipant {
+            node_id: 3,
+            boot_incarnation: uuid::Uuid::from_u128(3),
+        }],
+    )
+    .unwrap();
+    let reassigned = fresh_manager
+        .recover_committed_for_target(
+            &outcome,
+            &committed,
+            Some(ClusterRecoveryTarget {
+                assignment: successor.clone(),
+                owned_vnodes: vec![0, 1],
+                max_graph_payload_bytes: 64,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(reassigned.reassigned);
+    assert_eq!(reassigned.target_vnodes, vec![0, 1]);
+    assert_eq!(reassigned.state_frames.len(), 4);
+    assert_eq!(
+        reassigned
+            .state_frames
+            .iter()
+            .filter(|frame| matches!(&frame.key, StateFrameKey::OperatorWhole { .. }))
+            .count(),
+        2
+    );
+
+    let budget_error = fresh_manager
+        .recover_committed_for_target(
+            &outcome,
+            &committed,
+            Some(ClusterRecoveryTarget {
+                assignment: successor.clone(),
+                owned_vnodes: vec![0, 1],
+                max_graph_payload_bytes: 22,
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        budget_error,
+        crate::error::DbError::ManagedStateBudgetExceeded {
+            accounted_bytes: 23,
+            limit_bytes: 22,
+            ..
+        }
+    ));
+
+    let mut stateless_local = local.clone();
+    let mut stateless_remote = remote.clone();
+    stateless_local.state_frames.clear();
+    stateless_remote.state_frames.clear();
+    let stateless_target = ClusterRecoveryTarget {
+        assignment: successor,
+        owned_vnodes: vec![0, 1],
+        max_graph_payload_bytes: 64,
+    };
+    let stateless = fresh_manager
+        .select_state_frames(
+            &committed,
+            &[stateless_local, stateless_remote],
+            Some(&stateless_target),
+        )
+        .unwrap();
+    assert!(stateless.reassigned);
+    assert!(stateless.plans.is_empty());
+
     remote_store
         .delete_node_data(remote.node_data.chunk)
         .await
@@ -268,13 +394,39 @@ async fn cluster_recovery_reads_only_the_local_participant_node_object() {
         CheckpointScope::Cluster,
     );
     let recovered = manager
-        .recover_committed(&outcome, &committed)
+        .recover_committed_for_target(
+            &outcome,
+            &committed,
+            Some(ClusterRecoveryTarget {
+                assignment: fence,
+                owned_vnodes: vec![0],
+                max_graph_payload_bytes: 64,
+            }),
+        )
         .await
         .unwrap();
 
     assert_eq!(recovered.manifests.len(), 2);
-    assert_eq!(recovered.state_frames.len(), 1);
-    assert_eq!(recovered.state_frames[0].participant_id, 1);
+    assert_eq!(recovered.state_frames.len(), 2);
+    assert!(recovered
+        .state_frames
+        .iter()
+        .all(|frame| frame.participant_id == 1));
+    assert!(!recovered.reassigned);
+    assert_eq!(
+        recovered.predecessor_owners,
+        vec![
+            laminar_core::state::NodeId(1),
+            laminar_core::state::NodeId(2)
+        ]
+    );
+    assert_eq!(recovered.target_vnodes, vec![0]);
+
+    let direct = manager
+        .recover_committed(&outcome, &committed)
+        .await
+        .unwrap();
+    assert_eq!(direct.state_frames.len(), 2);
 }
 
 #[tokio::test]

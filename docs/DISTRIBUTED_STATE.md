@@ -1,6 +1,6 @@
 # Distributed state
 
-- **Status date:** 2026-08-03
+- **Status date:** 2026-08-04
 - **Checkpoint core:** implemented
 - **Cluster state matrix:** incomplete and fail-closed
 - **Production validation:** pending the final soak matrix
@@ -23,8 +23,10 @@ The committed index binds the deployment, pipeline ABI, checkpoint attempt, part
 source offsets, per-channel watermarks and idle flags, assignment fence, and predecessor index.
 Local recovery selects it from one authoritative decision head; cluster recovery uses the
 leader-fenced authority chain. Recovery verifies each manifest and range, restores only the local
-participant frames, then replays sources from the committed offsets. It never scans checkpoint
-objects to infer state references.
+participant frames for an unchanged assignment, and restores target-owned ranges from their
+committed donors for a direct successor. Successor recovery requires the authority's exact pinned
+handoff cut; skipped generations fail closed. Sources then replay from the committed offsets. It
+never scans checkpoint objects to infer state references.
 
 Retention keeps only the authoritative latest recovery cut because its manifests are a complete
 logical inventory and directly reference every older live chunk. A bounded two-phase cursor
@@ -49,20 +51,22 @@ commit contract; checkpoint-committable sinks publish only after the committed i
 ## Current capability boundary
 
 The runtime checkpoints aggregate accumulators, window/session state, bounded stream-join buffers,
-timers, channel progress, source offsets, reference-table history, and materialized-view images.
-Keyed aggregation and supported stream joins route by stable vnode in local and cluster execution.
-Reference-table and materialized-view images remain whole-node frames; cluster plans requiring
-them fail closed until they have assignment-fenced vnode ownership and restore.
+managed temporal ASOF history, timers, channel progress, source offsets, reference-table history,
+and materialized-view images. Keyed aggregation and supported stream joins route by stable vnode
+in local and cluster execution. Live assignment changes range-read the exact committed donor
+frames behind the rotation fence and publish the prepared operator transition only after the
+target assignment and shuffle authority match. Reference-table and materialized-view images remain
+whole-node frames; cluster plans requiring them fail closed until they have assignment-fenced vnode
+ownership and restore.
 
 The following remain production gaps, not alternate state implementations:
 
-- Assignment changes that acquire a vnode fail closed until range restore, replay/frontier
-  transfer, and assignment-fenced installation are complete. Revoke-only changes remain
-  supported.
 - Durable Aborts reclaim exact prepared objects, including after restart. An attempt that crashes
   before publishing a terminal decision can still leave unreferenced checkpoint metadata.
 - Checkpoint capture still performs state-sized snapshot work synchronously; its tail latency is
   not certified.
+- Temporal ASOF has vnode-keyed execution, checkpoint, recovery, and rescale machinery, but SQL
+  admission remains closed until correction output and sink contracts are certified.
 - Mutable update/merge joins, materialized-view joins, unbounded retention policy, and the complete
   cluster window/MV matrix still need planner/runtime certification.
 - Cluster EO remains connector-gated; unsupported source/sink compositions are rejected before I/O.
