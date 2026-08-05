@@ -7,8 +7,6 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-#[cfg(feature = "cluster")]
-use arrow::array::{Array, TimestampMillisecondArray};
 use arrow::datatypes::SchemaRef;
 #[cfg(feature = "cluster")]
 use arrow::ipc::reader::StreamReader;
@@ -43,7 +41,7 @@ use crate::operator_graph::{
 use crate::operator_graph::{ManagedVnodeTransition, ManagedVnodeTransitionMode};
 use crate::temporal_join_state::{
     temporal_join_output_schema, TemporalJoinStateConfig, TemporalJoinVnodeState,
-    TemporalStateLimits,
+    TemporalStateLimits, TimestampMillisView,
 };
 
 const ABSENT_VNODE: u8 = 0;
@@ -1866,10 +1864,22 @@ impl ManagedTemporalJoinOperator {
                 side.name()
             ))
         })?);
+        let time_index = match side {
+            TemporalInputSide::Left => self.left_time_index,
+            TemporalInputSide::Right => self.right_time_index,
+        };
+        let times = TimestampMillisView::try_new(batch.column(time_index).as_ref(), side.name())?;
         let row_vnodes = keys
             .iter()
-            .map(|key| PartitionKeyCodecV1::vnode_for_encoded(key.data(), self.vnode_count))
-            .collect();
+            .enumerate()
+            .map(|(row, key)| {
+                let _ = times.value(row, side.name())?;
+                Ok(PartitionKeyCodecV1::vnode_for_encoded(
+                    key.data(),
+                    self.vnode_count,
+                ))
+            })
+            .collect::<Result<Vec<_>, DbError>>()?;
         Ok((keys, row_vnodes))
     }
 
@@ -2143,16 +2153,10 @@ impl ManagedTemporalJoinOperator {
                 (self.right_time_index, self.limits.right_allowed_lateness_ms)
             }
         };
-        let times = batch
-            .column(time_index)
-            .as_any()
-            .downcast_ref::<TimestampMillisecondArray>()
-            .ok_or_else(|| self.schema_error(side.name()))?;
+        let times = TimestampMillisView::try_new(batch.column(time_index).as_ref(), side.name())?;
         for row in 0..times.len() {
-            if times.is_null(row) {
-                continue;
-            }
-            let deadline = times.value(row).checked_add(lateness).ok_or_else(|| {
+            let event_time = times.value(row, side.name())?;
+            let deadline = event_time.checked_add(lateness).ok_or_else(|| {
                 DbError::Pipeline(format!(
                     "temporal join [{}] {} lateness deadline overflowed",
                     self.name,
@@ -2164,7 +2168,7 @@ impl ManagedTemporalJoinOperator {
                     "temporal join [{}] {} event at {} arrived behind its applied frontier {frontier} and allowed lateness",
                     self.name,
                     side.name(),
-                    times.value(row)
+                    event_time
                 )));
             }
         }
@@ -5814,14 +5818,14 @@ mod tests {
             ],
         )
         .unwrap();
-        operator
+        assert!(operator
             .validate_batch_lateness(
                 TemporalInputSide::Left,
                 &nullable,
                 operator.local_frontiers[0],
                 false,
             )
-            .unwrap();
+            .is_err());
     }
 
     #[cfg(feature = "cluster")]

@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use arrow::array::{
     new_null_array, Array, ArrayRef, BinaryArray, Int64Array, RecordBatch,
-    TimestampMillisecondArray, UInt32Array,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt32Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::row::{RowConverter, Rows, SortField};
@@ -337,7 +338,6 @@ impl TemporalJoinVnodeState {
                 "multi-horizon temporal probes must emit offset_ms and probe_time".into(),
             ));
         }
-        validate_output_names(&left_schema, &right_schema, &config)?;
         let left_row_codec = row_codec(&left_schema, "left")?;
         let right_row_codec = row_codec(&right_schema, "right")?;
         let output_schema = temporal_join_output_schema(
@@ -480,7 +480,7 @@ impl TemporalJoinVnodeState {
             let null_key = key_columns.iter().any(|column| column.is_null(row));
             let key_row = source_rows.map_or(row, |rows| rows[row] as usize);
             let key = (!null_key).then(|| Box::<[u8]>::from(keys.row(key_row).data()));
-            let event_time = (!times.is_null(row)).then(|| times.value(row));
+            let event_time = Some(times.value(row, "right")?);
             if source_rows.is_none() {
                 if let Some(key) = key.as_deref() {
                     self.validate_vnode(key)?;
@@ -701,7 +701,7 @@ impl TemporalJoinVnodeState {
                 .try_reserve(self.offsets.len())
                 .map_err(|_| self.pipeline_error("temporal probe expansion is too large"))?;
             let null_key = key_columns.iter().any(|column| column.is_null(row));
-            let event_time = (!times.is_null(row)).then(|| times.value(row));
+            let event_time = Some(times.value(row, "left")?);
             let key_row = source_rows.map_or(row, |rows| rows[row] as usize);
             let key = (!null_key).then(|| Box::<[u8]>::from(keys.row(key_row).data()));
             if source_rows.is_none() {
@@ -2103,9 +2103,8 @@ impl TemporalJoinVnodeState {
                 let row = row as usize;
                 if row_positions[row] != version.source
                     || key_columns.iter().any(|column| column.is_null(row))
-                    || row_times.is_null(row)
                     || row_keys.row(row).as_ref() != version.key
-                    || row_times.value(row) != version.event_time
+                    || row_times.value(row, "right")? != version.event_time
                     || (frontier_order == Ordering::Equal
                         && row_fingerprints[row] != frontier.identity.payload_fingerprint)
                 {
@@ -2275,9 +2274,8 @@ impl TemporalJoinVnodeState {
             let row = probe.left_row as usize;
             if row_positions[row] != probe.source
                 || key_columns.iter().any(|column| column.is_null(row))
-                || row_times.is_null(row)
                 || row_keys.row(row).as_ref() != probe.key
-                || row_times.value(row) != probe.left_event_time
+                || row_times.value(row, "left")? != probe.left_event_time
                 || row_fingerprints[row] != probe.payload_fingerprint
             {
                 return Err(DbError::Checkpoint(
@@ -2420,12 +2418,9 @@ fn validate_config(
         let field = schema.fields().get(index).ok_or_else(|| {
             DbError::Config(format!("temporal {side} time index is out of bounds"))
         })?;
-        if !matches!(
-            field.data_type(),
-            DataType::Timestamp(TimeUnit::Millisecond, _)
-        ) {
+        if field.is_nullable() || !matches!(field.data_type(), DataType::Timestamp(_, _)) {
             return Err(DbError::Config(format!(
-                "temporal {side} time must be Timestamp(Millisecond)"
+                "temporal {side} time must be a non-null timestamp"
             )));
         }
     }
@@ -2501,7 +2496,8 @@ fn validate_position_schema(schema: &Schema, side: &str) -> Result<(), DbError> 
 fn validate_output_names(
     left: &Schema,
     right: &Schema,
-    config: &TemporalJoinStateConfig,
+    right_name: &str,
+    emit_probe_metadata: bool,
 ) -> Result<(), DbError> {
     let left_visible = left.fields().len() - POSITION_COLUMN_COUNT;
     let right_visible = right.fields().len() - POSITION_COLUMN_COUNT;
@@ -2515,14 +2511,14 @@ fn validate_output_names(
         }
     }
     for field in &right.fields()[..right_visible] {
-        let name = format!("{}_{}", field.name(), config.right_name);
+        let name = format!("{}_{}", field.name(), right_name);
         if !names.insert(name.to_ascii_lowercase()) {
             return Err(DbError::Config(format!(
                 "temporal output column name collision: {name}"
             )));
         }
     }
-    if config.emit_probe_metadata {
+    if emit_probe_metadata {
         for name in ["offset_ms", "probe_time"] {
             if !names.insert(name.to_owned()) {
                 return Err(DbError::Config(format!(
@@ -2571,6 +2567,7 @@ pub(crate) fn temporal_join_output_schema(
 ) -> Result<SchemaRef, DbError> {
     validate_position_schema(left, "left")?;
     validate_position_schema(right, "right")?;
+    validate_output_names(left, right, right_name, emit_probe_metadata)?;
     let left_visible = left.fields().len() - POSITION_COLUMN_COUNT;
     let right_visible = right.fields().len() - POSITION_COLUMN_COUNT;
     let mut fields = left.fields()[..left_visible].to_vec();
@@ -2628,20 +2625,98 @@ fn binary_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a BinaryArr
         })
 }
 
+pub(crate) struct TimestampMillisView<'a> {
+    values: &'a [i64],
+    scale: i64,
+}
+
+impl<'a> TimestampMillisView<'a> {
+    pub(crate) fn try_new(array: &'a dyn Array, side: &str) -> Result<Self, DbError> {
+        if array.null_count() != 0 {
+            return Err(DbError::Pipeline(format!(
+                "temporal {side} time must not contain nulls"
+            )));
+        }
+        let invalid = || {
+            DbError::Pipeline(format!(
+                "temporal {side} time is not a supported timestamp array"
+            ))
+        };
+        let (values, scale) = match array.data_type() {
+            DataType::Timestamp(TimeUnit::Second, _) => (
+                array
+                    .as_any()
+                    .downcast_ref::<TimestampSecondArray>()
+                    .ok_or_else(invalid)?
+                    .values()
+                    .as_ref(),
+                1_000,
+            ),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => (
+                array
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .ok_or_else(invalid)?
+                    .values()
+                    .as_ref(),
+                1,
+            ),
+            DataType::Timestamp(TimeUnit::Microsecond, _) => (
+                array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .ok_or_else(invalid)?
+                    .values()
+                    .as_ref(),
+                -1_000,
+            ),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => (
+                array
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .ok_or_else(invalid)?
+                    .values()
+                    .as_ref(),
+                -1_000_000,
+            ),
+            _ => return Err(invalid()),
+        };
+        Ok(Self { values, scale })
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub(crate) fn value(&self, row: usize, side: &str) -> Result<i64, DbError> {
+        let raw = self.values[row];
+        if self.scale > 1 {
+            return raw.checked_mul(self.scale).ok_or_else(|| {
+                DbError::Pipeline(format!(
+                    "temporal {side} timestamp at row {row} exceeds the millisecond range"
+                ))
+            });
+        }
+        if self.scale == 1 {
+            return Ok(raw);
+        }
+        let divisor = -self.scale;
+        if raw % divisor != 0 {
+            return Err(DbError::Pipeline(format!(
+                "temporal {side} timestamp at row {row} is not exactly representable in milliseconds"
+            )));
+        }
+        Ok(raw / divisor)
+    }
+}
+
 fn extract_times<'a>(
     batch: &'a RecordBatch,
     index: usize,
     side: &str,
-) -> Result<&'a TimestampMillisecondArray, DbError> {
-    batch
-        .column(index)
-        .as_any()
-        .downcast_ref::<TimestampMillisecondArray>()
-        .ok_or_else(|| {
-            DbError::Pipeline(format!(
-                "temporal {side} time is not Timestamp(Millisecond)"
-            ))
-        })
+) -> Result<TimestampMillisView<'a>, DbError> {
+    TimestampMillisView::try_new(batch.column(index).as_ref(), side)
 }
 
 fn row_codec(schema: &Schema, side: &str) -> Result<RowConverter, DbError> {
@@ -2834,7 +2909,11 @@ mod tests {
         Arc::new(Schema::new(vec![
             Field::new("key", DataType::Utf8, true),
             Field::new(format!("{prefix}_value"), DataType::Int64, true),
-            Field::new("ts", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
             Field::new(SOURCE_PARTITION_COLUMN, DataType::Binary, false),
             Field::new(SOURCE_ORDER_COLUMN, DataType::Binary, false),
             Field::new(SOURCE_SUB_OFFSET_COLUMN, DataType::UInt32, false),
@@ -3006,7 +3085,7 @@ mod tests {
                 schema("right"),
                 vec![None],
                 vec![Some(1)],
-                vec![None],
+                vec![Some(100)],
                 vec![order],
             );
             assert_eq!(
@@ -3017,7 +3096,7 @@ mod tests {
                 schema("left"),
                 vec![None],
                 vec![Some(1)],
-                vec![None],
+                vec![Some(100)],
                 vec![order],
             );
             assert_eq!(state.probe_left_batch(&left).unwrap().num_rows(), 1);
@@ -3188,7 +3267,7 @@ mod tests {
             schema("left"),
             vec![Some("missing"), None],
             vec![Some(1), Some(2)],
-            vec![Some(100), None],
+            vec![Some(100), Some(100)],
             vec![1, 2],
         );
         assert_eq!(state.probe_left_batch(&left).unwrap().num_rows(), 0);
@@ -3220,6 +3299,24 @@ mod tests {
         assert!(output.column_by_name(SOURCE_PARTITION_COLUMN).is_none());
         assert!(output.column_by_name(SOURCE_ORDER_COLUMN).is_none());
         assert!(output.column_by_name(SOURCE_SUB_OFFSET_COLUMN).is_none());
+    }
+
+    #[test]
+    fn sub_millisecond_timestamps_are_rejected_without_rounding() {
+        let aligned = TimestampMicrosecondArray::from(vec![2_000, -2_000]);
+        let view = TimestampMillisView::try_new(&aligned, "left").unwrap();
+        assert_eq!(view.value(0, "left").unwrap(), 2);
+        assert_eq!(view.value(1, "left").unwrap(), -2);
+
+        for value in [1_500, -1_500] {
+            let timestamps = TimestampMicrosecondArray::from(vec![value]);
+            let view = TimestampMillisView::try_new(&timestamps, "left").unwrap();
+            assert!(view
+                .value(0, "left")
+                .unwrap_err()
+                .to_string()
+                .contains("not exactly representable in milliseconds"));
+        }
     }
 
     #[test]
@@ -3282,7 +3379,7 @@ mod tests {
         .err()
         .unwrap()
         .to_string()
-        .contains("Timestamp(Millisecond)"));
+        .contains("non-null timestamp"));
 
         let mut invalid = config(TemporalJoinKind::Left, TemporalProbeSchedule::as_of());
         invalid.right_allowed_lateness_ms = 101;

@@ -66,8 +66,9 @@ The following remain production gaps, not alternate state implementations:
 - Checkpoint capture still performs state-sized snapshot work synchronously; its tail latency is
   not certified.
 - Temporal ASOF has vnode-keyed final-only execution, compact per-source-partition replay
-  frontiers, checkpoint, recovery, and rescale machinery. SQL admission remains closed until the
-  managed graph path, source-role contracts, execution limits, and output schema are certified.
+  frontiers, checkpoint, recovery, rescale, managed-graph SQL admission, positioned source-role
+  contracts, execution limits, and exact output-schema planning. Production certification remains
+  pending the final connector, fault, skew, and latency soak.
 - Mutable update/merge joins, materialized-view joins, unbounded retention policy, and the complete
   cluster window/MV matrix still need planner/runtime certification.
 - Cluster EO remains connector-gated; unsupported source/sink compositions are rejected before I/O.

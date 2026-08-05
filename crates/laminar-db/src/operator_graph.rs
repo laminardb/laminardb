@@ -1735,18 +1735,6 @@ impl OperatorGraph {
     ) {
         use laminar_sql::translator::JoinOperatorConfig;
 
-        if join_config.as_ref().is_some_and(|joins| {
-            joins
-                .iter()
-                .any(|join| matches!(join, JoinOperatorConfig::Temporal(_)))
-        }) {
-            self.build_errors.push(DbError::Unsupported(
-                "temporal joins require the managed two-input vnode operator; lookup execution is unsupported"
-                    .into(),
-            ));
-            return;
-        }
-
         if join_clause_count(&sql) > 1 {
             self.build_errors.push(DbError::InvalidOperation(
                 "multi-way streaming joins require explicitly named two-way stages".to_string(),

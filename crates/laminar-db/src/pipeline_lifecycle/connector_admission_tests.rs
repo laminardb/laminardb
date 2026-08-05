@@ -1,15 +1,17 @@
 use super::LaminarDB;
 use super::{
-    admit_sink, admit_sink_contract, admit_source_contract, close_opened_sinks,
-    open_prepared_sinks, resolve_stream_output_schemas, validate_source_recovery_assignment,
+    admit_sink, admit_sink_contract, admit_source_contract, admit_temporal_source_contract,
+    close_opened_sinks, has_only_temporal_right_consumers, open_prepared_sinks,
+    resolve_stream_output_schemas, validate_source_recovery_assignment,
     ConnectorTaskFenceRegistration, DbError, PreparedSink, RuntimeMode, SinkAdmissionContext,
-    TrackedSourceRegistration, CLUSTER_BEST_EFFORT, EXACT_SINK_PROTOCOL, KEYED_SOURCE_PRIMARY_KEY,
+    TemporalSourceRole, TrackedSourceRegistration, CLUSTER_BEST_EFFORT, EXACT_SINK_PROTOCOL,
+    KEYED_SOURCE_PRIMARY_KEY,
 };
 use crate::db::DbState;
 use crate::pipeline::streaming_coordinator::MUTATION_SOURCE_NOT_ADMITTED;
 use crate::pipeline::PipelineConfig;
 use crate::sink_task::{SinkTaskConfig, DEFAULT_CHANNEL_CAPACITY, SINK_EVENT_CHANNEL_CAPACITY};
-use arrow_array::RecordBatch;
+use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use laminar_connectors::checkpoint::SourceCheckpoint;
@@ -17,8 +19,8 @@ use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{
     ConnectorCancellationPolicy, ConnectorTaskOwner, ConnectorTaskTracker, DeliveryGuarantee,
     SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, SourceBatch,
-    SourceConnector, SourceConsistency, SourceContract, SourceInputMode, SourceStart,
-    SourceTopology, WriteResult,
+    SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
+    SourceRowPositionCapability, SourceStart, SourceTopology, WriteResult,
 };
 use laminar_connectors::error::ConnectorError;
 use laminar_core::checkpoint::object_store_builder::CheckpointStorageScope;
@@ -27,6 +29,51 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+async fn temporal_test_db() -> (
+    Arc<LaminarDB>,
+    crate::temporal_test_source::TemporalTestSourceControl,
+) {
+    let control = crate::temporal_test_source::TemporalTestSourceControl::new();
+    let registration_control = control.clone();
+    let db = LaminarDB::builder()
+        .temporal_join_idle_history_retention(Duration::from_secs(60))
+        .register_connector(move |registry| {
+            crate::temporal_test_source::register(registry, &registration_control)
+        })
+        .build()
+        .await
+        .unwrap();
+    (db, control)
+}
+
+async fn create_temporal_test_inputs(db: &LaminarDB) -> Result<(), DbError> {
+    let connector = crate::temporal_test_source::CONNECTOR_NAME;
+    db.execute(&format!(
+        "CREATE SOURCE left_events (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, \
+         value BIGINT NOT NULL, WATERMARK FOR ts AS ts) \
+         FROM \"{connector}\" ('mode' = 'append')"
+    ))
+    .await?;
+    db.execute(&format!(
+        "CREATE SOURCE right_events (id BIGINT PRIMARY KEY, ts TIMESTAMP NOT NULL, \
+         value BIGINT NOT NULL, WATERMARK FOR ts AS ts) \
+         FROM \"{connector}\" ('mode' = 'upsert')"
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn create_temporal_test_stream(db: &LaminarDB, name: &str) -> Result<(), DbError> {
+    db.execute(&format!(
+        "CREATE STREAM {name} AS \
+         SELECT l.id AS id, l.value AS left_value, r.value AS right_value \
+         FROM left_events l LEFT JOIN right_events \
+         FOR SYSTEM_TIME AS OF l.ts AS r ON l.id = r.id"
+    ))
+    .await?;
+    Ok(())
+}
 
 struct RetiringQuiesceSink {
     schema: SchemaRef,
@@ -830,6 +877,385 @@ fn mutation_sources_fail_before_connector_io() {
         .unwrap_err(),
         MUTATION_SOURCE_NOT_ADMITTED
     );
+}
+
+#[test]
+fn temporal_source_contracts_enforce_recovery_positions_and_input_roles() {
+    let positioned = |input_mode| {
+        SourceContract::new(
+            SourceConsistency::Replayable,
+            SourceTopology::Splittable,
+            input_mode,
+        )
+        .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
+    };
+
+    admit_temporal_source_contract(
+        positioned(SourceInputMode::AppendOnly),
+        TemporalSourceRole::Left,
+        false,
+        false,
+        DeliveryGuarantee::BestEffort,
+        false,
+        RuntimeMode::Local,
+    )
+    .expect("local in-memory temporal execution may be best-effort");
+
+    let error = admit_temporal_source_contract(
+        positioned(SourceInputMode::AppendOnly),
+        TemporalSourceRole::Left,
+        false,
+        false,
+        DeliveryGuarantee::AtLeastOnce,
+        false,
+        RuntimeMode::Local,
+    )
+    .unwrap_err();
+    assert!(error.contains("require checkpointing"));
+
+    let unavailable = SourceContract::new(
+        SourceConsistency::Replayable,
+        SourceTopology::Splittable,
+        SourceInputMode::AppendOnly,
+    );
+    let error = admit_temporal_source_contract(
+        unavailable,
+        TemporalSourceRole::Left,
+        false,
+        false,
+        DeliveryGuarantee::AtLeastOnce,
+        true,
+        RuntimeMode::Local,
+    )
+    .unwrap_err();
+    assert!(error.contains("ordered deterministic row positions"));
+
+    let keyed = positioned(SourceInputMode::KeyedUpsert);
+    admit_temporal_source_contract(
+        keyed,
+        TemporalSourceRole::Right,
+        true,
+        false,
+        DeliveryGuarantee::AtLeastOnce,
+        true,
+        RuntimeMode::Local,
+    )
+    .expect("keyed-upsert history is a supported temporal-right route");
+    assert_eq!(
+        admit_temporal_source_contract(
+            keyed,
+            TemporalSourceRole::Left,
+            true,
+            false,
+            DeliveryGuarantee::AtLeastOnce,
+            true,
+            RuntimeMode::Local,
+        )
+        .unwrap_err(),
+        "temporal left inputs must be append-only"
+    );
+    let full_changelog = positioned(SourceInputMode::FullChangelog);
+    assert!(admit_temporal_source_contract(
+        full_changelog,
+        TemporalSourceRole::Right,
+        true,
+        false,
+        DeliveryGuarantee::AtLeastOnce,
+        true,
+        RuntimeMode::Local,
+    )
+    .unwrap_err()
+    .contains("not full changelogs"));
+}
+
+fn temporal_stream_registration(name: &str) -> crate::connector_manager::StreamRegistration {
+    crate::connector_manager::StreamRegistration {
+        name: name.into(),
+        query_sql: "SELECT * FROM trades JOIN prices FOR SYSTEM_TIME AS OF trades.ts_ms ON trades.seq = prices.seq".into(),
+        emit_clause: None,
+        window_config: None,
+        order_config: None,
+        join_config: Some(vec![laminar_sql::translator::JoinOperatorConfig::Temporal(
+            laminar_sql::translator::TemporalJoinTranslatorConfig {
+                left_table: "trades".into(),
+                right_table: "prices".into(),
+                left_key_columns: vec!["seq".into()],
+                right_key_columns: vec!["seq".into()],
+                left_time_column: "ts_ms".into(),
+                right_time_column: "ts_ms".into(),
+                join_kind: laminar_sql::temporal::TemporalJoinKind::Inner,
+                probe_schedule: laminar_sql::temporal::TemporalProbeSchedule::as_of(),
+                probe_alias: None,
+            },
+        )]),
+        has_analytic: false,
+        has_frame: false,
+        incremental: false,
+    }
+}
+
+#[test]
+fn temporal_mutation_routes_cannot_share_the_source_with_other_consumers() {
+    let mut streams = HashMap::from([("joined".into(), temporal_stream_registration("joined"))]);
+    let sinks = HashMap::new();
+    assert!(has_only_temporal_right_consumers(
+        "prices", &streams, &sinks
+    ));
+
+    let mut left_consumer = temporal_stream_registration("reverse_join");
+    left_consumer.query_sql = "managed temporal plan".into();
+    let Some([laminar_sql::translator::JoinOperatorConfig::Temporal(config)]) =
+        left_consumer.join_config.as_deref_mut()
+    else {
+        unreachable!()
+    };
+    config.left_table = "prices".into();
+    config.right_table = "profiles".into();
+    streams.insert("reverse_join".into(), left_consumer);
+    assert!(!has_only_temporal_right_consumers(
+        "prices", &streams, &sinks
+    ));
+    streams.remove("reverse_join");
+
+    streams.insert(
+        "copied".into(),
+        crate::connector_manager::StreamRegistration {
+            name: "copied".into(),
+            query_sql: "SELECT * FROM prices".into(),
+            emit_clause: None,
+            window_config: None,
+            order_config: None,
+            join_config: None,
+            has_analytic: false,
+            has_frame: false,
+            incremental: false,
+        },
+    );
+    assert!(!has_only_temporal_right_consumers(
+        "prices", &streams, &sinks
+    ));
+}
+
+#[tokio::test]
+async fn persisted_temporal_preflight_requires_direct_event_time_sources() {
+    let (db, _) = temporal_test_db().await;
+    let schema = crate::temporal_test_source::schema();
+    for (name, primary_key) in [("trades", Vec::new()), ("prices", vec!["id".into()])] {
+        db.catalog
+            .register_source(
+                name,
+                Arc::clone(&schema),
+                primary_key,
+                Some("ts".into()),
+                Some(Duration::ZERO),
+                None,
+                None,
+            )
+            .unwrap();
+    }
+    let source = |name: &str, mode: &str| crate::connector_manager::SourceRegistration {
+        name: name.into(),
+        connector_type: Some(crate::temporal_test_source::CONNECTOR_NAME.into()),
+        connector_options: HashMap::from([("mode".into(), mode.into())]),
+        format: None,
+        format_options: HashMap::new(),
+    };
+    let mut sources = HashMap::from([
+        ("trades".into(), source("trades", "append")),
+        ("prices".into(), source("prices", "upsert")),
+    ]);
+    let mut temporal_stream = temporal_stream_registration("joined");
+    let Some([laminar_sql::translator::JoinOperatorConfig::Temporal(config)]) =
+        temporal_stream.join_config.as_deref_mut()
+    else {
+        unreachable!()
+    };
+    config.left_key_columns = vec!["id".into()];
+    config.right_key_columns = vec!["id".into()];
+    config.left_time_column = "ts".into();
+    config.right_time_column = "ts".into();
+    let streams = HashMap::from([("joined".into(), temporal_stream)]);
+    let sinks = HashMap::new();
+
+    let admitted = db
+        .validate_persisted_temporal_source_contracts(
+            &sources,
+            &sinks,
+            &streams,
+            RuntimeMode::Local,
+        )
+        .unwrap();
+    assert_eq!(admitted.get("trades"), Some(&TemporalSourceRole::Left));
+    assert_eq!(admitted.get("prices"), Some(&TemporalSourceRole::Right));
+
+    sources.get_mut("prices").unwrap().connector_type = None;
+    let error = db
+        .validate_persisted_temporal_source_contracts(
+            &sources,
+            &sinks,
+            &streams,
+            RuntimeMode::Local,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("direct configured source"));
+
+    sources.get_mut("prices").unwrap().connector_type =
+        Some(crate::temporal_test_source::CONNECTOR_NAME.into());
+    db.catalog
+        .get_source("prices")
+        .unwrap()
+        .is_processing_time
+        .store(true, std::sync::atomic::Ordering::Release);
+    let error = db
+        .validate_persisted_temporal_source_contracts(
+            &sources,
+            &sinks,
+            &streams,
+            RuntimeMode::Local,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("must use event time"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_temporal_stream_starts_and_emits_with_positioned_microsecond_sources() {
+    let (db, control) = temporal_test_db().await;
+    create_temporal_test_inputs(&db).await.unwrap();
+    create_temporal_test_stream(&db, "matched").await.unwrap();
+
+    db.start().await.unwrap();
+    let mut subscription = db
+        .open_subscription("matched", None, crate::subscription::SubscribeStart::Tail)
+        .await
+        .unwrap();
+    control.release();
+
+    let batch = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match subscription.next_frame().await {
+                Some(crate::subscription::PortalFrame::Batch { batch, .. })
+                    if batch.num_rows() != 0 =>
+                {
+                    break batch;
+                }
+                Some(crate::subscription::PortalFrame::Batch { .. })
+                | Some(crate::subscription::PortalFrame::Barrier { .. }) => {}
+                Some(crate::subscription::PortalFrame::Lagged(skipped)) => {
+                    panic!("temporal test subscription lagged by {skipped} entries");
+                }
+                Some(crate::subscription::PortalFrame::Error { message }) => {
+                    panic!("temporal test subscription failed: {message}");
+                }
+                None => panic!("temporal test subscription closed before output"),
+            }
+        }
+    })
+    .await
+    .expect("managed temporal output timed out");
+
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch.schema().field(0).name(), "id");
+    assert_eq!(batch.schema().field(1).name(), "left_value");
+    assert_eq!(batch.schema().field(2).name(), "right_value");
+    assert_eq!(
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
+    assert_eq!(
+        batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        10
+    );
+    assert_eq!(
+        batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        7
+    );
+    db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn keyed_temporal_right_consumer_admission_is_ddl_order_independent() {
+    let (db, _) = temporal_test_db().await;
+    create_temporal_test_inputs(&db).await.unwrap();
+    create_temporal_test_stream(&db, "matched").await.unwrap();
+
+    for (name, sql) in [
+        (
+            "right_copy",
+            "CREATE STREAM right_copy AS SELECT id, ts, value FROM right_events",
+        ),
+        ("right_sink", "CREATE SINK right_sink FROM right_events"),
+        (
+            "right_query_sink",
+            "CREATE SINK right_query_sink FROM (SELECT id FROM right_events)",
+        ),
+        (
+            "right_mv",
+            "CREATE MATERIALIZED VIEW right_mv AS SELECT id, ts, value FROM right_events",
+        ),
+    ] {
+        let error = db.execute(sql).await.unwrap_err();
+        assert!(
+            error.to_string().contains("non-temporal-right consumer"),
+            "{sql}: {error}"
+        );
+        assert!(!db.catalog_namespace.lock().contains_key(name));
+    }
+    db.execute("CREATE SINK left_query_sink FROM (SELECT id FROM left_events)")
+        .await
+        .unwrap();
+    assert!(db
+        .connector_manager
+        .lock()
+        .get_sink("left_query_sink")
+        .is_some());
+    assert!(db.catalog.get_stream_entry("right_copy").is_none());
+    assert!(db.catalog.get_sink_input("right_sink").is_none());
+    assert!(!db
+        .connector_manager
+        .lock()
+        .streams()
+        .contains_key("right_copy"));
+    assert!(db.connector_manager.lock().get_sink("right_sink").is_none());
+    assert!(db.mv_registry.lock().get("right_mv").is_none());
+    assert!(!db.mv_store.read().has_mv("right_mv"));
+    assert!(!db.ctx.table_exist("right_mv").unwrap());
+    db.shutdown().await.unwrap();
+
+    let (db, _) = temporal_test_db().await;
+    create_temporal_test_inputs(&db).await.unwrap();
+    db.execute("CREATE SINK right_sink FROM right_events")
+        .await
+        .unwrap();
+    let error = create_temporal_test_stream(&db, "matched")
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("non-temporal-right consumer"),
+        "{error}"
+    );
+    assert!(db.catalog.get_stream_entry("matched").is_none());
+    assert!(!db.catalog_namespace.lock().contains_key("matched"));
+    assert!(!db
+        .connector_manager
+        .lock()
+        .streams()
+        .contains_key("matched"));
+    db.shutdown().await.unwrap();
 }
 
 #[test]

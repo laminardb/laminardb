@@ -126,6 +126,8 @@ mod table_provider;
 mod table_rows;
 mod table_store;
 mod temporal_join_state;
+#[cfg(test)]
+mod temporal_test_source;
 #[cfg(feature = "cluster")]
 mod vnode_transition_staging;
 

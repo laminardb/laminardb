@@ -3433,7 +3433,7 @@ async fn test_create_source_with_watermark() {
 }
 
 #[tokio::test]
-async fn temporal_queries_fail_closed_before_managed_runtime_admission() {
+async fn temporal_query_entrypoints_and_retention_fail_closed() {
     let db = LaminarDB::open().unwrap();
     db.execute(
         "CREATE SOURCE trades (symbol VARCHAR, trade_time TIMESTAMP, WATERMARK FOR trade_time)",
@@ -3468,7 +3468,7 @@ async fn temporal_queries_fail_closed_before_managed_runtime_admission() {
         .unwrap_err();
     assert!(matches!(nested, DbError::Unsupported(_)), "{nested}");
 
-    let named = db
+    let unconfigured = db
         .execute(
             "CREATE STREAM markouts AS SELECT probe.offset_ms, probe.probe_time, q.price \
              FROM trades t TEMPORAL PROBE JOIN quotes q ON (symbol) \
@@ -3476,7 +3476,12 @@ async fn temporal_queries_fail_closed_before_managed_runtime_admission() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(named, DbError::Unsupported(_)), "{named}");
+    assert!(
+        unconfigured
+            .to_string()
+            .contains("temporal_join_idle_history_retention must be configured"),
+        "{unconfigured}"
+    );
     assert!(db.catalog.get_stream_entry("markouts").is_none());
 }
 
@@ -8632,6 +8637,7 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
 
     async fn one_owner_cluster() -> Arc<LaminarDB> {
         let node = NodeId(1);
+        let temporal_source_control = crate::temporal_test_source::TemporalTestSourceControl::new();
         let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
         let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
         let controller = Arc::new(ClusterController::new(node, kv, None, members_rx));
@@ -8654,6 +8660,15 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
             .shuffle_sender(Arc::new(ShuffleSender::new(node.0, process_incarnation)))
             .shuffle_receiver(receiver)
             .vnode_registry(Arc::new(VnodeRegistry::single_owner(8, node)))
+            .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+                interval_ms: Some(3_600_000),
+                ..Default::default()
+            })
+            .delivery_guarantee(laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce)
+            .temporal_join_idle_history_retention(std::time::Duration::from_secs(60))
+            .register_connector(move |registry| {
+                crate::temporal_test_source::register(registry, &temporal_source_control)
+            })
             .build()
             .await
             .unwrap()
@@ -8737,14 +8752,31 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
         .scope((), async {
             db.execute(
                 "CREATE SOURCE left_events (id BIGINT, shard BIGINT, value DOUBLE, ts TIMESTAMP NOT NULL, \
-                 WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
+                 WATERMARK FOR ts AS ts - INTERVAL '1' SECOND) \
+                 FROM GENERATOR ('max.rows' = '1')",
             )
             .await
             .unwrap();
             db.execute(
-                "CREATE SOURCE right_events (id BIGINT, shard BIGINT, value DOUBLE, ts TIMESTAMP NOT NULL, \
-                 WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
+                "CREATE SOURCE right_events (id BIGINT PRIMARY KEY, shard BIGINT, value DOUBLE, ts TIMESTAMP NOT NULL, \
+                 WATERMARK FOR ts AS ts - INTERVAL '1' SECOND) \
+                 FROM GENERATOR ('max.rows' = '1')",
             )
+            .await
+            .unwrap();
+            let temporal_connector = crate::temporal_test_source::CONNECTOR_NAME;
+            db.execute(&format!(
+                "CREATE SOURCE temporal_left (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, value BIGINT NOT NULL, \
+                 WATERMARK FOR ts AS ts - INTERVAL '1' SECOND) \
+                 FROM \"{temporal_connector}\" ('mode' = 'append')"
+            ))
+            .await
+            .unwrap();
+            db.execute(&format!(
+                "CREATE SOURCE temporal_right (id BIGINT PRIMARY KEY, ts TIMESTAMP NOT NULL, value BIGINT NOT NULL, \
+                 WATERMARK FOR ts AS ts - INTERVAL '1' SECOND) \
+                 FROM \"{temporal_connector}\" ('mode' = 'upsert')"
+            ))
             .await
             .unwrap();
 
@@ -8806,6 +8838,21 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
                 .catalog
                 .get_stream_entry("composite_interval_ok")
                 .is_some());
+            db.execute(
+                "CREATE STREAM temporal_ok AS \
+                 SELECT l.id AS id, r.value AS right_value FROM temporal_left l \
+                 LEFT JOIN temporal_right FOR SYSTEM_TIME AS OF l.ts AS r ON l.id = r.id",
+            )
+            .await
+            .expect("managed temporal vnode state is cluster-safe");
+            let temporal = db.connector_manager.lock().streams()["temporal_ok"].clone();
+            assert!(db
+                .revalidate_persisted_cluster_query_shapes(&std::collections::HashMap::from([(
+                    temporal.name.clone(),
+                    temporal,
+                )]))
+                .await
+                .expect("persisted temporal plans must retain managed-vnode admission"));
             assert_cluster_rejection(
                 &db,
                 "rejected_temporal_filter",

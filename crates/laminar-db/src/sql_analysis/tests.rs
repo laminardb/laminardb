@@ -117,6 +117,11 @@ fn extract_table_refs_plain() {
     let refs = extract_table_references("SELECT * FROM events WHERE id > 1");
     assert_eq!(refs.len(), 1);
     assert!(refs.contains("events"));
+
+    let refs = extract_table_references(
+        "WITH hidden AS (SELECT * FROM right_events) SELECT * FROM hidden",
+    );
+    assert_eq!(refs, FxHashSet::from_iter(["right_events".to_string()]));
 }
 
 #[test]
@@ -190,7 +195,8 @@ fn temporal_projection_rewrites_supported_scalar_select_and_filter() {
     let projection = temporal_projection_sql(&sql, &temporal_projection_config()).unwrap();
     assert_eq!(
         projection,
-        "SELECT trade_id AS id, price_quotes * 2 AS doubled FROM __temporal_tmp \
+        "SELECT trade_id AS id, price_quotes * 2 AS doubled FROM __temporal_tmp AS \
+         __temporal_projection_input \
          WHERE price_quotes > 0 AND trade_id IN (1, 2)"
     );
 
@@ -201,7 +207,16 @@ fn temporal_projection_rewrites_supported_scalar_select_and_filter() {
     let probe_sql = format!("SELECT probe.offset_ms, probe.probe_time, q.price {TEMPORAL_FROM}");
     assert_eq!(
         temporal_projection_sql(&probe_sql, &probe_config).unwrap(),
-        "SELECT offset_ms, probe_time, price_quotes FROM __temporal_tmp"
+        "SELECT offset_ms, probe_time, price_quotes FROM __temporal_tmp AS \
+         __temporal_projection_input"
+    );
+    let error = temporal_projection_sql(&format!("SELECT probe.id {TEMPORAL_FROM}"), &probe_config)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("probe qualifier exposes only offset_ms and probe_time"),
+        "{error}"
     );
 }
 
@@ -210,7 +225,8 @@ fn temporal_projection_matches_unquoted_qualifiers_case_insensitively() {
     let sql = format!("SELECT T.trade_id, Q.price {TEMPORAL_FROM} WHERE Q.price > 0");
     assert_eq!(
         temporal_projection_sql(&sql, &temporal_projection_config()).unwrap(),
-        "SELECT trade_id, price_quotes FROM __temporal_tmp WHERE price_quotes > 0"
+        "SELECT trade_id, price_quotes FROM __temporal_tmp AS __temporal_projection_input \
+         WHERE price_quotes > 0"
     );
 }
 

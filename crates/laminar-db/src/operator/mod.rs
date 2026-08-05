@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
 
@@ -280,6 +281,34 @@ pub(crate) struct LiveSqlCache {
     task_ctx: Arc<TaskContext>,
 }
 
+struct ScopedTableRegistration<'a> {
+    ctx: &'a SessionContext,
+    table: datafusion::common::TableReference,
+}
+
+impl<'a> ScopedTableRegistration<'a> {
+    fn register(
+        ctx: &'a SessionContext,
+        table_name: &str,
+        provider: Arc<dyn TableProvider>,
+    ) -> datafusion::common::Result<Self> {
+        let table = exact_table_reference(table_name);
+        if let Some(previous) = ctx.register_table(table.clone(), provider)? {
+            ctx.register_table(table.clone(), previous)?;
+            return Err(datafusion::common::DataFusionError::Execution(format!(
+                "temporary planning table '{table_name}' is already registered"
+            )));
+        }
+        Ok(Self { ctx, table })
+    }
+}
+
+impl Drop for ScopedTableRegistration<'_> {
+    fn drop(&mut self) {
+        let _ = self.ctx.deregister_table(self.table.clone());
+    }
+}
+
 impl LiveSqlCache {
     pub(crate) async fn build(
         ctx: &SessionContext,
@@ -291,8 +320,7 @@ impl LiveSqlCache {
         use laminar_sql::datafusion::LiveSourceProvider;
         let provider = Arc::new(LiveSourceProvider::new(schema));
         let handle = provider.handle();
-        let _ = ctx.deregister_table(exact_table_reference(table_name));
-        ctx.register_table(exact_table_reference(table_name), provider)
+        let _registration = ScopedTableRegistration::register(ctx, table_name, provider)
             .map_err(|e| DbError::Pipeline(format!("{what} register_table: {e}")))?;
         let logical = ctx
             .sql(sql)
@@ -371,16 +399,14 @@ pub(crate) async fn try_compile_post_projection(
 ) -> Option<CompiledProjection> {
     let empty =
         datafusion::datasource::MemTable::try_new(batch_schema.clone(), vec![vec![]]).ok()?;
-    let _ = ctx.deregister_table(exact_table_reference(tmp_table_name));
-    ctx.register_table(exact_table_reference(tmp_table_name), Arc::new(empty))
-        .ok()?;
+    let _registration =
+        ScopedTableRegistration::register(ctx, tmp_table_name, Arc::new(empty)).ok()?;
 
     let plan = ctx
         .sql(proj_sql)
         .await
         .ok()
         .map(|dataframe| dataframe.logical_plan().clone());
-    let _ = ctx.deregister_table(exact_table_reference(tmp_table_name));
     let plan = plan?;
 
     let info = extract_projection_filter(&plan)?;
@@ -421,6 +447,46 @@ pub(crate) async fn try_compile_post_projection(
         filter,
         output_schema: Arc::new(arrow::datatypes::Schema::new(fields)),
     })
+}
+
+pub(crate) async fn prepare_post_projection(
+    ctx: &SessionContext,
+    projection_sql: &str,
+    input_table: &str,
+    input_schema: &SchemaRef,
+    what: &str,
+) -> Result<(PostProjectionCache, SchemaRef), DbError> {
+    if let Some(compiled) =
+        try_compile_post_projection(ctx, projection_sql, input_table, input_schema).await
+    {
+        let schema = Arc::clone(&compiled.output_schema);
+        return Ok((
+            PostProjectionCache {
+                compiled: Some(compiled),
+                compile_failed: false,
+                sql_cache: None,
+            },
+            schema,
+        ));
+    }
+
+    let sql_cache = LiveSqlCache::build(
+        ctx,
+        input_table,
+        Arc::clone(input_schema),
+        projection_sql,
+        what,
+    )
+    .await?;
+    let schema = sql_cache.physical.schema();
+    Ok((
+        PostProjectionCache {
+            compiled: None,
+            compile_failed: true,
+            sql_cache: Some(sql_cache),
+        },
+        schema,
+    ))
 }
 
 #[cfg(all(test, feature = "cluster"))]
@@ -640,30 +706,15 @@ impl ProjectingJoinState {
         if self.cache.compiled.is_some() || self.cache.sql_cache.is_some() {
             return Ok(());
         }
-        if !self.cache.compile_failed {
-            if let Some(compiled) = try_compile_post_projection(
-                &self.ctx,
-                projection_sql,
-                self.tmp_table_name,
-                input_schema,
-            )
-            .await
-            {
-                self.cache.compiled = Some(compiled);
-                return Ok(());
-            }
-            self.cache.compile_failed = true;
-        }
-        self.cache.sql_cache = Some(
-            LiveSqlCache::build(
-                &self.ctx,
-                self.tmp_table_name,
-                Arc::clone(input_schema),
-                projection_sql,
-                &self.op_name,
-            )
-            .await?,
-        );
+        let (cache, _) = prepare_post_projection(
+            &self.ctx,
+            projection_sql,
+            self.tmp_table_name,
+            input_schema,
+            &self.op_name,
+        )
+        .await?;
+        self.cache = cache;
         Ok(())
     }
 }
@@ -721,6 +772,8 @@ mod post_projection_tests {
     use super::*;
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use laminar_sql::temporal::{TemporalJoinKind, TemporalProbeSchedule};
+    use laminar_sql::translator::TemporalJoinTranslatorConfig;
 
     #[tokio::test]
     async fn compiled_post_projection_applies_where_filter() {
@@ -757,5 +810,80 @@ mod post_projection_tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(adjusted.values(), &[21, 31]);
+    }
+
+    #[tokio::test]
+    async fn temporal_composite_output_name_is_independent_of_registration_key() {
+        let ctx = SessionContext::new();
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("trade_id", DataType::Int64, false),
+            Field::new("price_quotes", DataType::Int64, false),
+        ]));
+        let config = TemporalJoinTranslatorConfig {
+            left_table: "trades".into(),
+            right_table: "quotes".into(),
+            left_key_columns: vec!["symbol".into()],
+            right_key_columns: vec!["symbol".into()],
+            left_time_column: "trade_time".into(),
+            right_time_column: "quote_time".into(),
+            join_kind: TemporalJoinKind::Left,
+            probe_schedule: TemporalProbeSchedule::as_of(),
+            probe_alias: None,
+        };
+        let sql = "SELECT t.trade_id + q.price FROM trades t LEFT JOIN quotes \
+            FOR SYSTEM_TIME AS OF t.trade_time AS q ON t.symbol = q.symbol";
+
+        let mut schemas = Vec::new();
+        for table in ["__temporal_schema_first", "__temporal_schema_second"] {
+            let projection =
+                crate::sql_analysis::temporal_projection_sql_for_input(sql, &config, table)
+                    .unwrap();
+            let (_, schema) = prepare_post_projection(
+                &ctx,
+                &projection,
+                table,
+                &input_schema,
+                "temporal projection test",
+            )
+            .await
+            .unwrap();
+            assert!(!ctx.table_exist(exact_table_reference(table)).unwrap());
+            schemas.push(schema);
+        }
+
+        assert_eq!(schemas[0], schemas[1]);
+        let name = schemas[0].field(0).name();
+        assert!(!name.contains("__temporal_schema_first"));
+        assert!(!name.contains("__temporal_schema_second"));
+        assert!(!name.contains("__temporal_projection_input"), "{name}");
+
+        let collision = "__temporal_schema_collision";
+        let sentinel: Arc<dyn TableProvider> = Arc::new(
+            datafusion::datasource::MemTable::try_new(Arc::clone(&input_schema), vec![vec![]])
+                .unwrap(),
+        );
+        ctx.register_table(exact_table_reference(collision), Arc::clone(&sentinel))
+            .unwrap();
+        let projection =
+            crate::sql_analysis::temporal_projection_sql_for_input(sql, &config, collision)
+                .unwrap();
+        let error = match prepare_post_projection(
+            &ctx,
+            &projection,
+            collision,
+            &input_schema,
+            "temporal projection collision",
+        )
+        .await
+        {
+            Ok(_) => panic!("temporary planning table collision was admitted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("already exists"), "{error}");
+        let restored = ctx
+            .table_provider(exact_table_reference(collision))
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&restored, &sentinel));
     }
 }

@@ -2304,7 +2304,7 @@ fn managed_temporal_operator_internal_construction_uses_two_positioned_inputs() 
 }
 
 #[test]
-fn temporal_internal_construction_fails_closed_without_schemas_and_public_admission_stays_closed() {
+fn temporal_public_graph_admission_builds_managed_operator_and_requires_schemas() {
     use laminar_sql::translator::JoinOperatorConfig;
 
     let config = temporal_join_config();
@@ -2331,25 +2331,35 @@ fn temporal_internal_construction_fails_closed_without_schemas_and_public_admiss
         .contains("no registered schema for left source"));
 
     let mut graph = test_graph();
+    graph.set_temporal_join_idle_history_retention(Some(std::time::Duration::from_secs(60)));
     let (left_schema, right_schema) = temporal_source_schemas();
     graph.register_source_schema("trades".into(), left_schema);
     graph.register_source_schema("quotes".into(), right_schema);
     graph.add_query(
         "trade_quotes".into(),
-        "SELECT * FROM trades".into(),
+        "SELECT t.trade_id, q.price FROM trades t LEFT JOIN quotes \
+         FOR SYSTEM_TIME AS OF t.trade_time AS q ON t.symbol = q.symbol"
+            .into(),
         None,
         None,
         None,
         Some(vec![JoinOperatorConfig::Temporal(config)]),
         false,
     );
-    assert!(!graph.has_query("trade_quotes"));
-    assert!(graph.nodes.is_empty());
-    assert!(graph
-        .take_build_errors()
-        .unwrap_err()
-        .to_string()
-        .contains("temporal joins require the managed two-input vnode operator"));
+    graph.take_build_errors().unwrap();
+    assert!(graph.has_query("trade_quotes"));
+    let node = graph.output_map["trade_quotes"];
+    assert_eq!(
+        graph.nodes[node].capability,
+        OperatorCapability::managed_temporal_join()
+    );
+    assert_eq!(
+        graph.input_sources[node],
+        [
+            graph.positioned_source_map["trades"],
+            graph.positioned_source_map["quotes"],
+        ]
+    );
 }
 
 #[test]

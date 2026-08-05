@@ -23,6 +23,7 @@ pub(crate) struct SourceRegistration {
 pub(crate) struct SinkRegistration {
     pub name: String,
     pub input: String,
+    pub query_inputs: Vec<String>,
     pub connector_type: Option<String>,
     pub connector_options: HashMap<String, String>,
     pub format: Option<String>,
@@ -392,6 +393,7 @@ mod tests {
         mgr.register_sink(SinkRegistration {
             name: "output".to_string(),
             input: "events".to_string(),
+            query_inputs: Vec::new(),
             connector_type: Some("KAFKA".to_string()),
             connector_options: HashMap::new(),
             format: None,
@@ -446,6 +448,7 @@ mod tests {
         mgr.register_sink(SinkRegistration {
             name: "k1".to_string(),
             input: "s1".to_string(),
+            query_inputs: Vec::new(),
             connector_type: None,
             connector_options: HashMap::new(),
             format: None,
@@ -518,6 +521,7 @@ mod tests {
         mgr.register_sink(SinkRegistration {
             name: "test".to_string(),
             input: "events".to_string(),
+            query_inputs: Vec::new(),
             connector_type: Some("POSTGRES".to_string()),
             connector_options: HashMap::new(),
             format: None,
@@ -559,6 +563,7 @@ mod tests {
         mgr.register_sink(SinkRegistration {
             name: "s1".to_string(),
             input: "src".to_string(),
+            query_inputs: Vec::new(),
             connector_type: None,
             connector_options: HashMap::new(),
             format: None,
@@ -733,6 +738,7 @@ mod tests {
         let reg = SinkRegistration {
             name: "output".to_string(),
             input: "events".to_string(),
+            query_inputs: Vec::new(),
             connector_type: Some("KAFKA".to_string()),
             connector_options: HashMap::from([("topic".to_string(), "output".to_string())]),
             format: Some("JSON".to_string()),
@@ -761,6 +767,7 @@ mod tests {
         let reg = SinkRegistration {
             name: "output".to_string(),
             input: "events".to_string(),
+            query_inputs: Vec::new(),
             connector_type: Some("kafka".to_string()),
             connector_options: HashMap::from([(
                 "DELIVERY.GUARANTEE".to_string(),
@@ -813,6 +820,7 @@ mod tests {
         let reg = SinkRegistration {
             name: "output".to_string(),
             input: "events".to_string(),
+            query_inputs: Vec::new(),
             connector_type: None,
             connector_options: HashMap::new(),
             format: None,
@@ -832,6 +840,7 @@ mod tests {
         let reg = SinkRegistration {
             name: "output".to_string(),
             input: "events".to_string(),
+            query_inputs: Vec::new(),
             connector_type: Some("KAFKA".to_string()),
             connector_options: HashMap::new(),
             format: Some("NOPE".to_string()),
@@ -941,6 +950,7 @@ mod tests {
         let reg = SinkRegistration {
             name: "lake".to_string(),
             input: "events".to_string(),
+            query_inputs: Vec::new(),
             connector_type: Some("DELTA-LAKE".to_string()),
             connector_options: HashMap::new(),
             format: None,

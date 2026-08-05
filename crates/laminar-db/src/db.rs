@@ -3583,7 +3583,7 @@ impl LaminarDB {
                 } else if matches!(stmt.as_ref(), sqlparser::ast::Statement::Query(_)) {
                     if crate::sql_analysis::has_temporal_query(sql) {
                         Err(DbError::Unsupported(
-                            "direct temporal queries require the managed vnode runtime; create a stream or materialized view after temporal runtime admission is enabled"
+                            "direct temporal queries require the managed vnode runtime; create the temporal stream while the pipeline is stopped"
                                 .into(),
                         ))
                     } else {
@@ -3596,7 +3596,7 @@ impl LaminarDB {
                 }
             }
             StreamingStatement::TemporalProbeQuery { .. } => Err(DbError::Unsupported(
-                "TEMPORAL PROBE JOIN requires the managed vnode runtime and cannot execute as an ordinary SQL join"
+                "TEMPORAL PROBE JOIN requires a managed stream created while the pipeline is stopped and cannot execute as an ordinary SQL query"
                     .into(),
             )),
             StreamingStatement::InsertInto {

@@ -973,12 +973,12 @@ pub(crate) struct TrackedSourceRegistration {
     primary_key: Vec<String>,
     primary_key_indices: Vec<usize>,
     schema_admitted: bool,
+    temporal_right_mutations: bool,
     task_fence: ConnectorTaskFenceRegistration,
 }
 
 pub(crate) const MUTATION_SOURCE_NOT_ADMITTED: &str =
-    "[LDB-5039] mutation sources are not admitted until route-aware stateful operator wiring is \
-     installed";
+    "[LDB-5039] mutation sources require an exclusively admitted stateful operator route";
 
 pub(crate) fn admit_append_only_source(
     contract: SourceContract,
@@ -1045,6 +1045,7 @@ impl TrackedSourceRegistration {
             primary_key: Vec::new(),
             primary_key_indices: Vec::new(),
             schema_admitted: false,
+            temporal_right_mutations: false,
             task_fence,
         })
     }
@@ -1066,6 +1067,7 @@ impl TrackedSourceRegistration {
             primary_key: Vec::new(),
             primary_key_indices: Vec::new(),
             schema_admitted: false,
+            temporal_right_mutations: false,
             task_fence,
         })
     }
@@ -1097,6 +1099,11 @@ impl TrackedSourceRegistration {
 
     pub(crate) const fn contract(&self) -> SourceContract {
         self.contract
+    }
+
+    pub(crate) fn with_temporal_right_mutations(mut self) -> Self {
+        self.temporal_right_mutations = true;
+        self
     }
 
     fn has_reserved_mutation_columns(&self) -> bool {
@@ -1173,6 +1180,7 @@ pub struct StreamingCoordinator {
     source_fault_rx: tokio::sync::mpsc::UnboundedReceiver<SourceFault>,
     source_handles: Vec<SourceHandle>,
     source_names: Vec<Arc<str>>,
+    source_mutations_admitted: Vec<bool>,
     shutdown: Arc<tokio::sync::Notify>,
     terminal_shutdown: tokio_util::sync::CancellationToken,
     pending_barrier: PendingBarrier,
@@ -2611,17 +2619,28 @@ impl StreamingCoordinator {
                     source.name
                 )));
             }
-            admit_append_only_source(
-                source.contract(),
-                source.has_reserved_mutation_columns(),
-            )
-            .map_err(|reason| {
-                DbError::Config(format!(
-                    "source '{}' is not admissible through the public coordinator: {reason} (contract: {:?})",
-                    source.name,
-                    source.contract()
-                ))
-            })?;
+            if source.temporal_right_mutations {
+                if source.contract().input_mode != SourceInputMode::KeyedUpsert
+                    || source.has_reserved_mutation_columns()
+                {
+                    return Err(DbError::Config(format!(
+                        "source '{}' lost its admitted temporal-right mutation contract",
+                        source.name
+                    )));
+                }
+            } else {
+                admit_append_only_source(
+                    source.contract(),
+                    source.has_reserved_mutation_columns(),
+                )
+                .map_err(|reason| {
+                    DbError::Config(format!(
+                        "source '{}' is not admissible through the public coordinator: {reason} (contract: {:?})",
+                        source.name,
+                        source.contract()
+                    ))
+                })?;
+            }
         }
         Ok(())
     }
@@ -3159,6 +3178,7 @@ impl StreamingCoordinator {
         let (source_fault_tx, source_fault_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut source_handles = Vec::with_capacity(source_count);
         let mut source_names = Vec::with_capacity(source_count);
+        let mut source_mutations_admitted = Vec::with_capacity(source_count);
         let source_runtime = tokio::runtime::Handle::current();
 
         for (idx, prepared) in prepared_sources.into_iter().enumerate() {
@@ -3172,6 +3192,7 @@ impl StreamingCoordinator {
                 primary_key,
                 primary_key_indices,
                 schema_admitted: _,
+                temporal_right_mutations,
                 task_fence,
             } = registration;
             let terminal_tasks = task_fence.tracker();
@@ -4274,6 +4295,7 @@ impl StreamingCoordinator {
                 epoch_committed_tx,
             });
             source_names.push(arc_name);
+            source_mutations_admitted.push(temporal_right_mutations);
             task_fence.handoff();
         }
 
@@ -4283,6 +4305,7 @@ impl StreamingCoordinator {
             source_fault_rx,
             source_handles,
             source_names,
+            source_mutations_admitted,
             shutdown,
             terminal_shutdown: tokio_util::sync::CancellationToken::new(),
             pending_barrier: PendingBarrier::new(),
@@ -5565,12 +5588,21 @@ impl StreamingCoordinator {
             ))
         })?;
         let has_mutations = batch.column_by_name(SOURCE_MUTATION_COLUMN).is_some();
+        let mutations_admitted = self
+            .source_mutations_admitted
+            .get(source_idx)
+            .copied()
+            .ok_or_else(|| {
+                CycleError::Recovery(format!(
+                    "source '{name}' has no mutation-admission slot at runtime index {source_idx}"
+                ))
+            })?;
         let visible = strip_source_row_positions(&batch).map_err(|error| {
             CycleError::Recovery(format!(
                 "source '{name}' emitted invalid hidden metadata: {error}"
             ))
         })?;
-        if has_mutations {
+        if has_mutations && !mutations_admitted {
             return Err(CycleError::Recovery(format!(
                 "source '{name}' emitted mutations on the ordinary append-only route"
             )));

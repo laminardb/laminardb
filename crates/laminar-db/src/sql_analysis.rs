@@ -11,7 +11,7 @@ use datafusion_expr::LogicalPlan;
 use sqlparser::ast::{
     visit_expressions, CastKind, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
     GroupByExpr, Ident, ObjectName, ObjectNamePart, SelectFlavor, SelectItem, SetExpr, Statement,
-    TableFactor, TableVersion, WildcardAdditionalOptions,
+    TableFactor, TableVersion, Visit, Visitor, WildcardAdditionalOptions,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -57,11 +57,74 @@ pub(crate) fn extract_table_references(sql: &str) -> FxHashSet<String> {
     if let Ok(statements) = Parser::parse_sql(&dialect, sql) {
         for stmt in &statements {
             if let Statement::Query(query) = stmt {
-                collect_tables_from_set_expr(query.body.as_ref(), &mut tables);
+                let _ = query.visit(&mut TableReferenceVisitor::new(&mut tables));
             }
         }
     }
     tables
+}
+
+struct TableReferenceVisitor<'a> {
+    tables: &'a mut FxHashSet<String>,
+    cte_scopes: Vec<Vec<Ident>>,
+}
+
+impl<'a> TableReferenceVisitor<'a> {
+    fn new(tables: &'a mut FxHashSet<String>) -> Self {
+        Self {
+            tables,
+            cte_scopes: Vec::new(),
+        }
+    }
+
+    fn is_cte(&self, reference: &str) -> bool {
+        self.cte_scopes.iter().rev().flatten().any(|alias| {
+            if alias.quote_style.is_some() {
+                alias.value == reference
+            } else {
+                alias.value.eq_ignore_ascii_case(reference)
+            }
+        })
+    }
+}
+
+impl Visitor for TableReferenceVisitor<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &sqlparser::ast::Query) -> ControlFlow<Self::Break> {
+        self.cte_scopes.push(
+            query
+                .with
+                .as_ref()
+                .map(|with| {
+                    with.cte_tables
+                        .iter()
+                        .map(|cte| cte.alias.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &sqlparser::ast::Query) -> ControlFlow<Self::Break> {
+        self.cte_scopes.pop();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        match factor {
+            TableFactor::Table { .. } if is_inline_unnest_factor(factor) => {}
+            TableFactor::Table { name, args, .. } => {
+                let source = resolve_tvf_source(name, args.as_ref());
+                if !self.is_cte(&source) {
+                    self.tables.insert(source);
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 /// Column indices of `schema` to fetch for partial lookup `table`, for projection pushdown.
@@ -178,48 +241,6 @@ pub(crate) fn single_source_table(sql: &str) -> Option<String> {
         tables.into_iter().next()
     } else {
         None
-    }
-}
-
-fn collect_tables_from_set_expr(set_expr: &SetExpr, tables: &mut FxHashSet<String>) {
-    match set_expr {
-        SetExpr::Select(select) => {
-            for table_with_joins in &select.from {
-                collect_tables_from_factor(&table_with_joins.relation, tables);
-                for join in &table_with_joins.joins {
-                    collect_tables_from_factor(&join.relation, tables);
-                }
-            }
-        }
-        SetExpr::SetOperation { left, right, .. } => {
-            collect_tables_from_set_expr(left.as_ref(), tables);
-            collect_tables_from_set_expr(right.as_ref(), tables);
-        }
-        SetExpr::Query(query) => {
-            collect_tables_from_set_expr(query.body.as_ref(), tables);
-        }
-        _ => {}
-    }
-}
-
-fn collect_tables_from_factor(factor: &TableFactor, tables: &mut FxHashSet<String>) {
-    match factor {
-        TableFactor::Table { .. } if is_inline_unnest_factor(factor) => {}
-        TableFactor::Table { name, args, .. } => {
-            tables.insert(resolve_tvf_source(name, args.as_ref()));
-        }
-        TableFactor::Derived { subquery, .. } => {
-            collect_tables_from_set_expr(subquery.body.as_ref(), tables);
-        }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => {
-            collect_tables_from_factor(&table_with_joins.relation, tables);
-            for join in &table_with_joins.joins {
-                collect_tables_from_factor(&join.relation, tables);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1549,13 +1570,21 @@ fn validate_temporal_expr(
                     .right_alias
                     .as_deref()
                     .unwrap_or(config.right_table.as_str());
-                let known = unquoted_identifier_eq(&qualifier.value, left_qualifier)
-                    || unquoted_identifier_eq(&qualifier.value, right_qualifier)
-                    || config
-                        .probe_alias
-                        .as_deref()
-                        .is_some_and(|probe| unquoted_identifier_eq(&qualifier.value, probe));
-                if qualifier.quote_style.is_some() || column.quote_style.is_some() || !known {
+                let probe = config
+                    .probe_alias
+                    .as_deref()
+                    .is_some_and(|probe| unquoted_identifier_eq(&qualifier.value, probe));
+                let known_join = unquoted_identifier_eq(&qualifier.value, left_qualifier)
+                    || unquoted_identifier_eq(&qualifier.value, right_qualifier);
+                if qualifier.quote_style.is_some() || column.quote_style.is_some() {
+                    Some("column references must use an unquoted join or probe qualifier")
+                } else if probe
+                    && !["offset_ms", "probe_time"]
+                        .iter()
+                        .any(|name| unquoted_identifier_eq(&column.value, name))
+                {
+                    Some("the probe qualifier exposes only offset_ms and probe_time")
+                } else if !known_join && !probe {
                     Some("column references must use an unquoted join or probe qualifier")
                 } else {
                     None
@@ -1610,11 +1639,22 @@ pub(crate) fn temporal_projection_sql(
     sql: &str,
     config: &TemporalJoinTranslatorConfig,
 ) -> Result<String, DbError> {
+    temporal_projection_sql_for_input(sql, config, "__temporal_tmp")
+}
+
+const TEMPORAL_PROJECTION_INPUT_ALIAS: &str = "__temporal_projection_input";
+
+pub(crate) fn temporal_projection_sql_for_input(
+    sql: &str,
+    config: &TemporalJoinTranslatorConfig,
+    input_table: &str,
+) -> Result<String, DbError> {
     let (select, temporal_analysis) = parse_temporal_query(sql, config)?;
     Ok(build_temporal_projection_sql(
         &select,
         &temporal_analysis,
         config,
+        input_table,
     ))
 }
 
@@ -2171,6 +2211,7 @@ fn build_temporal_projection_sql(
     select: &sqlparser::ast::Select,
     analysis: &laminar_sql::parser::join_parser::JoinAnalysis,
     config: &TemporalJoinTranslatorConfig,
+    input_table: &str,
 ) -> String {
     let left_qualifier = analysis
         .left_alias
@@ -2186,7 +2227,14 @@ fn build_temporal_projection_sql(
         .iter()
         .map(|item| match item {
             SelectItem::UnnamedExpr(expr) => {
-                rewrite_temporal_expr(expr, left_qualifier, right_qualifier, config)
+                let rewritten =
+                    rewrite_temporal_expr(expr, left_qualifier, right_qualifier, config);
+                if matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                    rewritten
+                } else {
+                    let alias = expr.to_string().replace('"', "\"\"");
+                    format!("{rewritten} AS \"{alias}\"")
+                }
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 let rewritten =
@@ -2215,7 +2263,7 @@ fn build_temporal_projection_sql(
     });
 
     format!(
-        "SELECT {select_clause} FROM __temporal_tmp{}",
+        "SELECT {select_clause} FROM {input_table} AS {TEMPORAL_PROJECTION_INPUT_ALIAS}{}",
         where_clause.unwrap_or_default()
     )
 }

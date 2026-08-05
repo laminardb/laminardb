@@ -153,7 +153,7 @@ impl OperatorCapability {
             Implementation::TemporalJoin => Self::rejected(
                 implementation,
                 State::VnodeKeyed,
-                "temporal state is DDL-closed until ordered cluster channels and recovery are certified",
+                "temporal joins require the managed temporal operator construction path",
             ),
             Implementation::AiInference => Self::rejected(
                 implementation,
@@ -235,7 +235,7 @@ impl OperatorCapability {
         .with_managed_state(ManagedStateContract::BoundedIntervalJoinV1)
     }
 
-    /// Descriptor for the managed temporal operator while its DDL cutover remains closed.
+    /// Descriptor for the managed temporal operator.
     pub(crate) const fn managed_temporal_join() -> Self {
         Self::ddl_guarded(
             OperatorImplementation::TemporalJoin,
@@ -357,7 +357,8 @@ mod tests {
                 Implementation::TemporalJoin,
                 State::VnodeKeyed,
                 Rejected {
-                    reason: "temporal state is DDL-closed until ordered cluster channels and recovery are certified",
+                    reason:
+                        "temporal joins require the managed temporal operator construction path",
                 },
             ),
             (

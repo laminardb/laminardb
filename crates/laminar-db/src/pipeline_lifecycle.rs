@@ -8,7 +8,8 @@ use futures::FutureExt;
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{
     ConnectorCancellationPolicy, DeliveryGuarantee, SinkConnector, SinkConsistency, SinkContract,
-    SinkTopology, SourceConsistency, SourceContract, SourceInputMode, SourceTopology,
+    SinkTopology, SourceConsistency, SourceContract, SourceInputMode, SourceRowPositionCapability,
+    SourceTopology,
 };
 use laminar_core::checkpoint::object_store_builder::CheckpointStorageScope;
 use rustc_hash::FxHashMap;
@@ -199,6 +200,15 @@ fn admit_source_contract(
         return Err(KEYED_SOURCE_PRIMARY_KEY);
     }
     admit_append_only_source(contract, has_reserved_mutation_columns)?;
+    admit_source_recovery_contract(contract, delivery, checkpointing_enabled, runtime)
+}
+
+fn admit_source_recovery_contract(
+    contract: SourceContract,
+    delivery: DeliveryGuarantee,
+    checkpointing_enabled: bool,
+    runtime: RuntimeMode,
+) -> Result<(), &'static str> {
     if delivery == DeliveryGuarantee::ExactlyOnce && !contract.is_exact_delivery_certified() {
         return Err(
             "[LDB-5037] exactly-once source delivery is not production-certified for this \
@@ -245,6 +255,94 @@ fn admit_source_contract(
     }
 
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TemporalSourceRole {
+    Left,
+    Right,
+}
+
+impl TemporalSourceRole {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
+fn admit_temporal_source_contract(
+    contract: SourceContract,
+    role: TemporalSourceRole,
+    has_primary_key: bool,
+    has_reserved_mutation_columns: bool,
+    delivery: DeliveryGuarantee,
+    checkpointing_enabled: bool,
+    runtime: RuntimeMode,
+) -> Result<(), &'static str> {
+    if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::BestEffort {
+        return Err(CLUSTER_BEST_EFFORT);
+    }
+    if delivery != DeliveryGuarantee::BestEffort && !checkpointing_enabled {
+        return Err(
+            "at-least-once and exactly-once temporal joins require checkpointing for state and source-offset recovery",
+        );
+    }
+    if contract.row_positions != SourceRowPositionCapability::OrderedDeterministic {
+        return Err("temporal joins require ordered deterministic row positions");
+    }
+    if has_reserved_mutation_columns {
+        return Err("temporal source schemas cannot declare engine-owned mutation columns");
+    }
+    match (role, contract.input_mode) {
+        (TemporalSourceRole::Left, SourceInputMode::AppendOnly)
+        | (TemporalSourceRole::Right, SourceInputMode::AppendOnly | SourceInputMode::KeyedUpsert) =>
+            {}
+        (TemporalSourceRole::Left, _) => {
+            return Err("temporal left inputs must be append-only");
+        }
+        (TemporalSourceRole::Right, SourceInputMode::FullChangelog) => {
+            return Err(
+                "temporal right inputs support append-only or keyed-upsert mutations, not full changelogs",
+            );
+        }
+    }
+    if contract.input_mode == SourceInputMode::KeyedUpsert && !has_primary_key {
+        return Err(KEYED_SOURCE_PRIMARY_KEY);
+    }
+    admit_source_recovery_contract(contract, delivery, checkpointing_enabled, runtime)
+}
+
+fn has_only_temporal_right_consumers(
+    source: &str,
+    stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+    sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
+) -> bool {
+    if sink_regs
+        .values()
+        .any(|sink| sink.input == source || sink.query_inputs.iter().any(|input| input == source))
+    {
+        return false;
+    }
+    let mut consumed = false;
+    for stream in stream_regs.values() {
+        if let Some([laminar_sql::translator::JoinOperatorConfig::Temporal(config)]) =
+            stream.join_config.as_deref()
+        {
+            if config.right_table == source && config.left_table != source {
+                consumed = true;
+                continue;
+            }
+            if config.left_table == source || config.right_table == source {
+                return false;
+            }
+        }
+        if crate::sql_analysis::extract_table_references(&stream.query_sql).contains(source) {
+            return false;
+        }
+    }
+    consumed
 }
 
 fn validate_source_recovery_assignment(
@@ -888,6 +986,42 @@ pub(crate) async fn plan_output_schema(
     Some(Arc::new(arrow_schema::Schema::new(fields)))
 }
 
+pub(crate) async fn plan_temporal_output_schema(
+    ctx: &datafusion::prelude::SessionContext,
+    stream: &str,
+    sql: &str,
+    config: &laminar_sql::translator::TemporalJoinTranslatorConfig,
+    left_schema: &arrow_schema::SchemaRef,
+    right_schema: &arrow_schema::SchemaRef,
+) -> Result<arrow_schema::SchemaRef, DbError> {
+    let left = laminar_connectors::connector::schema_with_source_row_positions(left_schema)
+        .map_err(|error| {
+            DbError::Config(format!(
+                "temporal stream '{stream}' left source-position schema: {error}"
+            ))
+        })?;
+    let right = laminar_connectors::connector::schema_with_source_row_positions(right_schema)
+        .map_err(|error| {
+            DbError::Config(format!(
+                "temporal stream '{stream}' right source-position schema: {error}"
+            ))
+        })?;
+    let joined = crate::temporal_join_state::temporal_join_output_schema(
+        left.as_ref(),
+        right.as_ref(),
+        &config.right_table,
+        config.join_kind,
+        config.probe_alias.is_some(),
+    )?;
+    let input_table = format!("__temporal_schema_{}", uuid::Uuid::new_v4().simple());
+    let projection =
+        crate::sql_analysis::temporal_projection_sql_for_input(sql, config, &input_table)?;
+    let what = format!("temporal stream '{stream}' projection");
+    crate::operator::prepare_post_projection(ctx, &projection, &input_table, &joined, &what)
+        .await
+        .map(|(_, schema)| schema)
+}
+
 async fn resolve_stream_output_schemas(
     ctx: &datafusion::prelude::SessionContext,
     stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
@@ -907,25 +1041,67 @@ async fn resolve_stream_output_schemas(
             let mut next: Vec<&crate::connector_manager::StreamRegistration> = Vec::new();
             let mut progressed = false;
             for reg in pending {
-                let Ok(plan) = ctx.state().create_logical_plan(&reg.query_sql).await else {
-                    next.push(reg);
-                    continue;
-                };
-                let fields: Vec<_> = plan
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|field| (**field).clone())
-                    .collect();
-                let schema = Arc::new(arrow_schema::Schema::new(fields));
-                shapes.insert(
-                    reg.name.clone(),
-                    StreamOutputShape {
-                        aggregate: crate::aggregate_state::find_aggregate(&plan).is_some(),
-                        projection_filter: crate::sql_analysis::extract_projection_filter(&plan)
+                let temporal = reg.join_config.as_deref().and_then(|joins| match joins {
+                    [laminar_sql::translator::JoinOperatorConfig::Temporal(config)] => Some(config),
+                    _ => None,
+                });
+                let (schema, shape) = if let Some(config) = temporal {
+                    let left = ctx
+                        .table_provider(exact_table_reference(&config.left_table))
+                        .await
+                        .map_err(|error| {
+                            DbError::Pipeline(format!(
+                                "temporal stream '{}' cannot resolve left source '{}': {error}",
+                                reg.name, config.left_table
+                            ))
+                        })?;
+                    let right = ctx
+                        .table_provider(exact_table_reference(&config.right_table))
+                        .await
+                        .map_err(|error| {
+                            DbError::Pipeline(format!(
+                                "temporal stream '{}' cannot resolve right source '{}': {error}",
+                                reg.name, config.right_table
+                            ))
+                        })?;
+                    (
+                        plan_temporal_output_schema(
+                            ctx,
+                            &reg.name,
+                            &reg.query_sql,
+                            config,
+                            &left.schema(),
+                            &right.schema(),
+                        )
+                        .await?,
+                        StreamOutputShape {
+                            aggregate: false,
+                            projection_filter: false,
+                        },
+                    )
+                } else {
+                    let Ok(plan) = ctx.state().create_logical_plan(&reg.query_sql).await else {
+                        next.push(reg);
+                        continue;
+                    };
+                    let fields = plan
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| (**field).clone())
+                        .collect::<Vec<_>>();
+                    (
+                        Arc::new(arrow_schema::Schema::new(fields)),
+                        StreamOutputShape {
+                            aggregate: crate::aggregate_state::find_aggregate(&plan).is_some(),
+                            projection_filter: crate::sql_analysis::extract_projection_filter(
+                                &plan,
+                            )
                             .is_some(),
-                    },
-                );
+                        },
+                    )
+                };
+                shapes.insert(reg.name.clone(), shape);
 
                 if !ctx
                     .table_exist(exact_table_reference(&reg.name))
@@ -2918,6 +3094,272 @@ impl LaminarDB {
         }
         Ok(bound_pipeline_identity)
     }
+
+    pub(crate) fn validate_temporal_source_metadata(
+        &self,
+        stream: &str,
+        config: &laminar_sql::translator::TemporalJoinTranslatorConfig,
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+    ) -> Result<
+        (
+            Arc<crate::catalog::SourceEntry>,
+            Arc<crate::catalog::SourceEntry>,
+        ),
+        DbError,
+    > {
+        use arrow_schema::DataType;
+
+        if config.left_key_columns.is_empty()
+            || config.left_key_columns.len() != config.right_key_columns.len()
+        {
+            return Err(DbError::Config(format!(
+                "temporal stream '{stream}' requires paired equality keys"
+            )));
+        }
+        let left = self.catalog.get_source(&config.left_table).ok_or_else(|| {
+            DbError::Config(format!(
+                "temporal stream '{stream}' left source '{}' is absent from the source catalog",
+                config.left_table
+            ))
+        })?;
+        let right = self
+            .catalog
+            .get_source(&config.right_table)
+            .ok_or_else(|| {
+                DbError::Config(format!(
+                "temporal stream '{stream}' right source '{}' is absent from the source catalog",
+                config.right_table
+                ))
+            })?;
+
+        for (role, source_name, time_column, entry) in [
+            (
+                TemporalSourceRole::Left,
+                config.left_table.as_str(),
+                config.left_time_column.as_str(),
+                &left,
+            ),
+            (
+                TemporalSourceRole::Right,
+                config.right_table.as_str(),
+                config.right_time_column.as_str(),
+                &right,
+            ),
+        ] {
+            let source_reg = source_regs.get(source_name).ok_or_else(|| {
+                DbError::Config(format!(
+                    "temporal stream '{stream}' {} input '{source_name}' must be a direct configured source; catalog bridges and intermediate streams are unsupported",
+                    role.name()
+                ))
+            })?;
+            if source_reg.connector_type.is_none() || source_reg.name != source_name {
+                return Err(DbError::Config(format!(
+                    "temporal stream '{stream}' {} input '{source_name}' must be a direct configured source; catalog bridges and intermediate streams are unsupported",
+                    role.name()
+                )));
+            }
+            laminar_connectors::connector::schema_with_source_row_positions(&entry.schema)
+                .map_err(|error| {
+                    DbError::Config(format!(
+                        "temporal stream '{stream}' {} source-position schema: {error}",
+                        role.name()
+                    ))
+                })?;
+            if entry
+                .is_processing_time
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(DbError::Config(format!(
+                    "temporal stream '{stream}' {} source '{source_name}' must use event time, not processing time",
+                    role.name()
+                )));
+            }
+            if entry.watermark_column.as_deref() != Some(time_column)
+                || entry.max_out_of_orderness.is_none()
+            {
+                return Err(DbError::Config(format!(
+                    "temporal stream '{stream}' {} source '{source_name}' must declare WATERMARK FOR {time_column} with a bounded out-of-orderness policy",
+                    role.name()
+                )));
+            }
+            let field = entry.schema.field_with_name(time_column).map_err(|_| {
+                DbError::Config(format!(
+                    "temporal stream '{stream}' {} time column '{time_column}' is absent",
+                    role.name()
+                ))
+            })?;
+            if field.is_nullable() || !matches!(field.data_type(), DataType::Timestamp(_, _)) {
+                return Err(DbError::Config(format!(
+                    "temporal stream '{stream}' {} time column '{time_column}' must be a non-null timestamp",
+                    role.name()
+                )));
+            }
+        }
+
+        let mut key_types = Vec::with_capacity(config.left_key_columns.len());
+        for (left_key, right_key) in config
+            .left_key_columns
+            .iter()
+            .zip(&config.right_key_columns)
+        {
+            let left_field = left.schema.field_with_name(left_key).map_err(|_| {
+                DbError::Config(format!(
+                    "temporal stream '{stream}' left key column '{left_key}' is absent"
+                ))
+            })?;
+            let right_field = right.schema.field_with_name(right_key).map_err(|_| {
+                DbError::Config(format!(
+                    "temporal stream '{stream}' right key column '{right_key}' is absent"
+                ))
+            })?;
+            if left_field.data_type() != right_field.data_type() {
+                return Err(DbError::Config(format!(
+                    "temporal stream '{stream}' key types must match exactly"
+                )));
+            }
+            key_types.push(left_field.data_type().clone());
+        }
+        laminar_core::state::PartitionKeyCodecV1::try_new(key_types).map_err(|error| {
+            DbError::Config(format!(
+                "temporal stream '{stream}' key is not partitionable: {error}"
+            ))
+        })?;
+
+        Ok((left, right))
+    }
+
+    pub(crate) fn validate_persisted_temporal_source_contracts(
+        &self,
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+        sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
+        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+        runtime: RuntimeMode,
+    ) -> Result<FxHashMap<String, TemporalSourceRole>, DbError> {
+        use laminar_sql::translator::JoinOperatorConfig;
+
+        let mut streams: Vec<_> = stream_regs.values().collect();
+        streams.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut contracts = HashMap::new();
+        let mut temporal_source_roles = FxHashMap::default();
+        let mut retention_validated = false;
+        for stream in streams {
+            let Some(joins) = stream.join_config.as_deref() else {
+                continue;
+            };
+            for join in joins {
+                let JoinOperatorConfig::Temporal(config) = join else {
+                    continue;
+                };
+                if !retention_validated {
+                    crate::config::temporal_join_idle_history_retention_ms(
+                        self.config.temporal_join_idle_history_retention,
+                    )
+                    .map_err(|reason| {
+                        DbError::Config(format!("temporal stream '{}': {reason}", stream.name))
+                    })?;
+                    retention_validated = true;
+                }
+                let (left_entry, right_entry) =
+                    self.validate_temporal_source_metadata(&stream.name, config, source_regs)?;
+                for (role, source_name, entry) in [
+                    (
+                        TemporalSourceRole::Left,
+                        config.left_table.as_str(),
+                        left_entry.as_ref(),
+                    ),
+                    (
+                        TemporalSourceRole::Right,
+                        config.right_table.as_str(),
+                        right_entry.as_ref(),
+                    ),
+                ] {
+                    let source_reg = &source_regs[source_name];
+                    let contract = match contracts.get(source_name).copied() {
+                        Some(contract) => contract,
+                        None => {
+                            let connector_config = self
+                                .build_registered_source_config(source_name, source_reg)
+                                .map_err(|error| {
+                                    DbError::Config(format!(
+                                        "temporal source '{source_name}' has invalid connector configuration: {error}"
+                                    ))
+                                })?;
+                            let connector = self
+                                .connector_registry
+                                .create_source(&connector_config, None)
+                                .map_err(|error| {
+                                    DbError::Config(format!(
+                                        "cannot construct temporal source '{source_name}' for contract validation: {error}"
+                                    ))
+                                })?;
+                            let connector_schema = connector.schema();
+                            if !connector_schema.fields().is_empty()
+                                && connector_schema.as_ref() != entry.schema.as_ref()
+                            {
+                                return Err(DbError::Config(format!(
+                                    "temporal source '{source_name}' connector schema does not match its catalog schema"
+                                )));
+                            }
+                            let contract = connector.contract(&connector_config).map_err(|error| {
+                                DbError::Config(format!(
+                                    "temporal source '{source_name}' has an invalid connector contract: {error}"
+                                ))
+                            })?;
+                            contracts.insert(source_name.to_string(), contract);
+                            contract
+                        }
+                    };
+                    if matches!(role, TemporalSourceRole::Right)
+                        && contract.input_mode == SourceInputMode::KeyedUpsert
+                    {
+                        if !has_only_temporal_right_consumers(source_name, stream_regs, sink_regs) {
+                            return Err(DbError::Config(format!(
+                                "temporal right mutation source '{source_name}' has a non-temporal-right consumer"
+                            )));
+                        }
+                    }
+                    admit_temporal_source_contract(
+                        contract,
+                        role,
+                        !entry.primary_key.is_empty(),
+                        schema_has_reserved_mutation_columns(entry.schema.as_ref()),
+                        self.config.delivery_guarantee,
+                        self.config.checkpoint.is_some(),
+                        runtime,
+                    )
+                    .map_err(|reason| {
+                        DbError::Config(format!(
+                            "temporal stream '{}' {} source '{}' is not admissible in {runtime:?} mode with {} delivery: {reason} (contract: {contract:?})",
+                            stream.name,
+                            role.name(),
+                            source_name,
+                            self.config.delivery_guarantee
+                        ))
+                    })?;
+                    temporal_source_roles
+                        .entry(source_name.to_string())
+                        .or_insert(role);
+                }
+            }
+        }
+        Ok(temporal_source_roles)
+    }
+
+    fn build_registered_source_config(
+        &self,
+        source_name: &str,
+        registration: &crate::connector_manager::SourceRegistration,
+    ) -> Result<laminar_connectors::config::ConnectorConfig, DbError> {
+        let mut config = crate::connector_manager::build_source_config(registration)?;
+        if let Some(entry) = self.catalog.get_source(source_name) {
+            config.set(
+                "_arrow_schema".to_string(),
+                crate::pipeline_callback::encode_arrow_schema(&entry.schema),
+            );
+        }
+        Ok(config)
+    }
+
     async fn start_inner(&self) -> Result<(), DbError> {
         let runtime_shutdown = tokio_util::sync::CancellationToken::new();
         *self.runtime_shutdown.write() = runtime_shutdown.clone();
@@ -2945,6 +3387,13 @@ impl LaminarDB {
         }
 
         let startup_runtime = self.runtime_mode();
+
+        let temporal_source_roles = self.validate_persisted_temporal_source_contracts(
+            &source_regs,
+            &sink_regs,
+            &stream_regs,
+            startup_runtime,
+        )?;
 
         let injected_cluster_checkpoint_store =
             self.validate_startup_durability(startup_runtime)?;
@@ -2976,6 +3425,7 @@ impl LaminarDB {
                 table_regs,
                 has_external,
                 pipeline_identity,
+                temporal_source_roles,
                 runtime_shutdown,
             )
             .await?;
@@ -3184,11 +3634,11 @@ impl LaminarDB {
     fn build_pipeline_sources(
         &self,
         source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+        temporal_source_roles: &FxHashMap<String, TemporalSourceRole>,
         checkpointing_enabled: bool,
         runtime_mode: RuntimeMode,
         prom_registry: Option<&Arc<prometheus::Registry>>,
     ) -> Result<Vec<TrackedSourceRegistration>, DbError> {
-        use crate::connector_manager::build_source_config;
         use crate::pipeline::SourceRegistration;
         use laminar_connectors::connector::SourceConnector as _;
         let mut sources: Vec<TrackedSourceRegistration> = Vec::new();
@@ -3196,13 +3646,8 @@ impl LaminarDB {
             if reg.connector_type.is_none() {
                 continue;
             }
-            let mut config = build_source_config(reg)?;
-
             let source_entry = self.catalog.get_source(name);
-            if let Some(entry) = source_entry.as_ref() {
-                let schema_str = crate::pipeline_callback::encode_arrow_schema(&entry.schema);
-                config.set("_arrow_schema".to_string(), schema_str);
-            }
+            let config = self.build_registered_source_config(name, reg)?;
 
             let source = self
                 .connector_registry
@@ -3234,25 +3679,45 @@ impl LaminarDB {
                     source.with_admitted_schema(entry.schema.clone(), entry.primary_key.clone())?;
             }
             let contract = source.contract();
-            admit_source_contract(
-                contract,
-                source_entry
-                    .as_ref()
-                    .is_some_and(|entry| !entry.primary_key.is_empty()),
-                source_entry.as_ref().is_some_and(|entry| {
-                    schema_has_reserved_mutation_columns(entry.schema.as_ref())
-                }),
-                self.config.delivery_guarantee,
-                checkpointing_enabled,
-                runtime_mode,
-            )
-            .map_err(|reason| {
+            let has_primary_key = source_entry
+                .as_ref()
+                .is_some_and(|entry| !entry.primary_key.is_empty());
+            let has_reserved_mutation_columns = source_entry
+                .as_ref()
+                .is_some_and(|entry| schema_has_reserved_mutation_columns(entry.schema.as_ref()));
+            let temporal_role = temporal_source_roles.get(name).copied();
+            let admission = if let Some(role) = temporal_role {
+                admit_temporal_source_contract(
+                    contract,
+                    role,
+                    has_primary_key,
+                    has_reserved_mutation_columns,
+                    self.config.delivery_guarantee,
+                    checkpointing_enabled,
+                    runtime_mode,
+                )
+            } else {
+                admit_source_contract(
+                    contract,
+                    has_primary_key,
+                    has_reserved_mutation_columns,
+                    self.config.delivery_guarantee,
+                    checkpointing_enabled,
+                    runtime_mode,
+                )
+            };
+            admission.map_err(|reason| {
                 DbError::Config(format!(
                     "source '{name}' is not admissible in {runtime_mode:?} mode with {} delivery: \
                      {reason} (contract: {contract:?})",
                     self.config.delivery_guarantee
                 ))
             })?;
+            if matches!(temporal_role, Some(TemporalSourceRole::Right))
+                && contract.input_mode == SourceInputMode::KeyedUpsert
+            {
+                source = source.with_temporal_right_mutations();
+            }
             let assignment_scoped = cfg!(feature = "cluster")
                 && runtime_mode == RuntimeMode::Cluster
                 && contract.topology == SourceTopology::Splittable;
@@ -4871,6 +5336,7 @@ impl LaminarDB {
         table_regs: HashMap<String, crate::connector_manager::TableRegistration>,
         has_external: bool,
         pipeline_identity: Option<laminar_core::checkpoint::PipelineIdentity>,
+        temporal_source_roles: FxHashMap<String, TemporalSourceRole>,
         runtime_shutdown: tokio_util::sync::CancellationToken,
     ) -> Result<(), DbError> {
         use crate::pipeline::{CheckpointSchedule, PipelineConfig};
@@ -4961,6 +5427,7 @@ impl LaminarDB {
         let prom_registry = self.prometheus_registry.lock().clone();
         let mut sources = self.build_pipeline_sources(
             &source_regs,
+            &temporal_source_roles,
             checkpointing_enabled,
             runtime_mode,
             prom_registry.as_ref(),
