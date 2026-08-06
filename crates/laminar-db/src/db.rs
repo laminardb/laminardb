@@ -3,8 +3,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use arrow::array::{RecordBatch, StringArray};
+use arrow::array::{Array, BinaryArray, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
 use laminar_core::catalog::CatalogObjectKind;
@@ -789,10 +790,376 @@ pub(crate) type ForceCheckpointRx =
 
 pub(crate) const FORCE_CHECKPOINT_CHANNEL_CAPACITY: usize = 64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecoveredInputChannelProgress {
+    pub(crate) watermark: Option<i64>,
+    pub(crate) idle: bool,
+}
+
+pub(crate) struct InputChannelProgress {
+    pub(crate) input_channel: Vec<u8>,
+    pub(crate) watermark: Option<i64>,
+    pub(crate) idle: bool,
+}
+
+struct InputChannelWatermark {
+    generator: laminar_core::time::BoundedOutOfOrdernessGenerator,
+    idle: bool,
+    last_activity: Instant,
+}
+
+struct PartitionedSourceWatermarks {
+    max_out_of_orderness_ms: i64,
+    max_future_skew_ms: i64,
+    idle_timeout: Option<Duration>,
+    inventory: Option<Arc<[Vec<u8>]>>,
+    channels: rustc_hash::FxHashMap<Box<[u8]>, InputChannelWatermark>,
+    recovered: rustc_hash::FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>,
+    recovered_inventory: Option<Arc<[Vec<u8>]>>,
+    external_floor: i64,
+}
+
+impl PartitionedSourceWatermarks {
+    fn channel(
+        &self,
+        recovered: Option<RecoveredInputChannelProgress>,
+        admission_floor: i64,
+    ) -> InputChannelWatermark {
+        let mut generator =
+            laminar_core::time::BoundedOutOfOrdernessGenerator::new(self.max_out_of_orderness_ms)
+                .with_max_future_skew(self.max_future_skew_ms);
+        let watermark = recovered
+            .and_then(|progress| progress.watermark)
+            .map_or(admission_floor, |watermark| watermark.max(admission_floor));
+        if watermark > i64::MIN {
+            laminar_core::time::WatermarkGenerator::restore_watermark_for_recovery(
+                &mut generator,
+                watermark,
+            );
+        }
+        InputChannelWatermark {
+            generator,
+            idle: recovered.is_some_and(|progress| progress.idle),
+            last_activity: Instant::now(),
+        }
+    }
+
+    fn effective_watermark(&self, channel: &InputChannelWatermark) -> i64 {
+        laminar_core::time::WatermarkGenerator::current_watermark(&channel.generator)
+            .max(self.external_floor)
+    }
+
+    fn frontier(&self) -> i64 {
+        if self.channels.is_empty() {
+            return i64::MIN;
+        }
+        let mut active = false;
+        let mut active_min = i64::MAX;
+        let mut idle_max = i64::MIN;
+        for channel in self.channels.values() {
+            let watermark = self.effective_watermark(channel);
+            idle_max = idle_max.max(watermark);
+            if !channel.idle {
+                active = true;
+                active_min = active_min.min(watermark);
+            }
+        }
+        if active {
+            active_min
+        } else {
+            idle_max
+        }
+    }
+
+    fn all_idle(&self) -> bool {
+        self.inventory
+            .as_ref()
+            .is_some_and(|_| self.channels.values().all(|channel| channel.idle))
+    }
+}
+
 pub(crate) struct SourceWatermarkState {
     pub(crate) extractor: laminar_core::time::EventTimeExtractor,
     pub(crate) generator: Box<dyn laminar_core::time::WatermarkGenerator>,
     pub(crate) column: String,
+    partitioned: Option<PartitionedSourceWatermarks>,
+}
+
+impl SourceWatermarkState {
+    pub(crate) fn new(
+        extractor: laminar_core::time::EventTimeExtractor,
+        generator: Box<dyn laminar_core::time::WatermarkGenerator>,
+        column: String,
+    ) -> Self {
+        Self {
+            extractor,
+            generator,
+            column,
+            partitioned: None,
+        }
+    }
+
+    pub(crate) fn with_input_channels(
+        mut self,
+        max_out_of_orderness: Duration,
+        max_future_skew_ms: i64,
+        idle_timeout: Option<Duration>,
+        recovered: rustc_hash::FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>,
+        recovered_inventory: Option<Arc<[Vec<u8>]>>,
+    ) -> Self {
+        self.partitioned = Some(PartitionedSourceWatermarks {
+            max_out_of_orderness_ms: i64::try_from(max_out_of_orderness.as_millis())
+                .unwrap_or(i64::MAX),
+            max_future_skew_ms,
+            idle_timeout,
+            inventory: None,
+            channels: rustc_hash::FxHashMap::default(),
+            recovered,
+            recovered_inventory,
+            external_floor: i64::MIN,
+        });
+        self
+    }
+
+    pub(crate) const fn is_partitioned(&self) -> bool {
+        self.partitioned.is_some()
+    }
+
+    pub(crate) fn input_channels_all_idle(&self) -> Option<bool> {
+        self.partitioned
+            .as_ref()
+            .map(PartitionedSourceWatermarks::all_idle)
+    }
+
+    pub(crate) fn install_input_channels(
+        &mut self,
+        inventory: Option<Arc<[Vec<u8>]>>,
+        admission_floor: i64,
+    ) -> Result<bool, String> {
+        let activation_floor = admission_floor.max(self.generator.current_watermark());
+        let Some(state) = self.partitioned.as_mut() else {
+            return Ok(false);
+        };
+        let inventory = inventory.ok_or_else(|| {
+            "ordered event-time source checkpoint omitted its input-channel inventory".to_string()
+        })?;
+        if inventory.iter().any(Vec::is_empty)
+            || !inventory.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            return Err(
+                "input-channel inventory must contain non-empty, strictly ordered identities"
+                    .into(),
+            );
+        }
+        if state.inventory.as_ref().is_some_and(|installed| {
+            Arc::ptr_eq(installed, &inventory) || installed.as_ref() == inventory.as_ref()
+        }) {
+            return Ok(false);
+        }
+
+        let initial_install = state.inventory.is_none();
+        if initial_install {
+            let recovered_expected = state.recovered_inventory.as_deref();
+            if let Some(input_channel) = inventory.iter().find(|input_channel| {
+                !state.recovered.contains_key(input_channel.as_slice())
+                    && recovered_expected.is_some_and(|expected| {
+                        expected
+                            .binary_search_by(|candidate| candidate.as_slice().cmp(input_channel))
+                            .is_ok()
+                    })
+            }) {
+                return Err(format!(
+                    "recovered input channel {input_channel:02x?} has no committed watermark progress"
+                ));
+            }
+        }
+        let mut previous = std::mem::take(&mut state.channels);
+        let mut channels = rustc_hash::FxHashMap::with_capacity_and_hasher(
+            inventory.len(),
+            rustc_hash::FxBuildHasher,
+        );
+        for input_channel in inventory.iter() {
+            if let Some(channel) = previous.remove(input_channel.as_slice()) {
+                channels.insert(input_channel.clone().into_boxed_slice(), channel);
+                continue;
+            }
+            let recovered = if initial_install {
+                state.recovered.remove(input_channel.as_slice())
+            } else {
+                None
+            };
+            channels.insert(
+                input_channel.clone().into_boxed_slice(),
+                state.channel(recovered, activation_floor),
+            );
+        }
+        if initial_install {
+            state.recovered.clear();
+            state.recovered_inventory = None;
+        }
+        state.inventory = Some(inventory);
+        state.channels = channels;
+        self.generator.advance_watermark(state.frontier());
+        Ok(true)
+    }
+
+    pub(crate) fn observe_input_channels(
+        &mut self,
+        batch: &RecordBatch,
+        admission_floor: i64,
+    ) -> Result<Option<i64>, String> {
+        let Some(state) = self.partitioned.as_mut() else {
+            let floor = self.generator.advance_watermark(admission_floor);
+            let event = match self.extractor.extract(batch) {
+                Ok(timestamp) => self.generator.on_event(timestamp).map(|wm| wm.timestamp()),
+                Err(laminar_core::time::EventTimeError::NullTimestamp { .. }) => None,
+                Err(error) => return Err(error.to_string()),
+            };
+            return Ok(event.or_else(|| floor.map(|watermark| watermark.timestamp())));
+        };
+        if state.inventory.is_none() {
+            return Err("ordered event-time source emitted a batch before installing its input-channel inventory".into());
+        }
+        let timestamps = self
+            .extractor
+            .extract_millis_array(batch)
+            .map_err(|error| error.to_string())?;
+        let partitions = batch
+            .column_by_name(laminar_connectors::connector::SOURCE_PARTITION_COLUMN)
+            .ok_or_else(|| "ordered event-time batch omitted __source_partition".to_string())?
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                "ordered event-time batch __source_partition must be Binary".to_string()
+            })?;
+        if partitions.len() != timestamps.len() {
+            return Err("event-time and input-channel column lengths differ".into());
+        }
+
+        let observed_at = Instant::now();
+        let activation_floor = admission_floor.max(self.generator.current_watermark());
+        for row in 0..timestamps.len() {
+            if partitions.is_null(row) {
+                return Err(format!("null input-channel identity at row {row}"));
+            }
+            let input_channel = partitions.value(row);
+            let channel = state.channels.get_mut(input_channel).ok_or_else(|| {
+                format!("row {row} references an input channel outside the installed inventory")
+            })?;
+            if channel.idle {
+                laminar_core::time::WatermarkGenerator::advance_watermark(
+                    &mut channel.generator,
+                    activation_floor,
+                );
+            }
+            channel.idle = false;
+            channel.last_activity = observed_at;
+            if !timestamps.is_null(row) {
+                laminar_core::time::WatermarkGenerator::on_event(
+                    &mut channel.generator,
+                    timestamps.value(row),
+                );
+            }
+        }
+        let frontier = state.frontier();
+        Ok(self
+            .generator
+            .advance_watermark(frontier)
+            .map(|watermark| watermark.timestamp()))
+    }
+
+    pub(crate) fn advance_external_watermark(&mut self, watermark: i64) -> Option<i64> {
+        if let Some(state) = self.partitioned.as_mut() {
+            let candidate_floor = state.external_floor.max(watermark);
+            let frontier = state.frontier().max(candidate_floor);
+            let current = self.generator.current_watermark();
+            let advanced = self.generator.advance_watermark(frontier);
+            if frontier > current && advanced.is_none() {
+                return None;
+            }
+            state.external_floor = candidate_floor;
+            advanced.map(|watermark| watermark.timestamp())
+        } else {
+            self.generator
+                .advance_watermark(watermark)
+                .map(|watermark| watermark.timestamp())
+        }
+    }
+
+    pub(crate) fn tick_input_channel_idleness(&mut self) -> (Option<i64>, bool) {
+        let Some(state) = self.partitioned.as_mut() else {
+            return (
+                self.generator
+                    .on_periodic()
+                    .map(|watermark| watermark.timestamp()),
+                false,
+            );
+        };
+        let now = Instant::now();
+        let external_floor = state.external_floor;
+        let mut has_channel = false;
+        let mut has_active = false;
+        let mut active_min = i64::MAX;
+        let mut idle_max = i64::MIN;
+        for channel in state.channels.values_mut() {
+            has_channel = true;
+            if !channel.idle
+                && state.idle_timeout.is_some_and(|timeout| {
+                    now.saturating_duration_since(channel.last_activity) >= timeout
+                })
+            {
+                channel.idle = true;
+            }
+            let watermark =
+                laminar_core::time::WatermarkGenerator::current_watermark(&channel.generator)
+                    .max(external_floor);
+            idle_max = idle_max.max(watermark);
+            if !channel.idle {
+                has_active = true;
+                active_min = active_min.min(watermark);
+            }
+        }
+        let frontier = if !has_channel {
+            i64::MIN
+        } else if has_active {
+            active_min
+        } else {
+            idle_max
+        };
+        (
+            self.generator
+                .advance_watermark(frontier)
+                .map(|watermark| watermark.timestamp()),
+            state.inventory.is_some() && !has_active,
+        )
+    }
+
+    pub(crate) fn input_channel_progress(
+        &self,
+    ) -> Result<Option<Vec<InputChannelProgress>>, String> {
+        let Some(state) = self.partitioned.as_ref() else {
+            return Ok(None);
+        };
+        let inventory = state.inventory.as_ref().ok_or_else(|| {
+            "ordered event-time source has no installed input-channel inventory".to_string()
+        })?;
+        let mut progress = Vec::with_capacity(inventory.len());
+        for input_channel in inventory.iter() {
+            let channel = state
+                .channels
+                .get(input_channel.as_slice())
+                .ok_or_else(|| {
+                    "installed input-channel inventory and watermark state diverged".to_string()
+                })?;
+            let watermark = state.effective_watermark(channel);
+            progress.push(InputChannelProgress {
+                input_channel: input_channel.clone(),
+                watermark: (watermark > i64::MIN).then_some(watermark),
+                idle: channel.idle,
+            });
+        }
+        Ok(Some(progress))
+    }
 }
 
 /// Keep rows at/after the watermark. `Ok(None)` = all rows late;
@@ -2256,7 +2623,6 @@ impl LaminarDB {
             return Ok(SnapshotAdoption {
                 adopted: false,
                 version: snapshot.version,
-                ..SnapshotAdoption::default()
             });
         }
         // A successor cannot reinterpret transition bytes staged for the current assignment.
@@ -2478,7 +2844,6 @@ impl LaminarDB {
             return Ok(SnapshotAdoption {
                 adopted: false,
                 version: snapshot.version,
-                ..SnapshotAdoption::default()
             });
         }
 
@@ -2601,7 +2966,6 @@ impl LaminarDB {
             return Ok(SnapshotAdoption {
                 adopted: false,
                 version: snapshot.version,
-                ..SnapshotAdoption::default()
             });
         }
         if current_version != prepared_from_version {

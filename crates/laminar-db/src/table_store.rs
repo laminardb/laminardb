@@ -56,7 +56,7 @@ impl ReferenceTableCheckpointCapture {
         self.estimated_bytes
     }
 
-    pub(crate) fn encode(self, max_encoded_bytes: u64) -> Result<bytes::Bytes, DbError> {
+    pub(crate) fn encode(self, max_encoded_bytes: u64) -> Result<(bytes::Bytes, u64), DbError> {
         let max_encoded_bytes = max_encoded_bytes.min(MAX_REFERENCE_TABLE_CHECKPOINT_BYTES as u64);
         let mut entries = Vec::with_capacity(self.tables.len());
         let mut retained_payload_bytes = 0u64;
@@ -182,7 +182,9 @@ impl ReferenceTableCheckpointCapture {
         debug_assert!(
             retained_payload_bytes.saturating_add(encoded.capacity() as u64) <= max_encoded_bytes
         );
-        Ok(bytes::Bytes::from(encoded))
+        let retained_bytes = u64::try_from(encoded.capacity())
+            .map_err(|_| DbError::Checkpoint("reference-table checkpoint size overflow".into()))?;
+        Ok((bytes::Bytes::from(encoded), retained_bytes))
     }
 }
 
@@ -843,6 +845,7 @@ mod tests {
             .expect("non-empty table inventory")
             .encode(u64::MAX)
             .unwrap()
+            .0
     }
 
     fn rewrite_archive(
@@ -1329,7 +1332,8 @@ mod tests {
         store
             .upsert("t", &make_batch(&[1], &["new"], &[2.0]))
             .unwrap();
-        let encoded = capture.encode(u64::MAX).unwrap();
+        let (encoded, retained_bytes) = capture.encode(u64::MAX).unwrap();
+        assert!(retained_bytes >= encoded.len() as u64);
         let mut restored = TableStore::new();
         restored.create_table("t", test_schema(), "id").unwrap();
         restored.restore_checkpoint(&encoded).unwrap();

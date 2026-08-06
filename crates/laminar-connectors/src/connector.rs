@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
-use crate::checkpoint::SourceCheckpoint;
+use crate::checkpoint::{SourceCheckpoint, SourceCheckpointDelta};
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 
@@ -514,7 +514,7 @@ pub struct SourceMutationView<'a> {
     values: &'a UInt8Array,
 }
 
-impl<'a> SourceMutationView<'a> {
+impl SourceMutationView<'_> {
     /// Number of row mutations.
     #[must_use]
     pub fn len(self) -> usize {
@@ -827,6 +827,16 @@ pub struct SourceBatch {
     pub records: RecordBatch,
     row_positions: Option<SourceRowPositions>,
     mutations: Option<Box<[SourceMutation]>>,
+    cursor: Option<SourceBatchCursor>,
+}
+
+/// Source progress captured with one emitted batch.
+#[derive(Debug, Clone)]
+pub enum SourceBatchCursor {
+    /// Complete recovery cursor captured with the batch.
+    Complete(SourceCheckpoint),
+    /// Changed offsets extending a complete cursor emitted earlier.
+    Incremental(SourceCheckpointDelta),
 }
 
 impl SourceBatch {
@@ -837,6 +847,7 @@ impl SourceBatch {
             records,
             row_positions: None,
             mutations: None,
+            cursor: None,
         }
     }
 
@@ -853,6 +864,7 @@ impl SourceBatch {
             records,
             row_positions: Some(row_positions),
             mutations: None,
+            cursor: None,
         })
     }
 
@@ -879,6 +891,25 @@ impl SourceBatch {
             .contains(&SourceMutation::Tombstone)
             .then_some(mutations);
         Ok(self)
+    }
+
+    /// Bind the exact source cursor captured with this batch.
+    #[must_use]
+    pub fn with_checkpoint(mut self, checkpoint: SourceCheckpoint) -> Self {
+        self.cursor = Some(SourceBatchCursor::Complete(checkpoint));
+        self
+    }
+
+    /// Bind changed offsets from the assignment checkpoint already published by an earlier batch.
+    #[must_use]
+    pub fn with_checkpoint_delta(mut self, delta: SourceCheckpointDelta) -> Self {
+        self.cursor = Some(SourceBatchCursor::Incremental(delta));
+        self
+    }
+
+    /// Remove the source cursor bound to this batch, when present.
+    pub fn take_cursor(&mut self) -> Option<SourceBatchCursor> {
+        self.cursor.take()
     }
 
     /// Deterministic row positions, when supplied by the connector.
@@ -909,6 +940,7 @@ impl SourceBatch {
             records,
             row_positions,
             mutations,
+            cursor: _,
         } = self;
         match (capability, row_positions) {
             (SourceRowPositionCapability::Unavailable, None) if mutations.is_none() => Ok(records),

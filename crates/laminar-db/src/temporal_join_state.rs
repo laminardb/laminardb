@@ -32,23 +32,13 @@ const TIMER_ENTRY_CHARGE: usize = 96;
 const BATCH_CHARGE: usize = 256;
 const BASE_STATE_CHARGE: usize = 512;
 const HISTORY_KEY_ROSTER_CHARGE: usize = 32;
+const CAPTURE_ALLOCATION_CHARGE: usize = 32;
 const POSITION_COLUMN_COUNT: usize = 3;
 
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TemporalSourcePosition {
-    partition: Vec<u8>,
-    order: Vec<u8>,
+    partition: Arc<[u8]>,
+    order: Arc<[u8]>,
     sub_offset: u32,
 }
 
@@ -103,6 +93,7 @@ pub(crate) struct TemporalReadyDrain {
 
 pub(crate) struct TemporalHistoryGcDrain {
     pub(crate) steps: usize,
+    #[cfg(test)]
     pub(crate) removed_versions: usize,
     pub(crate) has_more: bool,
 }
@@ -118,13 +109,14 @@ struct RetainedBatch {
     references: usize,
 }
 
+#[derive(Clone, Copy)]
 struct Version {
     row: Option<(u64, u32)>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
 struct MutationIdentity {
-    key: Option<Box<[u8]>>,
+    key: Option<Arc<[u8]>>,
     event_time: Option<i64>,
     tombstone: bool,
     payload_fingerprint: [u8; 16],
@@ -132,20 +124,21 @@ struct MutationIdentity {
 
 #[derive(Clone, PartialEq, Eq)]
 struct LeftRowIdentity {
-    key: Option<Box<[u8]>>,
+    key: Option<Arc<[u8]>>,
     event_time: Option<i64>,
     payload_fingerprint: [u8; 16],
 }
 
+#[derive(Clone)]
 struct ReplayCursor {
-    order: Box<[u8]>,
+    order: Arc<[u8]>,
     sub_offset: u32,
 }
 
 impl ReplayCursor {
     fn from_source(source: &TemporalSourcePosition) -> Self {
         Self {
-            order: source.order.clone().into_boxed_slice(),
+            order: Arc::clone(&source.order),
             sub_offset: source.sub_offset,
         }
     }
@@ -153,17 +146,19 @@ impl ReplayCursor {
     fn compare(&self, source: &TemporalSourcePosition) -> Ordering {
         source
             .order
-            .as_slice()
+            .as_ref()
             .cmp(self.order.as_ref())
             .then_with(|| source.sub_offset.cmp(&self.sub_offset))
     }
 }
 
+#[derive(Clone)]
 struct RightReplayFrontier {
     cursor: ReplayCursor,
     identity: MutationIdentity,
 }
 
+#[derive(Clone)]
 struct LeftReplayFrontier {
     cursor: ReplayCursor,
     identity: LeftRowIdentity,
@@ -175,10 +170,11 @@ struct ProbeIdentity {
     offset_ms: i64,
 }
 
+#[derive(Clone)]
 struct PendingProbe {
     left_batch: u64,
     left_row: u32,
-    key: Box<[u8]>,
+    key: Arc<[u8]>,
     left_event_time: i64,
     probe_time: i64,
     deadline: i64,
@@ -199,7 +195,7 @@ struct HistoryGcRemoval {
 }
 
 type VersionChain = BTreeMap<(i64, TemporalSourcePosition), Version>;
-type VnodeHistory = FxHashMap<Box<[u8]>, VersionChain>;
+type VnodeHistory = FxHashMap<Arc<[u8]>, Arc<VersionChain>>;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct CheckpointConfig {
@@ -242,17 +238,44 @@ struct CheckpointLeftReplayFrontier {
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct CheckpointSourcePosition {
+    partition: Vec<u8>,
+    order: Vec<u8>,
+    sub_offset: u32,
+}
+
+impl From<&TemporalSourcePosition> for CheckpointSourcePosition {
+    fn from(source: &TemporalSourcePosition) -> Self {
+        Self {
+            partition: source.partition.to_vec(),
+            order: source.order.to_vec(),
+            sub_offset: source.sub_offset,
+        }
+    }
+}
+
+impl From<CheckpointSourcePosition> for TemporalSourcePosition {
+    fn from(source: CheckpointSourcePosition) -> Self {
+        Self {
+            partition: Arc::from(source.partition),
+            order: Arc::from(source.order),
+            sub_offset: source.sub_offset,
+        }
+    }
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct CheckpointVersion {
     key: Vec<u8>,
     event_time: i64,
-    source: TemporalSourcePosition,
+    source: CheckpointSourcePosition,
     tombstone: bool,
     right_row: Option<u32>,
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct CheckpointProbe {
-    source: TemporalSourcePosition,
+    source: CheckpointSourcePosition,
     offset_ms: i64,
     left_row: u32,
     key: Vec<u8>,
@@ -284,6 +307,414 @@ struct TemporalJoinCheckpoint {
     left_rows_ipc: Vec<u8>,
 }
 
+struct CapturedCheckpointHistory {
+    key: Arc<[u8]>,
+    versions: Arc<VersionChain>,
+}
+
+struct CapturedCheckpointProbe {
+    identity: ProbeIdentity,
+    probe: PendingProbe,
+}
+
+pub(crate) struct TemporalJoinCheckpointCapture {
+    checkpoint: TemporalJoinCheckpoint,
+    left_schema: SchemaRef,
+    right_schema: SchemaRef,
+    history: Vec<CapturedCheckpointHistory>,
+    pending: Vec<CapturedCheckpointProbe>,
+    history_key_roster: Vec<Arc<[u8]>>,
+    right_replay_frontiers: Vec<(Arc<[u8]>, RightReplayFrontier)>,
+    left_replay_frontiers: Vec<(Arc<[u8]>, LeftReplayFrontier)>,
+    right_batches: Vec<(u64, Arc<RecordBatch>)>,
+    left_batches: Vec<(u64, Arc<RecordBatch>)>,
+    retained_bytes: usize,
+}
+
+impl TemporalJoinCheckpointCapture {
+    pub(crate) const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    fn capture_allocation_bytes(&self) -> Result<usize, DbError> {
+        fn add(total: &mut usize, bytes: usize) -> Result<(), DbError> {
+            *total = total.checked_add(bytes).ok_or_else(|| {
+                DbError::Checkpoint("temporal checkpoint capture accounting overflow".into())
+            })?;
+            Ok(())
+        }
+
+        fn add_allocation(total: &mut usize, bytes: usize) -> Result<(), DbError> {
+            add(total, bytes)?;
+            if bytes != 0 {
+                add(total, CAPTURE_ALLOCATION_CHARGE)?;
+            }
+            Ok(())
+        }
+
+        fn add_roster<T>(total: &mut usize, capacity: usize) -> Result<(), DbError> {
+            let bytes = capacity
+                .checked_mul(std::mem::size_of::<T>())
+                .ok_or_else(|| {
+                    DbError::Checkpoint("temporal checkpoint roster accounting overflow".into())
+                })?;
+            add_allocation(total, bytes)
+        }
+
+        fn add_string(total: &mut usize, value: &String) -> Result<(), DbError> {
+            add_allocation(total, value.capacity())
+        }
+
+        let mut bytes = std::mem::size_of::<Self>();
+        let config = &self.checkpoint.config;
+        add_roster::<u32>(&mut bytes, config.left_key_indices.capacity())?;
+        add_roster::<u32>(&mut bytes, config.right_key_indices.capacity())?;
+        add_roster::<i64>(&mut bytes, config.offsets.capacity())?;
+        for value in [&config.left_name, &config.right_name, &config.operator_name] {
+            add_string(&mut bytes, value)?;
+        }
+
+        add_roster::<CapturedCheckpointHistory>(&mut bytes, self.history.capacity())?;
+        add_roster::<CapturedCheckpointProbe>(&mut bytes, self.pending.capacity())?;
+        add_roster::<Arc<[u8]>>(&mut bytes, self.history_key_roster.capacity())?;
+        add_roster::<(Arc<[u8]>, RightReplayFrontier)>(
+            &mut bytes,
+            self.right_replay_frontiers.capacity(),
+        )?;
+        add_roster::<(Arc<[u8]>, LeftReplayFrontier)>(
+            &mut bytes,
+            self.left_replay_frontiers.capacity(),
+        )?;
+        add_roster::<(u64, Arc<RecordBatch>)>(&mut bytes, self.right_batches.capacity())?;
+        add_roster::<(u64, Arc<RecordBatch>)>(&mut bytes, self.left_batches.capacity())?;
+        Ok(bytes)
+    }
+
+    fn encoding_scratch_bytes(&self) -> Result<usize, DbError> {
+        fn add(total: &mut usize, bytes: usize) -> Result<(), DbError> {
+            *total = total.checked_add(bytes).ok_or_else(|| {
+                DbError::Checkpoint("temporal checkpoint scratch accounting overflow".into())
+            })?;
+            Ok(())
+        }
+
+        fn add_allocation(total: &mut usize, bytes: usize) -> Result<(), DbError> {
+            add(total, bytes)?;
+            if bytes != 0 {
+                add(total, CAPTURE_ALLOCATION_CHARGE)?;
+            }
+            Ok(())
+        }
+
+        let version_count = self.history.iter().try_fold(0usize, |count, history| {
+            count.checked_add(history.versions.len()).ok_or_else(|| {
+                DbError::Checkpoint("temporal checkpoint version count overflow".into())
+            })
+        })?;
+        let live_version_count = self
+            .history
+            .iter()
+            .flat_map(|history| history.versions.values())
+            .filter(|version| version.row.is_some())
+            .count();
+        let pending_count = self.pending.len();
+        let mut bytes = BASE_STATE_CHARGE;
+        for schema in [&self.left_schema, &self.right_schema] {
+            add(&mut bytes, BATCH_CHARGE)?;
+            for field in schema.fields() {
+                add(&mut bytes, MAP_ENTRY_CHARGE)?;
+                add(&mut bytes, field.name().len())?;
+            }
+            for (key, value) in schema.metadata() {
+                add(&mut bytes, MAP_ENTRY_CHARGE)?;
+                add(&mut bytes, key.len())?;
+                add(&mut bytes, value.len())?;
+            }
+        }
+        for (len, element) in [
+            (live_version_count, std::mem::size_of::<RowRef>()),
+            (version_count, std::mem::size_of::<CheckpointVersion>()),
+            (pending_count, std::mem::size_of::<RowRef>()),
+            (pending_count, std::mem::size_of::<CheckpointProbe>()),
+            (
+                self.history_key_roster.len(),
+                std::mem::size_of::<Vec<u8>>(),
+            ),
+            (
+                self.right_replay_frontiers.len(),
+                std::mem::size_of::<CheckpointRightReplayFrontier>(),
+            ),
+            (
+                self.left_replay_frontiers.len(),
+                std::mem::size_of::<CheckpointLeftReplayFrontier>(),
+            ),
+        ] {
+            let allocation = len.checked_mul(element).ok_or_else(|| {
+                DbError::Checkpoint("temporal checkpoint scratch accounting overflow".into())
+            })?;
+            add_allocation(&mut bytes, allocation)?;
+        }
+        for history in &self.history {
+            for (_, source) in history.versions.keys() {
+                add_allocation(&mut bytes, history.key.len())?;
+                add_allocation(&mut bytes, source.partition.len())?;
+                add_allocation(&mut bytes, source.order.len())?;
+            }
+        }
+        for captured in &self.pending {
+            add_allocation(&mut bytes, captured.probe.key.len())?;
+            add_allocation(&mut bytes, captured.identity.source.partition.len())?;
+            add_allocation(&mut bytes, captured.identity.source.order.len())?;
+        }
+        for key in &self.history_key_roster {
+            add_allocation(&mut bytes, key.len())?;
+        }
+        for (partition, frontier) in &self.right_replay_frontiers {
+            add_allocation(&mut bytes, partition.len())?;
+            add_allocation(&mut bytes, frontier.cursor.order.len())?;
+            if let Some(key) = &frontier.identity.key {
+                add_allocation(&mut bytes, key.len())?;
+            }
+        }
+        for (partition, frontier) in &self.left_replay_frontiers {
+            add_allocation(&mut bytes, partition.len())?;
+            add_allocation(&mut bytes, frontier.cursor.order.len())?;
+            if let Some(key) = &frontier.identity.key {
+                add_allocation(&mut bytes, key.len())?;
+            }
+        }
+
+        let compact_row_scratch = std::mem::size_of::<Option<RowRef>>()
+            .checked_add(2 * std::mem::size_of::<(usize, usize)>())
+            .and_then(|per_row| {
+                live_version_count
+                    .checked_add(pending_count)
+                    .and_then(|rows| rows.checked_mul(per_row))
+            })
+            .ok_or_else(|| {
+                DbError::Checkpoint("temporal checkpoint row scratch overflow".into())
+            })?;
+        add(&mut bytes, compact_row_scratch)?;
+        for (_, batch) in &self.right_batches {
+            add(&mut bytes, batch.get_array_memory_size())?;
+        }
+        let left_repetitions = self.checkpoint.config.offsets.len().max(1);
+        for (_, batch) in &self.left_batches {
+            add(
+                &mut bytes,
+                batch
+                    .get_array_memory_size()
+                    .checked_mul(left_repetitions)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint("temporal checkpoint left compaction overflow".into())
+                    })?,
+            )?;
+        }
+        let archive_entries = version_count
+            .checked_add(pending_count)
+            .and_then(|entries| entries.checked_add(self.history_key_roster.len()))
+            .and_then(|entries| entries.checked_add(self.right_replay_frontiers.len()))
+            .and_then(|entries| entries.checked_add(self.left_replay_frontiers.len()))
+            .ok_or_else(|| {
+                DbError::Checkpoint("temporal checkpoint archive scratch overflow".into())
+            })?;
+        add(
+            &mut bytes,
+            archive_entries
+                .checked_mul(MAP_ENTRY_CHARGE)
+                .ok_or_else(|| {
+                    DbError::Checkpoint("temporal checkpoint archive scratch overflow".into())
+                })?,
+        )?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn encode(
+        self,
+        max_encoded_bytes: usize,
+        frame_tag: Option<u8>,
+    ) -> Result<Vec<u8>, DbError> {
+        fn captured_row(
+            batches: &[(u64, Arc<RecordBatch>)],
+            batch_id: u64,
+            row: u32,
+            side: &str,
+        ) -> Result<RowRef, DbError> {
+            let index = batches
+                .binary_search_by_key(&batch_id, |(id, _)| *id)
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "temporal {side} checkpoint row referenced a missing batch"
+                    ))
+                })?;
+            let batch = &batches[index].1;
+            if row as usize >= batch.num_rows() {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal {side} checkpoint row is out of bounds"
+                )));
+            }
+            Ok(RowRef {
+                batch: Arc::clone(batch),
+                row,
+            })
+        }
+
+        let scratch_bytes = self.encoding_scratch_bytes()?;
+        let encoding_budget = max_encoded_bytes.checked_sub(scratch_bytes).ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "temporal checkpoint scratch requires {scratch_bytes} bytes; encoding headroom is {max_encoded_bytes} bytes"
+            ))
+        })?;
+        let Self {
+            mut checkpoint,
+            left_schema,
+            right_schema,
+            mut history,
+            mut pending,
+            mut history_key_roster,
+            mut right_replay_frontiers,
+            mut left_replay_frontiers,
+            mut right_batches,
+            mut left_batches,
+            retained_bytes: _,
+        } = self;
+        right_batches.sort_unstable_by_key(|(id, _)| *id);
+        left_batches.sort_unstable_by_key(|(id, _)| *id);
+        history.sort_unstable_by(|left, right| left.key.as_ref().cmp(right.key.as_ref()));
+        pending.sort_unstable_by(|left, right| {
+            left.probe
+                .deadline
+                .cmp(&right.probe.deadline)
+                .then_with(|| left.identity.cmp(&right.identity))
+        });
+        right_replay_frontiers
+            .sort_unstable_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
+        left_replay_frontiers.sort_unstable_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
+
+        let version_count = history.iter().map(|history| history.versions.len()).sum();
+        let live_version_count = history
+            .iter()
+            .flat_map(|history| history.versions.values())
+            .filter(|version| version.row.is_some())
+            .count();
+        let mut right_rows = Vec::with_capacity(live_version_count);
+        let mut checkpoint_versions = Vec::with_capacity(version_count);
+        for captured_history in history {
+            for ((event_time, source), version) in captured_history.versions.iter() {
+                let right_row = if let Some((batch, row)) = version.row {
+                    let index = u32::try_from(right_rows.len()).map_err(|_| {
+                        DbError::Checkpoint("temporal checkpoint has too many right rows".into())
+                    })?;
+                    right_rows.push(captured_row(&right_batches, batch, row, "right")?);
+                    Some(index)
+                } else {
+                    None
+                };
+                checkpoint_versions.push(CheckpointVersion {
+                    key: captured_history.key.to_vec(),
+                    event_time: *event_time,
+                    source: source.into(),
+                    tombstone: right_row.is_none(),
+                    right_row,
+                });
+            }
+        }
+
+        let mut left_rows = Vec::with_capacity(pending.len());
+        let mut checkpoint_pending = Vec::with_capacity(pending.len());
+        for probe in pending {
+            let left_row = u32::try_from(left_rows.len()).map_err(|_| {
+                DbError::Checkpoint("temporal checkpoint has too many pending rows".into())
+            })?;
+            left_rows.push(captured_row(
+                &left_batches,
+                probe.probe.left_batch,
+                probe.probe.left_row,
+                "left",
+            )?);
+            checkpoint_pending.push(CheckpointProbe {
+                source: (&probe.identity.source).into(),
+                offset_ms: probe.identity.offset_ms,
+                left_row,
+                key: probe.probe.key.to_vec(),
+                left_event_time: probe.probe.left_event_time,
+                probe_time: probe.probe.probe_time,
+                deadline: probe.probe.deadline,
+                payload_fingerprint: probe.probe.payload_fingerprint,
+            });
+        }
+
+        checkpoint.history_key_roster = history_key_roster
+            .drain(..)
+            .map(|key| key.to_vec())
+            .collect();
+        checkpoint.right_replay_frontiers = right_replay_frontiers
+            .drain(..)
+            .map(|(partition, frontier)| CheckpointRightReplayFrontier {
+                partition: partition.to_vec(),
+                order: frontier.cursor.order.to_vec(),
+                sub_offset: frontier.cursor.sub_offset,
+                key: frontier.identity.key.map(|key| key.to_vec()),
+                event_time: frontier.identity.event_time,
+                tombstone: frontier.identity.tombstone,
+                payload_fingerprint: frontier.identity.payload_fingerprint,
+            })
+            .collect();
+        checkpoint.left_replay_frontiers = left_replay_frontiers
+            .drain(..)
+            .map(|(partition, frontier)| CheckpointLeftReplayFrontier {
+                partition: partition.to_vec(),
+                order: frontier.cursor.order.to_vec(),
+                sub_offset: frontier.cursor.sub_offset,
+                key: frontier.identity.key.map(|key| key.to_vec()),
+                event_time: frontier.identity.event_time,
+                payload_fingerprint: frontier.identity.payload_fingerprint,
+            })
+            .collect();
+
+        let right_rows = compact_rows(&right_schema, &right_rows, "right")?;
+        let left_rows = compact_rows(&left_schema, &left_rows, "left")?;
+        let mut remaining_bytes = encoding_budget;
+        checkpoint.right_rows_ipc = serialize_batches_stream_bounded(
+            right_schema.as_ref(),
+            std::iter::once(&right_rows),
+            remaining_bytes,
+        )
+        .map_err(|error| DbError::Checkpoint(format!("temporal right IPC: {error}")))?;
+        remaining_bytes = remaining_bytes
+            .checked_sub(checkpoint.right_rows_ipc.capacity())
+            .ok_or_else(|| {
+                DbError::Checkpoint("temporal right IPC exceeded its encoding budget".into())
+            })?;
+        checkpoint.left_rows_ipc = serialize_batches_stream_bounded(
+            left_schema.as_ref(),
+            std::iter::once(&left_rows),
+            remaining_bytes,
+        )
+        .map_err(|error| DbError::Checkpoint(format!("temporal left IPC: {error}")))?;
+        remaining_bytes = remaining_bytes
+            .checked_sub(checkpoint.left_rows_ipc.capacity())
+            .ok_or_else(|| {
+                DbError::Checkpoint("temporal left IPC exceeded its encoding budget".into())
+            })?;
+        checkpoint.versions = checkpoint_versions;
+        checkpoint.pending = checkpoint_pending;
+
+        let mut bounded = laminar_core::serialization::BoundedBytesWriter::new(remaining_bytes);
+        if let Some(tag) = frame_tag {
+            std::io::Write::write_all(&mut bounded, &[tag]).map_err(|error| {
+                DbError::Checkpoint(format!("temporal checkpoint frame header: {error}"))
+            })?;
+        }
+        // The tag is outside the archive. Keep rkyv's position relative to the payload while
+        // appending both into one bounded allocation.
+        let writer = rkyv::ser::writer::IoWriter::new(bounded);
+        rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(&checkpoint, writer)
+            .map(|bytes| bytes.into_inner().into_vec())
+            .map_err(|error| DbError::Checkpoint(format!("temporal checkpoint: {error}")))
+    }
+}
+
 pub(crate) struct TemporalJoinVnodeState {
     config: TemporalJoinStateConfig,
     offsets: Vec<i64>,
@@ -295,13 +726,13 @@ pub(crate) struct TemporalJoinVnodeState {
     left_row_codec: RowConverter,
     right_row_codec: RowConverter,
     history: VnodeHistory,
-    history_key_roster: Vec<Box<[u8]>>,
-    right_replay_frontiers: FxHashMap<Box<[u8]>, RightReplayFrontier>,
+    history_key_roster: Vec<Arc<[u8]>>,
+    right_replay_frontiers: FxHashMap<Arc<[u8]>, RightReplayFrontier>,
     right_batches: FxHashMap<u64, RetainedBatch>,
     pending: FxHashMap<ProbeIdentity, PendingProbe>,
     timers: BTreeMap<i64, BTreeSet<ProbeIdentity>>,
     left_batches: FxHashMap<u64, RetainedBatch>,
-    left_replay_frontiers: FxHashMap<Box<[u8]>, LeftReplayFrontier>,
+    left_replay_frontiers: FxHashMap<Arc<[u8]>, LeftReplayFrontier>,
     next_batch_id: u64,
     left_frontier: Option<i64>,
     left_idle: bool,
@@ -386,10 +817,12 @@ impl TemporalJoinVnodeState {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn retained_versions(&self) -> usize {
-        self.history.values().map(BTreeMap::len).sum()
+        self.history.values().map(|versions| versions.len()).sum()
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_probes(&self) -> usize {
         self.pending.len()
     }
@@ -461,7 +894,7 @@ impl TemporalJoinVnodeState {
         let positions = extract_source_positions(batch)?;
         if positions.iter().all(|source| {
             self.right_replay_frontiers
-                .get(source.partition.as_slice())
+                .get(source.partition.as_ref())
                 .is_some_and(|frontier| frontier.cursor.compare(source) == Ordering::Less)
         }) {
             return Ok(TemporalRightApplyStats {
@@ -474,12 +907,12 @@ impl TemporalJoinVnodeState {
         let key_columns = self.key_columns(batch, false);
         let mut stats = TemporalRightApplyStats::default();
         let mut candidates = Vec::new();
-        let mut staged_frontiers: FxHashMap<Box<[u8]>, RightReplayFrontier> = FxHashMap::default();
+        let mut staged_frontiers: FxHashMap<Arc<[u8]>, RightReplayFrontier> = FxHashMap::default();
 
         for (row, source_position) in positions.iter().enumerate() {
             let null_key = key_columns.iter().any(|column| column.is_null(row));
             let key_row = source_rows.map_or(row, |rows| rows[row] as usize);
-            let key = (!null_key).then(|| Box::<[u8]>::from(keys.row(key_row).data()));
+            let key = (!null_key).then(|| Arc::<[u8]>::from(keys.row(key_row).data()));
             let event_time = Some(times.value(row, "right")?);
             if source_rows.is_none() {
                 if let Some(key) = key.as_deref() {
@@ -494,7 +927,7 @@ impl TemporalJoinVnodeState {
                 tombstone,
                 payload_fingerprint: fingerprints[row],
             };
-            if let Some(current) = staged_frontiers.get(source_position.partition.as_slice()) {
+            if let Some(current) = staged_frontiers.get(source_position.partition.as_ref()) {
                 match current.cursor.compare(source_position) {
                     Ordering::Less => {
                         return Err(self.pipeline_error(
@@ -514,7 +947,7 @@ impl TemporalJoinVnodeState {
                 }
             } else if let Some(current) = self
                 .right_replay_frontiers
-                .get(source_position.partition.as_slice())
+                .get(source_position.partition.as_ref())
             {
                 match current.cursor.compare(source_position) {
                     Ordering::Less => {
@@ -534,7 +967,7 @@ impl TemporalJoinVnodeState {
                 }
             }
             staged_frontiers.insert(
-                source_position.partition.clone().into_boxed_slice(),
+                Arc::clone(&source_position.partition),
                 RightReplayFrontier {
                     cursor: ReplayCursor::from_source(source_position),
                     identity,
@@ -628,11 +1061,12 @@ impl TemporalJoinVnodeState {
                 };
                 let replaced = match self.history.entry(key) {
                     std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        entry.get_mut().insert(order, version)
+                        Arc::make_mut(entry.get_mut()).insert(order, version)
                     }
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         self.history_key_roster.push(entry.key().clone());
-                        entry.insert(BTreeMap::new()).insert(order, version)
+                        Arc::make_mut(entry.insert(Arc::new(BTreeMap::new())))
+                            .insert(order, version)
                     }
                 };
                 debug_assert!(replaced.is_none());
@@ -679,7 +1113,7 @@ impl TemporalJoinVnodeState {
         let positions = extract_source_positions(batch)?;
         if positions.iter().all(|source| {
             self.left_replay_frontiers
-                .get(source.partition.as_slice())
+                .get(source.partition.as_ref())
                 .is_some_and(|frontier| frontier.cursor.compare(source) == Ordering::Less)
                 && !self.has_pending_left_source(source)
         }) {
@@ -691,7 +1125,7 @@ impl TemporalJoinVnodeState {
         let input = Arc::new(batch.clone());
         let mut outputs = Vec::new();
         let mut planned = Vec::new();
-        let mut staged_frontiers: FxHashMap<Box<[u8]>, LeftReplayFrontier> = FxHashMap::default();
+        let mut staged_frontiers: FxHashMap<Arc<[u8]>, LeftReplayFrontier> = FxHashMap::default();
 
         for (row, source_position) in positions.iter().enumerate() {
             outputs
@@ -703,7 +1137,7 @@ impl TemporalJoinVnodeState {
             let null_key = key_columns.iter().any(|column| column.is_null(row));
             let event_time = Some(times.value(row, "left")?);
             let key_row = source_rows.map_or(row, |rows| rows[row] as usize);
-            let key = (!null_key).then(|| Box::<[u8]>::from(keys.row(key_row).data()));
+            let key = (!null_key).then(|| Arc::<[u8]>::from(keys.row(key_row).data()));
             if source_rows.is_none() {
                 if let Some(key) = key.as_deref() {
                     self.validate_vnode(key)?;
@@ -716,7 +1150,7 @@ impl TemporalJoinVnodeState {
                 event_time,
                 payload_fingerprint: fingerprints[row as usize],
             };
-            if let Some(current) = staged_frontiers.get(source_position.partition.as_slice()) {
+            if let Some(current) = staged_frontiers.get(source_position.partition.as_ref()) {
                 match current.cursor.compare(source_position) {
                     Ordering::Less => {
                         return Err(self.pipeline_error(
@@ -735,7 +1169,7 @@ impl TemporalJoinVnodeState {
                 }
             } else if let Some(current) = self
                 .left_replay_frontiers
-                .get(source_position.partition.as_slice())
+                .get(source_position.partition.as_ref())
             {
                 match current.cursor.compare(source_position) {
                     Ordering::Less => {
@@ -813,7 +1247,7 @@ impl TemporalJoinVnodeState {
                 }
             }
             staged_frontiers.insert(
-                source_position.partition.clone().into_boxed_slice(),
+                Arc::clone(&source_position.partition),
                 LeftReplayFrontier {
                     cursor: ReplayCursor::from_source(source_position),
                     identity: row_identity,
@@ -1076,49 +1510,151 @@ impl TemporalJoinVnodeState {
         })
     }
 
-    pub(crate) fn checkpoint(&self, max_encoded_bytes: usize) -> Result<Vec<u8>, DbError> {
-        let (versions, right_rows) = self.checkpoint_versions()?;
-        let (pending, left_rows) = self.checkpoint_pending()?;
-        let right_rows_ipc = serialize_batches_stream_bounded(
-            self.right_schema.as_ref(),
-            std::iter::once(&right_rows),
-            max_encoded_bytes,
-        )
-        .map_err(|error| DbError::Checkpoint(format!("temporal right IPC: {error}")))?;
-        let left_rows_ipc = serialize_batches_stream_bounded(
-            self.left_schema.as_ref(),
-            std::iter::once(&left_rows),
-            max_encoded_bytes,
-        )
-        .map_err(|error| DbError::Checkpoint(format!("temporal left IPC: {error}")))?;
-        let mut right_replay_frontiers: Vec<_> = self.right_replay_frontiers.iter().collect();
-        right_replay_frontiers
-            .sort_unstable_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
-        let right_replay_frontiers = right_replay_frontiers
-            .into_iter()
-            .map(|(partition, frontier)| CheckpointRightReplayFrontier {
-                partition: partition.to_vec(),
-                order: frontier.cursor.order.to_vec(),
-                sub_offset: frontier.cursor.sub_offset,
-                key: frontier.identity.key.as_deref().map(<[u8]>::to_vec),
-                event_time: frontier.identity.event_time,
-                tombstone: frontier.identity.tombstone,
-                payload_fingerprint: frontier.identity.payload_fingerprint,
+    pub(crate) fn capture_checkpoint(
+        &self,
+        max_capture_bytes: usize,
+    ) -> Result<TemporalJoinCheckpointCapture, DbError> {
+        let roster_bytes = |len: usize, element: usize| {
+            len.checked_mul(element)
+                .and_then(|bytes| {
+                    bytes.checked_add(usize::from(bytes != 0) * CAPTURE_ALLOCATION_CHARGE)
+                })
+                .ok_or_else(|| {
+                    DbError::Checkpoint("temporal checkpoint capture accounting overflow".into())
+                })
+        };
+        let mut shared_schema_bytes = 0usize;
+        for schema in [&self.left_schema, &self.right_schema] {
+            shared_schema_bytes =
+                shared_schema_bytes
+                    .checked_add(BATCH_CHARGE)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "temporal checkpoint capture accounting overflow".into(),
+                        )
+                    })?;
+            for field in schema.fields() {
+                shared_schema_bytes = shared_schema_bytes
+                    .checked_add(MAP_ENTRY_CHARGE)
+                    .and_then(|bytes| bytes.checked_add(field.name().len()))
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "temporal checkpoint capture accounting overflow".into(),
+                        )
+                    })?;
+            }
+            for (key, value) in schema.metadata() {
+                shared_schema_bytes = shared_schema_bytes
+                    .checked_add(MAP_ENTRY_CHARGE)
+                    .and_then(|bytes| bytes.checked_add(key.len()))
+                    .and_then(|bytes| bytes.checked_add(value.len()))
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "temporal checkpoint capture accounting overflow".into(),
+                        )
+                    })?;
+            }
+        }
+        let mut preflight = self
+            .accounted_state_bytes()
+            .checked_add(shared_schema_bytes)
+            .and_then(|bytes| {
+                bytes.checked_add(std::mem::size_of::<TemporalJoinCheckpointCapture>())
+            })
+            .ok_or_else(|| {
+                DbError::Checkpoint("temporal checkpoint capture accounting overflow".into())
+            })?;
+        for (len, element) in [
+            (
+                self.history.len(),
+                std::mem::size_of::<CapturedCheckpointHistory>(),
+            ),
+            (
+                self.pending.len(),
+                std::mem::size_of::<CapturedCheckpointProbe>(),
+            ),
+            (
+                self.history_key_roster.len(),
+                std::mem::size_of::<Arc<[u8]>>(),
+            ),
+            (
+                self.right_replay_frontiers.len(),
+                std::mem::size_of::<(Arc<[u8]>, RightReplayFrontier)>(),
+            ),
+            (
+                self.left_replay_frontiers.len(),
+                std::mem::size_of::<(Arc<[u8]>, LeftReplayFrontier)>(),
+            ),
+            (
+                self.right_batches.len(),
+                std::mem::size_of::<(u64, Arc<RecordBatch>)>(),
+            ),
+            (
+                self.left_batches.len(),
+                std::mem::size_of::<(u64, Arc<RecordBatch>)>(),
+            ),
+            (
+                self.config.left_key_indices.len(),
+                std::mem::size_of::<u32>(),
+            ),
+            (
+                self.config.right_key_indices.len(),
+                std::mem::size_of::<u32>(),
+            ),
+            (self.offsets.len(), std::mem::size_of::<i64>()),
+        ] {
+            preflight = preflight
+                .checked_add(roster_bytes(len, element)?)
+                .ok_or_else(|| {
+                    DbError::Checkpoint("temporal checkpoint capture accounting overflow".into())
+                })?;
+        }
+        for len in [
+            self.config.left_name.len(),
+            self.config.right_name.len(),
+            self.config.operator_name.len(),
+        ] {
+            preflight = preflight
+                .checked_add(len)
+                .and_then(|bytes| {
+                    bytes.checked_add(usize::from(len != 0) * CAPTURE_ALLOCATION_CHARGE)
+                })
+                .ok_or_else(|| {
+                    DbError::Checkpoint("temporal checkpoint capture accounting overflow".into())
+                })?;
+        }
+        if preflight > max_capture_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "temporal vnode {} capture requires at least {preflight} bytes; capture headroom is {max_capture_bytes} bytes",
+                self.config.vnode
+            )));
+        }
+
+        let history = self
+            .history
+            .iter()
+            .map(|(key, chain)| CapturedCheckpointHistory {
+                key: Arc::clone(key),
+                versions: Arc::clone(chain),
             })
             .collect();
-        let mut left_replay_frontiers: Vec<_> = self.left_replay_frontiers.iter().collect();
-        left_replay_frontiers
-            .sort_unstable_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
-        let left_replay_frontiers = left_replay_frontiers
-            .into_iter()
-            .map(|(partition, frontier)| CheckpointLeftReplayFrontier {
-                partition: partition.to_vec(),
-                order: frontier.cursor.order.to_vec(),
-                sub_offset: frontier.cursor.sub_offset,
-                key: frontier.identity.key.as_deref().map(<[u8]>::to_vec),
-                event_time: frontier.identity.event_time,
-                payload_fingerprint: frontier.identity.payload_fingerprint,
+        let pending = self
+            .pending
+            .iter()
+            .map(|(identity, probe)| CapturedCheckpointProbe {
+                identity: identity.clone(),
+                probe: probe.clone(),
             })
+            .collect();
+        let right_replay_frontiers = self
+            .right_replay_frontiers
+            .iter()
+            .map(|(partition, frontier)| (Arc::clone(partition), frontier.clone()))
+            .collect();
+        let left_replay_frontiers = self
+            .left_replay_frontiers
+            .iter()
+            .map(|(partition, frontier)| (Arc::clone(partition), frontier.clone()))
             .collect();
         let history_gc_cursor = u64::try_from(self.history_gc_cursor)
             .map_err(|_| DbError::Checkpoint("temporal history GC cursor exceeds u64".into()))?;
@@ -1132,28 +1668,60 @@ impl TemporalJoinVnodeState {
             right_frontier: self.right_frontier,
             right_idle: self.right_idle,
             history_evicted_before: self.history_evicted_before,
-            history_key_roster: self
-                .history_key_roster
-                .iter()
-                .map(|key| key.to_vec())
-                .collect(),
+            history_key_roster: Vec::new(),
             history_gc_cursor,
             history_gc_sweep_end,
             history_gc_active_cutoff: self.history_gc_active_cutoff,
             history_gc_completed_cutoff: self.history_gc_completed_cutoff,
+            right_replay_frontiers: Vec::new(),
+            left_replay_frontiers: Vec::new(),
+            versions: Vec::new(),
+            pending: Vec::new(),
+            right_rows_ipc: Vec::new(),
+            left_rows_ipc: Vec::new(),
+        };
+        let mut capture = TemporalJoinCheckpointCapture {
+            checkpoint,
+            left_schema: Arc::clone(&self.left_schema),
+            right_schema: Arc::clone(&self.right_schema),
+            history,
+            pending,
+            history_key_roster: self.history_key_roster.clone(),
             right_replay_frontiers,
             left_replay_frontiers,
-            versions,
-            pending,
-            right_rows_ipc,
-            left_rows_ipc,
+            right_batches: self
+                .right_batches
+                .iter()
+                .map(|(&batch_id, retained)| (batch_id, Arc::clone(&retained.batch)))
+                .collect(),
+            left_batches: self
+                .left_batches
+                .iter()
+                .map(|(&batch_id, retained)| (batch_id, Arc::clone(&retained.batch)))
+                .collect(),
+            retained_bytes: 0,
         };
-        let writer = rkyv::ser::writer::IoWriter::new(
-            laminar_core::serialization::BoundedBytesWriter::new(max_encoded_bytes),
-        );
-        rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(&checkpoint, writer)
-            .map(|bytes| bytes.into_inner().into_vec())
-            .map_err(|error| DbError::Checkpoint(format!("temporal checkpoint: {error}")))
+        let capture_allocation_bytes = capture.capture_allocation_bytes()?;
+        capture.retained_bytes = self
+            .accounted_state_bytes()
+            .checked_add(shared_schema_bytes)
+            .and_then(|bytes| bytes.checked_add(capture_allocation_bytes))
+            .ok_or_else(|| {
+                DbError::Checkpoint("temporal checkpoint capture accounting overflow".into())
+            })?;
+        if capture.retained_bytes > max_capture_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "temporal vnode {} capture retains {} bytes; capture headroom is {max_capture_bytes} bytes",
+                self.config.vnode, capture.retained_bytes
+            )));
+        }
+        Ok(capture)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint(&self, max_encoded_bytes: usize) -> Result<Vec<u8>, DbError> {
+        self.capture_checkpoint(usize::MAX)?
+            .encode(max_encoded_bytes, None)
     }
 
     pub(crate) fn restore(
@@ -1310,8 +1878,8 @@ impl TemporalJoinVnodeState {
         } else {
             let next_time = probe_time + 1;
             let minimum_position = TemporalSourcePosition {
-                partition: Vec::new(),
-                order: Vec::new(),
+                partition: Arc::from([]),
+                order: Arc::from([]),
                 sub_offset: 0,
             };
             versions.range(..(next_time, minimum_position)).next_back()
@@ -1470,6 +2038,7 @@ impl TemporalJoinVnodeState {
         if !self.has_history_gc_work() {
             return Ok(TemporalHistoryGcDrain {
                 steps: 0,
+                #[cfg(test)]
                 removed_versions: 0,
                 has_more: false,
             });
@@ -1481,6 +2050,7 @@ impl TemporalJoinVnodeState {
             self.history_gc_sweep_end = 0;
             return Ok(TemporalHistoryGcDrain {
                 steps: 0,
+                #[cfg(test)]
                 removed_versions: 0,
                 has_more: false,
             });
@@ -1583,11 +2153,12 @@ impl TemporalJoinVnodeState {
 
         for removal in &removals {
             let key = self.history_key_roster[removal.roster_index].as_ref();
-            let removed = self
-                .history
-                .get_mut(key)
-                .expect("validated history GC key exists")
-                .remove(&removal.order);
+            let removed = Arc::make_mut(
+                self.history
+                    .get_mut(key)
+                    .expect("validated history GC key exists"),
+            )
+            .remove(&removal.order);
             assert!(removed.is_some(), "validated history GC version exists");
         }
         for (batch_id, release_count) in batch_releases {
@@ -1619,6 +2190,7 @@ impl TemporalJoinVnodeState {
         }
         Ok(TemporalHistoryGcDrain {
             steps,
+            #[cfg(test)]
             removed_versions: removals.len(),
             has_more: self.has_history_gc_work(),
         })
@@ -1895,11 +2467,11 @@ impl TemporalJoinVnodeState {
             }
             let value = RightReplayFrontier {
                 cursor: ReplayCursor {
-                    order: frontier.order.into_boxed_slice(),
+                    order: Arc::from(frontier.order),
                     sub_offset: frontier.sub_offset,
                 },
                 identity: MutationIdentity {
-                    key: frontier.key.map(Vec::into_boxed_slice),
+                    key: frontier.key.map(Arc::from),
                     event_time: frontier.event_time,
                     tombstone: frontier.tombstone,
                     payload_fingerprint: frontier.payload_fingerprint,
@@ -1907,7 +2479,7 @@ impl TemporalJoinVnodeState {
             };
             if self
                 .right_replay_frontiers
-                .insert(frontier.partition.into_boxed_slice(), value)
+                .insert(Arc::from(frontier.partition), value)
                 .is_some()
             {
                 return Err(DbError::Checkpoint(
@@ -1929,18 +2501,18 @@ impl TemporalJoinVnodeState {
             }
             let value = LeftReplayFrontier {
                 cursor: ReplayCursor {
-                    order: frontier.order.into_boxed_slice(),
+                    order: Arc::from(frontier.order),
                     sub_offset: frontier.sub_offset,
                 },
                 identity: LeftRowIdentity {
-                    key: frontier.key.map(Vec::into_boxed_slice),
+                    key: frontier.key.map(Arc::from),
                     event_time: frontier.event_time,
                     payload_fingerprint: frontier.payload_fingerprint,
                 },
             };
             if self
                 .left_replay_frontiers
-                .insert(frontier.partition.into_boxed_slice(), value)
+                .insert(Arc::from(frontier.partition), value)
                 .is_some()
             {
                 return Err(DbError::Checkpoint(
@@ -1949,66 +2521,6 @@ impl TemporalJoinVnodeState {
             }
         }
         Ok(())
-    }
-
-    fn checkpoint_versions(&self) -> Result<(Vec<CheckpointVersion>, RecordBatch), DbError> {
-        let mut keys: Vec<&Box<[u8]>> = self.history.keys().collect();
-        keys.sort_unstable_by(|left, right| left.as_ref().cmp(right.as_ref()));
-        let mut rows = Vec::new();
-        let version_count = self.history.values().map(BTreeMap::len).sum();
-        let mut versions_out = Vec::with_capacity(version_count);
-        for key in keys {
-            for ((event_time, source), version) in &self.history[key] {
-                let right_row = if let Some((batch, row)) = version.row {
-                    let index = u32::try_from(rows.len()).map_err(|_| {
-                        DbError::Checkpoint("temporal checkpoint has too many right rows".into())
-                    })?;
-                    rows.push(self.right_row(batch, row)?);
-                    Some(index)
-                } else {
-                    None
-                };
-                versions_out.push(CheckpointVersion {
-                    key: key.to_vec(),
-                    event_time: *event_time,
-                    source: source.clone(),
-                    tombstone: version.row.is_none(),
-                    right_row,
-                });
-            }
-        }
-        Ok((
-            versions_out,
-            compact_rows(&self.right_schema, &rows, "right")?,
-        ))
-    }
-
-    fn checkpoint_pending(&self) -> Result<(Vec<CheckpointProbe>, RecordBatch), DbError> {
-        let mut entries: Vec<_> = self.pending.iter().collect();
-        entries.sort_unstable_by(|(left_id, left), (right_id, right)| {
-            left.deadline
-                .cmp(&right.deadline)
-                .then_with(|| left_id.cmp(right_id))
-        });
-        let mut rows = Vec::with_capacity(entries.len());
-        let mut pending_out = Vec::with_capacity(entries.len());
-        for (identity, probe) in entries {
-            let row = u32::try_from(rows.len()).map_err(|_| {
-                DbError::Checkpoint("temporal checkpoint has too many pending rows".into())
-            })?;
-            rows.push(self.left_row(probe.left_batch, probe.left_row)?);
-            pending_out.push(CheckpointProbe {
-                source: identity.source.clone(),
-                offset_ms: identity.offset_ms,
-                left_row: row,
-                key: probe.key.to_vec(),
-                left_event_time: probe.left_event_time,
-                probe_time: probe.probe_time,
-                deadline: probe.deadline,
-                payload_fingerprint: probe.payload_fingerprint,
-            });
-        }
-        Ok((pending_out, compact_rows(&self.left_schema, &rows, "left")?))
     }
 
     fn restore_versions(
@@ -2051,60 +2563,65 @@ impl TemporalJoinVnodeState {
             );
         }
         for version in versions {
-            if !retained_sources.insert(version.source.clone()) {
+            let CheckpointVersion {
+                key,
+                event_time,
+                source,
+                tombstone,
+                right_row,
+            } = version;
+            let source = TemporalSourcePosition::from(source);
+            if !retained_sources.insert(source.clone()) {
                 return Err(DbError::Checkpoint(
                     "temporal checkpoint retains one right source position more than once".into(),
                 ));
             }
-            self.validate_vnode(&version.key)
+            self.validate_vnode(&key)
                 .map_err(|error| DbError::Checkpoint(error.to_string()))?;
-            if version.tombstone != version.right_row.is_none() {
+            if tombstone != right_row.is_none() {
                 return Err(DbError::Checkpoint(
                     "temporal tombstone checkpoint row is invalid".into(),
                 ));
             }
-            if version
-                .right_row
-                .is_some_and(|row| row as usize >= right_row_count)
-            {
+            if right_row.is_some_and(|row| row as usize >= right_row_count) {
                 return Err(DbError::Checkpoint(
                     "temporal right checkpoint row is out of bounds".into(),
                 ));
             }
             let frontier = self
                 .right_replay_frontiers
-                .get(version.source.partition.as_slice())
+                .get(source.partition.as_ref())
                 .ok_or_else(|| {
                     DbError::Checkpoint(
                         "temporal version is missing its right replay frontier".into(),
                     )
                 })?;
-            let frontier_order = frontier.cursor.compare(&version.source);
+            let frontier_order = frontier.cursor.compare(&source);
             if frontier_order == Ordering::Greater {
                 return Err(DbError::Checkpoint(
                     "temporal version is ahead of its right replay frontier".into(),
                 ));
             }
             if frontier_order == Ordering::Equal
-                && (frontier.identity.key.as_deref() != Some(version.key.as_slice())
-                    || frontier.identity.event_time != Some(version.event_time)
-                    || frontier.identity.tombstone != version.tombstone)
+                && (frontier.identity.key.as_deref() != Some(key.as_slice())
+                    || frontier.identity.event_time != Some(event_time)
+                    || frontier.identity.tombstone != tombstone)
             {
                 return Err(DbError::Checkpoint(
                     "temporal version disagrees with its right replay frontier".into(),
                 ));
             }
-            if let Some(row) = version.right_row {
+            if let Some(row) = right_row {
                 if !used_rows.insert(row) {
                     return Err(DbError::Checkpoint(
                         "temporal right checkpoint row is referenced more than once".into(),
                     ));
                 }
                 let row = row as usize;
-                if row_positions[row] != version.source
+                if row_positions[row] != source
                     || key_columns.iter().any(|column| column.is_null(row))
-                    || row_keys.row(row).as_ref() != version.key
-                    || row_times.value(row, "right")? != version.event_time
+                    || row_keys.row(row).as_ref() != key
+                    || row_times.value(row, "right")? != event_time
                     || (frontier_order == Ordering::Equal
                         && row_fingerprints[row] != frontier.identity.payload_fingerprint)
                 {
@@ -2113,14 +2630,12 @@ impl TemporalJoinVnodeState {
                     ));
                 }
             }
-            let row = version
-                .right_row
-                .map(|row| (batch_id.expect("live batch exists"), row));
-            let replaced = self
+            let row = right_row.map(|row| (batch_id.expect("live batch exists"), row));
+            let versions = self
                 .history
-                .entry(version.key.into_boxed_slice())
-                .or_default()
-                .insert((version.event_time, version.source), Version { row });
+                .entry(Arc::from(key))
+                .or_insert_with(|| Arc::new(BTreeMap::new()));
+            let replaced = Arc::make_mut(versions).insert((event_time, source), Version { row });
             if replaced.is_some() {
                 return Err(DbError::Checkpoint(
                     "duplicate temporal version in checkpoint".into(),
@@ -2151,7 +2666,7 @@ impl TemporalJoinVnodeState {
                     "temporal history GC roster contains a duplicate or unknown key".into(),
                 ));
             }
-            self.history_key_roster.push(key.into_boxed_slice());
+            self.history_key_roster.push(Arc::from(key));
         }
         self.validate_restored_history_gc_progress()
     }
@@ -2242,41 +2757,49 @@ impl TemporalJoinVnodeState {
             );
         }
         for probe in pending {
-            self.validate_vnode(&probe.key)
+            let CheckpointProbe {
+                source,
+                offset_ms,
+                left_row,
+                key,
+                left_event_time,
+                probe_time,
+                deadline,
+                payload_fingerprint,
+            } = probe;
+            let source = TemporalSourcePosition::from(source);
+            self.validate_vnode(&key)
                 .map_err(|error| DbError::Checkpoint(error.to_string()))?;
-            if !self.offsets.contains(&probe.offset_ms) {
+            if !self.offsets.contains(&offset_ms) {
                 return Err(DbError::Checkpoint(
                     "temporal pending probe uses an unplanned offset".into(),
                 ));
             }
-            if probe.left_event_time.checked_add(probe.offset_ms) != Some(probe.probe_time)
-                || probe
-                    .probe_time
-                    .checked_add(self.config.right_allowed_lateness_ms)
-                    != Some(probe.deadline)
+            if left_event_time.checked_add(offset_ms) != Some(probe_time)
+                || probe_time.checked_add(self.config.right_allowed_lateness_ms) != Some(deadline)
             {
                 return Err(DbError::Checkpoint(
                     "temporal pending-probe timing is invalid".into(),
                 ));
             }
-            if probe.left_row as usize >= left_row_count {
+            if left_row as usize >= left_row_count {
                 return Err(DbError::Checkpoint(
                     "temporal pending checkpoint row is out of bounds".into(),
                 ));
             }
-            self.reject_evicted_probe(probe.probe_time)
+            self.reject_evicted_probe(probe_time)
                 .map_err(|error| DbError::Checkpoint(error.to_string()))?;
-            if !used_rows.insert(probe.left_row) {
+            if !used_rows.insert(left_row) {
                 return Err(DbError::Checkpoint(
                     "temporal pending checkpoint row is referenced more than once".into(),
                 ));
             }
-            let row = probe.left_row as usize;
-            if row_positions[row] != probe.source
+            let row = left_row as usize;
+            if row_positions[row] != source
                 || key_columns.iter().any(|column| column.is_null(row))
-                || row_keys.row(row).as_ref() != probe.key
-                || row_times.value(row, "left")? != probe.left_event_time
-                || row_fingerprints[row] != probe.payload_fingerprint
+                || row_keys.row(row).as_ref() != key
+                || row_times.value(row, "left")? != left_event_time
+                || row_fingerprints[row] != payload_fingerprint
             {
                 return Err(DbError::Checkpoint(
                     "temporal pending checkpoint row disagrees with probe metadata".into(),
@@ -2284,22 +2807,22 @@ impl TemporalJoinVnodeState {
             }
             let frontier = self
                 .left_replay_frontiers
-                .get(probe.source.partition.as_slice())
+                .get(source.partition.as_ref())
                 .ok_or_else(|| {
                     DbError::Checkpoint(
                         "temporal pending probe is missing its left replay frontier".into(),
                     )
                 })?;
-            match frontier.cursor.compare(&probe.source) {
+            match frontier.cursor.compare(&source) {
                 Ordering::Greater => {
                     return Err(DbError::Checkpoint(
                         "temporal pending probe is ahead of its left replay frontier".into(),
                     ));
                 }
                 Ordering::Equal
-                    if frontier.identity.key.as_deref() != Some(probe.key.as_slice())
-                        || frontier.identity.event_time != Some(probe.left_event_time)
-                        || frontier.identity.payload_fingerprint != probe.payload_fingerprint =>
+                    if frontier.identity.key.as_deref() != Some(key.as_slice())
+                        || frontier.identity.event_time != Some(left_event_time)
+                        || frontier.identity.payload_fingerprint != payload_fingerprint =>
                 {
                     return Err(DbError::Checkpoint(
                         "temporal pending probe disagrees with its left replay frontier".into(),
@@ -2307,13 +2830,10 @@ impl TemporalJoinVnodeState {
                 }
                 Ordering::Less | Ordering::Equal => {}
             }
-            let identity = ProbeIdentity {
-                source: probe.source,
-                offset_ms: probe.offset_ms,
-            };
+            let identity = ProbeIdentity { source, offset_ms };
             let inserted_timer = self
                 .timers
-                .entry(probe.deadline)
+                .entry(deadline)
                 .or_default()
                 .insert(identity.clone());
             if !inserted_timer {
@@ -2327,12 +2847,12 @@ impl TemporalJoinVnodeState {
                     identity,
                     PendingProbe {
                         left_batch: batch_id.expect("pending batch exists"),
-                        left_row: probe.left_row,
-                        key: probe.key.into_boxed_slice(),
-                        left_event_time: probe.left_event_time,
-                        probe_time: probe.probe_time,
-                        deadline: probe.deadline,
-                        payload_fingerprint: probe.payload_fingerprint,
+                        left_row,
+                        key: Arc::from(key),
+                        left_event_time,
+                        probe_time,
+                        deadline,
+                        payload_fingerprint,
                     },
                 )
                 .is_some()
@@ -2609,8 +3129,8 @@ fn extract_source_positions(batch: &RecordBatch) -> Result<Vec<TemporalSourcePos
     }
     Ok((0..batch.num_rows())
         .map(|row| TemporalSourcePosition {
-            partition: partition.value(row).to_vec(),
-            order: order.value(row).to_vec(),
+            partition: Arc::from(partition.value(row)),
+            order: Arc::from(order.value(row)),
             sub_offset: sub_offset.value(row),
         })
         .collect())
@@ -2941,7 +3461,9 @@ mod tests {
                 Arc::new(BinaryArray::from_iter_values(
                     orders.into_iter().map(|order| vec![order]),
                 )),
-                Arc::new(UInt32Array::from_iter_values(0..rows as u32)),
+                Arc::new(UInt32Array::from_iter_values(
+                    0..u32::try_from(rows).unwrap(),
+                )),
             ],
         )
         .unwrap()
@@ -3682,7 +4204,27 @@ mod tests {
         state.advance_left_frontier(Some(90), true).unwrap();
         state.advance_right_frontier(Some(151), false).unwrap();
         assert!(state.has_ready_probes());
-        let checkpoint = state.checkpoint(4 * 1024 * 1024).unwrap();
+        assert!(state
+            .capture_checkpoint(state.accounted_state_bytes())
+            .is_err());
+        let capture = state.capture_checkpoint(usize::MAX).unwrap();
+        fn assert_send_static<T: Send + 'static>(_: &T) {}
+        assert_send_static(&capture);
+        assert!(capture.retained_bytes() >= state.accounted_state_bytes());
+        state
+            .drain_ready_probes(NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert_eq!(state.pending_probes(), 0);
+        let post_cut = batch(
+            schema("right"),
+            vec![Some("A")],
+            vec![Some(10)],
+            vec![Some(160)],
+            vec![3],
+        );
+        state.apply_right_batch(&post_cut, None).unwrap();
+        assert_eq!(state.retained_versions(), 2);
+        let checkpoint = capture.encode(4 * 1024 * 1024, None).unwrap();
         let mut restored =
             TemporalJoinVnodeState::restore(schema("left"), schema("right"), cfg, &checkpoint)
                 .unwrap();

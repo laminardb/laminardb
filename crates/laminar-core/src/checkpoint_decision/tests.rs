@@ -36,6 +36,7 @@ async fn local_index(
             node_data_len: 0,
             node_data_sha256: digest(2),
         }],
+        source_names: Vec::new(),
         source_offsets: BTreeMap::new(),
         channel_progress: Vec::new(),
         checkpoint_watermark: None,

@@ -51,10 +51,155 @@ pub(crate) struct ManagedStateAccountingSnapshot {
 /// `None` means the slot is unchanged from the preceding committed checkpoint. The checkpoint
 /// coordinator resolves it to that manifest's direct frame reference; operators never persist
 /// ancestry or backend-specific metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct CapturedVnodeState {
     pub(crate) vnode: u32,
-    pub(crate) state: Option<bytes::Bytes>,
+    pub(crate) state: Option<StateFrameCapture>,
+}
+
+const GRAPH_CHECKPOINT_CAPTURE_OVERHEAD: u64 = 256;
+const GRAPH_CHECKPOINT_ENTRY_OVERHEAD: u64 = 128;
+
+type DeferredStateFrameEncoder =
+    Box<dyn FnOnce(usize) -> Result<EncodedStateFrame, DbError> + Send + 'static>;
+
+pub(crate) struct EncodedStateFrame {
+    state: bytes::Bytes,
+    retained_bytes: u64,
+}
+
+impl EncodedStateFrame {
+    pub(crate) fn from_vec(state: Vec<u8>) -> Self {
+        let retained_bytes = u64::try_from(state.capacity()).unwrap_or(u64::MAX);
+        Self {
+            state: bytes::Bytes::from(state),
+            retained_bytes,
+        }
+    }
+
+    pub(crate) fn shared(state: bytes::Bytes) -> Self {
+        Self {
+            state,
+            retained_bytes: 0,
+        }
+    }
+
+    pub(crate) fn payload_len(&self) -> usize {
+        self.state.len()
+    }
+
+    pub(crate) fn bytes(&self) -> &bytes::Bytes {
+        &self.state
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_bytes(self) -> bytes::Bytes {
+        self.state
+    }
+}
+
+pub(crate) enum StateFrameCapture {
+    Encoded {
+        state: bytes::Bytes,
+        retained_bytes: u64,
+    },
+    Deferred {
+        retained_bytes: u64,
+        encode: DeferredStateFrameEncoder,
+    },
+}
+
+impl StateFrameCapture {
+    pub(crate) fn encoded(state: Vec<u8>) -> Self {
+        let state = EncodedStateFrame::from_vec(state);
+        Self::Encoded {
+            state: state.state,
+            retained_bytes: state.retained_bytes,
+        }
+    }
+
+    pub(crate) fn encoded_static(state: &'static [u8]) -> Self {
+        Self::Encoded {
+            state: bytes::Bytes::from_static(state),
+            retained_bytes: 0,
+        }
+    }
+
+    pub(crate) fn deferred(
+        retained_bytes: u64,
+        encode: impl FnOnce(usize) -> Result<EncodedStateFrame, DbError> + Send + 'static,
+    ) -> Self {
+        Self::Deferred {
+            retained_bytes,
+            encode: Box::new(encode),
+        }
+    }
+
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        match self {
+            Self::Encoded { retained_bytes, .. } | Self::Deferred { retained_bytes, .. } => {
+                *retained_bytes
+            }
+        }
+    }
+
+    pub(crate) fn materialize(
+        self,
+        staged_bytes: &mut u64,
+        max_staged_bytes: u64,
+    ) -> Result<bytes::Bytes, DbError> {
+        match self {
+            Self::Encoded { state, .. } => Ok(state),
+            Self::Deferred {
+                retained_bytes,
+                encode,
+            } => {
+                let headroom = max_staged_bytes.checked_sub(*staged_bytes).ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "operator captures exceeded their staged-state budget".into(),
+                    )
+                })?;
+                let limit = usize::try_from(headroom).unwrap_or(usize::MAX);
+                let state = encode(limit)?;
+                if state.retained_bytes > headroom {
+                    return Err(DbError::Checkpoint(format!(
+                        "operator state frame retains {} bytes; staged-state headroom is {headroom} bytes",
+                        state.retained_bytes
+                    )));
+                }
+                *staged_bytes = staged_bytes
+                    .checked_sub(retained_bytes)
+                    .and_then(|bytes| bytes.checked_add(state.retained_bytes))
+                    .filter(|bytes| *bytes <= max_staged_bytes)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "operator state ownership transfer exceeded its staged-state budget"
+                                .into(),
+                        )
+                    })?;
+                Ok(state.state)
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for StateFrameCapture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encoded {
+                state,
+                retained_bytes,
+            } => formatter
+                .debug_struct("EncodedStateFrame")
+                .field("bytes", &state.len())
+                .field("retained_bytes", retained_bytes)
+                .finish(),
+            Self::Deferred { retained_bytes, .. } => formatter
+                .debug_struct("DeferredStateFrame")
+                .field("retained_bytes", retained_bytes)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -217,6 +362,24 @@ pub(crate) trait GraphOperator: Send {
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError>;
+
+    fn checkpoint_capture(
+        &mut self,
+        max_capture_bytes: u64,
+    ) -> Result<Option<StateFrameCapture>, DbError> {
+        let Some(checkpoint) = self.checkpoint()? else {
+            return Ok(None);
+        };
+        let capture = StateFrameCapture::encoded(checkpoint.data);
+        if capture.retained_bytes() > max_capture_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "operator whole-state capture retains {} bytes; capture headroom is {max_capture_bytes} bytes",
+                capture.retained_bytes()
+            )));
+        }
+        Ok(Some(capture))
+    }
+
     fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
         Err(DbError::Checkpoint(
             "operator does not accept checkpoint state".into(),
@@ -286,6 +449,7 @@ pub(crate) trait GraphOperator: Send {
         &mut self,
         _required_vnodes: &[u32],
         _vnode_count: u32,
+        _max_capture_bytes: u64,
     ) -> Result<Option<Vec<CapturedVnodeState>>, DbError> {
         Ok(None)
     }
@@ -401,28 +565,6 @@ enum GraphExecutionMode {
     CheckpointDrain,
 }
 
-#[derive(Clone, Copy)]
-enum SourceFrontiers<'a> {
-    Watermarks(Option<&'a FxHashMap<Arc<str>, i64>>),
-    Frontiers(Option<&'a FxHashMap<Arc<str>, InputFrontier>>),
-}
-
-impl SourceFrontiers<'_> {
-    fn get(self, name: &Arc<str>, current_watermark: i64) -> InputFrontier {
-        match self {
-            Self::Watermarks(frontiers) => frontiers
-                .and_then(|frontiers| frontiers.get(name).copied())
-                .map_or_else(
-                    || InputFrontier::from_watermark(current_watermark),
-                    InputFrontier::from_watermark,
-                ),
-            Self::Frontiers(frontiers) => frontiers
-                .and_then(|frontiers| frontiers.get(name).copied())
-                .unwrap_or_else(|| InputFrontier::from_watermark(current_watermark)),
-        }
-    }
-}
-
 const GRAPH_EXECUTION_POISON_REASON: &str =
     "operator graph execution was cancelled or panicked after potentially mutating state, failed \
      terminally after input admission, or a vnode lifecycle callback returned an indeterminate \
@@ -492,18 +634,25 @@ impl Drop for GraphExecutionAttemptGuard {
 const STATS_SAMPLE_INTERVAL: u64 = 32;
 
 /// Logical ABI for independently checksummed operator and vnode frames.
-pub(crate) const STATE_FRAME_ABI_VERSION: u32 = 2;
+pub(crate) const STATE_FRAME_ABI_VERSION: u32 = 3;
 
 #[derive(Debug)]
 pub(crate) struct CapturedWholeState {
     pub(crate) operator_id: String,
-    pub(crate) state: bytes::Bytes,
+    pub(crate) state: StateFrameCapture,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct GraphStateCapture {
     pub(crate) whole: Vec<CapturedWholeState>,
     pub(crate) vnodes: Vec<(String, CapturedVnodeState)>,
+    retained_bytes: u64,
+}
+
+impl GraphStateCapture {
+    pub(crate) const fn retained_bytes(&self) -> u64 {
+        self.retained_bytes
+    }
 }
 
 struct GraphNode {
@@ -1021,6 +1170,7 @@ impl OperatorGraph {
 
     pub fn set_metrics(&mut self, m: Arc<EngineMetrics>) {
         self.prom = Some(m);
+        self.publish_buffer_stats();
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -1056,10 +1206,16 @@ impl OperatorGraph {
         count_ratio.max(bytes_ratio).min(1.0)
     }
 
-    pub fn has_pending_input(&self) -> bool {
-        self.input_bufs.iter().enumerate().any(|(id, ports)| {
-            ports.iter().any(|port| !port.is_empty()) && !self.source_node_ids.contains(&id)
-        })
+    pub(crate) fn has_deferred_work(&self) -> bool {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| !node.removed)
+            .any(|(node_id, node)| {
+                !node.operator.wants_input()
+                    || (!self.source_node_ids.contains(&node_id)
+                        && self.input_bufs[node_id].iter().any(|port| !port.is_empty()))
+            })
     }
 
     /// Logical bytes queued on every live input port. Uses the maintained per-port byte counters
@@ -1857,8 +2013,11 @@ impl OperatorGraph {
             (None, None)
         };
 
-        let unbounded_lookup_join = if !enrich {
-            if let Some(steps) = detect_unbounded_join_steps(&sql) {
+        let unbounded_join_steps = (!enrich)
+            .then(|| detect_unbounded_join_steps(&sql))
+            .flatten();
+        let unbounded_lookup_join = match unbounded_join_steps {
+            Some(steps) => {
                 let lookup_only = steps.iter().all(|(_, right)| {
                     self.reference_tables.contains(right)
                         || self.partial_lookup_tables.contains_key(right)
@@ -1874,12 +2033,9 @@ impl OperatorGraph {
                     )));
                     return;
                 }
-                lookup_only
-            } else {
-                false
+                true
             }
-        } else {
-            false
+            None => false,
         };
 
         let projection_sql = temporal_projection_sql
@@ -2779,22 +2935,7 @@ impl OperatorGraph {
         }
     }
 
-    pub async fn execute_cycle(
-        &mut self,
-        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
-        current_watermark: i64,
-        source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
-    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
-        self.execute_cycle_with_mode(
-            source_batches,
-            current_watermark,
-            SourceFrontiers::Watermarks(source_watermarks),
-            GraphExecutionMode::Normal,
-        )
-        .await
-    }
-
-    pub(crate) async fn execute_cycle_with_frontiers(
+    pub(crate) async fn execute_cycle(
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         current_watermark: i64,
@@ -2803,7 +2944,7 @@ impl OperatorGraph {
         self.execute_cycle_with_mode(
             source_batches,
             current_watermark,
-            SourceFrontiers::Frontiers(source_frontiers),
+            source_frontiers,
             GraphExecutionMode::Normal,
         )
         .await
@@ -2882,28 +3023,13 @@ impl OperatorGraph {
     pub(crate) async fn execute_checkpoint_drain_cycle(
         &mut self,
         current_watermark: i64,
-        frozen_source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
-    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
-        let source_batches = FxHashMap::default();
-        self.execute_cycle_with_mode(
-            &source_batches,
-            current_watermark,
-            SourceFrontiers::Watermarks(frozen_source_watermarks),
-            GraphExecutionMode::CheckpointDrain,
-        )
-        .await
-    }
-
-    pub(crate) async fn execute_checkpoint_drain_cycle_with_frontiers(
-        &mut self,
-        current_watermark: i64,
         frozen_source_frontiers: Option<&FxHashMap<Arc<str>, InputFrontier>>,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
         let source_batches = FxHashMap::default();
         self.execute_cycle_with_mode(
             &source_batches,
             current_watermark,
-            SourceFrontiers::Frontiers(frozen_source_frontiers),
+            frozen_source_frontiers,
             GraphExecutionMode::CheckpointDrain,
         )
         .await
@@ -2913,7 +3039,7 @@ impl OperatorGraph {
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         current_watermark: i64,
-        source_frontiers: SourceFrontiers<'_>,
+        source_frontiers: Option<&FxHashMap<Arc<str>, InputFrontier>>,
         mode: GraphExecutionMode,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
         self.ensure_execution_not_poisoned()?;
@@ -2943,7 +3069,7 @@ impl OperatorGraph {
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         current_watermark: i64,
-        source_frontiers: SourceFrontiers<'_>,
+        source_frontiers: Option<&FxHashMap<Arc<str>, InputFrontier>>,
         mode: GraphExecutionMode,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
         let visible_source_batches = Self::visible_source_batches(source_batches)?;
@@ -3218,7 +3344,7 @@ impl OperatorGraph {
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         visible_source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         current_watermark: i64,
-        source_frontiers: SourceFrontiers<'_>,
+        source_frontiers: Option<&FxHashMap<Arc<str>, InputFrontier>>,
     ) {
         for route in &self.source_list {
             let batches = match route.view {
@@ -3232,7 +3358,9 @@ impl OperatorGraph {
                     self.input_buf_bytes[route.node_id][0] += bytes;
                 }
             }
-            let frontier = source_frontiers.get(&route.name, current_watermark);
+            let frontier = source_frontiers
+                .and_then(|frontiers| frontiers.get(&route.name).copied())
+                .unwrap_or_else(|| InputFrontier::from_watermark(current_watermark));
             let watermark = self.output_watermarks[route.node_id].max(frontier.watermark_or_min());
             self.output_watermarks[route.node_id] = watermark;
             self.output_idle[route.node_id] = frontier.idle;
@@ -3314,6 +3442,10 @@ impl OperatorGraph {
         if !self.stats_tick.is_multiple_of(STATS_SAMPLE_INTERVAL) {
             return;
         }
+        self.publish_buffer_stats();
+    }
+
+    fn publish_buffer_stats(&mut self) {
         if let Some(ref prom) = self.prom {
             for (id, ports) in self.input_buf_bytes.iter().enumerate() {
                 if self.nodes[id].removed {
@@ -3625,7 +3757,7 @@ impl OperatorGraph {
     #[cfg(feature = "cluster")]
     fn stage_received_shuffle_frontier(
         &mut self,
-        received: laminar_core::shuffle::ReceivedShuffle,
+        received: &laminar_core::shuffle::ReceivedShuffle,
     ) -> Result<(), DbError> {
         let peer = received.peer();
         let assignment_version = received.assignment_version();
@@ -3663,7 +3795,7 @@ impl OperatorGraph {
                 self.stage_received_shuffle_data(received, watermark)
             }
             laminar_core::shuffle::ShuffleMessage::Frontier { .. } => {
-                self.stage_received_shuffle_frontier(received)
+                self.stage_received_shuffle_frontier(&received)
             }
             laminar_core::shuffle::ShuffleMessage::Barrier(_) => Err(DbError::Pipeline(
                 "barrier entered ordered shuffle data/frontier staging".into(),
@@ -4368,10 +4500,21 @@ impl OperatorGraph {
         self.test_owned_vnodes = Some(owned_vnodes);
     }
 
-    pub(crate) fn capture_state(&mut self) -> Result<GraphStateCapture, DbError> {
+    pub(crate) fn capture_state(
+        &mut self,
+        max_capture_bytes: u64,
+    ) -> Result<GraphStateCapture, DbError> {
         self.ensure_execution_not_poisoned()?;
         #[cfg(feature = "cluster")]
         self.ensure_checkpoint_transition_is_applied()?;
+
+        let mut remaining = max_capture_bytes
+            .checked_sub(GRAPH_CHECKPOINT_CAPTURE_OVERHEAD)
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "operator checkpoint metadata exceeds its staged-state cap of {max_capture_bytes} bytes"
+                ))
+            })?;
 
         let vnode_count = u32::from(self.key_group_count);
         let owned_vnodes = self.owned_vnodes_for_managed_state()?;
@@ -4389,10 +4532,26 @@ impl OperatorGraph {
                 )));
             }
 
-            if let Some(checkpoint) = node.operator.checkpoint()? {
+            let entry_charge = GRAPH_CHECKPOINT_ENTRY_OVERHEAD
+                .checked_add(u64::try_from(name.len()).unwrap_or(u64::MAX))
+                .ok_or_else(|| {
+                    DbError::Checkpoint("operator checkpoint metadata overflowed u64".into())
+                })?;
+            let state_budget = remaining.saturating_sub(entry_charge);
+            if let Some(state) = node.operator.checkpoint_capture(state_budget)? {
+                let charge = entry_charge
+                    .checked_add(state.retained_bytes())
+                    .ok_or_else(|| {
+                        DbError::Checkpoint("operator checkpoint capture overflowed u64".into())
+                    })?;
+                remaining = remaining.checked_sub(charge).ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "operator '{name}' whole-state capture exceeded the remaining staged-state budget"
+                    ))
+                })?;
                 capture.whole.push(CapturedWholeState {
                     operator_id: name.clone(),
-                    state: bytes::Bytes::from(checkpoint.data),
+                    state,
                 });
             }
 
@@ -4403,9 +4562,22 @@ impl OperatorGraph {
             if required.is_empty() {
                 continue;
             }
+            let entry_charge = GRAPH_CHECKPOINT_ENTRY_OVERHEAD
+                .checked_add(u64::try_from(name.len()).unwrap_or(u64::MAX))
+                .and_then(|bytes| {
+                    bytes.checked_mul(u64::try_from(required.len()).unwrap_or(u64::MAX))
+                })
+                .ok_or_else(|| {
+                    DbError::Checkpoint("operator vnode capture metadata overflowed u64".into())
+                })?;
+            remaining = remaining.checked_sub(entry_charge).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "operator '{name}' vnode metadata exceeded the remaining staged-state budget"
+                ))
+            })?;
             let states = node
                 .operator
-                .checkpoint_vnodes(&required, vnode_count)?
+                .checkpoint_vnodes(&required, vnode_count, remaining)?
                 .ok_or_else(|| {
                     DbError::Checkpoint(format!(
                         "managed operator '{name}' did not capture its required vnode state"
@@ -4422,6 +4594,18 @@ impl OperatorGraph {
                     "managed operator '{name}' captured vnode roster {actual:?}; expected {required:?}"
                 )));
             }
+            for captured in &states {
+                if let Some(state) = captured.state.as_ref() {
+                    remaining = remaining
+                        .checked_sub(state.retained_bytes())
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "operator '{name}' vnode {} capture exceeded the remaining staged-state budget",
+                                captured.vnode
+                            ))
+                        })?;
+                }
+            }
             capture
                 .vnodes
                 .extend(states.into_iter().map(|state| (name.clone(), state)));
@@ -4435,6 +4619,7 @@ impl OperatorGraph {
                 .cmp(&right.0)
                 .then_with(|| left.1.vnode.cmp(&right.1.vnode))
         });
+        capture.retained_bytes = max_capture_bytes - remaining;
         Ok(capture)
     }
 

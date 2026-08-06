@@ -33,6 +33,44 @@ pub(crate) struct EmittedCheckpoint {
     pub values: Vec<u8>,
 }
 
+impl AggStateCheckpoint {
+    pub(crate) fn retained_serialization_bytes(&self) -> Result<usize, DbError> {
+        fn add(total: &mut usize, bytes: usize) -> Result<(), DbError> {
+            *total = total.checked_add(bytes).ok_or_else(|| {
+                DbError::Checkpoint("aggregate checkpoint serialization accounting overflow".into())
+            })?;
+            Ok(())
+        }
+
+        fn roster<T>(capacity: usize) -> Result<usize, DbError> {
+            capacity
+                .checked_mul(std::mem::size_of::<T>())
+                .ok_or_else(|| {
+                    DbError::Checkpoint("aggregate checkpoint serialization roster overflow".into())
+                })
+        }
+
+        let mut bytes = self.keys_ipc.capacity();
+        add(
+            &mut bytes,
+            roster::<Vec<u8>>(self.acc_state_ipc.capacity())?,
+        )?;
+        for state in &self.acc_state_ipc {
+            add(&mut bytes, state.capacity())?;
+        }
+        add(&mut bytes, roster::<i64>(self.last_updated_ms.capacity())?)?;
+        add(
+            &mut bytes,
+            roster::<EmittedCheckpoint>(self.last_emitted.capacity())?,
+        )?;
+        for emitted in &self.last_emitted {
+            add(&mut bytes, emitted.key.capacity())?;
+            add(&mut bytes, emitted.values.capacity())?;
+        }
+        Ok(bytes)
+    }
+}
+
 /// Query-plan limits for borrowed aggregate archive validation.
 #[derive(Clone, Copy)]
 pub(crate) struct AggStateArchiveRestoreProfile {

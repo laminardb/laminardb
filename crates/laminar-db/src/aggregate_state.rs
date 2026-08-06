@@ -41,7 +41,7 @@ pub(crate) use compile::{
 pub(crate) use keys::{
     global_aggregate_key, row_to_scalar_key_with_types, scalar_key_to_owned_row,
 };
-pub(crate) use scalar_ipc::{ipc_to_scalars, scalars_to_ipc};
+pub(crate) use scalar_ipc::{ipc_to_scalars, scalars_to_ipc, scalars_to_ipc_bounded};
 use vnode_state::{AggregateVnodeSlots, AggregateVnodeState};
 
 /// Builds the per-window result batch for one closed window.
@@ -215,9 +215,7 @@ pub(crate) fn snapshot_and_rebuild(
     scalars_to_ipc(&state)
 }
 
-/// Build an IPC stream from arrays as the columns of a single batch; empty input
-/// (no columns) → empty `Vec`.
-fn arrays_to_ipc(arrays: &[ArrayRef]) -> Result<Vec<u8>, DbError> {
+fn arrays_to_ipc_bounded(arrays: &[ArrayRef], max_bytes: usize) -> Result<Vec<u8>, DbError> {
     if arrays.is_empty() {
         return Ok(Vec::new());
     }
@@ -229,61 +227,333 @@ fn arrays_to_ipc(arrays: &[ArrayRef]) -> Result<Vec<u8>, DbError> {
     let schema = Arc::new(Schema::new(fields));
     let batch = RecordBatch::try_new(schema, arrays.to_vec())
         .map_err(|e| DbError::Pipeline(format!("columnar batch build: {e}")))?;
-    laminar_core::serialization::serialize_batch_stream(&batch)
-        .map_err(|e| DbError::Pipeline(format!("columnar IPC encode: {e}")))
+    laminar_core::serialization::serialize_batches_stream_bounded(
+        batch.schema().as_ref(),
+        std::iter::once(&batch),
+        max_bytes,
+    )
+    .map_err(|e| DbError::Pipeline(format!("columnar IPC encode: {e}")))
 }
 
-/// Columnar encode result: `(keys IPC, per-accumulator state IPC, last_updated_ms)`.
-type ColumnarEncoding = (Vec<u8>, Vec<Vec<u8>>, Vec<i64>);
+struct CapturedAggregateGroup {
+    key: arrow::row::OwnedRow,
+    accumulator_states: Vec<Vec<ScalarValue>>,
+    last_updated_ms: i64,
+}
 
-/// Encode groups columnar: keys in one IPC batch, each accumulator's state across
-/// all groups in one IPC batch. Row `j` of every batch refers to `entries[j]`.
-fn encode_groups_columnar(
-    row_converter: &arrow::row::RowConverter,
-    num_group_cols: usize,
-    agg_specs: &[AggFuncSpec],
-    retractable: bool,
-    entries: &mut [(arrow::row::OwnedRow, &mut GroupEntry)],
-) -> Result<ColumnarEncoding, DbError> {
-    if entries.is_empty() {
-        return Ok((Vec::new(), Vec::new(), Vec::new()));
+pub(crate) struct AggregateVnodeCheckpointCapture {
+    fingerprint: u64,
+    group_types: Arc<[DataType]>,
+    row_converter: Arc<arrow::row::RowConverter>,
+    groups: Vec<CapturedAggregateGroup>,
+    last_emitted: Vec<(arrow::row::OwnedRow, Vec<ScalarValue>)>,
+    retained_bytes: u64,
+}
+
+impl AggregateVnodeCheckpointCapture {
+    pub(crate) const fn retained_bytes(&self) -> u64 {
+        self.retained_bytes
     }
-    let n = entries.len();
 
-    let keys_ipc = if num_group_cols == 0 {
-        Vec::new()
-    } else {
-        let key_arrays = row_converter
-            .convert_rows(entries.iter().map(|(k, _)| k.row()))
-            .map_err(|e| DbError::Pipeline(format!("group key array build: {e}")))?;
-        arrays_to_ipc(&key_arrays)?
-    };
+    pub(crate) fn is_empty(&self) -> bool {
+        self.groups.is_empty() && self.last_emitted.is_empty()
+    }
 
-    // Per accumulator, per group: collect state scalars (also rebuilds the acc).
-    let num_accs = agg_specs.len();
-    let mut acc_rows: Vec<Vec<Vec<ScalarValue>>> =
-        (0..num_accs).map(|_| Vec::with_capacity(n)).collect();
-    let mut last_updated_ms = Vec::with_capacity(n);
-    for (_, entry) in entries.iter_mut() {
-        last_updated_ms.push(entry.last_updated_ms);
-        for (i, acc) in entry.accs.iter_mut().enumerate() {
-            acc_rows[i].push(snapshot_state_scalars(acc, &agg_specs[i], retractable)?);
+    fn calculate_retained_bytes(&self) -> u64 {
+        fn add(total: &mut u64, bytes: usize) {
+            *total = total.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
         }
-    }
 
-    let mut acc_state_ipc = Vec::with_capacity(num_accs);
-    for rows in acc_rows {
-        let arity = rows.first().map_or(0, Vec::len);
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(arity);
-        for c in 0..arity {
-            let col = ScalarValue::iter_to_array(rows.iter().map(|s| s[c].clone()))
-                .map_err(|e| DbError::Pipeline(format!("acc state column build: {e}")))?;
-            columns.push(col);
+        let mut retained = u64::try_from(std::mem::size_of::<Self>()).unwrap_or(u64::MAX);
+        add(
+            &mut retained,
+            self.group_types
+                .len()
+                .saturating_mul(std::mem::size_of::<DataType>()),
+        );
+        add(
+            &mut retained,
+            self.groups
+                .capacity()
+                .saturating_mul(std::mem::size_of::<CapturedAggregateGroup>()),
+        );
+        for group in &self.groups {
+            add(&mut retained, group.key.as_ref().len());
+            add(
+                &mut retained,
+                group
+                    .accumulator_states
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Vec<ScalarValue>>()),
+            );
+            for state in &group.accumulator_states {
+                for value in state {
+                    add(&mut retained, value.size());
+                }
+                add(
+                    &mut retained,
+                    state
+                        .capacity()
+                        .saturating_sub(state.len())
+                        .saturating_mul(std::mem::size_of::<ScalarValue>()),
+                );
+            }
         }
-        acc_state_ipc.push(arrays_to_ipc(&columns)?);
+        add(
+            &mut retained,
+            self.last_emitted
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(arrow::row::OwnedRow, Vec<ScalarValue>)>()),
+        );
+        for (key, values) in &self.last_emitted {
+            add(&mut retained, key.as_ref().len());
+            for value in values {
+                add(&mut retained, value.size());
+            }
+            add(
+                &mut retained,
+                values
+                    .capacity()
+                    .saturating_sub(values.len())
+                    .saturating_mul(std::mem::size_of::<ScalarValue>()),
+            );
+        }
+        retained
     }
 
-    Ok((keys_ipc, acc_state_ipc, last_updated_ms))
+    pub(crate) fn encode(self, max_working_bytes: usize) -> Result<AggStateCheckpoint, DbError> {
+        fn checked_product(left: usize, right: usize, component: &str) -> Result<usize, DbError> {
+            left.checked_mul(right).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "aggregate {component} checkpoint accounting overflow"
+                ))
+            })
+        }
+
+        fn checked_sum(
+            values: impl IntoIterator<Item = usize>,
+            component: &str,
+        ) -> Result<usize, DbError> {
+            values.into_iter().try_fold(0usize, |total, value| {
+                total.checked_add(value).ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "aggregate {component} checkpoint accounting overflow"
+                    ))
+                })
+            })
+        }
+
+        fn array_scratch_bytes<'a>(
+            values: impl IntoIterator<Item = &'a ScalarValue>,
+            rows: usize,
+            columns: usize,
+            component: &str,
+        ) -> Result<usize, DbError> {
+            let payload = checked_sum(values.into_iter().map(ScalarValue::size), component)?;
+            let copied_payload = checked_product(payload, 2, component)?;
+            let cell_overhead = checked_product(rows, columns, component)
+                .and_then(|cells| checked_product(cells, 32, component))?;
+            checked_sum(
+                [
+                    copied_payload,
+                    cell_overhead,
+                    checked_product(columns, std::mem::size_of::<ArrayRef>(), component)?,
+                ],
+                component,
+            )
+        }
+
+        fn row_scratch_bytes(
+            payload_bytes: usize,
+            rows: usize,
+            columns: usize,
+            component: &str,
+        ) -> Result<usize, DbError> {
+            checked_sum(
+                [
+                    checked_product(payload_bytes, 2, component)?,
+                    checked_product(rows, columns, component)
+                        .and_then(|cells| checked_product(cells, 32, component))?,
+                    checked_product(columns, std::mem::size_of::<ArrayRef>(), component)?,
+                ],
+                component,
+            )
+        }
+
+        fn transient_limit(
+            remaining: usize,
+            scratch: usize,
+            component: &str,
+        ) -> Result<usize, DbError> {
+            remaining.checked_sub(scratch).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "aggregate {component} scratch space exceeded its cumulative checkpoint byte limit"
+                ))
+            })
+        }
+
+        fn retain_roster<T>(
+            remaining: &mut usize,
+            capacity: usize,
+            component: &str,
+        ) -> Result<(), DbError> {
+            let bytes = checked_product(capacity, std::mem::size_of::<T>(), component)?;
+            *remaining = remaining.checked_sub(bytes).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "aggregate {component} exceeded its cumulative checkpoint byte limit"
+                ))
+            })?;
+            Ok(())
+        }
+
+        fn retain_encoded(
+            remaining: &mut usize,
+            encoded: Vec<u8>,
+            component: &str,
+        ) -> Result<Vec<u8>, DbError> {
+            *remaining = remaining.checked_sub(encoded.capacity()).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "aggregate {component} exceeded its cumulative checkpoint byte limit"
+                ))
+            })?;
+            Ok(encoded)
+        }
+
+        let mut remaining = max_working_bytes;
+        let keys_ipc = if self.groups.is_empty() || self.group_types.is_empty() {
+            Vec::new()
+        } else {
+            let key_payload = checked_sum(
+                self.groups.iter().map(|group| group.key.as_ref().len()),
+                "group keys",
+            )?;
+            let scratch = row_scratch_bytes(
+                key_payload,
+                self.groups.len(),
+                self.group_types.len(),
+                "group keys",
+            )?;
+            let encode_limit = transient_limit(remaining, scratch, "group keys")?;
+            let arrays = self
+                .row_converter
+                .convert_rows(self.groups.iter().map(|group| group.key.row()))
+                .map_err(|error| {
+                    DbError::Checkpoint(format!("aggregate group key array build: {error}"))
+                })?;
+            let encoded = arrays_to_ipc_bounded(&arrays, encode_limit)?;
+            retain_encoded(&mut remaining, encoded, "group keys")?
+        };
+
+        let accumulator_count = self
+            .groups
+            .first()
+            .map_or(0, |group| group.accumulator_states.len());
+        if self
+            .groups
+            .iter()
+            .any(|group| group.accumulator_states.len() != accumulator_count)
+        {
+            return Err(DbError::Checkpoint(
+                "aggregate checkpoint capture has inconsistent accumulator arity".into(),
+            ));
+        }
+
+        retain_roster::<Vec<u8>>(
+            &mut remaining,
+            accumulator_count,
+            "accumulator state roster",
+        )?;
+        let mut acc_state_ipc = Vec::with_capacity(accumulator_count);
+        for accumulator_index in 0..accumulator_count {
+            let arity = self
+                .groups
+                .first()
+                .map_or(0, |group| group.accumulator_states[accumulator_index].len());
+            if self
+                .groups
+                .iter()
+                .any(|group| group.accumulator_states[accumulator_index].len() != arity)
+            {
+                return Err(DbError::Checkpoint(
+                    "aggregate checkpoint capture has inconsistent state arity".into(),
+                ));
+            }
+            let scratch = array_scratch_bytes(
+                self.groups
+                    .iter()
+                    .flat_map(|group| group.accumulator_states[accumulator_index].iter()),
+                self.groups.len(),
+                arity,
+                "accumulator state",
+            )?;
+            let encode_limit = transient_limit(remaining, scratch, "accumulator state")?;
+            let mut columns = Vec::with_capacity(arity);
+            for column in 0..arity {
+                columns.push(
+                    ScalarValue::iter_to_array(
+                        self.groups.iter().map(|group| {
+                            group.accumulator_states[accumulator_index][column].clone()
+                        }),
+                    )
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "aggregate accumulator state array build: {error}"
+                        ))
+                    })?,
+                );
+            }
+            let encoded = arrays_to_ipc_bounded(&columns, encode_limit)?;
+            acc_state_ipc.push(retain_encoded(
+                &mut remaining,
+                encoded,
+                "accumulator state",
+            )?);
+        }
+
+        retain_roster::<i64>(&mut remaining, self.groups.len(), "last-updated roster")?;
+        let last_updated_ms = self
+            .groups
+            .iter()
+            .map(|group| group.last_updated_ms)
+            .collect::<Vec<_>>();
+
+        retain_roster::<EmittedCheckpoint>(
+            &mut remaining,
+            self.last_emitted.len(),
+            "changelog roster",
+        )?;
+        let mut last_emitted = Vec::with_capacity(self.last_emitted.len());
+        for (key, values) in self.last_emitted {
+            let key_scratch = row_scratch_bytes(
+                key.as_ref().len(),
+                1,
+                self.group_types.len(),
+                "changelog key",
+            )?;
+            let key_limit = transient_limit(remaining, key_scratch, "changelog key")?;
+            let key = row_to_scalar_key_with_types(&self.row_converter, &key, &self.group_types)?;
+            let key = scalars_to_ipc_bounded(&key, key_limit)?;
+            let key = retain_encoded(&mut remaining, key, "changelog key")?;
+            let value_scratch =
+                array_scratch_bytes(values.iter(), 1, values.len(), "changelog values")?;
+            let value_limit = transient_limit(remaining, value_scratch, "changelog values")?;
+            let values = scalars_to_ipc_bounded(&values, value_limit)?;
+            let values = retain_encoded(&mut remaining, values, "changelog values")?;
+            last_emitted.push(EmittedCheckpoint { key, values });
+        }
+
+        let checkpoint = AggStateCheckpoint {
+            fingerprint: self.fingerprint,
+            keys_ipc,
+            acc_state_ipc,
+            last_updated_ms,
+            last_emitted,
+        };
+        debug_assert!(checkpoint
+            .retained_serialization_bytes()
+            .is_ok_and(|bytes| bytes <= max_working_bytes));
+        Ok(checkpoint)
+    }
 }
 
 /// Reject retractable MIN/MAX checkpoint work before `Accumulator::state()` materializes the
@@ -494,7 +764,7 @@ pub(crate) struct IncrementalAggState {
     group_types: Vec<DataType>,
     agg_specs: Vec<AggFuncSpec>,
     vnode_states: AggregateVnodeSlots,
-    row_converter: arrow::row::RowConverter,
+    row_converter: Arc<arrow::row::RowConverter>,
     output_schema: SchemaRef,
     compiled_projection: Option<CompiledProjection>,
     cached_pre_agg_physical: Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
@@ -1127,8 +1397,10 @@ impl IncrementalAggState {
             .iter()
             .map(|dt| arrow::row::SortField::new(dt.clone()))
             .collect();
-        let row_converter = arrow::row::RowConverter::new(sort_fields)
-            .map_err(|e| DbError::Pipeline(format!("row converter init: {e}")))?;
+        let row_converter = Arc::new(
+            arrow::row::RowConverter::new(sort_fields)
+                .map_err(|e| DbError::Pipeline(format!("row converter init: {e}")))?,
+        );
         let vnode_states = AggregateVnodeSlots::try_new(key_group_count)?;
         let checkpointed_vnodes =
             vec![false; usize::from(key_group_count.get())].into_boxed_slice();
@@ -1773,52 +2045,76 @@ impl IncrementalAggState {
         Ok(out)
     }
 
-    fn checkpoint_full_vnode(
+    fn capture_full_vnode(
         &mut self,
         vnode: u32,
         fingerprint: u64,
         retractable: bool,
-    ) -> Result<AggStateCheckpoint, DbError> {
-        let mut entries: Vec<(arrow::row::OwnedRow, &mut GroupEntry)> = self
-            .vnode_states
-            .get_mut(vnode)
-            .map(|state| {
-                state
-                    .groups
-                    .iter_mut()
-                    .map(|(key, entry)| (key.clone(), entry))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let encoded = encode_groups_columnar(
-            &self.row_converter,
-            self.num_group_cols,
-            &self.agg_specs,
-            retractable,
-            &mut entries,
-        );
-        drop(entries);
+        group_types: Arc<[DataType]>,
+        row_converter: Arc<arrow::row::RowConverter>,
+    ) -> Result<AggregateVnodeCheckpointCapture, DbError> {
+        let mut groups = Vec::new();
+        let mut last_emitted = Vec::new();
         if let Some(state) = self.vnode_states.get_mut(vnode) {
+            groups
+                .try_reserve_exact(state.groups.len())
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "aggregate vnode {vnode} checkpoint group roster: {error}"
+                    ))
+                })?;
+            for (key, entry) in &mut state.groups {
+                let mut accumulator_states = Vec::with_capacity(entry.accs.len());
+                for (index, accumulator) in entry.accs.iter_mut().enumerate() {
+                    accumulator_states.push(snapshot_state_scalars(
+                        accumulator,
+                        &self.agg_specs[index],
+                        retractable,
+                    )?);
+                }
+                groups.push(CapturedAggregateGroup {
+                    key: key.clone(),
+                    accumulator_states,
+                    last_updated_ms: entry.last_updated_ms,
+                });
+            }
+            if self.emit_changelog {
+                last_emitted
+                    .try_reserve_exact(state.last_emitted.len())
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "aggregate vnode {vnode} checkpoint changelog roster: {error}"
+                        ))
+                    })?;
+                last_emitted.extend(
+                    state
+                        .last_emitted
+                        .iter()
+                        .map(|(key, values)| (key.clone(), values.clone())),
+                );
+            }
             state.refresh_usage();
         }
-        let (keys_ipc, acc_state_ipc, last_updated_ms) = encoded?;
-        let last_emitted = self.last_emitted_for_vnode(vnode)?;
-        Ok(AggStateCheckpoint {
+        let mut capture = AggregateVnodeCheckpointCapture {
             fingerprint,
-            keys_ipc,
-            acc_state_ipc,
-            last_updated_ms,
+            group_types,
+            row_converter,
+            groups,
             last_emitted,
-        })
+            retained_bytes: 0,
+        };
+        capture.retained_bytes = capture.calculate_retained_bytes();
+        Ok(capture)
     }
 
     /// Capture full images for dirty vnodes in the exact requested ownership order.
     /// `None` means the prior committed frame remains authoritative.
-    pub(crate) fn checkpoint_vnodes(
+    pub(crate) fn capture_checkpoint_vnodes(
         &mut self,
         required_vnodes: &[u32],
         vnode_count: u32,
-    ) -> Result<Vec<Option<AggStateCheckpoint>>, DbError> {
+        max_capture_bytes: u64,
+    ) -> Result<Vec<Option<AggregateVnodeCheckpointCapture>>, DbError> {
         let vnode_count = self.validate_vnode_count(vnode_count)?;
         if required_vnodes.windows(2).any(|pair| pair[0] >= pair[1])
             || required_vnodes
@@ -1868,12 +2164,43 @@ impl IncrementalAggState {
         )?;
 
         let mut out = Vec::with_capacity(required_vnodes.len());
+        let mut remaining_capture_bytes = max_capture_bytes;
+        let group_types = Arc::<[DataType]>::from(self.group_types.clone());
+        let row_converter = Arc::clone(&self.row_converter);
         for (&vnode, capture) in required_vnodes.iter().zip(&capture_plan) {
-            out.push(
-                capture
-                    .then(|| self.checkpoint_full_vnode(vnode, fingerprint, retractable))
-                    .transpose()?,
-            );
+            let captured = if *capture {
+                if let Some(state) = self.vnode_states.get(vnode) {
+                    let usage = state.usage();
+                    let estimated_bytes = if usage.is_saturated() {
+                        u64::MAX
+                    } else {
+                        u64::try_from(usage.total_bytes()).unwrap_or(u64::MAX)
+                    };
+                    if estimated_bytes > remaining_capture_bytes {
+                        return Err(DbError::Checkpoint(format!(
+                            "aggregate vnode {vnode} state exceeds the remaining capture budget"
+                        )));
+                    }
+                }
+                let captured = self.capture_full_vnode(
+                    vnode,
+                    fingerprint,
+                    retractable,
+                    Arc::clone(&group_types),
+                    Arc::clone(&row_converter),
+                )?;
+                remaining_capture_bytes = remaining_capture_bytes
+                    .checked_sub(captured.retained_bytes())
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "aggregate vnode {vnode} capture exceeded the remaining capture budget"
+                        ))
+                    })?;
+                Some(captured)
+            } else {
+                None
+            };
+            out.push(captured);
         }
 
         for (vnode, checkpointed) in self.checkpointed_vnodes.iter_mut().enumerate() {
@@ -1896,27 +2223,29 @@ impl IncrementalAggState {
         Ok(out)
     }
 
-    pub(crate) fn force_full_vnode_capture(&mut self) {
-        self.checkpointed_vnodes.fill(false);
+    #[cfg(test)]
+    pub(crate) fn checkpoint_vnodes(
+        &mut self,
+        required_vnodes: &[u32],
+        vnode_count: u32,
+    ) -> Result<Vec<Option<AggStateCheckpoint>>, DbError> {
+        let captures = self.capture_checkpoint_vnodes(required_vnodes, vnode_count, u64::MAX)?;
+        let encoded = captures
+            .into_iter()
+            .map(|capture| {
+                capture
+                    .map(|capture| capture.encode(usize::MAX))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>, _>>();
+        if encoded.is_err() {
+            self.force_full_vnode_capture();
+        }
+        encoded
     }
 
-    fn last_emitted_for_vnode(&self, vnode: u32) -> Result<Vec<EmittedCheckpoint>, DbError> {
-        if !self.emit_changelog {
-            return Ok(Vec::new());
-        }
-        let Some(state) = self.vnode_states.get(vnode) else {
-            return Ok(Vec::new());
-        };
-        let mut out = Vec::new();
-        for (row_key, vals) in &state.last_emitted {
-            let sv_key =
-                row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
-            out.push(EmittedCheckpoint {
-                key: scalars_to_ipc(&sv_key)?,
-                values: scalars_to_ipc(vals)?,
-            });
-        }
-        Ok(out)
+    pub(crate) fn force_full_vnode_capture(&mut self) {
+        self.checkpointed_vnodes.fill(false);
     }
 
     fn decode_recovery_mutation(

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 #[cfg(feature = "cluster")]
 use std::collections::VecDeque;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -34,8 +35,8 @@ use crate::operator::ProjectingJoinState;
 #[cfg(feature = "cluster")]
 use crate::operator_graph::merge_input_frontier_iter;
 use crate::operator_graph::{
-    merge_input_frontiers, CapturedVnodeState, GraphOperator, InputFrontier,
-    ManagedStateAccountingSnapshot, OperatorCheckpoint,
+    merge_input_frontiers, CapturedVnodeState, EncodedStateFrame, GraphOperator, InputFrontier,
+    ManagedStateAccountingSnapshot, OperatorCheckpoint, StateFrameCapture,
 };
 #[cfg(feature = "cluster")]
 use crate::operator_graph::{ManagedVnodeTransition, ManagedVnodeTransitionMode};
@@ -47,6 +48,8 @@ use crate::temporal_join_state::{
 const ABSENT_VNODE: u8 = 0;
 const PRESENT_VNODE: u8 = 1;
 const OPERATOR_CHECKPOINT_VERSION: u8 = 2;
+const OPERATOR_CAPTURE_ALLOCATION_CHARGE: usize = 32;
+const OPERATOR_CHECKPOINT_BASE_SCRATCH: usize = 512;
 const PENDING_HOLD_ENTRY_CHARGE: usize = 64;
 const TEMPORAL_TMP_TABLE: &str = "__temporal_tmp";
 const MAX_PENDING_PROBES_PER_VNODE: usize = 1_000_000;
@@ -57,6 +60,9 @@ const MAINTENANCE_VNODE_BUDGET: usize = 64;
 const REMOTE_EVENT_BUDGET_PER_SIDE: usize = 64;
 #[cfg(feature = "cluster")]
 const REMOTE_EVENT_CHARGE: usize = std::mem::size_of::<TemporalRemoteEvent>();
+#[cfg(feature = "cluster")]
+const RETAINED_BATCH_ARC_CHARGE: usize =
+    std::mem::size_of::<crate::operator::RetainedBatch>() + 2 * std::mem::size_of::<usize>();
 #[cfg(feature = "cluster")]
 const REMOTE_DRAIN_BYTE_BUDGET_PER_SIDE: usize = laminar_core::shuffle::ROUTE_MAX_BATCH_BYTES * 2;
 #[cfg(feature = "cluster")]
@@ -131,6 +137,256 @@ struct TemporalJoinOperatorCheckpoint {
     cluster: Option<TemporalClusterCheckpoint>,
 }
 
+#[cfg(feature = "cluster")]
+enum CapturedTemporalCheckpointEvent {
+    Data {
+        recovery_gen: u64,
+        retained: Arc<crate::operator::RetainedBatch>,
+        mutation_stream: bool,
+    },
+    Frontier {
+        recovery_gen: u64,
+        frontier: InputFrontier,
+    },
+}
+
+#[cfg(feature = "cluster")]
+struct CapturedTemporalCheckpointChannel {
+    peer: u64,
+    applied: InputFrontier,
+    events: Vec<CapturedTemporalCheckpointEvent>,
+}
+
+#[cfg(feature = "cluster")]
+struct CapturedTemporalClusterCheckpoint {
+    assignment_version: u64,
+    owner_map_digest: [u8; 32],
+    self_id: u64,
+    local_frontiers: [InputFrontier; 2],
+    remote_peer_cursors: [Option<u64>; 2],
+    channels: [Vec<CapturedTemporalCheckpointChannel>; 2],
+    retained_bytes: usize,
+}
+
+struct TemporalJoinOperatorCheckpointCapture {
+    checkpoint: TemporalJoinOperatorCheckpoint,
+    #[cfg(feature = "cluster")]
+    cluster: Option<CapturedTemporalClusterCheckpoint>,
+    retained_bytes: usize,
+}
+
+impl TemporalJoinOperatorCheckpointCapture {
+    const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    fn encode(mut self, max_encoded_bytes: usize) -> Result<Vec<u8>, DbError> {
+        let mut remaining = max_encoded_bytes
+            .checked_sub(OPERATOR_CHECKPOINT_BASE_SCRATCH)
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "temporal operator checkpoint scratch requires {OPERATOR_CHECKPOINT_BASE_SCRATCH} bytes; encoding headroom is {max_encoded_bytes} bytes"
+                ))
+            })?;
+        #[cfg(feature = "cluster")]
+        if let Some(cluster) = self.cluster.take() {
+            let (encoded, cluster_remaining) = cluster.encode(remaining)?;
+            self.checkpoint.cluster = Some(encoded);
+            remaining = cluster_remaining;
+        }
+        let writer = rkyv::ser::writer::IoWriter::new(
+            laminar_core::serialization::BoundedBytesWriter::new(remaining),
+        );
+        rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(&self.checkpoint, writer)
+            .map(|bytes| bytes.into_inner().into_vec())
+            .map_err(|error| {
+                DbError::Checkpoint(format!("temporal join operator checkpoint: {error}"))
+            })
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl CapturedTemporalClusterCheckpoint {
+    const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    fn encoding_scratch_bytes(&self) -> Result<usize, DbError> {
+        let mut bytes = 0usize;
+        let mut add = |amount: usize| -> Result<(), DbError> {
+            bytes = bytes.checked_add(amount).ok_or_else(|| {
+                DbError::Checkpoint("temporal channel checkpoint scratch overflow".into())
+            })?;
+            Ok(())
+        };
+        for channels in &self.channels {
+            add(channels
+                .len()
+                .checked_mul(std::mem::size_of::<TemporalCheckpointChannel>())
+                .and_then(|value| {
+                    value.checked_add(usize::from(value != 0) * OPERATOR_CAPTURE_ALLOCATION_CHARGE)
+                })
+                .ok_or_else(|| {
+                    DbError::Checkpoint("temporal channel checkpoint scratch overflow".into())
+                })?)?;
+            for channel in channels {
+                add(channel
+                    .events
+                    .len()
+                    .checked_mul(std::mem::size_of::<TemporalCheckpointEvent>())
+                    .and_then(|value| {
+                        value.checked_add(
+                            usize::from(value != 0) * OPERATOR_CAPTURE_ALLOCATION_CHARGE,
+                        )
+                    })
+                    .ok_or_else(|| {
+                        DbError::Checkpoint("temporal channel checkpoint scratch overflow".into())
+                    })?)?;
+                for event in &channel.events {
+                    if let CapturedTemporalCheckpointEvent::Data { retained, .. } = event {
+                        add(retained
+                            .routed_vnodes()
+                            .len()
+                            .checked_mul(std::mem::size_of::<u32>())
+                            .and_then(|value| {
+                                value.checked_add(
+                                    usize::from(value != 0) * OPERATOR_CAPTURE_ALLOCATION_CHARGE,
+                                )
+                            })
+                            .ok_or_else(|| {
+                                DbError::Checkpoint(
+                                    "temporal channel checkpoint scratch overflow".into(),
+                                )
+                            })?)?;
+                        add(retained.heap_bytes().ok_or_else(|| {
+                            DbError::Checkpoint(
+                                "temporal channel checkpoint scratch overflow".into(),
+                            )
+                        })?)?;
+                    }
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn encode(
+        self,
+        max_encoded_bytes: usize,
+    ) -> Result<(TemporalClusterCheckpoint, usize), DbError> {
+        let scratch_bytes = self.encoding_scratch_bytes()?;
+        let mut remaining = max_encoded_bytes.checked_sub(scratch_bytes).ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "temporal channel checkpoint scratch requires {scratch_bytes} bytes; encoding headroom is {max_encoded_bytes} bytes"
+            ))
+        })?;
+        let mut encoded_channels = [
+            Vec::with_capacity(self.channels[0].len()),
+            Vec::with_capacity(self.channels[1].len()),
+        ];
+        for (port, channels) in self.channels.into_iter().enumerate() {
+            for channel in channels {
+                let encode_stream =
+                    |mutation_stream: bool, remaining: &mut usize| -> Result<Vec<u8>, DbError> {
+                        let first_batch = channel.events.iter().find_map(|event| match event {
+                            CapturedTemporalCheckpointEvent::Data {
+                                retained,
+                                mutation_stream: event_stream,
+                                ..
+                            } if *event_stream == mutation_stream => Some(retained.batch()),
+                            CapturedTemporalCheckpointEvent::Data { .. }
+                            | CapturedTemporalCheckpointEvent::Frontier { .. } => None,
+                        });
+                        let Some(first_batch) = first_batch else {
+                            return Ok(Vec::new());
+                        };
+                        let batches = channel.events.iter().filter_map(|event| match event {
+                            CapturedTemporalCheckpointEvent::Data {
+                                retained,
+                                mutation_stream: event_stream,
+                                ..
+                            } if *event_stream == mutation_stream => Some(retained.batch()),
+                            CapturedTemporalCheckpointEvent::Data { .. }
+                            | CapturedTemporalCheckpointEvent::Frontier { .. } => None,
+                        });
+                        let ipc = laminar_core::serialization::serialize_batches_stream_bounded(
+                            first_batch.schema().as_ref(),
+                            batches,
+                            *remaining,
+                        )
+                        .map_err(|error| {
+                            DbError::Checkpoint(format!(
+                                "temporal {} peer {} {} channel IPC: {error}",
+                                if port == 0 { "left" } else { "right" },
+                                channel.peer,
+                                if mutation_stream {
+                                    "mutation"
+                                } else {
+                                    "positioned"
+                                }
+                            ))
+                        })?;
+                        *remaining = remaining.checked_sub(ipc.capacity()).ok_or_else(|| {
+                            DbError::Checkpoint(
+                                "temporal channel IPC exceeded its encoding budget".into(),
+                            )
+                        })?;
+                        Ok(ipc)
+                    };
+                let positioned_ipc = encode_stream(false, &mut remaining)?;
+                let mutation_ipc = encode_stream(true, &mut remaining)?;
+                let events = channel
+                    .events
+                    .into_iter()
+                    .map(|event| match event {
+                        CapturedTemporalCheckpointEvent::Data {
+                            recovery_gen,
+                            retained,
+                            mutation_stream,
+                        } => Ok(TemporalCheckpointEvent::Data {
+                            recovery_gen,
+                            routed_vnodes: retained.routed_vnodes().to_vec(),
+                            row_count: u64::try_from(retained.batch().num_rows()).map_err(
+                                |_| {
+                                    DbError::Checkpoint(
+                                        "temporal channel row count exceeds u64".into(),
+                                    )
+                                },
+                            )?,
+                            mutation_stream,
+                        }),
+                        CapturedTemporalCheckpointEvent::Frontier {
+                            recovery_gen,
+                            frontier,
+                        } => Ok(TemporalCheckpointEvent::Frontier {
+                            recovery_gen,
+                            frontier: frontier.into(),
+                        }),
+                    })
+                    .collect::<Result<Vec<_>, DbError>>()?;
+                encoded_channels[port].push(TemporalCheckpointChannel {
+                    peer: channel.peer,
+                    applied: channel.applied.into(),
+                    events,
+                    positioned_ipc,
+                    mutation_ipc,
+                });
+            }
+        }
+        Ok((
+            TemporalClusterCheckpoint {
+                assignment_version: self.assignment_version,
+                owner_map_digest: self.owner_map_digest,
+                self_id: self.self_id,
+                local_frontiers: self.local_frontiers.map(Into::into),
+                remote_peer_cursors: self.remote_peer_cursors,
+                channels: encoded_channels,
+            },
+            remaining,
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TemporalJoinExecutionLimits {
     pub(crate) left_allowed_lateness_ms: i64,
@@ -191,7 +447,7 @@ struct RoutedTemporalBatch {
 
 #[cfg(feature = "cluster")]
 struct QueuedTemporalBatch {
-    retained: crate::operator::RetainedBatch,
+    retained: Arc<crate::operator::RetainedBatch>,
     keys: Arc<Rows>,
     row_vnodes: Vec<u32>,
     charged_bytes: usize,
@@ -311,6 +567,12 @@ struct ClusterInputPlan {
     effective_frontiers: [InputFrontier; 2],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WholeRestoreState {
+    Pending,
+    Applied,
+}
+
 pub(crate) struct ManagedTemporalJoinOperator {
     name: Arc<str>,
     projection: ProjectingJoinState,
@@ -338,7 +600,7 @@ pub(crate) struct ManagedTemporalJoinOperator {
     max_managed_state_bytes: usize,
     frontiers: [InputFrontier; 2],
     restored_frontiers: Option<[InputFrontier; 2]>,
-    whole_restored: bool,
+    whole_restore: WholeRestoreState,
     pending_frontiers: Option<[InputFrontier; 2]>,
     frontier_cursor: usize,
     frontier_remaining: usize,
@@ -476,7 +738,7 @@ impl ManagedTemporalJoinOperator {
             max_managed_state_bytes: crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
             frontiers: [InputFrontier::default(); 2],
             restored_frontiers: None,
-            whole_restored: false,
+            whole_restore: WholeRestoreState::Pending,
             pending_frontiers: None,
             frontier_cursor: 0,
             frontier_remaining: 0,
@@ -513,7 +775,7 @@ impl ManagedTemporalJoinOperator {
             #[cfg(feature = "cluster")]
             vnode_transition_cleanup: None,
         };
-        let validation = operator.state_config(0, operator.max_managed_state_bytes)?;
+        let validation = operator.state_config(0, operator.max_managed_state_bytes);
         let _ = TemporalJoinVnodeState::try_new(
             Arc::clone(&operator.left_schema),
             Arc::clone(&operator.right_schema),
@@ -594,7 +856,10 @@ impl ManagedTemporalJoinOperator {
     }
 
     #[cfg(feature = "cluster")]
-    fn encode_cluster_checkpoint(&self) -> Result<Option<TemporalClusterCheckpoint>, DbError> {
+    fn capture_cluster_checkpoint(
+        &self,
+        max_capture_bytes: usize,
+    ) -> Result<Option<CapturedTemporalClusterCheckpoint>, DbError> {
         let Some(cluster) = self.cluster_shuffle.as_ref() else {
             return Ok(None);
         };
@@ -623,14 +888,10 @@ impl ManagedTemporalJoinOperator {
             }
         }
 
-        let mut encoded_bytes = 0usize;
         let mut event_count = 0usize;
         let mut queued_bytes = 0usize;
         let mut capacity_bytes = 0usize;
-        let mut channels = [
-            Vec::with_capacity(self.peer_channels[0].len()),
-            Vec::with_capacity(self.peer_channels[1].len()),
-        ];
+        let mut retained_bytes = 0usize;
         for side in [TemporalInputSide::Left, TemporalInputSide::Right] {
             let port = side.port();
             if self.peer_channels[port].len() != peers.len() {
@@ -640,6 +901,16 @@ impl ManagedTemporalJoinOperator {
                     side.name()
                 )));
             }
+            let channel_roster_bytes = self.peer_channels[port]
+                .len()
+                .checked_mul(std::mem::size_of::<CapturedTemporalCheckpointChannel>())
+                .and_then(|bytes| {
+                    bytes.checked_add(usize::from(bytes != 0) * OPERATOR_CAPTURE_ALLOCATION_CHARGE)
+                })
+                .ok_or_else(|| self.accounting_error())?;
+            retained_bytes = retained_bytes
+                .checked_add(channel_roster_bytes)
+                .ok_or_else(|| self.accounting_error())?;
             for (&peer, channel) in &self.peer_channels[port] {
                 if peers.binary_search(&peer).is_err() {
                     return Err(DbError::Checkpoint(format!(
@@ -657,6 +928,19 @@ impl ManagedTemporalJoinOperator {
                             .ok_or_else(|| self.accounting_error())?,
                     )
                     .ok_or_else(|| self.accounting_error())?;
+                let event_roster_bytes = channel
+                    .events
+                    .len()
+                    .checked_mul(std::mem::size_of::<CapturedTemporalCheckpointEvent>())
+                    .and_then(|bytes| {
+                        bytes.checked_add(
+                            usize::from(bytes != 0) * OPERATOR_CAPTURE_ALLOCATION_CHARGE,
+                        )
+                    })
+                    .ok_or_else(|| self.accounting_error())?;
+                retained_bytes = retained_bytes
+                    .checked_add(event_roster_bytes)
+                    .ok_or_else(|| self.accounting_error())?;
                 if !channel.applied.idle {
                     validate_frontier(
                         self.frontiers[port],
@@ -667,7 +951,6 @@ impl ManagedTemporalJoinOperator {
                 }
                 let mut accepted = channel.applied;
                 let mut previous_recovery = None;
-                let mut events = Vec::with_capacity(channel.events.len());
                 for event in &channel.events {
                     if event.assignment_version != assignment.version()
                         || event.recovery_gen > cluster.receiver.recovery_gen()
@@ -701,13 +984,15 @@ impl ManagedTemporalJoinOperator {
                                     side.name()
                                 )));
                             }
-                            events.push(TemporalCheckpointEvent::Data {
-                                recovery_gen: event.recovery_gen,
-                                routed_vnodes: batch.retained.routed_vnodes().to_vec(),
-                                row_count: u64::try_from(batch.retained.batch().num_rows())
-                                    .map_err(|_| self.accounting_error())?,
-                                mutation_stream: batch.mutation_stream,
-                            });
+                            retained_bytes = retained_bytes
+                                .checked_add(
+                                    batch
+                                        .retained
+                                        .heap_bytes()
+                                        .ok_or_else(|| self.accounting_error())?,
+                                )
+                                .and_then(|bytes| bytes.checked_add(RETAINED_BATCH_ARC_CHARGE))
+                                .ok_or_else(|| self.accounting_error())?;
                         }
                         TemporalRemoteEventPayload::Frontier(frontier) => {
                             validate_frontier(accepted, *frontier, side.name(), &self.name)?;
@@ -726,10 +1011,6 @@ impl ManagedTemporalJoinOperator {
                                 )));
                             }
                             accepted = *frontier;
-                            events.push(TemporalCheckpointEvent::Frontier {
-                                recovery_gen: event.recovery_gen,
-                                frontier: (*frontier).into(),
-                            });
                         }
                     }
                 }
@@ -740,76 +1021,6 @@ impl ManagedTemporalJoinOperator {
                         side.name()
                     )));
                 }
-                let mut encode_stream = |mutation_stream: bool| -> Result<Vec<u8>, DbError> {
-                    let first_batch =
-                        channel
-                            .events
-                            .iter()
-                            .find_map(|event| match &event.payload {
-                                TemporalRemoteEventPayload::Data(batch)
-                                    if batch.mutation_stream == mutation_stream =>
-                                {
-                                    Some(batch.retained.batch())
-                                }
-                                TemporalRemoteEventPayload::Frontier(_) => None,
-                                TemporalRemoteEventPayload::Data(_) => None,
-                            });
-                    let Some(first_batch) = first_batch else {
-                        return Ok(Vec::new());
-                    };
-                    let remaining = self
-                        .max_managed_state_bytes
-                        .checked_sub(encoded_bytes)
-                        .filter(|remaining| *remaining != 0)
-                        .ok_or_else(|| {
-                            DbError::Checkpoint(format!(
-                                "temporal join [{}] channel IPC exhausted its checkpoint limit",
-                                self.name
-                            ))
-                        })?;
-                    let batches = channel
-                        .events
-                        .iter()
-                        .filter_map(|event| match &event.payload {
-                            TemporalRemoteEventPayload::Data(batch)
-                                if batch.mutation_stream == mutation_stream =>
-                            {
-                                Some(batch.retained.batch())
-                            }
-                            TemporalRemoteEventPayload::Data(_)
-                            | TemporalRemoteEventPayload::Frontier(_) => None,
-                        });
-                    let data_ipc = laminar_core::serialization::serialize_batches_stream_bounded(
-                        first_batch.schema().as_ref(),
-                        batches,
-                        remaining,
-                    )
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "temporal join [{}] {} peer {peer} {} channel IPC: {error}",
-                            self.name,
-                            side.name(),
-                            if mutation_stream {
-                                "mutation"
-                            } else {
-                                "positioned"
-                            }
-                        ))
-                    })?;
-                    encoded_bytes = encoded_bytes
-                        .checked_add(data_ipc.capacity())
-                        .ok_or_else(|| self.accounting_error())?;
-                    Ok(data_ipc)
-                };
-                let positioned_ipc = encode_stream(false)?;
-                let mutation_ipc = encode_stream(true)?;
-                channels[port].push(TemporalCheckpointChannel {
-                    peer,
-                    applied: channel.applied.into(),
-                    events,
-                    positioned_ipc,
-                    mutation_ipc,
-                });
             }
         }
         if event_count != self.queued_remote_events
@@ -821,13 +1032,159 @@ impl ManagedTemporalJoinOperator {
                 self.name
             )));
         }
-        Ok(Some(TemporalClusterCheckpoint {
+        if retained_bytes > max_capture_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] channel capture requires {retained_bytes} bytes; capture headroom is {max_capture_bytes} bytes",
+                self.name
+            )));
+        }
+        let mut channels = [
+            Vec::with_capacity(self.peer_channels[0].len()),
+            Vec::with_capacity(self.peer_channels[1].len()),
+        ];
+        for side in [TemporalInputSide::Left, TemporalInputSide::Right] {
+            let port = side.port();
+            for (&peer, channel) in &self.peer_channels[port] {
+                let events = channel
+                    .events
+                    .iter()
+                    .map(|event| match &event.payload {
+                        TemporalRemoteEventPayload::Data(batch) => {
+                            CapturedTemporalCheckpointEvent::Data {
+                                recovery_gen: event.recovery_gen,
+                                retained: Arc::clone(&batch.retained),
+                                mutation_stream: batch.mutation_stream,
+                            }
+                        }
+                        TemporalRemoteEventPayload::Frontier(frontier) => {
+                            CapturedTemporalCheckpointEvent::Frontier {
+                                recovery_gen: event.recovery_gen,
+                                frontier: *frontier,
+                            }
+                        }
+                    })
+                    .collect();
+                channels[port].push(CapturedTemporalCheckpointChannel {
+                    peer,
+                    applied: channel.applied,
+                    events,
+                });
+            }
+        }
+        let mut actual_retained_bytes = retained_bytes;
+        for side in &channels {
+            actual_retained_bytes = actual_retained_bytes
+                .checked_add(
+                    side.capacity()
+                        .saturating_sub(side.len())
+                        .checked_mul(std::mem::size_of::<CapturedTemporalCheckpointChannel>())
+                        .ok_or_else(|| self.accounting_error())?,
+                )
+                .ok_or_else(|| self.accounting_error())?;
+            for channel in side {
+                actual_retained_bytes = actual_retained_bytes
+                    .checked_add(
+                        channel
+                            .events
+                            .capacity()
+                            .saturating_sub(channel.events.len())
+                            .checked_mul(std::mem::size_of::<CapturedTemporalCheckpointEvent>())
+                            .ok_or_else(|| self.accounting_error())?,
+                    )
+                    .ok_or_else(|| self.accounting_error())?;
+            }
+        }
+        if actual_retained_bytes > max_capture_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] channel capture retains {actual_retained_bytes} bytes; capture headroom is {max_capture_bytes} bytes",
+                self.name
+            )));
+        }
+        Ok(Some(CapturedTemporalClusterCheckpoint {
             assignment_version: assignment.version(),
             owner_map_digest: self.owner_map_digest(&assignment),
             self_id: cluster.self_id.0,
-            local_frontiers: self.local_frontiers.map(Into::into),
+            local_frontiers: self.local_frontiers,
             remote_peer_cursors: self.remote_peer_cursors,
             channels,
+            retained_bytes: actual_retained_bytes,
+        }))
+    }
+
+    fn capture_operator_checkpoint(
+        &self,
+        max_capture_bytes: usize,
+    ) -> Result<Option<TemporalJoinOperatorCheckpointCapture>, DbError> {
+        if self.pending_frontiers.is_some() {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] cannot checkpoint during bounded frontier fanout",
+                self.name
+            )));
+        }
+        self.validate_published_output_frontier(self.frontiers, self.published_output_frontier)?;
+        #[cfg(feature = "cluster")]
+        let cluster_attached = self.cluster_shuffle.is_some();
+        #[cfg(not(feature = "cluster"))]
+        let cluster_attached = false;
+        if self.frontiers == [InputFrontier::default(); 2]
+            && self.maintenance_cursor == 0
+            && !self.maintenance_pending
+            && self.maintenance_remaining == 0
+            && !self.maintenance_rescan
+            && self.published_output_frontier.is_none()
+            && !cluster_attached
+        {
+            return Ok(None);
+        }
+        let base_bytes = std::mem::size_of::<TemporalJoinOperatorCheckpointCapture>();
+        let cluster_headroom = max_capture_bytes.checked_sub(base_bytes).ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "temporal join [{}] operator capture metadata exceeds its {max_capture_bytes}-byte headroom",
+                self.name
+            ))
+        })?;
+        #[cfg(feature = "cluster")]
+        let cluster = self.capture_cluster_checkpoint(cluster_headroom)?;
+        let maintenance_cursor = u32::try_from(self.maintenance_cursor).map_err(|_| {
+            DbError::Checkpoint(format!(
+                "temporal join [{}] maintenance cursor exceeds u32",
+                self.name
+            ))
+        })?;
+        let maintenance_remaining = u32::try_from(self.maintenance_remaining).map_err(|_| {
+            DbError::Checkpoint(format!(
+                "temporal join [{}] maintenance sweep exceeds u32",
+                self.name
+            ))
+        })?;
+        #[cfg(feature = "cluster")]
+        let retained_bytes = cluster.as_ref().map_or(Ok(base_bytes), |cluster| {
+            base_bytes
+                .checked_add(cluster.retained_bytes())
+                .ok_or_else(|| self.accounting_error())
+        })?;
+        #[cfg(not(feature = "cluster"))]
+        let retained_bytes = base_bytes;
+        if retained_bytes > max_capture_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] operator capture retains {retained_bytes} bytes; capture headroom is {max_capture_bytes} bytes",
+                self.name
+            )));
+        }
+        Ok(Some(TemporalJoinOperatorCheckpointCapture {
+            checkpoint: TemporalJoinOperatorCheckpoint {
+                version: OPERATOR_CHECKPOINT_VERSION,
+                frontiers: self.frontiers.map(Into::into),
+                maintenance_cursor,
+                maintenance_pending: self.maintenance_pending,
+                maintenance_remaining,
+                maintenance_rescan: self.maintenance_rescan,
+                published_output_frontier: self.published_output_frontier.map(Into::into),
+                cluster: None,
+            },
+            #[cfg(feature = "cluster")]
+            cluster,
+            retained_bytes,
         }))
     }
 
@@ -1110,7 +1467,7 @@ impl ManagedTemporalJoinOperator {
                             } else {
                                 &mut positioned_reader
                             };
-                            let batch = match reader.as_mut().and_then(|reader| reader.next()) {
+                            let batch = match reader.as_mut().and_then(Iterator::next) {
                                 Some(Ok(batch)) => batch,
                                 Some(Err(error)) => {
                                     return Err(DbError::Checkpoint(format!(
@@ -1327,12 +1684,8 @@ impl ManagedTemporalJoinOperator {
         }
     }
 
-    fn state_config(
-        &self,
-        vnode: u32,
-        max_retained_bytes: usize,
-    ) -> Result<TemporalJoinStateConfig, DbError> {
-        Ok(TemporalJoinStateConfig {
+    fn state_config(&self, vnode: u32, max_retained_bytes: usize) -> TemporalJoinStateConfig {
+        TemporalJoinStateConfig {
             vnode,
             vnode_count: self.vnode_count,
             left_key_indices: self.left_key_indices.clone(),
@@ -1355,7 +1708,7 @@ impl ManagedTemporalJoinOperator {
                 max_offsets_per_row: MAX_TEMPORAL_PROBES_PER_ROW,
                 max_horizon_ms: MAX_TEMPORAL_PROBE_HORIZON_MS,
             },
-        })
+        }
     }
 
     fn vnode_state_frontiers(state: &TemporalJoinVnodeState) -> [InputFrontier; 2] {
@@ -1402,7 +1755,7 @@ impl ManagedTemporalJoinOperator {
                 self.name
             ))),
             PRESENT_VNODE => {
-                let config = self.state_config(vnode, max_state_bytes)?;
+                let config = self.state_config(vnode, max_state_bytes);
                 TemporalJoinVnodeState::restore(
                     Arc::clone(&self.left_schema),
                     Arc::clone(&self.right_schema),
@@ -1919,7 +2272,7 @@ impl ManagedTemporalJoinOperator {
                         self.name
                     )));
                 }
-                let port = matches!(side, TemporalInputSide::Right) as usize;
+                let port = usize::from(matches!(side, TemporalInputSide::Right));
                 for route in plan.local {
                     routed.entry(route.vnode).or_default()[port].push(RoutedTemporalBatch {
                         batch: route.batch,
@@ -2180,7 +2533,7 @@ impl ManagedTemporalJoinOperator {
         &self,
         side: TemporalInputSide,
         context: &str,
-        error: DbError,
+        error: &DbError,
     ) -> DbError {
         DbError::ShuffleTerminal(format!(
             "temporal join [{}] rejected {} shuffle {context}: {error}",
@@ -2244,12 +2597,12 @@ impl ManagedTemporalJoinOperator {
         }
         let mutation_stream = self
             .validate_routed_side_batch(side, retained.batch())
-            .map_err(|error| self.remote_input_error(side, "schema", error))?;
+            .map_err(|error| self.remote_input_error(side, "schema", &error))?;
         self.validate_batch_lateness(side, retained.batch(), accepted, true)
-            .map_err(|error| self.remote_input_error(side, "lateness", error))?;
+            .map_err(|error| self.remote_input_error(side, "lateness", &error))?;
         let (keys, row_vnodes) = self
             .encoded_route_keys(side, retained.batch())
-            .map_err(|error| self.remote_input_error(side, "partition key", error))?;
+            .map_err(|error| self.remote_input_error(side, "partition key", &error))?;
         let mut actual = row_vnodes.clone();
         actual.sort_unstable();
         actual.dedup();
@@ -2275,6 +2628,7 @@ impl ManagedTemporalJoinOperator {
         }
         let charged_bytes = retained
             .heap_bytes()
+            .and_then(|bytes| bytes.checked_add(RETAINED_BATCH_ARC_CHARGE))
             .and_then(|bytes| bytes.checked_add(keys.size()))
             .and_then(|bytes| {
                 row_vnodes
@@ -2284,7 +2638,7 @@ impl ManagedTemporalJoinOperator {
             })
             .ok_or_else(|| self.accounting_error())?;
         Ok(QueuedTemporalBatch {
-            retained,
+            retained: Arc::new(retained),
             keys,
             row_vnodes,
             charged_bytes,
@@ -2318,7 +2672,11 @@ impl ManagedTemporalJoinOperator {
             }
             let mut index = self.remote_peer_cursors[port].map_or(0, |cursor| {
                 let next = peers.partition_point(|peer| *peer <= cursor);
-                (next != peers.len()).then_some(next).unwrap_or(0)
+                if next == peers.len() {
+                    0
+                } else {
+                    next
+                }
             });
             let mut empty_visits = 0usize;
             let mut budget = REMOTE_EVENT_BUDGET_PER_SIDE;
@@ -2474,7 +2832,7 @@ impl ManagedTemporalJoinOperator {
                     accounted_bytes: *accounted_total,
                     limit_bytes: self.max_managed_state_bytes,
                 })?;
-            let config = self.state_config(vnode, shard_limit)?;
+            let config = self.state_config(vnode, shard_limit);
             let mut state = TemporalJoinVnodeState::try_new(
                 Arc::clone(&self.left_schema),
                 Arc::clone(&self.right_schema),
@@ -3433,7 +3791,7 @@ impl ManagedTemporalJoinOperator {
     #[cfg(feature = "cluster")]
     fn prepare_transition_image(
         &self,
-        transition: ManagedVnodeTransition<'_>,
+        transition: &ManagedVnodeTransition<'_>,
     ) -> Result<PreparedTemporalJoinTransition, DbError> {
         let config = self.cluster_shuffle.as_ref().ok_or_else(|| {
             DbError::Checkpoint(format!(
@@ -3512,7 +3870,7 @@ impl ManagedTemporalJoinOperator {
                     || self.frontiers != [InputFrontier::default(); 2]
                     || self.local_frontiers != [InputFrontier::default(); 2]
                     || self.published_output_frontier.is_some()
-                    || self.whole_restored
+                    || self.whole_restore == WholeRestoreState::Applied
                     || self.maintenance_pending
                     || self.maintenance_remaining != 0
                     || self.maintenance_rescan
@@ -3538,7 +3896,10 @@ impl ManagedTemporalJoinOperator {
                 .owners()
                 .iter()
                 .enumerate()
-                .filter_map(|(vnode, owner)| (*owner == config.self_id).then_some(vnode as u32))
+                .filter(|(_, owner)| **owner == config.self_id)
+                .map(|(vnode, _)| {
+                    u32::try_from(vnode).expect("temporal vnode topology must fit u32")
+                })
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -3547,7 +3908,8 @@ impl ManagedTemporalJoinOperator {
             .owners()
             .iter()
             .enumerate()
-            .filter_map(|(vnode, owner)| (*owner == config.self_id).then_some(vnode as u32))
+            .filter(|(_, owner)| **owner == config.self_id)
+            .map(|(vnode, _)| u32::try_from(vnode).expect("temporal vnode topology must fit u32"))
             .collect::<Vec<_>>();
         let fresh_acquirer =
             checkpoint_bootstrap || (predecessor_owned.is_empty() && !target_owned.is_empty());
@@ -3575,7 +3937,7 @@ impl ManagedTemporalJoinOperator {
                 self.name
             )));
         }
-        let mut handoff_cut = self.portable_handoff_cut(&transition, fresh_acquirer)?;
+        let mut handoff_cut = self.portable_handoff_cut(transition, fresh_acquirer)?;
         let transition_frontiers = handoff_cut.map_or(self.frontiers, |cut| cut.frontiers);
         let mut published_output_frontier = handoff_cut
             .map_or(self.published_output_frontier, |cut| {
@@ -3952,61 +4314,32 @@ impl GraphOperator for ManagedTemporalJoinOperator {
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
-        if self.pending_frontiers.is_some() {
-            return Err(DbError::Checkpoint(format!(
-                "temporal join [{}] cannot checkpoint during bounded frontier fanout",
-                self.name
-            )));
-        }
-        self.validate_published_output_frontier(self.frontiers, self.published_output_frontier)?;
-        #[cfg(feature = "cluster")]
-        let cluster = self.encode_cluster_checkpoint()?;
-        #[cfg(not(feature = "cluster"))]
-        let cluster = None;
-        if self.frontiers == [InputFrontier::default(); 2]
-            && self.maintenance_cursor == 0
-            && !self.maintenance_pending
-            && self.maintenance_remaining == 0
-            && !self.maintenance_rescan
-            && self.published_output_frontier.is_none()
-            && cluster.is_none()
-        {
+        let Some(capture) = self.capture_operator_checkpoint(usize::MAX)? else {
             return Ok(None);
-        }
-        let maintenance_cursor = u32::try_from(self.maintenance_cursor).map_err(|_| {
-            DbError::Checkpoint(format!(
-                "temporal join [{}] maintenance cursor exceeds u32",
-                self.name
-            ))
-        })?;
-        let maintenance_remaining = u32::try_from(self.maintenance_remaining).map_err(|_| {
-            DbError::Checkpoint(format!(
-                "temporal join [{}] maintenance sweep exceeds u32",
-                self.name
-            ))
-        })?;
-        let checkpoint = TemporalJoinOperatorCheckpoint {
-            version: OPERATOR_CHECKPOINT_VERSION,
-            frontiers: self.frontiers.map(Into::into),
-            maintenance_cursor,
-            maintenance_pending: self.maintenance_pending,
-            maintenance_remaining,
-            maintenance_rescan: self.maintenance_rescan,
-            published_output_frontier: self.published_output_frontier.map(Into::into),
-            cluster,
         };
-        let writer = rkyv::ser::writer::IoWriter::new(
-            laminar_core::serialization::BoundedBytesWriter::new(self.max_managed_state_bytes),
-        );
-        let data = rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(&checkpoint, writer)
-            .map(|bytes| bytes.into_inner().into_vec())
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "temporal join [{}] operator checkpoint: {error}",
-                    self.name
-                ))
-            })?;
+        let data = capture.encode(self.max_managed_state_bytes)?;
         Ok(Some(OperatorCheckpoint { data }))
+    }
+
+    fn checkpoint_capture(
+        &mut self,
+        max_capture_bytes: u64,
+    ) -> Result<Option<StateFrameCapture>, DbError> {
+        let Some(capture) = self.capture_operator_checkpoint(
+            usize::try_from(max_capture_bytes).unwrap_or(usize::MAX),
+        )?
+        else {
+            return Ok(None);
+        };
+        let retained_bytes = u64::try_from(capture.retained_bytes()).unwrap_or(u64::MAX);
+        let max_managed_state_bytes = self.max_managed_state_bytes;
+        Ok(Some(StateFrameCapture::deferred(
+            retained_bytes,
+            move |remaining| {
+                let data = capture.encode(remaining.min(max_managed_state_bytes))?;
+                Ok(EncodedStateFrame::from_vec(data))
+            },
+        )))
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
@@ -4025,7 +4358,7 @@ impl GraphOperator for ManagedTemporalJoinOperator {
         #[cfg(not(feature = "cluster"))]
         let cluster_pristine = true;
         if !cluster_pristine
-            || self.whole_restored
+            || self.whole_restore == WholeRestoreState::Applied
             || !self.resident_vnodes.is_empty()
             || self.frontiers != [InputFrontier::default(); 2]
             || self.pending_frontiers.is_some()
@@ -4152,7 +4485,7 @@ impl GraphOperator for ManagedTemporalJoinOperator {
             self.queued_remote_events = cluster.queued_remote_events;
             self.queued_event_capacity_bytes = cluster.queued_event_capacity_bytes;
         }
-        self.whole_restored = true;
+        self.whole_restore = WholeRestoreState::Applied;
         Ok(())
     }
 
@@ -4283,6 +4616,7 @@ impl GraphOperator for ManagedTemporalJoinOperator {
         &mut self,
         required_vnodes: &[u32],
         vnode_count: u32,
+        max_capture_bytes: u64,
     ) -> Result<Option<Vec<CapturedVnodeState>>, DbError> {
         if self.pending_frontiers.is_some() {
             return Err(DbError::Checkpoint(format!(
@@ -4291,56 +4625,81 @@ impl GraphOperator for ManagedTemporalJoinOperator {
             )));
         }
         self.validate_vnode_roster(required_vnodes, vnode_count)?;
-        let capture: Vec<bool> = required_vnodes
+        let capture_plan: Vec<bool> = required_vnodes
             .iter()
             .map(|vnode| {
                 !self.checkpointed_vnodes[*vnode as usize] || self.dirty_vnodes[*vnode as usize]
             })
             .collect();
-        let mut encoded_total = 0usize;
+        let absent_frame_bytes = required_vnodes
+            .iter()
+            .zip(&capture_plan)
+            .filter(|(vnode, include)| **include && self.vnode_states[**vnode as usize].is_none())
+            .count();
+        let remaining_operator_bytes = self
+            .max_managed_state_bytes
+            .checked_sub(absent_frame_bytes)
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "temporal join [{}] vnode checkpoint limit exhausted",
+                    self.name
+                ))
+            })?;
+        let remaining_operator_bytes = Arc::new(AtomicUsize::new(remaining_operator_bytes));
         let mut result = Vec::with_capacity(required_vnodes.len());
-        for (&vnode, include) in required_vnodes.iter().zip(&capture) {
+        let mut remaining_capture_bytes = max_capture_bytes;
+        for (&vnode, include) in required_vnodes.iter().zip(&capture_plan) {
             let state = if *include {
-                let remaining = self
-                    .max_managed_state_bytes
-                    .checked_sub(encoded_total)
-                    .filter(|remaining| *remaining != 0)
-                    .ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "temporal join [{}] vnode checkpoint limit exhausted",
-                            self.name
-                        ))
-                    })?;
-                let bytes = if let Some(state) = self.vnode_states[vnode as usize].as_ref() {
-                    let mut bytes = Vec::with_capacity(remaining.min(4096));
-                    bytes.push(PRESENT_VNODE);
-                    let payload_budget = remaining
-                        .checked_sub(1)
-                        .filter(|budget| *budget != 0)
-                        .ok_or_else(|| {
-                            DbError::Checkpoint(format!(
-                                "temporal join [{}] vnode {vnode} checkpoint header exhausted its limit",
-                                self.name
-                            ))
-                        })?;
-                    bytes.extend(state.checkpoint(payload_budget)?);
-                    bytes
-                } else {
-                    vec![ABSENT_VNODE]
-                };
-                encoded_total = encoded_total.checked_add(bytes.len()).ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "temporal join [{}] vnode checkpoint accounting overflow",
-                        self.name
+                if let Some(state) = self.vnode_states[vnode as usize].as_ref() {
+                    let capture = state.capture_checkpoint(
+                        usize::try_from(remaining_capture_bytes).unwrap_or(usize::MAX),
+                    )?;
+                    let retained_bytes =
+                        u64::try_from(capture.retained_bytes()).unwrap_or(u64::MAX);
+                    let max_managed_state_bytes = self.max_managed_state_bytes;
+                    let remaining_operator_bytes = Arc::clone(&remaining_operator_bytes);
+                    Some(StateFrameCapture::deferred(
+                        retained_bytes,
+                        move |remaining| {
+                            let operator_remaining =
+                                remaining_operator_bytes.load(AtomicOrdering::Relaxed);
+                            let frame_limit = remaining
+                                .min(operator_remaining)
+                                .min(max_managed_state_bytes);
+                            let frame = capture.encode(frame_limit, Some(PRESENT_VNODE))?;
+                            remaining_operator_bytes
+                                .fetch_update(
+                                    AtomicOrdering::Relaxed,
+                                    AtomicOrdering::Relaxed,
+                                    |remaining| remaining.checked_sub(frame.len()),
+                                )
+                                .map_err(|_| {
+                                    DbError::Checkpoint(format!(
+                                        "temporal join vnode {vnode} checkpoints exceeded their managed-state limit"
+                                    ))
+                                })?;
+                            Ok(EncodedStateFrame::from_vec(frame))
+                        },
                     ))
-                })?;
-                Some(bytes::Bytes::from(bytes))
+                } else {
+                    Some(StateFrameCapture::encoded_static(&[ABSENT_VNODE]))
+                }
             } else {
                 None
             };
+            if let Some(capture) = state.as_ref() {
+                remaining_capture_bytes = remaining_capture_bytes
+                    .checked_sub(capture.retained_bytes())
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "temporal join [{}] vnode {vnode} capture exceeded the remaining capture budget",
+                            self.name
+                        ))
+                    })?;
+            }
             result.push(CapturedVnodeState { vnode, state });
         }
-        for (&vnode, include) in required_vnodes.iter().zip(capture) {
+        for (&vnode, include) in required_vnodes.iter().zip(capture_plan) {
             self.checkpointed_vnodes[vnode as usize] = true;
             if include {
                 self.dirty_vnodes[vnode as usize] = false;
@@ -4381,7 +4740,7 @@ impl GraphOperator for ManagedTemporalJoinOperator {
         let replacement = self.decode_vnode_frame(vnode, vnode_count, bytes, limit)?;
         if let Some(state) = replacement.as_ref() {
             let restored = Self::vnode_state_frontiers(state);
-            if self.whole_restored
+            if self.whole_restore == WholeRestoreState::Applied
                 && !self.maintenance_pending
                 && (state.has_ready_probes() || state.has_history_gc_work())
             {
@@ -4390,7 +4749,7 @@ impl GraphOperator for ManagedTemporalJoinOperator {
                     self.name
                 )));
             }
-            if self.whole_restored && self.frontiers != restored {
+            if self.whole_restore == WholeRestoreState::Applied && self.frontiers != restored {
                 return Err(DbError::Checkpoint(format!(
                     "temporal join [{}] whole and vnode frontiers disagree",
                     self.name
@@ -4434,7 +4793,7 @@ impl GraphOperator for ManagedTemporalJoinOperator {
         }
         self.checkpointed_vnodes[vnode as usize] = false;
         self.dirty_vnodes[vnode as usize] = false;
-        if !self.whole_restored {
+        if self.whole_restore == WholeRestoreState::Pending {
             let restored_has_work = self.vnode_states[vnode as usize]
                 .as_ref()
                 .is_some_and(|state| state.has_ready_probes() || state.has_history_gc_work());
@@ -4458,7 +4817,7 @@ impl GraphOperator for ManagedTemporalJoinOperator {
                 self.name
             )));
         }
-        self.prepared_vnode_transition = Some(self.prepare_transition_image(transition)?);
+        self.prepared_vnode_transition = Some(self.prepare_transition_image(&transition)?);
         Ok(())
     }
 
@@ -4753,6 +5112,11 @@ mod tests {
             }
         }
         panic!("could not find key for vnode {target}");
+    }
+
+    fn materialize_capture(capture: StateFrameCapture) -> bytes::Bytes {
+        let mut staged_bytes = capture.retained_bytes();
+        capture.materialize(&mut staged_bytes, u64::MAX).unwrap()
     }
 
     fn frontier(watermark: i64) -> [InputFrontier; 2] {
@@ -5092,11 +5456,17 @@ mod tests {
             .unwrap();
         donor.maintenance_cursor = 1;
         let whole = donor.checkpoint().unwrap().unwrap();
-        let captured = donor.checkpoint_vnodes(&[0, 1], 2).unwrap().unwrap();
-        assert_eq!(captured[0].state.as_deref().unwrap(), &[ABSENT_VNODE]);
-        assert_eq!(captured[1].state.as_deref().unwrap()[0], PRESENT_VNODE);
+        let captured = donor
+            .checkpoint_vnodes(&[0, 1], 2, u64::MAX)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|frame| (frame.vnode, frame.state.map(materialize_capture)))
+            .collect::<Vec<_>>();
+        assert_eq!(captured[0].1.as_deref().unwrap(), &[ABSENT_VNODE]);
+        assert_eq!(captured[1].1.as_deref().unwrap()[0], PRESENT_VNODE);
         assert!(donor
-            .checkpoint_vnodes(&[0, 1], 2)
+            .checkpoint_vnodes(&[0, 1], 2, u64::MAX)
             .unwrap()
             .unwrap()
             .iter()
@@ -5105,15 +5475,18 @@ mod tests {
         let (mut restored, _, _) = operator(8);
         restored.restore(whole).unwrap();
         assert_eq!(restored.maintenance_cursor, 1);
-        for frame in &captured {
+        for (vnode, state) in &captured {
             restored
-                .restore_vnode(frame.vnode, 2, frame.state.as_deref().unwrap())
+                .restore_vnode(*vnode, 2, state.as_deref().unwrap())
                 .unwrap();
         }
         assert!(restored.vnode_states[0].is_none());
         assert!(restored.vnode_states[1].is_some());
         restored.force_full_vnode_capture();
-        let recaptured = restored.checkpoint_vnodes(&[0, 1], 2).unwrap().unwrap();
+        let recaptured = restored
+            .checkpoint_vnodes(&[0, 1], 2, u64::MAX)
+            .unwrap()
+            .unwrap();
         assert!(recaptured.iter().all(|frame| frame.state.is_some()));
 
         let left = left_batch(std::slice::from_ref(&key), &["X"], &[100], &[7]);
@@ -5232,8 +5605,8 @@ mod tests {
         while !donor.wants_input() {
             donor.process_with_frontiers(&[], &cut).await.unwrap();
         }
-        let captured = donor.checkpoint_vnodes(&[0], 2).unwrap().unwrap();
-        let vnode_frame = captured[0].state.as_deref().unwrap();
+        let captured = donor.checkpoint_vnodes(&[0], 2, u64::MAX).unwrap().unwrap();
+        let vnode_frame = materialize_capture(captured.into_iter().next().unwrap().state.unwrap());
 
         let scope = two_owner_scope().await;
         let target_version = scope.registry.assignment_version() + 1;
@@ -5339,7 +5712,7 @@ mod tests {
         let restores = [ManagedVnodeRestore {
             participant_id: 2,
             vnode: 0,
-            state: vnode_frame,
+            state: vnode_frame.as_ref(),
         }];
 
         let absent_vnode = [ABSENT_VNODE];
@@ -5347,7 +5720,7 @@ mod tests {
             ManagedVnodeRestore {
                 participant_id: 2,
                 vnode: 0,
-                state: vnode_frame,
+                state: vnode_frame.as_ref(),
             },
             ManagedVnodeRestore {
                 participant_id: 3,
@@ -5564,8 +5937,8 @@ mod tests {
         while !donor.wants_input() {
             donor.process_with_frontiers(&[], &cut).await.unwrap();
         }
-        let captured = donor.checkpoint_vnodes(&[1], 2).unwrap().unwrap();
-        let frame = captured[0].state.as_deref().unwrap();
+        let captured = donor.checkpoint_vnodes(&[1], 2, u64::MAX).unwrap().unwrap();
+        let frame = materialize_capture(captured.into_iter().next().unwrap().state.unwrap());
 
         let (mut target, _, _) = operator(8);
         let scope = two_owner_scope().await;
@@ -5621,7 +5994,7 @@ mod tests {
         let restores = [ManagedVnodeRestore {
             participant_id: 2,
             vnode: 1,
-            state: frame,
+            state: frame.as_ref(),
         }];
         target
             .prepare_vnode_transition(ManagedVnodeTransition {
@@ -5942,12 +6315,20 @@ mod tests {
             )
             .unwrap();
         operator.remote_peer_cursors = [Some(2); 2];
-        (operator.checkpoint().unwrap().unwrap(), scope)
+        let capture = operator
+            .checkpoint_capture(u64::MAX)
+            .unwrap()
+            .expect("queued cluster state must capture");
+        let local = operator.local_frontiers;
+        operator.process_with_frontiers(&[], &local).await.unwrap();
+        assert_eq!(operator.queued_remote_events, 0);
+        let data = materialize_capture(capture).to_vec();
+        (OperatorCheckpoint { data }, scope)
     }
 
     #[cfg(feature = "cluster")]
     fn assert_cluster_restore_pristine(operator: &ManagedTemporalJoinOperator) {
-        assert!(!operator.whole_restored);
+        assert_eq!(operator.whole_restore, WholeRestoreState::Pending);
         assert_eq!(operator.frontiers, [InputFrontier::default(); 2]);
         assert_eq!(operator.local_frontiers, [InputFrontier::default(); 2]);
         assert_eq!(operator.last_broadcasts, [InputFrontier::default(); 2]);

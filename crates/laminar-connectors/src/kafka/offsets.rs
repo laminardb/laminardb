@@ -17,7 +17,7 @@ use crate::error::ConnectorError;
 /// `@` and `:` are invalid in Kafka topic names, so a real topic-partition key cannot collide.
 pub(super) const KAFKA_PARTITION_BASELINE_PREFIX: &str = "@laminar.kafka.next.v1:";
 pub(super) const KAFKA_CHECKPOINT_VERSION_KEY: &str = "checkpoint.version";
-pub(super) const KAFKA_CHECKPOINT_VERSION: &str = "1";
+pub(super) const KAFKA_CHECKPOINT_VERSION: &str = "2";
 
 /// Tracks consumed offsets per topic-partition.
 ///
@@ -434,6 +434,11 @@ mod tests {
             cp.get_metadata(KAFKA_CHECKPOINT_VERSION_KEY),
             Some(KAFKA_CHECKPOINT_VERSION)
         );
+
+        let mut previous = cp;
+        previous.set_metadata(KAFKA_CHECKPOINT_VERSION_KEY, "1");
+        let error = OffsetTracker::try_from_checkpoint(&previous).unwrap_err();
+        assert!(error.to_string().contains("checkpoint.version=2"));
     }
 
     #[test]

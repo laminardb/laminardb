@@ -206,15 +206,23 @@ impl SourceConnector for TemporalTestSource {
             .to_vec();
         self.cursor = match position {
             SourcePosition::Initial => 0,
-            SourcePosition::Resume { checkpoint, .. } => checkpoint
-                .get_offset("cursor")
-                .and_then(|cursor| cursor.parse::<usize>().ok())
-                .filter(|cursor| *cursor <= 2)
-                .ok_or_else(|| {
-                    ConnectorError::ConfigurationError(
-                        "temporal test checkpoint has no valid cursor".into(),
-                    )
-                })?,
+            SourcePosition::Resume { checkpoint, .. } => {
+                if checkpoint.input_channels() != Some(std::slice::from_ref(&self.source_identity))
+                {
+                    return Err(ConnectorError::ConfigurationError(
+                        "temporal test checkpoint has the wrong input-channel inventory".into(),
+                    ));
+                }
+                checkpoint
+                    .get_offset("cursor")
+                    .and_then(|cursor| cursor.parse::<usize>().ok())
+                    .filter(|cursor| *cursor <= 2)
+                    .ok_or_else(|| {
+                        ConnectorError::ConfigurationError(
+                            "temporal test checkpoint has no valid cursor".into(),
+                        )
+                    })?
+            }
         };
         self.start_cursors
             .lock()
@@ -243,6 +251,9 @@ impl SourceConnector for TemporalTestSource {
     fn checkpoint(&self) -> SourceCheckpoint {
         let mut checkpoint = SourceCheckpoint::new();
         checkpoint.set_offset("cursor", self.cursor.to_string());
+        checkpoint
+            .set_input_channels(vec![self.source_identity.clone()])
+            .expect("the temporal test source identity is non-empty");
         checkpoint
     }
 

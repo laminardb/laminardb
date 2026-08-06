@@ -1720,6 +1720,7 @@ async fn recovery_target_is_the_exact_commit_and_global_index() {
             node_data_len: 1,
             node_data_sha256: "1".repeat(64),
         }],
+        source_names: Vec::new(),
         source_offsets: Default::default(),
         channel_progress: Vec::new(),
         checkpoint_watermark: None,

@@ -19,7 +19,7 @@ use crate::sql_analysis::extract_projection_filter;
 #[derive(Clone)]
 pub(crate) struct RetainedBatch {
     batch: RecordBatch,
-    _admissions: Arc<[laminar_core::shuffle::ShuffleBatchAdmission]>,
+    admissions: Arc<[laminar_core::shuffle::ShuffleBatchAdmission]>,
     assignment_version: Option<u64>,
     peer: Option<u64>,
     recovery_gen: Option<u64>,
@@ -40,7 +40,7 @@ impl RetainedBatch {
     pub(crate) fn local(batch: RecordBatch) -> Self {
         Self {
             batch,
-            _admissions: Arc::from([]),
+            admissions: Arc::from([]),
             assignment_version: None,
             peer: None,
             recovery_gen: None,
@@ -58,7 +58,7 @@ impl RetainedBatch {
         let (batch, admission) = received.into_parts();
         Self {
             batch,
-            _admissions: Arc::from([admission]),
+            admissions: Arc::from([admission]),
             assignment_version: Some(assignment_version),
             peer: Some(peer),
             recovery_gen: Some(recovery_gen),
@@ -78,7 +78,7 @@ impl RetainedBatch {
         let uniform_vnode = uniform_vnode_hint(&routed_vnodes);
         Self {
             batch,
-            _admissions: Arc::from([admission]),
+            admissions: Arc::from([admission]),
             assignment_version: Some(assignment_version),
             peer: Some(peer),
             recovery_gen: Some(recovery_gen),
@@ -97,7 +97,7 @@ impl RetainedBatch {
         let uniform_vnode = uniform_vnode_hint(&routed_vnodes);
         Self {
             batch,
-            _admissions: Arc::from([]),
+            admissions: Arc::from([]),
             assignment_version: Some(assignment_version),
             peer: Some(peer),
             recovery_gen: Some(recovery_gen),
@@ -140,7 +140,7 @@ impl RetainedBatch {
                     .len()
                     .checked_mul(std::mem::size_of::<u32>())?,
             )?
-            .checked_add(self._admissions.len().checked_mul(std::mem::size_of::<
+            .checked_add(self.admissions.len().checked_mul(std::mem::size_of::<
                 laminar_core::shuffle::ShuffleBatchAdmission,
             >())?)?
             .checked_add(4 * std::mem::size_of::<usize>())

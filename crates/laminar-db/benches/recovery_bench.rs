@@ -47,7 +47,8 @@ fn checkpoint_manifest(id: u64, sources: usize, payload: &[u8]) -> CheckpointMan
         );
         manifest.channel_progress.push(ChannelProgress {
             participant_id: manifest.participant_id,
-            channel_id: name,
+            source_name: name,
+            input_channel: vec![0],
             watermark: Some(500_000 + source as i64),
             idle: false,
         });

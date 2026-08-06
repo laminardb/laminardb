@@ -2271,12 +2271,10 @@ impl LaminarDB {
         let contains_temporal = joins
             .iter()
             .any(|join| matches!(join, JoinOperatorConfig::Temporal(_)));
-        if !contains_temporal {
-            if crate::sql_analysis::has_temporal_query(query_sql) {
-                return Err(DbError::Unsupported(
-                    "the planner did not bind the managed temporal-join contract".into(),
-                ));
-            }
+        if !contains_temporal && crate::sql_analysis::has_temporal_query(query_sql) {
+            return Err(DbError::Unsupported(
+                "the planner did not bind the managed temporal-join contract".into(),
+            ));
         }
         let (source_regs, sink_regs, mut stream_regs) = {
             let manager = self.connector_manager.lock();
@@ -2473,8 +2471,7 @@ impl LaminarDB {
                 let (time, nullable) = field(schema, table, column)?;
                 if !matches!(&time, DataType::Timestamp(_, _)) {
                     return Err(DbError::InvalidOperation(format!(
-                        "interval join '{object_name}' event-time column '{table}.{column}' must be Timestamp(_), found {}",
-                        time
+                        "interval join '{object_name}' event-time column '{table}.{column}' must be Timestamp(_), found {time}"
                     )));
                 }
                 if nullable {

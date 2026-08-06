@@ -2,19 +2,19 @@
 
 #![allow(clippy::disallowed_types)] // cold-path canonical checkpoint metadata
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::{
     classify_channel_progress, ChannelProgress, CheckpointAssignmentFence, CheckpointManifest,
-    ConnectorCheckpoint, PipelineIdentity,
+    ConnectorCheckpoint, PipelineIdentity, SINGLETON_WATERMARK_CHANNEL,
 };
 use crate::state::{KeyGroupCount, LOCAL_NODE_ID};
 
 /// Current committed-checkpoint index format.
-pub const COMMITTED_CHECKPOINT_INDEX_VERSION: u32 = 1;
+pub const COMMITTED_CHECKPOINT_INDEX_VERSION: u32 = 2;
 
 /// Hard bound on one canonical committed-checkpoint index.
 pub const MAX_COMMITTED_CHECKPOINT_INDEX_BYTES: usize = 8 * 1024 * 1024;
@@ -239,6 +239,8 @@ pub struct CommittedCheckpointIndex {
     pub predecessor: Option<CommittedCheckpointRef>,
     /// Canonically sorted exact participant objects.
     pub participants: Vec<CommittedParticipantRef>,
+    /// Canonically sorted registered source names.
+    pub source_names: Vec<String>,
     /// Complete merged connector source cut.
     pub source_offsets: BTreeMap<String, ConnectorCheckpoint>,
     /// Complete merged per-channel event-time progress.
@@ -322,8 +324,14 @@ impl CommittedCheckpointIndex {
             }
         }
 
+        validate_source_topology(&self.source_names, &self.source_offsets)?;
         validate_sources(&self.source_offsets, self.assignment_fence.as_ref())?;
-        validate_channel_progress(&self.channel_progress, self.checkpoint_watermark)?;
+        validate_channel_progress(
+            &self.source_names,
+            &self.channel_progress,
+            self.checkpoint_watermark,
+        )?;
+        validate_channel_rosters(&self.source_offsets, &self.channel_progress)?;
         if self.channel_progress.iter().any(|channel| {
             self.participants
                 .binary_search_by_key(&channel.participant_id, |participant| {
@@ -378,7 +386,6 @@ impl CommittedCheckpointIndex {
         let key_group_count = KeyGroupCount::try_from(u32::from(self.vnode_count))
             .map_err(|_| "committed checkpoint vnode count is invalid".to_owned())?;
         let mut owners = vec![None; usize::from(self.vnode_count)];
-        let mut source_names = None;
         let mut sink_names = None;
         for ((manifest, encoded), reference) in manifests.iter().zip(&self.participants) {
             reference.verify_manifest(manifest, encoded)?;
@@ -402,14 +409,10 @@ impl CommittedCheckpointIndex {
                 ));
             }
 
-            match source_names {
-                Some(expected) if expected != manifest.source_names.as_slice() => {
-                    return Err(
-                        "participant manifests disagree on the registered source topology".into(),
-                    );
-                }
-                None => source_names = Some(manifest.source_names.as_slice()),
-                Some(_) => {}
+            if manifest.source_names != self.source_names {
+                return Err(
+                    "participant manifest source topology differs from the committed index".into(),
+                );
             }
             match sink_names {
                 Some(expected) if expected != manifest.sink_names.as_slice() => {
@@ -470,6 +473,27 @@ impl CommittedCheckpointIndex {
     }
 }
 
+fn validate_source_topology(
+    source_names: &[String],
+    sources: &BTreeMap<String, ConnectorCheckpoint>,
+) -> Result<(), String> {
+    for source in source_names {
+        validate_name("source", source)?;
+    }
+    if !source_names.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err("committed source names must be sorted and unique".into());
+    }
+    if let Some(source) = sources
+        .keys()
+        .find(|source| source_names.binary_search(source).is_err())
+    {
+        return Err(format!(
+            "source offset '{source}' is absent from the committed source topology"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_sources(
     sources: &BTreeMap<String, ConnectorCheckpoint>,
     fence: Option<&CheckpointAssignmentFence>,
@@ -481,6 +505,23 @@ fn validate_sources(
         }
         for key in checkpoint.metadata.keys() {
             validate_name("source metadata key", key)?;
+        }
+        if let Some(channels) = &checkpoint.input_channels {
+            if channels.iter().any(Vec::is_empty)
+                || !channels.windows(2).all(|pair| pair[0] < pair[1])
+            {
+                return Err(format!(
+                    "source '{source}' input channels must contain non-empty, sorted unique identities"
+                ));
+            }
+            if channels
+                .iter()
+                .any(|channel| channel == SINGLETON_WATERMARK_CHANNEL)
+            {
+                return Err(format!(
+                    "source '{source}' input channels contain the reserved logical watermark channel"
+                ));
+            }
         }
         if let (Some(version), Some(fence)) = (checkpoint.source_assignment_version, fence) {
             if version.get() != fence.assignment_version {
@@ -495,6 +536,7 @@ fn validate_sources(
 }
 
 fn validate_channel_progress(
+    source_names: &[String],
     channels: &[ChannelProgress],
     checkpoint_watermark: Option<i64>,
 ) -> Result<(), String> {
@@ -502,19 +544,87 @@ fn validate_channel_progress(
         if channel.participant_id == 0 {
             return Err("channel progress participant ID cannot be zero".into());
         }
-        validate_name("channel", &channel.channel_id)?;
+        validate_name("channel source", &channel.source_name)?;
+        if source_names.binary_search(&channel.source_name).is_err() {
+            return Err(format!(
+                "channel progress source '{}' is absent from the committed source topology",
+                channel.source_name
+            ));
+        }
+        if channel.input_channel.is_empty() {
+            return Err("channel progress input channel cannot be empty".into());
+        }
     }
     if !channels.windows(2).all(|pair| {
-        (&pair[0].participant_id, &pair[0].channel_id)
-            < (&pair[1].participant_id, &pair[1].channel_id)
+        (
+            &pair[0].participant_id,
+            &pair[0].source_name,
+            &pair[0].input_channel,
+        ) < (
+            &pair[1].participant_id,
+            &pair[1].source_name,
+            &pair[1].input_channel,
+        )
     }) {
         return Err(
-            "channel progress must be sorted and unique by participant and channel ID".into(),
+            "channel progress must be sorted and unique by participant, source, and input channel"
+                .into(),
         );
+    }
+    let mut logical_sources = BTreeSet::new();
+    let mut physical_sources = BTreeSet::new();
+    let mut physical_channels = BTreeSet::new();
+    for channel in channels {
+        if channel.input_channel == SINGLETON_WATERMARK_CHANNEL {
+            logical_sources.insert(channel.source_name.as_str());
+            continue;
+        }
+        physical_sources.insert(channel.source_name.as_str());
+        if !physical_channels.insert((&channel.source_name, &channel.input_channel)) {
+            return Err(format!(
+                "source '{}' input channel is owned by multiple participants",
+                channel.source_name
+            ));
+        }
+    }
+    if let Some(source) = logical_sources.intersection(&physical_sources).next() {
+        return Err(format!(
+            "channel progress source '{source}' mixes logical and physical input channels"
+        ));
     }
     let classification = classify_channel_progress(channels)?;
     if checkpoint_watermark != classification.active_value() {
         return Err("checkpoint watermark does not match channel progress".into());
+    }
+    Ok(())
+}
+
+fn validate_channel_rosters(
+    sources: &BTreeMap<String, ConnectorCheckpoint>,
+    channels: &[ChannelProgress],
+) -> Result<(), String> {
+    for (source, checkpoint) in sources {
+        let Some(expected) = checkpoint.input_channels.as_ref() else {
+            continue;
+        };
+        let mut actual = channels
+            .iter()
+            .filter(|channel| channel.source_name == *source)
+            .map(|channel| channel.input_channel.as_slice())
+            .collect::<Vec<_>>();
+        if actual.is_empty()
+            || actual
+                .iter()
+                .all(|channel| *channel == SINGLETON_WATERMARK_CHANNEL)
+        {
+            continue;
+        }
+        actual.sort_unstable();
+        if !actual.into_iter().eq(expected.iter().map(Vec::as_slice)) {
+            return Err(format!(
+                "source '{source}' input channels do not match its channel progress roster"
+            ));
+        }
     }
     Ok(())
 }
@@ -640,10 +750,18 @@ mod tests {
                 node_data_len: 0,
                 node_data_sha256: digest(2),
             }],
-            source_offsets: BTreeMap::new(),
+            source_names: vec!["source".into()],
+            source_offsets: BTreeMap::from([(
+                "source".into(),
+                ConnectorCheckpoint {
+                    input_channels: Some(vec![b"orders".to_vec()]),
+                    ..ConnectorCheckpoint::default()
+                },
+            )]),
             channel_progress: vec![ChannelProgress {
                 participant_id: LOCAL_NODE_ID.0,
-                channel_id: "source/orders".into(),
+                source_name: "source".into(),
+                input_channel: b"orders".to_vec(),
                 watermark: Some(42),
                 idle: false,
             }],
@@ -691,7 +809,8 @@ mod tests {
             assignment_fence: Some(fence),
             predecessor: None,
             participants: Vec::new(),
-            source_offsets: BTreeMap::new(),
+            source_names: vec!["source".into()],
+            source_offsets: BTreeMap::from([("source".into(), ConnectorCheckpoint::default())]),
             channel_progress: Vec::new(),
             checkpoint_watermark: None,
         };
@@ -759,6 +878,86 @@ mod tests {
         assert!(index.validate().is_err());
         index.checkpoint_watermark = None;
         assert!(index.validate().is_ok());
+    }
+
+    #[test]
+    fn physical_input_channel_has_one_cluster_owner() {
+        let (mut index, _) = cluster_cut();
+        index.channel_progress = vec![
+            ChannelProgress {
+                participant_id: 1,
+                source_name: "source".into(),
+                input_channel: b"partition-0".to_vec(),
+                watermark: Some(42),
+                idle: false,
+            },
+            ChannelProgress {
+                participant_id: 2,
+                source_name: "source".into(),
+                input_channel: b"partition-0".to_vec(),
+                watermark: Some(42),
+                idle: false,
+            },
+        ];
+        index.checkpoint_watermark = Some(42);
+
+        let error = index.validate().unwrap_err();
+        assert!(error.contains("owned by multiple participants"));
+    }
+
+    #[test]
+    fn source_input_channels_match_merged_progress() {
+        let mut index = local_index();
+        index
+            .source_offsets
+            .get_mut("source")
+            .unwrap()
+            .input_channels = Some(vec![b"different".to_vec()]);
+
+        let error = index.validate().unwrap_err();
+        assert!(error.contains("channel progress roster"));
+
+        index
+            .source_offsets
+            .get_mut("source")
+            .unwrap()
+            .input_channels = Some(vec![SINGLETON_WATERMARK_CHANNEL.to_vec()]);
+        let error = index.validate().unwrap_err();
+        assert!(error.contains("reserved logical watermark channel"));
+    }
+
+    #[test]
+    fn logical_singleton_is_participant_local_and_requires_a_known_source() {
+        let (mut index, _) = cluster_cut();
+        index
+            .source_offsets
+            .get_mut("source")
+            .unwrap()
+            .input_channels = Some(vec![b"partition-0".to_vec(), b"partition-1".to_vec()]);
+        index.channel_progress = vec![
+            ChannelProgress {
+                participant_id: 1,
+                source_name: "source".into(),
+                input_channel: SINGLETON_WATERMARK_CHANNEL.to_vec(),
+                watermark: Some(42),
+                idle: false,
+            },
+            ChannelProgress {
+                participant_id: 2,
+                source_name: "source".into(),
+                input_channel: SINGLETON_WATERMARK_CHANNEL.to_vec(),
+                watermark: Some(41),
+                idle: false,
+            },
+        ];
+        index.checkpoint_watermark = Some(41);
+        assert!(index.validate().is_ok());
+        index.source_offsets.clear();
+        assert!(index.validate().is_ok());
+
+        index.channel_progress[0].source_name = "missing".into();
+        let error = index.validate().unwrap_err();
+        assert!(error.contains("absent from the committed source topology"));
     }
 
     #[test]

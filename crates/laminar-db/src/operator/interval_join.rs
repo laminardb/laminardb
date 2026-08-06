@@ -3,6 +3,7 @@
 //! Buffers left/right rows across cycles for
 //! `right_ts BETWEEN left_ts AND left_ts + time_bound`; evicts on watermark advance.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use std::collections::BTreeMap;
@@ -20,11 +21,14 @@ use laminar_sql::translator::StreamJoinConfig;
 
 use crate::error::DbError;
 use crate::interval_join::{
-    execute_interval_join_cycle, join_type_tag, IntervalJoinOutputBudget, IntervalJoinState,
-    JoinStateCheckpoint,
+    execute_interval_join_cycle, join_type_tag, ArchivedJoinStateCheckpoint,
+    IntervalJoinCheckpointCapture, IntervalJoinOutputBudget, IntervalJoinState,
+    JoinStateCheckpoint, HEAP_ALLOCATION_CHARGE,
 };
 use crate::operator::ProjectingJoinState;
-use crate::operator_graph::{CapturedVnodeState, InputFrontier};
+use crate::operator_graph::{
+    CapturedVnodeState, EncodedStateFrame, InputFrontier, StateFrameCapture,
+};
 use crate::operator_graph::{GraphOperator, ManagedStateAccountingSnapshot, OperatorCheckpoint};
 
 #[cfg(feature = "cluster")]
@@ -33,6 +37,10 @@ use crate::operator::sql_query::ClusterShuffleConfig;
 use crate::operator_graph::{ManagedVnodeTransition, ManagedVnodeTransitionMode};
 
 const OPERATOR_CHECKPOINT_VERSION: u8 = 1;
+const ABSENT_VNODE: u8 = 0;
+const PRESENT_VNODE: u8 = 1;
+const VNODE_FRAME_HEADER_LEN: usize = std::mem::align_of::<ArchivedJoinStateCheckpoint>();
+const ABSENT_VNODE_FRAME: [u8; VNODE_FRAME_HEADER_LEN] = [ABSENT_VNODE; VNODE_FRAME_HEADER_LEN];
 
 #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 enum JoinInputSide {
@@ -59,6 +67,184 @@ struct IntervalJoinOperatorCheckpoint {
     assignment_version: Option<u64>,
     owner_map_digest: Option<[u8; 32]>,
     participant_id: Option<u64>,
+}
+
+#[cfg(feature = "cluster")]
+type CapturedAlignedReplay = (u64, JoinInputSide, i64, crate::operator::RetainedBatch);
+
+struct IntervalJoinOperatorCheckpointCapture {
+    checkpoint: IntervalJoinOperatorCheckpoint,
+    #[cfg(feature = "cluster")]
+    aligned_replay: VecDeque<CapturedAlignedReplay>,
+    retained_bytes: u64,
+}
+
+impl IntervalJoinOperatorCheckpointCapture {
+    const fn retained_bytes(&self) -> u64 {
+        self.retained_bytes
+    }
+
+    fn calculate_retained_bytes_for(
+        left_keys_capacity: usize,
+        right_keys_capacity: usize,
+        string_capacities: impl IntoIterator<Item = usize>,
+        #[cfg(feature = "cluster")] aligned_replay_capacity: usize,
+        #[cfg(feature = "cluster")] aligned_replay_batch_bytes: impl IntoIterator<Item = Option<usize>>,
+    ) -> Result<u64, DbError> {
+        fn allocation(bytes: usize) -> Result<usize, DbError> {
+            bytes
+                .checked_add(if bytes == 0 {
+                    0
+                } else {
+                    HEAP_ALLOCATION_CHARGE
+                })
+                .ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "interval join whole-state capture accounting overflow".into(),
+                    )
+                })
+        }
+
+        fn roster<T>(capacity: usize) -> Result<usize, DbError> {
+            allocation(
+                capacity
+                    .checked_mul(std::mem::size_of::<T>())
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "interval join whole-state roster accounting overflow".into(),
+                        )
+                    })?,
+            )
+        }
+
+        fn add(total: &mut usize, bytes: usize) -> Result<(), DbError> {
+            *total = total.checked_add(bytes).ok_or_else(|| {
+                DbError::Checkpoint("interval join whole-state capture accounting overflow".into())
+            })?;
+            Ok(())
+        }
+
+        let mut bytes = std::mem::size_of::<Self>();
+        add(&mut bytes, roster::<String>(left_keys_capacity)?)?;
+        add(&mut bytes, roster::<String>(right_keys_capacity)?)?;
+        for capacity in string_capacities {
+            add(&mut bytes, allocation(capacity)?)?;
+        }
+
+        #[cfg(feature = "cluster")]
+        {
+            add(
+                &mut bytes,
+                roster::<CapturedAlignedReplay>(aligned_replay_capacity)?,
+            )?;
+            for batch_bytes in aligned_replay_batch_bytes {
+                add(
+                    &mut bytes,
+                    batch_bytes.ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "interval join aligned replay capture accounting overflow".into(),
+                        )
+                    })?,
+                )?;
+            }
+        }
+
+        u64::try_from(bytes).map_err(|_| {
+            DbError::Checkpoint("interval join whole-state capture exceeds u64".into())
+        })
+    }
+
+    fn calculate_retained_bytes(&self) -> Result<u64, DbError> {
+        Self::calculate_retained_bytes_for(
+            self.checkpoint.left_keys.capacity(),
+            self.checkpoint.right_keys.capacity(),
+            self.checkpoint
+                .left_keys
+                .iter()
+                .chain(&self.checkpoint.right_keys)
+                .chain([
+                    &self.checkpoint.left_time_column,
+                    &self.checkpoint.right_time_column,
+                    &self.checkpoint.left_table,
+                    &self.checkpoint.right_table,
+                ])
+                .map(String::capacity),
+            #[cfg(feature = "cluster")]
+            self.aligned_replay.capacity(),
+            #[cfg(feature = "cluster")]
+            self.aligned_replay
+                .iter()
+                .map(|(_, _, _, batch)| batch.heap_bytes()),
+        )
+    }
+
+    fn encode(self, max_working_bytes: usize, context: &str) -> Result<Vec<u8>, DbError> {
+        #[cfg(feature = "cluster")]
+        let mut capture = self;
+        #[cfg(not(feature = "cluster"))]
+        let capture = self;
+        #[cfg(feature = "cluster")]
+        let mut remaining = max_working_bytes;
+        #[cfg(not(feature = "cluster"))]
+        let remaining = max_working_bytes;
+        #[cfg(feature = "cluster")]
+        {
+            let mut aligned_replay = Vec::new();
+            aligned_replay
+                .try_reserve_exact(capture.aligned_replay.len())
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "{context}: aligned replay roster cannot be reserved"
+                    ))
+                })?;
+            let roster_bytes = aligned_replay
+                .capacity()
+                .checked_mul(std::mem::size_of::<(u64, JoinInputSide, i64, Vec<u8>)>())
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "{context}: aligned replay roster accounting overflow"
+                    ))
+                })?;
+            remaining = remaining.checked_sub(roster_bytes).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "{context}: aligned replay roster exceeded its cumulative serialization budget"
+                ))
+            })?;
+
+            while let Some((assignment, side, watermark, batch)) =
+                capture.aligned_replay.pop_front()
+            {
+                let bytes = laminar_core::serialization::serialize_batches_stream_bounded(
+                    batch.batch().schema().as_ref(),
+                    std::iter::once(batch.batch()),
+                    remaining,
+                )
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "{context}: aligned replay serialization within the cumulative budget: {error}"
+                    ))
+                })?;
+                remaining = remaining.checked_sub(bytes.capacity()).ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "{context}: aligned replay byte accounting overflow"
+                    ))
+                })?;
+                aligned_replay.push((assignment, side, watermark, bytes));
+            }
+            capture.checkpoint.aligned_replay = aligned_replay;
+        }
+
+        let writer = rkyv::ser::writer::IoWriter::new(
+            laminar_core::serialization::BoundedBytesWriter::new(remaining),
+        );
+        rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(&capture.checkpoint, writer)
+            .map(|bytes| bytes.into_inner().into_vec())
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "{context}: archive serialization exceeded the remaining {remaining}-byte cumulative budget: {error}"
+                ))
+            })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -206,26 +392,185 @@ impl IntervalJoinOperator {
             )
     }
 
+    fn capture_operator_checkpoint(
+        &self,
+        max_capture_bytes: u64,
+    ) -> Result<Option<IntervalJoinOperatorCheckpointCapture>, DbError> {
+        #[cfg(feature = "cluster")]
+        if self.cluster_shuffle.is_none() && !self.aligned_replay.is_empty() {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] has cluster replay without an attached cluster scope",
+                self.projection.op_name
+            )));
+        }
+        #[cfg(feature = "cluster")]
+        let aligned_replay_is_empty = self.aligned_replay.is_empty();
+        #[cfg(not(feature = "cluster"))]
+        let aligned_replay_is_empty = true;
+
+        if aligned_replay_is_empty
+            && self.applied_left_watermark == i64::MIN
+            && self.applied_right_watermark == i64::MIN
+            && !self.applied_left_idle
+            && !self.applied_right_idle
+        {
+            return Ok(None);
+        }
+        let bound_ms = i64::try_from(self.config.time_bound.as_millis()).map_err(|_| {
+            DbError::Checkpoint(format!(
+                "interval join [{}] configured time bound exceeds the supported millisecond range",
+                self.projection.op_name
+            ))
+        })?;
+        let preflight_bytes = IntervalJoinOperatorCheckpointCapture::calculate_retained_bytes_for(
+            self.config.left_keys.len(),
+            self.config.right_keys.len(),
+            self.config
+                .left_keys
+                .iter()
+                .chain(&self.config.right_keys)
+                .chain([
+                    &self.config.left_time_column,
+                    &self.config.right_time_column,
+                    &self.config.left_table,
+                    &self.config.right_table,
+                ])
+                .map(String::len),
+            #[cfg(feature = "cluster")]
+            self.aligned_replay.len(),
+            #[cfg(feature = "cluster")]
+            self.aligned_replay
+                .iter()
+                .map(|(_, _, _, batch)| batch.heap_bytes()),
+        )?;
+        if preflight_bytes > max_capture_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] whole checkpoint capture requires at least {preflight_bytes} bytes; capture headroom is {max_capture_bytes} bytes",
+                self.projection.op_name
+            )));
+        }
+        #[cfg(feature = "cluster")]
+        let assignment_identity = self
+            .cluster_shuffle
+            .as_ref()
+            .map(|_| self.checkpoint_assignment_identity())
+            .transpose()?;
+        #[cfg(not(feature = "cluster"))]
+        let assignment_identity: Option<(u64, [u8; 32], u64)> = None;
+        let checkpoint = IntervalJoinOperatorCheckpoint {
+            version: OPERATOR_CHECKPOINT_VERSION,
+            join_type: join_type_tag(self.config.join_type),
+            left_keys: self.config.left_keys.clone(),
+            right_keys: self.config.right_keys.clone(),
+            left_time_column: self.config.left_time_column.clone(),
+            right_time_column: self.config.right_time_column.clone(),
+            left_table: self.config.left_table.clone(),
+            right_table: self.config.right_table.clone(),
+            bound_ms,
+            aligned_replay: Vec::new(),
+            applied_left_watermark: self.applied_left_watermark,
+            applied_right_watermark: self.applied_right_watermark,
+            applied_left_idle: self.applied_left_idle,
+            applied_right_idle: self.applied_right_idle,
+            assignment_version: assignment_identity.map(|identity| identity.0),
+            owner_map_digest: assignment_identity.map(|identity| identity.1),
+            participant_id: assignment_identity.map(|identity| identity.2),
+        };
+        #[cfg(feature = "cluster")]
+        let mut aligned_replay = VecDeque::new();
+        #[cfg(feature = "cluster")]
+        aligned_replay
+            .try_reserve_exact(self.aligned_replay.len())
+            .map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] aligned replay capture roster cannot be reserved",
+                    self.projection.op_name
+                ))
+            })?;
+        let retained_bytes = IntervalJoinOperatorCheckpointCapture::calculate_retained_bytes_for(
+            checkpoint.left_keys.capacity(),
+            checkpoint.right_keys.capacity(),
+            checkpoint
+                .left_keys
+                .iter()
+                .chain(&checkpoint.right_keys)
+                .chain([
+                    &checkpoint.left_time_column,
+                    &checkpoint.right_time_column,
+                    &checkpoint.left_table,
+                    &checkpoint.right_table,
+                ])
+                .map(String::capacity),
+            #[cfg(feature = "cluster")]
+            aligned_replay.capacity(),
+            #[cfg(feature = "cluster")]
+            self.aligned_replay
+                .iter()
+                .map(|(_, _, _, batch)| batch.heap_bytes()),
+        )?;
+        if retained_bytes > max_capture_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] whole checkpoint capture retains {retained_bytes} bytes; capture headroom is {max_capture_bytes} bytes",
+                self.projection.op_name
+            )));
+        }
+        #[cfg(feature = "cluster")]
+        aligned_replay.extend(self.aligned_replay.iter().map(
+            |(assignment, side, watermark, batch)| (*assignment, *side, *watermark, batch.clone()),
+        ));
+        let capture = IntervalJoinOperatorCheckpointCapture {
+            checkpoint,
+            #[cfg(feature = "cluster")]
+            aligned_replay,
+            retained_bytes,
+        };
+        debug_assert_eq!(capture.calculate_retained_bytes()?, retained_bytes);
+        Ok(Some(capture))
+    }
+
+    fn encode_state_capture(
+        capture: IntervalJoinCheckpointCapture,
+        context: &str,
+        max_encoded_bytes: usize,
+    ) -> Result<EncodedStateFrame, DbError> {
+        let checkpoint = capture.encode(max_encoded_bytes)?;
+        let retained_checkpoint_bytes = checkpoint.retained_ipc_bytes()?;
+        let archive_budget = max_encoded_bytes
+            .checked_sub(retained_checkpoint_bytes)
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "{context}: encoded checkpoint retains {retained_checkpoint_bytes} bytes; state-frame budget is {max_encoded_bytes} bytes"
+                ))
+            })?;
+        let mut bounded = laminar_core::serialization::BoundedBytesWriter::new(archive_budget);
+        let mut header = [0_u8; VNODE_FRAME_HEADER_LEN];
+        header[0] = PRESENT_VNODE;
+        std::io::Write::write_all(&mut bounded, &header).map_err(|error| {
+            DbError::Checkpoint(format!("{context}: vnode frame header: {error}"))
+        })?;
+        let writer = rkyv::ser::writer::IoWriter::new(bounded);
+        rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(&checkpoint, writer)
+            .map(|bytes| EncodedStateFrame::from_vec(bytes.into_inner().into_vec()))
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "{context}: archive serialization exceeded its {archive_budget}-byte headroom within the {max_encoded_bytes}-byte state-frame budget: {error}"
+                ))
+            })
+    }
+
+    #[cfg(test)]
     fn serialize_state(
         state: &mut IntervalJoinState,
         config: &StreamJoinConfig,
         context: &str,
         max_encoded_bytes: usize,
     ) -> Result<Vec<u8>, DbError> {
-        let checkpoint = state.snapshot_checkpoint(config, max_encoded_bytes)?;
-        // Live state, IPC staging, and the final archive are independently bounded by M. They
-        // coexist only on this cold capture path, so its explicit peak envelope is at most 3M.
-        debug_assert!(checkpoint.retained_ipc_bytes()? <= max_encoded_bytes);
-        let writer = rkyv::ser::writer::IoWriter::new(
-            laminar_core::serialization::BoundedBytesWriter::new(max_encoded_bytes),
-        );
-        rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(&checkpoint, writer)
-            .map(|bytes| bytes.into_inner().into_vec())
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "{context}: archive serialization exceeded its {max_encoded_bytes}-byte budget: {error}"
-                ))
-            })
+        Self::encode_state_capture(
+            state.capture_checkpoint(config)?,
+            context,
+            max_encoded_bytes,
+        )
+        .map(|bytes| bytes.into_bytes().to_vec())
     }
 
     fn deserialize_state(
@@ -238,27 +583,82 @@ impl IntervalJoinOperator {
         let checkpoint = rkyv::from_bytes::<JoinStateCheckpoint, rkyv::rancor::Error>(bytes)
             .map_err(|error| DbError::Checkpoint(format!("{context}: {error}")))?;
         if let Some(cut) = cut {
-            let bound_ms = i64::try_from(config.time_bound.as_millis()).map_err(|_| {
-                DbError::Checkpoint(format!(
-                    "{context}: configured time bound exceeds the supported millisecond range"
-                ))
-            })?;
-            let expected_left_cutoff = cut.right_watermark.saturating_sub(bound_ms);
-            let expected_right_cutoff = cut.left_watermark;
-            if checkpoint.left_evicted_cutoff > expected_left_cutoff
-                || checkpoint.right_evicted_cutoff > expected_right_cutoff
-                || (checkpoint.left_buffer_rows != 0
-                    && checkpoint.left_evicted_cutoff != expected_left_cutoff)
-                || (checkpoint.right_buffer_rows != 0
-                    && checkpoint.right_evicted_cutoff != expected_right_cutoff)
-            {
-                return Err(DbError::Checkpoint(format!(
-                    "{context}: vnode eviction state is inconsistent with the portable handoff cut"
-                )));
-            }
+            Self::validate_handoff_cutoffs(
+                checkpoint.left_evicted_cutoff,
+                checkpoint.right_evicted_cutoff,
+                checkpoint.left_buffer_rows != 0,
+                checkpoint.right_buffer_rows != 0,
+                config,
+                context,
+                cut,
+            )?;
         }
         IntervalJoinState::from_checkpoint(&checkpoint, config, max_state_bytes)
             .map_err(|error| DbError::Checkpoint(format!("{context}: {error}")))
+    }
+
+    fn decode_vnode_frame(
+        bytes: &[u8],
+        config: &StreamJoinConfig,
+        context: &str,
+        max_state_bytes: usize,
+        cut: Option<IntervalHandoffCut>,
+    ) -> Result<Option<IntervalJoinState>, DbError> {
+        if bytes.len() < VNODE_FRAME_HEADER_LEN {
+            return Err(DbError::Checkpoint(format!(
+                "{context}: vnode frame header is truncated"
+            )));
+        }
+        let (header, payload) = bytes.split_at(VNODE_FRAME_HEADER_LEN);
+        if header[1..].iter().any(|byte| *byte != 0) {
+            return Err(DbError::Checkpoint(format!(
+                "{context}: vnode frame header is malformed"
+            )));
+        }
+        let tag = header[0];
+        match tag {
+            ABSENT_VNODE if payload.is_empty() => Ok(None),
+            ABSENT_VNODE => Err(DbError::Checkpoint(format!(
+                "{context}: absent vnode frame has a payload"
+            ))),
+            PRESENT_VNODE if payload.is_empty() => Err(DbError::Checkpoint(format!(
+                "{context}: present vnode frame has no payload"
+            ))),
+            PRESENT_VNODE => {
+                Self::deserialize_state(payload, config, context, max_state_bytes, cut).map(Some)
+            }
+            _ => Err(DbError::Checkpoint(format!(
+                "{context}: vnode frame has unknown tag {tag}"
+            ))),
+        }
+    }
+
+    fn validate_handoff_cutoffs(
+        left_evicted_cutoff: i64,
+        right_evicted_cutoff: i64,
+        left_nonempty: bool,
+        right_nonempty: bool,
+        config: &StreamJoinConfig,
+        context: &str,
+        cut: IntervalHandoffCut,
+    ) -> Result<(), DbError> {
+        let bound_ms = i64::try_from(config.time_bound.as_millis()).map_err(|_| {
+            DbError::Checkpoint(format!(
+                "{context}: configured time bound exceeds the supported millisecond range"
+            ))
+        })?;
+        let expected_left_cutoff = cut.right_watermark.saturating_sub(bound_ms);
+        let expected_right_cutoff = cut.left_watermark;
+        if left_evicted_cutoff > expected_left_cutoff
+            || right_evicted_cutoff > expected_right_cutoff
+            || (left_nonempty && left_evicted_cutoff != expected_left_cutoff)
+            || (right_nonempty && right_evicted_cutoff != expected_right_cutoff)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "{context}: vnode eviction state is inconsistent with the portable handoff cut"
+            )));
+        }
+        Ok(())
     }
 
     fn validate_checkpoint_config(
@@ -332,9 +732,9 @@ impl IntervalJoinOperator {
     fn portable_handoff_cut(
         &self,
         transition: &ManagedVnodeTransition<'_>,
-        fresh_acquirer: bool,
+        requires_handoff_cut: bool,
     ) -> Result<Option<IntervalHandoffCut>, DbError> {
-        if !fresh_acquirer {
+        if !requires_handoff_cut {
             return Ok(None);
         }
         let mut donors = std::collections::BTreeSet::new();
@@ -361,15 +761,12 @@ impl IntervalJoinOperator {
         }
         if donors.is_empty() {
             return Err(DbError::Checkpoint(format!(
-                "interval join [{}] fresh owner has no acquired vnode frames",
+                "interval join [{}] handoff transition has no acquired vnode frames",
                 self.projection.op_name
             )));
         }
         if transition.whole_restores.is_empty() {
-            return Ok(Some(IntervalHandoffCut {
-                left_watermark: i64::MIN,
-                right_watermark: i64::MIN,
-            }));
+            return Ok(None);
         }
 
         let mut whole_donors = std::collections::BTreeSet::new();
@@ -428,6 +825,41 @@ impl IntervalJoinOperator {
             )));
         }
         Ok(common)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn restored_handoff_cut_evidence(
+        &self,
+        state: &IntervalJoinState,
+        context: &str,
+    ) -> Result<Option<IntervalHandoffCut>, DbError> {
+        let (left_rows, right_rows) = state.buffered_rows();
+        let (left_evicted_cutoff, right_evicted_cutoff) = state.evicted_cutoffs();
+        if left_rows == 0
+            && right_rows == 0
+            && left_evicted_cutoff == i64::MIN
+            && right_evicted_cutoff == i64::MIN
+        {
+            return Ok(None);
+        }
+        let bound_ms = i64::try_from(self.config.time_bound.as_millis()).map_err(|_| {
+            DbError::Checkpoint(format!(
+                "{context}: configured time bound exceeds the supported millisecond range"
+            ))
+        })?;
+        let right_watermark = if left_evicted_cutoff == i64::MIN {
+            i64::MIN
+        } else {
+            left_evicted_cutoff.checked_add(bound_ms).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "{context}: left eviction cutoff cannot be converted to a handoff watermark"
+                ))
+            })?
+        };
+        Ok(Some(IntervalHandoffCut {
+            left_watermark: right_evicted_cutoff,
+            right_watermark,
+        }))
     }
 
     fn execute_shard_cycle(
@@ -1153,120 +1585,39 @@ impl GraphOperator for IntervalJoinOperator {
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
-        #[cfg(feature = "cluster")]
-        if self.cluster_shuffle.is_none() && !self.aligned_replay.is_empty() {
-            return Err(DbError::Checkpoint(format!(
-                "interval join [{}] has cluster replay without an attached cluster scope",
-                self.projection.op_name
-            )));
-        }
-        #[cfg(feature = "cluster")]
-        let mut retained_payload_bytes = 0usize;
-        #[cfg(not(feature = "cluster"))]
-        let retained_payload_bytes = 0usize;
-        #[cfg(feature = "cluster")]
-        let aligned_replay = {
-            let mut encoded = Vec::new();
-            encoded
-                .try_reserve_exact(self.aligned_replay.len())
-                .map_err(|_| {
-                    DbError::Checkpoint(format!(
-                        "interval join [{}] could not reserve aligned replay metadata",
-                        self.projection.op_name
-                    ))
-                })?;
-            for (assignment, side, watermark, batch) in &self.aligned_replay {
-                let remaining = self
-                    .max_managed_state_bytes
-                    .checked_sub(retained_payload_bytes)
-                    .ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "interval join [{}] aligned replay exhausted its checkpoint limit",
-                            self.projection.op_name
-                        ))
-                    })?;
-                let bytes = laminar_core::serialization::serialize_batches_stream_bounded(
-                    batch.batch().schema().as_ref(),
-                    std::iter::once(batch.batch()),
-                    remaining,
-                )
-                .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "interval join [{}] aligned replay serialization within the cumulative checkpoint limit: {error}",
-                        self.projection.op_name
-                    ))
-                })?;
-                retained_payload_bytes = retained_payload_bytes
-                    .checked_add(bytes.capacity())
-                    .ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "interval join [{}] aligned replay byte accounting overflow",
-                            self.projection.op_name
-                        ))
-                    })?;
-                encoded.push((*assignment, *side, *watermark, bytes));
-            }
-            encoded
-        };
-        #[cfg(not(feature = "cluster"))]
-        let aligned_replay = Vec::new();
-
-        if aligned_replay.is_empty()
-            && self.applied_left_watermark == i64::MIN
-            && self.applied_right_watermark == i64::MIN
-            && !self.applied_left_idle
-            && !self.applied_right_idle
-        {
+        let Some(capture) = self.capture_operator_checkpoint(u64::MAX)? else {
             return Ok(None);
-        }
-        let bound_ms = i64::try_from(self.config.time_bound.as_millis()).map_err(|_| {
-            DbError::Checkpoint(format!(
-                "interval join [{}] configured time bound exceeds the supported millisecond range",
-                self.projection.op_name
-            ))
-        })?;
-        #[cfg(feature = "cluster")]
-        let assignment_identity = self
-            .cluster_shuffle
-            .as_ref()
-            .map(|_| self.checkpoint_assignment_identity())
-            .transpose()?;
-        #[cfg(not(feature = "cluster"))]
-        let assignment_identity: Option<(u64, [u8; 32], u64)> = None;
-        let checkpoint = IntervalJoinOperatorCheckpoint {
-            version: OPERATOR_CHECKPOINT_VERSION,
-            join_type: join_type_tag(self.config.join_type),
-            left_keys: self.config.left_keys.clone(),
-            right_keys: self.config.right_keys.clone(),
-            left_time_column: self.config.left_time_column.clone(),
-            right_time_column: self.config.right_time_column.clone(),
-            left_table: self.config.left_table.clone(),
-            right_table: self.config.right_table.clone(),
-            bound_ms,
-            aligned_replay,
-            applied_left_watermark: self.applied_left_watermark,
-            applied_right_watermark: self.applied_right_watermark,
-            applied_left_idle: self.applied_left_idle,
-            applied_right_idle: self.applied_right_idle,
-            assignment_version: assignment_identity.map(|identity| identity.0),
-            owner_map_digest: assignment_identity.map(|identity| identity.1),
-            participant_id: assignment_identity.map(|identity| identity.2),
         };
-        // The retained IPC set is already <= M. Bound the final archive independently by M so a
-        // valid image in (M/2, M] remains checkpointable; live + IPC + archive peak at <= 3M.
-        debug_assert!(retained_payload_bytes <= self.max_managed_state_bytes);
-        let writer = rkyv::ser::writer::IoWriter::new(
-            laminar_core::serialization::BoundedBytesWriter::new(self.max_managed_state_bytes),
+        let context = format!(
+            "interval join [{}] whole checkpoint serialization",
+            self.projection.op_name
         );
-        let data = rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(&checkpoint, writer)
-            .map(|bytes| bytes.into_inner().into_vec())
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "interval join [{}] archive serialization exceeded its {}-byte checkpoint limit: {error}",
-                    self.projection.op_name, self.max_managed_state_bytes
-                ))
-            })?;
-        Ok(Some(OperatorCheckpoint { data }))
+        capture
+            .encode(self.max_managed_state_bytes, &context)
+            .map(|data| Some(OperatorCheckpoint { data }))
+    }
+
+    fn checkpoint_capture(
+        &mut self,
+        max_capture_bytes: u64,
+    ) -> Result<Option<StateFrameCapture>, DbError> {
+        let Some(capture) = self.capture_operator_checkpoint(max_capture_bytes)? else {
+            return Ok(None);
+        };
+        let retained_bytes = capture.retained_bytes();
+        let max_managed_state_bytes = self.max_managed_state_bytes;
+        let context = format!(
+            "interval join [{}] whole checkpoint serialization",
+            self.projection.op_name
+        );
+        Ok(Some(StateFrameCapture::deferred(
+            retained_bytes,
+            move |remaining| {
+                capture
+                    .encode(remaining.min(max_managed_state_bytes), &context)
+                    .map(EncodedStateFrame::from_vec)
+            },
+        )))
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
@@ -1451,6 +1802,7 @@ impl GraphOperator for IntervalJoinOperator {
         &mut self,
         required_vnodes: &[u32],
         vnode_count: u32,
+        max_capture_bytes: u64,
     ) -> Result<Option<Vec<CapturedVnodeState>>, DbError> {
         if u32::from(self.key_group_count) != vnode_count
             || required_vnodes.windows(2).any(|pair| pair[0] >= pair[1])
@@ -1481,50 +1833,96 @@ impl GraphOperator for IntervalJoinOperator {
                 !self.checkpointed_vnodes[*vnode as usize] || self.dirty_vnodes[*vnode as usize]
             })
             .collect::<Vec<_>>();
+        let absent_frame_bytes = required_vnodes
+            .iter()
+            .zip(&capture_plan)
+            .filter(|(vnode, capture)| **capture && self.vnode_states[**vnode as usize].is_none())
+            .count()
+            .checked_mul(VNODE_FRAME_HEADER_LEN)
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] absent vnode frame accounting overflow",
+                    self.projection.op_name
+                ))
+            })?;
         let mut captured = Vec::with_capacity(required_vnodes.len());
-        let mut retained_encoded_bytes = 0usize;
+        let mut retained_capture_bytes = 0_u64;
+        let operator_remaining = Arc::new(AtomicUsize::new(
+            self.max_managed_state_bytes
+                .checked_sub(absent_frame_bytes)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "interval join [{}] absent vnode frames exceed their {}-byte checkpoint limit",
+                        self.projection.op_name, self.max_managed_state_bytes
+                    ))
+                })?,
+        ));
         for (&vnode, capture) in required_vnodes.iter().zip(&capture_plan) {
             let state = if *capture {
-                let remaining = self
-                    .max_managed_state_bytes
-                    .checked_sub(retained_encoded_bytes)
-                    .ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "interval join [{}] vnode checkpoints exhausted their {}-byte limit",
-                            self.projection.op_name, self.max_managed_state_bytes
-                        ))
-                    })?;
-                let bytes = if let Some(state) = self.vnode_states[vnode as usize].as_mut() {
-                    Self::serialize_state(
-                        state,
-                        &self.config,
-                        &format!(
-                            "interval join [{}] vnode {vnode} checkpoint serialization",
+                if let Some(state) = self.vnode_states[vnode as usize].as_mut() {
+                    let remaining_capture_bytes = max_capture_bytes
+                        .checked_sub(retained_capture_bytes)
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "interval join [{}] checkpoint captures exhausted their {max_capture_bytes}-byte capture budget",
+                                self.projection.op_name
+                            ))
+                        })?;
+                    let state_bytes =
+                        u64::try_from(state.accounted_state_bytes()).unwrap_or(u64::MAX);
+                    if state_bytes > remaining_capture_bytes {
+                        return Err(DbError::Checkpoint(format!(
+                            "interval join [{}] vnode {vnode} retains {state_bytes} bytes; remaining capture budget is {remaining_capture_bytes} bytes",
                             self.projection.op_name
-                        ),
-                        remaining,
-                    )?
+                        )));
+                    }
+                    let state_capture = state.capture_checkpoint(&self.config)?;
+                    let retained_bytes =
+                        u64::try_from(state_capture.retained_bytes()).unwrap_or(u64::MAX);
+                    retained_capture_bytes = retained_capture_bytes
+                        .checked_add(retained_bytes)
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "interval join [{}] checkpoint capture byte accounting overflow",
+                                self.projection.op_name
+                            ))
+                        })?;
+                    if retained_capture_bytes > max_capture_bytes {
+                        return Err(DbError::Checkpoint(format!(
+                            "interval join [{}] checkpoint captures retain {retained_capture_bytes} bytes; capture budget is {max_capture_bytes} bytes",
+                            self.projection.op_name
+                        )));
+                    }
+                    let max_managed_state_bytes = self.max_managed_state_bytes;
+                    let operator_remaining = Arc::clone(&operator_remaining);
+                    let context = format!(
+                        "interval join [{}] vnode {vnode} checkpoint serialization",
+                        self.projection.op_name
+                    );
+                    Some(StateFrameCapture::deferred(
+                        retained_bytes,
+                        move |remaining| {
+                            let logical_remaining = operator_remaining.load(Ordering::Relaxed);
+                            let limit = remaining
+                                .min(max_managed_state_bytes)
+                                .min(logical_remaining);
+                            let encoded =
+                                Self::encode_state_capture(state_capture, &context, limit)?;
+                            operator_remaining
+                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                                    remaining.checked_sub(encoded.payload_len())
+                                })
+                                .map_err(|_| {
+                                    DbError::Checkpoint(format!(
+                                        "{context}: vnode checkpoints exhausted their {max_managed_state_bytes}-byte limit"
+                                    ))
+                                })?;
+                            Ok(encoded)
+                        },
+                    ))
                 } else {
-                    let mut empty = IntervalJoinState::new();
-                    Self::serialize_state(
-                        &mut empty,
-                        &self.config,
-                        &format!(
-                            "interval join [{}] vnode {vnode} empty checkpoint serialization",
-                            self.projection.op_name
-                        ),
-                        remaining,
-                    )?
-                };
-                retained_encoded_bytes = retained_encoded_bytes
-                    .checked_add(bytes.len())
-                    .ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "interval join [{}] vnode checkpoint byte accounting overflow",
-                            self.projection.op_name
-                        ))
-                    })?;
-                Some(bytes::Bytes::from(bytes))
+                    Some(StateFrameCapture::encoded_static(&ABSENT_VNODE_FRAME))
+                }
             } else {
                 None
             };
@@ -1570,7 +1968,7 @@ impl GraphOperator for IntervalJoinOperator {
                     self.projection.op_name, self.max_managed_state_bytes
                 ))
             })?;
-        let mut replacement = Self::deserialize_state(
+        let replacement = Self::decode_vnode_frame(
             state,
             &self.config,
             &format!(
@@ -1580,16 +1978,19 @@ impl GraphOperator for IntervalJoinOperator {
             remaining,
             None,
         )?;
-        replacement.validate_vnode(vnode, vnode_count, &self.config)?;
-        if let Some((left_schema, right_schema)) = &self.input_schemas {
-            replacement.seed_input_schemas(
-                left_schema.clone(),
-                right_schema.clone(),
-                &self.config,
-            )?;
-        }
-
-        self.vnode_states[vnode as usize] = Some(Box::new(replacement));
+        self.vnode_states[vnode as usize] = if let Some(mut replacement) = replacement {
+            replacement.validate_vnode(vnode, vnode_count, &self.config)?;
+            if let Some((left_schema, right_schema)) = &self.input_schemas {
+                replacement.seed_input_schemas(
+                    left_schema.clone(),
+                    right_schema.clone(),
+                    &self.config,
+                )?;
+            }
+            Some(Box::new(replacement))
+        } else {
+            None
+        };
         self.checkpointed_vnodes[vnode as usize] = false;
         self.dirty_vnodes[vnode as usize] = false;
         Ok(())
@@ -1696,8 +2097,8 @@ impl GraphOperator for IntervalJoinOperator {
             let target_owned = assignment
                 .owners()
                 .iter()
-                .enumerate()
-                .filter_map(|(vnode, owner)| (*owner == config.self_id).then_some(vnode as u32))
+                .zip(0_u32..)
+                .filter_map(|(owner, vnode)| (*owner == config.self_id).then_some(vnode))
                 .collect::<Vec<_>>();
             let restored = transition
                 .restores
@@ -1715,8 +2116,17 @@ impl GraphOperator for IntervalJoinOperator {
                 )));
             }
         }
-        let handoff_cut = self.portable_handoff_cut(&transition, fresh_acquirer)?;
-        let restore_cut = if transition.restores.is_empty() {
+        let pristine_restore_target = !transition.restores.is_empty()
+            && self.vnode_states.iter().all(Option::is_none)
+            && self.applied_left_watermark == i64::MIN
+            && self.applied_right_watermark == i64::MIN
+            && !self.applied_left_idle
+            && !self.applied_right_idle
+            && self.aligned_replay.is_empty();
+        let requires_handoff_cut = fresh_acquirer || pristine_restore_target;
+        let mut handoff_cut = self.portable_handoff_cut(&transition, requires_handoff_cut)?;
+        let derive_handoff_cut = requires_handoff_cut && handoff_cut.is_none();
+        let restore_cut = if transition.restores.is_empty() || derive_handoff_cut {
             None
         } else {
             Some(handoff_cut.unwrap_or(IntervalHandoffCut {
@@ -1781,6 +2191,7 @@ impl GraphOperator for IntervalJoinOperator {
 
         let live_bytes = self.accounted_state_bytes();
         let mut restored_bytes = 0usize;
+        let mut recovered_cut: Option<IntervalHandoffCut> = None;
         for restore in transition.restores {
             let remaining = self
                 .max_managed_state_bytes
@@ -1795,16 +2206,35 @@ impl GraphOperator for IntervalJoinOperator {
                         self.projection.op_name, self.max_managed_state_bytes
                     ))
                 })?;
-            let mut state = Self::deserialize_state(
+            let context = format!(
+                "interval join [{}] vnode {} restore",
+                self.projection.op_name, restore.vnode
+            );
+            let Some(mut state) = Self::decode_vnode_frame(
                 restore.state,
                 &self.config,
-                &format!(
-                    "interval join [{}] vnode {} restore",
-                    self.projection.op_name, restore.vnode
-                ),
+                &context,
                 remaining,
                 restore_cut,
-            )?;
+            )?
+            else {
+                replacements.insert(restore.vnode, None);
+                continue;
+            };
+            if derive_handoff_cut {
+                if let Some(candidate) = self.restored_handoff_cut_evidence(&state, &context)? {
+                    if recovered_cut.is_some_and(|expected| {
+                        expected.left_watermark != candidate.left_watermark
+                            || expected.right_watermark != candidate.right_watermark
+                    }) {
+                        return Err(DbError::Checkpoint(format!(
+                            "interval join [{}] restored vnode frames disagree on the handoff watermarks",
+                            self.projection.op_name
+                        )));
+                    }
+                    recovered_cut = Some(candidate);
+                }
+            }
             if let Some((left_schema, right_schema)) = &self.input_schemas {
                 state.seed_input_schemas(
                     left_schema.clone(),
@@ -1815,6 +2245,32 @@ impl GraphOperator for IntervalJoinOperator {
             state.validate_vnode(restore.vnode, transition.target.vnode_count, &self.config)?;
             restored_bytes = restored_bytes.saturating_add(state.accounted_state_bytes());
             replacements.insert(restore.vnode, Some(Box::new(state)));
+        }
+        if derive_handoff_cut {
+            let cut = recovered_cut.unwrap_or(IntervalHandoffCut {
+                left_watermark: i64::MIN,
+                right_watermark: i64::MIN,
+            });
+            for (vnode, state) in replacements
+                .iter()
+                .filter_map(|(vnode, state)| state.as_deref().map(|state| (*vnode, state)))
+            {
+                let (left_rows, right_rows) = state.buffered_rows();
+                let (left_evicted_cutoff, right_evicted_cutoff) = state.evicted_cutoffs();
+                Self::validate_handoff_cutoffs(
+                    left_evicted_cutoff,
+                    right_evicted_cutoff,
+                    left_rows != 0,
+                    right_rows != 0,
+                    &self.config,
+                    &format!(
+                        "interval join [{}] vnode {vnode} restore",
+                        self.projection.op_name
+                    ),
+                    cut,
+                )?;
+            }
+            handoff_cut = Some(cut);
         }
         for ((state, owner), vnode) in self
             .vnode_states
@@ -1906,6 +2362,11 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     use arrow::array::Int64Array;
+
+    fn materialize_capture(capture: StateFrameCapture) -> Result<bytes::Bytes, DbError> {
+        let mut staged_bytes = capture.retained_bytes();
+        capture.materialize(&mut staged_bytes, u64::MAX)
+    }
 
     #[cfg(feature = "cluster")]
     async fn single_owner_shuffle(
@@ -2150,6 +2611,76 @@ mod tests {
         );
         #[cfg(feature = "cluster")]
         assert_eq!(restored.restored_output_frontier(), Some(output));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn whole_checkpoint_capture_defers_and_preserves_its_replay_cut() {
+        let (scope, fence) = single_owner_shuffle(1).await;
+        let mut operator = IntervalJoinOperator::new(
+            "replay-checkpoint",
+            test_config(),
+            None,
+            SessionContext::new(),
+        );
+        operator.attach_cluster_shuffle(scope.clone());
+        operator.applied_left_watermark = 7_000;
+        operator.applied_right_watermark = 6_000;
+        operator.applied_left_idle = true;
+        operator.aligned_replay.push_back((
+            fence.assignment_version,
+            JoinInputSide::Right,
+            5_000,
+            crate::operator::RetainedBatch::restored_channel(
+                right_batch(&["A"], &[5_000], &[1.0]),
+                1,
+                fence.assignment_version,
+                1,
+                Arc::from([0_u32]),
+            ),
+        ));
+
+        let retained_bytes = operator
+            .capture_operator_checkpoint(u64::MAX)
+            .unwrap()
+            .unwrap()
+            .retained_bytes();
+        assert!(retained_bytes > 0);
+        assert!(operator.checkpoint_capture(retained_bytes - 1).is_err());
+        let capture = operator
+            .checkpoint_capture(retained_bytes)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&capture, StateFrameCapture::Deferred { .. }));
+
+        operator.applied_left_watermark = 9_000;
+        operator.applied_right_watermark = 9_000;
+        operator.applied_left_idle = false;
+        operator.applied_right_idle = true;
+        operator.aligned_replay.clear();
+
+        let checkpoint = OperatorCheckpoint {
+            data: materialize_capture(capture).unwrap().to_vec(),
+        };
+        let mut restored = IntervalJoinOperator::new(
+            "replay-checkpoint",
+            test_config(),
+            None,
+            SessionContext::new(),
+        );
+        restored.attach_cluster_shuffle(scope);
+        restored.restore(checkpoint).unwrap();
+
+        assert_eq!(restored.applied_left_watermark, 7_000);
+        assert_eq!(restored.applied_right_watermark, 6_000);
+        assert!(restored.applied_left_idle);
+        assert!(!restored.applied_right_idle);
+        let (assignment, side, watermark, batch) = restored.aligned_replay.front().unwrap();
+        assert_eq!(*assignment, fence.assignment_version);
+        assert!(matches!(side, JoinInputSide::Right));
+        assert_eq!(*watermark, 5_000);
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(restored.aligned_replay.len(), 1);
     }
 
     #[cfg(feature = "cluster")]
@@ -2500,8 +3031,8 @@ mod tests {
         let actual = op
             .vnode_states
             .iter()
-            .enumerate()
-            .filter_map(|(vnode, state)| state.as_ref().map(|_| vnode as u32))
+            .zip(0_u32..)
+            .filter_map(|(state, vnode)| state.as_ref().map(|_| vnode))
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
     }
@@ -2609,17 +3140,18 @@ mod tests {
             .unwrap()
             .expect("watermarks are checkpointed");
         let captured = op
-            .checkpoint_vnodes(&[0], 1)
+            .checkpoint_vnodes(&[0], 1, u64::MAX)
             .unwrap()
             .expect("interval join has vnode state");
-        let state = captured[0]
-            .state
-            .as_ref()
-            .expect("the first vnode capture is complete")
-            .clone();
-        assert!(op.checkpoint_vnodes(&[0], 1).unwrap().unwrap()[0]
+        let state = captured
+            .into_iter()
+            .next()
+            .and_then(|captured| captured.state)
+            .expect("the first vnode capture is complete");
+        assert!(op.checkpoint_vnodes(&[0], 1, u64::MAX).unwrap().unwrap()[0]
             .state
             .is_none());
+        let state = materialize_capture(state).unwrap();
 
         let mut op2 = IntervalJoinOperator::new("test_interval", test_config(), None, ctx);
         op2.restore(metadata).unwrap();
@@ -2640,7 +3172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_allows_ipc_over_half_budget_when_archive_fits() {
+    async fn checkpoint_respects_ipc_and_archive_peak_budget() {
         let ctx = laminar_sql::create_session_context();
         let mut op = IntervalJoinOperator::new("test_interval", test_config(), None, ctx);
         let wide_key = "x".repeat(64 * 1024);
@@ -2661,20 +3193,127 @@ mod tests {
             .unwrap()
             .retained_ipc_bytes()
             .unwrap();
-        let limit = ipc_bytes
-            .checked_add(ipc_bytes / 2)
-            .and_then(|bytes| bytes.checked_sub(1))
-            .unwrap();
-        assert!(ipc_bytes > limit / 2);
+        let archive_bytes = IntervalJoinOperator::serialize_state(
+            op.vnode_states[0].as_mut().unwrap(),
+            &op.config,
+            "interval join peak-budget sizing",
+            usize::MAX,
+        )
+        .unwrap()
+        .len();
+        let limit = ipc_bytes.checked_add(archive_bytes).unwrap();
         assert!(op.accounted_state_bytes() <= limit);
         op.set_managed_state_budget(limit);
 
-        let captured = op.checkpoint_vnodes(&[0], 1).unwrap().unwrap();
-        let state = captured[0]
-            .state
-            .as_ref()
+        let state = op
+            .checkpoint_vnodes(&[0], 1, u64::MAX)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|captured| captured.state)
             .expect("the first vnode capture is complete");
-        assert!(state.len() <= limit);
+        assert!(matches!(&state, StateFrameCapture::Deferred { .. }));
+        let state = materialize_capture(state).unwrap();
+        assert_eq!(state.len(), archive_bytes);
+    }
+
+    #[test]
+    fn deferred_vnode_frames_share_the_operator_checkpoint_budget() {
+        let make_operator = || {
+            let mut operator = IntervalJoinOperator::new_with_key_groups(
+                "test_interval",
+                test_config(),
+                None,
+                laminar_sql::create_session_context(),
+                KeyGroupCount::try_from(2_u16).unwrap(),
+            );
+            for state in &mut operator.vnode_states {
+                *state = Some(Box::new(IntervalJoinState::new()));
+            }
+            operator
+        };
+
+        let mut sizing = make_operator();
+        let capture = sizing
+            .checkpoint_vnodes(&[0, 1], 2, u64::MAX)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|captured| captured.state)
+            .unwrap();
+        let frame_bytes = materialize_capture(capture).unwrap().len();
+        let limit = frame_bytes.checked_mul(2).unwrap() - 1;
+
+        let mut peak_operator = make_operator();
+        peak_operator.vnode_states[1] = None;
+        peak_operator.set_managed_state_budget(frame_bytes);
+        let peak_capture = peak_operator
+            .checkpoint_vnodes(&[0], 2, u64::MAX)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|captured| captured.state)
+            .unwrap();
+        assert!(materialize_capture(peak_capture).is_err());
+
+        let mut operator = make_operator();
+        operator.set_managed_state_budget(limit);
+        let mut frames = operator
+            .checkpoint_vnodes(&[0, 1], 2, u64::MAX)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|captured| captured.state.unwrap());
+        materialize_capture(frames.next().unwrap()).unwrap();
+        assert!(materialize_capture(frames.next().unwrap()).is_err());
+    }
+
+    #[tokio::test]
+    async fn vnode_restore_preserves_sparse_state() {
+        let key_group_count = KeyGroupCount::try_from(2_u16).unwrap();
+        let key = key_for_vnode(1, 2);
+        let mut donor = IntervalJoinOperator::new_with_key_groups(
+            "sparse_interval",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+            key_group_count,
+        );
+        donor
+            .process(
+                &[vec![left_batch(&[key.as_str()], &[100], &[1.0])], vec![]],
+                &[0, 0],
+            )
+            .await
+            .unwrap();
+        let frames = donor
+            .checkpoint_vnodes(&[0, 1], 2, u64::MAX)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|frame| {
+                (
+                    frame.vnode,
+                    materialize_capture(frame.state.unwrap()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut restored = IntervalJoinOperator::new_with_key_groups(
+            "sparse_interval",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+            key_group_count,
+        );
+        for (vnode, state) in frames {
+            restored.restore_vnode(vnode, 2, &state).unwrap();
+        }
+
+        assert!(restored.vnode_states[0].is_none() && restored.vnode_states[1].is_some());
     }
 
     #[cfg(feature = "cluster")]
@@ -3039,21 +3678,23 @@ mod tests {
             donor
                 .vnode_states
                 .iter()
-                .enumerate()
-                .filter_map(|(vnode, state)| state.as_ref().map(|_| vnode as u32))
+                .zip(0_u32..)
+                .filter_map(|(state, vnode)| state.as_ref().map(|_| vnode))
                 .collect::<Vec<_>>(),
             vec![vnode]
         );
 
         let captured = donor
-            .checkpoint_vnodes(&[vnode], vnode_count)
+            .checkpoint_vnodes(&[vnode], vnode_count, u64::MAX)
             .unwrap()
             .unwrap();
         assert_eq!(captured[0].vnode, vnode);
-        let slice = captured[0]
-            .state
-            .as_ref()
+        let capture = captured
+            .into_iter()
+            .next()
+            .and_then(|captured| captured.state)
             .expect("the first vnode capture is complete");
+        let state = materialize_capture(capture).unwrap();
 
         let (restored_shuffle, fence) = single_owner_shuffle(vnode_count).await;
         let mut restored = IntervalJoinOperator::new(
@@ -3066,7 +3707,7 @@ mod tests {
         let restores = [crate::operator_graph::ManagedVnodeRestore {
             participant_id: 1,
             vnode,
-            state: slice,
+            state: &state,
         }];
         let predecessor = install_single_owner_predecessor(&mut restored, &fence);
         restored
@@ -3106,6 +3747,8 @@ mod tests {
             restored.local_assignment.version(),
             fence.assignment_version
         );
+        assert_eq!(restored.applied_left_watermark, 0);
+        assert_eq!(restored.applied_right_watermark, 0);
         restored.finish_vnode_transition();
 
         let output = restored
@@ -3120,8 +3763,8 @@ mod tests {
             restored
                 .vnode_states
                 .iter()
-                .enumerate()
-                .filter_map(|(vnode, state)| state.as_ref().map(|_| vnode as u32))
+                .zip(0_u32..)
+                .filter_map(|(state, vnode)| state.as_ref().map(|_| vnode))
                 .collect::<Vec<_>>(),
             vec![vnode]
         );
@@ -3158,12 +3801,20 @@ mod tests {
 
         assert!(matches!(&error, DbError::StatefulOperatorPartialApply(_)));
         assert!(error.requires_pipeline_recovery());
-        let captured = op.checkpoint_vnodes(&[0], 1).unwrap().unwrap();
-        let state = captured[0]
-            .state
-            .as_ref()
+        let capture = op
+            .checkpoint_vnodes(&[0], 1, u64::MAX)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|captured| captured.state)
             .expect("state admitted before projection failure remains checkpointable");
-        let decoded = rkyv::from_bytes::<JoinStateCheckpoint, rkyv::rancor::Error>(state).unwrap();
+        let state = materialize_capture(capture).unwrap();
+        assert_eq!(state.first(), Some(&PRESENT_VNODE));
+        let decoded = rkyv::from_bytes::<JoinStateCheckpoint, rkyv::rancor::Error>(
+            &state[VNODE_FRAME_HEADER_LEN..],
+        )
+        .unwrap();
         assert_eq!(decoded.left_buffer_rows, 1);
         assert_eq!(decoded.right_buffer_rows, 1);
     }

@@ -2,7 +2,7 @@
 
 #![allow(clippy::disallowed_types)] // cold path: manifest serialization
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::{NonZeroU32, NonZeroU64};
 
 use sha2::{Digest, Sha256};
@@ -13,7 +13,7 @@ use crate::state::{
 };
 
 /// Current checkpoint manifest format. Every other version is rejected.
-pub const CHECKPOINT_MANIFEST_VERSION: u32 = 7;
+pub const CHECKPOINT_MANIFEST_VERSION: u32 = 8;
 
 /// Canonical pipeline-identity payload version.
 pub const PIPELINE_IDENTITY_VERSION: u16 = 6;
@@ -159,8 +159,10 @@ pub struct PreparedSinkDescriptor {
 pub struct ChannelProgress {
     /// Participant owning this channel state.
     pub participant_id: u64,
-    /// Stable channel identity.
-    pub channel_id: String,
+    /// Stable registered source name.
+    pub source_name: String,
+    /// Reserved logical singleton or opaque physical input-channel identity.
+    pub input_channel: Vec<u8>,
     /// Watermark when initialized; `None` before the channel emits one.
     pub watermark: Option<i64>,
     /// Whether the channel is excluded from the active watermark minimum.
@@ -299,7 +301,7 @@ impl CheckpointManifest {
         self.node_data.chunk.participant_id = participant_id;
     }
 
-    /// Validate the exact v7 recovery contract.
+    /// Validate the exact v8 recovery contract.
     #[must_use]
     pub fn validate(
         &self,
@@ -374,17 +376,55 @@ impl CheckpointManifest {
         validate_sorted_unique("source_names", &self.source_names, &mut error);
         validate_sorted_unique("sink_names", &self.sink_names, &mut error);
         if !self.channel_progress.windows(2).all(|pair| {
-            (&pair[0].participant_id, &pair[0].channel_id)
-                < (&pair[1].participant_id, &pair[1].channel_id)
+            (
+                &pair[0].participant_id,
+                &pair[0].source_name,
+                &pair[0].input_channel,
+            ) < (
+                &pair[1].participant_id,
+                &pair[1].source_name,
+                &pair[1].input_channel,
+            )
         }) {
-            error("channel_progress must be strictly ordered by participant and channel_id".into());
+            error(
+                "channel_progress must be strictly ordered by participant, source, and input channel"
+                    .into(),
+            );
         }
+        let mut channel_modes = BTreeMap::new();
         for channel in &self.channel_progress {
             if channel.participant_id != self.participant_id {
                 error("channel_progress participant_id must match the manifest participant".into());
             }
-            if channel.channel_id.is_empty() {
-                error("channel_progress channel_id must not be empty".into());
+            if channel.source_name.is_empty() {
+                error("channel_progress source_name must not be empty".into());
+            } else if self
+                .source_names
+                .binary_search(&channel.source_name)
+                .is_err()
+            {
+                error(format!(
+                    "channel_progress source '{}' not in source_names",
+                    channel.source_name
+                ));
+            }
+            if channel.input_channel.is_empty() {
+                error("channel_progress input_channel must not be empty".into());
+            }
+            let modes = channel_modes
+                .entry(channel.source_name.as_str())
+                .or_insert((false, false));
+            if channel.input_channel == super::SINGLETON_WATERMARK_CHANNEL {
+                modes.0 = true;
+            } else {
+                modes.1 = true;
+            }
+        }
+        for (source, (logical, physical)) in channel_modes {
+            if logical && physical {
+                error(format!(
+                    "channel_progress source '{source}' mixes logical and physical input channels"
+                ));
             }
         }
         match super::classify_channel_progress(&self.channel_progress) {
@@ -399,6 +439,43 @@ impl CheckpointManifest {
                 error(format!(
                     "source_offsets contains '{name}' not in source_names"
                 ));
+            }
+        }
+        for (name, checkpoint) in &self.source_offsets {
+            if let Some(channels) = &checkpoint.input_channels {
+                if channels.iter().any(Vec::is_empty)
+                    || !channels.windows(2).all(|pair| pair[0] < pair[1])
+                {
+                    error(format!(
+                        "source '{name}' input_channels must contain non-empty, strictly ordered unique identities"
+                    ));
+                }
+                if channels
+                    .iter()
+                    .any(|channel| channel == super::SINGLETON_WATERMARK_CHANNEL)
+                {
+                    error(format!(
+                        "source '{name}' input_channels contains the reserved logical watermark channel"
+                    ));
+                }
+                let mut progress = self
+                    .channel_progress
+                    .iter()
+                    .filter(|channel| channel.source_name == *name)
+                    .map(|channel| channel.input_channel.as_slice())
+                    .collect::<Vec<_>>();
+                if !progress.is_empty()
+                    && !progress
+                        .iter()
+                        .all(|channel| *channel == super::SINGLETON_WATERMARK_CHANNEL)
+                {
+                    progress.sort_unstable();
+                    if !progress.into_iter().eq(channels.iter().map(Vec::as_slice)) {
+                        error(format!(
+                            "source '{name}' input_channels do not match its channel_progress roster"
+                        ));
+                    }
+                }
             }
         }
 
@@ -583,6 +660,8 @@ pub struct ConnectorCheckpoint {
     pub offsets: HashMap<String, String>,
     /// Connector metadata required to interpret the offsets.
     pub metadata: HashMap<String, String>,
+    /// Canonically ordered opaque identities of the input channels owned by this cut.
+    pub input_channels: Option<Vec<Vec<u8>>>,
     /// Source-assignment version owning this cut, when applicable.
     pub source_assignment_version: Option<NonZeroU64>,
 }
@@ -674,7 +753,8 @@ mod tests {
     fn channel(id: &str, watermark: Option<i64>, idle: bool) -> ChannelProgress {
         ChannelProgress {
             participant_id: LOCAL_NODE_ID.0,
-            channel_id: id.into(),
+            source_name: "source".into(),
+            input_channel: id.as_bytes().to_vec(),
             watermark,
             idle,
         }
@@ -727,6 +807,11 @@ mod tests {
             crate::checkpoint::classify_channel_progress(&channels),
             Ok(crate::checkpoint::CheckpointWatermark::Idle)
         );
+        let retained = vec![channel("a", Some(10), true), channel("b", Some(20), true)];
+        assert_eq!(
+            crate::checkpoint::channel_progress_frontier(&retained),
+            Ok(Some(20))
+        );
 
         let mut manifest = valid_manifest(1);
         manifest.channel_progress = channels;
@@ -744,8 +829,15 @@ mod tests {
     }
 
     #[test]
-    fn v7_round_trip_carries_ranges_sinks_and_prior_chunk_refs() {
+    fn v8_round_trip_carries_input_channels_ranges_sinks_and_prior_chunk_refs() {
         let mut manifest = valid_manifest(9);
+        manifest.source_offsets.insert(
+            "source".into(),
+            ConnectorCheckpoint {
+                input_channels: Some(vec![b"partition-0".to_vec(), b"partition-1".to_vec()]),
+                ..ConnectorCheckpoint::default()
+            },
+        );
         let prior = StateChunkId {
             participant_id: 2,
             checkpoint_id: 8,
@@ -804,15 +896,83 @@ mod tests {
     #[test]
     fn previous_manifest_versions_are_not_accepted() {
         let mut manifest = valid_manifest(1);
-        manifest.version = 6;
+        manifest.version = 7;
         let errors = manifest.validate(KeyGroupCount::try_from(1_u16).unwrap());
         assert!(errors
             .iter()
-            .any(|error| error.message.contains("unsupported manifest version 6")));
+            .any(|error| error.message.contains("unsupported manifest version 7")));
 
         let mut json = serde_json::to_value(valid_manifest(1)).unwrap();
         json.as_object_mut().unwrap().remove("node_data");
         assert!(serde_json::from_value::<CheckpointManifest>(json).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_noncanonical_or_mismatched_input_channels() {
+        let mut manifest = valid_manifest(1);
+        manifest.source_offsets.insert(
+            "source".into(),
+            ConnectorCheckpoint {
+                input_channels: Some(vec![b"partition-1".to_vec(), b"partition-0".to_vec()]),
+                ..ConnectorCheckpoint::default()
+            },
+        );
+
+        assert!(manifest
+            .validate(KeyGroupCount::try_from(1_u16).unwrap())
+            .iter()
+            .any(|error| error.message.contains("input_channels")));
+
+        manifest
+            .source_offsets
+            .get_mut("source")
+            .unwrap()
+            .input_channels = Some(vec![crate::checkpoint::SINGLETON_WATERMARK_CHANNEL.to_vec()]);
+        assert!(manifest
+            .validate(KeyGroupCount::try_from(1_u16).unwrap())
+            .iter()
+            .any(|error| error.message.contains("reserved logical watermark channel")));
+
+        manifest
+            .source_offsets
+            .get_mut("source")
+            .unwrap()
+            .input_channels = Some(vec![b"partition-0".to_vec(), b"partition-1".to_vec()]);
+        manifest.channel_progress = vec![channel("partition-0", Some(1), false)];
+        manifest.checkpoint_watermark = Some(1);
+        assert!(manifest
+            .validate(KeyGroupCount::try_from(1_u16).unwrap())
+            .iter()
+            .any(|error| error.message.contains("channel_progress roster")));
+    }
+
+    #[test]
+    fn logical_singleton_is_independent_of_the_connector_roster() {
+        let mut manifest = valid_manifest(1);
+        manifest.source_offsets.insert(
+            "source".into(),
+            ConnectorCheckpoint {
+                input_channels: Some(vec![b"partition-0".to_vec(), b"partition-1".to_vec()]),
+                ..ConnectorCheckpoint::default()
+            },
+        );
+        manifest.channel_progress = vec![ChannelProgress {
+            participant_id: LOCAL_NODE_ID.0,
+            source_name: "source".into(),
+            input_channel: crate::checkpoint::SINGLETON_WATERMARK_CHANNEL.to_vec(),
+            watermark: Some(1),
+            idle: false,
+        }];
+        manifest.checkpoint_watermark = Some(1);
+
+        let one = KeyGroupCount::try_from(1_u16).unwrap();
+        assert!(manifest.validate(one).is_empty());
+
+        manifest.channel_progress[0].source_name = "missing".into();
+        assert!(manifest
+            .validate(one)
+            .iter()
+            .any(|error| error.message.contains("not in source_names")));
     }
 
     #[test]

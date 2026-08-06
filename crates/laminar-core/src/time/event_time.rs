@@ -3,8 +3,6 @@
 //! Columns must be `Timestamp(_)` at any precision; non-millisecond
 //! precisions are cast to `Timestamp(Millisecond)` via the Arrow kernel.
 
-use std::sync::Arc;
-
 use arrow::array::{Array, TimestampMillisecondArray};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
@@ -141,12 +139,32 @@ impl EventTimeExtractor {
     /// the column is not a `Timestamp(_)`, the value at the selected row
     /// is null, or Arrow's cast kernel fails.
     pub fn extract(&mut self, batch: &RecordBatch) -> Result<i64, EventTimeError> {
+        let milliseconds = self.extract_millis_array(batch)?;
+        self.extract_from_millis(&milliseconds)
+    }
+
+    /// Returns the configured event-time column converted to epoch milliseconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch is empty, the column is missing, the
+    /// column is not a `Timestamp(_)`, or Arrow's cast kernel fails.
+    pub fn extract_millis_array(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> Result<TimestampMillisecondArray, EventTimeError> {
         if batch.num_rows() == 0 {
             return Err(EventTimeError::EmptyBatch);
         }
         let index = self.get_column_index(batch.schema().as_ref())?;
         let column = batch.column(index);
-        self.extract_from_column(column)
+        cast_to_millis_array(column.as_ref()).map_err(|e| {
+            if matches!(column.data_type(), DataType::Timestamp(_, _)) {
+                EventTimeError::CastFailed(e.0)
+            } else {
+                EventTimeError::IncompatibleType { found: e.0 }
+            }
+        })
     }
 
     fn get_column_index(&mut self, schema: &Schema) -> Result<usize, EventTimeError> {
@@ -183,19 +201,12 @@ impl EventTimeExtractor {
         }
     }
 
-    fn extract_from_column(&self, column: &Arc<dyn Array>) -> Result<i64, EventTimeError> {
-        let ms = cast_to_millis_array(column.as_ref()).map_err(|e| {
-            if matches!(column.data_type(), DataType::Timestamp(_, _)) {
-                EventTimeError::CastFailed(e.0)
-            } else {
-                EventTimeError::IncompatibleType { found: e.0 }
-            }
-        })?;
+    fn extract_from_millis(&self, ms: &TimestampMillisecondArray) -> Result<i64, EventTimeError> {
         match self.mode {
-            ExtractionMode::First => read_indexed(&ms, 0),
-            ExtractionMode::Last => read_indexed(&ms, ms.len() - 1),
-            ExtractionMode::Max => fold_non_null(&ms, i64::MIN, i64::max),
-            ExtractionMode::Min => fold_non_null(&ms, i64::MAX, i64::min),
+            ExtractionMode::First => read_indexed(ms, 0),
+            ExtractionMode::Last => read_indexed(ms, ms.len() - 1),
+            ExtractionMode::Max => fold_non_null(ms, i64::MIN, i64::max),
+            ExtractionMode::Min => fold_non_null(ms, i64::MAX, i64::min),
         }
     }
 }
@@ -324,6 +335,18 @@ mod tests {
         let batch = make_us_batch(&[Some(1_705_312_200_000_000)]);
         let mut extractor = EventTimeExtractor::from_column("ts");
         assert_eq!(extractor.extract(&batch).unwrap(), 1_705_312_200_000);
+    }
+
+    #[test]
+    fn test_extract_millis_array_rescales_micros() {
+        let batch = make_us_batch(&[Some(1_500), None, Some(2_500)]);
+        let mut extractor = EventTimeExtractor::from_column("ts");
+        let milliseconds = extractor.extract_millis_array(&batch).unwrap();
+
+        assert_eq!(
+            milliseconds.iter().collect::<Vec<_>>(),
+            vec![Some(1), None, Some(2)]
+        );
     }
 
     #[test]

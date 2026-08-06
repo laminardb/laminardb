@@ -77,9 +77,6 @@ pub struct PipelineConfig {
     /// Maximum wall-clock time for per-query execution within a cycle (nanoseconds). Default: 8ms.
     pub query_budget_ns: u64,
 
-    /// Maximum wall-clock time for background work after SQL execution (nanoseconds). Default: 5ms.
-    pub background_budget_ns: u64,
-
     /// Per-input-port batch cap. Default: 256.
     pub max_input_buf_batches: usize,
 
@@ -109,10 +106,9 @@ impl Default for PipelineConfig {
             batch_window: Duration::from_millis(5),
             checkpoint_timeout: Duration::from_secs(30),
             delivery_guarantee: DeliveryGuarantee::default(),
-            cycle_budget_ns: 10_000_000,     // 10ms
-            drain_budget_ns: 1_000_000,      // 1ms
-            query_budget_ns: 8_000_000,      // 8ms
-            background_budget_ns: 5_000_000, // 5ms
+            cycle_budget_ns: 10_000_000, // 10ms
+            drain_budget_ns: 1_000_000,  // 1ms
+            query_budget_ns: 8_000_000,  // 8ms
             max_input_buf_batches: 256,
             max_input_buf_bytes: None,
             backpressure_policy: BackpressurePolicy::default(),

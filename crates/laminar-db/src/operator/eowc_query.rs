@@ -427,6 +427,7 @@ impl GraphOperator for EowcQueryOperator {
         &mut self,
         required_vnodes: &[u32],
         vnode_count: u32,
+        max_capture_bytes: u64,
     ) -> Result<Option<Vec<crate::operator_graph::CapturedVnodeState>>, DbError> {
         if vnode_count == 0
             || required_vnodes.windows(2).any(|pair| pair[0] >= pair[1])
@@ -467,11 +468,23 @@ impl GraphOperator for EowcQueryOperator {
                 self.op_name
             )));
         };
+        if u64::try_from(window.accounted_state_bytes()).unwrap_or(u64::MAX) > max_capture_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' state exceeds its capture budget",
+                self.op_name
+            )));
+        }
         let checkpoint = window.checkpoint_windows()?;
         let bytes = Self::encode_checkpoint(&checkpoint, &self.op_name)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_capture_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' checkpoint exceeded its capture budget",
+                self.op_name
+            )));
+        }
         Ok(Some(vec![crate::operator_graph::CapturedVnodeState {
             vnode: 0,
-            state: Some(bytes::Bytes::from(bytes)),
+            state: Some(crate::operator_graph::StateFrameCapture::encoded(bytes)),
         }]))
     }
 

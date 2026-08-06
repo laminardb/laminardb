@@ -27,7 +27,20 @@ use crate::registry::ConnectorRegistry;
 
 const GENERATOR_CHECKPOINT_CONNECTOR: &str = "generator";
 const CHECKPOINT_VERSION_METADATA: &str = "checkpoint.version";
-const GENERATOR_CHECKPOINT_VERSION: &str = "1";
+const GENERATOR_CHECKPOINT_VERSION: &str = "2";
+
+fn generator_input_channel(source_name: &str) -> Result<Vec<u8>, ConnectorError> {
+    let source_len = u32::try_from(source_name.len()).map_err(|_| {
+        ConnectorError::ConfigurationError(
+            "generator source identity exceeds the input-channel encoding limit".into(),
+        )
+    })?;
+    let mut channel = Vec::with_capacity(source_name.len() + 8);
+    channel.extend_from_slice(&source_len.to_be_bytes());
+    channel.extend_from_slice(source_name.as_bytes());
+    channel.extend_from_slice(&0_u32.to_be_bytes());
+    Ok(channel)
+}
 
 fn validate_generator_checkpoint(checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
     match checkpoint.get_metadata("connector") {
@@ -57,7 +70,7 @@ pub struct GeneratorSource {
     rows_per_second: u64,
     batch_max: usize,
     max_rows: Option<u64>,
-    source_name: Arc<str>,
+    input_channel: Vec<u8>,
     /// Next sequence number to emit (== rows emitted so far across
     /// restarts; restored from the checkpoint).
     next_seq: u64,
@@ -114,17 +127,8 @@ impl GeneratorSource {
         start: u64,
         n: usize,
     ) -> Result<SourceRowPositions, ConnectorError> {
-        let source_len = u32::try_from(self.source_name.len()).map_err(|_| {
-            ConnectorError::ConfigurationError(
-                "generator source identity exceeds the row-position encoding limit".into(),
-            )
-        })?;
-        let mut partition = Vec::with_capacity(self.source_name.len() + 8);
-        partition.extend_from_slice(&source_len.to_be_bytes());
-        partition.extend_from_slice(self.source_name.as_bytes());
-        partition.extend_from_slice(&0_u32.to_be_bytes());
-
-        let mut partitions = BinaryBuilder::with_capacity(n, partition.len().saturating_mul(n));
+        let mut partitions =
+            BinaryBuilder::with_capacity(n, self.input_channel.len().saturating_mul(n));
         let mut order_keys = BinaryBuilder::with_capacity(n, 8_usize.saturating_mul(n));
         for row in 0..n {
             let sequence = start
@@ -132,7 +136,7 @@ impl GeneratorSource {
                     ConnectorError::Internal("generator batch row index exceeds u64".into())
                 })?)
                 .ok_or_else(|| ConnectorError::Internal("generator sequence overflow".into()))?;
-            partitions.append_value(&partition);
+            partitions.append_value(&self.input_channel);
             order_keys.append_value(sequence.to_be_bytes());
         }
         SourceRowPositions::try_new(
@@ -145,12 +149,14 @@ impl GeneratorSource {
 
 impl Default for GeneratorSource {
     fn default() -> Self {
+        let input_channel = generator_input_channel("generator")
+            .expect("the built-in generator source identity is valid");
         Self {
             schema: Self::generator_schema(),
             rows_per_second: 1000,
             batch_max: 1024,
             max_rows: None,
-            source_name: Arc::from("generator"),
+            input_channel,
             next_seq: 0,
             anchor: None,
         }
@@ -171,12 +177,11 @@ impl SourceConnector for GeneratorSource {
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         let (config, position, _) = request.into_parts();
-        self.source_name = Arc::from(
-            config
-                .get("laminar.source.name")
-                .filter(|name| !name.is_empty())
-                .unwrap_or("generator"),
-        );
+        let source_name = config
+            .get("laminar.source.name")
+            .filter(|name| !name.is_empty())
+            .unwrap_or("generator");
+        self.input_channel = generator_input_channel(source_name)?;
         if let Some(rps) = config.get_parsed::<u64>("rows.per.second")? {
             if rps == 0 {
                 return Err(ConnectorError::ConfigurationError(
@@ -197,6 +202,11 @@ impl SourceConnector for GeneratorSource {
                 checkpoint,
             } => {
                 validate_generator_checkpoint(&checkpoint)?;
+                if checkpoint.input_channels() != Some(std::slice::from_ref(&self.input_channel)) {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "generator checkpoint {attempt:?} has the wrong input-channel inventory"
+                    )));
+                }
                 let seq = checkpoint.get_offset("seq").ok_or_else(|| {
                     ConnectorError::ConfigurationError(format!(
                         "generator checkpoint {attempt:?} is missing required 'seq' offset"
@@ -259,6 +269,8 @@ impl SourceConnector for GeneratorSource {
         cp.set_offset("seq", self.next_seq.to_string());
         cp.set_metadata("connector", GENERATOR_CHECKPOINT_CONNECTOR);
         cp.set_metadata(CHECKPOINT_VERSION_METADATA, GENERATOR_CHECKPOINT_VERSION);
+        cp.set_input_channels(vec![self.input_channel.clone()])
+            .expect("the cached generator input-channel identity is valid");
         cp
     }
 
@@ -326,8 +338,10 @@ mod tests {
     #[test]
     fn row_positions_bind_source_partition_and_sequence() {
         let mut source = GeneratorSource::default();
-        source.source_name = Arc::from("prices");
+        source.input_channel = generator_input_channel("prices").unwrap();
         let positions = source.build_row_positions(7, 2).unwrap();
+        let checkpoint = source.checkpoint();
+        let expected_channel = positions.partition().value(0).to_vec();
 
         assert_eq!(&positions.partition().value(0)[4..10], b"prices");
         assert_eq!(
@@ -337,6 +351,10 @@ mod tests {
         assert_eq!(positions.order_key().value(0), 7_u64.to_be_bytes());
         assert_eq!(positions.order_key().value(1), 8_u64.to_be_bytes());
         assert_eq!(positions.sub_offset().values(), &[0, 0]);
+        assert_eq!(
+            checkpoint.input_channels(),
+            Some(std::slice::from_ref(&expected_channel))
+        );
     }
 
     #[tokio::test]
@@ -427,8 +445,8 @@ mod tests {
             ),
             (
                 GENERATOR_CHECKPOINT_CONNECTOR,
-                "0",
-                "requires checkpoint.version=1",
+                "1",
+                "requires checkpoint.version=2",
             ),
         ] {
             let mut checkpoint = SourceCheckpoint::new();

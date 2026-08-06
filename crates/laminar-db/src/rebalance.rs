@@ -3154,6 +3154,7 @@ pub(crate) async fn record_assignment_checkpoint_for_test(
                 node_data_sha256: "1".repeat(64),
             })
             .collect(),
+        source_names: Vec::new(),
         source_offsets: Default::default(),
         channel_progress: Vec::new(),
         checkpoint_watermark: None,

@@ -54,10 +54,13 @@ pub use committed_checkpoint::{
     COMMITTED_CHECKPOINT_INDEX_VERSION, MAX_COMMITTED_CHECKPOINT_INDEX_BYTES,
 };
 
+/// Reserved input-channel identity for one logical watermark per source and participant.
+pub const SINGLETON_WATERMARK_CHANNEL: &[u8] = b"\0";
+
 /// Reconstruct the event-time state represented by an exact channel cut.
 ///
 /// # Errors
-/// Returns an error when a channel uses the reserved watermark sentinel.
+/// Returns an error when a channel uses the reserved uninitialized watermark value.
 pub fn classify_channel_progress(
     channels: &[ChannelProgress],
 ) -> Result<CheckpointWatermark, String> {
@@ -75,4 +78,19 @@ pub fn classify_channel_progress(
         minimum = Some(minimum.map_or(watermark, |current: i64| current.min(watermark)));
     }
     Ok(minimum.map_or(CheckpointWatermark::Idle, CheckpointWatermark::Active))
+}
+
+/// Numeric frontier retained by a channel cut, including an all-idle cut.
+///
+/// # Errors
+/// Returns an error when the channel cut contains an invalid watermark sentinel.
+pub fn channel_progress_frontier(channels: &[ChannelProgress]) -> Result<Option<i64>, String> {
+    Ok(match classify_channel_progress(channels)? {
+        CheckpointWatermark::Active(watermark) => Some(watermark),
+        CheckpointWatermark::Idle => channels
+            .iter()
+            .filter_map(|channel| channel.watermark)
+            .max(),
+        CheckpointWatermark::Uninitialized => None,
+    })
 }

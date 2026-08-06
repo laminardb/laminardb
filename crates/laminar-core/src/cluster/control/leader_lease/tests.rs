@@ -433,6 +433,7 @@ async fn committed_checkpoint_with_predecessor(
                 node_data_sha256: digest(variant.wrapping_add(1)),
             })
             .collect(),
+        source_names: Vec::new(),
         source_offsets: std::collections::BTreeMap::new(),
         channel_progress: Vec::new(),
         checkpoint_watermark: None,

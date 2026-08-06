@@ -48,6 +48,7 @@ impl crate::operator_graph::GraphOperator for DrainingCaptureFailureOperator {
         &mut self,
         required_vnodes: &[u32],
         _vnode_count: u32,
+        _max_capture_bytes: u64,
     ) -> Result<Option<Vec<crate::operator_graph::CapturedVnodeState>>, DbError> {
         if self
             .fail_vnode_capture
@@ -64,7 +65,9 @@ impl crate::operator_graph::GraphOperator for DrainingCaptureFailureOperator {
                 .iter()
                 .map(|vnode| crate::operator_graph::CapturedVnodeState {
                     vnode: *vnode,
-                    state: Some(bytes::Bytes::from_static(b"test-vnode-state")),
+                    state: Some(crate::operator_graph::StateFrameCapture::encoded_static(
+                        b"test-vnode-state",
+                    )),
                 })
                 .collect(),
         ))
@@ -73,6 +76,46 @@ impl crate::operator_graph::GraphOperator for DrainingCaptureFailureOperator {
 
 struct DrainingCaptureOperator {
     live_rows: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(feature = "cluster")]
+struct UnchangedVnodeCaptureOperator;
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl crate::operator_graph::GraphOperator for UnchangedVnodeCaptureOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::test_vnode_state()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<crate::operator_graph::OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn checkpoint_vnodes(
+        &mut self,
+        required_vnodes: &[u32],
+        _vnode_count: u32,
+        _max_capture_bytes: u64,
+    ) -> Result<Option<Vec<crate::operator_graph::CapturedVnodeState>>, DbError> {
+        Ok(Some(
+            required_vnodes
+                .iter()
+                .map(|vnode| crate::operator_graph::CapturedVnodeState {
+                    vnode: *vnode,
+                    state: None,
+                })
+                .collect(),
+        ))
+    }
 }
 
 #[async_trait::async_trait]
@@ -185,6 +228,7 @@ impl crate::operator_graph::GraphOperator for CheckpointRotationFenceAuditOperat
         &mut self,
         required_vnodes: &[u32],
         _vnode_count: u32,
+        _max_capture_bytes: u64,
     ) -> Result<Option<Vec<crate::operator_graph::CapturedVnodeState>>, DbError> {
         if Arc::clone(&self.fence).try_write_owned().is_ok() {
             return Err(DbError::Checkpoint(
@@ -198,7 +242,9 @@ impl crate::operator_graph::GraphOperator for CheckpointRotationFenceAuditOperat
                 .iter()
                 .map(|vnode| crate::operator_graph::CapturedVnodeState {
                     vnode: *vnode,
-                    state: Some(bytes::Bytes::from_static(b"fence-audit-state")),
+                    state: Some(crate::operator_graph::StateFrameCapture::encoded_static(
+                        b"fence-audit-state",
+                    )),
                 })
                 .collect(),
         ))
@@ -288,6 +334,7 @@ fn empty_callback_fixture() -> ConnectorPipelineCallback {
         source_entries_for_wm: FxHashMap::default(),
         source_ids: FxHashMap::default(),
         source_name_arcs: FxHashMap::default(),
+        checkpoint_source_names: Vec::new(),
         source_frontiers_buf: FxHashMap::default(),
         tracker: None,
         prom: Arc::new(crate::engine_metrics::EngineMetrics::new(
@@ -341,6 +388,7 @@ fn empty_callback_fixture() -> ConnectorPipelineCallback {
         subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
         named_stream_names: rustc_hash::FxHashSet::default(),
         checkpoint_complete_tx,
+        checkpoint_tail_runtime: tokio::runtime::Handle::current(),
         checkpoint_tail_tasks: tokio::task::JoinSet::new(),
         checkpoint_in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         full_vnode_capture_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -387,8 +435,8 @@ async fn cancelled_graph_pass_is_a_sticky_pipeline_fault() {
     );
 }
 
-#[test]
-fn checkpoint_admission_failure_reporting_is_edge_deduplicated() {
+#[tokio::test]
+async fn checkpoint_admission_failure_reporting_is_edge_deduplicated() {
     let mut callback = empty_callback_fixture();
     assert!(callback.mark_checkpoint_admission_failure("authority unavailable"));
     assert!(!callback.mark_checkpoint_admission_failure("authority unavailable"));
@@ -792,8 +840,8 @@ async fn authoritative_follower_abort_cleanup_is_local_and_role_stable() {
 }
 
 #[cfg(feature = "cluster")]
-#[test]
-fn authoritative_follower_abort_cleanup_rejects_identity_mismatch() {
+#[tokio::test]
+async fn authoritative_follower_abort_cleanup_rejects_identity_mismatch() {
     use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 
     let controller = local_controller();
@@ -834,8 +882,8 @@ fn authoritative_follower_abort_cleanup_rejects_identity_mismatch() {
 }
 
 #[cfg(feature = "cluster")]
-#[test]
-fn authoritative_follower_abort_cleanup_keeps_command_when_reservation_is_missing() {
+#[tokio::test]
+async fn authoritative_follower_abort_cleanup_keeps_command_when_reservation_is_missing() {
     use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 
     let controller = local_controller();
@@ -1666,11 +1714,11 @@ fn cluster_callback_fixture(
     );
     let watermark_states = FxHashMap::from_iter([(
         "orders".into(),
-        SourceWatermarkState {
-            extractor: laminar_core::time::EventTimeExtractor::from_column("ts"),
-            generator: Box::new(generator),
-            column: "ts".into(),
-        },
+        SourceWatermarkState::new(
+            laminar_core::time::EventTimeExtractor::from_column("ts"),
+            Box::new(generator),
+            "ts".into(),
+        ),
     )]);
     let source_entries_for_wm = FxHashMap::from_iter([("orders".into(), Arc::clone(&source))]);
     let source_ids = FxHashMap::from_iter([("orders".into(), 0)]);
@@ -1700,6 +1748,7 @@ fn cluster_callback_fixture(
             source_entries_for_wm,
             source_ids,
             source_name_arcs,
+            checkpoint_source_names: vec!["orders".into()],
             source_frontiers_buf: FxHashMap::default(),
             tracker: Some(tracker),
             prom: Arc::new(crate::engine_metrics::EngineMetrics::new(
@@ -1743,6 +1792,7 @@ fn cluster_callback_fixture(
             subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
             named_stream_names: rustc_hash::FxHashSet::default(),
             checkpoint_complete_tx,
+            checkpoint_tail_runtime: tokio::runtime::Handle::current(),
             checkpoint_tail_tasks: tokio::task::JoinSet::new(),
             checkpoint_in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             full_vnode_capture_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1776,26 +1826,6 @@ async fn follower_checkpoint_control_exposes_expired_process_authority() {
         panic!("expired follower authority must be an explicit admission failure");
     };
     assert!(error.contains("cluster process lease expired"), "{error}");
-}
-
-#[test]
-fn checkpoint_watermark_distinguishes_idle_from_uninitialized_inputs() {
-    assert_eq!(
-        classify_checkpoint_watermark(0, 0, i64::MIN),
-        CheckpointWatermark::Idle
-    );
-    assert_eq!(
-        classify_checkpoint_watermark(2, 0, 10),
-        CheckpointWatermark::Idle
-    );
-    assert_eq!(
-        classify_checkpoint_watermark(2, 2, i64::MIN),
-        CheckpointWatermark::Uninitialized
-    );
-    assert_eq!(
-        classify_checkpoint_watermark(2, 1, 10),
-        CheckpointWatermark::Active(10)
-    );
 }
 
 #[cfg(feature = "cluster")]
@@ -1864,7 +1894,8 @@ async fn destructive_operator_capture_failure_faults_at_least_once_runtime() {
 async fn failure_after_destructive_operator_capture_faults_runtime() {
     let live_rows = Arc::new(std::sync::atomic::AtomicUsize::new(17));
     let mut callback = empty_callback_fixture();
-    callback.checkpoint_state_cap_bytes = 1;
+    callback.checkpoint_state_cap_bytes =
+        256 + 128 + u64::try_from("draining-capture".len()).unwrap();
     callback.graph.push_test_node(
         "draining-capture",
         Box::new(DrainingCaptureOperator {
@@ -1879,10 +1910,27 @@ async fn failure_after_destructive_operator_capture_faults_runtime() {
 
     assert_eq!(live_rows.load(std::sync::atomic::Ordering::Acquire), 0);
     assert!(error.contains("recovery from the last committed checkpoint is required"));
-    assert!(error.contains("staged-state cap"));
+    assert!(error.contains("staged-state budget"));
     let fault = crate::pipeline::PipelineCallback::take_pipeline_fault(&mut callback)
         .expect("a post-capture failure must become a runtime fault");
     assert_eq!(fault, error);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn unchanged_vnode_capture_does_not_arm_the_mutable_capture_guard() {
+    let mut callback = empty_callback_fixture();
+    callback.graph.set_test_vnode_count(2);
+    callback
+        .graph
+        .push_test_node("unchanged-vnodes", Box::new(UnchangedVnodeCaptureOperator));
+
+    let capture = callback
+        .capture_operator_state_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    drop(capture);
+
+    assert!(crate::pipeline::PipelineCallback::take_pipeline_fault(&mut callback).is_none());
 }
 
 #[tokio::test]
@@ -1981,13 +2029,12 @@ async fn dropping_serialized_destructive_image_before_commit_faults_runtime() {
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     let capture = callback.capture_operator_state_until(deadline).unwrap();
-    let budget = encoded_operator_state_budget(
-        callback.checkpoint_state_cap_bytes,
-        capture.estimated_bytes(),
-    )
-    .unwrap();
     let serialized = capture
-        .serialize_until(budget, callback.serialization_timeout, deadline)
+        .serialize_until(
+            callback.checkpoint_state_cap_bytes,
+            callback.serialization_timeout,
+            deadline,
+        )
         .await
         .unwrap();
 
@@ -1999,8 +2046,8 @@ async fn dropping_serialized_destructive_image_before_commit_faults_runtime() {
 }
 
 #[cfg(feature = "cluster")]
-#[test]
-fn destructive_vnode_capture_failure_faults_runtime() {
+#[tokio::test]
+async fn destructive_vnode_capture_failure_faults_runtime() {
     let live_rows = Arc::new(std::sync::atomic::AtomicUsize::new(23));
     let mut callback = empty_callback_fixture();
     callback.graph.set_test_vnode_count(4);
@@ -2368,8 +2415,8 @@ fn pending_and_absent_filters_dispatch_to_passthrough() {
     }
 }
 
-#[test]
-fn tracker_refresh_preserves_watermark_idleness_and_uninitialized_state() {
+#[tokio::test]
+async fn tracker_refresh_preserves_watermark_idleness_and_uninitialized_state() {
     let mut callback = empty_callback_fixture();
     callback.source_name_arcs = FxHashMap::from_iter([
         (0, Arc::from("active")),
@@ -3215,7 +3262,7 @@ async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement() {
         complete_tx,
         request,
         operator_state: None,
-        operator_state_encoded_budget: 0,
+        operator_state_staged_cap_bytes: 0,
         mutable_operator_capture_guard: None,
         fan_out: FxHashMap::default(),
         local_watermark: CheckpointWatermark::Uninitialized,
@@ -3617,7 +3664,8 @@ async fn gate_committed_checkpoint(
 ) -> laminar_core::checkpoint::CommittedCheckpointRef {
     use laminar_core::checkpoint::{
         ChannelProgress, CheckpointScope, CommittedCheckpointIndex, CommittedParticipantRef,
-        PipelineIdentity, COMMITTED_CHECKPOINT_INDEX_VERSION,
+        ConnectorCheckpoint, PipelineIdentity, COMMITTED_CHECKPOINT_INDEX_VERSION,
+        SINGLETON_WATERMARK_CHANNEL,
     };
 
     let participants = fence
@@ -3635,7 +3683,8 @@ async fn gate_committed_checkpoint(
         .iter()
         .map(|participant| ChannelProgress {
             participant_id: participant.participant_id,
-            channel_id: format!("participant-{}", participant.participant_id),
+            source_name: "source".into(),
+            input_channel: SINGLETON_WATERMARK_CHANNEL.to_vec(),
             watermark: Some(42),
             idle: false,
         })
@@ -3651,7 +3700,11 @@ async fn gate_committed_checkpoint(
         assignment_fence: Some(fence.clone()),
         predecessor: None,
         participants,
-        source_offsets: Default::default(),
+        source_names: vec!["source".into()],
+        source_offsets: std::collections::BTreeMap::from([(
+            "source".into(),
+            ConnectorCheckpoint::default(),
+        )]),
         channel_progress,
         checkpoint_watermark: Some(42),
     };

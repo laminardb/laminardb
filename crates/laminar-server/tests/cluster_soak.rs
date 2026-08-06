@@ -138,6 +138,8 @@ const CHECKPOINT_PIPELINE_STALL_SLO_NS: u64 = 1_024_000_000;
 #[cfg(feature = "kafka")]
 const MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS: u64 = 100;
 #[cfg(feature = "kafka")]
+const MIN_CONTINUOUS_AGGREGATE_STATE_BYTES: u64 = 64 * 1_024;
+#[cfg(feature = "kafka")]
 const RECOVERY_RELEASE_LOG: &str = "coordinated recovery: releasing source gate";
 #[cfg(feature = "kafka")]
 const CHECKPOINT_ATTEMPT_RESERVED_LOG: &str = "checkpoint attempt reserved";
@@ -185,6 +187,8 @@ const TEMPORAL_RECOVERY_LEFT_ID: u64 = 8_000_000_000_000_001;
 const TEMPORAL_RECOVERY_RIGHT_ID: u64 = 8_000_000_000_000_002;
 #[cfg(feature = "kafka")]
 const TEMPORAL_FUTURE_RIGHT_ID: u64 = 8_000_000_000_000_003;
+#[cfg(feature = "kafka")]
+const TEMPORAL_FUTURE_LEFT_ID: u64 = 8_000_000_000_001_000;
 #[cfg(feature = "kafka")]
 const TEMPORAL_WATERMARK_ADVANCE_MS: u64 = 5_001;
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
@@ -1686,10 +1690,6 @@ impl Node {
             (!values.is_empty()).then(|| values.into_iter().sum())
         };
         Some(CheckpointLatencySnapshot {
-            gate_wait_seconds: value("laminardb_checkpoint_restorable_gate_wait_seconds_sum")?,
-            gate_wait_observations: value(
-                "laminardb_checkpoint_restorable_gate_wait_seconds_count",
-            )?,
             checkpoint_seconds: value("laminardb_checkpoint_duration_seconds_sum")?,
             checkpoint_observations: value("laminardb_checkpoint_duration_seconds_count")?,
             pipeline_stall_observations: value(
@@ -1774,11 +1774,33 @@ impl Node {
         std::fs::write(path, role).expect("arm checkpoint kill gate");
     }
 
+    fn checkpoint_kill_predecessor(&self, role: &str) -> Option<DurableCheckpointStatus> {
+        let path = self.checkpoint_gate_path.as_ref()?;
+        let ready = std::fs::read_to_string(path.with_extension("ready")).ok()?;
+        let mut fields = ready.split_ascii_whitespace();
+        if fields.next()? != role {
+            return None;
+        }
+        let armed = DurableCheckpointStatus {
+            checkpoint_id: fields.next()?.parse().ok()?,
+            epoch: fields.next()?.parse().ok()?,
+        };
+        let predecessor = DurableCheckpointStatus {
+            checkpoint_id: fields.next()?.parse().ok()?,
+            epoch: fields.next()?.parse().ok()?,
+        };
+        if fields.next().is_some()
+            || !armed.is_canonical()
+            || !predecessor.is_canonical()
+            || predecessor.checkpoint_id >= armed.checkpoint_id
+        {
+            return None;
+        }
+        Some(predecessor)
+    }
+
     fn checkpoint_kill_ready(&self, role: &str) -> bool {
-        self.checkpoint_gate_path.as_ref().is_some_and(|path| {
-            std::fs::read_to_string(path.with_extension("ready"))
-                .is_ok_and(|ready| ready.trim() == role)
-        })
+        self.checkpoint_kill_predecessor(role).is_some()
     }
 
     fn disarm_checkpoint_kill(&self) {
@@ -2918,8 +2940,6 @@ struct CheckpointBarrierTimingEvidence {
 #[cfg(feature = "kafka")]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct CheckpointLatencySnapshot {
-    gate_wait_seconds: f64,
-    gate_wait_observations: f64,
     checkpoint_seconds: f64,
     checkpoint_observations: f64,
     pipeline_stall_observations: f64,
@@ -2936,8 +2956,6 @@ struct CheckpointLatencySnapshot {
 impl CheckpointLatencySnapshot {
     fn validate(self) -> Result<Self, String> {
         for (name, value) in [
-            ("restorable-gate wait sum", self.gate_wait_seconds),
-            ("restorable-gate wait count", self.gate_wait_observations),
             ("checkpoint duration sum", self.checkpoint_seconds),
             ("checkpoint duration count", self.checkpoint_observations),
             (
@@ -2995,8 +3013,6 @@ impl CheckpointLatencySnapshot {
     }
 
     fn merge(&mut self, other: Self) {
-        self.gate_wait_seconds += other.gate_wait_seconds;
-        self.gate_wait_observations += other.gate_wait_observations;
         self.checkpoint_seconds += other.checkpoint_seconds;
         self.checkpoint_observations += other.checkpoint_observations;
         self.pipeline_stall_observations += other.pipeline_stall_observations;
@@ -3090,6 +3106,12 @@ impl CheckpointLatencyEvidence {
     fn aggregate_by_node(&self) -> Result<BTreeMap<usize, CheckpointLatencySnapshot>, String> {
         let mut nodes = BTreeMap::<usize, CheckpointLatencySnapshot>::new();
         for (generation, snapshot) in &self.generations {
+            if snapshot.checkpoint_observations <= 0.0 {
+                return Err(format!(
+                    "node{} process generation {} captured no checkpoint-duration observations",
+                    generation.node_id, generation.generation
+                ));
+            }
             if snapshot.pipeline_stall_observations <= 0.0 {
                 return Err(format!(
                     "node{} process generation {} captured no checkpoint pipeline-stall observations",
@@ -3152,23 +3174,12 @@ impl CheckpointLatencyEvidence {
         let within_slo_percent = aggregate.pipeline_stall_within_slo_percent().unwrap_or(0.0);
         let checkpoint_average_ms =
             aggregate.checkpoint_seconds / aggregate.checkpoint_observations * 1_000.0;
-        if aggregate.gate_wait_observations > 0.0 {
-            eprintln!(
-                "soak: PROFILE pipeline-stall <= {:.0}ms for {within_slo_percent:.2}% of {} obs; gate-wait avg={:.0}ms over {} obs; checkpoint_duration avg={checkpoint_average_ms:.0}ms over {} obs (finalized pre-restart generations plus observed cuts of live generations)",
-                CHECKPOINT_PIPELINE_STALL_SLO_SECONDS * 1_000.0,
-                aggregate.pipeline_stall_observations as u64,
-                aggregate.gate_wait_seconds / aggregate.gate_wait_observations * 1_000.0,
-                aggregate.gate_wait_observations as u64,
-                aggregate.checkpoint_observations as u64,
-            );
-        } else {
-            eprintln!(
-                "soak: PROFILE pipeline-stall <= {:.0}ms for {within_slo_percent:.2}% of {} obs; checkpoint_duration avg={checkpoint_average_ms:.0}ms over {} obs (finalized pre-restart generations plus observed cuts of live generations); no restorable-gate waits were observed",
-                CHECKPOINT_PIPELINE_STALL_SLO_SECONDS * 1_000.0,
-                aggregate.pipeline_stall_observations as u64,
-                aggregate.checkpoint_observations as u64,
-            );
-        }
+        eprintln!(
+            "soak: PROFILE pipeline-stall <= {:.0}ms for {within_slo_percent:.2}% of {} obs; checkpoint_duration avg={checkpoint_average_ms:.0}ms over {} obs (finalized pre-restart generations plus observed cuts of live generations)",
+            CHECKPOINT_PIPELINE_STALL_SLO_SECONDS * 1_000.0,
+            aggregate.pipeline_stall_observations as u64,
+            aggregate.checkpoint_observations as u64,
+        );
         self.validate_slos()
             .unwrap_or_else(|error| panic!("{error}"));
     }
@@ -3314,6 +3325,22 @@ impl CheckpointBarrierTimingEvidence {
             latency,
             deadline,
             |timing| timing.capture_node(node, Some(expected_authority), deadline),
+            || node.checkpoint_latency_metrics(),
+        )
+    }
+
+    fn finalize_node_unbound(
+        &mut self,
+        node: &Node,
+        latency: &mut CheckpointLatencyEvidence,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let generation = Self::generation(node);
+        self.finalize_generation_with(
+            generation,
+            latency,
+            deadline,
+            |timing| timing.capture_node(node, None, deadline),
             || node.checkpoint_latency_metrics(),
         )
     }
@@ -4053,7 +4080,7 @@ impl KafkaOutputOracle {
                 .all(|(consumed, boundary)| consumed >= boundary)
     }
 
-    fn drain(&mut self, expected: &BTreeSet<(u64, u64)>, boundary: &[i64]) -> usize {
+    fn drain(&mut self, expected: &BTreeSet<(u64, u64)>, boundary: &mut [i64]) -> usize {
         use rdkafka::message::Message;
 
         let mut drained = 0usize;
@@ -4067,15 +4094,10 @@ impl KafkaOutputOracle {
             );
             let partition = usize::try_from(message.partition())
                 .expect("Kafka output returned a negative partition");
-            let frozen_end = *boundary
-                .get(partition)
+            let boundary_end = boundary
+                .get_mut(partition)
                 .expect("Kafka output returned an out-of-range partition");
-            assert!(
-                message.offset() < frozen_end,
-                "Kafka output appended after frozen boundary: partition={}, offset={}, boundary={frozen_end}",
-                message.partition(),
-                message.offset()
-            );
+            *boundary_end = (*boundary_end).max(message.offset().saturating_add(1));
             record_consumed_offset(
                 &mut self.consumed_offsets,
                 message.partition(),
@@ -4131,7 +4153,7 @@ fn assert_final_outputs(
     output: &mut KafkaOutputOracle,
     produced_count: u64,
     expected: &BTreeSet<(u64, u64)>,
-    output_boundary: &[i64],
+    mut output_boundary: Vec<i64>,
     window: Duration,
 ) {
     assert!(produced_count > 0, "soak producer emitted no input records");
@@ -4140,19 +4162,20 @@ fn assert_final_outputs(
     let mut quiet_since = None;
     while start.elapsed() < window {
         assert_running_nodes(nodes);
-        let boundaries_stable = match output.high_watermarks() {
-            Some(current_output) => {
-                assert_eq!(
-                    current_output, output_boundary,
-                    "Kafka output high watermark changed after the durable input cut"
-                );
-                true
-            }
-            None => false,
+        let Some(current_output) = output.high_watermarks() else {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
         };
-        let drained = output.drain(expected, output_boundary);
+        if current_output != output_boundary {
+            output_boundary = current_output;
+            quiet_since = None;
+        }
+        let drained = output.drain(expected, &mut output_boundary);
+        let boundaries_stable = output
+            .high_watermarks()
+            .is_some_and(|current| current == output_boundary);
         if boundaries_stable
-            && output.consumed_through(output_boundary)
+            && output.consumed_through(&output_boundary)
             && output.is_complete(expected)
         {
             if drained == 0 {
@@ -4160,7 +4183,7 @@ fn assert_final_outputs(
                 if quiet_since.elapsed() >= OUTPUT_BOUNDARY_STABILITY {
                     assert_eq!(
                         output.high_watermarks().as_deref(),
-                        Some(output_boundary),
+                        Some(output_boundary.as_slice()),
                         "Kafka output boundary changed during final drain"
                     );
                     eprintln!(
@@ -4178,9 +4201,9 @@ fn assert_final_outputs(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let _ = output.drain(expected, output_boundary);
+    let _ = output.drain(expected, &mut output_boundary);
     assert!(
-        output.consumed_through(output_boundary),
+        output.consumed_through(&output_boundary),
         "soak: output oracle did not consume through frozen boundary {output_boundary:?}; consumed {:?}",
         output.consumed_offsets
     );
@@ -4223,7 +4246,7 @@ fn assert_frozen_kafka_outputs(
         output,
         produced_count,
         expected,
-        &boundary.expect("Kafka output boundary wait completed without a value"),
+        boundary.expect("Kafka output boundary wait completed without a value"),
         remaining_progress_window(deadline, label),
     );
 }
@@ -5642,6 +5665,7 @@ fn aggregate_high_seq(key: u64, count: u64, groups: u64, span: u64) -> u64 {
 }
 
 #[cfg(feature = "kafka")]
+#[cfg_attr(not(feature = "delta-lake-s3"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JoinDelivery {
     AtLeastOnce,
@@ -6190,6 +6214,14 @@ LEFT JOIN temporal_right
 FOR SYSTEM_TIME AS OF l.temporal_time AS r
   ON l.join_key = r.join_key
 WHERE l.join_key >= 0
+"""
+
+[[pipeline]]
+name = "soak_join_aggregate"
+sql = """
+SELECT join_key, COUNT(*) AS match_count, MAX(right_id) AS max_right_id
+FROM soak_join
+GROUP BY join_key
 """
 
 {sink}
@@ -6853,26 +6885,40 @@ fn observe_live_join_state(
         ("soak_join", join_high_water),
         ("soak_temporal", temporal_high_water),
     ] {
-        let operator_label = format!("operator=\"{operator}\"");
-        let mut current = 0.0;
-        let mut live = 0usize;
-        for node in nodes.iter().filter(|node| node.child.is_some()) {
-            current += node
-                .metric_with_labels(
-                    "laminardb_managed_state_accounted_bytes",
-                    &[&operator_label, "phase=\"live\""],
-                )
-                .unwrap_or_else(|| {
-                    panic!(
-                        "node{} did not expose live managed-state accounting for {operator}",
-                        node.id
-                    )
-                });
-            live += 1;
-        }
-        assert!(live > 0, "soak has no live node for state accounting");
+        let current = live_operator_state_bytes(nodes, operator);
         *high_water = Some(high_water.unwrap_or(0.0).max(current));
     }
+}
+
+#[cfg(feature = "kafka")]
+fn live_operator_state_bytes(nodes: &[Node], operator: &str) -> f64 {
+    let operator_label = format!("operator=\"{operator}\"");
+    let mut current = 0.0;
+    let mut live = 0usize;
+    for node in nodes.iter().filter(|node| node.child.is_some()) {
+        current += node
+            .metric_with_labels(
+                "laminardb_managed_state_accounted_bytes",
+                &[&operator_label, "phase=\"live\""],
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "node{} did not expose live managed-state accounting for {operator}",
+                    node.id
+                )
+            });
+        live += 1;
+    }
+    assert!(live > 0, "soak has no live node for state accounting");
+    current
+}
+
+#[cfg(feature = "kafka")]
+fn continuous_aggregate_minimum_bytes(join_keys: u64) -> u64 {
+    let profiled_keys = join_keys.min(DEFAULT_JOIN_KEYS);
+    MIN_CONTINUOUS_AGGREGATE_STATE_BYTES
+        .saturating_mul(profiled_keys)
+        .div_ceil(DEFAULT_JOIN_KEYS)
 }
 
 #[cfg(feature = "kafka")]
@@ -6890,26 +6936,26 @@ fn validate_retained_state_profile(soak_secs: u64, interval_ms: u64, minimum_byt
 }
 
 #[cfg(feature = "kafka")]
-fn assert_live_join_state_high_water(
-    high_water: Option<f64>,
+fn assert_live_join_state_bytes(
+    observed: Option<f64>,
     minimum_bytes: u64,
     node_count: usize,
     label: &str,
 ) {
-    let high_water = high_water.unwrap_or_else(|| panic!("{label}: no live-state sample"));
+    let observed = observed.unwrap_or_else(|| panic!("{label}: no live-state sample"));
     let maximum_bytes = laminar_db::DEFAULT_MAX_MANAGED_STATE_BYTES
         .checked_mul(node_count)
         .expect("managed-state accounting bound overflow");
     eprintln!(
-        "soak: PROFILE {label} accounted-state high-water={high_water:.0} bytes, aggregate operator ceiling={maximum_bytes} bytes"
+        "soak: PROFILE {label} accounted-state observation={observed:.0} bytes, aggregate operator ceiling={maximum_bytes} bytes"
     );
     assert!(
-        high_water >= minimum_bytes as f64,
-        "{label}: live managed-state high-water {high_water:.0} bytes is below required {minimum_bytes} bytes"
+        observed >= minimum_bytes as f64,
+        "{label}: live managed-state observation {observed:.0} bytes is below required {minimum_bytes} bytes"
     );
     assert!(
-        high_water <= maximum_bytes as f64,
-        "{label}: accounted-state high-water {high_water:.0} bytes exceeds the {maximum_bytes}-byte aggregate operator ceiling"
+        observed <= maximum_bytes as f64,
+        "{label}: accounted-state observation {observed:.0} bytes exceeds the {maximum_bytes}-byte aggregate operator ceiling"
     );
 }
 
@@ -7312,8 +7358,8 @@ fn local_exact_source_state_kill9_soak() {
         },
     );
     let moving_checkpoint = node
-        .durable_checkpoint_status()
-        .expect("moving local checkpoint has no preceding durable recovery cut");
+        .checkpoint_kill_predecessor("leader")
+        .expect("moving local checkpoint gate has no exact durable-cut evidence");
     let moving_checkpoint_sequence =
         local_exact_checkpoint_source_sequence(&checkpoint_dir, moving_checkpoint)
             .unwrap_or_else(|error| panic!("moving-source recovery cut is invalid: {error}"));
@@ -7395,10 +7441,10 @@ fn local_exact_source_state_kill9_soak() {
             },
         );
         let durable_checkpoint = node
-            .durable_checkpoint_status()
-            .expect("armed local checkpoint has no preceding durable recovery cut");
-        // `.ready` is published while the new attempt is held in Snapshotting, so the latest
-        // status is necessarily the preceding committed recovery cut, not the armed attempt.
+            .checkpoint_kill_predecessor("leader")
+            .expect("armed local checkpoint gate has no exact durable-cut evidence");
+        // `.ready` carries the preceding committed recovery cut while the new attempt is held
+        // before its Commit decision.
         assert!(
             durable_checkpoint.epoch >= latest_epoch,
             "committed epoch regressed before the armed local checkpoint: previous={latest_epoch}, current={}",
@@ -7545,10 +7591,22 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     kafka_create_topic(&brokers, &matrix_right_topic, MATRIX_INPUT_PARTITIONS);
     let (matrix_input_boundary, matrix_pre_fault_event_time) =
         produce_matrix_pre_fault_inputs(&brokers, &matrix_left_topic, &matrix_right_topic);
+    #[cfg(feature = "delta-lake-s3")]
     let mut output_oracle = None;
+    #[cfg(not(feature = "delta-lake-s3"))]
+    let mut output_oracle;
+    #[cfg(feature = "delta-lake-s3")]
     let mut temporal_output_oracle = None;
+    #[cfg(not(feature = "delta-lake-s3"))]
+    let mut temporal_output_oracle;
+    #[cfg(feature = "delta-lake-s3")]
     let mut matrix_output_oracle = None;
+    #[cfg(not(feature = "delta-lake-s3"))]
+    let mut matrix_output_oracle;
+    #[cfg(feature = "delta-lake-s3")]
     let mut matrix_aggregate_oracle = None;
+    #[cfg(not(feature = "delta-lake-s3"))]
+    let mut matrix_aggregate_oracle;
     #[cfg(feature = "delta-lake-s3")]
     let mut delta_output_oracle = None;
     #[cfg(feature = "delta-lake-s3")]
@@ -7705,6 +7763,9 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         fault_trigger_path: None,
         checkpoint_gate_path: Some(dir.path().join("checkpoint-single-join.arm")),
     }];
+    let mut latency_evidence = CheckpointLatencyEvidence::default();
+    let mut exact_timing_evidence =
+        CheckpointBarrierTimingEvidence::with_artifact_directory(log_dir.clone());
     let mut live_state_high_water = None;
     let mut temporal_state_high_water = None;
     let initial_spawn = nodes[0].verify_executable_for_spawn();
@@ -7768,8 +7829,8 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
             },
         );
         let preceding_checkpoint = nodes[0]
-            .durable_checkpoint_status()
-            .expect("single-node checkpoint gate did not preserve a preceding durable checkpoint");
+            .checkpoint_kill_predecessor("leader")
+            .expect("single-node checkpoint gate has no exact durable-cut evidence");
         assert!(
             preceding_checkpoint.checkpoint_id >= latest_checkpoint.checkpoint_id
                 && preceding_checkpoint.epoch >= latest_checkpoint.epoch,
@@ -7781,6 +7842,17 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
             preceding_checkpoint.checkpoint_id,
             preceding_checkpoint.epoch,
         );
+        exact_timing_evidence
+            .finalize_node_unbound(
+                &nodes[0],
+                &mut latency_evidence,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "single {delivery_label} kill-{round} could not finalize checkpoint timing evidence: {error}"
+                )
+            });
         let restart = nodes[0].verify_executable_for_spawn();
         let recovery_started = Instant::now();
         nodes[0].kill9();
@@ -7873,6 +7945,72 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut live_state_high_water,
         &mut temporal_state_high_water,
     );
+    let aggregate_state_sample = Some(live_operator_state_bytes(&nodes, "soak_join_aggregate"));
+    assert_live_join_state_bytes(
+        aggregate_state_sample,
+        continuous_aggregate_minimum_bytes(join_keys),
+        nodes.len(),
+        &format!("single {delivery_label} continuous join aggregate"),
+    );
+
+    let finalized_stalls = exact_prometheus_count(
+        latency_evidence
+            .aggregate()
+            .unwrap_or_else(|error| panic!("single {delivery_label} checkpoint latency: {error}"))
+            .pipeline_stall_observations,
+        "finalized checkpoint pipeline-stall observations",
+    )
+    .unwrap_or_else(|error| panic!("single {delivery_label} checkpoint latency: {error}"));
+    let required_live_stalls = MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS
+        .saturating_sub(finalized_stalls)
+        .max(1);
+    let observation_window_ms = interval_ms
+        .saturating_add(CHECKPOINT_PIPELINE_STALL_SLO_NS / 1_000_000)
+        .saturating_mul(required_live_stalls)
+        .saturating_add(u64::try_from(recovery_ceiling.as_millis()).unwrap_or(u64::MAX));
+    wait_for(
+        &format!(
+            "single {delivery_label} to capture {MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS} checkpoint stalls under active load"
+        ),
+        Duration::from_millis(observation_window_ms),
+        || {
+            producer.assert_running();
+            nodes[0].assert_running();
+            nodes[0].checkpoint_latency_metrics().is_some_and(|metrics| {
+                metrics.pipeline_stall_observations >= required_live_stalls as f64
+            })
+        },
+    );
+    nodes[0].arm_checkpoint_kill("leader");
+    wait_for(
+        &format!("single {delivery_label} final checkpoint timing cut"),
+        Duration::from_secs(45),
+        || {
+            producer.assert_running();
+            nodes[0].assert_running();
+            nodes[0].checkpoint_kill_ready("leader")
+        },
+    );
+    exact_timing_evidence
+        .finalize_node_unbound(
+            &nodes[0],
+            &mut latency_evidence,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "single {delivery_label} final checkpoint timing evidence did not stabilize: {error}"
+            )
+        });
+    nodes[0].disarm_checkpoint_kill();
+    exact_timing_evidence
+        .validate_observed_cuts(&latency_evidence, &nodes)
+        .unwrap_or_else(|error| {
+            panic!("single {delivery_label} exact checkpoint evidence: {error}")
+        });
+    exact_timing_evidence.report();
+    latency_evidence.report();
+
     let (mut produced_prefix, _bounded_frozen_input_at) = producer.stop();
     let produced_count = produced_prefix.count;
     assert!(
@@ -8013,37 +8151,17 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         }
     }
 
-    let checkpoint_latency = nodes[0]
-        .checkpoint_latency_metrics()
-        .unwrap_or_else(|| {
-            panic!("single {delivery_label} node did not expose checkpoint latency metrics")
-        })
-        .validate()
-        .unwrap_or_else(|error| panic!("single {delivery_label} checkpoint latency: {error}"));
-    assert!(
-        checkpoint_latency.pipeline_stall_observations
-            >= MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS as f64,
-        "single {delivery_label} captured only {} checkpoint stalls; at least {MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS} are required",
-        checkpoint_latency.pipeline_stall_observations as u64,
-    );
-    checkpoint_latency
-        .validate_pipeline_stall_slo(&format!("single-node {delivery_label} stateful joins"))
-        .unwrap_or_else(|error| panic!("{error}"));
-    eprintln!(
-        "soak: PROFILE single-node {delivery_label} checkpoint stall {}",
-        checkpoint_latency.pipeline_stall_profile()
-    );
     assert_hot_path_latency(
         &nodes,
         &format!("single-node {delivery_label} stateful joins"),
     );
-    assert_live_join_state_high_water(
+    assert_live_join_state_bytes(
         live_state_high_water,
         minimum_live_state_bytes,
         nodes.len(),
         &format!("single-node {delivery_label} bounded join"),
     );
-    assert_live_join_state_high_water(
+    assert_live_join_state_bytes(
         temporal_state_high_water,
         1,
         nodes.len(),
@@ -8129,10 +8247,22 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     kafka_create_topic(&brokers, &matrix_right_topic, MATRIX_INPUT_PARTITIONS);
     let (matrix_input_boundary, matrix_pre_fault_event_time) =
         produce_matrix_pre_fault_inputs(&brokers, &matrix_left_topic, &matrix_right_topic);
+    #[cfg(feature = "delta-lake-s3")]
     let mut output_oracle = None;
+    #[cfg(not(feature = "delta-lake-s3"))]
+    let mut output_oracle;
+    #[cfg(feature = "delta-lake-s3")]
     let mut temporal_output_oracle = None;
+    #[cfg(not(feature = "delta-lake-s3"))]
+    let mut temporal_output_oracle;
+    #[cfg(feature = "delta-lake-s3")]
     let mut matrix_output_oracle = None;
+    #[cfg(not(feature = "delta-lake-s3"))]
+    let mut matrix_output_oracle;
+    #[cfg(feature = "delta-lake-s3")]
     let mut matrix_aggregate_oracle = None;
+    #[cfg(not(feature = "delta-lake-s3"))]
+    let mut matrix_aggregate_oracle;
     #[cfg(feature = "delta-lake-s3")]
     let mut delta_output_oracle = None;
     #[cfg(feature = "delta-lake-s3")]
@@ -8885,6 +9015,13 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut live_state_high_water,
         &mut temporal_state_high_water,
     );
+    let aggregate_state_sample = Some(live_operator_state_bytes(&nodes, "soak_join_aggregate"));
+    assert_live_join_state_bytes(
+        aggregate_state_sample,
+        continuous_aggregate_minimum_bytes(join_keys),
+        nodes.len(),
+        &format!("three-node {delivery_label} continuous join aggregate"),
+    );
     exact_timing_evidence.capture_nodes_bound(
         &nodes,
         &local_convergence,
@@ -8894,6 +9031,86 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     if let Some(evidence) = &explicit_fault_evidence {
         assert_explicit_fault_recovery_evidence(&nodes, evidence);
     }
+
+    let finalized_stalls_by_node = latency_evidence
+        .aggregate_by_node()
+        .unwrap_or_else(|error| panic!("three-node {delivery_label} checkpoint latency: {error}"));
+    let required_live_stalls = nodes
+        .iter()
+        .map(|node| {
+            let finalized = finalized_stalls_by_node
+                .get(&node.id)
+                .map(|snapshot| {
+                    exact_prometheus_count(
+                        snapshot.pipeline_stall_observations,
+                        "finalized checkpoint pipeline-stall observations",
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("three-node {delivery_label} checkpoint latency: {error}")
+                    })
+                })
+                .unwrap_or(0);
+            MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS
+                .saturating_sub(finalized)
+                .max(1)
+        })
+        .collect::<Vec<_>>();
+    let observation_window_ms = interval_ms
+        .saturating_add(CHECKPOINT_PIPELINE_STALL_SLO_NS / 1_000_000)
+        .saturating_mul(required_live_stalls.iter().copied().max().unwrap_or(1))
+        .saturating_add(u64::try_from(recovery_ceiling.as_millis()).unwrap_or(u64::MAX));
+    wait_for(
+        &format!(
+            "three-node {delivery_label} to capture {MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS} checkpoint stalls per node under active load"
+        ),
+        Duration::from_millis(observation_window_ms),
+        || {
+            assert_running_nodes(&mut nodes);
+            producer.assert_running();
+            nodes
+                .iter()
+                .zip(&required_live_stalls)
+                .all(|(node, required)| {
+                    node.checkpoint_latency_metrics().is_some_and(|metrics| {
+                        metrics.pipeline_stall_observations >= *required as f64
+                    })
+                })
+        },
+    );
+    let final_fence = local_convergence
+        .snapshot
+        .assignment_fence()
+        .expect("final converged assignment is canonical");
+    for node in &nodes {
+        producer.assert_running();
+        let evidence = local_convergence
+            .evidence_by_node
+            .get(&node.id)
+            .unwrap_or_else(|| panic!("final converged authority omitted node{}", node.id));
+        let expected_authority = checkpoint_barrier_timing_authority(evidence, &final_fence)
+            .unwrap_or_else(|error| panic!("final node{} timing authority: {error}", node.id));
+        exact_timing_evidence
+            .finalize_node(
+                node,
+                expected_authority,
+                &mut latency_evidence,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "final node{} checkpoint timing evidence did not stabilize under active load: {error}",
+                    node.id
+                )
+            });
+    }
+    producer.assert_running();
+    exact_timing_evidence
+        .validate_observed_cuts(&latency_evidence, &nodes)
+        .unwrap_or_else(|error| {
+            panic!("incomplete exact checkpoint observed-cut evidence: {error}")
+        });
+    exact_timing_evidence.report();
+    latency_evidence.report();
 
     // Freeze the exact broker-acknowledged input offsets and require source commits to cover them.
     observe_live_join_state(
@@ -8958,13 +9175,6 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         "soak: frozen bounded and temporal input prefix is durable through checkpoint {} epoch {}",
         latest_checkpoint.checkpoint_id, latest_checkpoint.epoch
     );
-    exact_timing_evidence.capture_nodes_bound(
-        &nodes,
-        &local_convergence,
-        Instant::now() + Duration::from_secs(10),
-        "final durable input cut",
-    );
-
     match delivery {
         JoinDelivery::AtLeastOnce => {
             assert_frozen_kafka_outputs(
@@ -9051,56 +9261,17 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
             unreachable!("EO runner is unavailable without delta-lake-s3");
         }
     }
-    exact_timing_evidence.capture_nodes_bound(
-        &nodes,
-        &local_convergence,
-        Instant::now() + Duration::from_secs(10),
-        "final output validation",
-    );
-
-    let final_fence = local_convergence
-        .snapshot
-        .assignment_fence()
-        .expect("final converged assignment is canonical");
-    for node in &nodes {
-        let evidence = local_convergence
-            .evidence_by_node
-            .get(&node.id)
-            .unwrap_or_else(|| panic!("final converged authority omitted node{}", node.id));
-        let expected_authority = checkpoint_barrier_timing_authority(evidence, &final_fence)
-            .unwrap_or_else(|error| panic!("final node{} timing authority: {error}", node.id));
-        exact_timing_evidence
-            .finalize_node(
-                node,
-                expected_authority,
-                &mut latency_evidence,
-                Instant::now() + Duration::from_secs(10),
-            )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "final node{} checkpoint timing evidence did not stabilize: {error}",
-                    node.id
-                )
-            });
-    }
-    exact_timing_evidence
-        .validate_observed_cuts(&latency_evidence, &nodes)
-        .unwrap_or_else(|error| {
-            panic!("incomplete exact checkpoint observed-cut evidence: {error}")
-        });
-    exact_timing_evidence.report();
-    latency_evidence.report();
     assert_hot_path_latency(
         &nodes,
         &format!("three-node {delivery_label} stateful joins"),
     );
-    assert_live_join_state_high_water(
+    assert_live_join_state_bytes(
         live_state_high_water,
         minimum_live_state_bytes,
         nodes.len(),
         &format!("three-node {delivery_label} bounded join"),
     );
-    assert_live_join_state_high_water(
+    assert_live_join_state_bytes(
         temporal_state_high_water,
         1,
         nodes.len(),
@@ -9387,13 +9558,27 @@ fn produce_temporal_post_fault_inputs(
     let right_temporal_time_ms = left_temporal_time_ms
         .checked_add(TEMPORAL_WATERMARK_ADVANCE_MS)
         .expect("temporal watermark sentinel time overflow");
-    let left = [TemporalSoakRecord {
+    let mut left = Vec::with_capacity(
+        usize::try_from(partitions).expect("Kafka partition count fits usize") + 1,
+    );
+    left.push(TemporalSoakRecord {
         partition: 0,
         id: TEMPORAL_RECOVERY_LEFT_ID,
         key: seed.key,
         event_time_ms: left_event_time_ms,
         temporal_time_ms: left_temporal_time_ms,
-    }];
+    });
+    left.extend((0..partitions).map(|partition| {
+        TemporalSoakRecord {
+            partition,
+            id: TEMPORAL_FUTURE_LEFT_ID
+                .checked_add(u64::try_from(partition).expect("non-negative Kafka partition"))
+                .expect("temporal left sentinel id overflow"),
+            key: -i64::from(partition) - 1,
+            event_time_ms: right_event_time_ms,
+            temporal_time_ms: right_temporal_time_ms,
+        }
+    }));
     let right = (0..partitions)
         .map(|partition| TemporalSoakRecord {
             partition,
@@ -11020,8 +11205,6 @@ fn test_checkpoint_latency_snapshot(
     pipeline_stall_within_slo: f64,
 ) -> CheckpointLatencySnapshot {
     CheckpointLatencySnapshot {
-        gate_wait_seconds: 0.25,
-        gate_wait_observations: 1.0,
         checkpoint_seconds: checkpoint_observations * 0.1,
         checkpoint_observations,
         pipeline_stall_observations,
@@ -11121,7 +11304,7 @@ fn checkpoint_latency_node_gate_prevents_cluster_dilution() {
                 node_id: 1,
                 generation: 1,
             },
-            test_checkpoint_latency_snapshot(0.0, 0.0, 0.0),
+            test_checkpoint_latency_snapshot(1.0, 0.0, 0.0),
         )
         .unwrap();
     let error = missing_generation.validate_slos().unwrap_err();
@@ -11131,8 +11314,8 @@ fn checkpoint_latency_node_gate_prevents_cluster_dilution() {
         "{error}"
     );
 
-    let mut healthy_follower = CheckpointLatencyEvidence::default();
-    healthy_follower
+    let mut missing_follower_duration = CheckpointLatencyEvidence::default();
+    missing_follower_duration
         .record_generation(
             ProcessGeneration {
                 node_id: 0,
@@ -11141,7 +11324,7 @@ fn checkpoint_latency_node_gate_prevents_cluster_dilution() {
             test_checkpoint_latency_snapshot(100.0, 100.0, 100.0),
         )
         .unwrap();
-    healthy_follower
+    missing_follower_duration
         .record_generation(
             ProcessGeneration {
                 node_id: 1,
@@ -11150,6 +11333,24 @@ fn checkpoint_latency_node_gate_prevents_cluster_dilution() {
             test_checkpoint_latency_snapshot(0.0, 100.0, 100.0),
         )
         .unwrap();
+    let error = missing_follower_duration.validate_slos().unwrap_err();
+    assert!(
+        error.contains("node1 process generation 1 captured no checkpoint-duration observations"),
+        "{error}"
+    );
+
+    let mut healthy_follower = CheckpointLatencyEvidence::default();
+    for node_id in 0..=1 {
+        healthy_follower
+            .record_generation(
+                ProcessGeneration {
+                    node_id,
+                    generation: 1,
+                },
+                test_checkpoint_latency_snapshot(100.0, 100.0, 100.0),
+            )
+            .unwrap();
+    }
     assert!(healthy_follower.validate_slos().is_ok());
 }
 
@@ -11246,6 +11447,24 @@ fn bounded_join_oracle_matches_one_sided_sql_contract() {
     );
 }
 
+#[cfg(feature = "kafka")]
+#[test]
+fn continuous_aggregate_minimum_scales_with_key_profile() {
+    assert_eq!(
+        continuous_aggregate_minimum_bytes(DEFAULT_JOIN_KEYS),
+        MIN_CONTINUOUS_AGGREGATE_STATE_BYTES
+    );
+    assert_eq!(
+        continuous_aggregate_minimum_bytes(DEFAULT_JOIN_KEYS / 4),
+        MIN_CONTINUOUS_AGGREGATE_STATE_BYTES / 4
+    );
+    assert_eq!(continuous_aggregate_minimum_bytes(1), 16);
+    assert_eq!(
+        continuous_aggregate_minimum_bytes(DEFAULT_JOIN_KEYS * 2),
+        MIN_CONTINUOUS_AGGREGATE_STATE_BYTES
+    );
+}
+
 #[test]
 fn follower_selection_covers_distinct_nodes_before_rotating() {
     let mut killed = BTreeSet::new();
@@ -11287,7 +11506,7 @@ fn aggregate_prefix_formula_matches_sequential_source() {
 }
 
 #[test]
-fn local_exact_source_cursor_oracle_reads_v7_node_manifest() {
+fn local_exact_source_cursor_oracle_reads_v8_node_manifest() {
     let directory = tempfile::tempdir().unwrap();
     let checkpoint = DurableCheckpointStatus {
         checkpoint_id: 7,

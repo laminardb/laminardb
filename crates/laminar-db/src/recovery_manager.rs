@@ -1,4 +1,4 @@
-//! Exact-cut recovery from committed v7 checkpoint manifests.
+//! Exact-cut recovery from committed v8 checkpoint manifests.
 #![allow(clippy::disallowed_types)] // bounded recovery metadata
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -523,7 +523,7 @@ impl<'a> RecoveryManager<'a> {
             })?;
 
         let mut source_offsets = BTreeMap::<String, ConnectorCheckpoint>::new();
-        let mut channel_progress = BTreeMap::<(u64, String), ChannelProgress>::new();
+        let mut channel_progress = BTreeMap::<(u64, String, Vec<u8>), ChannelProgress>::new();
         for manifest in manifests {
             merge_manifest_progress(manifest, &mut source_offsets, &mut channel_progress)?;
         }
@@ -565,7 +565,7 @@ fn validate_cluster_target(
             "cluster recovery target vnode roster is not canonical",
         ));
     }
-    if target.assignment.contains(local_participant) != !target.owned_vnodes.is_empty() {
+    if target.assignment.contains(local_participant) == target.owned_vnodes.is_empty() {
         return Err(checkpoint_error(
             "cluster recovery target participant roster disagrees with local vnode ownership",
         ));
@@ -766,17 +766,19 @@ pub(crate) async fn load_verified_state_frames(
 fn merge_manifest_progress(
     manifest: &CheckpointManifest,
     source_offsets: &mut BTreeMap<String, ConnectorCheckpoint>,
-    channel_progress: &mut BTreeMap<(u64, String), ChannelProgress>,
+    channel_progress: &mut BTreeMap<(u64, String, Vec<u8>), ChannelProgress>,
 ) -> Result<(), DbError> {
     for (source, local) in &manifest.source_offsets {
-        let merged = match source_offsets.entry(source.clone()) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
+        let (merged, first_participant) = match source_offsets.entry(source.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => (
                 entry.insert(ConnectorCheckpoint {
                     offsets: std::collections::HashMap::new(),
                     metadata: std::collections::HashMap::new(),
+                    input_channels: local.input_channels.clone(),
                     source_assignment_version: local.source_assignment_version,
-                })
-            }
+                }),
+                true,
+            ),
             std::collections::btree_map::Entry::Occupied(entry) => {
                 if entry.get().source_assignment_version != local.source_assignment_version {
                     return Err(checkpoint_error(format!(
@@ -784,7 +786,7 @@ fn merge_manifest_progress(
                         manifest.participant_id
                     )));
                 }
-                entry.into_mut()
+                (entry.into_mut(), false)
             }
         };
         merge_connector_map(
@@ -801,23 +803,49 @@ fn merge_manifest_progress(
             &mut merged.metadata,
             &local.metadata,
         )?;
+        if !first_participant {
+            match (&mut merged.input_channels, &local.input_channels) {
+                (None, None) => {}
+                (Some(merged), Some(local)) => {
+                    if local
+                        .iter()
+                        .any(|channel| merged.binary_search(channel).is_ok())
+                    {
+                        return Err(checkpoint_error(format!(
+                            "source '{source}' input channel is owned by multiple participants"
+                        )));
+                    }
+                    merged.extend(local.iter().cloned());
+                    merged.sort_unstable();
+                }
+                _ => {
+                    return Err(checkpoint_error(format!(
+                        "source '{source}' participant checkpoints disagree on whether input channels are declared"
+                    )));
+                }
+            }
+        }
     }
 
     for channel in &manifest.channel_progress {
         if channel.participant_id != manifest.participant_id {
             return Err(checkpoint_error(format!(
-                "participant {} manifest contains channel '{}' owned by participant {}",
-                manifest.participant_id, channel.channel_id, channel.participant_id
+                "participant {} manifest contains source '{}' progress owned by participant {}",
+                manifest.participant_id, channel.source_name, channel.participant_id
             )));
         }
-        let key = (channel.participant_id, channel.channel_id.clone());
+        let key = (
+            channel.participant_id,
+            channel.source_name.clone(),
+            channel.input_channel.clone(),
+        );
         if let Some(existing) = channel_progress.insert(key, channel.clone()) {
             if existing == *channel {
                 continue;
             }
             return Err(checkpoint_error(format!(
-                "participant {} channel '{}' has conflicting progress",
-                manifest.participant_id, channel.channel_id
+                "participant {} source '{}' input channel has conflicting progress",
+                manifest.participant_id, channel.source_name
             )));
         }
     }

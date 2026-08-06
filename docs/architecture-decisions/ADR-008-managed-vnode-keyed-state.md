@@ -8,10 +8,10 @@
 
 LaminarDB keeps authoritative working state in concrete per-vnode `FxHashMap` layouts. Vnodes are
 the unit of routing, ownership, checkpointing, restore, and rescale for joins, aggregations,
-windows, sessions, timers, temporal history, and materialized views. Keyed aggregates and supported
-interval joins implement this layout now; the managed temporal ASOF operator uses it internally
-while SQL admission remains closed. Remaining whole-node materialized-view and reference frames
-must be converted before their cluster plans can be admitted.
+windows, sessions, timers, temporal history, and materialized views. Keyed aggregates, supported
+interval joins, and managed SQL temporal ASOF plans implement this layout now. Temporal production
+certification and conversion of remaining whole-node materialized-view and reference frames are
+still required.
 
 Embedded and single-node deployments use one node that owns every vnode and routes shuffles over
 local channels. Cluster deployments run the same stateful operators with vnodes spread across nodes.

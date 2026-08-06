@@ -40,7 +40,7 @@ fn donor_manifest(
     manifest.bind_participant(participant_id);
     manifest.deployment_id = deployment_id.into();
     manifest.assignment_fence = Some(fence.clone());
-    manifest.owned_vnodes = owned_vnodes.clone();
+    manifest.owned_vnodes.clone_from(&owned_vnodes);
 
     let mut entries = vec![
         (
@@ -147,6 +147,7 @@ async fn handoff_fixture() -> HandoffFixture {
         assignment_fence: Some(fence.clone()),
         predecessor: None,
         participants,
+        source_names: Vec::new(),
         source_offsets: BTreeMap::new(),
         channel_progress: Vec::new(),
         checkpoint_watermark: None,

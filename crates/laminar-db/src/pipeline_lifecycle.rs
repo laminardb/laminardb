@@ -12,13 +12,17 @@ use laminar_connectors::connector::{
     SourceTopology,
 };
 use laminar_core::checkpoint::object_store_builder::CheckpointStorageScope;
+use laminar_core::checkpoint::{channel_progress_frontier, SINGLETON_WATERMARK_CHANNEL};
 use rustc_hash::FxHashMap;
 
 use crate::catalog::schema_has_reserved_mutation_columns;
 use crate::connector_task_fence::ConnectorTaskFenceRegistration;
 #[cfg(feature = "cluster")]
 use crate::db::ClusterStartupDisposition;
-use crate::db::{exact_table_reference, DbState, LaminarDB, RuntimeMode, SourceWatermarkState};
+use crate::db::{
+    exact_table_reference, DbState, LaminarDB, RecoveredInputChannelProgress, RuntimeMode,
+    SourceWatermarkState,
+};
 use crate::error::DbError;
 use crate::pipeline::streaming_coordinator::{admit_append_only_source, TrackedSourceRegistration};
 
@@ -478,8 +482,9 @@ struct PipelineSinkSetup {
 struct PipelineRecoveryState {
     graph: crate::operator_graph::OperatorGraph,
     recovered_mv_store: crate::mv_store::MvStore,
-    recovered_source_wms: rustc_hash::FxHashMap<String, i64>,
-    recovered_source_idle: rustc_hash::FxHashMap<String, bool>,
+    recovered_channel_progress:
+        FxHashMap<String, FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>>,
+    recovered_input_channels: FxHashMap<String, Arc<[Vec<u8>]>>,
     recovered_watermark_frontier: Option<i64>,
     restored_reference_tables: bool,
 }
@@ -489,7 +494,59 @@ struct PipelineWatermarks {
     watermark_states: FxHashMap<String, SourceWatermarkState>,
     source_entries: FxHashMap<String, Arc<crate::catalog::SourceEntry>>,
     source_ids: FxHashMap<String, usize>,
+    source_names: Vec<String>,
     tracker: Option<laminar_core::time::WatermarkTracker>,
+}
+
+fn recovered_source_watermark(
+    progress: Option<&FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>>,
+    owns_empty_inventory: bool,
+) -> (Option<i64>, bool) {
+    let Some(progress) = progress.filter(|progress| !progress.is_empty()) else {
+        return (None, owns_empty_inventory);
+    };
+    let mut active = false;
+    let mut active_min = i64::MAX;
+    let mut idle_max = None;
+    for channel in progress.values() {
+        if let Some(watermark) = channel.watermark {
+            idle_max = Some(idle_max.map_or(watermark, |current: i64| current.max(watermark)));
+        }
+        if !channel.idle {
+            active = true;
+            let Some(watermark) = channel.watermark else {
+                return (None, false);
+            };
+            active_min = active_min.min(watermark);
+        }
+    }
+    if active {
+        (Some(active_min), false)
+    } else {
+        (idle_max, true)
+    }
+}
+
+fn validate_recovered_input_channels(
+    source_name: &str,
+    progress: &FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>,
+    inventory: Option<&Arc<[Vec<u8>]>>,
+) -> Result<(), DbError> {
+    let inventory = inventory.ok_or_else(|| {
+        DbError::Checkpoint(format!(
+            "recovered ordered source '{source_name}' has no input-channel inventory"
+        ))
+    })?;
+    if inventory.len() != progress.len()
+        || inventory
+            .iter()
+            .any(|channel| !progress.contains_key(channel.as_slice()))
+    {
+        return Err(DbError::Checkpoint(format!(
+            "recovered ordered source '{source_name}' input-channel inventory does not match its watermark progress"
+        )));
+    }
+    Ok(())
 }
 
 struct PipelineRuntimeSetup {
@@ -3274,49 +3331,47 @@ impl LaminarDB {
                     ),
                 ] {
                     let source_reg = &source_regs[source_name];
-                    let contract = match contracts.get(source_name).copied() {
-                        Some(contract) => contract,
-                        None => {
-                            let connector_config = self
-                                .build_registered_source_config(source_name, source_reg)
-                                .map_err(|error| {
-                                    DbError::Config(format!(
-                                        "temporal source '{source_name}' has invalid connector configuration: {error}"
-                                    ))
-                                })?;
-                            let connector = self
-                                .connector_registry
-                                .create_source(&connector_config, None)
-                                .map_err(|error| {
-                                    DbError::Config(format!(
-                                        "cannot construct temporal source '{source_name}' for contract validation: {error}"
-                                    ))
-                                })?;
-                            let connector_schema = connector.schema();
-                            if !connector_schema.fields().is_empty()
-                                && connector_schema.as_ref() != entry.schema.as_ref()
-                            {
-                                return Err(DbError::Config(format!(
-                                    "temporal source '{source_name}' connector schema does not match its catalog schema"
-                                )));
-                            }
-                            let contract = connector.contract(&connector_config).map_err(|error| {
+                    let contract = if let Some(contract) = contracts.get(source_name).copied() {
+                        contract
+                    } else {
+                        let connector_config = self
+                            .build_registered_source_config(source_name, source_reg)
+                            .map_err(|error| {
                                 DbError::Config(format!(
-                                    "temporal source '{source_name}' has an invalid connector contract: {error}"
+                                    "temporal source '{source_name}' has invalid connector configuration: {error}"
                                 ))
                             })?;
-                            contracts.insert(source_name.to_string(), contract);
-                            contract
+                        let connector = self
+                            .connector_registry
+                            .create_source(&connector_config, None)
+                            .map_err(|error| {
+                                DbError::Config(format!(
+                                    "cannot construct temporal source '{source_name}' for contract validation: {error}"
+                                ))
+                            })?;
+                        let connector_schema = connector.schema();
+                        if !connector_schema.fields().is_empty()
+                            && connector_schema.as_ref() != entry.schema.as_ref()
+                        {
+                            return Err(DbError::Config(format!(
+                                "temporal source '{source_name}' connector schema does not match its catalog schema"
+                            )));
                         }
+                        let contract = connector.contract(&connector_config).map_err(|error| {
+                            DbError::Config(format!(
+                                "temporal source '{source_name}' has an invalid connector contract: {error}"
+                            ))
+                        })?;
+                        contracts.insert(source_name.to_string(), contract);
+                        contract
                     };
                     if matches!(role, TemporalSourceRole::Right)
                         && contract.input_mode == SourceInputMode::KeyedUpsert
+                        && !has_only_temporal_right_consumers(source_name, stream_regs, sink_regs)
                     {
-                        if !has_only_temporal_right_consumers(source_name, stream_regs, sink_regs) {
-                            return Err(DbError::Config(format!(
-                                "temporal right mutation source '{source_name}' has a non-temporal-right consumer"
-                            )));
-                        }
+                        return Err(DbError::Config(format!(
+                            "temporal right mutation source '{source_name}' has a non-temporal-right consumer"
+                        )));
                     }
                     admit_temporal_source_contract(
                         contract,
@@ -4327,10 +4382,11 @@ impl LaminarDB {
         // Hoist watermarks now so generators are seeded before watermark-state construction;
         // without this, generators restart at i64::MIN while offsets resume mid-stream.
         let mut recovered_mv_store = self.mv_store.read().fresh_image()?;
-        let mut recovered_source_wms: rustc_hash::FxHashMap<String, i64> =
-            rustc_hash::FxHashMap::default();
-        let mut recovered_source_idle: rustc_hash::FxHashMap<String, bool> =
-            rustc_hash::FxHashMap::default();
+        let mut recovered_channel_progress: FxHashMap<
+            String,
+            FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>,
+        > = FxHashMap::default();
+        let mut recovered_input_channels: FxHashMap<String, Arc<[Vec<u8>]>> = FxHashMap::default();
         let mut recovered_watermark_frontier = None;
         let mut restored_reference_tables = false;
         {
@@ -4416,40 +4472,33 @@ impl LaminarDB {
                             )?;
                         }
 
-                        recovered_watermark_frontier = recovered.checkpoint_watermark();
+                        recovered_watermark_frontier =
+                            channel_progress_frontier(recovered.channel_progress())
+                                .map_err(DbError::Checkpoint)?;
                         let participant_id = coord.store().participant_id();
-                        #[cfg(feature = "cluster")]
-                        if runtime_mode == RuntimeMode::Cluster && recovered.reassigned {
-                            if let Some(watermark) = recovered.checkpoint_watermark() {
-                                for source in sources.iter() {
-                                    recovered_source_wms.insert(source.name.clone(), watermark);
-                                    recovered_source_idle.insert(source.name.clone(), false);
-                                }
-                            }
-                        } else {
-                            for channel in recovered
-                                .channel_progress()
-                                .iter()
-                                .filter(|channel| channel.participant_id == participant_id)
+                        for channel in recovered.channel_progress() {
+                            // Physical channels may move on rescale; logical singleton state does not.
+                            if channel.input_channel == SINGLETON_WATERMARK_CHANNEL
+                                && channel.participant_id != participant_id
                             {
-                                if let Some(watermark) = channel.watermark {
-                                    recovered_source_wms
-                                        .insert(channel.channel_id.clone(), watermark);
-                                }
-                                recovered_source_idle
-                                    .insert(channel.channel_id.clone(), channel.idle);
+                                continue;
                             }
+                            recovered_channel_progress
+                                .entry(channel.source_name.clone())
+                                .or_default()
+                                .insert(
+                                    channel.input_channel.clone().into_boxed_slice(),
+                                    RecoveredInputChannelProgress {
+                                        watermark: channel.watermark,
+                                        idle: channel.idle,
+                                    },
+                                );
                         }
-                        #[cfg(not(feature = "cluster"))]
-                        for channel in recovered
-                            .channel_progress()
-                            .iter()
-                            .filter(|channel| channel.participant_id == participant_id)
-                        {
-                            if let Some(watermark) = channel.watermark {
-                                recovered_source_wms.insert(channel.channel_id.clone(), watermark);
+                        for (source_name, checkpoint) in recovered.source_offsets() {
+                            if let Some(input_channels) = checkpoint.input_channels.as_ref() {
+                                recovered_input_channels
+                                    .insert(source_name.clone(), Arc::from(input_channels.clone()));
                             }
-                            recovered_source_idle.insert(channel.channel_id.clone(), channel.idle);
                         }
 
                         let recovered_attempt =
@@ -4501,11 +4550,16 @@ impl LaminarDB {
             }
         }
 
+        let graph_metrics = self.engine_metrics.lock().clone();
+        if let Some(prom) = graph_metrics {
+            graph.set_metrics(prom);
+        }
+
         Ok(PipelineRecoveryState {
             graph,
             recovered_mv_store,
-            recovered_source_wms,
-            recovered_source_idle,
+            recovered_channel_progress,
+            recovered_input_channels,
             recovered_watermark_frontier,
             restored_reference_tables,
         })
@@ -4635,9 +4689,13 @@ impl LaminarDB {
     }
     fn prepare_pipeline_watermarks(
         &self,
+        sources: &[TrackedSourceRegistration],
         stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
-        recovered_source_wms: &FxHashMap<String, i64>,
-        recovered_source_idle: &FxHashMap<String, bool>,
+        recovered_channel_progress: &FxHashMap<
+            String,
+            FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>,
+        >,
+        recovered_input_channels: &FxHashMap<String, Arc<[Vec<u8>]>>,
         recovered_watermark_frontier: Option<i64>,
     ) -> Result<PipelineWatermarks, DbError> {
         let stream_entries: Vec<_> = self
@@ -4670,110 +4728,126 @@ impl LaminarDB {
             }),
             Err(_) => laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
         };
-        let source_names = self.catalog.list_sources();
-        let mut watermark_states: FxHashMap<String, SourceWatermarkState> =
-            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
-        let mut source_entries_for_wm: FxHashMap<String, Arc<crate::catalog::SourceEntry>> =
-            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
-        let mut source_ids: FxHashMap<String, usize> =
-            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
-        for name in source_names {
-            if let Some(entry) = self.catalog.get_source(&name) {
-                if let (Some(col), Some(dur)) =
-                    (&entry.watermark_column, entry.max_out_of_orderness)
-                {
-                    let extractor = laminar_core::time::EventTimeExtractor::from_column(col)
-                        .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
-                        .is_processing_time
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        Box::new(laminar_core::time::ProcessingTimeGenerator::new())
-                    } else {
-                        Box::new(
-                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur)
-                                .with_max_future_skew(future_skew_ms),
-                        )
-                    };
-                    let id = source_ids.len();
-                    source_ids.insert(name.clone(), id);
-                    watermark_states.insert(
-                        name.clone(),
-                        SourceWatermarkState {
-                            extractor,
-                            generator,
-                            column: col.clone(),
-                        },
-                    );
-                }
-                source_entries_for_wm.insert(name, entry);
-            }
-        }
-
-        // Fallback watermark path for sources configured through the programmatic API.
-        for name in self.catalog.list_sources() {
-            if watermark_states.contains_key(&name) {
-                continue;
-            }
-            if let Some(entry) = self.catalog.get_source(&name) {
-                if let Some(col) = entry.source.event_time_column() {
-                    let extractor = laminar_core::time::EventTimeExtractor::from_column(&col)
-                        .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let ooo_bound = entry
-                        .source
-                        .max_out_of_orderness()
-                        .unwrap_or(std::time::Duration::ZERO);
-                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
-                        .is_processing_time
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        Box::new(laminar_core::time::ProcessingTimeGenerator::new())
-                    } else {
-                        Box::new(
-                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
-                                ooo_bound,
-                            )
-                            .with_max_future_skew(future_skew_ms),
-                        )
-                    };
-                    let id = source_ids.len();
-                    source_ids.insert(name.clone(), id);
-                    watermark_states.insert(
-                        name.clone(),
-                        SourceWatermarkState {
-                            extractor,
-                            generator,
-                            column: col,
-                        },
-                    );
-                }
-            }
-        }
-
-        // LAMINAR_SOURCE_IDLE_TIMEOUT_MS > 0 enables idle-source detection; unset/0 = disabled.
-        let idle_timeout_ms: Option<u64> = match std::env::var("LAMINAR_SOURCE_IDLE_TIMEOUT_MS") {
-            Ok(v) => match v.parse::<u64>() {
+        let idle_timeout = match std::env::var("LAMINAR_SOURCE_IDLE_TIMEOUT_MS") {
+            Ok(value) => match value.parse::<u64>() {
                 Ok(0) => None,
-                Ok(ms) => Some(ms),
+                Ok(milliseconds) => Some(std::time::Duration::from_millis(milliseconds)),
                 Err(_) => {
                     tracing::warn!(
-                        value = %v,
-                        "invalid LAMINAR_SOURCE_IDLE_TIMEOUT_MS (expected a non-negative \
-                         integer); idle-source detection disabled"
+                        %value,
+                        "invalid LAMINAR_SOURCE_IDLE_TIMEOUT_MS; idle-source detection disabled"
                     );
                     None
                 }
             },
             Err(_) => None,
         };
+        let source_contracts: FxHashMap<&str, SourceContract> = sources
+            .iter()
+            .map(|source| (source.name.as_str(), source.contract()))
+            .collect();
+        let mut checkpoint_source_names = self.catalog.list_sources();
+        checkpoint_source_names.sort_unstable();
+        let mut watermark_states: FxHashMap<String, SourceWatermarkState> =
+            FxHashMap::with_capacity_and_hasher(
+                checkpoint_source_names.len(),
+                rustc_hash::FxBuildHasher,
+            );
+        let mut source_entries_for_wm: FxHashMap<String, Arc<crate::catalog::SourceEntry>> =
+            FxHashMap::with_capacity_and_hasher(
+                checkpoint_source_names.len(),
+                rustc_hash::FxBuildHasher,
+            );
+        let mut source_ids: FxHashMap<String, usize> = FxHashMap::with_capacity_and_hasher(
+            checkpoint_source_names.len(),
+            rustc_hash::FxBuildHasher,
+        );
+        for name in checkpoint_source_names.iter().cloned() {
+            if let Some(entry) = self.catalog.get_source(&name) {
+                let watermark = entry
+                    .watermark_column
+                    .clone()
+                    .zip(entry.max_out_of_orderness)
+                    .or_else(|| {
+                        entry.source.event_time_column().map(|column| {
+                            (
+                                column,
+                                entry
+                                    .source
+                                    .max_out_of_orderness()
+                                    .unwrap_or(std::time::Duration::ZERO),
+                            )
+                        })
+                    });
+                if let Some((column, out_of_orderness)) = watermark {
+                    let extractor = laminar_core::time::EventTimeExtractor::from_column(&column)
+                        .with_mode(laminar_core::time::ExtractionMode::Max);
+                    let processing_time = entry
+                        .is_processing_time
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> =
+                        if processing_time {
+                            Box::new(laminar_core::time::ProcessingTimeGenerator::new())
+                        } else {
+                            Box::new(
+                                laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
+                                    out_of_orderness,
+                                )
+                                .with_max_future_skew(future_skew_ms),
+                            )
+                        };
+                    let contract = source_contracts.get(name.as_str()).ok_or_else(|| {
+                        DbError::Pipeline(format!(
+                            "watermarked source '{name}' has no runtime source contract"
+                        ))
+                    })?;
+                    let mut state = SourceWatermarkState::new(extractor, generator, column);
+                    if !processing_time
+                        && contract.row_positions
+                            == SourceRowPositionCapability::OrderedDeterministic
+                    {
+                        let recovered = recovered_channel_progress
+                            .get(&name)
+                            .cloned()
+                            .unwrap_or_default();
+                        let recovered_inventory = recovered_input_channels.get(&name).cloned();
+                        if recovered_channel_progress.contains_key(&name)
+                            || recovered_input_channels.contains_key(&name)
+                        {
+                            validate_recovered_input_channels(
+                                &name,
+                                &recovered,
+                                recovered_inventory.as_ref(),
+                            )?;
+                        }
+                        state = state.with_input_channels(
+                            out_of_orderness,
+                            future_skew_ms,
+                            idle_timeout,
+                            recovered,
+                            recovered_inventory,
+                        );
+                    }
+                    let id = source_ids.len();
+                    source_ids.insert(name.clone(), id);
+                    watermark_states.insert(name.clone(), state);
+                }
+                source_entries_for_wm.insert(name, entry);
+            }
+        }
+
         let mut tracker = if source_ids.is_empty() {
             None
         } else {
             let mut t = laminar_core::time::WatermarkTracker::new(source_ids.len());
-            if let Some(ms) = idle_timeout_ms {
-                let d = std::time::Duration::from_millis(ms);
-                for id in 0..source_ids.len() {
-                    t.set_idle_timeout(id, Some(d));
+            if let Some(timeout) = idle_timeout {
+                for (name, id) in &source_ids {
+                    if !watermark_states
+                        .get(name)
+                        .is_some_and(SourceWatermarkState::is_partitioned)
+                    {
+                        t.set_idle_timeout(*id, Some(timeout));
+                    }
                 }
             }
             Some(t)
@@ -4803,9 +4877,18 @@ impl LaminarDB {
         let mut tracker_watermarks = vec![None; source_ids.len()];
         let mut idle_sources = vec![false; source_ids.len()];
         for (name, &source_id) in &source_ids {
-            let recovered = recovered_source_wms.get(name).copied();
+            let owns_empty_inventory = watermark_states
+                .get(name)
+                .is_some_and(SourceWatermarkState::is_partitioned)
+                && recovered_input_channels
+                    .get(name)
+                    .is_some_and(|inventory| inventory.is_empty());
+            let (recovered, idle) = recovered_source_watermark(
+                recovered_channel_progress.get(name),
+                owns_empty_inventory,
+            );
             tracker_watermarks[source_id] = recovered;
-            idle_sources[source_id] = recovered_source_idle.get(name).copied().unwrap_or(false);
+            idle_sources[source_id] = idle;
             if let (Some(state), Some(watermark)) = (watermark_states.get_mut(name), recovered) {
                 state.generator.restore_watermark_for_recovery(watermark);
             }
@@ -4839,6 +4922,7 @@ impl LaminarDB {
             watermark_states,
             source_entries: source_entries_for_wm,
             source_ids,
+            source_names: checkpoint_source_names,
             tracker,
         })
     }
@@ -4863,6 +4947,7 @@ impl LaminarDB {
             watermark_states,
             source_entries,
             source_ids,
+            source_names: checkpoint_source_names,
             tracker,
         } = watermarks;
 
@@ -4967,6 +5052,7 @@ impl LaminarDB {
             source_entries_for_wm: source_entries,
             source_ids,
             source_name_arcs,
+            checkpoint_source_names,
             source_frontiers_buf,
             tracker,
             prom,
@@ -5014,6 +5100,7 @@ impl LaminarDB {
             subscription_registry: Arc::clone(&self.subscription_registry),
             named_stream_names,
             checkpoint_complete_tx,
+            checkpoint_tail_runtime: self.control_runtime.handle()?,
             checkpoint_tail_tasks: tokio::task::JoinSet::new(),
             checkpoint_in_flight: Arc::clone(&checkpoint_in_flight),
             full_vnode_capture_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -5459,8 +5546,8 @@ impl LaminarDB {
         let PipelineRecoveryState {
             graph,
             recovered_mv_store,
-            recovered_source_wms,
-            recovered_source_idle,
+            recovered_channel_progress,
+            recovered_input_channels,
             recovered_watermark_frontier,
             restored_reference_tables,
         } = recovery;
@@ -5472,21 +5559,25 @@ impl LaminarDB {
 
         for source_name in self.catalog.list_sources() {
             if let Some(entry) = self.catalog.get_source(&source_name) {
-                entry.source.restore_watermark_for_recovery(
-                    recovered_source_wms
+                let (watermark, _) = recovered_source_watermark(
+                    recovered_channel_progress.get(&source_name),
+                    recovered_input_channels
                         .get(&source_name)
-                        .copied()
-                        .unwrap_or(i64::MIN),
+                        .is_some_and(|inventory| inventory.is_empty()),
                 );
+                entry
+                    .source
+                    .restore_watermark_for_recovery(watermark.unwrap_or(i64::MIN));
             }
         }
 
         self.initialize_reference_tables(&table_regs, &stream_regs, restored_reference_tables)
             .await?;
         let watermarks = self.prepare_pipeline_watermarks(
+            &sources,
             &stream_regs,
-            &recovered_source_wms,
-            &recovered_source_idle,
+            &recovered_channel_progress,
+            &recovered_input_channels,
             recovered_watermark_frontier,
         )?;
         let max_poll = self.config.default_buffer_size.min(1024);
@@ -5522,7 +5613,6 @@ impl LaminarDB {
             cycle_budget_ns: 10_000_000_u64.max(drain_budget_ns + query_budget_ns),
             drain_budget_ns,
             query_budget_ns,
-            background_budget_ns: 5_000_000, // 5ms
             max_input_buf_batches: self.config.pipeline_max_input_buf_batches.unwrap_or(256),
             max_input_buf_bytes: self.config.pipeline_max_input_buf_bytes,
             backpressure_policy: self.config.pipeline_backpressure_policy,

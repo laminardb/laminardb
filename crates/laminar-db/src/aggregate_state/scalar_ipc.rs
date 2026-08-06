@@ -1,7 +1,6 @@
 //! Arrow IPC round-trip for `Vec<ScalarValue>`.
 //!
 //! Each tuple is a one-row `RecordBatch` encoded via the IPC stream format.
-//! Old `serde_json` checkpoints are incompatible; no migration.
 
 use std::sync::Arc;
 
@@ -14,6 +13,13 @@ use crate::error::DbError;
 
 /// Encode a scalar tuple as a one-row Arrow IPC stream; empty input → empty `Vec`.
 pub(crate) fn scalars_to_ipc(scalars: &[ScalarValue]) -> Result<Vec<u8>, DbError> {
+    scalars_to_ipc_bounded(scalars, usize::MAX)
+}
+
+pub(crate) fn scalars_to_ipc_bounded(
+    scalars: &[ScalarValue],
+    max_bytes: usize,
+) -> Result<Vec<u8>, DbError> {
     if scalars.is_empty() {
         return Ok(Vec::new());
     }
@@ -32,8 +38,12 @@ pub(crate) fn scalars_to_ipc(scalars: &[ScalarValue]) -> Result<Vec<u8>, DbError
         .collect::<Result<Vec<_>, _>>()?;
     let batch = RecordBatch::try_new(schema, columns)
         .map_err(|e| DbError::Pipeline(format!("scalar batch build: {e}")))?;
-    laminar_core::serialization::serialize_batch_stream(&batch)
-        .map_err(|e| DbError::Pipeline(format!("scalar IPC encode: {e}")))
+    laminar_core::serialization::serialize_batches_stream_bounded(
+        batch.schema().as_ref(),
+        std::iter::once(&batch),
+        max_bytes,
+    )
+    .map_err(|e| DbError::Pipeline(format!("scalar IPC encode: {e}")))
 }
 
 /// Decode bytes previously produced by [`scalars_to_ipc`]; empty input → empty `Vec`.

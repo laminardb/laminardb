@@ -522,13 +522,33 @@ pub trait PipelineCallback: Send + 'static {
     ) -> Result<(), CycleError>;
 
     /// Extract watermark from a batch for a given source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source batch has invalid event-time metadata.
     fn extract_watermark(
         &mut self,
         source_name: &str,
         batch: &RecordBatch,
+        admission_floor: i64,
+    ) -> Result<(), CycleError>;
+
+    /// Install the exact input-channel inventory carried by a source cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the inventory is invalid or conflicts with recovered progress.
+    fn reconcile_source_input_channels(
+        &mut self,
+        source_name: &str,
+        input_channels: Option<Arc<[Vec<u8>]>>,
     ) -> Result<(), CycleError>;
 
     /// Filter late rows while preserving any validated hidden source metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when hidden metadata is malformed or the batch cannot be filtered.
     fn filter_late_rows(
         &self,
         source_name: &str,

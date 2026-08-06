@@ -16,7 +16,7 @@ use laminar_connectors::connector::{
     MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
 #[cfg(feature = "cluster")]
-use laminar_core::checkpoint::CheckpointAttemptRelation;
+use laminar_core::checkpoint::{channel_progress_frontier, CheckpointAttemptRelation};
 use laminar_core::checkpoint::{
     checkpoint_descriptor_sha256, checkpoint_manifest_bytes, checkpoint_sha256,
     classify_channel_progress, ByteRange, ChannelProgress, CheckpointAttempt, CheckpointManifest,
@@ -39,6 +39,44 @@ const MAX_RETENTION_IO_CONCURRENCY: usize = 8;
 const RETENTION_RETRY_DELAY: Duration = Duration::from_secs(30);
 #[cfg(feature = "cluster")]
 const FOLLOWER_DECISION_POLL: Duration = Duration::from_millis(250);
+
+#[cfg(all(debug_assertions, feature = "cluster"))]
+async fn checkpoint_kill_gate(
+    role: &'static str,
+    attempt: CheckpointAttempt,
+    predecessor: Option<(u64, u64)>,
+) {
+    static GATE_FILE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let Some(gate_file) = GATE_FILE
+        .get_or_init(|| std::env::var_os("LAMINAR_CHECKPOINT_KILL_GATE_FILE").map(Into::into))
+        .as_ref()
+    else {
+        return;
+    };
+    if std::fs::read_to_string(gate_file)
+        .ok()
+        .is_none_or(|requested| requested.trim() != role)
+    {
+        return;
+    }
+    let Some((predecessor_id, predecessor_epoch)) = predecessor else {
+        return;
+    };
+
+    let ready_file = gate_file.with_extension("ready");
+    let evidence = format!(
+        "{role} {} {} {predecessor_id} {predecessor_epoch}",
+        attempt.checkpoint_id, attempt.epoch
+    );
+    if std::fs::write(&ready_file, evidence).is_err() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while gate_file.is_file() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _ = std::fs::remove_file(ready_file);
+}
 
 #[cfg(feature = "cluster")]
 fn handoff_error(message: impl Into<String>) -> DbError {
@@ -71,6 +109,7 @@ pub struct CheckpointRequest {
     pub handoff_replay_pending: bool,
     pub assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
     pub state_frames: Vec<CapturedStateFrame>,
+    pub source_names: Vec<String>,
     pub channel_progress: Vec<ChannelProgress>,
     pub source_offset_overrides: HashMap<String, ConnectorCheckpoint>,
 }
@@ -1028,6 +1067,7 @@ mod artifact_tests {
                 assignment_fence: None,
                 predecessor,
                 participants: vec![participant],
+                source_names: Vec::new(),
                 source_offsets: BTreeMap::new(),
                 channel_progress: Vec::new(),
                 checkpoint_watermark: None,
@@ -1126,6 +1166,7 @@ mod artifact_tests {
             assignment_fence: None,
             predecessor,
             participants: vec![CommittedParticipantRef::from_manifest(&manifest, &encoded).unwrap()],
+            source_names: Vec::new(),
             source_offsets: BTreeMap::new(),
             channel_progress: Vec::new(),
             checkpoint_watermark: None,
@@ -1369,6 +1410,7 @@ mod artifact_tests {
             assignment_fence: None,
             predecessor: None,
             participants: vec![participant],
+            source_names: Vec::new(),
             source_offsets: BTreeMap::new(),
             channel_progress: Vec::new(),
             checkpoint_watermark: None,
@@ -1408,6 +1450,45 @@ mod artifact_tests {
             .await
             .unwrap()
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use laminar_core::checkpoint::ObjectStoreCheckpointStore;
+    use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn outcome_recording_keeps_internal_and_prometheus_counts_in_lockstep() {
+        let store = ObjectStoreCheckpointStore::new(Arc::new(InMemory::new()), "metrics");
+        let mut coordinator =
+            CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+        coordinator.set_metrics(Arc::clone(&metrics));
+
+        coordinator.record_checkpoint_outcome(
+            true,
+            CheckpointAttempt::canonical(1),
+            Duration::from_millis(10),
+            Some(37),
+        );
+        coordinator.record_checkpoint_outcome(
+            false,
+            CheckpointAttempt::canonical(2),
+            Duration::from_millis(20),
+            None,
+        );
+
+        let stats = coordinator.stats();
+        assert_eq!((stats.completed, stats.failed), (1, 1));
+        assert_eq!(stats.last_duration, Some(Duration::from_millis(20)));
+        assert_eq!(metrics.checkpoints_completed.get(), 1);
+        assert_eq!(metrics.checkpoints_failed.get(), 1);
+        assert_eq!(metrics.checkpoint_duration.get_sample_count(), 2);
+        assert_eq!(metrics.checkpoint_epoch.get(), 2);
+        assert_eq!(metrics.checkpoint_size_bytes.get(), 37);
     }
 }
 
@@ -1654,6 +1735,54 @@ impl CheckpointCoordinator {
 
     pub fn set_metrics(&mut self, prom: Arc<crate::engine_metrics::EngineMetrics>) {
         self.prom = Some(prom);
+    }
+
+    fn emit_checkpoint_metrics(
+        &self,
+        success: bool,
+        attempt: CheckpointAttempt,
+        duration: Duration,
+        checkpoint_bytes: Option<u64>,
+    ) {
+        let Some(metrics) = self.prom.as_ref() else {
+            return;
+        };
+        if success {
+            metrics.checkpoints_completed.inc();
+            if let Some(checkpoint_bytes) = checkpoint_bytes {
+                metrics
+                    .checkpoint_size_bytes
+                    .set(i64::try_from(checkpoint_bytes).unwrap_or(i64::MAX));
+            }
+        } else {
+            metrics.checkpoints_failed.inc();
+            warn!(
+                checkpoint_id = attempt.checkpoint_id,
+                epoch = attempt.epoch,
+                "checkpoint failure metric recorded"
+            );
+        }
+        metrics
+            .checkpoint_epoch
+            .set(i64::try_from(attempt.epoch).unwrap_or(i64::MAX));
+        metrics.checkpoint_duration.observe(duration.as_secs_f64());
+    }
+
+    fn record_checkpoint_outcome(
+        &mut self,
+        success: bool,
+        attempt: CheckpointAttempt,
+        duration: Duration,
+        checkpoint_bytes: Option<u64>,
+    ) {
+        if success {
+            self.checkpoints_completed = self.checkpoints_completed.saturating_add(1);
+        } else {
+            self.checkpoints_failed = self.checkpoints_failed.saturating_add(1);
+        }
+        self.last_checkpoint_duration = Some(duration);
+        self.duration_histogram.record(duration);
+        self.emit_checkpoint_metrics(success, attempt, duration, checkpoint_bytes);
     }
 
     pub(crate) fn register_sink(
@@ -1990,7 +2119,6 @@ impl CheckpointCoordinator {
             .into_iter()
             .map(|(participant, requested, expected)| {
                 let store = Arc::clone(&self.store);
-                let predecessor = predecessor;
                 let pipeline_identity = &pipeline_identity;
                 let deployment_id = &deployment_id;
                 async move {
@@ -2284,11 +2412,12 @@ impl CheckpointCoordinator {
         self.failure_requires_recovery = false;
         self.phase = CheckpointPhase::Idle;
         #[cfg(feature = "cluster")]
-        if let (Some(controller), Some(watermark)) = (
-            self.cluster_controller.as_ref(),
-            committed.checkpoint_watermark,
-        ) {
-            controller.publish_cluster_min_watermark(watermark);
+        if let Some(controller) = self.cluster_controller.as_ref() {
+            if let Some(watermark) = channel_progress_frontier(&committed.channel_progress)
+                .map_err(DbError::Checkpoint)?
+            {
+                controller.publish_cluster_min_watermark(watermark);
+            }
         }
         Ok(recovered)
     }
@@ -2897,12 +3026,21 @@ impl CheckpointCoordinator {
             channel.participant_id = self.store.participant_id();
         }
         request.channel_progress.sort_unstable_by(|left, right| {
-            (left.participant_id, left.channel_id.as_str())
-                .cmp(&(right.participant_id, right.channel_id.as_str()))
+            (
+                left.participant_id,
+                left.source_name.as_str(),
+                left.input_channel.as_slice(),
+            )
+                .cmp(&(
+                    right.participant_id,
+                    right.source_name.as_str(),
+                    right.input_channel.as_slice(),
+                ))
         });
         if request.channel_progress.windows(2).any(|pair| {
             pair[0].participant_id == pair[1].participant_id
-                && pair[0].channel_id == pair[1].channel_id
+                && pair[0].source_name == pair[1].source_name
+                && pair[0].input_channel == pair[1].input_channel
         }) {
             return Err(DbError::Checkpoint(
                 "channel progress contains duplicate channel identities".into(),
@@ -3093,8 +3231,7 @@ impl CheckpointCoordinator {
             })
             .collect::<Result<Vec<_>, _>>()?;
         manifest.source_offsets = request.source_offset_overrides;
-        manifest.source_names = manifest.source_offsets.keys().cloned().collect();
-        manifest.source_names.sort_unstable();
+        manifest.source_names = request.source_names;
         manifest.sink_names = self.sorted_sink_names()?;
         manifest.channel_progress = request.channel_progress;
         manifest.checkpoint_watermark = classify_channel_progress(&manifest.channel_progress)
@@ -3315,6 +3452,26 @@ impl CheckpointCoordinator {
                 )));
             }
         }
+        match (&mut destination.input_channels, &incoming.input_channels) {
+            (None, None) => {}
+            (Some(destination), Some(incoming)) => {
+                if incoming
+                    .iter()
+                    .any(|channel| destination.binary_search(channel).is_ok())
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "source '{source}' input channel is owned by multiple participants"
+                    )));
+                }
+                destination.extend(incoming.iter().cloned());
+                destination.sort_unstable();
+            }
+            _ => {
+                return Err(DbError::Checkpoint(format!(
+                    "source '{source}' participant checkpoints disagree on whether input channels are declared"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -3328,7 +3485,7 @@ impl CheckpointCoordinator {
     ) -> Result<CommittedCheckpointIndex, DbError> {
         let mut participants = Vec::with_capacity(manifests.len());
         let mut source_offsets = BTreeMap::<String, ConnectorCheckpoint>::new();
-        let mut channels = BTreeMap::<(u64, String), ChannelProgress>::new();
+        let mut channels = BTreeMap::<(u64, String, Vec<u8>), ChannelProgress>::new();
         for (manifest, encoded) in manifests {
             participants.push(
                 CommittedParticipantRef::from_manifest(manifest, encoded)
@@ -3347,14 +3504,18 @@ impl CheckpointCoordinator {
             for channel in &manifest.channel_progress {
                 if channels
                     .insert(
-                        (channel.participant_id, channel.channel_id.clone()),
+                        (
+                            channel.participant_id,
+                            channel.source_name.clone(),
+                            channel.input_channel.clone(),
+                        ),
                         channel.clone(),
                     )
                     .is_some()
                 {
                     return Err(DbError::Checkpoint(format!(
-                        "participant {} channel '{}' appears more than once",
-                        channel.participant_id, channel.channel_id
+                        "participant {} source '{}' input channel appears more than once",
+                        channel.participant_id, channel.source_name
                     )));
                 }
             }
@@ -3382,6 +3543,9 @@ impl CheckpointCoordinator {
             assignment_fence,
             predecessor: self.last_committed_ref.clone(),
             participants,
+            source_names: manifests
+                .first()
+                .map_or_else(Vec::new, |(manifest, _)| manifest.source_names.clone()),
             source_offsets,
             channel_progress,
             checkpoint_watermark,
@@ -3696,9 +3860,7 @@ impl CheckpointCoordinator {
     ) -> CheckpointResult {
         let duration = started.elapsed();
         self.phase = CheckpointPhase::Idle;
-        self.checkpoints_failed = self.checkpoints_failed.saturating_add(1);
-        self.last_checkpoint_duration = Some(duration);
-        self.duration_histogram.record(duration);
+        self.record_checkpoint_outcome(false, attempt, duration, None);
         if disposition == CheckpointFailureDisposition::RequiresRecovery {
             self.failure_requires_recovery = true;
         }
@@ -3993,6 +4155,15 @@ impl CheckpointCoordinator {
                     .await);
             }
         };
+        #[cfg(all(debug_assertions, feature = "cluster"))]
+        checkpoint_kill_gate(
+            "leader",
+            attempt,
+            self.last_committed_ref
+                .as_ref()
+                .map(|reference| (reference.checkpoint_id, reference.epoch)),
+        )
+        .await;
         let reference = match self.create_committed_index_until(&index, deadline).await {
             Ok(reference) => reference,
             Err(error) => {
@@ -4045,10 +4216,12 @@ impl CheckpointCoordinator {
             "closing a committed checkpoint",
         )?);
         #[cfg(feature = "cluster")]
-        if let (Some(controller), Some(watermark)) =
-            (self.cluster_controller.as_ref(), index.checkpoint_watermark)
-        {
-            controller.publish_cluster_min_watermark(watermark);
+        if let Some(controller) = self.cluster_controller.as_ref() {
+            if let Some(watermark) =
+                channel_progress_frontier(&index.channel_progress).map_err(DbError::Checkpoint)?
+            {
+                controller.publish_cluster_min_watermark(watermark);
+            }
         }
         #[cfg(feature = "cluster")]
         if let Some(controller) = self.cluster_controller.as_ref() {
@@ -4096,9 +4269,11 @@ impl CheckpointCoordinator {
 
         let duration = started.elapsed();
         self.phase = CheckpointPhase::Idle;
-        self.checkpoints_completed = self.checkpoints_completed.saturating_add(1);
-        self.last_checkpoint_duration = Some(duration);
-        self.duration_histogram.record(duration);
+        let checkpoint_bytes = self
+            .last_committed_manifest
+            .as_ref()
+            .map(|manifest| manifest.node_data.object_length);
+        self.record_checkpoint_outcome(true, attempt, duration, checkpoint_bytes);
         let continuation_error = continuation.err().map(|error| {
             self.failure_requires_recovery = true;
             format!(
@@ -4407,6 +4582,15 @@ impl CheckpointCoordinator {
             self.phase = CheckpointPhase::Idle;
             return Err(error);
         }
+        #[cfg(all(debug_assertions, feature = "cluster"))]
+        checkpoint_kill_gate(
+            "follower",
+            attempt,
+            self.last_committed_ref
+                .as_ref()
+                .map(|reference| (reference.checkpoint_id, reference.epoch)),
+        )
+        .await;
         self.phase = CheckpointPhase::Idle;
         Ok(())
     }
@@ -4420,6 +4604,7 @@ impl CheckpointCoordinator {
     ) -> Result<bool, DbError> {
         use laminar_core::cluster::control::{BarrierAck, BarrierAckDisposition};
 
+        let started = Instant::now();
         let controller = self.cluster_controller.clone().ok_or_else(|| {
             DbError::Checkpoint("follower checkpoint has no cluster controller".into())
         })?;
@@ -4459,8 +4644,13 @@ impl CheckpointCoordinator {
             decision_timeout,
         )
         .await?;
-        self.follower_finish(announcement.epoch, announcement.checkpoint_id, committed)
-            .await
+        self.follower_finish(
+            announcement.epoch,
+            announcement.checkpoint_id,
+            committed,
+            started,
+        )
+        .await
     }
 
     #[cfg(feature = "cluster")]
@@ -4547,7 +4737,9 @@ impl CheckpointCoordinator {
                             ));
                         }
                         index.validate().map_err(DbError::Checkpoint)?;
-                        if let Some(watermark) = index.checkpoint_watermark {
+                        if let Some(watermark) = channel_progress_frontier(&index.channel_progress)
+                            .map_err(DbError::Checkpoint)?
+                        {
                             controller.publish_cluster_min_watermark(watermark);
                         }
                         return Ok(true);
@@ -4576,6 +4768,7 @@ impl CheckpointCoordinator {
         epoch: u64,
         checkpoint_id: u64,
         committed: bool,
+        started: Instant,
     ) -> Result<bool, DbError> {
         let attempt = require_canonical_attempt(
             CheckpointAttempt::new(epoch, checkpoint_id),
@@ -4624,7 +4817,6 @@ impl CheckpointCoordinator {
             self.last_committed_ref = Some(reference);
             self.last_committed_manifest = Some(manifest);
             self.prepared.remove(&attempt);
-            self.checkpoints_completed = self.checkpoints_completed.saturating_add(1);
         } else {
             let controller = self.cluster_controller.as_ref().ok_or_else(|| {
                 DbError::Checkpoint("follower completion has no cluster controller".into())
@@ -4659,16 +4851,30 @@ impl CheckpointCoordinator {
             let artifact_cleanup = self.delete_prepared_artifact_until(attempt, deadline).await;
             rollback?;
             artifact_cleanup?;
-            self.checkpoints_failed = self.checkpoints_failed.saturating_add(1);
         }
         self.allocator.advance_epoch_to(checked_successor_epoch(
             epoch,
             "closing a follower checkpoint",
         )?);
-        if self.has_checkpoint_committable_sinks() {
-            self.begin_sink_epoch_until(deadline).await?;
-        }
+        let continuation = if self.has_checkpoint_committable_sinks() {
+            self.begin_sink_epoch_until(deadline).await
+        } else {
+            Ok(())
+        };
+        let duration = started.elapsed();
         self.phase = CheckpointPhase::Idle;
+        let checkpoint_bytes = if committed {
+            self.last_committed_manifest
+                .as_ref()
+                .map(|manifest| manifest.node_data.object_length)
+        } else {
+            None
+        };
+        self.record_checkpoint_outcome(committed, attempt, duration, checkpoint_bytes);
+        if continuation.is_err() {
+            self.failure_requires_recovery = true;
+        }
+        continuation?;
         Ok(committed)
     }
 }
@@ -4769,6 +4975,7 @@ pub(crate) fn source_to_connector_checkpoint(cp: &SourceCheckpoint) -> Connector
     ConnectorCheckpoint {
         offsets: cp.durable_offsets(),
         metadata: cp.metadata().clone(),
+        input_channels: cp.input_channels().map(<[Vec<u8>]>::to_vec),
         source_assignment_version: cp.assignment_version(),
     }
 }
@@ -4778,6 +4985,11 @@ pub(crate) fn connector_to_source_checkpoint(cp: &ConnectorCheckpoint) -> Source
     let mut source = SourceCheckpoint::with_offsets(cp.offsets.clone());
     for (key, value) in &cp.metadata {
         source.set_metadata(key.clone(), value.clone());
+    }
+    if let Some(channels) = &cp.input_channels {
+        source
+            .set_input_channels(channels.clone())
+            .expect("validated connector checkpoint input-channel inventory");
     }
     if let Some(version) = cp.source_assignment_version {
         source.bind_assignment_version(version);

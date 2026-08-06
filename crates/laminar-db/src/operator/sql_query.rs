@@ -36,8 +36,8 @@ use crate::error::DbError;
 use crate::operator::capability::{ManagedStateContract, OperatorStateClass};
 use crate::operator::capability::{OperatorCapability, OperatorImplementation};
 use crate::operator_graph::{
-    try_evaluate_compiled, CapturedVnodeState, GraphOperator, ManagedStateAccountingSnapshot,
-    OperatorCheckpoint,
+    try_evaluate_compiled, CapturedVnodeState, EncodedStateFrame, GraphOperator,
+    ManagedStateAccountingSnapshot, OperatorCheckpoint, StateFrameCapture,
 };
 #[cfg(feature = "cluster")]
 use crate::operator_graph::{InputFrontier, ManagedVnodeTransition};
@@ -91,15 +91,99 @@ struct AggOpCheckpoint {
     aligned_replay: Vec<(u64, i64, Vec<u8>)>,
 }
 
-/// Serialize one authoritative aggregate vnode image.
-fn serialize_agg_cp(cp: &AggStateCheckpoint, op_name: &str) -> Result<Vec<u8>, DbError> {
-    rkyv::to_bytes::<rkyv::rancor::Error>(cp)
-        .map(|v| v.to_vec())
-        .map_err(|e| {
-            DbError::Pipeline(format!(
-                "per-vnode checkpoint serialization for '{op_name}': {e}"
+fn serialize_agg_cp(
+    cp: &AggStateCheckpoint,
+    op_name: &str,
+    max_encoded_bytes: usize,
+) -> Result<EncodedStateFrame, DbError> {
+    let writer = rkyv::ser::writer::IoWriter::new(
+        laminar_core::serialization::BoundedBytesWriter::new(max_encoded_bytes),
+    );
+    rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(cp, writer)
+        .map(|bytes| EncodedStateFrame::from_vec(bytes.into_inner().into_vec()))
+        .map_err(|error| {
+            DbError::Checkpoint(format!(
+                "aggregate '{op_name}' vnode checkpoint exceeded its {max_encoded_bytes}-byte limit: {error}"
             ))
         })
+}
+
+#[cfg(feature = "cluster")]
+fn encode_aligned_replay_capture(
+    op_name: &str,
+    aligned_replay: &[(u64, i64, crate::operator::RetainedBatch)],
+    max_working_bytes: usize,
+) -> Result<EncodedStateFrame, DbError> {
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(aligned_replay.len())
+        .map_err(|_| {
+            DbError::Checkpoint(format!(
+                "aligned aggregate replay checkpoint for '{op_name}' could not reserve metadata"
+            ))
+        })?;
+    let mut working_bytes = encoded
+        .capacity()
+        .checked_mul(std::mem::size_of::<(u64, i64, Vec<u8>)>())
+        .filter(|bytes| *bytes <= max_working_bytes)
+        .ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "aligned aggregate replay checkpoint for '{op_name}' metadata exceeds its {max_working_bytes}-byte working limit"
+            ))
+        })?;
+
+    for (assignment_version, watermark, batch) in aligned_replay {
+        let remaining = max_working_bytes
+            .checked_sub(working_bytes)
+            .filter(|remaining| *remaining != 0)
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "aligned aggregate replay checkpoint for '{op_name}' exhausted its {max_working_bytes}-byte working limit"
+                ))
+            })?;
+        let blob = laminar_core::serialization::serialize_batches_stream_bounded(
+            batch.batch().schema().as_ref(),
+            std::iter::once(batch.batch()),
+            remaining,
+        )
+        .map_err(|error| {
+            DbError::Checkpoint(format!(
+                "aligned aggregate replay checkpoint for '{op_name}' IPC serialization: {error}"
+            ))
+        })?;
+        working_bytes = working_bytes
+            .checked_add(blob.capacity())
+            .filter(|bytes| *bytes <= max_working_bytes)
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "aligned aggregate replay checkpoint for '{op_name}' IPC exceeds its {max_working_bytes}-byte working limit"
+                ))
+            })?;
+        encoded.push((*assignment_version, *watermark, blob));
+    }
+
+    let archive_budget = max_working_bytes
+        .checked_sub(working_bytes)
+        .ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "aligned aggregate replay checkpoint for '{op_name}' exhausted its working limit before archive serialization"
+            ))
+        })?;
+    let writer = rkyv::ser::writer::IoWriter::new(
+        laminar_core::serialization::BoundedBytesWriter::new(archive_budget),
+    );
+    rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(
+        &AggOpCheckpoint {
+            aligned_replay: encoded,
+        },
+        writer,
+    )
+    .map(|bytes| EncodedStateFrame::from_vec(bytes.into_inner().into_vec()))
+    .map_err(|error| {
+        DbError::Checkpoint(format!(
+            "aligned aggregate replay checkpoint for '{op_name}' archive serialization exceeded its {archive_budget}-byte headroom: {error}"
+        ))
+    })
 }
 
 fn is_direct_single_source_shape(query: &Query, select: &Select) -> bool {
@@ -542,7 +626,7 @@ impl SqlQueryOperator {
     ) -> Result<Vec<RecordBatch>, DbError> {
         #[cfg(feature = "cluster")]
         if !self.aligned_replay.is_empty() {
-            return self.execute_aligned_replay().await;
+            return self.execute_aligned_replay();
         }
         let QueryState::Agg(ref mut agg_state) = self.state else {
             return Err(DbError::Pipeline(
@@ -625,7 +709,7 @@ impl SqlQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
-    async fn execute_aligned_replay(&mut self) -> Result<Vec<RecordBatch>, DbError> {
+    fn execute_aligned_replay(&mut self) -> Result<Vec<RecordBatch>, DbError> {
         let Some(config) = self.cluster_shuffle.as_ref() else {
             return Err(DbError::Checkpoint(format!(
                 "aggregate '{}' has aligned shuffle replay without an active cluster scope",
@@ -938,36 +1022,136 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
-        #[cfg(feature = "cluster")]
-        let aligned_replay = self
-            .aligned_replay
-            .iter()
-            .map(|(assignment_version, watermark, batch)| {
-                laminar_core::serialization::serialize_batch_stream(batch.batch())
-                    .map(|blob| (*assignment_version, *watermark, blob))
-                    .map_err(|error| {
-                        DbError::Pipeline(format!(
-                            "aligned aggregate replay checkpoint for '{}': {error}",
-                            self.op_name
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>, DbError>>()?;
         #[cfg(not(feature = "cluster"))]
-        let aligned_replay = Vec::new();
+        return Ok(None);
 
-        if aligned_replay.is_empty() {
+        #[cfg(feature = "cluster")]
+        {
+            if self.aligned_replay.is_empty() {
+                return Ok(None);
+            }
+            let aligned_replay: Vec<(u64, i64, crate::operator::RetainedBatch)> = self
+                .aligned_replay
+                .iter()
+                .map(|(assignment_version, watermark, batch)| {
+                    (*assignment_version, *watermark, batch.clone())
+                })
+                .collect();
+            let state = encode_aligned_replay_capture(&self.op_name, &aligned_replay, usize::MAX)?;
+            Ok(Some(OperatorCheckpoint {
+                data: state.bytes().to_vec(),
+            }))
+        }
+    }
+
+    fn checkpoint_capture(
+        &mut self,
+        max_capture_bytes: u64,
+    ) -> Result<Option<StateFrameCapture>, DbError> {
+        #[cfg(not(feature = "cluster"))]
+        {
+            let _ = max_capture_bytes;
             return Ok(None);
         }
-        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&AggOpCheckpoint { aligned_replay })
-            .map(|bytes| bytes.to_vec())
-            .map_err(|error| {
-                DbError::Pipeline(format!(
-                    "checkpoint serialization for '{}': {error}",
+
+        #[cfg(feature = "cluster")]
+        {
+            if self.aligned_replay.is_empty() {
+                return Ok(None);
+            }
+
+            let batch_bytes = self
+                .aligned_replay
+                .iter()
+                .try_fold(0usize, |total, (_, _, batch)| {
+                    total.checked_add(batch.heap_bytes()?)
+                })
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "aligned aggregate replay capture for '{}' overflowed byte accounting",
+                        self.op_name
+                    ))
+                })?;
+            let requested_roster_bytes = self
+                .aligned_replay
+                .len()
+                .checked_mul(std::mem::size_of::<(
+                    u64,
+                    i64,
+                    crate::operator::RetainedBatch,
+                )>())
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "aligned aggregate replay capture for '{}' overflowed metadata accounting",
+                        self.op_name
+                    ))
+                })?;
+            let requested_bytes = batch_bytes
+                .checked_add(requested_roster_bytes)
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "aligned aggregate replay capture for '{}' overflowed byte accounting",
+                        self.op_name
+                    ))
+                })?;
+            if requested_bytes > max_capture_bytes {
+                return Err(DbError::Checkpoint(format!(
+                    "aligned aggregate replay capture for '{}' retains {requested_bytes} bytes; capture headroom is {max_capture_bytes} bytes",
                     self.op_name
-                ))
-            })?;
-        Ok(Some(OperatorCheckpoint { data }))
+                )));
+            }
+
+            let mut aligned_replay = Vec::new();
+            aligned_replay
+                .try_reserve_exact(self.aligned_replay.len())
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "aligned aggregate replay capture for '{}' could not reserve metadata",
+                        self.op_name
+                    ))
+                })?;
+            let roster_bytes = aligned_replay
+                .capacity()
+                .checked_mul(std::mem::size_of::<(
+                    u64,
+                    i64,
+                    crate::operator::RetainedBatch,
+                )>())
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "aligned aggregate replay capture for '{}' overflowed metadata accounting",
+                        self.op_name
+                    ))
+                })?;
+            let retained_bytes = batch_bytes
+                .checked_add(roster_bytes)
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .filter(|bytes| *bytes <= max_capture_bytes)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "aligned aggregate replay capture for '{}' exceeds its {max_capture_bytes}-byte capture limit",
+                        self.op_name
+                    ))
+                })?;
+            aligned_replay.extend(self.aligned_replay.iter().map(
+                |(assignment_version, watermark, batch)| {
+                    (*assignment_version, *watermark, batch.clone())
+                },
+            ));
+
+            let op_name = Arc::clone(&self.op_name);
+            Ok(Some(StateFrameCapture::deferred(
+                retained_bytes,
+                move |max_working_bytes| {
+                    encode_aligned_replay_capture(
+                        op_name.as_ref(),
+                        &aligned_replay,
+                        max_working_bytes,
+                    )
+                },
+            )))
+        }
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
@@ -1086,21 +1270,47 @@ impl GraphOperator for SqlQueryOperator {
         &mut self,
         required_vnodes: &[u32],
         vnode_count: u32,
+        max_capture_bytes: u64,
     ) -> Result<Option<Vec<CapturedVnodeState>>, DbError> {
         let QueryState::Agg(aggregate) = &mut self.state else {
             return Ok(None);
         };
-        let checkpoints = aggregate.checkpoint_vnodes(required_vnodes, vnode_count)?;
+        let checkpoints =
+            aggregate.capture_checkpoint_vnodes(required_vnodes, vnode_count, max_capture_bytes)?;
         let mut captured = Vec::with_capacity(required_vnodes.len());
+        let empty_frame = Arc::new(std::sync::OnceLock::<bytes::Bytes>::new());
         for (&vnode, checkpoint) in required_vnodes.iter().zip(checkpoints) {
             let state = match checkpoint {
-                Some(checkpoint) => match serialize_agg_cp(&checkpoint, &self.op_name) {
-                    Ok(bytes) => Some(bytes::Bytes::from(bytes)),
-                    Err(error) => {
-                        aggregate.force_full_vnode_capture();
-                        return Err(error);
-                    }
-                },
+                Some(checkpoint) => {
+                    let retained_bytes = checkpoint.retained_bytes();
+                    let empty_frame = checkpoint.is_empty().then(|| Arc::clone(&empty_frame));
+                    let op_name = Arc::clone(&self.op_name);
+                    Some(StateFrameCapture::deferred(
+                        retained_bytes,
+                        move |max_encoded_bytes| {
+                            if let Some(encoded) =
+                                empty_frame.as_ref().and_then(|frame| frame.get())
+                            {
+                                return Ok(EncodedStateFrame::shared(encoded.clone()));
+                            }
+                            let checkpoint = checkpoint.encode(max_encoded_bytes)?;
+                            let retained_serialization_bytes =
+                                checkpoint.retained_serialization_bytes()?;
+                            let archive_budget = max_encoded_bytes
+                                .checked_sub(retained_serialization_bytes)
+                                .ok_or_else(|| {
+                                    DbError::Checkpoint(format!(
+                                        "aggregate '{op_name}' intermediate checkpoint exhausted its frame budget"
+                                    ))
+                                })?;
+                            let encoded = serialize_agg_cp(&checkpoint, &op_name, archive_budget)?;
+                            if let Some(empty_frame) = empty_frame {
+                                let _ = empty_frame.set(encoded.bytes().clone());
+                            }
+                            Ok(encoded)
+                        },
+                    ))
+                }
                 None => None,
             };
             captured.push(CapturedVnodeState { vnode, state });
@@ -1398,10 +1608,55 @@ mod checkpoint_tests {
         assert_eq!(populated_accounting.retired, 0);
         assert!(operator.checkpoint().unwrap().is_none());
         let captured = operator
-            .checkpoint_vnodes(&(0..8).collect::<Vec<_>>(), 8)
+            .checkpoint_vnodes(&(0..8).collect::<Vec<_>>(), 8, u64::MAX)
             .unwrap()
             .unwrap();
         assert!(captured.iter().all(|frame| frame.state.is_some()));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn aligned_replay_checkpoint_capture_is_deferred_and_bounded() {
+        let (context, batch) = context_and_batch();
+        let mut operator = SqlQueryOperator::new(
+            "sum",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            false,
+        );
+        operator.aligned_replay.push_back((
+            7,
+            123,
+            crate::operator::RetainedBatch::local(batch.clone()),
+        ));
+
+        let error = operator.checkpoint_capture(0).unwrap_err();
+        assert!(error.to_string().contains("capture headroom"));
+
+        let capture = operator
+            .checkpoint_capture(1 << 20)
+            .unwrap()
+            .expect("replay state must be captured");
+        let mut staged_bytes = capture.retained_bytes();
+        let encoded = capture.materialize(&mut staged_bytes, 1 << 20).unwrap();
+
+        let (restored_context, _) = context_and_batch();
+        let mut restored = SqlQueryOperator::new(
+            "sum",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            restored_context,
+            None,
+            false,
+        );
+        restored
+            .restore(OperatorCheckpoint {
+                data: encoded.to_vec(),
+            })
+            .unwrap();
+        let (assignment, watermark, restored_batch) = restored.aligned_replay.front().unwrap();
+        assert_eq!((*assignment, *watermark), (7, 123));
+        assert_eq!(restored_batch.batch(), &batch);
     }
 
     #[tokio::test]
@@ -1576,10 +1831,13 @@ mod checkpoint_tests {
         donor.initialize_managed_state().await.unwrap();
         donor.process(&[vec![batch]], &[100]).await.unwrap();
         let owned = (0..8).collect::<Vec<_>>();
-        let baseline = donor.checkpoint_vnodes(&owned, 8).unwrap().unwrap();
+        let baseline = donor
+            .checkpoint_vnodes(&owned, 8, u64::MAX)
+            .unwrap()
+            .unwrap();
         assert!(baseline.iter().all(|frame| frame.state.is_some()));
         assert!(donor
-            .checkpoint_vnodes(&owned, 8)
+            .checkpoint_vnodes(&owned, 8, u64::MAX)
             .unwrap()
             .unwrap()
             .iter()
@@ -1595,9 +1853,10 @@ mod checkpoint_tests {
         );
         restored.initialize_managed_state().await.unwrap();
         for frame in baseline {
-            restored
-                .restore_vnode(frame.vnode, 8, frame.state.as_deref().unwrap())
-                .unwrap();
+            let capture = frame.state.unwrap();
+            let mut staged_bytes = capture.retained_bytes();
+            let state = capture.materialize(&mut staged_bytes, u64::MAX).unwrap();
+            restored.restore_vnode(frame.vnode, 8, &state).unwrap();
         }
         let QueryState::Agg(aggregate) = &mut restored.state else {
             panic!("expected restored aggregate state");
@@ -1606,7 +1865,7 @@ mod checkpoint_tests {
 
         donor.force_full_vnode_capture();
         assert!(donor
-            .checkpoint_vnodes(&owned, 8)
+            .checkpoint_vnodes(&owned, 8, u64::MAX)
             .unwrap()
             .unwrap()
             .iter()

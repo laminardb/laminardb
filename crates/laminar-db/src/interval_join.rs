@@ -43,7 +43,7 @@ pub(crate) struct IntervalJoinOutputBudget {
 // Conservative allocator-independent charges. The B-tree charge covers a sparsely populated
 // internal node (including spare key/value slots and child edges), while the hash charge covers
 // bucket slack and control bytes. These are budget charges, not an allocator/RSS measurement.
-const HEAP_ALLOCATION_CHARGE: usize = 32;
+pub(crate) const HEAP_ALLOCATION_CHARGE: usize = 32;
 const HASH_BUCKET_CHARGE: usize = 128;
 const BTREE_TIMESTAMP_CHARGE: usize = 512;
 const BATCH_METADATA_CHARGE: usize = 256;
@@ -77,6 +77,10 @@ fn position_vector_charge(capacity: usize) -> usize {
         .saturating_add(capacity.saturating_mul(std::mem::size_of::<(usize, usize)>()))
 }
 
+fn mark_row_flag(row_flags: &mut [Arc<[u8]>], batch: usize, row: usize, flag: u8) {
+    Arc::make_mut(&mut row_flags[batch])[row] |= flag;
+}
+
 fn insert_index_position(
     index: &mut SideIndex,
     index_entry_bytes: &mut usize,
@@ -89,8 +93,7 @@ fn insert_index_position(
     let timestamps = index.entry(key_hash).or_default();
     match timestamps.entry(timestamp) {
         Entry::Vacant(entry) => {
-            let mut positions = Vec::new();
-            positions.push(position);
+            let positions = vec![position];
             *index_entry_bytes = index_entry_bytes
                 .saturating_add(BTREE_TIMESTAMP_CHARGE)
                 .saturating_add(position_vector_charge(positions.capacity()));
@@ -192,8 +195,10 @@ fn logical_row_bytes(batch: &RecordBatch) -> Result<Vec<usize>, DbError> {
             }
         };
         let offset_bytes = match column.data_type() {
-            DataType::LargeUtf8 | DataType::LargeBinary => 16,
-            DataType::Utf8View | DataType::BinaryView => 16,
+            DataType::LargeUtf8
+            | DataType::LargeBinary
+            | DataType::Utf8View
+            | DataType::BinaryView => 16,
             _ => 8,
         };
         for (row, length) in bytes.iter_mut().zip(lengths) {
@@ -269,13 +274,47 @@ pub(crate) struct JoinStateCheckpoint {
 
 impl JoinStateCheckpoint {
     pub(crate) fn retained_ipc_bytes(&self) -> Result<usize, DbError> {
+        let roster_bytes = [
+            self.left_batches
+                .capacity()
+                .checked_mul(std::mem::size_of::<Vec<u8>>()),
+            self.right_batches
+                .capacity()
+                .checked_mul(std::mem::size_of::<Vec<u8>>()),
+            self.left_row_flags
+                .capacity()
+                .checked_mul(std::mem::size_of::<Vec<u8>>()),
+            self.right_row_flags
+                .capacity()
+                .checked_mul(std::mem::size_of::<Vec<u8>>()),
+            self.left_keys
+                .capacity()
+                .checked_mul(std::mem::size_of::<String>()),
+            self.right_keys
+                .capacity()
+                .checked_mul(std::mem::size_of::<String>()),
+        ]
+        .into_iter()
+        .try_fold(0usize, |total, bytes| {
+            total
+                .checked_add(bytes.ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "interval join checkpoint roster accounting overflow".into(),
+                    )
+                })?)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "interval join checkpoint roster accounting overflow".into(),
+                    )
+                })
+        })?;
         let payload = self
             .left_batches
             .iter()
             .chain(&self.right_batches)
             .chain(&self.left_row_flags)
             .chain(&self.right_row_flags)
-            .try_fold(0usize, |total, batch| {
+            .try_fold(roster_bytes, |total, batch| {
                 total.checked_add(batch.capacity()).ok_or_else(|| {
                     DbError::Checkpoint(
                         "interval join checkpoint retained IPC accounting overflow".into(),
@@ -302,6 +341,469 @@ impl JoinStateCheckpoint {
     }
 }
 
+pub(crate) struct IntervalJoinCheckpointCapture {
+    config: StreamJoinConfig,
+    bound_ms: i64,
+    left_buffer_rows: u64,
+    right_buffer_rows: u64,
+    left_batches: Vec<RecordBatch>,
+    right_batches: Vec<RecordBatch>,
+    left_evicted_cutoff: i64,
+    right_evicted_cutoff: i64,
+    left_row_flags: Vec<Arc<[u8]>>,
+    right_row_flags: Vec<Arc<[u8]>>,
+    left_needs_compaction: bool,
+    right_needs_compaction: bool,
+    retained_bytes: usize,
+}
+
+impl IntervalJoinCheckpointCapture {
+    pub(crate) const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    fn calculate_retained_bytes(&self) -> usize {
+        fn allocation(bytes: usize) -> usize {
+            bytes.saturating_add(if bytes == 0 {
+                0
+            } else {
+                HEAP_ALLOCATION_CHARGE
+            })
+        }
+
+        fn roster<T>(capacity: usize) -> usize {
+            allocation(capacity.saturating_mul(std::mem::size_of::<T>()))
+        }
+
+        fn batch_side(
+            batches: &[RecordBatch],
+            batch_capacity: usize,
+            row_flags: &[Arc<[u8]>],
+            flag_capacity: usize,
+        ) -> usize {
+            batches
+                .iter()
+                .fold(roster::<RecordBatch>(batch_capacity), |bytes, batch| {
+                    bytes
+                        .saturating_add(batch.get_array_memory_size())
+                        .saturating_add(batch_metadata_charge(batch))
+                })
+                .saturating_add(roster::<Arc<[u8]>>(flag_capacity))
+                .saturating_add(row_flags.iter().fold(0usize, |bytes, flags| {
+                    bytes.saturating_add(allocation(flags.len()))
+                }))
+        }
+
+        fn string_vector(values: &[String], capacity: usize) -> usize {
+            values
+                .iter()
+                .fold(roster::<String>(capacity), |bytes, value| {
+                    bytes.saturating_add(allocation(value.capacity()))
+                })
+        }
+
+        let mut bytes = std::mem::size_of::<Self>();
+        bytes = bytes
+            .saturating_add(string_vector(
+                &self.config.left_keys,
+                self.config.left_keys.capacity(),
+            ))
+            .saturating_add(string_vector(
+                &self.config.right_keys,
+                self.config.right_keys.capacity(),
+            ));
+        for value in [
+            &self.config.left_time_column,
+            &self.config.right_time_column,
+            &self.config.left_table,
+            &self.config.right_table,
+        ] {
+            bytes = bytes.saturating_add(allocation(value.capacity()));
+        }
+        bytes
+            .saturating_add(batch_side(
+                &self.left_batches,
+                self.left_batches.capacity(),
+                &self.left_row_flags,
+                self.left_row_flags.capacity(),
+            ))
+            .saturating_add(batch_side(
+                &self.right_batches,
+                self.right_batches.capacity(),
+                &self.right_row_flags,
+                self.right_row_flags.capacity(),
+            ))
+    }
+
+    pub(crate) fn encode(self, max_encoded_bytes: usize) -> Result<JoinStateCheckpoint, DbError> {
+        type EncodedSide = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+        fn encode_side(
+            side: &str,
+            batches: &[RecordBatch],
+            captured_flags: &[Arc<[u8]>],
+            needs_compaction: bool,
+            key_columns: &[String],
+            time_column: &str,
+            evicted_cutoff: i64,
+            retain_null_tuples: bool,
+            expected_rows: u64,
+            remaining: &mut usize,
+        ) -> Result<EncodedSide, DbError> {
+            if batches.len() != captured_flags.len() {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join {side} checkpoint flag roster does not match its batch roster"
+                )));
+            }
+            let mut encoded = Vec::new();
+            encoded.try_reserve_exact(batches.len()).map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "interval join {side} checkpoint batch roster cannot be reserved"
+                ))
+            })?;
+            let mut row_flags = Vec::new();
+            row_flags
+                .try_reserve_exact(captured_flags.len())
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint flag roster cannot be reserved"
+                    ))
+                })?;
+            let roster_bytes = encoded
+                .capacity()
+                .checked_mul(std::mem::size_of::<Vec<u8>>())
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        row_flags
+                            .capacity()
+                            .checked_mul(std::mem::size_of::<Vec<u8>>())?,
+                    )
+                })
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint roster accounting overflow"
+                    ))
+                })?;
+            *remaining = remaining.checked_sub(roster_bytes).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join {side} checkpoint roster exceeded its cumulative checkpoint byte limit"
+                ))
+            })?;
+
+            let mut encoded_rows = 0_u64;
+            for (batch, captured_flags) in batches.iter().zip(captured_flags) {
+                if batch.num_rows() == 0 || captured_flags.len() != batch.num_rows() {
+                    return Err(DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint batch shape is invalid"
+                    )));
+                }
+                let (compacted, flags) = if needs_compaction {
+                    let scan_bytes = batch
+                        .num_rows()
+                        .checked_mul(2 * std::mem::size_of::<i64>() + std::mem::size_of::<u32>())
+                        .and_then(|bytes| {
+                            bytes.checked_add(
+                                key_columns
+                                    .len()
+                                    .checked_mul(std::mem::size_of::<KeyColumn<'_>>())?,
+                            )
+                        })
+                        .and_then(|bytes| bytes.checked_add(3 * HEAP_ALLOCATION_CHARGE))
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "interval join {side} checkpoint compaction accounting overflow"
+                            ))
+                        })?;
+                    if scan_bytes > *remaining {
+                        return Err(DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint compaction requires {scan_bytes} bytes; remaining limit is {} bytes",
+                            *remaining
+                        )));
+                    }
+                    let timestamps =
+                        extract_column_as_timestamps(batch, time_column).map_err(|error| {
+                            DbError::Checkpoint(format!(
+                                "interval join {side} checkpoint time column: {error}"
+                            ))
+                        })?;
+                    let keys = extract_key_columns(batch, key_columns).map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint key columns: {error}"
+                        ))
+                    })?;
+                    let mut selected = Vec::<u32>::new();
+                    selected.try_reserve_exact(batch.num_rows()).map_err(|_| {
+                        DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint selection cannot be reserved"
+                        ))
+                    })?;
+                    for (row, (&timestamp, &flag)) in
+                        timestamps.iter().zip(captured_flags.iter()).enumerate()
+                    {
+                        if flag & !(ROW_MATCHED | ROW_EMITTED) != 0 {
+                            return Err(DbError::Checkpoint(format!(
+                                "interval join {side} checkpoint has invalid per-row match state"
+                            )));
+                        }
+                        if timestamp >= evicted_cutoff
+                            && (retain_null_tuples || keys.iter().all(|key| !key.is_null(row)))
+                        {
+                            selected.push(u32::try_from(row).map_err(|_| {
+                                DbError::Checkpoint(format!(
+                                    "interval join {side} checkpoint row index exceeds u32"
+                                ))
+                            })?);
+                        }
+                    }
+                    if selected.is_empty() {
+                        continue;
+                    }
+                    let scan_retained = timestamps
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<i64>())
+                        .and_then(|bytes| {
+                            bytes.checked_add(
+                                selected
+                                    .capacity()
+                                    .checked_mul(std::mem::size_of::<u32>())?,
+                            )
+                        })
+                        .and_then(|bytes| {
+                            bytes.checked_add(
+                                keys.capacity()
+                                    .checked_mul(std::mem::size_of::<KeyColumn<'_>>())?,
+                            )
+                        })
+                        .and_then(|bytes| bytes.checked_add(3 * HEAP_ALLOCATION_CHARGE))
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "interval join {side} checkpoint scan accounting overflow"
+                            ))
+                        })?;
+                    let flag_headroom = remaining.checked_sub(scan_retained).ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint scan exceeded its remaining byte limit"
+                        ))
+                    })?;
+                    if selected.len() > flag_headroom {
+                        return Err(DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint flags exceed the remaining byte limit"
+                        )));
+                    }
+                    let mut flags = Vec::new();
+                    flags.try_reserve_exact(selected.len()).map_err(|_| {
+                        DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint flags cannot be reserved"
+                        ))
+                    })?;
+                    let scratch_headroom = remaining
+                        .checked_sub(flags.capacity())
+                        .and_then(|bytes| bytes.checked_sub(scan_retained))
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "interval join {side} checkpoint scan exceeded its remaining byte limit"
+                            ))
+                        })?;
+                    flags.extend(selected.iter().map(|row| captured_flags[*row as usize]));
+                    let compacted = if selected.len() == batch.num_rows() {
+                        None
+                    } else {
+                        let upper_bound = batch
+                            .get_array_memory_size()
+                            .checked_add(batch_metadata_charge(batch))
+                            .ok_or_else(|| {
+                                DbError::Checkpoint(format!(
+                                    "interval join {side} checkpoint compaction accounting overflow"
+                                ))
+                            })?;
+                        if upper_bound > scratch_headroom {
+                            return Err(DbError::Checkpoint(format!(
+                                "interval join {side} checkpoint compaction requires up to {upper_bound} bytes; scratch headroom is {scratch_headroom} bytes"
+                            )));
+                        }
+                        let indices = arrow::array::UInt32Array::from(selected);
+                        let columns = batch
+                            .columns()
+                            .iter()
+                            .map(|column| arrow::compute::take(column.as_ref(), &indices, None))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|error| {
+                                DbError::query_pipeline_arrow(
+                                    "interval join checkpoint compaction",
+                                    &error,
+                                )
+                            })?;
+                        Some(
+                            RecordBatch::try_new(batch.schema(), columns).map_err(|error| {
+                                DbError::query_pipeline_arrow(
+                                    "interval join checkpoint compacted batch",
+                                    &error,
+                                )
+                            })?,
+                        )
+                    };
+                    (compacted, flags)
+                } else {
+                    if captured_flags
+                        .iter()
+                        .any(|flag| flag & !(ROW_MATCHED | ROW_EMITTED) != 0)
+                    {
+                        return Err(DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint has invalid per-row match state"
+                        )));
+                    }
+                    if captured_flags.len() > *remaining {
+                        return Err(DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint flags exceed the remaining byte limit"
+                        )));
+                    }
+                    let mut flags = Vec::new();
+                    flags.try_reserve_exact(captured_flags.len()).map_err(|_| {
+                        DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint flags cannot be reserved"
+                        ))
+                    })?;
+                    flags.extend_from_slice(captured_flags);
+                    (None, flags)
+                };
+                *remaining = remaining.checked_sub(flags.capacity()).ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint flag accounting overflow"
+                    ))
+                })?;
+                encoded_rows = encoded_rows
+                    .checked_add(u64::try_from(flags.len()).map_err(|_| {
+                        DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint row count exceeds u64"
+                        ))
+                    })?)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint row-count overflow"
+                        ))
+                    })?;
+                let batch = compacted.as_ref().unwrap_or(batch);
+                let scratch_bytes = compacted.as_ref().map_or(0, |batch| {
+                    batch
+                        .get_array_memory_size()
+                        .saturating_add(batch_metadata_charge(batch))
+                });
+                let serialization_limit = remaining.checked_sub(scratch_bytes).ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint compacted batch exceeds its remaining byte limit"
+                    ))
+                })?;
+                let ipc = laminar_core::serialization::serialize_batches_stream_bounded(
+                    batch.schema().as_ref(),
+                    std::iter::once(batch),
+                    serialization_limit,
+                )
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "interval join {side} batch serialization within the cumulative checkpoint limit: {error}"
+                    ))
+                })?;
+                *remaining = remaining.checked_sub(ipc.capacity()).ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "interval join checkpoint encoded byte accounting overflow".into(),
+                    )
+                })?;
+                encoded.push(ipc);
+                row_flags.push(flags);
+            }
+            if encoded_rows != expected_rows {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join {side} checkpoint row-count mismatch: expected {expected_rows}, encoded {encoded_rows}"
+                )));
+            }
+            Ok((encoded, row_flags))
+        }
+
+        let config_bytes = self
+            .config
+            .left_keys
+            .iter()
+            .chain(&self.config.right_keys)
+            .map(String::capacity)
+            .chain([
+                self.config.left_time_column.capacity(),
+                self.config.right_time_column.capacity(),
+                self.config.left_table.capacity(),
+                self.config.right_table.capacity(),
+            ])
+            .try_fold(0usize, usize::checked_add)
+            .and_then(|total| {
+                total.checked_add(
+                    self.config
+                        .left_keys
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<String>())?,
+                )
+            })
+            .and_then(|total| {
+                total.checked_add(
+                    self.config
+                        .right_keys
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<String>())?,
+                )
+            })
+            .ok_or_else(|| {
+                DbError::Checkpoint(
+                    "interval join checkpoint configuration accounting overflow".into(),
+                )
+            })?;
+        let mut remaining = max_encoded_bytes.checked_sub(config_bytes).ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "interval join retained configuration exceeds its {max_encoded_bytes}-byte checkpoint limit"
+            ))
+        })?;
+        let (left_batches, left_row_flags) = encode_side(
+            "left",
+            &self.left_batches,
+            &self.left_row_flags,
+            self.left_needs_compaction,
+            &self.config.left_keys,
+            &self.config.left_time_column,
+            self.left_evicted_cutoff,
+            retain_left_null_tuples(self.config.join_type),
+            self.left_buffer_rows,
+            &mut remaining,
+        )?;
+        let (right_batches, right_row_flags) = encode_side(
+            "right",
+            &self.right_batches,
+            &self.right_row_flags,
+            self.right_needs_compaction,
+            &self.config.right_keys,
+            &self.config.right_time_column,
+            self.right_evicted_cutoff,
+            retain_right_null_tuples(self.config.join_type),
+            self.right_buffer_rows,
+            &mut remaining,
+        )?;
+
+        Ok(JoinStateCheckpoint {
+            join_type: join_type_tag(self.config.join_type),
+            left_keys: self.config.left_keys,
+            right_keys: self.config.right_keys,
+            left_time_column: self.config.left_time_column,
+            right_time_column: self.config.right_time_column,
+            left_table: self.config.left_table,
+            right_table: self.config.right_table,
+            bound_ms: self.bound_ms,
+            left_buffer_rows: self.left_buffer_rows,
+            right_buffer_rows: self.right_buffer_rows,
+            left_batches,
+            right_batches,
+            left_evicted_cutoff: self.left_evicted_cutoff,
+            right_evicted_cutoff: self.right_evicted_cutoff,
+            left_row_flags,
+            right_row_flags,
+        })
+    }
+}
+
 pub(crate) const fn join_type_tag(join_type: JoinType) -> u8 {
     match join_type {
         JoinType::Inner => 0,
@@ -324,7 +826,7 @@ pub(crate) struct SideState {
     retained_batch_bytes: usize,
     retained_batch_metadata_bytes: usize,
     row_bytes: Vec<Vec<usize>>,
-    row_flags: Vec<Vec<u8>>,
+    row_flags: Vec<Arc<[u8]>>,
     row_size_vector_bytes: usize,
     index_entry_bytes: usize,
 }
@@ -398,7 +900,7 @@ impl SideState {
             .saturating_add(position_vector_charge(row_bytes.capacity()));
         self.batches.push(batch.clone());
         self.row_bytes.push(row_bytes);
-        self.row_flags.push(vec![0; batch.num_rows()]);
+        self.row_flags.push(Arc::from(vec![0; batch.num_rows()]));
         Ok(true)
     }
 
@@ -559,7 +1061,7 @@ impl SideState {
         self.row_size_vector_bytes = position_vector_charge(row_bytes.capacity());
         self.batches = vec![compacted];
         self.row_bytes = vec![row_bytes];
-        self.row_flags = vec![replacement_flags];
+        self.row_flags = vec![Arc::from(replacement_flags)];
         self.index = replacement_index;
         self.index_entry_bytes = replacement_index_entry_bytes;
         self.row_count = replacement_rows;
@@ -589,14 +1091,16 @@ impl SideState {
             .saturating_add(
                 self.row_flags
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<Vec<u8>>()),
+                    .saturating_mul(std::mem::size_of::<Arc<[u8]>>()),
             )
             .saturating_add(
                 usize::from(self.row_flags.capacity() > 0).saturating_mul(HEAP_ALLOCATION_CHARGE),
             )
-            .saturating_add(self.row_flags.iter().fold(0usize, |bytes, flags| {
-                bytes.saturating_add(flags.capacity())
-            }))
+            .saturating_add(
+                self.row_flags
+                    .iter()
+                    .fold(0usize, |bytes, flags| bytes.saturating_add(flags.len())),
+            )
             .saturating_add(self.index.capacity().saturating_mul(HASH_BUCKET_CHARGE))
             .saturating_add(
                 usize::from(self.index.capacity() > 0).saturating_mul(HEAP_ALLOCATION_CHARGE),
@@ -615,7 +1119,7 @@ impl SideState {
                     .checked_add(batch.get_array_memory_size())
                     .and_then(|total| total.checked_add(batch_metadata_charge(batch)))
                     .and_then(|total| total.checked_add(batch.num_rows()))
-                    .and_then(|total| total.checked_add(std::mem::size_of::<Vec<u8>>()))
+                    .and_then(|total| total.checked_add(std::mem::size_of::<Arc<[u8]>>()))
                     .and_then(|total| total.checked_add(HEAP_ALLOCATION_CHARGE))
                     .ok_or_else(|| {
                         DbError::BackpressureFail(
@@ -728,9 +1232,12 @@ impl IntervalJoinState {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) const fn buffered_rows(&self) -> (usize, usize) {
         (self.left.row_count, self.right.row_count)
+    }
+
+    pub(crate) const fn evicted_cutoffs(&self) -> (i64, i64) {
+        (self.left_evicted_cutoff, self.right_evicted_cutoff)
     }
 
     pub(crate) fn seed_input_schemas(
@@ -917,10 +1424,10 @@ impl IntervalJoinState {
                 output_budget,
             )?;
             for (batch, row) in emitted_left {
-                self.left.row_flags[batch][row] |= ROW_EMITTED;
+                mark_row_flag(&mut self.left.row_flags, batch, row, ROW_EMITTED);
             }
             for (batch, row) in emitted_right {
-                self.right.row_flags[batch][row] |= ROW_EMITTED;
+                mark_row_flag(&mut self.right.row_flags, batch, row, ROW_EMITTED);
             }
         }
 
@@ -994,122 +1501,99 @@ impl IntervalJoinState {
         Ok(())
     }
 
-    /// Removes dead rows before serialization; already-dense batches are encoded in place.
-    pub(crate) fn snapshot_checkpoint(
-        &mut self,
+    pub(crate) fn capture_checkpoint(
+        &self,
         config: &StreamJoinConfig,
-        max_encoded_bytes: usize,
-    ) -> Result<JoinStateCheckpoint, DbError> {
-        if !self.left.batches.is_empty() && !self.left.is_compact() {
-            self.left
-                .compact(&config.left_keys, &config.left_time_column)?;
-        }
-        if !self.right.batches.is_empty() && !self.right.is_compact() {
-            self.right
-                .compact(&config.right_keys, &config.right_time_column)?;
-        }
+    ) -> Result<IntervalJoinCheckpointCapture, DbError> {
+        type CapturedSide = (Vec<RecordBatch>, Vec<Arc<[u8]>>, u64);
 
-        fn encode_side(
-            side: &str,
-            batches: &[RecordBatch],
-            remaining: &mut usize,
-        ) -> Result<Vec<Vec<u8>>, DbError> {
-            let mut encoded = Vec::new();
-            encoded.try_reserve_exact(batches.len()).map_err(|_| {
-                DbError::Checkpoint(format!(
-                    "interval join {side} checkpoint batch roster cannot be reserved"
-                ))
-            })?;
-            for batch in batches {
+        fn capture_side(side: &str, state: &SideState) -> Result<CapturedSide, DbError> {
+            if state.batches.len() != state.row_flags.len() {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join {side} checkpoint flag roster does not match its batch roster"
+                )));
+            }
+            let mut retained_rows = 0usize;
+            for (batch, flags) in state.batches.iter().zip(&state.row_flags) {
                 if batch.num_rows() == 0 {
-                    continue;
+                    return Err(DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint contains an empty batch"
+                    )));
                 }
-                let ipc = laminar_core::serialization::serialize_batches_stream_bounded(
-                    batch.schema().as_ref(),
-                    std::iter::once(batch),
-                    *remaining,
-                )
-                .map_err(|error| {
+                if flags.len() != batch.num_rows() {
+                    return Err(DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint flag length does not match its batch"
+                    )));
+                }
+                retained_rows = retained_rows.checked_add(batch.num_rows()).ok_or_else(|| {
                     DbError::Checkpoint(format!(
-                        "interval join {side} batch serialization within the cumulative checkpoint limit: {error}"
+                        "interval join {side} checkpoint row-count overflow"
                     ))
                 })?;
-                *remaining = remaining.checked_sub(ipc.capacity()).ok_or_else(|| {
-                    DbError::Checkpoint(
-                        "interval join checkpoint encoded byte accounting overflow".into(),
-                    )
-                })?;
-                encoded.push(ipc);
             }
-            Ok(encoded)
+            if retained_rows != state.retained_rows || state.row_count > retained_rows {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join {side} checkpoint row-count metadata is inconsistent"
+                )));
+            }
+            let rows = u64::try_from(state.row_count).map_err(|_| {
+                DbError::Checkpoint(format!("interval join {side} row count does not fit u64"))
+            })?;
+            let mut batches = Vec::new();
+            batches
+                .try_reserve_exact(state.batches.len())
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint batch roster cannot be reserved"
+                    ))
+                })?;
+            batches.extend(state.batches.iter().cloned());
+            let mut row_flags = Vec::new();
+            row_flags
+                .try_reserve_exact(state.row_flags.len())
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint flag roster cannot be reserved"
+                    ))
+                })?;
+            row_flags.extend(state.row_flags.iter().cloned());
+            Ok((batches, row_flags, rows))
         }
 
-        let config_bytes = config
-            .left_keys
-            .iter()
-            .chain(&config.right_keys)
-            .map(String::capacity)
-            .chain([
-                config.left_time_column.capacity(),
-                config.right_time_column.capacity(),
-                config.left_table.capacity(),
-                config.right_table.capacity(),
-            ])
-            .try_fold(0usize, |total, bytes| total.checked_add(bytes))
-            .ok_or_else(|| {
-                DbError::Checkpoint(
-                    "interval join checkpoint configuration accounting overflow".into(),
-                )
-            })?;
-        let flag_bytes = self
-            .left
-            .row_flags
-            .iter()
-            .chain(&self.right.row_flags)
-            .try_fold(0usize, |total, flags| total.checked_add(flags.capacity()))
-            .ok_or_else(|| {
-                DbError::Checkpoint("interval join checkpoint flag accounting overflow".into())
-            })?;
-        let retained_metadata = config_bytes.checked_add(flag_bytes).ok_or_else(|| {
-            DbError::Checkpoint("interval join checkpoint metadata accounting overflow".into())
-        })?;
-        let mut remaining = max_encoded_bytes.checked_sub(retained_metadata).ok_or_else(|| {
-            DbError::Checkpoint(format!(
-                "interval join retained metadata exceeds its {max_encoded_bytes}-byte checkpoint limit"
-            ))
-        })?;
         let bound_ms = i64::try_from(config.time_bound.as_millis()).map_err(|_| {
             DbError::InvalidOperation(
                 "interval join time bound exceeds the supported millisecond range".into(),
             )
         })?;
-        let left_batches_ipc = encode_side("left", &self.left.batches, &mut remaining)?;
-        let right_batches_ipc = encode_side("right", &self.right.batches, &mut remaining)?;
-
-        let left_buffer_rows = u64::try_from(self.left.row_count).map_err(|_| {
-            DbError::Checkpoint("interval join left row count does not fit u64".into())
-        })?;
-        let right_buffer_rows = u64::try_from(self.right.row_count).map_err(|_| {
-            DbError::Checkpoint("interval join right row count does not fit u64".into())
-        })?;
-        Ok(JoinStateCheckpoint {
-            join_type: join_type_tag(config.join_type),
-            left_keys: config.left_keys.clone(),
-            right_keys: config.right_keys.clone(),
-            left_time_column: config.left_time_column.clone(),
-            right_time_column: config.right_time_column.clone(),
-            left_table: config.left_table.clone(),
-            right_table: config.right_table.clone(),
+        let (left_batches, left_row_flags, left_buffer_rows) = capture_side("left", &self.left)?;
+        let (right_batches, right_row_flags, right_buffer_rows) =
+            capture_side("right", &self.right)?;
+        let mut capture = IntervalJoinCheckpointCapture {
+            config: config.clone(),
             bound_ms,
             left_buffer_rows,
             right_buffer_rows,
-            left_batches: left_batches_ipc,
-            right_batches: right_batches_ipc,
+            left_batches,
+            right_batches,
             left_evicted_cutoff: self.left_evicted_cutoff,
             right_evicted_cutoff: self.right_evicted_cutoff,
-            left_row_flags: self.left.row_flags.clone(),
-            right_row_flags: self.right.row_flags.clone(),
-        })
+            left_row_flags,
+            right_row_flags,
+            left_needs_compaction: !self.left.is_compact(),
+            right_needs_compaction: !self.right.is_compact(),
+            retained_bytes: 0,
+        };
+        capture.retained_bytes = capture.calculate_retained_bytes();
+        Ok(capture)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_checkpoint(
+        &mut self,
+        config: &StreamJoinConfig,
+        max_encoded_bytes: usize,
+    ) -> Result<JoinStateCheckpoint, DbError> {
+        self.capture_checkpoint(config)?.encode(max_encoded_bytes)
     }
 
     /// Restores from a checkpoint, rebuilding the index from deserialized batches.
@@ -1118,63 +1602,6 @@ impl IntervalJoinState {
         config: &StreamJoinConfig,
         max_state_bytes: usize,
     ) -> Result<Self, DbError> {
-        if max_state_bytes == 0 {
-            return Err(DbError::Checkpoint(
-                "interval join restore state limit must be greater than zero".into(),
-            ));
-        }
-        let bound_ms = i64::try_from(config.time_bound.as_millis()).map_err(|_| {
-            DbError::Checkpoint(
-                "interval join configured time bound exceeds the supported millisecond range"
-                    .into(),
-            )
-        })?;
-        if cp.join_type != join_type_tag(config.join_type)
-            || cp.left_keys != config.left_keys
-            || cp.right_keys != config.right_keys
-            || cp.left_time_column != config.left_time_column
-            || cp.right_time_column != config.right_time_column
-            || cp.left_table != config.left_table
-            || cp.right_table != config.right_table
-            || cp.bound_ms != bound_ms
-        {
-            return Err(DbError::Checkpoint(
-                "interval join checkpoint configuration does not match the restored operator"
-                    .into(),
-            ));
-        }
-        let expected_left = usize::try_from(cp.left_buffer_rows).map_err(|_| {
-            DbError::Checkpoint("interval join left row count does not fit usize".into())
-        })?;
-        let expected_right = usize::try_from(cp.right_buffer_rows).map_err(|_| {
-            DbError::Checkpoint("interval join right row count does not fit usize".into())
-        })?;
-        let expected_rows = expected_left.checked_add(expected_right).ok_or_else(|| {
-            DbError::Checkpoint("interval join checkpoint row-count overflow".into())
-        })?;
-        let worst_case_row_bytes = expected_rows
-            .checked_mul(RESTORE_WORST_CASE_ROW_CHARGE)
-            .ok_or_else(|| {
-                DbError::Checkpoint(
-                    "interval join checkpoint worst-case row accounting overflow".into(),
-                )
-            })?;
-        if worst_case_row_bytes > max_state_bytes {
-            return Err(DbError::Checkpoint(format!(
-                "interval join checkpoint declares {expected_rows} rows whose worst-case decoded index charge exceeds the {max_state_bytes}-byte restore limit"
-            )));
-        }
-        for (side, batch_count, expected) in [
-            ("left", cp.left_batches.len(), expected_left),
-            ("right", cp.right_batches.len(), expected_right),
-        ] {
-            if batch_count > expected {
-                return Err(DbError::Checkpoint(format!(
-                    "interval join {side} checkpoint has {batch_count} non-empty batches for {expected} rows"
-                )));
-            }
-        }
-
         fn decode_side(
             side: &str,
             ipc_batches: &[Vec<u8>],
@@ -1262,6 +1689,63 @@ impl IntervalJoinState {
             Ok(decoded)
         }
 
+        if max_state_bytes == 0 {
+            return Err(DbError::Checkpoint(
+                "interval join restore state limit must be greater than zero".into(),
+            ));
+        }
+        let bound_ms = i64::try_from(config.time_bound.as_millis()).map_err(|_| {
+            DbError::Checkpoint(
+                "interval join configured time bound exceeds the supported millisecond range"
+                    .into(),
+            )
+        })?;
+        if cp.join_type != join_type_tag(config.join_type)
+            || cp.left_keys != config.left_keys
+            || cp.right_keys != config.right_keys
+            || cp.left_time_column != config.left_time_column
+            || cp.right_time_column != config.right_time_column
+            || cp.left_table != config.left_table
+            || cp.right_table != config.right_table
+            || cp.bound_ms != bound_ms
+        {
+            return Err(DbError::Checkpoint(
+                "interval join checkpoint configuration does not match the restored operator"
+                    .into(),
+            ));
+        }
+        let expected_left = usize::try_from(cp.left_buffer_rows).map_err(|_| {
+            DbError::Checkpoint("interval join left row count does not fit usize".into())
+        })?;
+        let expected_right = usize::try_from(cp.right_buffer_rows).map_err(|_| {
+            DbError::Checkpoint("interval join right row count does not fit usize".into())
+        })?;
+        let expected_rows = expected_left.checked_add(expected_right).ok_or_else(|| {
+            DbError::Checkpoint("interval join checkpoint row-count overflow".into())
+        })?;
+        let worst_case_row_bytes = expected_rows
+            .checked_mul(RESTORE_WORST_CASE_ROW_CHARGE)
+            .ok_or_else(|| {
+                DbError::Checkpoint(
+                    "interval join checkpoint worst-case row accounting overflow".into(),
+                )
+            })?;
+        if worst_case_row_bytes > max_state_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "interval join checkpoint declares {expected_rows} rows whose worst-case decoded index charge exceeds the {max_state_bytes}-byte restore limit"
+            )));
+        }
+        for (side, batch_count, expected) in [
+            ("left", cp.left_batches.len(), expected_left),
+            ("right", cp.right_batches.len(), expected_right),
+        ] {
+            if batch_count > expected {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join {side} checkpoint has {batch_count} non-empty batches for {expected} rows"
+                )));
+            }
+        }
+
         let mut decoded_charge = std::mem::size_of::<Self>();
         if decoded_charge > max_state_bytes {
             return Err(DbError::Checkpoint(format!(
@@ -1305,7 +1789,7 @@ impl IntervalJoinState {
                 })?;
             *state.left.row_flags.last_mut().ok_or_else(|| {
                 DbError::Checkpoint("interval join left row flags lost during restore".into())
-            })? = flags.clone();
+            })? = Arc::from(flags.clone());
             state.left_schema = Some(batch.schema());
             if state.accounted_state_bytes() > max_state_bytes {
                 return Err(DbError::Checkpoint(format!(
@@ -1330,7 +1814,7 @@ impl IntervalJoinState {
                 })?;
             *state.right.row_flags.last_mut().ok_or_else(|| {
                 DbError::Checkpoint("interval join right row flags lost during restore".into())
-            })? = flags.clone();
+            })? = Arc::from(flags.clone());
             state.right_schema = Some(batch.schema());
             if state.accounted_state_bytes() > max_state_bytes {
                 return Err(DbError::Checkpoint(format!(
@@ -1501,7 +1985,7 @@ fn flush_output_rows(
                 .collect();
             arrays.push(nulls.as_ref());
             let array = arrow::compute::interleave(&arrays, indices).map_err(|error| {
-                DbError::query_pipeline_arrow(&format!("interval join (interleave {side})"), &error)
+                DbError::query_pipeline_arrow(format!("interval join (interleave {side})"), &error)
             })?;
             columns.push(array);
         }
@@ -1803,8 +2287,18 @@ pub(crate) fn execute_interval_join_cycle(
 
         macro_rules! admit_match {
             ($left_batch:expr, $left_row:expr, $right_batch:expr, $right_row:expr) => {{
-                state.left.row_flags[$left_batch][$left_row] |= ROW_MATCHED;
-                state.right.row_flags[$right_batch][$right_row] |= ROW_MATCHED;
+                mark_row_flag(
+                    &mut state.left.row_flags,
+                    $left_batch,
+                    $left_row,
+                    ROW_MATCHED,
+                );
+                mark_row_flag(
+                    &mut state.right.row_flags,
+                    $right_batch,
+                    $right_row,
+                    ROW_MATCHED,
+                );
                 match config.join_type {
                     JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
                         output_rows.push(JoinOutputRow {
@@ -1814,7 +2308,12 @@ pub(crate) fn execute_interval_join_cycle(
                     }
                     JoinType::LeftSemi => {
                         if state.left.row_flags[$left_batch][$left_row] & ROW_EMITTED == 0 {
-                            state.left.row_flags[$left_batch][$left_row] |= ROW_EMITTED;
+                            mark_row_flag(
+                                &mut state.left.row_flags,
+                                $left_batch,
+                                $left_row,
+                                ROW_EMITTED,
+                            );
                             output_rows.push(JoinOutputRow {
                                 left: Some(($left_batch, $left_row)),
                                 right: None,
@@ -1823,7 +2322,12 @@ pub(crate) fn execute_interval_join_cycle(
                     }
                     JoinType::RightSemi => {
                         if state.right.row_flags[$right_batch][$right_row] & ROW_EMITTED == 0 {
-                            state.right.row_flags[$right_batch][$right_row] |= ROW_EMITTED;
+                            mark_row_flag(
+                                &mut state.right.row_flags,
+                                $right_batch,
+                                $right_row,
+                                ROW_EMITTED,
+                            );
                             output_rows.push(JoinOutputRow {
                                 left: None,
                                 right: Some(($right_batch, $right_row)),
@@ -2394,7 +2898,7 @@ mod tests {
         let _ =
             execute_interval_join_cycle(&mut state, &[left], &[right], &config, 50, 50).unwrap();
 
-        // Checkpoint (compacts before serializing)
+        // Snapshot and serialize the retained cut.
         let cp = state
             .snapshot_checkpoint(&config, crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES)
             .unwrap();
@@ -2512,35 +3016,86 @@ mod tests {
     }
 
     #[test]
-    fn dense_checkpoint_skips_copy_and_obeys_encoder_limit() {
+    fn checkpoint_capture_is_shallow_and_does_not_compact_live_state() {
         let config = make_config();
         let mut state = IntervalJoinState::new();
-        for (key, timestamp) in [("A", 100), ("B", 200)] {
-            execute_interval_join_cycle(
-                &mut state,
-                &[left_batch(&[key], &[timestamp], &[1.0])],
-                &[],
-                &config,
-                0,
-                0,
-            )
-            .unwrap();
-        }
+        execute_interval_join_cycle(
+            &mut state,
+            &[left_batch_nullable(
+                &[Some("A"), None],
+                &[100, 200],
+                &[1.0, 2.0],
+            )],
+            &[],
+            &config,
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(!state.left.is_compact());
         let first_column = state.left.batches[0].column(0).clone();
+        let first_flags = Arc::clone(&state.left.row_flags[0]);
 
         let error = state
-            .snapshot_checkpoint(&config, 1)
+            .capture_checkpoint(&config)
+            .unwrap()
+            .encode(1)
             .err()
             .expect("a one-byte checkpoint budget must reject Arrow IPC");
         assert!(error.to_string().contains("checkpoint limit"));
-        assert_eq!(state.left.batches.len(), 2);
+        assert_eq!(state.left.batches.len(), 1);
+        assert!(!state.left.is_compact());
         assert!(Arc::ptr_eq(&first_column, state.left.batches[0].column(0)));
 
-        let checkpoint = state
-            .snapshot_checkpoint(&config, crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES)
+        let capture = state.capture_checkpoint(&config).unwrap();
+        assert!(Arc::ptr_eq(&first_flags, &capture.left_row_flags[0]));
+        assert!(Arc::ptr_eq(
+            &first_column,
+            capture.left_batches[0].column(0)
+        ));
+        let checkpoint = capture
+            .encode(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES)
             .unwrap();
-        assert_eq!(checkpoint.left_batches.len(), 2);
+        assert_eq!(checkpoint.left_buffer_rows, 1);
+        assert_eq!(checkpoint.left_row_flags, vec![vec![0]]);
         assert!(Arc::ptr_eq(&first_column, state.left.batches[0].column(0)));
+        assert!(!state.left.is_compact());
+    }
+
+    #[test]
+    fn post_cut_flag_mutation_preserves_captured_flags() {
+        let config = make_config();
+        let mut state = IntervalJoinState::new();
+        execute_interval_join_cycle(
+            &mut state,
+            &[left_batch(&["A"], &[100], &[1.0])],
+            &[],
+            &config,
+            0,
+            0,
+        )
+        .unwrap();
+        let capture = state.capture_checkpoint(&config).unwrap();
+
+        execute_interval_join_cycle(
+            &mut state,
+            &[],
+            &[right_batch(&["A"], &[110], &[2.0])],
+            &config,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(state.left.row_flags[0][0], ROW_MATCHED);
+        assert!(!Arc::ptr_eq(
+            &capture.left_row_flags[0],
+            &state.left.row_flags[0]
+        ));
+
+        let checkpoint = capture
+            .encode(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES)
+            .unwrap();
+        assert_eq!(checkpoint.left_row_flags, vec![vec![0]]);
     }
 
     #[test]

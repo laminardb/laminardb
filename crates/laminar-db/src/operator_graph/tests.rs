@@ -175,7 +175,7 @@ async fn rich_frontiers_exclude_idle_inputs_and_remain_monotone() {
         ),
     ]);
     graph
-        .execute_cycle_with_frontiers(&sources, i64::MIN, Some(&frontiers))
+        .execute_cycle(&sources, i64::MIN, Some(&frontiers))
         .await
         .unwrap();
 
@@ -186,7 +186,7 @@ async fn rich_frontiers_exclude_idle_inputs_and_remain_monotone() {
     frontiers.get_mut("left").unwrap().idle = true;
     frontiers.get_mut("right").unwrap().watermark = Some(200);
     graph
-        .execute_cycle_with_frontiers(&sources, i64::MIN, Some(&frontiers))
+        .execute_cycle(&sources, i64::MIN, Some(&frontiers))
         .await
         .unwrap();
     assert_eq!(graph.output_watermarks[output], 200);
@@ -195,7 +195,7 @@ async fn rich_frontiers_exclude_idle_inputs_and_remain_monotone() {
     frontiers.get_mut("left").unwrap().idle = false;
     frontiers.get_mut("left").unwrap().watermark = Some(75);
     graph
-        .execute_cycle_with_frontiers(&sources, i64::MIN, Some(&frontiers))
+        .execute_cycle(&sources, i64::MIN, Some(&frontiers))
         .await
         .unwrap();
     assert_eq!(graph.output_watermarks[output], 200);
@@ -238,7 +238,7 @@ async fn all_idle_frontier_respects_operator_hold() {
         ),
     ]);
     graph
-        .execute_cycle_with_frontiers(&FxHashMap::default(), i64::MIN, Some(&frontiers))
+        .execute_cycle(&FxHashMap::default(), i64::MIN, Some(&frontiers))
         .await
         .unwrap();
 
@@ -357,6 +357,63 @@ fn handoff_quiescence_includes_checkpoint_aligned_replay() {
 
     drain_pending.store(false, std::sync::atomic::Ordering::Release);
     assert!(graph.handoff_is_quiescent());
+}
+
+#[tokio::test]
+async fn snapshotable_operator_work_keeps_idle_cycles_live() {
+    struct BoundedDrainProbe(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl GraphOperator for BoundedDrainProbe {
+        fn cluster_capability(&self) -> OperatorCapability {
+            OperatorCapability::test_probe()
+        }
+
+        async fn process(
+            &mut self,
+            inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            assert!(inputs.is_empty());
+            self.0
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .expect("bounded drain was polled after completion");
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn wants_input(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::Acquire) == 0
+        }
+    }
+
+    let remaining = Arc::new(std::sync::atomic::AtomicUsize::new(2));
+    let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+    graph.push_test_node(
+        "bounded-drain",
+        Box::new(BoundedDrainProbe(Arc::clone(&remaining))),
+    );
+    graph.compute_topo_order();
+
+    assert!(graph.has_deferred_work());
+    assert!(graph.checkpoint_is_quiescent());
+    graph
+        .execute_cycle(&FxHashMap::default(), i64::MIN, None)
+        .await
+        .unwrap();
+    assert!(graph.has_deferred_work());
+    graph
+        .execute_cycle(&FxHashMap::default(), i64::MIN, None)
+        .await
+        .unwrap();
+    assert!(!graph.has_deferred_work());
 }
 
 struct RestoreProbe(Arc<std::sync::atomic::AtomicUsize>);
@@ -2221,7 +2278,7 @@ async fn source_views_share_payloads_but_hide_positions_from_ordinary_queries() 
         },
     )]);
     graph
-        .execute_cycle_with_frontiers(&sources, i64::MIN, Some(&frontiers))
+        .execute_cycle(&sources, i64::MIN, Some(&frontiers))
         .await
         .unwrap();
 
@@ -3038,7 +3095,7 @@ fn test_checkpoint_empty() {
         None,
         false,
     );
-    let checkpoint = graph.capture_state().unwrap();
+    let checkpoint = graph.capture_state(u64::MAX).unwrap();
     assert!(checkpoint.whole.is_empty());
     assert!(checkpoint.vnodes.is_empty());
 }
@@ -3064,7 +3121,7 @@ async fn test_temporal_filter_checkpoint_restore_through_graph() {
     let r = g1.execute_cycle(&src, 5_000, None).await.unwrap();
     assert_eq!(total_rows(&r, "recent"), 2);
 
-    let checkpoint = g1.capture_state().unwrap();
+    let checkpoint = g1.capture_state(u64::MAX).unwrap();
     let (whole, vnodes) = full_state_frames(checkpoint);
     let mut g2 = test_graph();
     g2.add_query(
@@ -3218,7 +3275,7 @@ fn full_state_frames(
     let whole = capture
         .whole
         .into_iter()
-        .map(|state| (state.operator_id, state.state))
+        .map(|state| (state.operator_id, materialize_state_frame(state.state)))
         .collect();
     let vnodes = capture
         .vnodes
@@ -3227,13 +3284,80 @@ fn full_state_frames(
             (
                 operator,
                 state.vnode,
-                state
-                    .state
-                    .expect("the first capture must contain a full vnode frame"),
+                materialize_state_frame(
+                    state
+                        .state
+                        .expect("the first capture must contain a full vnode frame"),
+                ),
             )
         })
         .collect();
     (whole, vnodes)
+}
+
+fn materialize_state_frame(capture: StateFrameCapture) -> bytes::Bytes {
+    let mut staged_bytes = capture.retained_bytes();
+    capture.materialize(&mut staged_bytes, u64::MAX).unwrap()
+}
+
+#[test]
+fn state_frame_materialization_replaces_retained_ownership_without_double_charging() {
+    fn spare_capacity_frame(headroom: usize) -> EncodedStateFrame {
+        let mut writer = laminar_core::serialization::BoundedBytesWriter::new(headroom);
+        std::io::Write::write_all(&mut writer, b"four").unwrap();
+        let mut state = writer.into_vec();
+        state.truncate(1);
+        EncodedStateFrame::from_vec(state)
+    }
+
+    let mut owned = Vec::with_capacity(8);
+    owned.extend_from_slice(b"encoded");
+    let encoded = StateFrameCapture::encoded(owned);
+    let mut staged_bytes = encoded.retained_bytes();
+    let max_staged_bytes = staged_bytes;
+    let bytes = encoded
+        .materialize(&mut staged_bytes, max_staged_bytes)
+        .unwrap();
+    assert_eq!(bytes.as_ref(), b"encoded");
+    assert!(max_staged_bytes > bytes.len() as u64);
+    assert_eq!(staged_bytes, max_staged_bytes);
+
+    let second_headroom = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+    let first = StateFrameCapture::deferred(4, move |headroom| {
+        assert_eq!(headroom, 4);
+        Ok(spare_capacity_frame(headroom))
+    });
+    let observed = Arc::clone(&second_headroom);
+    let second = StateFrameCapture::deferred(4, move |headroom| {
+        observed.store(headroom, std::sync::atomic::Ordering::Relaxed);
+        Ok(spare_capacity_frame(headroom))
+    });
+    let mut staged_bytes = 8;
+    let first_bytes = first.materialize(&mut staged_bytes, 12).unwrap();
+    let second_bytes = second.materialize(&mut staged_bytes, 12).unwrap();
+    assert_eq!(first_bytes.as_ref(), b"f");
+    assert_eq!(second_bytes.as_ref(), b"f");
+    assert_eq!(
+        second_headroom.load(std::sync::atomic::Ordering::Relaxed),
+        4
+    );
+    assert_eq!(staged_bytes, 8);
+
+    let shared = Arc::new(std::sync::OnceLock::new());
+    let first_shared = Arc::clone(&shared);
+    let first = StateFrameCapture::deferred(4, move |headroom| {
+        let encoded = spare_capacity_frame(headroom);
+        first_shared.set(encoded.bytes().clone()).unwrap();
+        Ok(encoded)
+    });
+    let second = StateFrameCapture::deferred(4, move |_| {
+        Ok(EncodedStateFrame::shared(shared.get().unwrap().clone()))
+    });
+    let mut staged_bytes = 8;
+    let first_bytes = first.materialize(&mut staged_bytes, 12).unwrap();
+    let second_bytes = second.materialize(&mut staged_bytes, 12).unwrap();
+    assert_eq!(first_bytes.as_ref(), second_bytes.as_ref());
+    assert_eq!(staged_bytes, 4);
 }
 
 /// Creates a graph with streaming functions registered and generous budget.
@@ -3470,13 +3594,14 @@ fn managed_vnode_capture_requires_the_exact_owned_roster() {
             &mut self,
             _required_vnodes: &[u32],
             _vnode_count: u32,
+            _max_capture_bytes: u64,
         ) -> Result<Option<Vec<CapturedVnodeState>>, DbError> {
             Ok(Some(
                 self.0
                     .iter()
                     .map(|vnode| CapturedVnodeState {
                         vnode: *vnode,
-                        state: Some(bytes::Bytes::from_static(b"state")),
+                        state: Some(StateFrameCapture::encoded_static(b"state")),
                     })
                     .collect(),
             ))
@@ -3495,11 +3620,78 @@ fn managed_vnode_capture_requires_the_exact_owned_roster() {
         graph.push_test_node("managed", Box::new(InexactCapture(captured)));
 
         let error = graph
-            .capture_state()
+            .capture_state(u64::MAX)
             .expect_err("an inexact managed capture roster must fail closed");
 
         assert!(error.to_string().contains(expected_message), "{error}");
     }
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn managed_vnode_capture_enforces_the_cumulative_graph_budget() {
+    struct OversizedCapture(Arc<std::sync::atomic::AtomicU64>);
+
+    #[async_trait]
+    impl GraphOperator for OversizedCapture {
+        fn cluster_capability(&self) -> OperatorCapability {
+            OperatorCapability::test_vnode_state()
+        }
+
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+
+        fn checkpoint_vnodes(
+            &mut self,
+            required_vnodes: &[u32],
+            _vnode_count: u32,
+            max_capture_bytes: u64,
+        ) -> Result<Option<Vec<CapturedVnodeState>>, DbError> {
+            self.0
+                .store(max_capture_bytes, std::sync::atomic::Ordering::Relaxed);
+            Ok(Some(
+                required_vnodes
+                    .iter()
+                    .map(|vnode| CapturedVnodeState {
+                        vnode: *vnode,
+                        state: Some(StateFrameCapture::encoded(b"123".to_vec())),
+                    })
+                    .collect(),
+            ))
+        }
+    }
+
+    let observed_budget = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let mut graph = test_graph();
+    graph.set_test_vnode_count(2);
+    graph.push_test_node(
+        "budgeted",
+        Box::new(OversizedCapture(Arc::clone(&observed_budget))),
+    );
+    let metadata_bytes = GRAPH_CHECKPOINT_CAPTURE_OVERHEAD
+        + 2 * (GRAPH_CHECKPOINT_ENTRY_OVERHEAD + u64::try_from("budgeted".len()).unwrap());
+
+    let error = graph
+        .capture_state(metadata_bytes + 5)
+        .expect_err("two three-byte frames must not fit a five-byte payload budget");
+
+    assert_eq!(
+        observed_budget.load(std::sync::atomic::Ordering::Relaxed),
+        5
+    );
+    assert!(
+        error.to_string().contains("vnode 1 capture exceeded"),
+        "{error}"
+    );
 }
 
 #[cfg(feature = "cluster")]
@@ -3532,6 +3724,7 @@ fn managed_state_placement_scopes_capture_and_restore_rosters() {
             &mut self,
             required_vnodes: &[u32],
             _vnode_count: u32,
+            _max_capture_bytes: u64,
         ) -> Result<Option<Vec<CapturedVnodeState>>, DbError> {
             self.observed.lock().push(required_vnodes.to_vec());
             Ok(Some(
@@ -3539,7 +3732,7 @@ fn managed_state_placement_scopes_capture_and_restore_rosters() {
                     .iter()
                     .map(|vnode| CapturedVnodeState {
                         vnode: *vnode,
-                        state: Some(bytes::Bytes::from_static(b"state")),
+                        state: Some(StateFrameCapture::encoded_static(b"state")),
                     })
                     .collect(),
             ))
@@ -3566,7 +3759,7 @@ fn managed_state_placement_scopes_capture_and_restore_rosters() {
             }),
         );
 
-        let captured = graph.capture_state().unwrap();
+        let captured = graph.capture_state(u64::MAX).unwrap();
         let expected_global = owned
             .contains(&0)
             .then_some(vec![vec![0]])
@@ -4153,12 +4346,12 @@ async fn named_bounded_join_feeds_keyed_aggregate_at_safe_frontier() {
     let mut sources = FxHashMap::default();
     sources.insert(Arc::from("orders"), vec![orders]);
     sources.insert(Arc::from("receipts"), vec![receipts]);
-    let mut source_watermarks = FxHashMap::default();
-    source_watermarks.insert(Arc::from("orders"), 4_000);
-    source_watermarks.insert(Arc::from("receipts"), 4_500);
+    let mut source_frontiers = FxHashMap::default();
+    source_frontiers.insert(Arc::from("orders"), InputFrontier::from_watermark(4_000));
+    source_frontiers.insert(Arc::from("receipts"), InputFrontier::from_watermark(4_500));
 
     let results = graph
-        .execute_cycle(&sources, 4_500, Some(&source_watermarks))
+        .execute_cycle(&sources, 4_500, Some(&source_frontiers))
         .await
         .unwrap();
     assert_eq!(total_rows(&results, "matched"), 1);
@@ -4189,7 +4382,7 @@ async fn named_bounded_join_feeds_keyed_aggregate_at_safe_frontier() {
 
     let joined = *graph.output_map.get("matched").unwrap();
     let aggregate = *graph.output_map.get("totals").unwrap();
-    let safe_frontier = 4_000_i64.min(4_500 - 1_000);
+    let safe_frontier = 4_500_i64 - 1_000;
     assert_eq!(graph.output_watermarks[joined], safe_frontier);
     assert_eq!(graph.output_watermarks[aggregate], safe_frontier);
 }
@@ -4638,7 +4831,7 @@ async fn cancelled_stateful_cycle_poison_requires_fresh_graph_restore() {
         .execute_cycle(&bid_sources(10.0), i64::MIN, None)
         .await
         .unwrap();
-    let checkpoint = graph.capture_state().unwrap();
+    let checkpoint = graph.capture_state(u64::MAX).unwrap();
     let (whole, vnodes) = full_state_frames(checkpoint);
 
     let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
@@ -4664,7 +4857,7 @@ async fn cancelled_stateful_cycle_poison_requires_fresh_graph_restore() {
     );
     drop(cycle);
 
-    let snapshot_error = match graph.capture_state() {
+    let snapshot_error = match graph.capture_state(u64::MAX) {
         Err(error) => error,
         Ok(_) => panic!("cancelled graph generation accepted a checkpoint"),
     };
@@ -4731,7 +4924,7 @@ async fn caught_stateful_cycle_panic_poison_prevents_graph_reuse() {
         .await;
     assert!(panic.is_err(), "the downstream probe must panic");
     assert_eq!(*observation.lock(), Some((1, Some(20.0))));
-    let snapshot_error = match graph.capture_state() {
+    let snapshot_error = match graph.capture_state(u64::MAX) {
         Err(error) => error,
         Ok(_) => panic!("panicked graph generation accepted a checkpoint"),
     };
@@ -4765,7 +4958,7 @@ async fn test_og_checkpoint_roundtrip_aggregate() {
     // Cycle 1: build up state
     let _ = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
 
-    let checkpoint = graph.capture_state().unwrap();
+    let checkpoint = graph.capture_state(u64::MAX).unwrap();
     let (whole, vnodes) = full_state_frames(checkpoint);
 
     // Create a new graph with same query and restore
@@ -5342,7 +5535,7 @@ async fn test_byte_budget_gates_capacity() {
 }
 
 #[test]
-fn managed_state_accounting_is_sampled_at_cold_cadence_and_skips_removed_nodes() {
+fn managed_state_accounting_is_seeded_then_sampled_at_cold_cadence() {
     let registry = prometheus::Registry::new();
     let prom = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
     let mut graph = test_graph();
@@ -5375,6 +5568,11 @@ fn managed_state_accounting_is_sampled_at_cold_cadence_and_skips_removed_nodes()
         }),
         0,
     ));
+    assert_eq!(active_samples.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(removed_samples.load(std::sync::atomic::Ordering::SeqCst), 0);
+    graph.set_metrics(Arc::clone(&prom));
+    assert_eq!(active_samples.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(removed_samples.load(std::sync::atomic::Ordering::SeqCst), 1);
     graph.managed_state_accounting_peaks[active].observe_transient(
         ManagedStateAccountingSnapshot {
             live: 0,
@@ -5386,12 +5584,12 @@ fn managed_state_accounting_is_sampled_at_cold_cadence_and_skips_removed_nodes()
     for _ in 1..STATS_SAMPLE_INTERVAL {
         graph.sample_buffer_stats();
     }
-    assert_eq!(active_samples.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(active_samples.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     graph.sample_buffer_stats();
 
-    assert_eq!(active_samples.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(removed_samples.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(active_samples.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(removed_samples.load(std::sync::atomic::Ordering::SeqCst), 2);
     for (phase, expected) in [("live", 11), ("prepared", 99), ("retired", 88)] {
         assert_eq!(
             prom.managed_state_accounted_bytes
@@ -5411,8 +5609,8 @@ fn managed_state_accounting_is_sampled_at_cold_cadence_and_skips_removed_nodes()
     for _ in 0..STATS_SAMPLE_INTERVAL {
         graph.sample_buffer_stats();
     }
-    assert_eq!(active_samples.load(std::sync::atomic::Ordering::SeqCst), 2);
-    assert_eq!(removed_samples.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(active_samples.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(removed_samples.load(std::sync::atomic::Ordering::SeqCst), 2);
     for phase in ["live", "prepared", "retired"] {
         assert!(
             prom.managed_state_accounted_bytes

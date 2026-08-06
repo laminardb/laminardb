@@ -42,7 +42,8 @@ async fn committed_checkpoint() -> Fixture {
     );
     manifest.channel_progress.push(ChannelProgress {
         participant_id: 1,
-        channel_id: "source:partition-0".into(),
+        source_name: "source".into(),
+        input_channel: b"partition-0".to_vec(),
         watermark: Some(1_000),
         idle: false,
     });
@@ -81,6 +82,7 @@ async fn committed_checkpoint() -> Fixture {
         vnode_count: 1,
         assignment_fence: None,
         participants: vec![participant],
+        source_names: manifest.source_names.clone(),
         source_offsets: BTreeMap::from([(
             "source".into(),
             manifest.source_offsets["source"].clone(),
@@ -265,6 +267,7 @@ async fn cluster_recovery_selects_exact_and_adjacent_target_frames() {
         assignment_fence: Some(fence.clone()),
         predecessor: None,
         participants: vec![local_ref, remote_ref],
+        source_names: Vec::new(),
         source_offsets: BTreeMap::new(),
         channel_progress: Vec::new(),
         checkpoint_watermark: None,

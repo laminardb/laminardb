@@ -13,12 +13,14 @@ use std::time::{Duration, Instant};
 use arrow_array::RecordBatch;
 use crossfire::{mpsc, AsyncRx, MAsyncTx};
 use laminar_connectors::checkpoint::SourceCheckpoint;
-use laminar_connectors::connector::SourceBatch;
+#[cfg(test)]
+use laminar_connectors::checkpoint::SourceCheckpointDelta;
 use laminar_connectors::connector::{
     schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,
     strip_source_row_positions, ConnectorCancellationPolicy, ConnectorTaskTracker,
-    DeliveryGuarantee, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
-    SourcePosition, SourceRowPositionCapability, SourceStart, SOURCE_MUTATION_COLUMN,
+    DeliveryGuarantee, SourceBatch, SourceBatchCursor, SourceConnector, SourceConsistency,
+    SourceContract, SourceInputMode, SourcePosition, SourceRowPositionCapability, SourceStart,
+    SOURCE_MUTATION_COLUMN,
 };
 #[cfg(feature = "cluster")]
 use laminar_connectors::connector::{
@@ -132,14 +134,13 @@ async fn wait_coordinator_delay(
     false
 }
 
-/// Message from a source task to the coordinator; carries the [`SourceCheckpoint`]
-/// captured at production time so no offset is checkpointed for unprocessed data.
+/// Message from a source task to the coordinator with its production-time cursor.
 enum SourceMsg {
     Batch {
         source_idx: usize,
         batch: RecordBatch,
         /// Committed to `committed_offsets` only after successful cycle publication.
-        checkpoint: SourceCheckpoint,
+        cursor: SourceBatchCursor,
     },
     Barrier {
         source_idx: usize,
@@ -1173,6 +1174,13 @@ pub enum ExitReason {
     Fault(String),
 }
 
+struct PendingWatermarkBatch {
+    source_name: Arc<str>,
+    batch: RecordBatch,
+    admission_floor: i64,
+    input_channels: Option<Arc<[Vec<u8>]>>,
+}
+
 /// Single-task pipeline coordinator — no core threads.
 pub struct StreamingCoordinator {
     config: PipelineConfig,
@@ -1191,15 +1199,15 @@ pub struct StreamingCoordinator {
     /// At most one FIFO message removed just as the external intake gate closes. Exact source
     /// barrier holds make post-barrier data impossible; this slot exists only for that gate race.
     parked_source_msg: Option<SourceMsg>,
-    pending_watermark_batches: Vec<(Arc<str>, RecordBatch)>,
+    pending_watermark_batches: Vec<PendingWatermarkBatch>,
     /// Sources that delivered a barrier this drain cycle. A later batch from one of these sources
     /// violates the source hold protocol and faults the pipeline.
     barrier_seen: FxHashSet<usize>,
-    /// Per-source offset merged from `pending_offsets` after successful cycle publication.
+    /// Per-source offset advanced from `pending_offsets` after successful cycle publication.
     committed_offsets: Vec<Option<SourceCheckpoint>>,
-    /// Offsets staged by `process_msg`; a replay-preserving deferral retains them until the graph
+    /// Cursors staged by `process_msg`; a replay-preserving deferral retains them until the graph
     /// consumes its buffered work, while a fault discards them.
-    pending_offsets: Vec<Option<SourceCheckpoint>>,
+    pending_offsets: Vec<Option<SourceBatchCursor>>,
     /// The previous cycle retained graph work. Its retry is scheduled ahead of source intake so a
     /// newer connector cursor cannot overtake the buffered mutation.
     replay_pending: bool,
@@ -1464,15 +1472,47 @@ fn try_source_checkpoint(
     let Some(captured) = checkpoint.as_ref() else {
         return Ok(None);
     };
-    match (assignment_scoped, captured.assignment_version()) {
+    validate_source_checkpoint_scope(captured, assignment_scoped)?;
+    Ok(checkpoint)
+}
+
+fn validate_source_checkpoint_scope(
+    checkpoint: &SourceCheckpoint,
+    assignment_scoped: bool,
+) -> Result<(), ConnectorError> {
+    match (assignment_scoped, checkpoint.assignment_version()) {
         (true, None) => Err(ConnectorError::Internal(
             "cluster-assigned source checkpoint is missing its assignment version".into(),
         )),
         (false, Some(version)) => Err(ConnectorError::Internal(format!(
             "local source checkpoint unexpectedly carries cluster assignment version {version}"
         ))),
-        _ => Ok(checkpoint),
+        _ => Ok(()),
     }
+}
+
+fn take_assignment_bound_batch_cursor(
+    batch: &mut SourceBatch,
+    assignment_scoped: bool,
+) -> Result<Option<SourceBatchCursor>, ConnectorError> {
+    if !assignment_scoped {
+        return Ok(None);
+    }
+    let cursor = batch.take_cursor().ok_or_else(|| {
+        ConnectorError::Internal(
+            "cluster-assigned source batch is missing its assignment-bound checkpoint".into(),
+        )
+    })?;
+    if let SourceBatchCursor::Complete(checkpoint) = &cursor {
+        validate_source_checkpoint_scope(checkpoint, true)?;
+        if checkpoint.input_channels().is_none() {
+            return Err(ConnectorError::Internal(
+                "cluster-assigned source batch checkpoint is missing its input-channel inventory"
+                    .into(),
+            ));
+        }
+    }
+    Ok(Some(cursor))
 }
 
 /// Apply the newest durable commit notification while no source poll borrows
@@ -2032,6 +2072,8 @@ fn source_drain_held(active: Option<&ActiveSourceDrain>) -> bool {
     active.is_some_and(|drain| drain.ready)
 }
 
+// Keep `SourceBatch` inline: boxing every successful poll would allocate on the source hot path.
+#[allow(clippy::large_enum_variant)]
 enum SourcePollOutcome {
     Completed(Result<Option<SourceBatch>, ConnectorError>),
     Deadline,
@@ -3504,10 +3546,8 @@ impl StreamingCoordinator {
                         continue;
                     }
 
-                    // A source assignment can publish after a batch was drained but before its
-                    // cursor is captured. Keep the already-polled batch ahead of later data and
-                    // retry its cursor once reconciliation completes; faulting or dropping here
-                    // would turn a normal rotation into either downtime or data loss.
+                    // Local connectors may defer cursor capture after polling. Assignment-scoped
+                    // connectors bind the exact ownership cut to the batch and never enter here.
                     if let Some(batch) = pending_batch.take() {
                         match lifecycle.run_sync_hook(
                             &src_name,
@@ -3516,13 +3556,13 @@ impl StreamingCoordinator {
                             cancellation_policy,
                             #[cfg(feature = "cluster")]
                             task_process_authority.as_deref(),
-                            || try_source_checkpoint(connector.as_ref(), assignment_scoped),
+                            || try_source_checkpoint(connector.as_ref(), false),
                         ) {
                             Ok(Some(checkpoint)) => {
                                 let msg = SourceMsg::Batch {
                                     source_idx: idx,
                                     batch,
-                                    checkpoint,
+                                    cursor: SourceBatchCursor::Complete(checkpoint),
                                 };
                                 if !send_source_msg(
                                     &task_tx,
@@ -3851,7 +3891,21 @@ impl StreamingCoordinator {
                     }
 
                     match poll_result {
-                        Ok(Some(batch)) => {
+                        Ok(Some(mut source_batch)) => {
+                            let bound_checkpoint = match take_assignment_bound_batch_cursor(
+                                &mut source_batch,
+                                assignment_scoped,
+                            ) {
+                                Ok(checkpoint) => checkpoint,
+                                Err(error) => {
+                                    lifecycle.fault_data_plane();
+                                    let _ = task_fault_tx.send(SourceFault {
+                                        source: Arc::from(src_name.as_str()),
+                                        error: error.to_string(),
+                                    });
+                                    break;
+                                }
+                            };
                             let batch = match prepare_encoded_source_batch(
                                 &src_name,
                                 &expected_schema,
@@ -3860,7 +3914,7 @@ impl StreamingCoordinator {
                                 &primary_key,
                                 &primary_key_indices,
                                 contract.row_positions,
-                                batch,
+                                source_batch,
                             ) {
                                 Ok(batch) => batch,
                                 Err(error) => {
@@ -3872,33 +3926,38 @@ impl StreamingCoordinator {
                                     break;
                                 }
                             };
-                            let checkpoint = match lifecycle.run_sync_hook(
-                                &src_name,
-                                "polled batch checkpoint capture",
-                                poll_deadline,
-                                cancellation_policy,
-                                #[cfg(feature = "cluster")]
-                                task_process_authority.as_deref(),
-                                || try_source_checkpoint(connector.as_ref(), assignment_scoped),
-                            ) {
-                                Ok(Some(checkpoint)) => checkpoint,
-                                Ok(None) => {
-                                    pending_batch = Some(batch);
-                                    continue;
-                                }
-                                Err(error) => {
-                                    lifecycle.fault_data_plane();
-                                    let _ = task_fault_tx.send(SourceFault {
-                                        source: Arc::from(src_name.as_str()),
-                                        error: error.to_string(),
-                                    });
-                                    break;
-                                }
+                            let cursor = if let Some(cursor) = bound_checkpoint {
+                                cursor
+                            } else {
+                                let checkpoint = match lifecycle.run_sync_hook(
+                                    &src_name,
+                                    "polled batch checkpoint capture",
+                                    poll_deadline,
+                                    cancellation_policy,
+                                    #[cfg(feature = "cluster")]
+                                    task_process_authority.as_deref(),
+                                    || try_source_checkpoint(connector.as_ref(), false),
+                                ) {
+                                    Ok(Some(checkpoint)) => checkpoint,
+                                    Ok(None) => {
+                                        pending_batch = Some(batch);
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        lifecycle.fault_data_plane();
+                                        let _ = task_fault_tx.send(SourceFault {
+                                            source: Arc::from(src_name.as_str()),
+                                            error: error.to_string(),
+                                        });
+                                        break;
+                                    }
+                                };
+                                SourceBatchCursor::Complete(checkpoint)
                             };
                             let msg = SourceMsg::Batch {
                                 source_idx: idx,
                                 batch,
-                                checkpoint,
+                                cursor,
                             };
                             if !send_source_msg(
                                 &task_tx,
@@ -4102,14 +4161,14 @@ impl StreamingCoordinator {
                             cancellation_policy,
                             #[cfg(feature = "cluster")]
                             task_process_authority.as_deref(),
-                            || try_source_checkpoint(connector.as_ref(), assignment_scoped),
+                            || try_source_checkpoint(connector.as_ref(), false),
                         ) {
                             Ok(Some(checkpoint)) => {
                                 if task_tx
                                     .try_send(SourceMsg::Batch {
                                         source_idx: idx,
                                         batch,
-                                        checkpoint,
+                                        cursor: SourceBatchCursor::Complete(checkpoint),
                                     })
                                     .is_err()
                                 {
@@ -4155,7 +4214,21 @@ impl StreamingCoordinator {
                             break;
                         }
                         match poll_result {
-                            Some(Ok(Some(batch))) => {
+                            Some(Ok(Some(mut source_batch))) => {
+                                let bound_checkpoint = match take_assignment_bound_batch_cursor(
+                                    &mut source_batch,
+                                    assignment_scoped,
+                                ) {
+                                    Ok(checkpoint) => checkpoint,
+                                    Err(error) => {
+                                        lifecycle.fault_data_plane();
+                                        let _ = task_fault_tx.send(SourceFault {
+                                            source: Arc::from(src_name.as_str()),
+                                            error: error.to_string(),
+                                        });
+                                        break;
+                                    }
+                                };
                                 let batch = match prepare_encoded_source_batch(
                                     &src_name,
                                     &expected_schema,
@@ -4164,7 +4237,7 @@ impl StreamingCoordinator {
                                     &primary_key,
                                     &primary_key_indices,
                                     contract.row_positions,
-                                    batch,
+                                    source_batch,
                                 ) {
                                     Ok(batch) => batch,
                                     Err(error) => {
@@ -4176,30 +4249,35 @@ impl StreamingCoordinator {
                                         break;
                                     }
                                 };
-                                let checkpoint = match lifecycle.run_sync_hook(
-                                    &src_name,
-                                    "shutdown tail checkpoint capture",
-                                    shutdown_deadline,
-                                    cancellation_policy,
-                                    #[cfg(feature = "cluster")]
-                                    task_process_authority.as_deref(),
-                                    || try_source_checkpoint(connector.as_ref(), assignment_scoped),
-                                ) {
-                                    Ok(Some(checkpoint)) => checkpoint,
-                                    Ok(None) => break,
-                                    Err(error) => {
-                                        lifecycle.fault_data_plane();
-                                        let _ = task_fault_tx.send(SourceFault {
-                                            source: Arc::from(src_name.as_str()),
-                                            error: error.to_string(),
-                                        });
-                                        break;
-                                    }
+                                let cursor = if let Some(cursor) = bound_checkpoint {
+                                    cursor
+                                } else {
+                                    let checkpoint = match lifecycle.run_sync_hook(
+                                        &src_name,
+                                        "shutdown tail checkpoint capture",
+                                        shutdown_deadline,
+                                        cancellation_policy,
+                                        #[cfg(feature = "cluster")]
+                                        task_process_authority.as_deref(),
+                                        || try_source_checkpoint(connector.as_ref(), false),
+                                    ) {
+                                        Ok(Some(checkpoint)) => checkpoint,
+                                        Ok(None) => break,
+                                        Err(error) => {
+                                            lifecycle.fault_data_plane();
+                                            let _ = task_fault_tx.send(SourceFault {
+                                                source: Arc::from(src_name.as_str()),
+                                                error: error.to_string(),
+                                            });
+                                            break;
+                                        }
+                                    };
+                                    SourceBatchCursor::Complete(checkpoint)
                                 };
                                 let msg = SourceMsg::Batch {
                                     source_idx: idx,
                                     batch,
-                                    checkpoint,
+                                    cursor,
                                 };
                                 if task_tx.try_send(msg).is_err() {
                                     lifecycle.fault_data_plane();
@@ -4893,19 +4971,32 @@ impl StreamingCoordinator {
         state: &mut CoordinatorRunState,
         checkpoint_control_due: bool,
     ) -> bool {
-        let started = Instant::now();
         if self.replay_pending && self.pending_barrier.active {
-            if let Err(error) = self
-                .cancel_pending_barrier_for_stop(
-                    callback,
-                    "operator input remained deferred before source barrier alignment",
-                    true,
-                )
-                .await
-            {
-                state.fault = Some(error);
+            let deadline = tokio::time::Instant::from_std(self.pending_barrier.started_at)
+                + self.config.checkpoint_timeout;
+            if let Err(error) = callback.drain_checkpoint_edges_until(deadline).await {
+                let reason = error.to_string();
+                tracing::error!(%error, "checkpoint replay drain failed");
+                if let Err(cleanup) = self
+                    .cancel_pending_barrier_for_stop(callback, &reason, true)
+                    .await
+                {
+                    state.fault = Some(format!(
+                        "{reason}; checkpoint cleanup failed after replay drain: {cleanup}"
+                    ));
+                    return false;
+                }
+                match error {
+                    CycleError::Halt(_) => state.halted = true,
+                    CycleError::Fatal(_) | CycleError::Recovery(_) => state.fault = Some(reason),
+                }
                 return false;
             }
+            if let Err(error) = self.commit_pending_offsets() {
+                state.fault = Some(error.to_string());
+                return false;
+            }
+            self.replay_pending = false;
         }
 
         for (source_idx, barrier, checkpoint) in &state.barriers {
@@ -4938,14 +5029,11 @@ impl StreamingCoordinator {
             return false;
         }
 
-        let within_budget =
-            started.elapsed() < Duration::from_nanos(self.config.background_budget_ns);
         let follower_control_ready =
             state.checkpoint_control_pending && checkpoint_control_due && !callback.is_leader();
         let checkpoint_work_due =
             callback.is_leader() || follower_control_ready || !self.manual_waiting.is_empty();
-        if !self.replay_pending && checkpoint_work_due && (follower_control_ready || within_budget)
-        {
+        if checkpoint_work_due {
             let control_serviced = self.maybe_checkpoint(callback).await;
             if follower_control_ready {
                 #[cfg(feature = "cluster")]
@@ -5175,10 +5263,20 @@ impl StreamingCoordinator {
             }
 
             let staged_source_progress = !self.pending_watermark_batches.is_empty();
-            let watermark_result = self
-                .pending_watermark_batches
-                .drain(..)
-                .try_for_each(|(name, batch)| callback.extract_watermark(&name, &batch));
+            let watermark_result =
+                self.pending_watermark_batches
+                    .drain(..)
+                    .try_for_each(|pending| {
+                        callback.reconcile_source_input_channels(
+                            &pending.source_name,
+                            pending.input_channels,
+                        )?;
+                        callback.extract_watermark(
+                            &pending.source_name,
+                            &pending.batch,
+                            pending.admission_floor,
+                        )
+                    });
             if let Err(error) = watermark_result {
                 self.discard_pending_offsets();
                 state.fault = Some(error.to_string());
@@ -5444,10 +5542,20 @@ impl StreamingCoordinator {
 
         if fault.is_none() && !intake_fenced {
             let staged_source_progress = !self.pending_watermark_batches.is_empty();
-            let watermark_result = self
-                .pending_watermark_batches
-                .drain(..)
-                .try_for_each(|(name, batch)| callback.extract_watermark(&name, &batch));
+            let watermark_result =
+                self.pending_watermark_batches
+                    .drain(..)
+                    .try_for_each(|pending| {
+                        callback.reconcile_source_input_channels(
+                            &pending.source_name,
+                            pending.input_channels,
+                        )?;
+                        callback.extract_watermark(
+                            &pending.source_name,
+                            &pending.batch,
+                            pending.admission_floor,
+                        )
+                    });
             let watermarks_valid = match watermark_result {
                 Ok(()) => true,
                 Err(error) => {
@@ -5566,19 +5674,20 @@ impl StreamingCoordinator {
 
         let exit = fault.map_or(ExitReason::Shutdown, ExitReason::Fault);
         let reason = match &exit {
-        ExitReason::Shutdown => {
-            "pipeline stopped; discard subscription rows after the last committed progress frontier"
-        }
-        ExitReason::Fault(error) => error,
-    };
+            ExitReason::Shutdown => {
+                "pipeline stopped; discard subscription rows after the last committed progress frontier"
+            }
+            ExitReason::Fault(error) => error,
+        };
         callback.invalidate_subscriptions(reason);
         exit
     }
+
     fn stage_batch(
         &mut self,
         source_idx: usize,
-        batch: RecordBatch,
-        checkpoint: SourceCheckpoint,
+        batch: &RecordBatch,
+        cursor: SourceBatchCursor,
         callback: &mut impl PipelineCallback,
         cycle_events: &mut u64,
     ) -> Result<(), CycleError> {
@@ -5597,7 +5706,7 @@ impl StreamingCoordinator {
                     "source '{name}' has no mutation-admission slot at runtime index {source_idx}"
                 ))
             })?;
-        let visible = strip_source_row_positions(&batch).map_err(|error| {
+        let visible = strip_source_row_positions(batch).map_err(|error| {
             CycleError::Recovery(format!(
                 "source '{name}' emitted invalid hidden metadata: {error}"
             ))
@@ -5610,13 +5719,58 @@ impl StreamingCoordinator {
 
         // Filter against the pre-drain watermark. Extraction is deferred until after all batches
         // are filtered so one batch cannot make the next batch appear late.
-        let filtered = callback.filter_late_rows(&name, &batch)?;
-        let pending = self.pending_offsets.get_mut(source_idx).ok_or_else(|| {
-            CycleError::Recovery(format!(
+        let admission_floor = callback.current_watermark();
+        let filtered = callback.filter_late_rows(&name, batch)?;
+        if source_idx >= self.pending_offsets.len() || source_idx >= self.committed_offsets.len() {
+            return Err(CycleError::Recovery(format!(
                 "source '{name}' has no runtime offset slot at index {source_idx}"
-            ))
-        })?;
-        *pending = Some(checkpoint);
+            )));
+        }
+        let input_channels = match cursor {
+            SourceBatchCursor::Complete(checkpoint) => {
+                let input_channels = checkpoint.input_channels_arc().cloned();
+                self.pending_offsets[source_idx] = Some(SourceBatchCursor::Complete(checkpoint));
+                input_channels
+            }
+            SourceBatchCursor::Incremental(delta) => {
+                let input_channels = Some(Arc::clone(delta.input_channels_arc()));
+                match self.pending_offsets[source_idx].as_mut() {
+                    Some(SourceBatchCursor::Complete(checkpoint)) => {
+                        checkpoint.apply_delta(delta).map_err(|error| {
+                            CycleError::Recovery(format!(
+                                "source '{name}' emitted an invalid incremental cursor: {error}"
+                            ))
+                        })?;
+                    }
+                    Some(SourceBatchCursor::Incremental(pending)) => {
+                        pending.merge(delta).map_err(|error| {
+                            CycleError::Recovery(format!(
+                                "source '{name}' emitted an invalid incremental cursor: {error}"
+                            ))
+                        })?;
+                    }
+                    None => {
+                        let committed = self
+                            .committed_offsets
+                            .get(source_idx)
+                            .and_then(Option::as_ref)
+                            .ok_or_else(|| {
+                                CycleError::Recovery(format!(
+                                    "source '{name}' emitted an incremental cursor before its complete assignment cursor"
+                                ))
+                            })?;
+                        delta.validate_base(committed).map_err(|error| {
+                            CycleError::Recovery(format!(
+                                "source '{name}' emitted an invalid incremental cursor: {error}"
+                            ))
+                        })?;
+                        self.pending_offsets[source_idx] =
+                            Some(SourceBatchCursor::Incremental(delta));
+                    }
+                }
+                input_channels
+            }
+        };
         *cycle_events += visible.num_rows() as u64;
         if let Some(filtered) = filtered {
             self.source_batches_buf
@@ -5624,7 +5778,12 @@ impl StreamingCoordinator {
                 .or_default()
                 .push(filtered);
         }
-        self.pending_watermark_batches.push((name, visible));
+        self.pending_watermark_batches.push(PendingWatermarkBatch {
+            source_name: name,
+            batch: visible,
+            admission_floor,
+            input_channels,
+        });
         Ok(())
     }
 
@@ -5640,7 +5799,7 @@ impl StreamingCoordinator {
             SourceMsg::Batch {
                 source_idx,
                 batch,
-                checkpoint,
+                cursor,
             } => {
                 if self.barrier_seen.contains(&source_idx) {
                     return Err(CycleError::Recovery(format!(
@@ -5650,7 +5809,7 @@ impl StreamingCoordinator {
                             .map_or("<unknown>", AsRef::as_ref)
                     )));
                 }
-                self.stage_batch(source_idx, batch, checkpoint, callback, cycle_events)?;
+                self.stage_batch(source_idx, &batch, cursor, callback, cycle_events)?;
             }
             SourceMsg::Barrier {
                 source_idx,
@@ -5695,9 +5854,9 @@ impl StreamingCoordinator {
             SourceMsg::Batch {
                 source_idx,
                 batch,
-                checkpoint,
+                cursor,
             } => self
-                .stage_batch(source_idx, batch, checkpoint, callback, cycle_events)
+                .stage_batch(source_idx, &batch, cursor, callback, cycle_events)
                 .err()
                 .map(|error| error.to_string()),
             SourceMsg::Barrier {
@@ -5739,13 +5898,69 @@ impl StreamingCoordinator {
             .collect()
     }
 
-    /// Merge staged offsets into `committed_offsets` after successful cycle publication.
-    fn commit_pending_offsets(&mut self) {
-        for (i, pending) in self.pending_offsets.iter_mut().enumerate() {
-            if let Some(cp) = pending.take() {
-                self.committed_offsets[i] = Some(cp);
-            }
+    /// Commit one staged complete cursor or assignment-local delta.
+    fn commit_pending_offset(&mut self, source_idx: usize) -> Result<(), CycleError> {
+        let name = self
+            .source_names
+            .get(source_idx)
+            .map_or("<unknown>", AsRef::as_ref);
+        let pending = self.pending_offsets.get(source_idx).ok_or_else(|| {
+            CycleError::Recovery(format!(
+                "source '{name}' has no runtime offset slot at index {source_idx}"
+            ))
+        })?;
+        if source_idx >= self.committed_offsets.len() {
+            return Err(CycleError::Recovery(format!(
+                "source '{name}' has no committed offset slot at index {source_idx}"
+            )));
         }
+        if let Some(SourceBatchCursor::Incremental(delta)) = pending.as_ref() {
+            let committed = self
+                .committed_offsets
+                .get(source_idx)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| {
+                    CycleError::Recovery(format!(
+                        "source '{name}' cannot commit an incremental cursor without a complete assignment cursor"
+                    ))
+                })?;
+            delta.validate_base(committed).map_err(|error| {
+                CycleError::Recovery(format!(
+                    "source '{name}' cannot commit its incremental cursor: {error}"
+                ))
+            })?;
+        }
+
+        match self.pending_offsets[source_idx].take() {
+            Some(SourceBatchCursor::Complete(checkpoint)) => {
+                self.committed_offsets[source_idx] = Some(checkpoint);
+            }
+            Some(SourceBatchCursor::Incremental(delta)) => {
+                self.committed_offsets[source_idx]
+                    .as_mut()
+                    .ok_or_else(|| {
+                        CycleError::Recovery(format!(
+                            "source '{name}' lost its complete assignment cursor before delta commit"
+                        ))
+                    })?
+                    .apply_delta(delta)
+                    .map_err(|error| {
+                        CycleError::Recovery(format!(
+                            "source '{name}' cannot commit its incremental cursor: {error}"
+                        ))
+                    })?;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Merge staged offsets into `committed_offsets` after successful cycle publication.
+    fn commit_pending_offsets(&mut self) -> Result<(), CycleError> {
+        for source_idx in 0..self.pending_offsets.len() {
+            self.commit_pending_offset(source_idx)?;
+        }
+        Ok(())
     }
 
     /// Publish materialized views, streams, and sink work before advancing source cursors.
@@ -5796,7 +6011,7 @@ impl StreamingCoordinator {
             self.discard_pending_offsets();
             return Err(error);
         }
-        self.settle_pending_offsets(&outcome.failed_sources, &outcome.deferred_sources);
+        self.settle_pending_offsets(&outcome.failed_sources, &outcome.deferred_sources)?;
         self.replay_pending = outcome.any_deferred;
         Ok(())
     }
@@ -5808,28 +6023,33 @@ impl StreamingCoordinator {
         &mut self,
         failed: &FxHashSet<Arc<str>>,
         deferred: &FxHashSet<Arc<str>>,
-    ) {
-        if failed.is_empty() && deferred.is_empty() {
-            self.commit_pending_offsets();
-            return;
+    ) -> Result<(), CycleError> {
+        if self.committed_offsets.len() != self.pending_offsets.len() {
+            return Err(CycleError::Recovery(
+                "source cursor slot counts diverged at cycle settlement".into(),
+            ));
         }
-        for (i, pending) in self.pending_offsets.iter_mut().enumerate() {
+        if failed.is_empty() && deferred.is_empty() {
+            return self.commit_pending_offsets();
+        }
+        for i in 0..self.pending_offsets.len() {
             let in_failed_domain = self
                 .source_names
                 .get(i)
                 .is_some_and(|name| failed.contains(name));
             if in_failed_domain {
-                *pending = None;
+                self.pending_offsets[i] = None;
             } else if self
                 .source_names
                 .get(i)
                 .is_some_and(|name| deferred.contains(name))
             {
                 // Retain the cursor alongside the graph's buffered input.
-            } else if let Some(cp) = pending.take() {
-                self.committed_offsets[i] = Some(cp);
+            } else {
+                self.commit_pending_offset(i)?;
             }
         }
+        Ok(())
     }
 
     /// Discard staged offsets when cycle execution or publication fails.
@@ -6011,6 +6231,15 @@ impl StreamingCoordinator {
         self.require_process_authority("source barrier handling")
             .map_err(|error| CycleError::Recovery(error.to_string()))?;
 
+        let source_name = self.source_names.get(source_idx).ok_or_else(|| {
+            CycleError::Recovery(format!(
+                "source barrier referenced unknown runtime index {source_idx}"
+            ))
+        })?;
+        callback.reconcile_source_input_channels(
+            source_name,
+            barrier_checkpoint.input_channels_arc().cloned(),
+        )?;
         self.capture_replayable_barrier_cursor(source_idx, barrier_checkpoint);
 
         self.pending_barrier.sources_aligned.insert(source_idx);

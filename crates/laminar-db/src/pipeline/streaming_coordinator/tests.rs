@@ -63,10 +63,16 @@ fn source_metadata_stays_row_aligned_and_mutations_are_route_admitted() {
         None,
     );
     let mut callback = MockCallback::new();
-    callback.filter_first_row = true;
+    callback.late_filter = MockLateFilter::DropFirst;
     let mut events = 0;
     coordinator
-        .stage_batch(0, output, checkpoint_at(1), &mut callback, &mut events)
+        .stage_batch(
+            0,
+            &output,
+            SourceBatchCursor::Complete(checkpoint_at(1)),
+            &mut callback,
+            &mut events,
+        )
         .unwrap();
     let positioned = &coordinator.source_batches_buf["test_source"][0];
     assert_eq!(positioned.schema(), positioned_schema);
@@ -81,8 +87,11 @@ fn source_metadata_stays_row_aligned_and_mutations_are_route_admitted() {
             .value(0),
         b"o2"
     );
-    assert_eq!(coordinator.pending_watermark_batches[0].1.schema(), schema);
-    assert_eq!(coordinator.pending_watermark_batches[0].1.num_rows(), 2);
+    assert_eq!(
+        coordinator.pending_watermark_batches[0].batch.schema(),
+        schema
+    );
+    assert_eq!(coordinator.pending_watermark_batches[0].batch.num_rows(), 2);
     assert_eq!(events, 2);
 
     let mutations = SourceBatch::positioned(records, positions)
@@ -103,8 +112,8 @@ fn source_metadata_stays_row_aligned_and_mutations_are_route_admitted() {
     let error = coordinator
         .stage_batch(
             0,
-            mutations.clone(),
-            checkpoint_at(2),
+            &mutations,
+            SourceBatchCursor::Complete(checkpoint_at(2)),
             &mut callback,
             &mut events,
         )
@@ -115,7 +124,13 @@ fn source_metadata_stays_row_aligned_and_mutations_are_route_admitted() {
 
     coordinator.source_mutations_admitted[0] = true;
     coordinator
-        .stage_batch(0, mutations, checkpoint_at(2), &mut callback, &mut events)
+        .stage_batch(
+            0,
+            &mutations,
+            SourceBatchCursor::Complete(checkpoint_at(2)),
+            &mut callback,
+            &mut events,
+        )
         .unwrap();
     assert!(coordinator.source_batches_buf["test_source"][1]
         .column_by_name(SOURCE_MUTATION_COLUMN)
@@ -140,8 +155,8 @@ fn source_preparation_failure_does_not_stage_offset_or_data() {
     let error = coordinator
         .stage_batch(
             0,
-            int_batch(1),
-            checkpoint_at(9),
+            &int_batch(1),
+            SourceBatchCursor::Complete(checkpoint_at(9)),
             &mut callback,
             &mut events,
         )
@@ -168,14 +183,14 @@ async fn fully_filtered_batch_executes_an_empty_progress_cycle() {
         None,
     );
     let mut callback = MockCallback::new();
-    callback.filter_all_rows = true;
+    callback.late_filter = MockLateFilter::DropAll;
     let cycle_input_rows = Arc::clone(&callback.cycle_input_rows);
     let run = tokio::spawn(coordinator.run(callback));
 
     tx.send(SourceMsg::Batch {
         source_idx: 0,
         batch: int_batch(1),
-        checkpoint: checkpoint_at(1),
+        cursor: SourceBatchCursor::Complete(checkpoint_at(1)),
     })
     .await
     .unwrap();
@@ -209,7 +224,7 @@ async fn watermark_extraction_failure_faults_before_cycle_publication() {
     tx.send(SourceMsg::Batch {
         source_idx: 0,
         batch: int_batch(1),
-        checkpoint: checkpoint_at(1),
+        cursor: SourceBatchCursor::Complete(checkpoint_at(1)),
     })
     .await
     .unwrap();
@@ -358,7 +373,7 @@ fn stale_cancelled_barrier_does_not_fence_later_source_data() {
             SourceMsg::Batch {
                 source_idx: 0,
                 batch: int_batch(11),
-                checkpoint: checkpoint_at(8),
+                cursor: SourceBatchCursor::Complete(checkpoint_at(8)),
             },
             &mut callback,
             &mut barriers,
@@ -392,7 +407,7 @@ async fn ready_completion_does_not_drop_the_parked_intake_message() {
     coordinator.parked_source_msg = Some(SourceMsg::Batch {
         source_idx: 0,
         batch: int_batch(42),
-        checkpoint: checkpoint_at(8),
+        cursor: SourceBatchCursor::Complete(checkpoint_at(8)),
     });
     completion_tx
         .send(CheckpointCompletion::new(
@@ -466,6 +481,14 @@ enum ProcessAuthorityFencePoint {
 }
 
 /// Minimal mock callback for testing the coordinator loop.
+#[derive(Clone, Copy, Default)]
+enum MockLateFilter {
+    #[default]
+    Keep,
+    DropAll,
+    DropFirst,
+}
+
 struct MockCallback {
     cycle_count: u32,
     attempt_to_reserve: CheckpointAttempt,
@@ -509,8 +532,7 @@ struct MockCallback {
     watermark: i64,
     watermark_error: Option<String>,
     late_filter_error: Option<String>,
-    filter_all_rows: bool,
-    filter_first_row: bool,
+    late_filter: MockLateFilter,
     /// Halt cleanly on this 1-based cycle number.
     halt_at_cycle: Option<u32>,
     /// Fail on this 1-based cycle number.
@@ -594,8 +616,7 @@ impl MockCallback {
             watermark: 0,
             watermark_error: None,
             late_filter_error: None,
-            filter_all_rows: false,
-            filter_first_row: false,
+            late_filter: MockLateFilter::default(),
             halt_at_cycle: None,
             fatal_at_cycle: None,
             recovery_at_cycle: None,
@@ -898,6 +919,7 @@ impl PipelineCallback for MockCallback {
         &mut self,
         _source_name: &str,
         batch: &RecordBatch,
+        _admission_floor: i64,
     ) -> Result<(), CycleError> {
         #[cfg(feature = "cluster")]
         self.fence_process_authority_at(ProcessAuthorityFencePoint::Watermark);
@@ -913,6 +935,15 @@ impl PipelineCallback for MockCallback {
         Ok(())
     }
 
+    fn reconcile_source_input_channels(
+        &mut self,
+        _source_name: &str,
+        _input_channels: Option<Arc<[Vec<u8>]>>,
+    ) -> Result<(), CycleError> {
+        // This coordinator mock models only the logical row-count watermark above.
+        Ok(())
+    }
+
     fn filter_late_rows(
         &self,
         _source_name: &str,
@@ -921,13 +952,13 @@ impl PipelineCallback for MockCallback {
         if let Some(error) = &self.late_filter_error {
             return Err(CycleError::Recovery(error.clone()));
         }
-        if self.filter_all_rows {
-            Ok(None)
-        } else if self.filter_first_row {
-            let skip = usize::from(batch.num_rows() != 0);
-            Ok(Some(batch.slice(skip, batch.num_rows() - skip)))
-        } else {
-            Ok(Some(batch.clone()))
+        match self.late_filter {
+            MockLateFilter::Keep => Ok(Some(batch.clone())),
+            MockLateFilter::DropAll => Ok(None),
+            MockLateFilter::DropFirst => {
+                let skip = usize::from(batch.num_rows() != 0);
+                Ok(Some(batch.slice(skip, batch.num_rows() - skip)))
+            }
         }
     }
 
@@ -1063,18 +1094,17 @@ async fn coordinator_exit_invalidates_provisional_subscription_delivery() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test(start_paused = true)]
-async fn checkpoint_control_watch_wakes_a_quiet_follower_outside_background_budget() {
+async fn checkpoint_control_watch_wakes_a_quiet_follower() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
-    let mut coordinator = test_coordinator(
+    let coordinator = test_coordinator(
         rx,
         control_rx,
         Arc::clone(&shutdown),
         DeliveryGuarantee::AtLeastOnce,
         None,
     );
-    coordinator.config.background_budget_ns = 0;
 
     let (announcement_tx, announcement_rx) = tokio::sync::watch::channel(None);
     let mut callback = MockCallback::new();
@@ -1131,7 +1161,6 @@ async fn pending_checkpoint_control_rechecks_when_completion_precedes_claim_drop
         None,
     )
     .with_checkpoint_complete_rx(completion_rx);
-    coordinator.config.background_budget_ns = 0;
     coordinator.checkpoint_in_flight = Arc::clone(&in_flight);
 
     let mut callback = MockCallback::new();
@@ -1195,7 +1224,6 @@ async fn pending_checkpoint_control_rechecks_eventless_follower_tail_at_25ms() {
         DeliveryGuarantee::AtLeastOnce,
         None,
     );
-    coordinator.config.background_budget_ns = 0;
     coordinator.checkpoint_in_flight = Arc::clone(&in_flight);
 
     let mut callback = MockCallback::new();
@@ -1232,14 +1260,13 @@ async fn pending_checkpoint_control_rearms_while_intake_is_paused() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
-    let mut coordinator = test_coordinator(
+    let coordinator = test_coordinator(
         rx,
         control_rx,
         Arc::clone(&shutdown),
         DeliveryGuarantee::AtLeastOnce,
         None,
     );
-    coordinator.config.background_budget_ns = 0;
 
     let mut callback = MockCallback::new();
     callback.runtime.leader = false;
@@ -1282,14 +1309,13 @@ async fn checkpoint_control_fault_stops_before_post_fault_batch_executes() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let (source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
-    let mut coordinator = test_coordinator(
+    let coordinator = test_coordinator(
         rx,
         control_rx,
         Arc::clone(&shutdown),
         DeliveryGuarantee::AtLeastOnce,
         None,
     );
-    coordinator.config.background_budget_ns = 0;
     let mut callback = MockCallback::new();
     callback.runtime.leader = false;
     callback.checkpoint_control_enabled = true;
@@ -1307,7 +1333,7 @@ async fn checkpoint_control_fault_stops_before_post_fault_batch_executes() {
         .send(SourceMsg::Batch {
             source_idx: 0,
             batch: int_batch(42),
-            checkpoint: checkpoint_at(1),
+            cursor: SourceBatchCursor::Complete(checkpoint_at(1)),
         })
         .await
         .unwrap();
@@ -1344,7 +1370,6 @@ fn test_coordinator(
             cycle_budget_ns: 10_000_000,
             drain_budget_ns: 1_000_000,
             query_budget_ns: 8_000_000,
-            background_budget_ns: 5_000_000,
             max_input_buf_batches: 256,
             max_input_buf_bytes: None,
             backpressure_policy: crate::config::BackpressurePolicy::Backpressure,
@@ -1514,7 +1539,7 @@ async fn recovery_intake_gate_blocks_compute_and_discards_shutdown_open_epoch() 
     tx.send(SourceMsg::Batch {
         source_idx: 0,
         batch: int_batch(1),
-        checkpoint: checkpoint_at(1),
+        cursor: SourceBatchCursor::Complete(checkpoint_at(1)),
     })
     .await
     .unwrap();
@@ -1534,7 +1559,7 @@ async fn recovery_intake_gate_blocks_compute_and_discards_shutdown_open_epoch() 
     tx.send(SourceMsg::Batch {
         source_idx: 0,
         batch: int_batch(2),
-        checkpoint: checkpoint_at(2),
+        cursor: SourceBatchCursor::Complete(checkpoint_at(2)),
     })
     .await
     .unwrap();
@@ -1607,7 +1632,7 @@ async fn intake_gate_close_after_receive_parks_fifo_message_until_reopen() {
     tx.send(SourceMsg::Batch {
         source_idx: 0,
         batch: int_batch(1),
-        checkpoint: checkpoint_at(1),
+        cursor: SourceBatchCursor::Complete(checkpoint_at(1)),
     })
     .await
     .unwrap();
@@ -1620,7 +1645,7 @@ async fn intake_gate_close_after_receive_parks_fifo_message_until_reopen() {
         tx.send(SourceMsg::Batch {
             source_idx: 0,
             batch: int_batch(2),
-            checkpoint: checkpoint_at(2),
+            cursor: SourceBatchCursor::Complete(checkpoint_at(2)),
         }),
     )
     .await
@@ -2420,6 +2445,54 @@ async fn sourced_pipeline_without_output_streams_has_one_periodic_barrier_path()
             reserved.epoch
         ))
     );
+}
+
+#[tokio::test]
+async fn deferred_operator_work_does_not_cancel_due_checkpoint() {
+    let (source, poll) = checkpoint_source_handle("deferred-source");
+    let mut coordinator = admission_coordinator(vec![source]);
+    coordinator.config.checkpoint_schedule = CheckpointSchedule::Periodic(Duration::ZERO);
+    coordinator.replay_pending = true;
+    let deferred_offset = checkpoint_at(42);
+    coordinator.pending_offsets[0] = Some(SourceBatchCursor::Complete(deferred_offset.clone()));
+    let attempt = CheckpointAttempt::canonical(10_002);
+    let mut callback = MockCallback::new();
+    callback.attempt_to_reserve = attempt;
+    let mut state = CoordinatorRunState {
+        batch_window: Duration::ZERO,
+        checkpoint_control_wake: None,
+        checkpoint_control_poll_at: tokio::time::Instant::now(),
+        checkpoint_control_pending: false,
+        barriers: Vec::new(),
+        fault: None,
+        halted: false,
+        source_channel_expected: true,
+    };
+
+    assert!(
+        coordinator
+            .service_background_work(&mut callback, &mut state, false)
+            .await
+    );
+    assert_eq!(
+        poll.poll(),
+        Some(CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch))
+    );
+    assert!(coordinator.pending_barrier.active);
+    assert!(coordinator.committed_offsets[0].is_none());
+
+    assert!(
+        coordinator
+            .service_background_work(&mut callback, &mut state, false)
+            .await
+    );
+    assert!(coordinator.pending_barrier.active);
+    assert_eq!(callback.reserve_calls, 1);
+    assert!(!coordinator.replay_pending);
+    assert!(coordinator.pending_offsets[0].is_none());
+    assert_eq!(coordinator.committed_offsets[0], Some(deferred_offset));
+    assert_eq!(callback.checkpoint_order.lock().as_slice(), &["drain"]);
+    assert!(callback.abandoned_attempts.lock().is_empty());
 }
 
 #[tokio::test]
@@ -4254,7 +4327,7 @@ async fn process_lease_loss_wakes_a_source_blocked_on_the_bounded_fifo() {
     tx.send(SourceMsg::Batch {
         source_idx: 0,
         batch: int_batch(1),
-        checkpoint: checkpoint_at(1),
+        cursor: SourceBatchCursor::Complete(checkpoint_at(1)),
     })
     .await
     .unwrap();
@@ -4272,7 +4345,7 @@ async fn process_lease_loss_wakes_a_source_blocked_on_the_bounded_fifo() {
         SourceMsg::Batch {
             source_idx: 0,
             batch: int_batch(2),
-            checkpoint: checkpoint_at(2),
+            cursor: SourceBatchCursor::Complete(checkpoint_at(2)),
         },
         &shutdown,
         Some(&authority),
@@ -4298,7 +4371,7 @@ async fn shutdown_wakes_a_source_blocked_on_the_bounded_fifo_without_cluster_aut
     tx.send(SourceMsg::Batch {
         source_idx: 0,
         batch: int_batch(1),
-        checkpoint: checkpoint_at(1),
+        cursor: SourceBatchCursor::Complete(checkpoint_at(1)),
     })
     .await
     .unwrap();
@@ -4308,7 +4381,7 @@ async fn shutdown_wakes_a_source_blocked_on_the_bounded_fifo_without_cluster_aut
         SourceMsg::Batch {
             source_idx: 0,
             batch: int_batch(2),
-            checkpoint: checkpoint_at(2),
+            cursor: SourceBatchCursor::Complete(checkpoint_at(2)),
         },
         &shutdown,
         #[cfg(feature = "cluster")]
@@ -4361,7 +4434,7 @@ async fn process_lease_loss_between_drain_and_execute_prevents_cycle_publication
     tx.send(SourceMsg::Batch {
         source_idx: 0,
         batch: int_batch(1),
-        checkpoint: checkpoint_at(1),
+        cursor: SourceBatchCursor::Complete(checkpoint_at(1)),
     })
     .await
     .unwrap();
@@ -5895,6 +5968,191 @@ fn source_checkpoint_scope_is_validated_before_publication() {
         .contains("unexpectedly carries cluster assignment version 7"));
 }
 
+#[test]
+fn assignment_scoped_batch_uses_its_bound_cursor_and_missing_fails_closed() {
+    let mut batch = SourceBatch::new(RecordBatch::new_empty(test_source_schema()));
+    let error = match take_assignment_bound_batch_cursor(&mut batch, true) {
+        Err(error) => error,
+        Ok(_) => panic!("missing assignment cursor was accepted"),
+    };
+    assert!(error
+        .to_string()
+        .contains("missing its assignment-bound checkpoint"));
+
+    let mut expected = SourceCheckpoint::new();
+    expected.bind_assignment_version(std::num::NonZeroU64::new(7).unwrap());
+    expected
+        .set_input_channels(vec![b"old-partition".to_vec()])
+        .unwrap();
+    let mut batch = SourceBatch::new(RecordBatch::new_empty(test_source_schema()))
+        .with_checkpoint(expected.clone());
+
+    match take_assignment_bound_batch_cursor(&mut batch, true).unwrap() {
+        Some(SourceBatchCursor::Complete(checkpoint)) => {
+            assert_eq!(checkpoint, expected);
+        }
+        _ => panic!("expected a complete assignment cursor"),
+    }
+
+    let channels: Arc<[Vec<u8>]> = Arc::from([b"old-partition".to_vec()]);
+    let delta = SourceCheckpointDelta::new(
+        std::num::NonZeroU64::new(7).unwrap(),
+        channels,
+        std::collections::HashMap::from([("topic:0".into(), Some("11".into()))]),
+    )
+    .unwrap();
+    let mut batch = SourceBatch::new(RecordBatch::new_empty(test_source_schema()))
+        .with_checkpoint_delta(delta.clone());
+    match take_assignment_bound_batch_cursor(&mut batch, true).unwrap() {
+        Some(SourceBatchCursor::Incremental(actual)) => assert_eq!(actual, delta),
+        _ => panic!("expected an incremental assignment cursor"),
+    }
+}
+
+#[test]
+fn incremental_assignment_cursor_preserves_complete_cut_and_rotation_replaces_it() {
+    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+    let mut coordinator = test_coordinator(
+        rx,
+        control_rx,
+        Arc::new(tokio::sync::Notify::new()),
+        DeliveryGuarantee::ExactlyOnce,
+        None,
+    );
+    let channels: Arc<[Vec<u8>]> = Arc::from([b"topic:0".to_vec(), b"topic:1".to_vec()]);
+    let mut committed = SourceCheckpoint::new();
+    committed.set_offset("topic:0", "10");
+    committed.set_offset("@laminar.kafka.next.v1:topic:0", "1");
+    committed.set_offset("@laminar.kafka.next.v1:topic:1", "5");
+    committed.set_metadata("owner", "node-a");
+    committed.set_input_channels(Arc::clone(&channels)).unwrap();
+    committed.bind_assignment_version(std::num::NonZeroU64::new(7).unwrap());
+    coordinator.committed_offsets[0] = Some(committed);
+
+    let delta = SourceCheckpointDelta::new(
+        std::num::NonZeroU64::new(7).unwrap(),
+        Arc::clone(&channels),
+        std::collections::HashMap::from([
+            ("topic:0".into(), Some("11".into())),
+            ("@laminar.kafka.next.v1:topic:0".into(), None),
+        ]),
+    )
+    .unwrap();
+    let mut callback = MockCallback::new();
+    let mut events = 0;
+    coordinator
+        .stage_batch(
+            0,
+            &int_batch(1),
+            SourceBatchCursor::Incremental(delta),
+            &mut callback,
+            &mut events,
+        )
+        .unwrap();
+    assert_eq!(
+        coordinator.committed_offsets[0]
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.get_offset("topic:0")),
+        Some("10")
+    );
+    let deferred = FxHashSet::from_iter([Arc::from("test_source")]);
+    coordinator
+        .settle_pending_offsets(&FxHashSet::default(), &deferred)
+        .unwrap();
+    assert!(coordinator.pending_offsets[0].is_some());
+    coordinator
+        .settle_pending_offsets(&FxHashSet::default(), &FxHashSet::default())
+        .unwrap();
+
+    let committed = coordinator.committed_offsets[0].as_ref().unwrap();
+    assert_eq!(committed.get_offset("topic:0"), Some("11"));
+    assert_eq!(committed.get_offset("@laminar.kafka.next.v1:topic:0"), None);
+    assert_eq!(
+        committed.get_offset("@laminar.kafka.next.v1:topic:1"),
+        Some("5")
+    );
+    assert_eq!(
+        committed.metadata().get("owner").map(String::as_str),
+        Some("node-a")
+    );
+    assert_eq!(committed.input_channels(), Some(channels.as_ref()));
+    assert_eq!(
+        committed
+            .assignment_version()
+            .map(std::num::NonZeroU64::get),
+        Some(7)
+    );
+
+    let replacement_channels: Arc<[Vec<u8>]> = Arc::from([b"topic:2".to_vec()]);
+    let mut replacement = SourceCheckpoint::new();
+    replacement.set_offset("topic:2", "1");
+    replacement
+        .set_input_channels(Arc::clone(&replacement_channels))
+        .unwrap();
+    replacement.bind_assignment_version(std::num::NonZeroU64::new(8).unwrap());
+    coordinator
+        .stage_batch(
+            0,
+            &int_batch(2),
+            SourceBatchCursor::Complete(replacement),
+            &mut callback,
+            &mut events,
+        )
+        .unwrap();
+    coordinator.commit_pending_offsets().unwrap();
+    let committed = coordinator.committed_offsets[0].as_ref().unwrap();
+    assert_eq!(committed.get_offset("topic:2"), Some("1"));
+    assert_eq!(committed.get_offset("topic:0"), None);
+    assert_eq!(committed.get_offset("@laminar.kafka.next.v1:topic:0"), None);
+    assert_eq!(committed.get_offset("@laminar.kafka.next.v1:topic:1"), None);
+    assert_eq!(
+        committed.input_channels(),
+        Some(replacement_channels.as_ref())
+    );
+
+    let stale = SourceCheckpointDelta::new(
+        std::num::NonZeroU64::new(7).unwrap(),
+        channels,
+        std::collections::HashMap::from([("topic:0".into(), Some("12".into()))]),
+    )
+    .unwrap();
+    let error = coordinator
+        .stage_batch(
+            0,
+            &int_batch(3),
+            SourceBatchCursor::Incremental(stale),
+            &mut callback,
+            &mut events,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("invalid incremental cursor"));
+
+    let rollback = SourceCheckpointDelta::new(
+        std::num::NonZeroU64::new(8).unwrap(),
+        replacement_channels,
+        std::collections::HashMap::from([("topic:2".into(), Some("2".into()))]),
+    )
+    .unwrap();
+    coordinator
+        .stage_batch(
+            0,
+            &int_batch(4),
+            SourceBatchCursor::Incremental(rollback),
+            &mut callback,
+            &mut events,
+        )
+        .unwrap();
+    coordinator.discard_pending_offsets();
+    assert!(coordinator.pending_offsets[0].is_none());
+    assert_eq!(
+        coordinator.committed_offsets[0]
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.get_offset("topic:2")),
+        Some("1")
+    );
+}
+
 #[tokio::test]
 async fn emitted_barrier_holds_polling_until_an_applicable_release() {
     let state = Arc::new(BarrierHoldProbeState::default());
@@ -7169,7 +7427,7 @@ async fn fatal_cycle_error_faults_exactly_once() {
     tx.send(SourceMsg::Batch {
         source_idx: 0,
         batch: int_batch(1),
-        checkpoint: checkpoint_at(1),
+        cursor: SourceBatchCursor::Complete(checkpoint_at(1)),
     })
     .await
     .unwrap();
@@ -7211,7 +7469,7 @@ async fn recovery_cycle_error_faults_best_effort() {
     tx.send(SourceMsg::Batch {
         source_idx: 0,
         batch: int_batch(1),
-        checkpoint: checkpoint_at(1),
+        cursor: SourceBatchCursor::Complete(checkpoint_at(1)),
     })
     .await
     .unwrap();
@@ -7254,7 +7512,7 @@ async fn halt_cycle_error_exits_cleanly() {
     tx.send(SourceMsg::Batch {
         source_idx: 0,
         batch: int_batch(1),
-        checkpoint: checkpoint_at(1),
+        cursor: SourceBatchCursor::Complete(checkpoint_at(1)),
     })
     .await
     .unwrap();
@@ -7279,7 +7537,7 @@ async fn publication_failure_does_not_settle_offsets_or_write_sinks_and_faults_a
         DeliveryGuarantee::AtLeastOnce,
         None,
     );
-    coordinator.pending_offsets[0] = Some(checkpoint_at(7));
+    coordinator.pending_offsets[0] = Some(SourceBatchCursor::Complete(checkpoint_at(7)));
     let mut callback = MockCallback::new();
     *callback.publication_error.lock() = Some("injected subscription admission failure".into());
     let written_rows = Arc::clone(&callback.written_rows);
@@ -7311,7 +7569,7 @@ async fn publication_failure_does_not_settle_offsets_or_write_sinks_and_faults_a
         tx.send(SourceMsg::Batch {
             source_idx: 0,
             batch: int_batch(1),
-            checkpoint: checkpoint_at(7),
+            cursor: SourceBatchCursor::Complete(checkpoint_at(7)),
         })
         .await
         .unwrap();
@@ -7337,7 +7595,7 @@ async fn sink_publication_failure_does_not_advance_source_cursor() {
         None,
     );
     coordinator.committed_offsets[0] = Some(checkpoint_at(3));
-    coordinator.pending_offsets[0] = Some(checkpoint_at(7));
+    coordinator.pending_offsets[0] = Some(SourceBatchCursor::Complete(checkpoint_at(7)));
     let mut callback = MockCallback::new();
     *callback.sink_publication_error.lock() = Some("injected sink rejection".into());
     let mut results = FxHashMap::default();
@@ -7381,7 +7639,7 @@ async fn fatal_cycle_error_continues_at_least_once() {
     tx.send(SourceMsg::Batch {
         source_idx: 0,
         batch: int_batch(1),
-        checkpoint: checkpoint_at(1),
+        cursor: SourceBatchCursor::Complete(checkpoint_at(1)),
     })
     .await
     .unwrap();
@@ -7433,7 +7691,7 @@ fn source_data_after_barrier_returns_invariant_fault() {
             SourceMsg::Batch {
                 source_idx: 0,
                 batch: int_batch(99),
-                checkpoint: checkpoint_at(8),
+                cursor: SourceBatchCursor::Complete(checkpoint_at(8)),
             },
             &mut callback,
             &mut barriers,
@@ -7467,7 +7725,7 @@ async fn exactly_once_sink_fault_faults_pipeline() {
     tx.send(SourceMsg::Batch {
         source_idx: 0,
         batch: int_batch(1),
-        checkpoint: checkpoint_at(1),
+        cursor: SourceBatchCursor::Complete(checkpoint_at(1)),
     })
     .await
     .unwrap();
@@ -7503,7 +7761,6 @@ async fn test_coordinator_direct_channel() {
             cycle_budget_ns: 10_000_000,
             drain_budget_ns: 1_000_000,
             query_budget_ns: 8_000_000,
-            background_budget_ns: 5_000_000,
             max_input_buf_batches: 256,
             max_input_buf_bytes: None,
             backpressure_policy: crate::config::BackpressurePolicy::Backpressure,
@@ -7550,7 +7807,7 @@ async fn test_coordinator_direct_channel() {
     tx.send(SourceMsg::Batch {
         source_idx: 0,
         batch,
-        checkpoint: checkpoint_at(1),
+        cursor: SourceBatchCursor::Complete(checkpoint_at(1)),
     })
     .await
     .unwrap();
@@ -7898,7 +8155,7 @@ async fn committed_cut_with_successor_failure_acks_then_faults_before_next_write
         .send(SourceMsg::Batch {
             source_idx: 0,
             batch: int_batch(12),
-            checkpoint: checkpoint_at(attempt.epoch + 1),
+            cursor: SourceBatchCursor::Complete(checkpoint_at(attempt.epoch + 1)),
         })
         .await
         .unwrap();
@@ -7962,7 +8219,6 @@ async fn shutdown_does_not_synthesize_final_checkpoint() {
             cycle_budget_ns: 10_000_000,
             drain_budget_ns: 1_000_000,
             query_budget_ns: 8_000_000,
-            background_budget_ns: 5_000_000,
             max_input_buf_batches: 256,
             max_input_buf_bytes: None,
             backpressure_policy: crate::config::BackpressurePolicy::Backpressure,
@@ -8009,7 +8265,7 @@ async fn shutdown_does_not_synthesize_final_checkpoint() {
     tx.send(SourceMsg::Batch {
         source_idx: 0,
         batch,
-        checkpoint: checkpoint_at(1),
+        cursor: SourceBatchCursor::Complete(checkpoint_at(1)),
     })
     .await
     .unwrap();
@@ -8093,7 +8349,7 @@ async fn shutdown_drain_ignores_barrier_and_processes_following_batch() {
         .send(SourceMsg::Batch {
             source_idx: 0,
             batch: int_batch(7),
-            checkpoint: checkpoint_at(attempt.epoch + 1),
+            cursor: SourceBatchCursor::Complete(checkpoint_at(attempt.epoch + 1)),
         })
         .await
         .unwrap();
@@ -8254,7 +8510,6 @@ async fn test_barrier_excludes_post_barrier_data() {
             cycle_budget_ns: 10_000_000,
             drain_budget_ns: 1_000_000,
             query_budget_ns: 8_000_000,
-            background_budget_ns: 5_000_000,
             max_input_buf_batches: 256,
             max_input_buf_bytes: None,
             backpressure_policy: crate::config::BackpressurePolicy::Backpressure,
@@ -8312,7 +8567,7 @@ async fn test_barrier_excludes_post_barrier_data() {
             SourceMsg::Batch {
                 source_idx: 0,
                 batch: batch_1,
-                checkpoint: checkpoint_at(10),
+                cursor: SourceBatchCursor::Complete(checkpoint_at(10)),
             },
             &mut callback,
             &mut barriers,
@@ -8342,7 +8597,7 @@ async fn test_barrier_excludes_post_barrier_data() {
             SourceMsg::Batch {
                 source_idx: 1,
                 batch: batch_s1,
-                checkpoint: checkpoint_at(5),
+                cursor: SourceBatchCursor::Complete(checkpoint_at(5)),
             },
             &mut callback,
             &mut barriers,
@@ -8380,22 +8635,16 @@ async fn test_barrier_excludes_post_barrier_data() {
     assert_eq!(s1_batches.len(), 1, "s1 should have exactly 1 batch");
 
     // Pending offsets stop at the barrier cut.
-    assert_eq!(
-        coordinator.pending_offsets[0]
-            .as_ref()
-            .unwrap()
-            .get_offset("test_position"),
-        Some("10"),
-        "s0 pending offset should be the pre-barrier batch"
-    );
-    assert_eq!(
-        coordinator.pending_offsets[1]
-            .as_ref()
-            .unwrap()
-            .get_offset("test_position"),
-        Some("5"),
-        "s1 pending offset should be epoch 5"
-    );
+    assert!(matches!(
+        &coordinator.pending_offsets[0],
+        Some(SourceBatchCursor::Complete(checkpoint))
+            if checkpoint.get_offset("test_position") == Some("10")
+    ));
+    assert!(matches!(
+        &coordinator.pending_offsets[1],
+        Some(SourceBatchCursor::Complete(checkpoint))
+            if checkpoint.get_offset("test_position") == Some("5")
+    ));
     // committed_offsets must still be None — no execute_cycle has run.
     assert!(
         coordinator.committed_offsets[0].is_none(),
@@ -8407,7 +8656,7 @@ async fn test_barrier_excludes_post_barrier_data() {
     );
 
     // Simulate successful cycle → commit.
-    coordinator.commit_pending_offsets();
+    coordinator.commit_pending_offsets().unwrap();
     assert_eq!(
         coordinator.committed_offsets[0]
             .as_ref()
@@ -8446,7 +8695,6 @@ async fn test_settle_pending_offsets_holds_failed_source() {
             cycle_budget_ns: 10_000_000,
             drain_budget_ns: 1_000_000,
             query_budget_ns: 8_000_000,
-            background_budget_ns: 5_000_000,
             max_input_buf_batches: 256,
             max_input_buf_bytes: None,
             backpressure_policy: crate::config::BackpressurePolicy::Backpressure,
@@ -8469,7 +8717,10 @@ async fn test_settle_pending_offsets_holds_failed_source() {
         pending_watermark_batches: Vec::new(),
         barrier_seen: FxHashSet::default(),
         committed_offsets: vec![None, None],
-        pending_offsets: vec![Some(checkpoint_at(10)), Some(checkpoint_at(20))],
+        pending_offsets: vec![
+            Some(SourceBatchCursor::Complete(checkpoint_at(10))),
+            Some(SourceBatchCursor::Complete(checkpoint_at(20))),
+        ],
         replay_pending: false,
         control_rx,
         checkpoint_complete_rx: None,
@@ -8486,7 +8737,9 @@ async fn test_settle_pending_offsets_holds_failed_source() {
 
     let mut failed: FxHashSet<Arc<str>> = FxHashSet::default();
     failed.insert(Arc::from("s0"));
-    coordinator.settle_pending_offsets(&failed, &FxHashSet::default());
+    coordinator
+        .settle_pending_offsets(&failed, &FxHashSet::default())
+        .unwrap();
 
     assert!(
         coordinator.committed_offsets[0].is_none(),
@@ -8506,17 +8759,21 @@ async fn test_settle_pending_offsets_holds_failed_source() {
     );
 
     coordinator.committed_offsets = vec![None, None];
-    coordinator.pending_offsets = vec![Some(checkpoint_at(10)), Some(checkpoint_at(20))];
+    coordinator.pending_offsets = vec![
+        Some(SourceBatchCursor::Complete(checkpoint_at(10))),
+        Some(SourceBatchCursor::Complete(checkpoint_at(20))),
+    ];
     let failed = FxHashSet::default();
     let deferred = FxHashSet::from_iter([Arc::from("s0")]);
-    coordinator.settle_pending_offsets(&failed, &deferred);
+    coordinator
+        .settle_pending_offsets(&failed, &deferred)
+        .unwrap();
     assert!(coordinator.committed_offsets[0].is_none());
-    assert_eq!(
-        coordinator.pending_offsets[0]
-            .as_ref()
-            .and_then(|cp| cp.get_offset("test_position")),
-        Some("10")
-    );
+    assert!(matches!(
+        &coordinator.pending_offsets[0],
+        Some(SourceBatchCursor::Complete(checkpoint))
+            if checkpoint.get_offset("test_position") == Some("10")
+    ));
     assert_eq!(
         coordinator.committed_offsets[1]
             .as_ref()
@@ -8524,7 +8781,9 @@ async fn test_settle_pending_offsets_holds_failed_source() {
         Some("20")
     );
 
-    coordinator.settle_pending_offsets(&failed, &FxHashSet::default());
+    coordinator
+        .settle_pending_offsets(&failed, &FxHashSet::default())
+        .unwrap();
     assert!(coordinator.pending_offsets[0].is_none());
     assert_eq!(
         coordinator.committed_offsets[0]
@@ -8555,7 +8814,7 @@ async fn quiet_source_deferral_retries_before_reading_another_message() {
         .send(SourceMsg::Batch {
             source_idx: 0,
             batch: int_batch(7),
-            checkpoint: checkpoint_at(10),
+            cursor: SourceBatchCursor::Complete(checkpoint_at(10)),
         })
         .await
         .unwrap();
@@ -8642,8 +8901,21 @@ impl PipelineCallback for BackpressuredCallback {
     ) -> Result<(), CycleError> {
         self.inner.write_to_sinks(r, deadline).await
     }
-    fn extract_watermark(&mut self, s: &str, b: &RecordBatch) -> Result<(), CycleError> {
-        self.inner.extract_watermark(s, b)
+    fn extract_watermark(
+        &mut self,
+        s: &str,
+        b: &RecordBatch,
+        admission_floor: i64,
+    ) -> Result<(), CycleError> {
+        self.inner.extract_watermark(s, b, admission_floor)
+    }
+    fn reconcile_source_input_channels(
+        &mut self,
+        source_name: &str,
+        input_channels: Option<Arc<[Vec<u8>]>>,
+    ) -> Result<(), CycleError> {
+        self.inner
+            .reconcile_source_input_channels(source_name, input_channels)
     }
     fn filter_late_rows(
         &self,
@@ -8742,7 +9014,6 @@ async fn test_drain_skip_under_backpressure() {
             cycle_budget_ns: 10_000_000,
             drain_budget_ns: 1_000_000,
             query_budget_ns: 8_000_000,
-            background_budget_ns: 5_000_000,
             max_input_buf_batches: 256,
             max_input_buf_bytes: None,
             backpressure_policy: crate::config::BackpressurePolicy::Backpressure,
@@ -8792,7 +9063,7 @@ async fn test_drain_skip_under_backpressure() {
         tx.send(SourceMsg::Batch {
             source_idx: 0,
             batch,
-            checkpoint: checkpoint_at(u64::try_from(i).unwrap()),
+            cursor: SourceBatchCursor::Complete(checkpoint_at(u64::try_from(i).unwrap())),
         })
         .await
         .unwrap();

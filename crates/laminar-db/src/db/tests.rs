@@ -916,6 +916,7 @@ async fn record_two_vnode_acquisition_checkpoint(
         assignment_fence: Some(fence.clone()),
         predecessor: None,
         participants,
+        source_names: Vec::new(),
         source_offsets: Default::default(),
         channel_progress: Vec::new(),
         checkpoint_watermark: None,
@@ -8156,6 +8157,301 @@ fn test_filter_late_rows_filters_correctly() {
         .unwrap();
     assert_eq!(ids.value(0), 2); // ts=500
     assert_eq!(ids.value(1), 4); // ts=800
+}
+
+#[test]
+fn recovered_input_channels_hold_the_logical_watermark_during_skewed_replay() {
+    use arrow::array::{BinaryArray, TimestampMillisecondArray};
+    use laminar_core::time::{BoundedOutOfOrdernessGenerator, EventTimeExtractor, ExtractionMode};
+
+    let recovered_inventory: Arc<[Vec<u8>]> =
+        Arc::from([b"fast".to_vec(), b"slow".to_vec(), b"stale".to_vec()]);
+    let recovered = rustc_hash::FxHashMap::from_iter([
+        (
+            Box::<[u8]>::from(&b"slow"[..]),
+            RecoveredInputChannelProgress {
+                watermark: Some(10),
+                idle: false,
+            },
+        ),
+        (
+            Box::<[u8]>::from(&b"fast"[..]),
+            RecoveredInputChannelProgress {
+                watermark: Some(100),
+                idle: false,
+            },
+        ),
+        (
+            Box::<[u8]>::from(&b"stale"[..]),
+            RecoveredInputChannelProgress {
+                watermark: Some(1_000),
+                idle: true,
+            },
+        ),
+    ]);
+    let mut state = SourceWatermarkState::new(
+        EventTimeExtractor::from_column("ts").with_mode(ExtractionMode::Max),
+        Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(0)),
+        "ts".into(),
+    )
+    .with_input_channels(
+        Duration::ZERO,
+        0,
+        None,
+        recovered,
+        Some(recovered_inventory),
+    );
+    state
+        .install_input_channels(
+            Some(Arc::from([b"fast".to_vec(), b"slow".to_vec()])),
+            i64::MIN,
+        )
+        .unwrap();
+    let partitioned = state.partitioned.as_ref().unwrap();
+    assert!(partitioned.recovered.is_empty());
+    assert!(partitioned.recovered_inventory.is_none());
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            false,
+        ),
+        Field::new(
+            laminar_connectors::connector::SOURCE_PARTITION_COLUMN,
+            DataType::Binary,
+            false,
+        ),
+    ]));
+    let batch = |timestamp, input_channel: &'static [u8]| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(vec![timestamp])),
+                Arc::new(BinaryArray::from(vec![input_channel])),
+            ],
+        )
+        .unwrap()
+    };
+
+    state
+        .observe_input_channels(&batch(200, b"fast"), 10)
+        .unwrap();
+    assert_eq!(state.generator.current_watermark(), 10);
+
+    let slow = filter_late_rows(&batch(12, b"slow"), "ts", 10)
+        .unwrap()
+        .expect("the slow channel row is still on time");
+    state.observe_input_channels(&slow, 10).unwrap();
+    assert_eq!(state.generator.current_watermark(), 12);
+
+    state
+        .install_input_channels(Some(Arc::from([b"slow".to_vec()])), 1)
+        .unwrap();
+    let retained = state.input_channel_progress().unwrap().unwrap();
+    assert_eq!(retained[0].watermark, Some(12));
+
+    state
+        .install_input_channels(
+            Some(Arc::from([
+                b"fast".to_vec(),
+                b"slow".to_vec(),
+                b"stale".to_vec(),
+            ])),
+            1,
+        )
+        .unwrap();
+    let reassigned = state.input_channel_progress().unwrap().unwrap();
+    assert_eq!(reassigned[0].watermark, Some(12));
+    assert_eq!(reassigned[1].watermark, Some(12));
+    assert_eq!(reassigned[2].watermark, Some(12));
+    assert!(!reassigned[2].idle);
+
+    {
+        let channels = &mut state.partitioned.as_mut().unwrap().channels;
+        channels.get_mut(&b"slow"[..]).unwrap().idle = true;
+        channels.get_mut(&b"stale"[..]).unwrap().idle = true;
+    }
+    state
+        .observe_input_channels(&batch(200, b"fast"), 1)
+        .unwrap();
+    assert_eq!(state.generator.current_watermark(), 200);
+
+    state
+        .observe_input_channels(&batch(13, b"slow"), 1)
+        .unwrap();
+    let resumed = state.input_channel_progress().unwrap().unwrap();
+    assert_eq!(resumed[1].watermark, Some(200));
+    assert!(!resumed[1].idle);
+}
+
+#[test]
+fn null_event_time_does_not_advance_a_physical_input_channel() {
+    use arrow::array::{BinaryArray, TimestampMillisecondArray};
+    use laminar_core::time::{BoundedOutOfOrdernessGenerator, EventTimeExtractor};
+
+    let mut state = SourceWatermarkState::new(
+        EventTimeExtractor::from_column("ts"),
+        Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(0)),
+        "ts".into(),
+    )
+    .with_input_channels(Duration::ZERO, 0, None, Default::default(), None);
+    state
+        .install_input_channels(Some(Arc::from([b"p0".to_vec()])), i64::MIN)
+        .unwrap();
+
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new(
+                laminar_connectors::connector::SOURCE_PARTITION_COLUMN,
+                DataType::Binary,
+                false,
+            ),
+        ])),
+        vec![
+            Arc::new(TimestampMillisecondArray::from(vec![None])),
+            Arc::new(BinaryArray::from(vec![&b"p0"[..]])),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        state.observe_input_channels(&batch, i64::MIN).unwrap(),
+        None
+    );
+    assert_eq!(state.generator.current_watermark(), i64::MIN);
+    assert_eq!(
+        state.input_channel_progress().unwrap().unwrap()[0].watermark,
+        None
+    );
+}
+
+#[test]
+fn recovered_input_channels_are_not_idle_before_inventory_reconciliation() {
+    use laminar_core::time::{BoundedOutOfOrdernessGenerator, EventTimeExtractor, ExtractionMode};
+
+    let inventory: Arc<[Vec<u8>]> = Arc::from([b"slow".to_vec()]);
+    let recovered = rustc_hash::FxHashMap::from_iter([(
+        Box::<[u8]>::from(&b"slow"[..]),
+        RecoveredInputChannelProgress {
+            watermark: Some(10),
+            idle: false,
+        },
+    )]);
+    let mut state = SourceWatermarkState::new(
+        EventTimeExtractor::from_column("ts").with_mode(ExtractionMode::Max),
+        Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(0)),
+        "ts".into(),
+    )
+    .with_input_channels(
+        Duration::ZERO,
+        0,
+        None,
+        recovered,
+        Some(Arc::clone(&inventory)),
+    );
+    state.generator.restore_watermark_for_recovery(10);
+    assert_eq!(state.input_channels_all_idle(), Some(false));
+
+    let mut tracker = laminar_core::time::WatermarkTracker::new(2);
+    tracker.update_source(0, 10);
+    tracker.update_source(1, 100);
+    let advanced = tracker.update_source(0, state.generator.current_watermark());
+    if state.input_channels_all_idle() == Some(true) {
+        let _ = tracker.mark_idle(0).or(advanced);
+    }
+    assert_eq!(
+        tracker
+            .current_watermark()
+            .map(|watermark| watermark.timestamp()),
+        Some(10),
+        "an uninstalled recovered source must hold the combined frontier"
+    );
+
+    state
+        .install_input_channels(Some(Arc::from([])), 10)
+        .unwrap();
+    assert_eq!(state.input_channels_all_idle(), Some(true));
+}
+
+#[test]
+fn input_channel_idle_tick_keeps_active_minimum_and_idle_maximum_semantics() {
+    use laminar_core::time::{BoundedOutOfOrdernessGenerator, EventTimeExtractor};
+
+    let mut state = SourceWatermarkState::new(
+        EventTimeExtractor::from_column("ts"),
+        Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(0)),
+        "ts".into(),
+    )
+    .with_input_channels(Duration::ZERO, 0, None, Default::default(), None);
+    state
+        .install_input_channels(
+            Some(Arc::from([b"fast".to_vec(), b"slow".to_vec()])),
+            i64::MIN,
+        )
+        .unwrap();
+    let channels = &mut state.partitioned.as_mut().unwrap().channels;
+    laminar_core::time::WatermarkGenerator::restore_watermark_for_recovery(
+        &mut channels.get_mut(&b"fast"[..]).unwrap().generator,
+        20,
+    );
+    laminar_core::time::WatermarkGenerator::restore_watermark_for_recovery(
+        &mut channels.get_mut(&b"slow"[..]).unwrap().generator,
+        10,
+    );
+
+    assert_eq!(state.tick_input_channel_idleness(), (Some(10), false));
+    state
+        .partitioned
+        .as_mut()
+        .unwrap()
+        .channels
+        .get_mut(&b"slow"[..])
+        .unwrap()
+        .idle = true;
+    assert_eq!(state.tick_input_channel_idleness(), (Some(20), false));
+    state
+        .partitioned
+        .as_mut()
+        .unwrap()
+        .channels
+        .get_mut(&b"fast"[..])
+        .unwrap()
+        .idle = true;
+    assert_eq!(state.tick_input_channel_idleness(), (None, true));
+}
+
+#[test]
+fn rejected_external_watermark_is_not_checkpointed_as_a_partition_floor() {
+    use laminar_core::time::{BoundedOutOfOrdernessGenerator, EventTimeExtractor};
+
+    let mut state = SourceWatermarkState::new(
+        EventTimeExtractor::from_column("ts"),
+        Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(1)),
+        "ts".into(),
+    )
+    .with_input_channels(
+        Duration::ZERO,
+        1,
+        None,
+        rustc_hash::FxHashMap::default(),
+        None,
+    );
+    state
+        .install_input_channels(Some(Arc::from([b"partition".to_vec()])), i64::MIN)
+        .unwrap();
+
+    assert_eq!(state.advance_external_watermark(i64::MAX), None);
+    assert_eq!(state.generator.current_watermark(), i64::MIN);
+    assert_eq!(
+        state.input_channel_progress().unwrap().unwrap()[0].watermark,
+        None
+    );
 }
 
 #[test]

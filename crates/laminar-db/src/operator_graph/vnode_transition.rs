@@ -875,8 +875,7 @@ impl OperatorGraph {
     ) -> Result<(), DbError> {
         let accounted_bytes = self
             .managed_state_accounted_bytes()
-            .checked_add(payload_bytes)
-            .unwrap_or(usize::MAX);
+            .saturating_add(payload_bytes);
         if accounted_bytes > self.max_managed_state_bytes {
             return Err(DbError::ManagedStateBudgetExceeded {
                 context: context.into(),
