@@ -89,8 +89,6 @@ pub const STATE_CORRUPTION: &str = "LDB-4006";
 pub const CLUSTER_STATE_LIFECYCLE_UNSUPPORTED: &str = "LDB-4007";
 /// Managed operator state exceeded the configured pipeline working-state budget.
 pub const MANAGED_STATE_BUDGET_EXCEEDED: &str = "LDB-4008";
-/// Retractable MIN/MAX checkpoint work exceeded its configured pre-encoding budget.
-pub const RETRACTABLE_EXTREMUM_CHECKPOINT_BUDGET_EXCEEDED: &str = "LDB-4009";
 // ── Connector / I/O (LDB-5xxx) ──
 
 /// Connector failed to establish a connection.
@@ -304,7 +302,6 @@ mod tests {
         assert_eq!(INVALID_CONFIG, "LDB-0001");
         assert_eq!(SERIALIZATION_FAILED, "LDB-4001");
         assert_eq!(MANAGED_STATE_BUDGET_EXCEEDED, "LDB-4008");
-        assert_eq!(RETRACTABLE_EXTREMUM_CHECKPOINT_BUDGET_EXCEEDED, "LDB-4009");
         assert_eq!(EXACTLY_ONCE_SOURCE_UNCERTIFIED, "LDB-5037");
         assert_eq!(SOURCE_PRIMARY_KEY_REQUIRED, "LDB-5038");
         assert_eq!(SOURCE_MUTATION_NOT_ADMITTED, "LDB-5039");

@@ -266,8 +266,8 @@ non-`DISTINCT` aggregates:
 | `MIN(col)` / `MAX(col)` | Min/max |
 
 `first_value` and `last_value` are available on supported local window paths, not on the distributed
-named-aggregate path. Cluster `DISTINCT` aggregates and `MIN`/`MAX` over changelog inputs remain
-rejected because their per-key state is not spillable; bounded join outputs are append-only.
+named-aggregate path. `DISTINCT` aggregates and `MIN`/`MAX` over changelog inputs remain rejected
+because bounded retractable extrema state is not supported; bounded join outputs are append-only.
 
 ### Streaming UDFs
 

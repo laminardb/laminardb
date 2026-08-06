@@ -5008,6 +5008,7 @@ dependencies = [
  "datafusion",
  "datafusion-common",
  "datafusion-expr",
+ "datafusion-functions-aggregate-common",
  "datafusion-optimizer",
  "futures",
  "futures-util",

@@ -3,10 +3,7 @@ use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use super::{
-    build_table_fields_and_primary_key, distinct_streaming_aggregate,
-    validate_create_table_envelope,
-};
+use super::{build_table_fields_and_primary_key, validate_create_table_envelope};
 
 fn parse_create_table(sql: &str) -> sqlparser::ast::CreateTable {
     let mut statements = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
@@ -15,19 +12,6 @@ fn parse_create_table(sql: &str) -> sqlparser::ast::CreateTable {
         Statement::CreateTable(create) => create,
         statement => panic!("expected CREATE TABLE, got {statement}"),
     }
-}
-
-#[test]
-fn cluster_distinct_aggregate_preflight_is_exact() {
-    assert_eq!(
-        distinct_streaming_aggregate("SELECT k, COUNT(DISTINCT v) FROM events GROUP BY k")
-            .as_deref(),
-        Some("countdistinct")
-    );
-    assert_eq!(
-        distinct_streaming_aggregate("SELECT k, COUNT(v) FROM events GROUP BY k"),
-        None
-    );
 }
 
 #[test]

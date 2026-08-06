@@ -1910,7 +1910,7 @@ async fn failure_after_destructive_operator_capture_faults_runtime() {
 
     assert_eq!(live_rows.load(std::sync::atomic::Ordering::Acquire), 0);
     assert!(error.contains("recovery from the last committed checkpoint is required"));
-    assert!(error.contains("staged-state budget"));
+    assert!(error.contains("capture headroom"), "{error}");
     let fault = crate::pipeline::PipelineCallback::take_pipeline_fault(&mut callback)
         .expect("a post-capture failure must become a runtime fault");
     assert_eq!(fault, error);
@@ -2232,38 +2232,6 @@ async fn managed_state_budget_exhaustion_halts_and_notifies_shutdown() {
     tokio::time::timeout(Duration::from_millis(50), notify.notified())
         .await
         .expect("managed-state exhaustion must notify shutdown");
-}
-
-#[tokio::test]
-async fn retractable_extremum_checkpoint_budget_exhaustion_is_terminal() {
-    use crate::pipeline::CycleError;
-    let notify = Arc::new(tokio::sync::Notify::new());
-    let error = DbError::RetractableExtremumCheckpointBudgetExceeded {
-        context: "aggregate 'agg' delta capture".into(),
-        charged_bytes: 1_048_577,
-        limit_bytes: 1_048_576,
-    };
-
-    assert_eq!(
-        error.code(),
-        laminar_core::error_codes::RETRACTABLE_EXTREMUM_CHECKPOINT_BUDGET_EXCEEDED
-    );
-    assert!(error.requires_pipeline_halt());
-    assert!(!error.requires_pipeline_recovery());
-    assert!(!error.is_transient());
-
-    let mapped = ConnectorPipelineCallback::map_graph_error(&error, &notify);
-    assert!(matches!(
-        &mapped,
-        CycleError::Halt(message)
-            if message.contains(
-                laminar_core::error_codes::RETRACTABLE_EXTREMUM_CHECKPOINT_BUDGET_EXCEEDED
-            ) && message.contains("1048577")
-                && message.contains("1048576")
-    ));
-    tokio::time::timeout(Duration::from_millis(50), notify.notified())
-        .await
-        .expect("retractable-extremum checkpoint exhaustion must notify shutdown");
 }
 
 #[tokio::test]

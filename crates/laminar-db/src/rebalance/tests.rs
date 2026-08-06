@@ -94,10 +94,13 @@ async fn install_running_test_vnode_state(
     db: &LaminarDB,
     assignment: &AssignmentSnapshot,
 ) -> tempfile::TempDir {
+    let assignment_fence = assignment.assignment_fence().unwrap();
+    let key_group_count =
+        laminar_core::state::KeyGroupCount::try_from(assignment_fence.vnode_count).unwrap();
     let pipeline_identity = laminar_core::checkpoint::PipelineIdentity::empty();
     *db.installed_vnode_state.lock() = Some(
         crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
-            assignment.assignment_fence().unwrap(),
+            assignment_fence,
             pipeline_identity.clone(),
         )
         .unwrap(),
@@ -109,12 +112,19 @@ async fn install_running_test_vnode_state(
     );
     let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
         crate::checkpoint_coordinator::CheckpointConfig::default(),
-        Box::new(laminar_core::checkpoint::ObjectStoreCheckpointStore::new(
-            checkpoint_store,
-            "",
-        )),
+        Box::new(
+            laminar_core::checkpoint::ObjectStoreCheckpointStore::new(checkpoint_store, "")
+                .with_key_group_count(key_group_count),
+        ),
     )
     .unwrap();
+    let decision_store = db.decision_store.lock().clone();
+    if let Some(decision_store) = decision_store {
+        coordinator
+            .bind_durable_decision_store(decision_store)
+            .await
+            .unwrap();
+    }
     coordinator
         .bind_pipeline_identity(pipeline_identity)
         .unwrap();
@@ -446,6 +456,11 @@ async fn predecessor_failure_fixture(
         )))
         .shuffle_receiver(shuffle_receiver)
         .vnode_registry(Arc::clone(&registry))
+        .decision_store(Arc::new(
+            laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::clone(
+                &shared_store,
+            )),
+        ))
         .assignment_snapshot_store(Arc::clone(&durable))
         .build()
         .await
@@ -796,9 +811,9 @@ async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("the successor cannot install acquired state until vnode transfer is implemented");
+    .expect_err("the test checkpoint intentionally omits the acquired vnode manifest");
     assert!(
-        error.contains("committed-frame vnode reassignment"),
+        error.contains("participant 2 handoff manifest is missing"),
         "{error}"
     );
     let successor = durable.load().await.unwrap().unwrap();
@@ -1540,9 +1555,9 @@ async fn successor_adoption_accepts_a_retained_predecessor_after_ancestry_prunin
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("the test recovery cannot install transferred vnode state");
+    .expect_err("the test checkpoint intentionally omits the acquired vnode manifest");
     assert!(
-        error.contains("committed-frame vnode reassignment"),
+        error.contains("participant 2 handoff manifest is missing"),
         "{error}"
     );
     let recovery = durable.load().await.unwrap().unwrap();

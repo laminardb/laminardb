@@ -5780,7 +5780,7 @@ impl StreamingCoordinator {
         }
         self.pending_watermark_batches.push(PendingWatermarkBatch {
             source_name: name,
-            batch: visible,
+            batch: batch.clone(),
             admission_floor,
             input_channels,
         });

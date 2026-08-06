@@ -82,6 +82,7 @@ arrow-select = "=57.2.0"
 datafusion = "52.3"
 datafusion-common = "52.0"
 datafusion-expr = "52.0"
+datafusion-functions-aggregate-common = "52.3"
 datafusion-sql = "52.0"
 datafusion-optimizer = "52.0"
 # `visitor` enables sqlparser's exhaustive `visit_expressions` AST walker, used

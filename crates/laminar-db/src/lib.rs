@@ -115,7 +115,6 @@ pub mod profile;
 pub mod rebalance;
 /// Unified recovery manager.
 pub mod recovery_manager;
-mod retractable_accumulator;
 mod show_commands;
 mod sink_task;
 mod sql_analysis;
@@ -155,7 +154,6 @@ pub use checkpoint_coordinator::{
 };
 pub use config::{
     BackpressurePolicy, LaminarConfig, RestartPolicy, DEFAULT_MAX_MANAGED_STATE_BYTES,
-    DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES,
 };
 pub use db::LaminarDB;
 pub use engine_metrics::EngineMetrics;

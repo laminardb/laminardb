@@ -32,11 +32,10 @@ fn reg(name: &str, sql: &str, windowed: bool) -> StreamRegistration {
         name: name.to_string(),
         query_sql: sql.to_string(),
         emit_clause: None,
-        // Resolver only checks `is_some()`; the size doesn't matter.
         window_config: windowed.then(|| {
             laminar_sql::translator::WindowOperatorConfig::tumbling(
                 "event_time".into(),
-                Duration::ZERO,
+                Duration::from_secs(60),
             )
         }),
         order_config: None,
@@ -279,6 +278,56 @@ async fn ambiguous_changelog_consumer_fails_closed() {
         error.contains("cannot safely consume a changelog"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn windowed_changelog_consumer_fails_closed() {
+    use laminar_sql::parser::EmitClause;
+
+    let ctx = ctx_with_payments();
+    let mut changes = reg(
+        "changes",
+        "SELECT region, event_time, SUM(amount_usd) AS total FROM payments \
+         GROUP BY region, event_time",
+        false,
+    );
+    changes.emit_clause = Some(EmitClause::Changes);
+
+    let mut regs = std::collections::HashMap::new();
+    regs.insert(changes.name.clone(), changes);
+    regs.insert(
+        "windowed".to_string(),
+        reg(
+            "windowed",
+            "SELECT region, COUNT(*) AS n FROM changes \
+             GROUP BY tumble(event_time, INTERVAL '1' MINUTE), region",
+            true,
+        ),
+    );
+
+    let error = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("cannot safely consume a changelog") && error.contains("window"),
+        "{error}"
+    );
+
+    let mut unsupported = std::collections::HashMap::new();
+    unsupported.insert(
+        "distinct".to_string(),
+        reg(
+            "distinct",
+            "SELECT region, COUNT(DISTINCT method) AS n FROM payments GROUP BY region",
+            false,
+        ),
+    );
+    let error = resolve_stream_output_schemas(&ctx, &unsupported, &Default::default())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("DISTINCT aggregates"), "{error}");
 }
 
 #[tokio::test]

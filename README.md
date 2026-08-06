@@ -262,8 +262,9 @@ GROUP BY account_id;
 ```
 
 Within this bounded stream-stream path, fused `JOIN ... GROUP BY`, intermediate-input, cross,
-as-of, unbounded, general non-equality, and multi-way joins fail closed. Temporal and lookup joins
-are separate local enrichment paths and are rejected in cluster mode. A join cycle is capped at
+as-of, unbounded, general non-equality, and multi-way joins fail closed. `FOR SYSTEM_TIME AS OF`
+and `TEMPORAL PROBE JOIN` use the separate managed vnode-keyed temporal path in local and cluster
+mode; lookup-table enrichment remains local-only. A join cycle is capped at
 262,144 output rows and 64 MiB; exceeding either limit is a terminal hot-key fanout error, with no
 continuation or spill path.
 

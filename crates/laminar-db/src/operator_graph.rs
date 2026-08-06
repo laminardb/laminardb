@@ -326,10 +326,6 @@ pub(crate) trait GraphOperator: Send {
     /// Install the pipeline-wide retained-state limit for bounded restore preflight.
     fn set_managed_state_budget(&mut self, _bytes: usize) {}
 
-    /// Install the backend-neutral pre-encoding work budget used by retractable MIN/MAX aggregate
-    /// checkpoints. Non-SQL operators do not consume this query-execution setting.
-    fn set_retractable_extremum_checkpoint_budget(&mut self, _bytes: usize) {}
-
     /// Build and install the operator's declared managed working state before recovery.
     ///
     /// The graph calls this only for operators whose capability declares a managed-state
@@ -684,13 +680,7 @@ impl GraphNode {
         }
     }
 
-    fn replace_operator(
-        &mut self,
-        mut operator: Box<dyn GraphOperator>,
-        max_retractable_extremum_checkpoint_bytes: usize,
-    ) {
-        operator
-            .set_retractable_extremum_checkpoint_budget(max_retractable_extremum_checkpoint_bytes);
+    fn replace_operator(&mut self, operator: Box<dyn GraphOperator>) {
         let capability = operator.cluster_capability();
         tracing::debug!(
             operator = %self.name,
@@ -951,9 +941,6 @@ pub(crate) struct OperatorGraph {
     // Pipeline-wide backend-neutral charged-byte envelope for all managed operators and lifecycle
     // phases. Runtime construction always replaces the unbounded test/default sentinel.
     max_managed_state_bytes: usize,
-    // Per aggregate-operator capture charge allowed before retractable MIN/MAX multisets are
-    // materialized. Runtime construction replaces the public default with the resolved setting.
-    max_retractable_extremum_checkpoint_bytes: usize,
     temporal_join_idle_history_retention: Option<std::time::Duration>,
     // Since-last-sample high watermarks make synchronous prepare/publish/finish ownership visible
     // without invoking Prometheus inside the vnode publication section. Indices mirror `nodes`.
@@ -973,9 +960,8 @@ pub(crate) struct OperatorGraph {
     main_runtime_handle: Option<tokio::runtime::Handle>,
     // Lookup table name → column names; routes lookup-enrich joins to the async operator.
     partial_lookup_tables: FxHashMap<String, Vec<String>>,
-    // Incremental MV names (changelog producers); routes a `changelog ⋈ static dim` join to the
-    // ChangelogEnrich operator. Kept current as incremental MVs are added.
-    incremental_tables: FxHashSet<String>,
+    // Changelog-producing intermediates used for consumer admission and changelog enrichment.
+    changelog_tables: FxHashSet<String>,
     // Static reference/dimension table names — valid right sides of a changelog enrich join.
     reference_tables: FxHashSet<String>,
     // Plan-time errors from add_query (returns ()); surfaced by take_build_errors at start.
@@ -1038,8 +1024,6 @@ impl OperatorGraph {
             deferred_scan_offset: 0,
             stats_tick: 0,
             max_managed_state_bytes: usize::MAX,
-            max_retractable_extremum_checkpoint_bytes:
-                crate::config::DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES,
             temporal_join_idle_history_retention: None,
             managed_state_accounting_peaks: Vec::new(),
             key_group_count: DEFAULT_KEY_GROUP_COUNT,
@@ -1067,7 +1051,7 @@ impl OperatorGraph {
             ai_runtime: None,
             main_runtime_handle: None,
             partial_lookup_tables: FxHashMap::default(),
-            incremental_tables: FxHashSet::default(),
+            changelog_tables: FxHashSet::default(),
             reference_tables: FxHashSet::default(),
             build_errors: Vec::new(),
             whole_restore_open: true,
@@ -1081,11 +1065,9 @@ impl OperatorGraph {
         self.reference_tables = tables;
     }
 
-    /// Seed the incremental-MV (changelog producer) set before operators are built, so a
-    /// `changelog ⋈ static dim` consumer detects its source regardless of build order. Kept
-    /// current by `add_query` as MVs are hot-added.
-    pub fn set_incremental_tables(&mut self, tables: FxHashSet<String>) {
-        self.incremental_tables = tables;
+    /// Seed changelog producers before operators are built so admission is build-order independent.
+    pub fn set_changelog_tables(&mut self, tables: FxHashSet<String>) {
+        self.changelog_tables = tables;
     }
 
     /// Install the AI subsystem and main runtime handle for inference workers.
@@ -1146,18 +1128,6 @@ impl OperatorGraph {
         self.max_managed_state_bytes = bytes;
         for node in &mut self.nodes {
             node.operator.set_managed_state_budget(bytes);
-        }
-    }
-
-    pub(crate) fn set_max_retractable_extremum_checkpoint_bytes(&mut self, bytes: usize) {
-        assert!(
-            bytes > 0,
-            "retractable-extremum checkpoint budget must be nonzero"
-        );
-        self.max_retractable_extremum_checkpoint_bytes = bytes;
-        for node in &mut self.nodes {
-            node.operator
-                .set_retractable_extremum_checkpoint_budget(bytes);
         }
     }
 
@@ -1698,9 +1668,6 @@ impl OperatorGraph {
     fn allocate_node(&mut self, mut node: GraphNode) -> usize {
         node.operator
             .set_managed_state_budget(self.max_managed_state_bytes);
-        node.operator.set_retractable_extremum_checkpoint_budget(
-            self.max_retractable_extremum_checkpoint_bytes,
-        );
         let input_port_count = node.input_port_count;
         if let Some(id) = self.free_node_ids.pop() {
             debug_assert!(self.nodes[id].removed);
@@ -1928,14 +1895,25 @@ impl OperatorGraph {
 
         let mut table_refs = extract_table_references(&sql);
 
+        if window_config.is_some()
+            && table_refs
+                .iter()
+                .any(|table| self.changelog_tables.contains(table))
+        {
+            self.build_errors.push(DbError::InvalidOperation(format!(
+                "window aggregate '{name}' cannot safely consume a changelog; window aggregates do not apply input retractions"
+            )));
+            return;
+        }
+
         // `changelog ⋈ static dim`: detected first so it wins over the generic processing-time
         // equi-join — a changelog left makes this a retraction-aware enrich, not a stream join.
-        let changelog_enrich_config = if self.incremental_tables.is_empty() {
+        let changelog_enrich_config = if self.changelog_tables.is_empty() {
             None
         } else {
             crate::sql_analysis::detect_changelog_enrich_query(
                 &sql,
-                &self.incremental_tables,
+                &self.changelog_tables,
                 &self.reference_tables,
             )
         };
@@ -1945,10 +1923,10 @@ impl OperatorGraph {
             && !enrich
             && table_refs
                 .iter()
-                .any(|table| self.incremental_tables.contains(table))
+                .any(|table| self.changelog_tables.contains(table))
         {
             self.build_errors.push(DbError::InvalidOperation(format!(
-                "join '{name}' reads an incremental changelog; only changelog-to-static-table enrichment is supported"
+                "join '{name}' reads a changelog; only changelog-to-static-table enrichment is supported"
             )));
             return;
         }
@@ -2110,7 +2088,7 @@ impl OperatorGraph {
         }
         self.output_map.insert(Arc::from(name.as_str()), node_id);
         if incremental {
-            self.incremental_tables.insert(name.clone());
+            self.changelog_tables.insert(name.clone());
         }
         self.topo_dirty = true;
     }
@@ -2135,8 +2113,7 @@ impl OperatorGraph {
         input_port_count: usize,
     ) -> usize {
         if let Some(&id) = self.source_map.get(name) {
-            self.nodes[id]
-                .replace_operator(operator, self.max_retractable_extremum_checkpoint_bytes);
+            self.nodes[id].replace_operator(operator);
             self.nodes[id].input_port_count = input_port_count;
             self.input_bufs[id] = vec![Vec::new(); input_port_count];
             self.input_buf_bytes[id] = vec![0; input_port_count];
@@ -2492,10 +2469,7 @@ impl OperatorGraph {
             }
             self.managed_state_accounting_peaks[id] = ManagedStateAccountingSnapshot::default();
             self.nodes[id].removed = true;
-            self.nodes[id].replace_operator(
-                Box::new(TombstonedOperator),
-                self.max_retractable_extremum_checkpoint_bytes,
-            );
+            self.nodes[id].replace_operator(Box::new(TombstonedOperator));
             self.nodes[id].output_routes.clear();
             for port_buf in &mut self.input_bufs[id] {
                 port_buf.clear();
@@ -2518,7 +2492,7 @@ impl OperatorGraph {
         }
 
         self.output_map.remove(name);
-        self.incremental_tables.remove(name);
+        self.changelog_tables.remove(name);
         self.live_handles.remove(name);
         if !ids_to_remove.is_empty() {
             self.topo_dirty = true;

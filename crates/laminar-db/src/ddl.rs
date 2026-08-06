@@ -240,18 +240,6 @@ pub(crate) fn logical_aggregate_stage_count(plan: &datafusion_expr::LogicalPlan)
             .sum::<usize>()
 }
 
-fn distinct_streaming_aggregate(sql: &str) -> Option<String> {
-    let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
-    let laminar_sql::parser::StreamingStatement::Standard(statement) = statements.first()? else {
-        return None;
-    };
-    laminar_sql::parser::aggregation_parser::analyze_aggregates(statement.as_ref())
-        .aggregates
-        .into_iter()
-        .find(|aggregate| aggregate.distinct)
-        .map(|aggregate| format!("{:?}", aggregate.aggregate_type).to_ascii_lowercase())
-}
-
 pub(crate) struct PlannedStreamingQuery {
     pub(crate) emit_clause: Option<laminar_sql::parser::EmitClause>,
     pub(crate) window_config: Option<laminar_sql::translator::WindowOperatorConfig>,
@@ -259,6 +247,50 @@ pub(crate) struct PlannedStreamingQuery {
     pub(crate) join_config: Option<Vec<laminar_sql::translator::JoinOperatorConfig>>,
     pub(crate) has_analytic: bool,
     pub(crate) has_frame: bool,
+}
+
+pub(crate) async fn validate_managed_aggregate_admission(
+    ctx: &datafusion::prelude::SessionContext,
+    query_sql: &str,
+    window_config: Option<&laminar_sql::translator::WindowOperatorConfig>,
+    emit_clause: Option<&laminar_sql::parser::EmitClause>,
+    key_group_count: laminar_core::state::KeyGroupCount,
+) -> Result<bool, DbError> {
+    if let Some(window) = window_config {
+        let state = crate::core_window_state::CoreWindowState::try_from_sql(
+            ctx,
+            query_sql,
+            window,
+            emit_clause,
+        )
+        .await?;
+        if state.is_none() {
+            return Err(DbError::InvalidOperation(
+                "window aggregate cannot be constructed on the managed execution path".into(),
+            ));
+        }
+        return Ok(true);
+    }
+
+    let emit_changelog =
+        emit_clause.is_some_and(|emit| matches!(emit, laminar_sql::parser::EmitClause::Changes));
+    crate::aggregate_state::IncrementalAggState::try_from_sql(
+        ctx,
+        query_sql,
+        emit_changelog,
+        key_group_count,
+    )
+    .await
+    .map(|state| state.is_some())
+}
+
+fn query_inputs_registered(ctx: &datafusion::prelude::SessionContext, query_sql: &str) -> bool {
+    crate::sql_analysis::extract_table_references(query_sql)
+        .iter()
+        .all(|name| {
+            ctx.table_exist(exact_table_reference(name))
+                .unwrap_or(false)
+        })
 }
 
 /// Terminality guard error: `consumer` tried to read incremental MV `mv`'s changelog.
@@ -1791,6 +1823,19 @@ impl LaminarDB {
         self.validate_cluster_query_shape_before_plan("stream", &name_str, query_sql, emit_clause)?;
         let planned =
             self.plan_streaming_query(name, query, emit_clause.cloned(), query_sql, false)?;
+        if !self.is_cluster_runtime()
+            && (planned.window_config.is_some() || planned.join_config.is_none())
+            && query_inputs_registered(&self.ctx, query_sql)
+        {
+            let _ = validate_managed_aggregate_admission(
+                &self.ctx,
+                query_sql,
+                planned.window_config.as_ref(),
+                planned.emit_clause.as_ref(),
+                self.checkpoint_key_groups(),
+            )
+            .await?;
+        }
         let temporal_output_schema = self
             .validate_temporal_topology_candidate(&name_str, query_sql, &planned)
             .await?;
@@ -1807,10 +1852,14 @@ impl LaminarDB {
             has_frame: plan_has_frame,
         } = planned;
 
-        // A stream over an incremental MV must net the changelog — an aggregate or a simple
-        // projection/filter; a complex shape (e.g. a join) is rejected.
-        self.reject_unsupported_reading_incremental_mv(query_sql, "a stream")
-            .await?;
+        // A stream over an incremental MV must net the changelog — a non-windowed aggregate or a
+        // simple projection/filter; a complex shape (e.g. a join) is rejected.
+        self.reject_unsupported_reading_incremental_mv(
+            query_sql,
+            "a stream",
+            plan_window.is_some(),
+        )
+        .await?;
         let query_sql = query_sql.to_string();
 
         // The typed namespace reservation prevents rollback from erasing another object.
@@ -2557,12 +2606,6 @@ impl LaminarDB {
             ))
         };
 
-        if let Some(aggregate) = distinct_streaming_aggregate(query_sql) {
-            return reject(&format!(
-                "DISTINCT aggregate '{aggregate}' has unbounded per-key state and no spillable vnode lifecycle"
-            ));
-        }
-
         if emit_clause
             .is_some_and(|emit| matches!(emit, EmitClause::OnWindowClose | EmitClause::Final))
         {
@@ -2762,7 +2805,7 @@ impl LaminarDB {
                 .emit_clause
                 .as_ref()
                 .is_some_and(|emit| matches!(emit, laminar_sql::parser::EmitClause::Changes));
-            let aggregate = match crate::aggregate_state::IncrementalAggState::try_from_sql(
+            match crate::aggregate_state::IncrementalAggState::try_from_sql(
                 &self.ctx,
                 query_sql,
                 emit_changelog,
@@ -2770,7 +2813,7 @@ impl LaminarDB {
             )
             .await
             {
-                Ok(Some(aggregate)) => aggregate,
+                Ok(Some(_)) => {}
                 Ok(None) => {
                     return reject(
                         "aggregate cannot be constructed on the exact incremental execution path",
@@ -2781,13 +2824,6 @@ impl LaminarDB {
                         "aggregate incremental execution path could not be constructed: {error}"
                     ));
                 }
-            };
-            let incremental_mvs = self.incremental_mv_names();
-            let reads_changelog = crate::sql_analysis::extract_table_references(query_sql)
-                .iter()
-                .any(|table| incremental_mvs.contains(table));
-            if let Some(reason) = aggregate.cluster_state_rejection(reads_changelog) {
-                return reject(&reason);
             }
         }
         Ok(has_aggregate)
@@ -2835,6 +2871,19 @@ impl LaminarDB {
         };
 
         let planned = self.plan_streaming_query(name, query, emit_clause, query_sql, true)?;
+        if !self.is_cluster_runtime()
+            && (planned.window_config.is_some() || planned.join_config.is_none())
+            && query_inputs_registered(&self.ctx, query_sql)
+        {
+            let _ = validate_managed_aggregate_admission(
+                &self.ctx,
+                query_sql,
+                planned.window_config.as_ref(),
+                planned.emit_clause.as_ref(),
+                self.checkpoint_key_groups(),
+            )
+            .await?;
+        }
         Self::reject_temporal_materialized_view(query_sql, &planned)?;
         let _ = self
             .validate_temporal_topology_candidate(&name_str, query_sql, &planned)
@@ -2851,10 +2900,14 @@ impl LaminarDB {
         } = planned;
 
         let query_sql = query_sql.to_string();
-        // A chained MV over an incremental MV must net the changelog — an aggregate or a simple
-        // projection/filter; a complex shape (e.g. a join) is rejected.
-        self.reject_unsupported_reading_incremental_mv(&query_sql, "a materialized view")
-            .await?;
+        // A chained MV over an incremental MV must net the changelog — a non-windowed aggregate or
+        // a simple projection/filter; a complex shape (e.g. a join) is rejected.
+        self.reject_unsupported_reading_incremental_mv(
+            &query_sql,
+            "a materialized view",
+            plan_window.is_some(),
+        )
+        .await?;
         let schema = self.resolve_mv_schema(&query_sql).await?;
         let sources = self.collect_mv_sources(&query_sql, &name_str);
 
@@ -3014,18 +3067,23 @@ impl LaminarDB {
         self.table_store.read().table_names().into_iter().collect()
     }
 
-    /// A query reading an incremental MV must net the retraction changelog — an aggregate or a
-    /// simple projection/filter; complex shapes (e.g. joins) mishandle retractions and are rejected.
+    /// A query reading an incremental MV must net the retraction changelog — a non-windowed
+    /// aggregate or a simple projection/filter; other stateful shapes are rejected.
     async fn reject_unsupported_reading_incremental_mv(
         &self,
         query_sql: &str,
         consumer: &str,
+        has_window: bool,
     ) -> Result<(), DbError> {
         let Some(mv) = self.first_incremental_ref(query_sql) else {
             return Ok(());
         };
+        if has_window {
+            return Err(incremental_mv_consumer_error(&mv, consumer));
+        }
         // A changelog may enrich against a static table. Every other join shape is rejected;
-        // aggregates and simple projection/filter consumers continue to net retractions.
+        // non-windowed aggregates and simple projection/filter consumers continue to net
+        // retractions.
         let inc = self.incremental_mv_names();
         let changelog_enrich = crate::sql_analysis::detect_changelog_enrich_query(
             query_sql,

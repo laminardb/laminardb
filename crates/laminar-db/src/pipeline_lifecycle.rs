@@ -1198,6 +1198,38 @@ async fn resolve_stream_output_schemas(
             pending = next;
         }
 
+        for reg in stream_regs.values() {
+            let shape = shapes.get(&reg.name).ok_or_else(|| {
+                DbError::Pipeline(format!(
+                    "stream '{}' has no resolved output shape",
+                    reg.name
+                ))
+            })?;
+            if !shape.aggregate && reg.window_config.is_none() {
+                continue;
+            }
+            let certified = crate::ddl::validate_managed_aggregate_admission(
+                ctx,
+                &reg.query_sql,
+                reg.window_config.as_ref(),
+                reg.emit_clause.as_ref(),
+                laminar_core::state::DEFAULT_KEY_GROUP_COUNT,
+            )
+            .await
+            .map_err(|error| {
+                DbError::Pipeline(format!(
+                    "stream '{}' aggregate could not be certified: {error}",
+                    reg.name
+                ))
+            })?;
+            if !certified {
+                return Err(DbError::Pipeline(format!(
+                    "stream '{}' aggregate has no managed execution path",
+                    reg.name
+                )));
+            }
+        }
+
         let declared_incremental: rustc_hash::FxHashSet<String> = stream_regs
             .values()
             .filter(|reg| reg.incremental)
@@ -1218,31 +1250,7 @@ async fn resolve_stream_output_schemas(
                     .as_ref()
                     .is_some_and(|emit| matches!(emit, laminar_sql::parser::EmitClause::Changes));
             if shape.aggregate && emit_changelog {
-                match crate::aggregate_state::IncrementalAggState::try_from_sql(
-                    ctx,
-                    &reg.query_sql,
-                    true,
-                    laminar_core::state::DEFAULT_KEY_GROUP_COUNT,
-                )
-                .await
-                {
-                    Ok(Some(_)) => {
-                        changelog_carrying.insert(reg.name.clone());
-                    }
-                    Ok(None) => {
-                        return Err(DbError::Pipeline(format!(
-                            "stream '{}' requests changelog aggregate output, but its aggregate \
-                             shape has no retraction-producing execution path",
-                            reg.name
-                        )));
-                    }
-                    Err(error) => {
-                        return Err(DbError::Pipeline(format!(
-                            "stream '{}' changelog aggregate could not be certified: {error}",
-                            reg.name
-                        )));
-                    }
-                }
+                changelog_carrying.insert(reg.name.clone());
             }
 
             if reg.window_config.is_none()
@@ -1277,6 +1285,12 @@ async fn resolve_stream_output_schemas(
                     .any(|name| changelog_carrying.contains(name))
                 {
                     continue;
+                }
+                if reg.window_config.is_some() {
+                    return Err(DbError::Pipeline(format!(
+                        "stream '{}' cannot safely consume a changelog with window state; window aggregates do not apply input retractions",
+                        reg.name
+                    )));
                 }
                 let shape = shapes.get(&reg.name).expect("resolved above");
                 let temporal_filter = !matches!(
@@ -3529,6 +3543,7 @@ impl LaminarDB {
         &self,
         stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
         table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
+        changelog_carrying: &rustc_hash::FxHashSet<String>,
         pipeline_identity: Option<&laminar_core::checkpoint::PipelineIdentity>,
     ) -> Result<crate::operator_graph::OperatorGraph, DbError> {
         use crate::operator_graph::OperatorGraph;
@@ -3658,15 +3673,8 @@ impl LaminarDB {
                 .unwrap_or_else(tokio::runtime::Handle::current),
         );
 
-        // Seed incremental MVs up front so a `changelog ⋈ static dim` consumer detects its source
-        // regardless of the (HashMap-ordered) build loop below.
-        graph.set_incremental_tables(
-            stream_regs
-                .values()
-                .filter(|r| r.incremental)
-                .map(|r| r.name.clone())
-                .collect(),
-        );
+        // Seed changelog producers up front so consumer admission is independent of build order.
+        graph.set_changelog_tables(changelog_carrying.clone());
 
         let mut ordered_streams: Vec<_> = stream_regs.values().collect();
         ordered_streams.sort_by(|left, right| left.name.cmp(&right.name));
@@ -5492,6 +5500,7 @@ impl LaminarDB {
         let mut graph = self.build_connector_operator_graph(
             &stream_regs,
             &table_regs,
+            &resolved_stream_outputs.changelog_carrying,
             pipeline_identity.as_ref(),
         )?;
         for (name, schema) in stream_output_schemas {
@@ -5501,13 +5510,6 @@ impl LaminarDB {
             self.config
                 .pipeline_max_managed_state_bytes
                 .expect("managed-state budget must be resolved at database construction"),
-        );
-        graph.set_max_retractable_extremum_checkpoint_bytes(
-            self.config
-                .pipeline_max_retractable_extremum_checkpoint_bytes
-                .expect(
-                    "retractable-extremum checkpoint budget must be resolved at database construction",
-                ),
         );
         let graph = graph.initialize_managed_state().await?;
 

@@ -335,7 +335,6 @@ pub(crate) struct SqlQueryOperator {
     state: QueryState,
     key_group_count: KeyGroupCount,
     prom: Option<Arc<EngineMetrics>>,
-    max_retractable_extremum_checkpoint_bytes: usize,
     execution_path_logged: bool,
     emit_changelog: bool,
     #[cfg(feature = "cluster")]
@@ -399,8 +398,6 @@ impl SqlQueryOperator {
             state: QueryState::Uninit,
             key_group_count,
             prom,
-            max_retractable_extremum_checkpoint_bytes:
-                crate::config::DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES,
             execution_path_logged: false,
             emit_changelog,
             #[cfg(feature = "cluster")]
@@ -425,7 +422,7 @@ impl SqlQueryOperator {
 
     #[allow(clippy::too_many_lines)]
     async fn lazy_init(&mut self) -> Result<(), DbError> {
-        if let Some(mut agg_state) = IncrementalAggState::try_from_sql(
+        if let Some(agg_state) = IncrementalAggState::try_from_sql(
             &self.ctx,
             &self.sql,
             self.emit_changelog,
@@ -439,9 +436,6 @@ impl SqlQueryOperator {
                     self.op_name
                 )));
             }
-            agg_state.set_max_retractable_extremum_checkpoint_bytes(
-                self.max_retractable_extremum_checkpoint_bytes,
-            );
             #[cfg(feature = "cluster")]
             if self.cluster_shuffle.is_some() {
                 let expected_state_class = if agg_state.num_group_cols() == 0 {
@@ -927,17 +921,6 @@ impl GraphOperator for SqlQueryOperator {
         })
     }
 
-    fn set_retractable_extremum_checkpoint_budget(&mut self, bytes: usize) {
-        assert!(
-            bytes > 0,
-            "retractable-extremum checkpoint budget must be nonzero"
-        );
-        self.max_retractable_extremum_checkpoint_bytes = bytes;
-        if let QueryState::Agg(aggregate) = &mut self.state {
-            aggregate.set_max_retractable_extremum_checkpoint_bytes(bytes);
-        }
-    }
-
     async fn initialize_managed_state(&mut self) -> Result<(), DbError> {
         if matches!(self.state, QueryState::Uninit) {
             self.lazy_init().await?;
@@ -1319,19 +1302,22 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     fn restore_vnode(&mut self, vnode: u32, vnode_count: u32, state: &[u8]) -> Result<(), DbError> {
-        let checkpoint = rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(state)
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "aggregate '{}' vnode {vnode} deserialization: {error}",
-                    self.op_name
-                ))
-            })?;
         let QueryState::Agg(aggregate) = &mut self.state else {
             return Err(DbError::Checkpoint(format!(
                 "aggregate '{}' vnode restore requires initialized managed state",
                 self.op_name
             )));
         };
+        let profile = aggregate.vnode_archive_restore_profile();
+        let checkpoint = profile
+            .preflight(
+                state,
+                format_args!("aggregate '{}' vnode {vnode}", self.op_name),
+            )
+            .and_then(|archive| {
+                archive.deserialize(format_args!("aggregate '{}' vnode {vnode}", self.op_name))
+            })
+            .map_err(|error| DbError::Checkpoint(error.to_string()))?;
         aggregate
             .restore_vnode(vnode, vnode_count, checkpoint)
             .map_err(|error| {

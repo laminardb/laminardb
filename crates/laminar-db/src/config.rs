@@ -12,12 +12,6 @@ use laminar_core::streaming::{BackpressureStrategy, StreamCheckpointConfig};
 /// This execution budget is independent of checkpoint storage.
 pub const DEFAULT_MAX_MANAGED_STATE_BYTES: usize = 256 * 1024 * 1024;
 
-/// Default pre-encoding work charge allowed for one retractable MIN/MAX checkpoint capture.
-///
-/// This limit is independent of checkpoint storage.
-/// It is a cached accumulator work proxy, not an encoded-payload or process-RSS limit.
-pub const DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES: usize = 1024 * 1024;
-
 pub(crate) fn temporal_join_idle_history_retention_ms(
     retention: Option<std::time::Duration>,
 ) -> Result<i64, &'static str> {
@@ -129,11 +123,6 @@ pub struct LaminarConfig {
     /// Pipeline-wide managed working-state budget in charged bytes. `None` resolves to
     /// [`DEFAULT_MAX_MANAGED_STATE_BYTES`] when the database is constructed.
     pub pipeline_max_managed_state_bytes: Option<usize>,
-    /// Pre-encoding work budget for one retractable MIN/MAX checkpoint capture. `None` resolves to
-    /// [`DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES`] when the database is constructed.
-    /// This charge is not an encoded-payload or process-RSS limit. Database construction rejects
-    /// zero.
-    pub pipeline_max_retractable_extremum_checkpoint_bytes: Option<usize>,
     /// Retention contract for right-side history while a temporal join input is idle.
     /// Required only when the pipeline contains a temporal join.
     pub temporal_join_idle_history_retention: Option<std::time::Duration>,
@@ -165,7 +154,6 @@ impl Default for LaminarConfig {
             pipeline_max_input_buf_batches: None,
             pipeline_max_input_buf_bytes: None,
             pipeline_max_managed_state_bytes: None,
-            pipeline_max_retractable_extremum_checkpoint_bytes: None,
             temporal_join_idle_history_retention: None,
             pipeline_backpressure_policy: BackpressurePolicy::default(),
             restart_policy: RestartPolicy::default(),

@@ -122,12 +122,12 @@ impl AggregateVnodeState {
         self.usage = self.usage.saturating_add(usage);
     }
 
-    pub(super) fn reconcile_accumulator_usage(
-        &mut self,
-        previous: AggregateStateUsage,
-        current: AggregateStateUsage,
-    ) {
-        self.usage = self.usage.saturating_sub(previous).saturating_add(current);
+    pub(super) fn reconcile_accumulator_usage(&mut self, previous: usize, current: usize) {
+        let usage = |bytes| AggregateStateUsage::from_parts(0, 0, 0, 0, bytes);
+        self.usage = self
+            .usage
+            .saturating_sub(usage(previous))
+            .saturating_add(usage(current));
     }
 
     pub(super) fn insert_emit_dirty_key(&mut self, key: arrow::row::OwnedRow) {
@@ -224,6 +224,29 @@ impl AggregateVnodeState {
         }
         self.last_emitted.insert(key, values);
         self.reconcile_collection_spare_usage(previous_spare);
+    }
+
+    pub(super) fn remove_group(&mut self, key: &arrow::row::OwnedRow) -> Option<GroupEntry> {
+        let previous_spare = self.collection_spare_usage();
+        let (resident_key, entry) = self.groups.remove_entry(key)?;
+        self.usage = self
+            .usage
+            .saturating_sub(Self::group_usage(&resident_key, &entry));
+        self.reconcile_collection_spare_usage(previous_spare);
+        Some(entry)
+    }
+
+    pub(super) fn remove_last_emitted(
+        &mut self,
+        key: &arrow::row::OwnedRow,
+    ) -> Option<Vec<ScalarValue>> {
+        let previous_spare = self.collection_spare_usage();
+        let (resident_key, values) = self.last_emitted.remove_entry(key)?;
+        self.usage = self
+            .usage
+            .saturating_sub(Self::emitted_usage(&resident_key, &values));
+        self.reconcile_collection_spare_usage(previous_spare);
+        Some(values)
     }
 
     fn recompute_usage(&self) -> AggregateStateUsage {
@@ -366,6 +389,14 @@ impl AggregateVnodeSlots {
             .resident_group_count
             .checked_add(1)
             .expect("aggregate resident group count was preflighted");
+    }
+
+    #[inline]
+    pub(super) fn decrement_resident_groups(&mut self) {
+        self.resident_group_count = self
+            .resident_group_count
+            .checked_sub(1)
+            .expect("aggregate resident group count must include a removed group");
     }
 
     #[inline]

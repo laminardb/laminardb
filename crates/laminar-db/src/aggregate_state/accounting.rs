@@ -13,7 +13,8 @@ use std::mem::size_of;
 
 use arrow::row::OwnedRow;
 use datafusion_common::ScalarValue;
-use datafusion_expr::Accumulator;
+
+use super::ConcreteAggregateState;
 
 /// Categorized charged bytes retained by aggregate state.
 ///
@@ -249,20 +250,17 @@ pub(super) fn owned_row_payload_usage(
     AggregateStateUsage::from_parts_with_saturation(0, 0, 0, payload, 0, saturated)
 }
 
-/// Reserved accumulator-vector elements plus bytes reported by every live accumulator.
-///
-/// `Accumulator::size()` includes the accumulator value and its nested allocations. The vector
-/// category counts only its `Box<dyn Accumulator>` elements, so these components do not overlap.
+/// Reserved concrete-state vector elements plus nested bytes retained by its values.
 #[allow(clippy::ptr_arg)] // Capacity, not only the initialized slice, is part of the allocation.
-pub(super) fn accumulator_usage(accumulators: &Vec<Box<dyn Accumulator>>) -> AggregateStateUsage {
+pub(super) fn accumulator_usage(accumulators: &Vec<ConcreteAggregateState>) -> AggregateStateUsage {
     let (vector_elements, vector_saturated) =
-        saturating_element_storage::<Box<dyn Accumulator>>(accumulators.capacity());
+        saturating_element_storage::<ConcreteAggregateState>(accumulators.capacity());
     let (reported, reported_saturated) =
         accumulators
             .iter()
             .fold((0_usize, false), |(total, saturated), accumulator| {
                 let (total, addition_saturated) =
-                    saturating_add_with_flag(total, accumulator.size());
+                    saturating_add_with_flag(total, accumulator.nested_retained_bytes());
                 (total, saturated || addition_saturated)
             });
     AggregateStateUsage::from_parts_with_saturation(
@@ -341,7 +339,7 @@ mod tests {
     use arrow::array::{ArrayRef, StringArray};
     use arrow::datatypes::DataType;
     use arrow::row::{RowConverter, SortField};
-    use datafusion_common::{Result as DataFusionResult, ScalarValue};
+    use datafusion_common::ScalarValue;
 
     use super::*;
 
@@ -427,50 +425,6 @@ mod tests {
             initialized.saturating_add(spare).total_bytes(),
             capacity * size_of::<u64>()
         );
-    }
-
-    #[derive(Debug)]
-    struct ReportedSizeAccumulator(usize);
-
-    impl Accumulator for ReportedSizeAccumulator {
-        fn update_batch(&mut self, _values: &[ArrayRef]) -> DataFusionResult<()> {
-            Ok(())
-        }
-
-        fn evaluate(&mut self) -> DataFusionResult<ScalarValue> {
-            Ok(ScalarValue::Null)
-        }
-
-        fn size(&self) -> usize {
-            self.0
-        }
-
-        fn state(&mut self) -> DataFusionResult<Vec<ScalarValue>> {
-            Ok(vec![ScalarValue::Null])
-        }
-
-        fn merge_batch(&mut self, _states: &[ArrayRef]) -> DataFusionResult<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn accumulator_usage_counts_capacity_and_reported_sizes_without_overlap() {
-        let mut accumulators: Vec<Box<dyn Accumulator>> = Vec::with_capacity(3);
-        accumulators.push(Box::new(ReportedSizeAccumulator(11)));
-        accumulators.push(Box::new(ReportedSizeAccumulator(17)));
-
-        let usage = accumulator_usage(&accumulators);
-        assert_eq!(
-            usage.logical_collection_element_storage_bytes(),
-            accumulators.capacity() * size_of::<Box<dyn Accumulator>>()
-        );
-        assert_eq!(usage.accumulator_reported_bytes(), 28);
-        assert_eq!(
-            usage.total_bytes(),
-            accumulators.capacity() * size_of::<Box<dyn Accumulator>>() + 28
-        );
-        assert!(!usage.is_saturated());
     }
 
     #[test]

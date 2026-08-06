@@ -43,19 +43,17 @@ async fn test_try_from_sql_rejects_post_aggregate_projection() {
     let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    // SUM(a)/SUM(b) collapses 2 aggregates into 1 derived column →
-    // top_schema fields != agg_schema fields → should return None.
-    let result = try_from_sql_local(
+    let error = match try_from_sql_local(
         &ctx,
         "SELECT name, SUM(a) / SUM(b) AS ratio FROM events GROUP BY name",
         false,
     )
     .await
-    .unwrap();
-    assert!(
-        result.is_none(),
-        "Post-aggregate projection should return None"
-    );
+    {
+        Err(error) => error,
+        Ok(_) => panic!("post-aggregate projection was admitted"),
+    };
+    assert!(error.to_string().contains("post-aggregate projection"));
 }
 
 #[test]
@@ -394,113 +392,6 @@ fn sum_pre_agg_batch(names: &[&str], values: &[f64]) -> RecordBatch {
     .unwrap()
 }
 
-async fn setup_retractable_min_state() -> IncrementalAggState {
-    let ctx = laminar_sql::create_session_context();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, false),
-        Field::new("value", DataType::Float64, false),
-        Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-    ]));
-    let dummy = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["seed"])),
-            Arc::new(arrow::array::Float64Array::from(vec![0.0])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-        ],
-    )
-    .unwrap();
-    let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![dummy]]).unwrap();
-    ctx.register_table("events", Arc::new(mem)).unwrap();
-    try_from_sql_local(
-        &ctx,
-        "SELECT name, MIN(value) AS minimum FROM events GROUP BY name",
-        false,
-    )
-    .await
-    .unwrap()
-    .unwrap()
-}
-
-fn retractable_min_pre_agg_batch(names: &[&str], values: &[f64], weights: &[i64]) -> RecordBatch {
-    RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, true),
-            Field::new("__agg_input_1", DataType::Float64, true),
-            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(arrow::array::StringArray::from(names.to_vec())),
-            Arc::new(arrow::array::Float64Array::from(values.to_vec())),
-            Arc::new(arrow::array::Int64Array::from(weights.to_vec())),
-        ],
-    )
-    .unwrap()
-}
-
-fn selected_accumulator_charge(state: &IncrementalAggState) -> usize {
-    state
-        .vnode_states
-        .iter()
-        .flat_map(|(_, vnode_state)| vnode_state.groups.values())
-        .map(|entry| entry.accumulator_reported_bytes)
-        .sum()
-}
-
-#[derive(Debug)]
-struct StateCountingAccumulator {
-    inner: Box<dyn datafusion_expr::Accumulator>,
-    state_calls: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl datafusion_expr::Accumulator for StateCountingAccumulator {
-    fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion_common::Result<()> {
-        self.inner.update_batch(values)
-    }
-
-    fn evaluate(&mut self) -> datafusion_common::Result<ScalarValue> {
-        self.inner.evaluate()
-    }
-
-    fn size(&self) -> usize {
-        self.inner.size()
-    }
-
-    fn state(&mut self) -> datafusion_common::Result<Vec<ScalarValue>> {
-        self.state_calls
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.state()
-    }
-
-    fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion_common::Result<()> {
-        self.inner.merge_batch(states)
-    }
-}
-
-fn install_state_counters(
-    state: &mut IncrementalAggState,
-) -> Vec<Arc<std::sync::atomic::AtomicUsize>> {
-    let mut counters = Vec::new();
-    for (_, vnode_state) in state.vnode_states.iter_mut() {
-        for entry in vnode_state.groups.values_mut() {
-            let capacity = entry.accs.capacity();
-            let original = std::mem::take(&mut entry.accs);
-            let mut wrapped: Vec<Box<dyn datafusion_expr::Accumulator>> =
-                Vec::with_capacity(capacity);
-            for inner in original {
-                let state_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                wrapped.push(Box::new(StateCountingAccumulator {
-                    inner,
-                    state_calls: Arc::clone(&state_calls),
-                }));
-                counters.push(state_calls);
-            }
-            entry.accs = wrapped;
-        }
-    }
-    counters
-}
-
 fn capture_all_vnodes(
     state: &mut IncrementalAggState,
 ) -> Result<Vec<Option<AggStateCheckpoint>>, DbError> {
@@ -513,85 +404,6 @@ fn checkpoint_bytes(state: &mut IncrementalAggState) -> Vec<u8> {
     rkyv::to_bytes::<rkyv::rancor::Error>(&capture_all_vnodes(state).unwrap())
         .unwrap()
         .to_vec()
-}
-
-#[tokio::test]
-async fn retractable_extremum_checkpoint_budget_is_capture_wide_exact_and_pre_encoding() {
-    let mut state = setup_retractable_min_state().await;
-    state
-        .process_batch(
-            &retractable_min_pre_agg_batch(
-                &["a", "a", "b", "b"],
-                &[1.0, 2.0, 10.0, 20.0],
-                &[1, 1, 1, 1],
-            ),
-            1,
-        )
-        .unwrap();
-    let per_group_charges = state
-        .vnode_states
-        .iter()
-        .flat_map(|(_, vnode_state)| vnode_state.groups.values())
-        .map(|entry| entry.accumulator_reported_bytes)
-        .collect::<Vec<_>>();
-    assert_eq!(per_group_charges.len(), 2);
-    let exact_charge = per_group_charges.iter().sum::<usize>();
-    assert!(
-        per_group_charges
-            .iter()
-            .all(|charge| *charge < exact_charge),
-        "each group must fit while their combined capture consumes the exact allowance"
-    );
-
-    state.set_max_retractable_extremum_checkpoint_bytes(exact_charge);
-    let exact_checkpoint = checkpoint_bytes(&mut state);
-    assert_eq!(selected_accumulator_charge(&state), exact_charge);
-
-    let values_before = state.evaluated_groups_for_test().unwrap();
-    let bookkeeping_before = state.working_set_snapshot_for_test();
-    let state_calls = install_state_counters(&mut state);
-    state.set_max_retractable_extremum_checkpoint_bytes(exact_charge - 1);
-    for _ in 0..2 {
-        let error = match capture_all_vnodes(&mut state) {
-            Ok(_) => panic!("an over-budget capture must be rejected"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            DbError::RetractableExtremumCheckpointBudgetExceeded {
-                charged_bytes,
-                limit_bytes,
-                ..
-            } if charged_bytes == exact_charge && limit_bytes == exact_charge - 1
-        ));
-    }
-    assert!(
-        state_calls
-            .iter()
-            .all(|calls| { calls.load(std::sync::atomic::Ordering::Relaxed) == 0 }),
-        "budget rejection must precede every Accumulator::state call"
-    );
-    assert_eq!(state.working_set_snapshot_for_test(), bookkeeping_before);
-    assert_eq!(state.evaluated_groups_for_test().unwrap(), values_before);
-
-    state.set_max_retractable_extremum_checkpoint_bytes(exact_charge);
-    let retry = checkpoint_bytes(&mut state);
-    assert_eq!(retry, exact_checkpoint);
-    assert!(state_calls
-        .iter()
-        .all(|calls| { calls.load(std::sync::atomic::Ordering::Relaxed) == 1 }));
-}
-
-#[tokio::test]
-async fn extremum_checkpoint_budget_ignores_non_retractable_minimums() {
-    let (_, mut state) =
-        setup_agg_state("SELECT name, MIN(value) AS minimum FROM events GROUP BY name").await;
-    state
-        .process_batch(&sum_pre_agg_batch(&["a", "a"], &[1.0, 2.0]), 1)
-        .unwrap();
-    state.set_max_retractable_extremum_checkpoint_bytes(1);
-    capture_all_vnodes(&mut state)
-        .expect("ordinary append-only MIN must not consume the retractable-extremum budget");
 }
 
 #[tokio::test]
@@ -706,7 +518,7 @@ async fn local_keyed_state_routes_across_common_vnodes() {
 }
 
 #[tokio::test]
-async fn test_distinct_flag_extracted() {
+async fn distinct_aggregates_are_rejected_at_admission() {
     let ctx = laminar_sql::create_session_context();
     let schema = Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, false),
@@ -724,87 +536,17 @@ async fn test_distinct_flag_extracted() {
         datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let state = try_from_sql_local(
+    let error = match try_from_sql_local(
         &ctx,
         "SELECT name, COUNT(DISTINCT value) as cnt FROM events GROUP BY name",
         false,
     )
     .await
-    .unwrap()
-    .expect("expected aggregate state");
-    assert!(state.agg_specs[0].distinct, "DISTINCT flag should be set");
-}
-
-#[tokio::test]
-async fn test_distinct_count_produces_correct_result() {
-    let (_, mut state) =
-        setup_agg_state("SELECT name, COUNT(DISTINCT value) as cnt FROM events GROUP BY name")
-            .await;
-
-    // Pre-agg schema: name, __agg_input_1
-    let pre_agg_schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, true),
-        Field::new("__agg_input_1", DataType::Float64, true),
-    ]));
-
-    // Feed duplicates: value 10 appears 3 times for group "a"
-    let batch = RecordBatch::try_new(
-        Arc::clone(&pre_agg_schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["a", "a", "a", "a"])),
-            Arc::new(arrow::array::Float64Array::from(vec![
-                10.0, 10.0, 10.0, 20.0,
-            ])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&batch, i64::MIN).unwrap();
-
-    let result = state.emit().unwrap();
-    assert_eq!(result.len(), 1);
-    let count_col = result[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("count should be Int64");
-    // DISTINCT count: {10.0, 20.0} = 2
-    assert_eq!(count_col.value(0), 2, "COUNT(DISTINCT) should be 2");
-}
-
-#[tokio::test]
-async fn test_distinct_sum_produces_correct_result() {
-    let (_, mut state) =
-        setup_agg_state("SELECT name, SUM(DISTINCT value) as total FROM events GROUP BY name")
-            .await;
-
-    let pre_agg_schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, true),
-        Field::new("__agg_input_1", DataType::Float64, true),
-    ]));
-
-    // Feed duplicates: 10 appears twice
-    let batch = RecordBatch::try_new(
-        Arc::clone(&pre_agg_schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["a", "a", "a"])),
-            Arc::new(arrow::array::Float64Array::from(vec![10.0, 10.0, 20.0])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&batch, i64::MIN).unwrap();
-
-    let result = state.emit().unwrap();
-    let total_col = result[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Float64Array>()
-        .expect("sum should be Float64");
-    // DISTINCT sum: 10 + 20 = 30 (not 10+10+20=40)
-    assert!(
-        (total_col.value(0) - 30.0).abs() < f64::EPSILON,
-        "SUM(DISTINCT) should be 30, got {}",
-        total_col.value(0)
-    );
+    {
+        Err(error) => error,
+        Ok(_) => panic!("DISTINCT aggregate was admitted"),
+    };
+    assert!(error.to_string().contains("DISTINCT aggregates"));
 }
 
 #[tokio::test]
@@ -1297,24 +1039,6 @@ fn test_expr_to_sql_aggregate_function() {
     assert!(sql.contains("\"x\""), "should contain arg: {sql}");
 }
 
-#[test]
-fn test_expr_to_sql_aggregate_distinct() {
-    use datafusion_expr::Expr;
-    let count_udf = datafusion::functions_aggregate::count::count_udaf();
-    let e = Expr::AggregateFunction(datafusion_expr::expr::AggregateFunction {
-        func: count_udf,
-        params: datafusion_expr::expr::AggregateFunctionParams {
-            args: vec![datafusion_expr::col("id")],
-            distinct: true,
-            filter: None,
-            order_by: vec![],
-            null_treatment: None,
-        },
-    });
-    let sql = expr_to_sql(&e);
-    assert!(sql.contains("DISTINCT"), "should contain DISTINCT: {sql}");
-}
-
 #[tokio::test]
 async fn test_group_by_expression_scalar_function() {
     let ctx = laminar_sql::create_session_context();
@@ -1652,8 +1376,7 @@ async fn test_cascaded_agg_retract_batch() {
 }
 
 #[tokio::test]
-async fn test_min_accepted_over_changelog_upstream() {
-    // MIN is now supported over changelog streams via retractable accumulators.
+async fn weighted_min_and_max_are_rejected_at_admission() {
     let ctx = SessionContext::new();
     let schema = Arc::new(Schema::new(vec![
         Field::new("symbol", DataType::Utf8, false),
@@ -1672,18 +1395,16 @@ async fn test_min_accepted_over_changelog_upstream() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let result = try_from_sql_local(
-        &ctx,
-        "SELECT symbol, MIN(price) AS low FROM upstream GROUP BY symbol",
-        false,
-    )
-    .await;
-    assert!(result.is_ok(), "MIN should be accepted over changelog");
+    for sql in [
+        "SELECT symbol, MIN(price) AS value FROM upstream GROUP BY symbol",
+        "SELECT symbol, MAX(price) AS value FROM upstream GROUP BY symbol",
+    ] {
+        assert!(try_from_sql_local(&ctx, sql, false).await.is_err(), "{sql}");
+    }
 }
 
 #[tokio::test]
-async fn test_unsupported_agg_rejected_over_changelog() {
-    // STDDEV is NOT supported over changelog streams.
+async fn unsupported_aggregate_is_rejected_at_admission() {
     let ctx = SessionContext::new();
     let schema = Arc::new(Schema::new(vec![
         Field::new("symbol", DataType::Utf8, false),
@@ -1702,19 +1423,13 @@ async fn test_unsupported_agg_rejected_over_changelog() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let result = try_from_sql_local(
+    assert!(try_from_sql_local(
         &ctx,
         "SELECT symbol, STDDEV(price) AS sd FROM upstream GROUP BY symbol",
         false,
     )
-    .await;
-    match result {
-        Err(e) => {
-            let msg = e.to_string();
-            assert!(msg.contains("Cannot compute"), "got: {msg}");
-        }
-        Ok(_) => panic!("expected error for STDDEV over changelog upstream"),
-    }
+    .await
+    .is_err());
 }
 
 #[tokio::test]
@@ -1803,11 +1518,7 @@ async fn test_cascaded_count_star_over_changelog() {
 }
 
 #[tokio::test]
-async fn changelog_retractable_survives_vnode_checkpoint() {
-    // Vnode capture rebuilds each live accumulator from its snapshot.
-    // For a changelog (`__weight`) aggregate the live accumulator is the
-    // retractable variant; rebuilding it as a plain one would silently drop
-    // retraction. Prove a retract still works *after* a mid-stream checkpoint.
+async fn pending_group_deletion_survives_vnode_checkpoint() {
     let ctx = SessionContext::new();
     let schema = Arc::new(Schema::new(vec![
         Field::new("region", DataType::Utf8, false),
@@ -1826,14 +1537,8 @@ async fn changelog_retractable_survives_vnode_checkpoint() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let mut state = try_from_sql_local(
-        &ctx,
-        "SELECT region, COUNT(*) AS cnt FROM upstream GROUP BY region",
-        false,
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let sql = "SELECT region, COUNT(*) AS cnt FROM upstream GROUP BY region";
+    let mut state = try_from_sql_local(&ctx, sql, true).await.unwrap().unwrap();
     assert!(state.weight_col_idx.is_some());
 
     let pre_agg_schema = Arc::new(Schema::new(vec![
@@ -1854,36 +1559,47 @@ async fn changelog_retractable_survives_vnode_checkpoint() {
         .unwrap()
     };
 
-    state
-        .process_batch(&mk(vec!["US", "US", "EU"], vec![1, 1, 1]), 1000)
-        .unwrap();
+    state.process_batch(&mk(vec!["US"], vec![1]), 1000).unwrap();
     let _ = state.emit().unwrap();
 
-    // Mid-stream checkpoint — must keep the live accumulators retractable.
-    capture_all_vnodes(&mut state).unwrap();
-
-    // Retract one US row; a downgraded plain accumulator could not.
     state
         .process_batch(&mk(vec!["US"], vec![-1]), 2000)
         .unwrap();
-    let r = state.emit().unwrap();
-    let regions = r[0]
+    let vnode = state.active_vnodes_for_test()[0];
+    let vnode_count = u32::from(state.key_group_count().get());
+    let checkpoint = state
+        .checkpoint_vnodes(&[vnode], vnode_count)
+        .unwrap()
+        .pop()
+        .unwrap()
+        .unwrap();
+
+    let mut restored = try_from_sql_local(&ctx, sql, true).await.unwrap().unwrap();
+    restored
+        .restore_vnode(vnode, vnode_count, checkpoint)
+        .unwrap();
+    let output = restored.emit().unwrap();
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    let regions = output[0]
         .column(0)
         .as_any()
         .downcast_ref::<arrow::array::StringArray>()
         .unwrap();
-    let counts = r[0]
+    let counts = output[0]
         .column(1)
         .as_any()
         .downcast_ref::<arrow::array::Int64Array>()
         .unwrap();
-    for i in 0..r[0].num_rows() {
-        match regions.value(i) {
-            "US" => assert_eq!(counts.value(i), 1, "US count must be 1 after retract"),
-            "EU" => assert_eq!(counts.value(i), 1),
-            other => panic!("unexpected region: {other}"),
-        }
-    }
+    let weights = output[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    assert_eq!(regions.value(0), "US");
+    assert_eq!(counts.value(0), 1);
+    assert_eq!(weights.value(0), -1);
+    assert_eq!(restored.logical_group_count_for_test(), 0);
 }
 
 #[tokio::test]
@@ -1919,12 +1635,12 @@ async fn test_cascaded_avg_over_changelog() {
     let b1 = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("region", DataType::Utf8, true),
-            Field::new("price", DataType::Int64, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
             Field::new(WEIGHT_COLUMN, DataType::Int64, false),
         ])),
         vec![
             Arc::new(arrow::array::StringArray::from(vec!["US", "US", "US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])),
+            Arc::new(arrow::array::Float64Array::from(vec![10.0, 20.0, 30.0])),
             Arc::new(arrow::array::Int64Array::from(vec![1, 1, 1])),
         ],
     )
@@ -1942,12 +1658,12 @@ async fn test_cascaded_avg_over_changelog() {
     let b2 = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("region", DataType::Utf8, true),
-            Field::new("price", DataType::Int64, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
             Field::new(WEIGHT_COLUMN, DataType::Int64, false),
         ])),
         vec![
             Arc::new(arrow::array::StringArray::from(vec!["US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![10])),
+            Arc::new(arrow::array::Float64Array::from(vec![10.0])),
             Arc::new(arrow::array::Int64Array::from(vec![-1])),
         ],
     )
@@ -1963,300 +1679,6 @@ async fn test_cascaded_avg_over_changelog() {
         (avg2.value(0) - 25.0).abs() < 0.001,
         "avg should be 25.0 after retraction"
     );
-}
-
-#[tokio::test]
-async fn test_cascaded_min_over_changelog() {
-    // Single MIN aggregate — pre-agg schema: [region, price, __weight]
-    let ctx = SessionContext::new();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("region", DataType::Utf8, false),
-        Field::new("price", DataType::Int64, false),
-        Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["X"])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-        ],
-    )
-    .unwrap();
-    let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-    ctx.register_table("upstream", Arc::new(mem)).unwrap();
-
-    let mut state = try_from_sql_local(
-        &ctx,
-        "SELECT region, MIN(price) AS lo FROM upstream GROUP BY region",
-        false,
-    )
-    .await
-    .unwrap()
-    .unwrap();
-
-    // Insert 10, 20, 30
-    let b1 = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, true),
-            Field::new("price", DataType::Int64, true),
-            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["US", "US", "US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])),
-            Arc::new(arrow::array::Int64Array::from(vec![1, 1, 1])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&b1, 1000).unwrap();
-    let r1 = state.emit().unwrap();
-    let mins = r1[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    assert_eq!(mins.value(0), 10);
-
-    // Retract current min (10) -> new min = 20
-    let b2 = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, true),
-            Field::new("price", DataType::Int64, true),
-            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![10])),
-            Arc::new(arrow::array::Int64Array::from(vec![-1])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&b2, 2000).unwrap();
-    let r2 = state.emit().unwrap();
-    let mins2 = r2[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    assert_eq!(mins2.value(0), 20, "min should be 20 after retracting 10");
-
-    // Retract 20, retract 30 -> empty -> NULL
-    let b3 = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, true),
-            Field::new("price", DataType::Int64, true),
-            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["US", "US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![20, 30])),
-            Arc::new(arrow::array::Int64Array::from(vec![-1, -1])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&b3, 3000).unwrap();
-    let r3 = state.emit().unwrap();
-    assert!(
-        r3[0].column(1).is_null(0),
-        "min should be NULL after all values retracted"
-    );
-}
-
-#[tokio::test]
-async fn test_cascaded_max_retract_over_changelog() {
-    // Single MAX aggregate — pre-agg schema: [region, price, __weight]
-    let ctx = SessionContext::new();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("region", DataType::Utf8, false),
-        Field::new("price", DataType::Int64, false),
-        Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["X"])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-        ],
-    )
-    .unwrap();
-    let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-    ctx.register_table("upstream", Arc::new(mem)).unwrap();
-
-    let mut state = try_from_sql_local(
-        &ctx,
-        "SELECT region, MAX(price) AS hi FROM upstream GROUP BY region",
-        false,
-    )
-    .await
-    .unwrap()
-    .unwrap();
-
-    // Insert 10, 20, 30
-    let b1 = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, true),
-            Field::new("price", DataType::Int64, true),
-            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["US", "US", "US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])),
-            Arc::new(arrow::array::Int64Array::from(vec![1, 1, 1])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&b1, 1000).unwrap();
-    let r1 = state.emit().unwrap();
-    let maxs = r1[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    assert_eq!(maxs.value(0), 30);
-
-    // Retract current max (30) -> new max = 20
-    let b2 = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, true),
-            Field::new("price", DataType::Int64, true),
-            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![30])),
-            Arc::new(arrow::array::Int64Array::from(vec![-1])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&b2, 2000).unwrap();
-    let r2 = state.emit().unwrap();
-    let maxs2 = r2[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    assert_eq!(maxs2.value(0), 20, "max should be 20 after retracting 30");
-}
-
-#[tokio::test]
-async fn test_cascaded_mixed_aggregates_over_changelog() {
-    // Mixed: SUM + COUNT(*) + AVG + MIN + MAX on same column.
-    // Pre-agg schema: [region, amount(SUM), TRUE(COUNT), amount(AVG),
-    //                   amount(MIN), amount(MAX), __weight] = 7 columns.
-    let ctx = SessionContext::new();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("region", DataType::Utf8, false),
-        Field::new("amount", DataType::Int64, false),
-        Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["X"])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-        ],
-    )
-    .unwrap();
-    let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-    ctx.register_table("upstream", Arc::new(mem)).unwrap();
-
-    let result = try_from_sql_local(
-        &ctx,
-        "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt, \
-         AVG(amount) AS avg_amt, MIN(amount) AS lo, MAX(amount) AS hi \
-         FROM upstream GROUP BY region",
-        false,
-    )
-    .await;
-    assert!(result.is_ok(), "mixed aggregates should be accepted");
-    let mut state = result.unwrap().unwrap();
-
-    // Pre-agg has 7 cols: [region, amt, TRUE, amt, amt, amt, __weight].
-    // Build matching batch.
-    let b1 = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, true),
-            Field::new("__agg_input_1", DataType::Int64, true),
-            Field::new("__agg_input_2", DataType::Boolean, true),
-            Field::new("__agg_input_3", DataType::Int64, true),
-            Field::new("__agg_input_4", DataType::Int64, true),
-            Field::new("__agg_input_5", DataType::Int64, true),
-            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["US", "US", "US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])), // SUM input
-            Arc::new(arrow::array::BooleanArray::from(vec![true, true, true])), // COUNT(*)
-            Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])), // AVG input
-            Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])), // MIN input
-            Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])), // MAX input
-            Arc::new(arrow::array::Int64Array::from(vec![1, 1, 1])),    // weight
-        ],
-    )
-    .unwrap();
-    state.process_batch(&b1, 1000).unwrap();
-    let r1 = state.emit().unwrap();
-    assert_eq!(r1[0].num_rows(), 1);
-
-    // Retract 10, insert 40.
-    let b2 = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, true),
-            Field::new("__agg_input_1", DataType::Int64, true),
-            Field::new("__agg_input_2", DataType::Boolean, true),
-            Field::new("__agg_input_3", DataType::Int64, true),
-            Field::new("__agg_input_4", DataType::Int64, true),
-            Field::new("__agg_input_5", DataType::Int64, true),
-            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["US", "US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![10, 40])),
-            Arc::new(arrow::array::BooleanArray::from(vec![true, true])),
-            Arc::new(arrow::array::Int64Array::from(vec![10, 40])),
-            Arc::new(arrow::array::Int64Array::from(vec![10, 40])),
-            Arc::new(arrow::array::Int64Array::from(vec![10, 40])),
-            Arc::new(arrow::array::Int64Array::from(vec![-1, 1])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&b2, 2000).unwrap();
-    let r2 = state.emit().unwrap();
-    // {20, 30, 40}: SUM=90, COUNT=3, AVG=30, MIN=20, MAX=40
-    let b = &r2[0];
-    let sum_col = b
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    let cnt_col = b
-        .column(2)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    let avg_col = b
-        .column(3)
-        .as_any()
-        .downcast_ref::<arrow::array::Float64Array>()
-        .unwrap();
-    let min_col = b
-        .column(4)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    let max_col = b
-        .column(5)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    assert_eq!(sum_col.value(0), 90, "SUM should be 90");
-    assert_eq!(cnt_col.value(0), 3, "COUNT should be 3");
-    assert!((avg_col.value(0) - 30.0).abs() < 0.001, "AVG should be 30");
-    assert_eq!(min_col.value(0), 20, "MIN should be 20");
-    assert_eq!(max_col.value(0), 40, "MAX should be 40");
 }
 
 fn round_trip(sv: &ScalarValue) -> ScalarValue {

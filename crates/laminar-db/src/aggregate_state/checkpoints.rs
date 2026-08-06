@@ -17,12 +17,13 @@ pub(crate) struct GroupCheckpoint {
 
 /// Columnar running-aggregate state: all keys in one IPC batch, each accumulator's
 /// state across all groups in one IPC batch. Row `j` of `keys_ipc`, every
-/// `acc_state_ipc[i]`, and `last_updated_ms[j]` refer to the same group.
+/// `acc_state_ipc[i]`, `input_weights[j]`, and `last_updated_ms[j]` refer to the same group.
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct AggStateCheckpoint {
     pub fingerprint: u64,
     pub keys_ipc: Vec<u8>,
     pub acc_state_ipc: Vec<Vec<u8>>,
+    pub input_weights: Vec<i64>,
     pub last_updated_ms: Vec<i64>,
     pub last_emitted: Vec<EmittedCheckpoint>,
 }
@@ -58,6 +59,7 @@ impl AggStateCheckpoint {
         for state in &self.acc_state_ipc {
             add(&mut bytes, state.capacity())?;
         }
+        add(&mut bytes, roster::<i64>(self.input_weights.capacity())?)?;
         add(&mut bytes, roster::<i64>(self.last_updated_ms.capacity())?)?;
         add(
             &mut bytes,
@@ -132,6 +134,7 @@ impl AggStateArchiveRestoreProfile {
         if group_count == 0 {
             if !archived.keys_ipc.is_empty()
                 || !archived.acc_state_ipc.is_empty()
+                || !archived.input_weights.is_empty()
                 || !archived.last_emitted.is_empty()
             {
                 return Err(DbError::Pipeline(format!(
@@ -139,11 +142,31 @@ impl AggStateArchiveRestoreProfile {
                 )));
             }
         } else {
+            if archived.input_weights.len() != group_count {
+                return Err(DbError::Pipeline(format!(
+                    "{context} aggregate checkpoint has {} input weights for {group_count} groups",
+                    archived.input_weights.len()
+                )));
+            }
+            if archived.input_weights.iter().any(|weight| *weight < 0) {
+                return Err(DbError::Pipeline(format!(
+                    "{context} aggregate checkpoint contains a negative input weight"
+                )));
+            }
             if archived.acc_state_ipc.len() != self.accumulator_states {
                 return Err(DbError::Pipeline(format!(
                     "{context} aggregate checkpoint has {} accumulator states; the query requires {}",
                     archived.acc_state_ipc.len(),
                     self.accumulator_states
+                )));
+            }
+            if archived
+                .acc_state_ipc
+                .iter()
+                .any(rkyv::vec::ArchivedVec::is_empty)
+            {
+                return Err(DbError::Pipeline(format!(
+                    "{context} aggregate checkpoint contains an empty accumulator state"
                 )));
             }
             if self.grouped && archived.keys_ipc.is_empty() {
@@ -220,7 +243,7 @@ pub(crate) fn query_fingerprint_with_config(
     config: &[u8],
 ) -> u64 {
     let mut hasher = Xxh3::new();
-    hasher.update(b"laminardb.state-query.v2\0");
+    hasher.update(b"laminardb.state-query.v3\0");
     hash_bytes(&mut hasher, state_sql.as_bytes());
     hasher.update(&(output_schema.fields().len() as u64).to_le_bytes());
     for field in output_schema.fields() {
@@ -251,7 +274,8 @@ mod tests {
         AggStateCheckpoint {
             fingerprint: FINGERPRINT,
             keys_ipc: vec![1],
-            acc_state_ipc: vec![Vec::new()],
+            acc_state_ipc: vec![vec![1]],
+            input_weights: vec![1],
             last_updated_ms: vec![i64::MIN],
             last_emitted: Vec::new(),
         }
@@ -273,6 +297,7 @@ mod tests {
             fingerprint: FINGERPRINT,
             keys_ipc: Vec::new(),
             acc_state_ipc: Vec::new(),
+            input_weights: Vec::new(),
             last_updated_ms: Vec::new(),
             last_emitted: Vec::new(),
         };
@@ -313,6 +338,18 @@ mod tests {
         missing_keys.keys_ipc.clear();
         cases.push((missing_keys, "no key bytes"));
 
+        let mut missing_weights = one_group();
+        missing_weights.input_weights.clear();
+        cases.push((missing_weights, "input weights"));
+
+        let mut negative_weight = one_group();
+        negative_weight.input_weights[0] = -1;
+        cases.push((negative_weight, "negative input weight"));
+
+        let mut empty_accumulator = one_group();
+        empty_accumulator.acc_state_ipc[0].clear();
+        cases.push((empty_accumulator, "empty accumulator state"));
+
         let mut noncanonical_empty = one_group();
         noncanonical_empty.last_updated_ms.clear();
         cases.push((noncanonical_empty, "non-canonical empty"));
@@ -351,6 +388,7 @@ mod tests {
         assert!(error.to_string().contains("contains key bytes"), "{error}");
 
         keyed_global.keys_ipc.clear();
+        keyed_global.input_weights.push(1);
         keyed_global.last_updated_ms.push(0);
         let encoded = encode(&keyed_global);
         let error = global_profile

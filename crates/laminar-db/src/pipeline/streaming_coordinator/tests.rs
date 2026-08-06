@@ -89,7 +89,7 @@ fn source_metadata_stays_row_aligned_and_mutations_are_route_admitted() {
     );
     assert_eq!(
         coordinator.pending_watermark_batches[0].batch.schema(),
-        schema
+        positioned_schema
     );
     assert_eq!(coordinator.pending_watermark_batches[0].batch.num_rows(), 2);
     assert_eq!(events, 2);

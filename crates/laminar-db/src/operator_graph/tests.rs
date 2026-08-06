@@ -442,51 +442,6 @@ impl GraphOperator for RestoreProbe {
     }
 }
 
-struct CheckpointBudgetProbe(Arc<std::sync::atomic::AtomicUsize>);
-
-#[async_trait]
-impl GraphOperator for CheckpointBudgetProbe {
-    fn cluster_capability(&self) -> OperatorCapability {
-        OperatorCapability::test_probe()
-    }
-
-    fn set_retractable_extremum_checkpoint_budget(&mut self, bytes: usize) {
-        self.0.store(bytes, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    async fn process(
-        &mut self,
-        _inputs: &[Vec<RecordBatch>],
-        _watermarks: &[i64],
-    ) -> Result<Vec<RecordBatch>, DbError> {
-        Ok(Vec::new())
-    }
-
-    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
-        Ok(None)
-    }
-}
-
-#[test]
-fn retractable_extremum_checkpoint_budget_reaches_existing_and_late_nodes() {
-    let first = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let second = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
-    graph.push_test_node("first", Box::new(CheckpointBudgetProbe(Arc::clone(&first))));
-    assert_eq!(
-        first.load(std::sync::atomic::Ordering::SeqCst),
-        crate::config::DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES
-    );
-
-    graph.set_max_retractable_extremum_checkpoint_bytes(123_456);
-    assert_eq!(first.load(std::sync::atomic::Ordering::SeqCst), 123_456);
-    graph.push_test_node(
-        "second",
-        Box::new(CheckpointBudgetProbe(Arc::clone(&second))),
-    );
-    assert_eq!(second.load(std::sync::atomic::Ordering::SeqCst), 123_456);
-}
-
 struct ManagedStateAccountingProbe {
     accounting: ManagedStateAccountingSnapshot,
     samples: Arc<std::sync::atomic::AtomicUsize>,
@@ -1049,9 +1004,7 @@ fn install_ordered_probe(
     harness: &mut AlignmentHarness,
 ) -> Arc<parking_lot::Mutex<Vec<OrderedShuffleEvent>>> {
     let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let budget = harness.graph.max_retractable_extremum_checkpoint_bytes;
-    harness.graph.nodes[0]
-        .replace_operator(Box::new(OrderedShuffleProbe(Arc::clone(&events))), budget);
+    harness.graph.nodes[0].replace_operator(Box::new(OrderedShuffleProbe(Arc::clone(&events))));
     events
 }
 
@@ -2579,7 +2532,7 @@ fn test_remove_query() {
     graph.remove_query("q1");
     assert!(!graph.output_map.contains_key("q1"));
     assert!(graph.nodes[1].removed); // node 0 = source, node 1 = q1
-    assert!(!graph.incremental_tables.contains("q1"));
+    assert!(!graph.changelog_tables.contains("q1"));
     assert!(!graph.live_handles.contains_key("q1"));
 
     graph.add_query(
@@ -2601,25 +2554,25 @@ fn test_remove_query() {
             .count(),
         1
     );
-    assert!(!graph.incremental_tables.contains("q1"));
+    assert!(!graph.changelog_tables.contains("q1"));
     graph.ensure_live_provider("q1", &test_schema());
     assert!(graph.live_handles.contains_key("q1"));
 
-    graph.incremental_tables.insert("metadata_only".to_string());
+    graph.changelog_tables.insert("metadata_only".to_string());
     graph.ensure_live_provider("metadata_only", &test_schema());
     assert!(!graph.output_map.contains_key("metadata_only"));
     graph.remove_query("metadata_only");
-    assert!(!graph.incremental_tables.contains("metadata_only"));
+    assert!(!graph.changelog_tables.contains("metadata_only"));
     assert!(!graph.live_handles.contains_key("metadata_only"));
 }
 
 #[test]
-fn changelog_join_fails_closed_before_graph_mutation() {
+fn changelog_stateful_consumers_fail_closed_before_graph_mutation() {
     let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
-    let mut incremental = FxHashSet::default();
-    incremental.insert("agg_a".to_string());
-    incremental.insert("agg_b".to_string());
-    graph.set_incremental_tables(incremental);
+    let mut changelog = FxHashSet::default();
+    changelog.insert("agg_a".to_string());
+    changelog.insert("agg_b".to_string());
+    graph.set_changelog_tables(changelog);
 
     graph.add_query(
         "joined".to_string(),
@@ -2635,7 +2588,28 @@ fn changelog_join_fails_closed_before_graph_mutation() {
     assert!(graph
         .build_errors
         .iter()
-        .any(|error| error.to_string().contains("reads an incremental changelog")));
+        .any(|error| error.to_string().contains("reads a changelog")));
+
+    graph.build_errors.clear();
+    graph.add_query(
+        "windowed".to_string(),
+        "SELECT COUNT(*) AS n FROM agg_a GROUP BY TUMBLE(event_time, INTERVAL '1' MINUTE)"
+            .to_string(),
+        None,
+        Some(laminar_sql::translator::WindowOperatorConfig::tumbling(
+            "event_time".into(),
+            std::time::Duration::from_secs(60),
+        )),
+        None,
+        None,
+        false,
+    );
+    assert!(!graph.output_map.contains_key("windowed"));
+    assert!(graph.build_errors.iter().any(|error| {
+        error
+            .to_string()
+            .contains("cannot safely consume a changelog")
+    }));
 }
 
 #[test]
@@ -2671,7 +2645,7 @@ fn rejected_control_add_removes_all_query_artifacts() {
     );
     assert!(matches!(error, DbError::Pipeline(_)));
     assert!(!graph.output_map.contains_key("rejected"));
-    assert!(!graph.incremental_tables.contains("rejected"));
+    assert!(!graph.changelog_tables.contains("rejected"));
     assert!(!graph.live_handles.contains_key("rejected"));
     let rejected_nodes: FxHashSet<_> = graph
         .nodes

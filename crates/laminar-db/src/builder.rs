@@ -400,17 +400,6 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Pre-encoding work limit for one retractable MIN/MAX checkpoint capture.
-    ///
-    /// This is independent of checkpoint storage. The charge is a cached accumulator work proxy,
-    /// not an encoded-payload or process-RSS limit. Database construction rejects zero.
-    #[must_use]
-    pub fn pipeline_max_retractable_extremum_checkpoint_bytes(mut self, bytes: usize) -> Self {
-        self.config
-            .pipeline_max_retractable_extremum_checkpoint_bytes = Some(bytes);
-        self
-    }
-
     /// Retain temporal right-side history across idle periods for at least this duration.
     #[must_use]
     pub fn temporal_join_idle_history_retention(mut self, retention: std::time::Duration) -> Self {
@@ -893,19 +882,6 @@ mod tests {
         assert_eq!(
             builder.config.pipeline_max_managed_state_bytes,
             Some(123_456)
-        );
-    }
-
-    #[test]
-    fn retractable_extremum_checkpoint_budget_builder_option_is_preserved() {
-        let builder =
-            LaminarDbBuilder::new().pipeline_max_retractable_extremum_checkpoint_bytes(654_321);
-
-        assert_eq!(
-            builder
-                .config
-                .pipeline_max_retractable_extremum_checkpoint_bytes,
-            Some(654_321)
         );
     }
 

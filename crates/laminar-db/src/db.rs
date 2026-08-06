@@ -1438,18 +1438,6 @@ impl LaminarDB {
         }
         config.pipeline_max_managed_state_bytes = Some(max_managed_state_bytes);
 
-        let max_retractable_extremum_checkpoint_bytes = config
-            .pipeline_max_retractable_extremum_checkpoint_bytes
-            .unwrap_or(crate::config::DEFAULT_MAX_RETRACTABLE_EXTREMUM_CHECKPOINT_BYTES);
-        if max_retractable_extremum_checkpoint_bytes == 0 {
-            return Err(DbError::Config(
-                "pipeline_max_retractable_extremum_checkpoint_bytes must be greater than zero"
-                    .into(),
-            ));
-        }
-        config.pipeline_max_retractable_extremum_checkpoint_bytes =
-            Some(max_retractable_extremum_checkpoint_bytes);
-
         if let Some(checkpoint) = config.checkpoint.as_mut() {
             let max_node_data_bytes = checkpoint.max_node_data_bytes.unwrap_or(
                 laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES,

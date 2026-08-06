@@ -438,8 +438,12 @@ impl CoreWindowState {
         let compile = |e: &datafusion_expr::Expr| {
             create_physical_expr(e, input_df_schema, compile_props).ok()
         };
-        let mut builder =
-            PreAggBuilder::new(&input_schema, num_group_cols, compile_source.is_some());
+        let mut builder = PreAggBuilder::new(
+            &input_schema,
+            input_df_schema,
+            num_group_cols,
+            compile_source.is_some(),
+        );
 
         for (i, group_expr) in group_exprs.iter().enumerate() {
             builder.push_group_expr(i, group_expr, &compile);
@@ -455,7 +459,7 @@ impl CoreWindowState {
             } else {
                 agg_field.name().clone()
             };
-            if !builder.push_aggregate(expr, output_name, agg_field, &compile) {
+            if !builder.push_aggregate(expr, output_name, &compile)? {
                 return Ok(None);
             }
         }
@@ -466,6 +470,19 @@ impl CoreWindowState {
         let agg_specs = builder.agg_specs;
         let mut compiled_exprs = builder.compiled_exprs;
         let mut proj_fields = builder.proj_fields;
+
+        if crate::aggregate_state::query_reads_weighted_changelog(ctx, sql).await? {
+            return Err(DbError::Unsupported(format!(
+                "[{}] window aggregates cannot consume a changelog until window retractions use the managed vnode state path",
+                laminar_core::error_codes::SQL_UNSUPPORTED
+            )));
+        }
+        for spec in &agg_specs {
+            crate::aggregate_state::ConcreteAggregateState::try_new(
+                spec,
+                crate::aggregate_state::ConcreteInputMode::AppendOnly,
+            )?;
+        }
 
         let time_col_index = next_col_idx;
         pre_agg_select_items.push(format!("\"{}\" AS \"__cw_ts\"", window_config.time_column));
@@ -607,14 +624,7 @@ impl CoreWindowState {
 
         let managed_global_tumbling = matches!(assigner, CoreWindowAssigner::Tumbling(_))
             && window_config.offset_ms == 0
-            && num_group_cols == 0
-            && agg_specs.iter().all(|spec| {
-                !spec.distinct
-                    && matches!(
-                        spec.udf.name().to_ascii_lowercase().as_str(),
-                        "count" | "sum" | "avg" | "min" | "max"
-                    )
-            });
+            && num_group_cols == 0;
 
         Ok(Some(Self {
             assigner,
@@ -1551,49 +1561,39 @@ impl CoreWindowState {
 
         match &self.assigner {
             CoreWindowAssigner::Tumbling(_) | CoreWindowAssigner::Hopping(_) => {
-                let checkpoint = (|| {
-                    let mut windows = Vec::with_capacity(self.windows.len());
-                    for (&window_start, groups) in &mut self.windows {
-                        let mut group_checkpoints = Vec::with_capacity(groups.len());
-                        for (key, accs) in groups {
-                            let sv_key = crate::aggregate_state::row_to_scalar_key_with_types(
-                                &self.row_converter,
-                                key,
-                                &self.group_types,
-                            )?;
-                            let key_ipc = scalars_to_ipc(&sv_key)?;
-                            let mut acc_states = Vec::with_capacity(accs.len());
-                            for (i, acc) in accs.iter_mut().enumerate() {
-                                acc_states.push(crate::aggregate_state::snapshot_and_rebuild(
-                                    acc,
-                                    &self.agg_specs[i],
-                                    false,
-                                )?);
-                            }
-                            group_checkpoints.push(GroupCheckpoint {
-                                key: key_ipc,
-                                acc_states,
-                                last_updated_ms: i64::MIN,
-                            });
+                let mut windows = Vec::with_capacity(self.windows.len());
+                for (&window_start, groups) in &mut self.windows {
+                    let mut group_checkpoints = Vec::with_capacity(groups.len());
+                    for (key, accs) in groups {
+                        let sv_key = crate::aggregate_state::row_to_scalar_key_with_types(
+                            &self.row_converter,
+                            key,
+                            &self.group_types,
+                        )?;
+                        let key_ipc = scalars_to_ipc(&sv_key)?;
+                        let mut acc_states = Vec::with_capacity(accs.len());
+                        for acc in accs.iter_mut() {
+                            acc_states
+                                .push(crate::aggregate_state::snapshot_window_accumulator(acc)?);
                         }
-                        windows.push(WindowCheckpoint {
-                            window_start,
-                            groups: group_checkpoints,
+                        group_checkpoints.push(GroupCheckpoint {
+                            key: key_ipc,
+                            acc_states,
+                            last_updated_ms: i64::MIN,
                         });
                     }
-                    Ok(CoreWindowCheckpoint {
-                        fingerprint,
-                        windows,
-                        session_state: Vec::new(),
-                        window_type,
-                        high_watermark_ms: self.high_watermark_ms,
-                    })
-                })();
-                // Snapshotting may rebuild accumulator implementations with different retained
-                // capacities. Capture already visits the complete image, so reconcile once here
-                // without adding another steady-state scan, including on an encode failure.
-                self.refresh_managed_accounting();
-                checkpoint
+                    windows.push(WindowCheckpoint {
+                        window_start,
+                        groups: group_checkpoints,
+                    });
+                }
+                Ok(CoreWindowCheckpoint {
+                    fingerprint,
+                    windows,
+                    session_state: Vec::new(),
+                    window_type,
+                    high_watermark_ms: self.high_watermark_ms,
+                })
             }
             CoreWindowAssigner::Session { .. } => {
                 let mut session_state = Vec::with_capacity(self.session_groups.len());
@@ -1607,12 +1607,9 @@ impl CoreWindowState {
                     let mut sessions = Vec::with_capacity(group.sessions.len());
                     for sess in group.sessions.values_mut() {
                         let mut acc_states = Vec::with_capacity(sess.accs.len());
-                        for (i, acc) in sess.accs.iter_mut().enumerate() {
-                            acc_states.push(crate::aggregate_state::snapshot_and_rebuild(
-                                acc,
-                                &self.agg_specs[i],
-                                false,
-                            )?);
+                        for acc in &mut sess.accs {
+                            acc_states
+                                .push(crate::aggregate_state::snapshot_window_accumulator(acc)?);
                         }
                         sessions.push(SessionCheckpoint {
                             start: sess.start,
@@ -2054,7 +2051,6 @@ mod tests {
             input_col_indices: vec![1],
             output_name: "total".to_string(),
             return_type: DataType::Int64,
-            distinct: false,
             is_count_star: false,
             filter_col_index: None,
         }];
@@ -2111,7 +2107,6 @@ mod tests {
                 input_col_indices: vec![1],
                 output_name: "total".to_string(),
                 return_type: DataType::Int64,
-                distinct: false,
                 is_count_star: false,
                 filter_col_index: None,
             },
@@ -2121,7 +2116,6 @@ mod tests {
                 input_col_indices: vec![1],
                 output_name: "cnt".to_string(),
                 return_type: DataType::Int64,
-                distinct: false,
                 is_count_star: false,
                 filter_col_index: None,
             },
@@ -2178,7 +2172,6 @@ mod tests {
             input_col_indices: vec![1],
             output_name: "total".to_string(),
             return_type: DataType::Int64,
-            distinct: false,
             is_count_star: false,
             filter_col_index: None,
         }];
@@ -2235,7 +2228,6 @@ mod tests {
             input_col_indices: vec![1],
             output_name: "total".to_string(),
             return_type: DataType::Int64,
-            distinct: false,
             is_count_star: false,
             filter_col_index: None,
         }];
