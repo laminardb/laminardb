@@ -43,6 +43,8 @@ pub(crate) struct EowcQueryOperator {
     capability: OperatorCapability,
     state: Option<Box<CoreWindowState>>,
     pending_restore: Option<CoreWindowCheckpoint>,
+    vnode_checkpointed: bool,
+    vnode_dirty: bool,
     prom: Option<Arc<EngineMetrics>>,
     #[cfg(feature = "cluster")]
     cluster_scope: Option<ClusterShuffleConfig>,
@@ -82,6 +84,8 @@ impl EowcQueryOperator {
             capability,
             state: None,
             pending_restore: None,
+            vnode_checkpointed: false,
+            vnode_dirty: false,
             prom,
             #[cfg(feature = "cluster")]
             cluster_scope: None,
@@ -370,7 +374,8 @@ impl GraphOperator for EowcQueryOperator {
         })?;
         let recovery_fenced =
             self.capability.managed_state == Some(ManagedStateContract::CoreWindowV1);
-        Self::process_core_window(
+        let prior_watermark = window.high_watermark_ms();
+        let output = Self::process_core_window(
             window,
             input_batches,
             watermark,
@@ -379,7 +384,14 @@ impl GraphOperator for EowcQueryOperator {
             &self.task_ctx,
             recovery_fenced,
         )
-        .await
+        .await?;
+        if recovery_fenced
+            && (input_batches.iter().any(|batch| batch.num_rows() != 0)
+                || window.high_watermark_ms() != prior_watermark)
+        {
+            self.vnode_dirty = true;
+        }
+        Ok(output)
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
@@ -419,6 +431,8 @@ impl GraphOperator for EowcQueryOperator {
         } else {
             self.apply_checkpoint(&checkpoint)?;
         }
+        self.vnode_checkpointed = false;
+        self.vnode_dirty = false;
 
         Ok(())
     }
@@ -454,7 +468,7 @@ impl GraphOperator for EowcQueryOperator {
             }
         }
         if required_vnodes.is_empty() {
-            return Ok(None);
+            return Ok(Some(Vec::new()));
         }
         if self.capability.managed_state != Some(ManagedStateContract::CoreWindowV1) {
             return Err(DbError::Checkpoint(format!(
@@ -468,6 +482,9 @@ impl GraphOperator for EowcQueryOperator {
                 self.op_name
             )));
         };
+        if self.vnode_checkpointed && !self.vnode_dirty {
+            return Ok(Some(Vec::new()));
+        }
         if u64::try_from(window.accounted_state_bytes()).unwrap_or(u64::MAX) > max_capture_bytes {
             return Err(DbError::Checkpoint(format!(
                 "managed CoreWindow '{}' state exceeds its capture budget",
@@ -482,6 +499,8 @@ impl GraphOperator for EowcQueryOperator {
                 self.op_name
             )));
         }
+        self.vnode_checkpointed = true;
+        self.vnode_dirty = false;
         Ok(Some(vec![crate::operator_graph::CapturedVnodeState {
             vnode: 0,
             state: Some(crate::operator_graph::StateFrameCapture::encoded(bytes)),
@@ -589,12 +608,18 @@ impl GraphOperator for EowcQueryOperator {
             .as_mut()
             .expect("managed CoreWindow publication targeted uninitialized state");
         let retired = window.publish_managed_tumbling_transition(prepared);
+        self.vnode_checkpointed = false;
+        self.vnode_dirty = false;
         self.vnode_transition_cleanup = Some(CoreWindowTransitionCleanup::Published(retired));
     }
 
     #[cfg(feature = "cluster")]
     fn finish_vnode_transition(&mut self) {
         drop(self.vnode_transition_cleanup.take());
+    }
+
+    fn force_full_vnode_capture(&mut self) {
+        self.vnode_checkpointed = false;
     }
 }
 
@@ -704,6 +729,59 @@ mod core_tests {
         assert!(error.to_string().contains("CoreWindow restore"));
         assert!(error.requires_pipeline_recovery());
         assert_eq!(op.checkpoint().unwrap().unwrap().data, before.data);
+    }
+
+    #[tokio::test]
+    async fn managed_window_captures_only_dirty_vnode_zero() {
+        let ctx = aggregate_context();
+        let config = test_window_config();
+        let sql = "SELECT SUM(price) AS total FROM trades";
+        let mut op = EowcQueryOperator::new(
+            "managed_window",
+            sql,
+            Some(EmitClause::OnWindowClose),
+            Some(config),
+            ctx,
+            None,
+        );
+        op.initialize_managed_state().await.unwrap();
+        op.process(&[vec![test_batch(vec![100])]], &[i64::MIN])
+            .await
+            .unwrap();
+
+        let baseline = op.checkpoint_vnodes(&[0], 1, u64::MAX).unwrap().unwrap();
+        assert_eq!(baseline.len(), 1);
+        assert!(baseline[0].state.is_some());
+        assert!(op
+            .checkpoint_vnodes(&[0], 1, u64::MAX)
+            .unwrap()
+            .unwrap()
+            .is_empty());
+
+        op.process(&[vec![test_batch(vec![200])]], &[i64::MIN])
+            .await
+            .unwrap();
+        assert_eq!(
+            op.checkpoint_vnodes(&[0], 1, u64::MAX)
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(op
+            .checkpoint_vnodes(&[0], 1, u64::MAX)
+            .unwrap()
+            .unwrap()
+            .is_empty());
+
+        op.force_full_vnode_capture();
+        assert_eq!(
+            op.checkpoint_vnodes(&[0], 1, u64::MAX)
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

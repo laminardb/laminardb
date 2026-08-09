@@ -256,6 +256,7 @@ struct IntervalHandoffCut {
 struct PreparedIntervalJoinTransition {
     replacements: Vec<(u32, Option<Box<IntervalJoinState>>)>,
     local_assignment: VnodeAssignmentSnapshot,
+    resident_vnodes: Vec<u32>,
     handoff_cut: Option<IntervalHandoffCut>,
 }
 
@@ -269,8 +270,10 @@ pub(crate) struct IntervalJoinOperator {
     key_group_count: KeyGroupCount,
     local_assignment: VnodeAssignmentSnapshot,
     vnode_states: Vec<Option<Box<IntervalJoinState>>>,
-    checkpointed_vnodes: Vec<bool>,
+    resident_vnodes: Vec<u32>,
     dirty_vnodes: Vec<bool>,
+    dirty_vnode_roster: Vec<u32>,
+    full_vnode_capture_required: bool,
     max_managed_state_bytes: usize,
     input_schemas: Option<(SchemaRef, SchemaRef)>,
     projection: ProjectingJoinState,
@@ -320,8 +323,10 @@ impl IntervalJoinOperator {
             vnode_states: std::iter::repeat_with(|| None)
                 .take(usize::from(key_group_count.get()))
                 .collect(),
-            checkpointed_vnodes: vec![false; usize::from(key_group_count.get())],
+            resident_vnodes: Vec::with_capacity(usize::from(key_group_count.get())),
             dirty_vnodes: vec![false; usize::from(key_group_count.get())],
+            dirty_vnode_roster: Vec::with_capacity(usize::from(key_group_count.get())),
+            full_vnode_capture_required: true,
             max_managed_state_bytes: crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
             input_schemas: None,
             projection: ProjectingJoinState::new(name, ctx, projection_sql, "__interval_tmp"),
@@ -346,14 +351,18 @@ impl IntervalJoinOperator {
     #[cfg(feature = "cluster")]
     pub(crate) fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
         debug_assert!(self.vnode_states.iter().all(Option::is_none));
+        debug_assert!(self.resident_vnodes.is_empty());
+        debug_assert!(self.dirty_vnode_roster.is_empty());
         self.key_group_count = KeyGroupCount::try_from(config.registry.vnode_count())
             .expect("vnode registry count must fit the checkpoint key-group ABI");
         self.vnode_states
             .resize_with(config.registry.vnode_count() as usize, || None);
-        self.checkpointed_vnodes
-            .resize(config.registry.vnode_count() as usize, false);
         self.dirty_vnodes
             .resize(config.registry.vnode_count() as usize, false);
+        let vnode_count = config.registry.vnode_count() as usize;
+        self.resident_vnodes.reserve_exact(vnode_count);
+        self.dirty_vnode_roster.reserve_exact(vnode_count);
+        self.full_vnode_capture_required = true;
         self.local_assignment = config.registry.versioned_snapshot();
         self.cluster_shuffle = Some(config);
     }
@@ -362,16 +371,25 @@ impl IntervalJoinOperator {
         self.vnode_states
             .capacity()
             .saturating_mul(std::mem::size_of::<Option<Box<IntervalJoinState>>>())
+            .saturating_add(
+                self.resident_vnodes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(
+                self.dirty_vnode_roster
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(self.dirty_vnodes.capacity().div_ceil(8))
             .saturating_add(32)
             .saturating_add(std::mem::size_of::<VnodeAssignmentSnapshot>())
-            .saturating_add(
-                self.vnode_states
-                    .iter()
-                    .flatten()
-                    .fold(0usize, |total, state| {
-                        total.saturating_add(state.accounted_state_bytes())
-                    }),
-            )
+            .saturating_add(self.resident_vnodes.iter().fold(0usize, |total, &vnode| {
+                let state = self.vnode_states[vnode as usize]
+                    .as_ref()
+                    .expect("resident interval vnode must contain state");
+                total.saturating_add(state.accounted_state_bytes())
+            }))
     }
 
     fn transition_accounted_bytes(transition: &PreparedIntervalJoinTransition) -> usize {
@@ -379,6 +397,12 @@ impl IntervalJoinOperator {
             .replacements
             .capacity()
             .saturating_mul(std::mem::size_of::<(u32, Option<Box<IntervalJoinState>>)>())
+            .saturating_add(
+                transition
+                    .resident_vnodes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
             .saturating_add(32)
             .saturating_add(std::mem::size_of::<VnodeAssignmentSnapshot>())
             .saturating_add(
@@ -390,6 +414,35 @@ impl IntervalJoinOperator {
                         total.saturating_add(state.accounted_state_bytes())
                     }),
             )
+    }
+
+    fn add_resident_vnode(&mut self, vnode: u32) {
+        if let Err(index) = self.resident_vnodes.binary_search(&vnode) {
+            self.resident_vnodes.insert(index, vnode);
+        }
+    }
+
+    fn remove_resident_vnode(&mut self, vnode: u32) {
+        if let Ok(index) = self.resident_vnodes.binary_search(&vnode) {
+            self.resident_vnodes.remove(index);
+        }
+    }
+
+    fn mark_vnode_dirty(&mut self, vnode: u32) {
+        let dirty = self
+            .dirty_vnodes
+            .get_mut(vnode as usize)
+            .expect("interval join dirty vnode must have a state slot");
+        if !*dirty {
+            *dirty = true;
+            self.dirty_vnode_roster.push(vnode);
+        }
+    }
+
+    fn clear_dirty_vnode_roster(&mut self) {
+        for vnode in self.dirty_vnode_roster.drain(..) {
+            self.dirty_vnodes[vnode as usize] = false;
+        }
     }
 
     fn capture_operator_checkpoint(
@@ -897,7 +950,8 @@ impl IntervalJoinOperator {
             })?;
         let has_input = left.iter().any(|batch| batch.num_rows() > 0)
             || right.iter().any(|batch| batch.num_rows() > 0);
-        let slot = self.vnode_states.get_mut(vnode as usize).ok_or_else(|| {
+        let vnode_index = vnode as usize;
+        let slot = self.vnode_states.get(vnode_index).ok_or_else(|| {
             DbError::Checkpoint(format!(
                 "interval join [{}] routed vnode {vnode} outside its {}-vnode state table",
                 self.projection.op_name, state_slots
@@ -921,9 +975,13 @@ impl IntervalJoinOperator {
                     &self.config,
                 )?;
             }
-            *slot = Some(Box::new(state));
+            self.vnode_states[vnode_index] = Some(Box::new(state));
+            self.add_resident_vnode(vnode);
         }
-        let state = slot.as_mut().expect("interval join state initialized");
+        let state = self.vnode_states[vnode_index]
+            .as_mut()
+            .expect("interval join state initialized");
+        let cutoffs_before = state.evicted_cutoffs();
         let result = execute_interval_join_cycle(
             state,
             left,
@@ -937,8 +995,9 @@ impl IntervalJoinOperator {
             output_budget,
         );
         *accounted_total = other_state_bytes.saturating_add(state.accounted_state_bytes());
-        if result.is_ok() {
-            self.dirty_vnodes[vnode as usize] = true;
+        let checkpoint_state_changed = has_input || state.evicted_cutoffs() != cutoffs_before;
+        if result.is_ok() && checkpoint_state_changed {
+            self.mark_vnode_dirty(vnode);
         }
         result
     }
@@ -1016,10 +1075,8 @@ impl IntervalJoinOperator {
     }
 
     fn add_resident_vnodes(&self, routed: &mut BTreeMap<u32, [Vec<RecordBatch>; 2]>) {
-        for (state, vnode) in self.vnode_states.iter().zip(0_u32..) {
-            if state.is_some() {
-                routed.entry(vnode).or_default();
-            }
+        for &vnode in &self.resident_vnodes {
+            routed.entry(vnode).or_default();
         }
     }
 
@@ -1814,12 +1871,10 @@ impl GraphOperator for IntervalJoinOperator {
             )));
         }
         if let Some(unowned) = self
-            .vnode_states
+            .resident_vnodes
             .iter()
-            .zip(0_u32..)
-            .find_map(|(state, vnode)| {
-                (state.is_some() && required_vnodes.binary_search(&vnode).is_err()).then_some(vnode)
-            })
+            .copied()
+            .find(|vnode| required_vnodes.binary_search(vnode).is_err())
         {
             return Err(DbError::Checkpoint(format!(
                 "interval join [{}] retained unowned vnode state {unowned}",
@@ -1827,16 +1882,29 @@ impl GraphOperator for IntervalJoinOperator {
             )));
         }
 
-        let capture_plan = required_vnodes
+        let full_capture = self.full_vnode_capture_required;
+        let mut capture_vnodes = if full_capture {
+            required_vnodes.to_vec()
+        } else {
+            self.dirty_vnode_roster
+                .iter()
+                .copied()
+                .filter(|vnode| required_vnodes.binary_search(vnode).is_ok())
+                .collect::<Vec<_>>()
+        };
+        if !full_capture {
+            capture_vnodes.sort_unstable();
+        }
+        debug_assert!(capture_vnodes.windows(2).all(|pair| pair[0] < pair[1]));
+        if capture_vnodes.is_empty() {
+            self.full_vnode_capture_required = false;
+            self.clear_dirty_vnode_roster();
+            return Ok(Some(Vec::new()));
+        }
+
+        let absent_frame_bytes = capture_vnodes
             .iter()
-            .map(|vnode| {
-                !self.checkpointed_vnodes[*vnode as usize] || self.dirty_vnodes[*vnode as usize]
-            })
-            .collect::<Vec<_>>();
-        let absent_frame_bytes = required_vnodes
-            .iter()
-            .zip(&capture_plan)
-            .filter(|(vnode, capture)| **capture && self.vnode_states[**vnode as usize].is_none())
+            .filter(|vnode| self.vnode_states[**vnode as usize].is_none())
             .count()
             .checked_mul(VNODE_FRAME_HEADER_LEN)
             .ok_or_else(|| {
@@ -1845,7 +1913,7 @@ impl GraphOperator for IntervalJoinOperator {
                     self.projection.op_name
                 ))
             })?;
-        let mut captured = Vec::with_capacity(required_vnodes.len());
+        let mut captured = Vec::with_capacity(capture_vnodes.len());
         let mut retained_capture_bytes = 0_u64;
         let operator_remaining = Arc::new(AtomicUsize::new(
             self.max_managed_state_bytes
@@ -1857,94 +1925,74 @@ impl GraphOperator for IntervalJoinOperator {
                     ))
                 })?,
         ));
-        for (&vnode, capture) in required_vnodes.iter().zip(&capture_plan) {
-            let state = if *capture {
-                if let Some(state) = self.vnode_states[vnode as usize].as_mut() {
-                    let remaining_capture_bytes = max_capture_bytes
-                        .checked_sub(retained_capture_bytes)
-                        .ok_or_else(|| {
-                            DbError::Checkpoint(format!(
-                                "interval join [{}] checkpoint captures exhausted their {max_capture_bytes}-byte capture budget",
-                                self.projection.op_name
-                            ))
-                        })?;
-                    let state_bytes =
-                        u64::try_from(state.accounted_state_bytes()).unwrap_or(u64::MAX);
-                    if state_bytes > remaining_capture_bytes {
-                        return Err(DbError::Checkpoint(format!(
-                            "interval join [{}] vnode {vnode} retains {state_bytes} bytes; remaining capture budget is {remaining_capture_bytes} bytes",
+        for vnode in capture_vnodes {
+            let state = if let Some(state) = self.vnode_states[vnode as usize].as_ref() {
+                let remaining_capture_bytes = max_capture_bytes
+                    .checked_sub(retained_capture_bytes)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "interval join [{}] checkpoint captures exhausted their {max_capture_bytes}-byte capture budget",
                             self.projection.op_name
-                        )));
-                    }
-                    let state_capture = state.capture_checkpoint(&self.config)?;
-                    let retained_bytes =
-                        u64::try_from(state_capture.retained_bytes()).unwrap_or(u64::MAX);
-                    retained_capture_bytes = retained_capture_bytes
-                        .checked_add(retained_bytes)
-                        .ok_or_else(|| {
-                            DbError::Checkpoint(format!(
-                                "interval join [{}] checkpoint capture byte accounting overflow",
-                                self.projection.op_name
-                            ))
-                        })?;
-                    if retained_capture_bytes > max_capture_bytes {
-                        return Err(DbError::Checkpoint(format!(
-                            "interval join [{}] checkpoint captures retain {retained_capture_bytes} bytes; capture budget is {max_capture_bytes} bytes",
-                            self.projection.op_name
-                        )));
-                    }
-                    let max_managed_state_bytes = self.max_managed_state_bytes;
-                    let operator_remaining = Arc::clone(&operator_remaining);
-                    let context = format!(
-                        "interval join [{}] vnode {vnode} checkpoint serialization",
+                        ))
+                    })?;
+                let state_bytes = u64::try_from(state.accounted_state_bytes()).unwrap_or(u64::MAX);
+                if state_bytes > remaining_capture_bytes {
+                    return Err(DbError::Checkpoint(format!(
+                        "interval join [{}] vnode {vnode} retains {state_bytes} bytes; remaining capture budget is {remaining_capture_bytes} bytes",
                         self.projection.op_name
-                    );
-                    Some(StateFrameCapture::deferred(
-                        retained_bytes,
-                        move |remaining| {
-                            let logical_remaining = operator_remaining.load(Ordering::Relaxed);
-                            let limit = remaining
-                                .min(max_managed_state_bytes)
-                                .min(logical_remaining);
-                            let encoded =
-                                Self::encode_state_capture(state_capture, &context, limit)?;
-                            operator_remaining
-                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                                    remaining.checked_sub(encoded.payload_len())
-                                })
-                                .map_err(|_| {
-                                    DbError::Checkpoint(format!(
-                                        "{context}: vnode checkpoints exhausted their {max_managed_state_bytes}-byte limit"
-                                    ))
-                                })?;
-                            Ok(encoded)
-                        },
-                    ))
-                } else {
-                    Some(StateFrameCapture::encoded_static(&ABSENT_VNODE_FRAME))
+                    )));
                 }
+                let state_capture = state.capture_checkpoint(&self.config)?;
+                let retained_bytes =
+                    u64::try_from(state_capture.retained_bytes()).unwrap_or(u64::MAX);
+                retained_capture_bytes = retained_capture_bytes
+                    .checked_add(retained_bytes)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "interval join [{}] checkpoint capture byte accounting overflow",
+                            self.projection.op_name
+                        ))
+                    })?;
+                if retained_capture_bytes > max_capture_bytes {
+                    return Err(DbError::Checkpoint(format!(
+                        "interval join [{}] checkpoint captures retain {retained_capture_bytes} bytes; capture budget is {max_capture_bytes} bytes",
+                        self.projection.op_name
+                    )));
+                }
+                let max_managed_state_bytes = self.max_managed_state_bytes;
+                let operator_remaining = Arc::clone(&operator_remaining);
+                let context = format!(
+                    "interval join [{}] vnode {vnode} checkpoint serialization",
+                    self.projection.op_name
+                );
+                Some(StateFrameCapture::deferred(
+                    retained_bytes,
+                    move |remaining| {
+                        let logical_remaining = operator_remaining.load(Ordering::Relaxed);
+                        let limit = remaining
+                            .min(max_managed_state_bytes)
+                            .min(logical_remaining);
+                        let encoded = Self::encode_state_capture(state_capture, &context, limit)?;
+                        operator_remaining
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                                remaining.checked_sub(encoded.payload_len())
+                            })
+                            .map_err(|_| {
+                                DbError::Checkpoint(format!(
+                                    "{context}: vnode checkpoints exhausted their {max_managed_state_bytes}-byte limit"
+                                ))
+                            })?;
+                        Ok(encoded)
+                    },
+                ))
             } else {
-                None
+                Some(StateFrameCapture::encoded_static(&ABSENT_VNODE_FRAME))
             };
             captured.push(CapturedVnodeState { vnode, state });
         }
 
-        for (vnode, (checkpointed, dirty)) in (0_u32..).zip(
-            self.checkpointed_vnodes
-                .iter_mut()
-                .zip(&mut self.dirty_vnodes),
-        ) {
-            if required_vnodes.binary_search(&vnode).is_err() {
-                *checkpointed = false;
-                *dirty = false;
-            }
-        }
-        for (&vnode, capture) in required_vnodes.iter().zip(capture_plan) {
-            self.checkpointed_vnodes[vnode as usize] = true;
-            if capture {
-                self.dirty_vnodes[vnode as usize] = false;
-            }
-        }
+        self.full_vnode_capture_required = false;
+        self.clear_dirty_vnode_roster();
         Ok(Some(captured))
     }
 
@@ -1991,8 +2039,12 @@ impl GraphOperator for IntervalJoinOperator {
         } else {
             None
         };
-        self.checkpointed_vnodes[vnode as usize] = false;
-        self.dirty_vnodes[vnode as usize] = false;
+        if self.vnode_states[vnode as usize].is_some() {
+            self.add_resident_vnode(vnode);
+        } else {
+            self.remove_resident_vnode(vnode);
+        }
+        self.mark_vnode_dirty(vnode);
         Ok(())
     }
 
@@ -2288,9 +2340,43 @@ impl GraphOperator for IntervalJoinOperator {
                 )));
             }
         }
+        let target_resident_capacity = self.resident_vnodes.len().saturating_add(
+            replacements
+                .values()
+                .filter(|state| state.is_some())
+                .count(),
+        );
+        let mut resident_vnodes = Vec::new();
+        resident_vnodes
+            .try_reserve_exact(target_resident_capacity)
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] target resident-vnode roster reservation failed: {error}",
+                    self.projection.op_name
+                ))
+            })?;
+        let mut resident_index = 0;
+        for (&vnode, replacement) in &replacements {
+            while self
+                .resident_vnodes
+                .get(resident_index)
+                .is_some_and(|resident| *resident < vnode)
+            {
+                resident_vnodes.push(self.resident_vnodes[resident_index]);
+                resident_index += 1;
+            }
+            if self.resident_vnodes.get(resident_index) == Some(&vnode) {
+                resident_index += 1;
+            }
+            if replacement.is_some() {
+                resident_vnodes.push(vnode);
+            }
+        }
+        resident_vnodes.extend_from_slice(&self.resident_vnodes[resident_index..]);
         let prepared = PreparedIntervalJoinTransition {
             replacements: replacements.into_iter().collect(),
             local_assignment: assignment,
+            resident_vnodes,
             handoff_cut,
         };
         let total_bytes = live_bytes
@@ -2329,10 +2415,10 @@ impl GraphOperator for IntervalJoinOperator {
                 .get_mut(*vnode as usize)
                 .expect("prepared interval join vnode must have a state slot");
             std::mem::swap(slot, replacement);
-            self.checkpointed_vnodes[*vnode as usize] = false;
-            self.dirty_vnodes[*vnode as usize] = false;
+            self.mark_vnode_dirty(*vnode);
         }
         std::mem::swap(&mut self.local_assignment, &mut prepared.local_assignment);
+        std::mem::swap(&mut self.resident_vnodes, &mut prepared.resident_vnodes);
         if let Some(mut cut) = prepared.handoff_cut {
             std::mem::swap(&mut self.applied_left_watermark, &mut cut.left_watermark);
             std::mem::swap(&mut self.applied_right_watermark, &mut cut.right_watermark);
@@ -2349,7 +2435,7 @@ impl GraphOperator for IntervalJoinOperator {
     }
 
     fn force_full_vnode_capture(&mut self) {
-        self.checkpointed_vnodes.fill(false);
+        self.full_vnode_capture_required = true;
     }
 }
 
@@ -3065,6 +3151,7 @@ mod tests {
         )
         .unwrap();
         op.vnode_states[1] = Some(Box::new(retained));
+        op.add_resident_vnode(1);
 
         let mut routed = BTreeMap::new();
         routed.insert(0, [vec![left_batch(&["ok"], &[100], &[1.0])], vec![]]);
@@ -3105,6 +3192,7 @@ mod tests {
             .unwrap();
         }
         op.vnode_states[0] = Some(Box::new(retained));
+        op.add_resident_vnode(0);
 
         // Force compaction to fail after the sweep has already removed old index entries.
         op.config.left_keys = vec!["missing".to_string()];
@@ -3148,9 +3236,11 @@ mod tests {
             .next()
             .and_then(|captured| captured.state)
             .expect("the first vnode capture is complete");
-        assert!(op.checkpoint_vnodes(&[0], 1, u64::MAX).unwrap().unwrap()[0]
-            .state
-            .is_none());
+        assert!(op
+            .checkpoint_vnodes(&[0], 1, u64::MAX)
+            .unwrap()
+            .unwrap()
+            .is_empty());
         let state = materialize_capture(state).unwrap();
 
         let mut op2 = IntervalJoinOperator::new("test_interval", test_config(), None, ctx);
@@ -3169,6 +3259,64 @@ mod tests {
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn vnode_capture_is_full_then_sparse_until_forced() {
+        let vnode_count = 4_u32;
+        let required = [0, 1, 2, 3];
+        let mut op = IntervalJoinOperator::new_with_key_groups(
+            "sparse_interval",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+            KeyGroupCount::try_from(4_u16).unwrap(),
+        );
+
+        let baseline = op
+            .checkpoint_vnodes(&required, vnode_count, u64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            baseline.iter().map(|frame| frame.vnode).collect::<Vec<_>>(),
+            required
+        );
+        assert!(baseline.iter().all(|frame| frame.state.is_some()));
+        drop(baseline);
+
+        assert!(op
+            .checkpoint_vnodes(&required, vnode_count, u64::MAX)
+            .unwrap()
+            .unwrap()
+            .is_empty());
+
+        let vnode = 2;
+        let key = key_for_vnode(vnode, vnode_count);
+        op.process(
+            &[vec![left_batch(&[key.as_str()], &[100], &[1.0])], vec![]],
+            &[0, 0],
+        )
+        .await
+        .unwrap();
+        let dirty = op
+            .checkpoint_vnodes(&required, vnode_count, u64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].vnode, vnode);
+        assert!(dirty[0].state.is_some());
+        drop(dirty);
+
+        op.force_full_vnode_capture();
+        let forced = op
+            .checkpoint_vnodes(&required, vnode_count, u64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            forced.iter().map(|frame| frame.vnode).collect::<Vec<_>>(),
+            required
+        );
+        assert!(forced.iter().all(|frame| frame.state.is_some()));
     }
 
     #[tokio::test]

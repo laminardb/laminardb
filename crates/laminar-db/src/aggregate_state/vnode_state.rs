@@ -13,14 +13,12 @@ use crate::error::DbError;
 /// Complete mutable working set owned by one aggregate vnode.
 ///
 /// The box containing this value is the unit of rebalance publication. Keeping logical state,
-/// changelog state, and checkpoint bookkeeping under the same owner prevents a vnode transition
-/// from publishing only part of a group's state.
+/// changelog state, and accounting under the same owner prevents a vnode transition from
+/// publishing only part of a group's state.
 pub(super) struct AggregateVnodeState {
     pub(super) groups: FxHashMap<arrow::row::OwnedRow, GroupEntry>,
     pub(super) last_emitted: FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
     pub(super) emit_dirty_keys: FxHashSet<arrow::row::OwnedRow>,
-    pub(super) checkpoint_dirty_keys: FxHashSet<arrow::row::OwnedRow>,
-    pub(super) last_emitted_dirty_keys: FxHashSet<arrow::row::OwnedRow>,
     usage: AggregateStateUsage,
 }
 
@@ -38,8 +36,6 @@ impl Default for AggregateVnodeState {
             groups: FxHashMap::default(),
             last_emitted: FxHashMap::default(),
             emit_dirty_keys: FxHashSet::default(),
-            checkpoint_dirty_keys: FxHashSet::default(),
-            last_emitted_dirty_keys: FxHashSet::default(),
             usage: vnode_inline_usage::<AggregateVnodeState>(1),
         }
     }
@@ -65,8 +61,6 @@ impl AggregateVnodeState {
             self.last_emitted.capacity(), self.last_emitted.len()
         ))
         .saturating_add(Self::hash_set_spare_usage(&self.emit_dirty_keys))
-        .saturating_add(Self::hash_set_spare_usage(&self.checkpoint_dirty_keys))
-        .saturating_add(Self::hash_set_spare_usage(&self.last_emitted_dirty_keys))
     }
 
     pub(super) fn reconcile_collection_spare_usage(&mut self, previous: AggregateStateUsage) {
@@ -136,50 +130,6 @@ impl AggregateVnodeState {
         if self.emit_dirty_keys.insert(key) {
             self.usage = self.usage.saturating_add(usage);
         }
-        self.reconcile_collection_spare_usage(previous_spare);
-    }
-
-    pub(super) fn insert_checkpoint_dirty_key(&mut self, key: arrow::row::OwnedRow) {
-        let previous_spare = self.collection_spare_usage();
-        let usage = Self::dirty_key_usage(&key);
-        if self.checkpoint_dirty_keys.insert(key) {
-            self.usage = self.usage.saturating_add(usage);
-        }
-        self.reconcile_collection_spare_usage(previous_spare);
-    }
-
-    pub(super) fn insert_last_emitted_dirty_key(&mut self, key: arrow::row::OwnedRow) {
-        let previous_spare = self.collection_spare_usage();
-        let usage = Self::dirty_key_usage(&key);
-        if self.last_emitted_dirty_keys.insert(key) {
-            self.usage = self.usage.saturating_add(usage);
-        }
-        self.reconcile_collection_spare_usage(previous_spare);
-    }
-
-    pub(super) fn clear_checkpoint_dirty_keys(&mut self) {
-        let previous_spare = self.collection_spare_usage();
-        let released = self
-            .checkpoint_dirty_keys
-            .iter()
-            .fold(AggregateStateUsage::default(), |usage, key| {
-                usage.saturating_add(Self::dirty_key_usage(key))
-            });
-        self.checkpoint_dirty_keys.clear();
-        self.usage = self.usage.saturating_sub(released);
-        self.reconcile_collection_spare_usage(previous_spare);
-    }
-
-    pub(super) fn clear_last_emitted_dirty_keys(&mut self) {
-        let previous_spare = self.collection_spare_usage();
-        let released = self
-            .last_emitted_dirty_keys
-            .iter()
-            .fold(AggregateStateUsage::default(), |usage, key| {
-                usage.saturating_add(Self::dirty_key_usage(key))
-            });
-        self.last_emitted_dirty_keys.clear();
-        self.usage = self.usage.saturating_sub(released);
         self.reconcile_collection_spare_usage(previous_spare);
     }
 
@@ -258,14 +208,8 @@ impl AggregateVnodeState {
         for (key, values) in &self.last_emitted {
             usage = usage.saturating_add(Self::emitted_usage(key, values));
         }
-        for keys in [
-            &self.emit_dirty_keys,
-            &self.checkpoint_dirty_keys,
-            &self.last_emitted_dirty_keys,
-        ] {
-            for key in keys {
-                usage = usage.saturating_add(Self::dirty_key_usage(key));
-            }
+        for key in &self.emit_dirty_keys {
+            usage = usage.saturating_add(Self::dirty_key_usage(key));
         }
         usage
     }

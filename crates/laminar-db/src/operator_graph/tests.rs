@@ -3543,7 +3543,7 @@ async fn checkpoint_capture_guard_excludes_assignment_publication() {
 
 #[cfg(feature = "cluster")]
 #[test]
-fn managed_vnode_capture_requires_the_exact_owned_roster() {
+fn managed_vnode_capture_accepts_sparse_owned_roster_and_rejects_invalid_entries() {
     struct InexactCapture(Vec<u32>);
 
     #[async_trait]
@@ -3582,11 +3582,18 @@ fn managed_vnode_capture_requires_the_exact_owned_roster() {
         }
     }
 
+    let mut graph = test_graph();
+    graph.set_test_vnode_count(2);
+    graph.push_test_node("managed", Box::new(InexactCapture(vec![0])));
+    let sparse = graph.capture_state(u64::MAX).unwrap();
+    assert_eq!(sparse.vnodes.len(), 1);
+    assert_eq!(sparse.vnodes[0].1.vnode, 0);
+
     for (captured, expected_message) in [
-        (vec![0], "captured vnode roster [0]; expected [0, 1]"),
+        (vec![0, 0], "captured invalid sparse vnode roster [0, 0]"),
         (
             vec![0, 1, 2],
-            "captured vnode roster [0, 1, 2]; expected [0, 1]",
+            "captured invalid sparse vnode roster [0, 1, 2]",
         ),
     ] {
         let mut graph = test_graph();
@@ -3595,7 +3602,7 @@ fn managed_vnode_capture_requires_the_exact_owned_roster() {
 
         let error = graph
             .capture_state(u64::MAX)
-            .expect_err("an inexact managed capture roster must fail closed");
+            .expect_err("an invalid sparse managed capture roster must fail closed");
 
         assert!(error.to_string().contains(expected_message), "{error}");
     }
@@ -3651,8 +3658,8 @@ fn managed_vnode_capture_enforces_the_cumulative_graph_budget() {
         "budgeted",
         Box::new(OversizedCapture(Arc::clone(&observed_budget))),
     );
-    let metadata_bytes = GRAPH_CHECKPOINT_CAPTURE_OVERHEAD
-        + 2 * (GRAPH_CHECKPOINT_ENTRY_OVERHEAD + u64::try_from("budgeted".len()).unwrap());
+    let entry_bytes = GRAPH_CHECKPOINT_ENTRY_OVERHEAD + u64::try_from("budgeted".len()).unwrap();
+    let metadata_bytes = GRAPH_CHECKPOINT_CAPTURE_OVERHEAD + 3 * entry_bytes;
 
     let error = graph
         .capture_state(metadata_bytes + 5)
@@ -3660,7 +3667,7 @@ fn managed_vnode_capture_enforces_the_cumulative_graph_budget() {
 
     assert_eq!(
         observed_budget.load(std::sync::atomic::Ordering::Relaxed),
-        5
+        2 * entry_bytes + 5
     );
     assert!(
         error.to_string().contains("vnode 1 capture exceeded"),

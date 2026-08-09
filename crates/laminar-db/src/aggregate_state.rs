@@ -722,7 +722,9 @@ pub(crate) struct IncrementalAggState {
     max_groups: usize,
     emit_changelog: bool,
     weight_col_idx: Option<usize>,
-    checkpointed_vnodes: Box<[bool]>,
+    checkpoint_dirty_vnodes: Box<[bool]>,
+    checkpoint_dirty_vnode_roster: Vec<u32>,
+    full_vnode_capture_required: bool,
 }
 
 #[cfg(test)]
@@ -733,10 +735,8 @@ pub(crate) struct AggregateWorkingSetSnapshot {
     pub(crate) group_input_weights: std::collections::BTreeMap<Vec<u8>, i64>,
     pub(crate) last_emitted: std::collections::BTreeMap<Vec<u8>, Vec<ScalarValue>>,
     pub(crate) emit_dirty_keys: std::collections::BTreeSet<Vec<u8>>,
-    pub(crate) checkpoint_dirty_keys:
-        std::collections::BTreeMap<u32, std::collections::BTreeSet<Vec<u8>>>,
-    pub(crate) last_emitted_dirty_keys:
-        std::collections::BTreeMap<u32, std::collections::BTreeSet<Vec<u8>>>,
+    pub(crate) checkpoint_dirty_vnodes: std::collections::BTreeSet<u32>,
+    pub(crate) full_vnode_capture_required: bool,
 }
 
 impl IncrementalAggState {
@@ -857,10 +857,10 @@ impl IncrementalAggState {
             group_input_weights: std::collections::BTreeMap::new(),
             last_emitted: std::collections::BTreeMap::new(),
             emit_dirty_keys: std::collections::BTreeSet::new(),
-            checkpoint_dirty_keys: std::collections::BTreeMap::new(),
-            last_emitted_dirty_keys: std::collections::BTreeMap::new(),
+            checkpoint_dirty_vnodes: self.checkpoint_dirty_vnode_roster.iter().copied().collect(),
+            full_vnode_capture_required: self.full_vnode_capture_required,
         };
-        for (vnode, state) in self.vnode_states.iter() {
+        for (_, state) in self.vnode_states.iter() {
             snapshot.group_timestamps.extend(
                 state
                     .groups
@@ -885,26 +885,6 @@ impl IncrementalAggState {
                     .iter()
                     .map(|key| key.as_ref().to_vec()),
             );
-            if !state.checkpoint_dirty_keys.is_empty() {
-                snapshot.checkpoint_dirty_keys.insert(
-                    vnode,
-                    state
-                        .checkpoint_dirty_keys
-                        .iter()
-                        .map(|key| key.as_ref().to_vec())
-                        .collect(),
-                );
-            }
-            if !state.last_emitted_dirty_keys.is_empty() {
-                snapshot.last_emitted_dirty_keys.insert(
-                    vnode,
-                    state
-                        .last_emitted_dirty_keys
-                        .iter()
-                        .map(|key| key.as_ref().to_vec())
-                        .collect(),
-                );
-            }
         }
         snapshot
     }
@@ -1328,8 +1308,16 @@ impl IncrementalAggState {
                 .map_err(|e| DbError::Pipeline(format!("row converter init: {e}")))?,
         );
         let vnode_states = AggregateVnodeSlots::try_new(key_group_count)?;
-        let checkpointed_vnodes =
-            vec![false; usize::from(key_group_count.get())].into_boxed_slice();
+        let vnode_count = usize::from(key_group_count.get());
+        let checkpoint_dirty_vnodes = vec![false; vnode_count].into_boxed_slice();
+        let mut checkpoint_dirty_vnode_roster = Vec::new();
+        checkpoint_dirty_vnode_roster
+            .try_reserve_exact(vnode_count)
+            .map_err(|error| {
+                DbError::Pipeline(format!(
+                    "aggregate dirty-vnode roster could not reserve {vnode_count} entries: {error}"
+                ))
+            })?;
 
         Ok(Some(Self {
             query_sql: sql.to_string(),
@@ -1349,7 +1337,9 @@ impl IncrementalAggState {
             max_groups: 1_000_000,
             emit_changelog,
             weight_col_idx,
-            checkpointed_vnodes,
+            checkpoint_dirty_vnodes,
+            checkpoint_dirty_vnode_roster,
+            full_vnode_capture_required: true,
         }))
     }
 
@@ -1400,6 +1390,40 @@ impl IncrementalAggState {
         Ok(self.routing_vnode_count())
     }
 
+    #[inline]
+    fn mark_checkpoint_vnode_dirty_parts(
+        dirty_vnodes: &mut [bool],
+        dirty_vnode_roster: &mut Vec<u32>,
+        vnode: u32,
+    ) {
+        let dirty = &mut dirty_vnodes[vnode as usize];
+        if !*dirty {
+            *dirty = true;
+            debug_assert!(dirty_vnode_roster.len() < dirty_vnode_roster.capacity());
+            dirty_vnode_roster.push(vnode);
+        }
+    }
+
+    #[inline]
+    fn mark_checkpoint_vnode_dirty(&mut self, vnode: u32) {
+        Self::mark_checkpoint_vnode_dirty_parts(
+            &mut self.checkpoint_dirty_vnodes,
+            &mut self.checkpoint_dirty_vnode_roster,
+            vnode,
+        );
+    }
+
+    fn clear_checkpoint_dirty_vnodes(&mut self) {
+        for &vnode in &self.checkpoint_dirty_vnode_roster {
+            self.checkpoint_dirty_vnodes[vnode as usize] = false;
+        }
+        self.checkpoint_dirty_vnode_roster.clear();
+    }
+
+    fn require_full_vnode_capture(&mut self) {
+        self.full_vnode_capture_required = true;
+    }
+
     /// Commit a successfully built changelog insertion to the dedup map.
     fn commit_last_emitted(
         &mut self,
@@ -1407,29 +1431,29 @@ impl IncrementalAggState {
         key: arrow::row::OwnedRow,
         values: Vec<ScalarValue>,
     ) {
-        let state = self
-            .vnode_states
+        self.vnode_states
             .get_mut(vnode)
-            .expect("emitted aggregate group must remain in its vnode slot");
-        state.insert_last_emitted_dirty_key(key.clone());
-        state.insert_last_emitted(key, values);
+            .expect("emitted aggregate group must remain in its vnode slot")
+            .insert_last_emitted(key, values);
+        self.mark_checkpoint_vnode_dirty(vnode);
     }
 
     fn commit_deleted_group(&mut self, vnode: u32, key: &arrow::row::OwnedRow) {
-        let removed = {
+        let (removed_group, removed_last_emitted) = {
             let state = self
                 .vnode_states
                 .get_mut(vnode)
                 .expect("deleted aggregate group must retain its vnode slot");
-            state.insert_checkpoint_dirty_key(key.clone());
-            if state.last_emitted.contains_key(key) {
-                state.insert_last_emitted_dirty_key(key.clone());
-                state.remove_last_emitted(key);
-            }
-            state.remove_group(key).is_some()
+            (
+                state.remove_group(key).is_some(),
+                state.remove_last_emitted(key).is_some(),
+            )
         };
-        if removed {
+        if removed_group {
             self.vnode_states.decrement_resident_groups();
+        }
+        if removed_group || removed_last_emitted {
+            self.mark_checkpoint_vnode_dirty(vnode);
         }
     }
 
@@ -1550,17 +1574,21 @@ impl IncrementalAggState {
                 entry.refresh_accumulator_usage();
 
                 let usage = AggregateVnodeState::group_usage(&owned_key, &entry);
-                let dirty_key = owned_key.clone();
+                let emit_key = emit_changelog.then(|| owned_key.clone());
                 let vnode_state = self.vnode_states.get_or_insert(vnode);
                 let previous_spare = vnode_state.collection_spare_usage();
                 debug_assert!(vnode_state.groups.insert(owned_key, entry).is_none());
                 vnode_state.add_usage(usage);
                 vnode_state.reconcile_collection_spare_usage(previous_spare);
-                if emit_changelog {
-                    vnode_state.insert_emit_dirty_key(dirty_key.clone());
+                if let Some(emit_key) = emit_key {
+                    vnode_state.insert_emit_dirty_key(emit_key);
                 }
-                vnode_state.insert_checkpoint_dirty_key(dirty_key);
                 self.vnode_states.increment_resident_groups();
+                Self::mark_checkpoint_vnode_dirty_parts(
+                    &mut self.checkpoint_dirty_vnodes,
+                    &mut self.checkpoint_dirty_vnode_roster,
+                    vnode,
+                );
                 continue;
             }
 
@@ -1588,13 +1616,15 @@ impl IncrementalAggState {
                 (update_result, previous, current)
             };
             vnode_state.reconcile_accumulator_usage(previous_usage, current_usage);
-            if update_result.is_ok() {
-                if emit_changelog {
-                    vnode_state.insert_emit_dirty_key(owned_key.clone());
-                }
-                vnode_state.insert_checkpoint_dirty_key(owned_key);
+            if update_result.is_ok() && emit_changelog {
+                vnode_state.insert_emit_dirty_key(owned_key.clone());
             }
             update_result?;
+            Self::mark_checkpoint_vnode_dirty_parts(
+                &mut self.checkpoint_dirty_vnodes,
+                &mut self.checkpoint_dirty_vnode_roster,
+                vnode,
+            );
         }
         Ok(())
     }
@@ -1645,11 +1675,11 @@ impl IncrementalAggState {
                 .is_none());
             vnode_state.add_usage(usage);
             vnode_state.reconcile_collection_spare_usage(previous_spare);
-            vnode_state.insert_checkpoint_dirty_key(empty_key.clone());
             if self.emit_changelog {
                 vnode_state.insert_emit_dirty_key(empty_key);
             }
             self.vnode_states.increment_resident_groups();
+            self.mark_checkpoint_vnode_dirty(0);
             return Ok(());
         }
 
@@ -1677,13 +1707,12 @@ impl IncrementalAggState {
             (update_result, previous, current)
         };
         vnode_state.reconcile_accumulator_usage(previous_usage, current_usage);
-        if update_result.is_ok() {
-            vnode_state.insert_checkpoint_dirty_key(empty_key.clone());
-            if self.emit_changelog {
-                vnode_state.insert_emit_dirty_key(empty_key);
-            }
+        if update_result.is_ok() && self.emit_changelog {
+            vnode_state.insert_emit_dirty_key(empty_key);
         }
-        update_result
+        update_result?;
+        self.mark_checkpoint_vnode_dirty(0);
+        Ok(())
     }
 
     fn validated_input_weights(
@@ -2129,7 +2158,15 @@ impl IncrementalAggState {
     /// overhead, transient scratch, and RSS remain outside this deterministic envelope. Overflow is
     /// clamped because metrics publication must not fault processing.
     pub(crate) fn accounted_state_bytes(&self) -> usize {
-        let usage = self.vnode_states.accounted_usage();
+        let usage = self
+            .vnode_states
+            .accounted_usage()
+            .saturating_add(accounting::topology_element_usage::<bool>(
+                self.checkpoint_dirty_vnodes.len(),
+            ))
+            .saturating_add(accounting::topology_element_usage::<u32>(
+                self.checkpoint_dirty_vnode_roster.capacity(),
+            ));
         if usage.is_saturated() {
             usize::MAX
         } else {
@@ -2235,103 +2272,111 @@ impl IncrementalAggState {
         Ok(capture)
     }
 
-    /// Capture full images for dirty vnodes in the exact requested ownership order.
-    /// `None` means the prior committed frame remains authoritative.
+    /// Capture full images for the selected vnodes in ascending vnode order.
     pub(crate) fn capture_checkpoint_vnodes(
         &mut self,
         required_vnodes: &[u32],
         vnode_count: u32,
         max_capture_bytes: u64,
-    ) -> Result<Vec<Option<AggregateVnodeCheckpointCapture>>, DbError> {
+    ) -> Result<Vec<(u32, AggregateVnodeCheckpointCapture)>, DbError> {
         let vnode_count = self.validate_vnode_count(vnode_count)?;
-        if required_vnodes.windows(2).any(|pair| pair[0] >= pair[1])
-            || required_vnodes
+        let full_capture = self.full_vnode_capture_required;
+        if full_capture {
+            if required_vnodes.windows(2).any(|pair| pair[0] >= pair[1])
+                || required_vnodes
+                    .iter()
+                    .any(|vnode| *vnode >= vnode_count.get())
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "aggregate received a non-canonical vnode roster {required_vnodes:?} for vnode_count {}",
+                    vnode_count.get()
+                )));
+            }
+            if let Some(unowned) = self
+                .vnode_states
+                .active_vnodes()
                 .iter()
-                .any(|vnode| *vnode >= vnode_count.get())
-        {
-            return Err(DbError::Checkpoint(format!(
-                "aggregate received a non-canonical vnode roster {required_vnodes:?} for vnode_count {}",
-                vnode_count.get()
-            )));
-        }
-        if let Some(unowned) = self
-            .vnode_states
-            .active_vnodes()
-            .iter()
-            .find(|vnode| required_vnodes.binary_search(vnode).is_err())
-        {
-            return Err(DbError::Checkpoint(format!(
-                "aggregate retained state for unowned vnode {unowned}"
-            )));
+                .find(|vnode| required_vnodes.binary_search(vnode).is_err())
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "aggregate retained state for unowned vnode {unowned}"
+                )));
+            }
+        } else {
+            // The graph validates every ownership roster; avoid rescanning it on steady cuts.
+            debug_assert!(required_vnodes.windows(2).all(|pair| pair[0] < pair[1]));
+            debug_assert!(required_vnodes
+                .iter()
+                .all(|vnode| *vnode < vnode_count.get()));
         }
 
-        let fingerprint = self.query_fingerprint();
-        let capture_plan = required_vnodes
-            .iter()
-            .map(|&vnode| {
-                !self.checkpointed_vnodes[vnode as usize]
-                    || self.vnode_states.get(vnode).is_some_and(|state| {
-                        !state.checkpoint_dirty_keys.is_empty()
-                            || !state.last_emitted_dirty_keys.is_empty()
-                    })
-            })
-            .collect::<Vec<_>>();
-        let mut out = Vec::with_capacity(required_vnodes.len());
+        if !full_capture {
+            self.checkpoint_dirty_vnode_roster.sort_unstable();
+            if let Some(unowned) = self
+                .checkpoint_dirty_vnode_roster
+                .iter()
+                .find(|vnode| required_vnodes.binary_search(vnode).is_err())
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "aggregate retained dirty state for unowned vnode {unowned}"
+                )));
+            }
+        }
+        let capture_vnodes: &[u32] = if full_capture {
+            required_vnodes
+        } else {
+            &self.checkpoint_dirty_vnode_roster
+        };
+        let capture_vnode_count = capture_vnodes.len();
+        if capture_vnode_count == 0 {
+            self.clear_checkpoint_dirty_vnodes();
+            self.full_vnode_capture_required = false;
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        out.try_reserve_exact(capture_vnode_count)
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "aggregate checkpoint capture roster reservation failed: {error}"
+                ))
+            })?;
         let mut remaining_capture_bytes = max_capture_bytes;
+        let fingerprint = self.query_fingerprint();
         let group_types = Arc::<[DataType]>::from(self.group_types.clone());
         let row_converter = Arc::clone(&self.row_converter);
-        for (&vnode, capture) in required_vnodes.iter().zip(&capture_plan) {
-            let captured = if *capture {
-                if let Some(state) = self.vnode_states.get(vnode) {
-                    let usage = state.usage();
-                    let estimated_bytes = if usage.is_saturated() {
-                        u64::MAX
-                    } else {
-                        u64::try_from(usage.total_bytes()).unwrap_or(u64::MAX)
-                    };
-                    if estimated_bytes > remaining_capture_bytes {
-                        return Err(DbError::Checkpoint(format!(
-                            "aggregate vnode {vnode} state exceeds the remaining capture budget"
-                        )));
-                    }
+        for &vnode in capture_vnodes {
+            if let Some(state) = self.vnode_states.get(vnode) {
+                let usage = state.usage();
+                let estimated_bytes = if usage.is_saturated() {
+                    u64::MAX
+                } else {
+                    u64::try_from(usage.total_bytes()).unwrap_or(u64::MAX)
+                };
+                if estimated_bytes > remaining_capture_bytes {
+                    return Err(DbError::Checkpoint(format!(
+                        "aggregate vnode {vnode} state exceeds the remaining capture budget"
+                    )));
                 }
-                let captured = self.capture_full_vnode(
-                    vnode,
-                    fingerprint,
-                    Arc::clone(&group_types),
-                    Arc::clone(&row_converter),
-                )?;
-                remaining_capture_bytes = remaining_capture_bytes
-                    .checked_sub(captured.retained_bytes())
-                    .ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "aggregate vnode {vnode} capture exceeded the remaining capture budget"
-                        ))
-                    })?;
-                Some(captured)
-            } else {
-                None
-            };
-            out.push(captured);
+            }
+            let captured = self.capture_full_vnode(
+                vnode,
+                fingerprint,
+                Arc::clone(&group_types),
+                Arc::clone(&row_converter),
+            )?;
+            remaining_capture_bytes = remaining_capture_bytes
+                .checked_sub(captured.retained_bytes())
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "aggregate vnode {vnode} capture exceeded the remaining capture budget"
+                    ))
+                })?;
+            out.push((vnode, captured));
         }
 
-        for (vnode, checkpointed) in self.checkpointed_vnodes.iter_mut().enumerate() {
-            let vnode = u32::try_from(vnode).map_err(|_| {
-                DbError::Checkpoint("aggregate vnode index exceeds the u32 domain".into())
-            })?;
-            if required_vnodes.binary_search(&vnode).is_err() {
-                *checkpointed = false;
-            }
-        }
-        for (&vnode, capture) in required_vnodes.iter().zip(capture_plan) {
-            self.checkpointed_vnodes[vnode as usize] = true;
-            if capture {
-                if let Some(state) = self.vnode_states.get_mut(vnode) {
-                    state.clear_checkpoint_dirty_keys();
-                    state.clear_last_emitted_dirty_keys();
-                }
-            }
-        }
+        self.clear_checkpoint_dirty_vnodes();
+        self.full_vnode_capture_required = false;
         Ok(out)
     }
 
@@ -2340,15 +2385,11 @@ impl IncrementalAggState {
         &mut self,
         required_vnodes: &[u32],
         vnode_count: u32,
-    ) -> Result<Vec<Option<AggStateCheckpoint>>, DbError> {
+    ) -> Result<Vec<(u32, AggStateCheckpoint)>, DbError> {
         let captures = self.capture_checkpoint_vnodes(required_vnodes, vnode_count, u64::MAX)?;
         let encoded = captures
             .into_iter()
-            .map(|capture| {
-                capture
-                    .map(|capture| capture.encode(usize::MAX))
-                    .transpose()
-            })
+            .map(|(vnode, capture)| capture.encode(usize::MAX).map(|state| (vnode, state)))
             .collect::<Result<Vec<_>, _>>();
         if encoded.is_err() {
             self.force_full_vnode_capture();
@@ -2357,7 +2398,7 @@ impl IncrementalAggState {
     }
 
     pub(crate) fn force_full_vnode_capture(&mut self) {
-        self.checkpointed_vnodes.fill(false);
+        self.require_full_vnode_capture();
     }
 
     fn decode_recovery_mutation(
@@ -2630,12 +2671,12 @@ impl IncrementalAggState {
             // transition then owns every old slot until post-fence cleanup without allocating or
             // deallocating during publication.
             *replacement = retired;
-            self.checkpointed_vnodes[*vnode as usize] = false;
         }
         self.vnode_states
             .swap_active_vnodes(&mut prepared.final_active_vnodes);
         self.vnode_states
             .set_resident_group_count(prepared.final_group_count);
+        self.require_full_vnode_capture();
 
         RetiredAggVnodeTransition {
             retired_state: prepared,

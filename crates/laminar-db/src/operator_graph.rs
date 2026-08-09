@@ -642,6 +642,7 @@ pub(crate) struct CapturedWholeState {
 pub(crate) struct GraphStateCapture {
     pub(crate) whole: Vec<CapturedWholeState>,
     pub(crate) vnodes: Vec<(String, CapturedVnodeState)>,
+    pub(crate) managed_vnode_operators: Vec<(String, OperatorStateClass)>,
     retained_bytes: u64,
 }
 
@@ -895,6 +896,22 @@ pub(crate) enum ShuffleAlignmentOutcome {
     ScopeCancelledBeforeStaging,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OwnedVnodeRosterCacheKey {
+    Local {
+        vnode_count: u32,
+    },
+    #[cfg(feature = "cluster")]
+    Cluster {
+        assignment_version: u64,
+        self_id: laminar_core::state::NodeId,
+    },
+    #[cfg(all(test, feature = "cluster"))]
+    Test {
+        vnode_count: u32,
+    },
+}
+
 #[allow(clippy::struct_excessive_bools)] // distinct independent flags, not a state enum
 pub(crate) struct OperatorGraph {
     nodes: Vec<GraphNode>,
@@ -946,6 +963,7 @@ pub(crate) struct OperatorGraph {
     // without invoking Prometheus inside the vnode publication section. Indices mirror `nodes`.
     managed_state_accounting_peaks: Vec<ManagedStateAccountingSnapshot>,
     key_group_count: KeyGroupCount,
+    owned_vnodes_cache: Option<(OwnedVnodeRosterCacheKey, Arc<[u32]>)>,
     ctx: SessionContext,
     prom: Option<Arc<EngineMetrics>>,
     lookup_registry: Option<Arc<laminar_sql::datafusion::LookupTableRegistry>>,
@@ -1027,6 +1045,7 @@ impl OperatorGraph {
             temporal_join_idle_history_retention: None,
             managed_state_accounting_peaks: Vec::new(),
             key_group_count: DEFAULT_KEY_GROUP_COUNT,
+            owned_vnodes_cache: None,
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
             #[cfg(feature = "cluster")]
@@ -1294,6 +1313,7 @@ impl OperatorGraph {
             return;
         }
         self.key_group_count = key_group_count;
+        self.owned_vnodes_cache = None;
     }
 
     /// Install the cluster shuffle config for streaming aggregates.
@@ -1311,6 +1331,7 @@ impl OperatorGraph {
             return;
         }
         self.cluster_shuffle = Some(config);
+        self.owned_vnodes_cache = None;
     }
 
     /// Cluster shuffle config, if installed; reused by the pipeline callback for subscriptions.
@@ -1324,16 +1345,17 @@ impl OperatorGraph {
     fn required_vnodes_for_capability(
         capability: OperatorCapability,
         owned_vnodes: &[u32],
-    ) -> Result<Vec<u32>, DbError> {
+    ) -> Result<&[u32], DbError> {
         if capability.managed_state.is_none() {
-            return Ok(Vec::new());
+            return Ok(&[]);
         }
         match capability.state_class {
-            OperatorStateClass::GlobalSingleton => Ok(owned_vnodes
-                .binary_search(&0)
-                .ok()
-                .map_or_else(Vec::new, |_| vec![0])),
-            OperatorStateClass::VnodeKeyed => Ok(owned_vnodes.to_vec()),
+            OperatorStateClass::GlobalSingleton => Ok(if owned_vnodes.first() == Some(&0) {
+                &owned_vnodes[..1]
+            } else {
+                &[]
+            }),
+            OperatorStateClass::VnodeKeyed => Ok(owned_vnodes),
             state_class => Err(DbError::Checkpoint(format!(
                 "managed-state contract {:?} has unsupported placement {state_class:?}",
                 capability.managed_state
@@ -1341,13 +1363,13 @@ impl OperatorGraph {
         }
     }
 
-    fn owned_vnodes_for_managed_state(&self) -> Result<Vec<u32>, DbError> {
+    fn owned_vnodes_for_managed_state(&mut self) -> Result<Option<Arc<[u32]>>, DbError> {
         let has_participants = self
             .nodes
             .iter()
             .any(|node| !node.removed && node.capability.managed_state.is_some());
         if !has_participants {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         #[cfg(feature = "cluster")]
         if let Some(config) = &self.cluster_shuffle {
@@ -1359,19 +1381,50 @@ impl OperatorGraph {
                     "managed-state capture vnode count does not match the active assignment".into(),
                 ));
             }
-            return Ok(assignment
+            let cache_key = OwnedVnodeRosterCacheKey::Cluster {
+                assignment_version: assignment.version(),
+                self_id: config.self_id,
+            };
+            if let Some((cached_key, cached)) = &self.owned_vnodes_cache {
+                if *cached_key == cache_key {
+                    return Ok(Some(Arc::clone(cached)));
+                }
+            }
+            let owned_vnodes = assignment
                 .owners()
                 .iter()
                 .enumerate()
                 .filter(|(_, owner)| **owner == config.self_id)
                 .map(|(vnode, _)| u32::try_from(vnode).expect("vnode count is represented by u32"))
-                .collect());
+                .collect::<Vec<_>>();
+            let owned_vnodes = Arc::<[u32]>::from(owned_vnodes);
+            self.owned_vnodes_cache = Some((cache_key, Arc::clone(&owned_vnodes)));
+            return Ok(Some(owned_vnodes));
         }
         #[cfg(all(test, feature = "cluster"))]
         if let Some(vnodes) = &self.test_owned_vnodes {
-            return Ok(vnodes.clone());
+            let cache_key = OwnedVnodeRosterCacheKey::Test {
+                vnode_count: u32::from(self.key_group_count),
+            };
+            if let Some((cached_key, cached)) = &self.owned_vnodes_cache {
+                if *cached_key == cache_key {
+                    return Ok(Some(Arc::clone(cached)));
+                }
+            }
+            let owned_vnodes = Arc::<[u32]>::from(vnodes.clone());
+            self.owned_vnodes_cache = Some((cache_key, Arc::clone(&owned_vnodes)));
+            return Ok(Some(owned_vnodes));
         }
-        Ok((0..u32::from(self.key_group_count)).collect())
+        let vnode_count = u32::from(self.key_group_count);
+        let cache_key = OwnedVnodeRosterCacheKey::Local { vnode_count };
+        if let Some((cached_key, cached)) = &self.owned_vnodes_cache {
+            if *cached_key == cache_key {
+                return Ok(Some(Arc::clone(cached)));
+            }
+        }
+        let owned_vnodes = Arc::<[u32]>::from((0..vnode_count).collect::<Vec<_>>());
+        self.owned_vnodes_cache = Some((cache_key, Arc::clone(&owned_vnodes)));
+        Ok(Some(owned_vnodes))
     }
 
     /// Bind the graph to the logical pipeline and recovery-state ABI.
@@ -4472,6 +4525,7 @@ impl OperatorGraph {
         self.key_group_count = KeyGroupCount::try_from(vnode_count)
             .expect("test vnode count must fit the checkpoint key-group ABI");
         self.test_owned_vnodes = Some(owned_vnodes);
+        self.owned_vnodes_cache = None;
     }
 
     pub(crate) fn capture_state(
@@ -4492,6 +4546,7 @@ impl OperatorGraph {
 
         let vnode_count = u32::from(self.key_group_count);
         let owned_vnodes = self.owned_vnodes_for_managed_state()?;
+        let owned_vnodes = owned_vnodes.as_deref().unwrap_or(&[]);
         let mut capture = GraphStateCapture::default();
         let mut names = std::collections::BTreeSet::new();
 
@@ -4532,42 +4587,46 @@ impl OperatorGraph {
             if node.capability.managed_state.is_none() {
                 continue;
             }
-            let required = Self::required_vnodes_for_capability(node.capability, &owned_vnodes)?;
+            remaining = remaining.checked_sub(entry_charge).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "operator '{name}' managed-state inventory exceeded the remaining staged-state budget"
+                ))
+            })?;
+            capture
+                .managed_vnode_operators
+                .push((name.clone(), node.capability.state_class));
+            let required = Self::required_vnodes_for_capability(node.capability, owned_vnodes)?;
             if required.is_empty() {
                 continue;
             }
-            let entry_charge = GRAPH_CHECKPOINT_ENTRY_OVERHEAD
-                .checked_add(u64::try_from(name.len()).unwrap_or(u64::MAX))
-                .and_then(|bytes| {
-                    bytes.checked_mul(u64::try_from(required.len()).unwrap_or(u64::MAX))
-                })
-                .ok_or_else(|| {
-                    DbError::Checkpoint("operator vnode capture metadata overflowed u64".into())
-                })?;
-            remaining = remaining.checked_sub(entry_charge).ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "operator '{name}' vnode metadata exceeded the remaining staged-state budget"
-                ))
-            })?;
             let states = node
                 .operator
-                .checkpoint_vnodes(&required, vnode_count, remaining)?
+                .checkpoint_vnodes(required, vnode_count, remaining)?
                 .ok_or_else(|| {
                     DbError::Checkpoint(format!(
                         "managed operator '{name}' did not capture its required vnode state"
                     ))
                 })?;
-            if states.len() != required.len()
+            if states.windows(2).any(|pair| pair[0].vnode >= pair[1].vnode)
                 || states
                     .iter()
-                    .zip(&required)
-                    .any(|(captured, expected)| captured.vnode != *expected)
+                    .any(|captured| required.binary_search(&captured.vnode).is_err())
             {
                 let actual = states.iter().map(|state| state.vnode).collect::<Vec<_>>();
                 return Err(DbError::Checkpoint(format!(
-                    "managed operator '{name}' captured vnode roster {actual:?}; expected {required:?}"
+                    "managed operator '{name}' captured invalid sparse vnode roster {actual:?}; owned roster is {required:?}"
                 )));
             }
+            let vnode_entry_charge = entry_charge
+                .checked_mul(u64::try_from(states.len()).unwrap_or(u64::MAX))
+                .ok_or_else(|| {
+                    DbError::Checkpoint("operator vnode capture metadata overflowed u64".into())
+                })?;
+            remaining = remaining.checked_sub(vnode_entry_charge).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "operator '{name}' vnode metadata exceeded the remaining staged-state budget"
+                ))
+            })?;
             for captured in &states {
                 if let Some(state) = captured.state.as_ref() {
                     remaining = remaining
@@ -4593,6 +4652,9 @@ impl OperatorGraph {
                 .cmp(&right.0)
                 .then_with(|| left.1.vnode.cmp(&right.1.vnode))
         });
+        capture
+            .managed_vnode_operators
+            .sort_unstable_by(|left, right| left.0.cmp(&right.0));
         capture.retained_bytes = max_capture_bytes - remaining;
         Ok(capture)
     }
@@ -4645,6 +4707,7 @@ impl OperatorGraph {
         }
 
         let owned_vnodes = self.owned_vnodes_for_managed_state()?;
+        let owned_vnodes = owned_vnodes.as_deref().unwrap_or(&[]);
         let mut actual_vnodes: FxHashMap<&str, Vec<u32>> = FxHashMap::default();
         for (name, vnode, _) in vnodes {
             let node = self
@@ -4675,7 +4738,7 @@ impl OperatorGraph {
             if node.capability.managed_state.is_none() {
                 continue;
             }
-            let required = Self::required_vnodes_for_capability(node.capability, &owned_vnodes)?;
+            let required = Self::required_vnodes_for_capability(node.capability, owned_vnodes)?;
             let actual = actual_vnodes
                 .get(&*node.name)
                 .map_or(&[][..], Vec::as_slice);

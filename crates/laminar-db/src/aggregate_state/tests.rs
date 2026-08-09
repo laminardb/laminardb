@@ -394,7 +394,7 @@ fn sum_pre_agg_batch(names: &[&str], values: &[f64]) -> RecordBatch {
 
 fn capture_all_vnodes(
     state: &mut IncrementalAggState,
-) -> Result<Vec<Option<AggStateCheckpoint>>, DbError> {
+) -> Result<Vec<(u32, AggStateCheckpoint)>, DbError> {
     state.force_full_vnode_capture();
     let vnode_count = u32::from(state.key_group_count().get());
     state.checkpoint_vnodes(&(0..vnode_count).collect::<Vec<_>>(), vnode_count)
@@ -1561,18 +1561,27 @@ async fn pending_group_deletion_survives_vnode_checkpoint() {
 
     state.process_batch(&mk(vec!["US"], vec![1]), 1000).unwrap();
     let _ = state.emit().unwrap();
+    let vnode = state.active_vnodes_for_test()[0];
+    let vnode_count = u32::from(state.key_group_count().get());
+    assert_eq!(
+        state
+            .checkpoint_vnodes(&[vnode], vnode_count)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(state
+        .checkpoint_vnodes(&[vnode], vnode_count)
+        .unwrap()
+        .is_empty());
 
     state
         .process_batch(&mk(vec!["US"], vec![-1]), 2000)
         .unwrap();
-    let vnode = state.active_vnodes_for_test()[0];
-    let vnode_count = u32::from(state.key_group_count().get());
-    let checkpoint = state
-        .checkpoint_vnodes(&[vnode], vnode_count)
-        .unwrap()
-        .pop()
-        .unwrap()
-        .unwrap();
+    let mut captured = state.checkpoint_vnodes(&[vnode], vnode_count).unwrap();
+    assert_eq!(captured.len(), 1);
+    let (captured_vnode, checkpoint) = captured.pop().unwrap();
+    assert_eq!(captured_vnode, vnode);
 
     let mut restored = try_from_sql_local(&ctx, sql, true).await.unwrap().unwrap();
     restored

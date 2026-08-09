@@ -1260,43 +1260,35 @@ impl GraphOperator for SqlQueryOperator {
         };
         let checkpoints =
             aggregate.capture_checkpoint_vnodes(required_vnodes, vnode_count, max_capture_bytes)?;
-        let mut captured = Vec::with_capacity(required_vnodes.len());
+        let mut captured = Vec::with_capacity(checkpoints.len());
         let empty_frame = Arc::new(std::sync::OnceLock::<bytes::Bytes>::new());
-        for (&vnode, checkpoint) in required_vnodes.iter().zip(checkpoints) {
-            let state = match checkpoint {
-                Some(checkpoint) => {
-                    let retained_bytes = checkpoint.retained_bytes();
-                    let empty_frame = checkpoint.is_empty().then(|| Arc::clone(&empty_frame));
-                    let op_name = Arc::clone(&self.op_name);
-                    Some(StateFrameCapture::deferred(
-                        retained_bytes,
-                        move |max_encoded_bytes| {
-                            if let Some(encoded) =
-                                empty_frame.as_ref().and_then(|frame| frame.get())
-                            {
-                                return Ok(EncodedStateFrame::shared(encoded.clone()));
-                            }
-                            let checkpoint = checkpoint.encode(max_encoded_bytes)?;
-                            let retained_serialization_bytes =
-                                checkpoint.retained_serialization_bytes()?;
-                            let archive_budget = max_encoded_bytes
-                                .checked_sub(retained_serialization_bytes)
-                                .ok_or_else(|| {
-                                    DbError::Checkpoint(format!(
-                                        "aggregate '{op_name}' intermediate checkpoint exhausted its frame budget"
-                                    ))
-                                })?;
-                            let encoded = serialize_agg_cp(&checkpoint, &op_name, archive_budget)?;
-                            if let Some(empty_frame) = empty_frame {
-                                let _ = empty_frame.set(encoded.bytes().clone());
-                            }
-                            Ok(encoded)
-                        },
-                    ))
+        for (vnode, checkpoint) in checkpoints {
+            let retained_bytes = checkpoint.retained_bytes();
+            let empty_frame = checkpoint.is_empty().then(|| Arc::clone(&empty_frame));
+            let op_name = Arc::clone(&self.op_name);
+            let state = StateFrameCapture::deferred(retained_bytes, move |max_encoded_bytes| {
+                if let Some(encoded) = empty_frame.as_ref().and_then(|frame| frame.get()) {
+                    return Ok(EncodedStateFrame::shared(encoded.clone()));
                 }
-                None => None,
-            };
-            captured.push(CapturedVnodeState { vnode, state });
+                let checkpoint = checkpoint.encode(max_encoded_bytes)?;
+                let retained_serialization_bytes = checkpoint.retained_serialization_bytes()?;
+                let archive_budget = max_encoded_bytes
+                    .checked_sub(retained_serialization_bytes)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "aggregate '{op_name}' intermediate checkpoint exhausted its frame budget"
+                        ))
+                    })?;
+                let encoded = serialize_agg_cp(&checkpoint, &op_name, archive_budget)?;
+                if let Some(empty_frame) = empty_frame {
+                    let _ = empty_frame.set(encoded.bytes().clone());
+                }
+                Ok(encoded)
+            });
+            captured.push(CapturedVnodeState {
+                vnode,
+                state: Some(state),
+            });
         }
         Ok(Some(captured))
     }
@@ -1597,6 +1589,7 @@ mod checkpoint_tests {
             .checkpoint_vnodes(&(0..8).collect::<Vec<_>>(), 8, u64::MAX)
             .unwrap()
             .unwrap();
+        assert_eq!(captured.len(), 8);
         assert!(captured.iter().all(|frame| frame.state.is_some()));
     }
 
@@ -1821,13 +1814,13 @@ mod checkpoint_tests {
             .checkpoint_vnodes(&owned, 8, u64::MAX)
             .unwrap()
             .unwrap();
+        assert_eq!(baseline.len(), owned.len());
         assert!(baseline.iter().all(|frame| frame.state.is_some()));
         assert!(donor
             .checkpoint_vnodes(&owned, 8, u64::MAX)
             .unwrap()
             .unwrap()
-            .iter()
-            .all(|frame| frame.state.is_none()));
+            .is_empty());
 
         let mut restored = SqlQueryOperator::new_with_key_groups(
             "sum",
@@ -1850,12 +1843,12 @@ mod checkpoint_tests {
         assert_eq!(aggregate.logical_group_count_for_test(), 2);
 
         donor.force_full_vnode_capture();
-        assert!(donor
+        let forced = donor
             .checkpoint_vnodes(&owned, 8, u64::MAX)
             .unwrap()
-            .unwrap()
-            .iter()
-            .all(|frame| frame.state.is_some()));
+            .unwrap();
+        assert_eq!(forced.len(), owned.len());
+        assert!(forced.iter().all(|frame| frame.state.is_some()));
     }
 
     #[cfg(not(feature = "cluster"))]

@@ -474,6 +474,11 @@ struct OperatorStateCapture {
     serialization_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
+struct EncodedOperatorState {
+    frames: Vec<crate::checkpoint_coordinator::CapturedStateFrame>,
+    managed_vnode_operators: Vec<crate::checkpoint_coordinator::ManagedVnodeOperator>,
+}
+
 fn graph_capture_needs_mutable_guard(graph: &crate::operator_graph::GraphStateCapture) -> bool {
     !graph.whole.is_empty()
         || graph
@@ -487,13 +492,36 @@ impl OperatorStateCapture {
         self,
         max_staged_bytes: u64,
         mut staged_bytes: u64,
-    ) -> Result<Vec<crate::checkpoint_coordinator::CapturedStateFrame>, DbError> {
+    ) -> Result<EncodedOperatorState, DbError> {
         let Self {
             graph,
             materialized_views,
             reference_tables,
             serialization_permit,
         } = self;
+        let managed_vnode_operators = graph
+            .managed_vnode_operators
+            .into_iter()
+            .map(|(operator_id, placement)| {
+                let placement = match placement {
+                    crate::operator::capability::OperatorStateClass::GlobalSingleton => {
+                        crate::checkpoint_coordinator::ManagedVnodePlacement::GlobalSingleton
+                    }
+                    crate::operator::capability::OperatorStateClass::VnodeKeyed => {
+                        crate::checkpoint_coordinator::ManagedVnodePlacement::VnodeKeyed
+                    }
+                    unsupported => {
+                        return Err(DbError::Checkpoint(format!(
+                            "managed operator '{operator_id}' has unsupported placement {unsupported:?}"
+                        )));
+                    }
+                };
+                Ok(crate::checkpoint_coordinator::ManagedVnodeOperator {
+                    operator_id: format!("graph:{operator_id}"),
+                    placement,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut frames = Vec::with_capacity(graph.whole.len() + graph.vnodes.len() + 1);
         for state in graph.whole {
             let encoded = state
@@ -589,7 +617,10 @@ impl OperatorStateCapture {
         // The permit is deliberately owned by the non-abortable worker. If its async waiter times
         // out, another checkpoint cannot capture a second image until this worker actually exits.
         drop(serialization_permit);
-        Ok(frames)
+        Ok(EncodedOperatorState {
+            frames,
+            managed_vnode_operators,
+        })
     }
 }
 
@@ -603,6 +634,7 @@ struct CapturedOperatorState {
 
 struct SerializedOperatorState {
     frames: Vec<crate::checkpoint_coordinator::CapturedStateFrame>,
+    managed_vnode_operators: Vec<crate::checkpoint_coordinator::ManagedVnodeOperator>,
     mutable_capture_guard: Option<MutableCheckpointCaptureGuard>,
 }
 
@@ -632,7 +664,7 @@ impl CapturedOperatorState {
             attempt_deadline.min(tokio::time::Instant::now() + serialization_timeout);
         let worker =
             tokio::task::spawn_blocking(move || image.encode(max_staged_bytes, estimated_bytes));
-        let frames = match tokio::time::timeout_at(serialization_deadline, worker).await {
+        let encoded = match tokio::time::timeout_at(serialization_deadline, worker).await {
             Err(_) => {
                 let error = format!(
                     "[LDB-6017] checkpoint state serialization timed out ({serialization_timeout:?})"
@@ -656,10 +688,11 @@ impl CapturedOperatorState {
                     error,
                 ));
             }
-            Ok(Ok(Ok(states))) => states,
+            Ok(Ok(Ok(encoded))) => encoded,
         };
         Ok(SerializedOperatorState {
-            frames,
+            frames: encoded.frames,
+            managed_vnode_operators: encoded.managed_vnode_operators,
             mutable_capture_guard,
         })
     }
@@ -1488,6 +1521,7 @@ impl ConnectorPipelineCallback {
             }
         };
         tail.request.state_frames = serialized_operator_state.frames;
+        tail.request.managed_vnode_operators = serialized_operator_state.managed_vnode_operators;
         tail.mutable_operator_capture_guard = serialized_operator_state.mutable_capture_guard;
 
         let source_offsets =
@@ -1751,6 +1785,7 @@ impl ConnectorPipelineCallback {
             }
         };
         tail.request.state_frames = serialized_operator_state.frames;
+        tail.request.managed_vnode_operators = serialized_operator_state.managed_vnode_operators;
         tail.mutable_operator_capture_guard = serialized_operator_state.mutable_capture_guard;
 
         let source_offsets = match materialize_source_checkpoints_until(
@@ -3631,6 +3666,7 @@ impl ConnectorPipelineCallback {
             handoff_replay_pending: false,
             assignment_fence: None,
             state_frames: Vec::new(),
+            managed_vnode_operators: Vec::new(),
             source_names: self.checkpoint_source_names.clone(),
             channel_progress,
             source_offset_overrides: HashMap::new(),

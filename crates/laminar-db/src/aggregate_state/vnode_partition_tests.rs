@@ -80,26 +80,50 @@ async fn capture_is_complete_then_only_serializes_dirty_vnodes() {
     let owned = (0..VNODES).collect::<Vec<_>>();
 
     let baseline = state.checkpoint_vnodes(&owned, VNODES).unwrap();
-    assert!(baseline.iter().all(Option::is_some));
-    assert!(state
-        .checkpoint_vnodes(&owned, VNODES)
-        .unwrap()
-        .iter()
-        .all(Option::is_none));
+    assert_eq!(baseline.len(), VNODES as usize);
+    assert_eq!(
+        baseline.iter().map(|(vnode, _)| *vnode).collect::<Vec<_>>(),
+        owned
+    );
+    assert!(state.checkpoint_vnodes(&owned, VNODES).unwrap().is_empty());
 
     state
         .process_batch(&batch(&[(key.as_str(), 2)]), 200)
         .unwrap();
+    assert!(state.capture_checkpoint_vnodes(&owned, VNODES, 0).is_err());
+    assert_eq!(
+        state
+            .working_set_snapshot_for_test()
+            .checkpoint_dirty_vnodes,
+        std::collections::BTreeSet::from([3])
+    );
     let dirty = state.checkpoint_vnodes(&owned, VNODES).unwrap();
-    assert_eq!(dirty.iter().filter(|image| image.is_some()).count(), 1);
-    assert!(dirty[3].is_some());
+    assert_eq!(dirty.len(), 1);
+    assert_eq!(dirty[0].0, 3);
+    assert!(state.checkpoint_vnodes(&owned, VNODES).unwrap().is_empty());
+
+    let second_key = symbol_for_vnode(&state, 9, 100_000);
+    state
+        .process_batch(&batch(&[(second_key.as_str(), 4)]), 300)
+        .unwrap();
+    state
+        .process_batch(&batch(&[(key.as_str(), 3)]), 400)
+        .unwrap();
+    assert_eq!(
+        state
+            .checkpoint_vnodes(&owned, VNODES)
+            .unwrap()
+            .into_iter()
+            .map(|(vnode, _)| vnode)
+            .collect::<Vec<_>>(),
+        [3, 9]
+    );
 
     state.force_full_vnode_capture();
-    assert!(state
-        .checkpoint_vnodes(&owned, VNODES)
-        .unwrap()
-        .iter()
-        .all(Option::is_some));
+    assert_eq!(
+        state.checkpoint_vnodes(&owned, VNODES).unwrap().len(),
+        VNODES as usize
+    );
 }
 
 #[tokio::test]
@@ -113,11 +137,10 @@ async fn capture_rejects_wrong_topology_and_unowned_resident_state() {
     assert!(state.checkpoint_vnodes(&[5], VNODES * 2).is_err());
     assert!(state.checkpoint_vnodes(&[0, 1], VNODES).is_err());
     let owned = (0..VNODES).collect::<Vec<_>>();
-    assert!(state
-        .checkpoint_vnodes(&owned, VNODES)
-        .unwrap()
-        .iter()
-        .all(Option::is_some));
+    assert_eq!(
+        state.checkpoint_vnodes(&owned, VNODES).unwrap().len(),
+        VNODES as usize
+    );
 }
 
 #[tokio::test]
@@ -131,7 +154,7 @@ async fn vnode_restore_replaces_atomically_and_preserves_other_vnodes() {
         .checkpoint_vnodes(&(0..VNODES).collect::<Vec<_>>(), VNODES)
         .unwrap()
         .remove(2)
-        .unwrap();
+        .1;
 
     let mut live = fresh_state().await;
     let stale_key = symbol_for_vnode(&live, 2, 10_000);

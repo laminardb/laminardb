@@ -109,6 +109,7 @@ pub struct CheckpointRequest {
     pub handoff_replay_pending: bool,
     pub assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
     pub state_frames: Vec<CapturedStateFrame>,
+    pub(crate) managed_vnode_operators: Vec<ManagedVnodeOperator>,
     pub source_names: Vec<String>,
     pub channel_progress: Vec<ChannelProgress>,
     pub source_offset_overrides: HashMap<String, ConnectorCheckpoint>,
@@ -118,6 +119,18 @@ pub struct CheckpointRequest {
 pub struct CapturedStateFrame {
     pub key: StateFrameKey,
     pub state: Option<Bytes>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagedVnodePlacement {
+    GlobalSingleton,
+    VnodeKeyed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedVnodeOperator {
+    pub(crate) operator_id: String,
+    pub(crate) placement: ManagedVnodePlacement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -1489,6 +1502,138 @@ mod outcome_tests {
         assert_eq!(metrics.checkpoint_duration.get_sample_count(), 2);
         assert_eq!(metrics.checkpoint_epoch.get(), 2);
         assert_eq!(metrics.checkpoint_size_bytes.get(), 37);
+    }
+}
+
+#[cfg(test)]
+mod sparse_capture_tests {
+    use super::*;
+    use laminar_core::checkpoint::{checkpoint_sha256, ObjectStoreCheckpointStore};
+    use laminar_core::state::KeyGroupCount;
+    use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn sparse_capture_carries_only_live_owned_frames_and_refcounts_chunks() {
+        let key_groups = KeyGroupCount::try_from(3_u16).unwrap();
+        let store = ObjectStoreCheckpointStore::new(Arc::new(InMemory::new()), "sparse-capture")
+            .with_key_group_count(key_groups);
+        let mut coordinator =
+            CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+        coordinator
+            .bind_pipeline_identity(PipelineIdentity::empty())
+            .unwrap();
+        coordinator
+            .bind_deployment_id(uuid::Uuid::from_u128(1).to_string())
+            .unwrap();
+
+        let mut prior = CheckpointManifest::new_with_key_group_count(1, 1, key_groups);
+        prior.bind_participant(coordinator.store.participant_id());
+        prior.deployment_id = uuid::Uuid::from_u128(1).to_string();
+        prior.owned_vnodes = vec![0, 1, 2];
+        let mut prior_bytes = Vec::new();
+        for (operator_id, vnode) in [
+            ("graph:dropped", 0),
+            ("graph:dropped", 1),
+            ("graph:dropped", 2),
+            ("graph:global", 0),
+            ("graph:keep", 0),
+            ("graph:keep", 1),
+            ("graph:keep", 2),
+        ] {
+            let payload = format!("{operator_id}-{vnode}").into_bytes();
+            let offset = prior_bytes.len() as u64;
+            prior_bytes.extend_from_slice(&payload);
+            prior.state_frames.push(StateFrame {
+                key: StateFrameKey::Vnode {
+                    operator_id: operator_id.into(),
+                    vnode,
+                },
+                chunk: prior.node_data.chunk,
+                range: ByteRange {
+                    offset,
+                    length: payload.len() as u64,
+                },
+                sha256: checkpoint_sha256(&payload),
+            });
+        }
+        prior.node_data.object_length = prior_bytes.len() as u64;
+        prior.node_data.sha256 = checkpoint_sha256(&prior_bytes);
+        coordinator.last_committed_manifest = Some(Arc::new(prior));
+        let request = || CheckpointRequest {
+            state_frames: vec![CapturedStateFrame {
+                key: StateFrameKey::Vnode {
+                    operator_id: "graph:keep".into(),
+                    vnode: 2,
+                },
+                state: Some(Bytes::from_static(b"new-two")),
+            }],
+            managed_vnode_operators: vec![
+                ManagedVnodeOperator {
+                    operator_id: "graph:keep".into(),
+                    placement: ManagedVnodePlacement::VnodeKeyed,
+                },
+                ManagedVnodeOperator {
+                    operator_id: "graph:global".into(),
+                    placement: ManagedVnodePlacement::GlobalSingleton,
+                },
+            ],
+            ..CheckpointRequest::default()
+        };
+
+        coordinator.set_vnode_set(vec![0, 2]);
+        let mut reassigned = request();
+        reassigned
+            .state_frames
+            .sort_unstable_by(|left, right| left.key.cmp(&right.key));
+        coordinator
+            .complete_sparse_vnode_captures(&mut reassigned)
+            .unwrap();
+        assert!(reassigned
+            .state_frames
+            .iter()
+            .all(|capture| match &capture.key {
+                StateFrameKey::Vnode { operator_id, vnode } => {
+                    operator_id != "graph:dropped" && *vnode != 1
+                }
+                StateFrameKey::OperatorWhole { .. } => true,
+            }));
+
+        coordinator.set_vnode_set(vec![0, 1, 2]);
+        let packed = coordinator
+            .pack_checkpoint(CheckpointAttempt::canonical(2), request(), BTreeMap::new())
+            .await
+            .unwrap();
+
+        let keys = packed
+            .manifest
+            .state_frames
+            .iter()
+            .map(|frame| frame.key.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                StateFrameKey::Vnode {
+                    operator_id: "graph:global".into(),
+                    vnode: 0,
+                },
+                StateFrameKey::Vnode {
+                    operator_id: "graph:keep".into(),
+                    vnode: 0,
+                },
+                StateFrameKey::Vnode {
+                    operator_id: "graph:keep".into(),
+                    vnode: 1,
+                },
+                StateFrameKey::Vnode {
+                    operator_id: "graph:keep".into(),
+                    vnode: 2,
+                },
+            ]
+        );
+        assert_eq!(packed.manifest.referenced_chunks.len(), 1);
+        assert_eq!(packed.manifest.referenced_chunks[0].ref_count.get(), 3);
+        assert_eq!(packed.node_data, vec![Bytes::from_static(b"new-two")]);
     }
 }
 
@@ -2990,9 +3135,173 @@ impl CheckpointCoordinator {
         }
         prior
             .referenced_chunks
-            .iter()
-            .find(|reference| reference.chunk == chunk)
+            .binary_search_by_key(&chunk, |reference| reference.chunk)
+            .ok()
+            .map(|index| &prior.referenced_chunks[index])
             .map(|reference| (reference.object_length, reference.sha256.clone()))
+    }
+
+    fn managed_vnode_is_required(
+        &self,
+        operators: &[ManagedVnodeOperator],
+        operator_id: &str,
+        vnode: u16,
+    ) -> bool {
+        let Ok(index) =
+            operators.binary_search_by(|operator| operator.operator_id.as_str().cmp(operator_id))
+        else {
+            return false;
+        };
+        let vnode = u32::from(vnode);
+        if self.owned_vnodes.binary_search(&vnode).is_err() {
+            return false;
+        }
+        match operators[index].placement {
+            ManagedVnodePlacement::GlobalSingleton => vnode == 0,
+            ManagedVnodePlacement::VnodeKeyed => true,
+        }
+    }
+
+    fn complete_sparse_vnode_captures(
+        &self,
+        request: &mut CheckpointRequest,
+    ) -> Result<(), DbError> {
+        request
+            .managed_vnode_operators
+            .sort_unstable_by(|left, right| left.operator_id.cmp(&right.operator_id));
+        if request
+            .managed_vnode_operators
+            .iter()
+            .any(|operator| operator.operator_id.is_empty())
+            || request
+                .managed_vnode_operators
+                .windows(2)
+                .any(|pair| pair[0].operator_id == pair[1].operator_id)
+        {
+            return Err(DbError::Checkpoint(
+                "managed vnode operator inventory must have non-empty, unique identifiers".into(),
+            ));
+        }
+
+        for capture in &request.state_frames {
+            if let StateFrameKey::Vnode { operator_id, vnode } = &capture.key {
+                if !self.managed_vnode_is_required(
+                    &request.managed_vnode_operators,
+                    operator_id,
+                    *vnode,
+                ) {
+                    return Err(DbError::Checkpoint(format!(
+                        "captured vnode frame {:?} is outside the current managed-state inventory or ownership roster",
+                        capture.key
+                    )));
+                }
+            }
+        }
+
+        let expected_vnodes =
+            request
+                .managed_vnode_operators
+                .iter()
+                .try_fold(0usize, |total, operator| {
+                    let count = match operator.placement {
+                        ManagedVnodePlacement::GlobalSingleton => {
+                            usize::from(self.owned_vnodes.first() == Some(&0))
+                        }
+                        ManagedVnodePlacement::VnodeKeyed => self.owned_vnodes.len(),
+                    };
+                    total.checked_add(count).ok_or_else(|| {
+                        DbError::Checkpoint("managed vnode frame count overflowed usize".into())
+                    })
+                })?;
+        let current_vnodes = request
+            .state_frames
+            .iter()
+            .filter(|capture| matches!(capture.key, StateFrameKey::Vnode { .. }))
+            .count();
+        if current_vnodes < expected_vnodes {
+            if let Some(prior) = self.last_committed_manifest.as_ref() {
+                let current_whole_frames = request.state_frames.len() - current_vnodes;
+                let merged_capacity = current_whole_frames
+                    .checked_add(expected_vnodes)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "managed vnode checkpoint frame count overflowed usize".into(),
+                        )
+                    })?;
+                let mut merged = Vec::new();
+                merged.try_reserve_exact(merged_capacity).map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "managed vnode checkpoint roster reservation failed: {error}"
+                    ))
+                })?;
+
+                let current = std::mem::take(&mut request.state_frames);
+                let mut current = current.into_iter().peekable();
+                let mut inherited = prior
+                    .state_frames
+                    .iter()
+                    .filter(|frame| {
+                        let StateFrameKey::Vnode { operator_id, vnode } = &frame.key else {
+                            return false;
+                        };
+                        self.managed_vnode_is_required(
+                            &request.managed_vnode_operators,
+                            operator_id,
+                            *vnode,
+                        )
+                    })
+                    .peekable();
+
+                loop {
+                    match (current.peek(), inherited.peek()) {
+                        (Some(current_frame), Some(inherited_frame)) => {
+                            match current_frame.key.cmp(&inherited_frame.key) {
+                                std::cmp::Ordering::Less => {
+                                    merged.push(current.next().expect("peeked current frame"));
+                                }
+                                std::cmp::Ordering::Equal => {
+                                    merged.push(current.next().expect("peeked current frame"));
+                                    inherited.next();
+                                }
+                                std::cmp::Ordering::Greater => {
+                                    let frame = inherited.next().expect("peeked inherited frame");
+                                    merged.push(CapturedStateFrame {
+                                        key: frame.key.clone(),
+                                        state: None,
+                                    });
+                                }
+                            }
+                        }
+                        (Some(_), None) => {
+                            merged.extend(current);
+                            break;
+                        }
+                        (None, Some(_)) => {
+                            merged.extend(inherited.map(|frame| CapturedStateFrame {
+                                key: frame.key.clone(),
+                                state: None,
+                            }));
+                            break;
+                        }
+                        (None, None) => break,
+                    }
+                }
+                request.state_frames = merged;
+            }
+        }
+        self.validate_capture_roster(&request.state_frames)?;
+
+        let actual_vnodes = request
+            .state_frames
+            .iter()
+            .filter(|capture| matches!(capture.key, StateFrameKey::Vnode { .. }))
+            .count();
+        if actual_vnodes != expected_vnodes {
+            return Err(DbError::Checkpoint(format!(
+                "managed vnode checkpoint is incomplete: captured {actual_vnodes} logical frames, expected {expected_vnodes}"
+            )));
+        }
+        Ok(())
     }
 
     fn validate_capture_roster(&self, captures: &[CapturedStateFrame]) -> Result<(), DbError> {
@@ -3022,6 +3331,7 @@ impl CheckpointCoordinator {
             .state_frames
             .sort_unstable_by(|left, right| left.key.cmp(&right.key));
         self.validate_capture_roster(&request.state_frames)?;
+        self.complete_sparse_vnode_captures(&mut request)?;
         for channel in &mut request.channel_progress {
             channel.participant_id = self.store.participant_id();
         }
@@ -3068,15 +3378,14 @@ impl CheckpointCoordinator {
         let mut current_frame_chunks = Vec::new();
         let mut referenced = BTreeMap::<StateChunkId, (u64, String, u32)>::new();
 
-        for capture in request.state_frames {
-            if let Some(bytes) = capture.state {
+        for CapturedStateFrame { key, state } in request.state_frames {
+            if let Some(bytes) = state {
                 let length = u64::try_from(bytes.len()).map_err(|_| {
-                    DbError::Checkpoint(format!("state frame {:?} length exceeds u64", capture.key))
+                    DbError::Checkpoint(format!("state frame {key:?} length exceeds u64"))
                 })?;
                 if length == 0 {
                     return Err(DbError::Checkpoint(format!(
-                        "state frame {:?} has an empty payload",
-                        capture.key
+                        "state frame {key:?} has an empty payload"
                     )));
                 }
                 let range = ByteRange {
@@ -3090,7 +3399,7 @@ impl CheckpointCoordinator {
                 let node_data_index = node_data.len() - 1;
                 let frame_index = frames.len();
                 frames.push(StateFrame {
-                    key: capture.key,
+                    key,
                     chunk: current_chunk,
                     range,
                     sha256: String::new(),
@@ -3099,42 +3408,46 @@ impl CheckpointCoordinator {
             } else {
                 let prior = self.last_committed_manifest.as_ref().ok_or_else(|| {
                     DbError::Checkpoint(format!(
-                        "unchanged state frame {:?} has no committed predecessor",
-                        capture.key
+                        "unchanged state frame {key:?} has no committed predecessor"
                     ))
                 })?;
-                let frame = prior
+                let frame_index = prior
                     .state_frames
-                    .iter()
-                    .find(|frame| frame.key == capture.key)
+                    .binary_search_by(|frame| frame.key.cmp(&key))
+                    .ok()
                     .ok_or_else(|| {
                         DbError::Checkpoint(format!(
-                            "unchanged state frame {:?} is absent from its committed predecessor",
-                            capture.key
-                        ))
-                    })?
-                    .clone();
-                let (length, digest) =
-                    Self::prior_chunk_metadata(prior, frame.chunk).ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "predecessor frame {:?} references untracked object {:?}",
-                            frame.key, frame.chunk
+                            "unchanged state frame {key:?} is absent from its committed predecessor"
                         ))
                     })?;
-                let entry = referenced
-                    .entry(frame.chunk)
-                    .or_insert((length, digest.clone(), 0));
+                let prior_frame = &prior.state_frames[frame_index];
+                let (length, digest) = Self::prior_chunk_metadata(prior, prior_frame.chunk)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "predecessor frame {:?} references untracked object {:?}",
+                            prior_frame.key, prior_frame.chunk
+                        ))
+                    })?;
+                let entry =
+                    referenced
+                        .entry(prior_frame.chunk)
+                        .or_insert((length, digest.clone(), 0));
                 if entry.0 != length || entry.1 != digest {
                     return Err(DbError::Checkpoint(format!(
                         "conflicting metadata for referenced object {:?}",
-                        frame.chunk
+                        prior_frame.chunk
                     )));
                 }
                 entry.2 = entry
                     .2
                     .checked_add(1)
                     .ok_or_else(|| DbError::Checkpoint("referenced frame count overflow".into()))?;
-                frames.push(frame);
+                frames.push(StateFrame {
+                    key,
+                    chunk: prior_frame.chunk,
+                    range: prior_frame.range,
+                    sha256: prior_frame.sha256.clone(),
+                });
             }
         }
 

@@ -1194,6 +1194,10 @@ impl CoreWindowState {
             <= self.high_watermark_ms
     }
 
+    pub(crate) const fn high_watermark_ms(&self) -> i64 {
+        self.high_watermark_ms
+    }
+
     /// Close and emit all windows whose end (plus lateness grace) <= watermark.
     pub fn close_windows(&mut self, watermark_ms: i64) -> Result<Vec<RecordBatch>, DbError> {
         self.high_watermark_ms = self.high_watermark_ms.max(watermark_ms);

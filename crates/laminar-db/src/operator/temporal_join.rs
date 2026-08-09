@@ -573,6 +573,12 @@ enum WholeRestoreState {
     Applied,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VnodeCaptureMode {
+    Full,
+    Sparse,
+}
+
 pub(crate) struct ManagedTemporalJoinOperator {
     name: Arc<str>,
     projection: ProjectingJoinState,
@@ -594,8 +600,9 @@ pub(crate) struct ManagedTemporalJoinOperator {
     resident_vnodes: Vec<u32>,
     vnode_pending_holds: Vec<Option<i64>>,
     pending_hold_counts: BTreeMap<i64, usize>,
-    checkpointed_vnodes: Vec<bool>,
     dirty_vnodes: Vec<bool>,
+    dirty_vnode_roster: Vec<u32>,
+    vnode_capture_mode: VnodeCaptureMode,
     retained_state_bytes: usize,
     max_managed_state_bytes: usize,
     frontiers: [InputFrontier; 2],
@@ -732,8 +739,9 @@ impl ManagedTemporalJoinOperator {
             resident_vnodes: Vec::with_capacity(vnode_count as usize),
             vnode_pending_holds: vec![None; vnode_count as usize],
             pending_hold_counts: BTreeMap::new(),
-            checkpointed_vnodes: vec![false; vnode_count as usize],
             dirty_vnodes: vec![false; vnode_count as usize],
+            dirty_vnode_roster: Vec::with_capacity(vnode_count as usize),
+            vnode_capture_mode: VnodeCaptureMode::Full,
             retained_state_bytes: 0,
             max_managed_state_bytes: crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
             frontiers: [InputFrontier::default(); 2],
@@ -1821,11 +1829,16 @@ impl ManagedTemporalJoinOperator {
                     .try_fold(bytes, |total, column| total.checked_add(column.capacity()))
             })
             .ok_or_else(|| self.accounting_error())?;
-        let bool_rosters = self
-            .checkpointed_vnodes
+        let capture_tracking = self
+            .dirty_vnodes
             .capacity()
             .div_ceil(8)
-            .checked_add(self.dirty_vnodes.capacity().div_ceil(8))
+            .checked_add(
+                self.dirty_vnode_roster
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .ok_or_else(|| self.accounting_error())?,
+            )
             .ok_or_else(|| self.accounting_error())?;
         let strings = self
             .name
@@ -1852,7 +1865,7 @@ impl ManagedTemporalJoinOperator {
             assignment,
             key_indices,
             configured_keys,
-            bool_rosters,
+            capture_tracking,
             strings,
             schedule,
         ]
@@ -2819,6 +2832,29 @@ impl ManagedTemporalJoinOperator {
         next
     }
 
+    fn mark_vnode_dirty(&mut self, vnode: u32) {
+        let dirty = self
+            .dirty_vnodes
+            .get_mut(vnode as usize)
+            .expect("temporal dirty vnode must be inside the configured topology");
+        if !*dirty {
+            *dirty = true;
+            debug_assert!(self.dirty_vnode_roster.len() < self.dirty_vnode_roster.capacity());
+            self.dirty_vnode_roster.push(vnode);
+        }
+    }
+
+    fn clear_dirty_vnodes(&mut self) {
+        for vnode in self.dirty_vnode_roster.drain(..) {
+            let dirty = self
+                .dirty_vnodes
+                .get_mut(vnode as usize)
+                .expect("temporal dirty vnode must remain inside the configured topology");
+            debug_assert!(*dirty);
+            *dirty = false;
+        }
+    }
+
     fn prepare_vnode(&mut self, vnode: u32, accounted_total: &mut usize) -> Result<usize, DbError> {
         let index = vnode as usize;
         if self.vnode_states[index].is_none() {
@@ -2852,7 +2888,7 @@ impl ManagedTemporalJoinOperator {
             *accounted_total = next_total;
             self.vnode_states[index] = Some(Box::new(state));
             self.add_resident_vnode(vnode);
-            self.dirty_vnodes[index] = true;
+            self.mark_vnode_dirty(vnode);
         }
         let current = self.vnode_states[index]
             .as_ref()
@@ -2947,15 +2983,18 @@ impl ManagedTemporalJoinOperator {
                     &routed.keys,
                     &routed.source_rows,
                 );
-            if let Err(error) = result {
-                return Err(self.after_apply_error(applied, vnode, error));
+            let stats = match result {
+                Ok(stats) => stats,
+                Err(error) => return Err(self.after_apply_error(applied, vnode, error)),
+            };
+            if stats.duplicates != positioned.num_rows() {
+                applied = true;
+                self.mark_vnode_dirty(vnode);
             }
-            applied = true;
-            self.dirty_vnodes[vnode as usize] = true;
             self.refresh_vnode_accounting(vnode, previous, accounted_total)
                 .map_err(|error| self.after_apply_error(applied, vnode, error))?;
         }
-        Ok(true)
+        Ok(applied)
     }
 
     fn apply_left_batches(
@@ -2983,7 +3022,7 @@ impl ManagedTemporalJoinOperator {
             if result.num_rows() != 0 {
                 output.push(result);
             }
-            self.dirty_vnodes[vnode as usize] = true;
+            self.mark_vnode_dirty(vnode);
             self.refresh_vnode_accounting(vnode, previous, accounted_total)
                 .map_err(|error| self.after_apply_error(applied, vnode, error))?;
         }
@@ -3055,7 +3094,7 @@ impl ManagedTemporalJoinOperator {
                 return Err(self.after_apply_error(applied, vnode, error));
             }
             applied = true;
-            self.dirty_vnodes[vnode as usize] = true;
+            self.mark_vnode_dirty(vnode);
             let right = self.vnode_states[vnode as usize]
                 .as_mut()
                 .expect("resident state")
@@ -3163,6 +3202,7 @@ impl ManagedTemporalJoinOperator {
                 if drained.drained_probes != 0 {
                     vnode_changed = true;
                     applied = true;
+                    self.mark_vnode_dirty(vnode);
                     if drained.output.num_rows() != 0 {
                         output.push(drained.output);
                     }
@@ -3175,6 +3215,10 @@ impl ManagedTemporalJoinOperator {
                 vnode_has_more = true;
             }
             if gc != 0 {
+                let had_gc_work = self.vnode_states[vnode as usize]
+                    .as_ref()
+                    .expect("resident state")
+                    .has_history_gc_work();
                 let drained = self.vnode_states[vnode as usize]
                     .as_mut()
                     .expect("resident state")
@@ -3187,9 +3231,10 @@ impl ManagedTemporalJoinOperator {
                 };
                 gc -= drained.steps;
                 vnode_has_more |= drained.has_more;
-                if drained.steps != 0 {
+                if drained.steps != 0 || had_gc_work {
                     vnode_changed = true;
                     applied = true;
+                    self.mark_vnode_dirty(vnode);
                 }
             } else if self.vnode_states[vnode as usize]
                 .as_ref()
@@ -3199,7 +3244,6 @@ impl ManagedTemporalJoinOperator {
                 vnode_has_more = true;
             }
             if vnode_changed {
-                self.dirty_vnodes[vnode as usize] = true;
                 changed = true;
             }
             if let Err(error) = self.refresh_vnode_accounting(vnode, previous, accounted_total) {
@@ -4625,16 +4669,29 @@ impl GraphOperator for ManagedTemporalJoinOperator {
             )));
         }
         self.validate_vnode_roster(required_vnodes, vnode_count)?;
-        let capture_plan: Vec<bool> = required_vnodes
+        let full_capture = self.vnode_capture_mode == VnodeCaptureMode::Full;
+        let mut capture_vnodes = if full_capture {
+            required_vnodes.to_vec()
+        } else {
+            self.dirty_vnode_roster
+                .iter()
+                .copied()
+                .filter(|vnode| required_vnodes.binary_search(vnode).is_ok())
+                .collect::<Vec<_>>()
+        };
+        if !full_capture {
+            capture_vnodes.sort_unstable();
+        }
+        debug_assert!(capture_vnodes.windows(2).all(|pair| pair[0] < pair[1]));
+        if capture_vnodes.is_empty() {
+            self.vnode_capture_mode = VnodeCaptureMode::Sparse;
+            self.clear_dirty_vnodes();
+            return Ok(Some(Vec::new()));
+        }
+
+        let absent_frame_bytes = capture_vnodes
             .iter()
-            .map(|vnode| {
-                !self.checkpointed_vnodes[*vnode as usize] || self.dirty_vnodes[*vnode as usize]
-            })
-            .collect();
-        let absent_frame_bytes = required_vnodes
-            .iter()
-            .zip(&capture_plan)
-            .filter(|(vnode, include)| **include && self.vnode_states[**vnode as usize].is_none())
+            .filter(|vnode| self.vnode_states[**vnode as usize].is_none())
             .count();
         let remaining_operator_bytes = self
             .max_managed_state_bytes
@@ -4646,65 +4703,53 @@ impl GraphOperator for ManagedTemporalJoinOperator {
                 ))
             })?;
         let remaining_operator_bytes = Arc::new(AtomicUsize::new(remaining_operator_bytes));
-        let mut result = Vec::with_capacity(required_vnodes.len());
+        let mut result = Vec::with_capacity(capture_vnodes.len());
         let mut remaining_capture_bytes = max_capture_bytes;
-        for (&vnode, include) in required_vnodes.iter().zip(&capture_plan) {
-            let state = if *include {
-                if let Some(state) = self.vnode_states[vnode as usize].as_ref() {
-                    let capture = state.capture_checkpoint(
-                        usize::try_from(remaining_capture_bytes).unwrap_or(usize::MAX),
-                    )?;
-                    let retained_bytes =
-                        u64::try_from(capture.retained_bytes()).unwrap_or(u64::MAX);
-                    let max_managed_state_bytes = self.max_managed_state_bytes;
-                    let remaining_operator_bytes = Arc::clone(&remaining_operator_bytes);
-                    Some(StateFrameCapture::deferred(
-                        retained_bytes,
-                        move |remaining| {
-                            let operator_remaining =
-                                remaining_operator_bytes.load(AtomicOrdering::Relaxed);
-                            let frame_limit = remaining
-                                .min(operator_remaining)
-                                .min(max_managed_state_bytes);
-                            let frame = capture.encode(frame_limit, Some(PRESENT_VNODE))?;
-                            remaining_operator_bytes
-                                .fetch_update(
-                                    AtomicOrdering::Relaxed,
-                                    AtomicOrdering::Relaxed,
-                                    |remaining| remaining.checked_sub(frame.len()),
-                                )
-                                .map_err(|_| {
-                                    DbError::Checkpoint(format!(
-                                        "temporal join vnode {vnode} checkpoints exceeded their managed-state limit"
-                                    ))
-                                })?;
-                            Ok(EncodedStateFrame::from_vec(frame))
-                        },
-                    ))
-                } else {
-                    Some(StateFrameCapture::encoded_static(&[ABSENT_VNODE]))
-                }
+        for vnode in capture_vnodes.iter().copied() {
+            let state = if let Some(state) = self.vnode_states[vnode as usize].as_ref() {
+                let capture = state.capture_checkpoint(
+                    usize::try_from(remaining_capture_bytes).unwrap_or(usize::MAX),
+                )?;
+                let retained_bytes = u64::try_from(capture.retained_bytes()).unwrap_or(u64::MAX);
+                let max_managed_state_bytes = self.max_managed_state_bytes;
+                let remaining_operator_bytes = Arc::clone(&remaining_operator_bytes);
+                StateFrameCapture::deferred(retained_bytes, move |remaining| {
+                    let operator_remaining = remaining_operator_bytes.load(AtomicOrdering::Relaxed);
+                    let frame_limit = remaining
+                        .min(operator_remaining)
+                        .min(max_managed_state_bytes);
+                    let frame = capture.encode(frame_limit, Some(PRESENT_VNODE))?;
+                    remaining_operator_bytes
+                        .fetch_update(
+                            AtomicOrdering::Relaxed,
+                            AtomicOrdering::Relaxed,
+                            |remaining| remaining.checked_sub(frame.len()),
+                        )
+                        .map_err(|_| {
+                            DbError::Checkpoint(format!(
+                                "temporal join vnode {vnode} checkpoints exceeded their managed-state limit"
+                            ))
+                        })?;
+                    Ok(EncodedStateFrame::from_vec(frame))
+                })
             } else {
-                None
+                StateFrameCapture::encoded_static(&[ABSENT_VNODE])
             };
-            if let Some(capture) = state.as_ref() {
-                remaining_capture_bytes = remaining_capture_bytes
-                    .checked_sub(capture.retained_bytes())
-                    .ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "temporal join [{}] vnode {vnode} capture exceeded the remaining capture budget",
-                            self.name
-                        ))
-                    })?;
-            }
-            result.push(CapturedVnodeState { vnode, state });
+            remaining_capture_bytes = remaining_capture_bytes
+                .checked_sub(state.retained_bytes())
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "temporal join [{}] vnode {vnode} capture exceeded the remaining capture budget",
+                        self.name
+                    ))
+                })?;
+            result.push(CapturedVnodeState {
+                vnode,
+                state: Some(state),
+            });
         }
-        for (&vnode, include) in required_vnodes.iter().zip(capture_plan) {
-            self.checkpointed_vnodes[vnode as usize] = true;
-            if include {
-                self.dirty_vnodes[vnode as usize] = false;
-            }
-        }
+        self.vnode_capture_mode = VnodeCaptureMode::Sparse;
+        self.clear_dirty_vnodes();
         Ok(Some(result))
     }
 
@@ -4777,6 +4822,8 @@ impl GraphOperator for ManagedTemporalJoinOperator {
             .ok_or_else(|| self.accounting_error())?;
         let present = replacement.is_some();
         self.vnode_states[vnode as usize] = replacement;
+        self.mark_vnode_dirty(vnode);
+        self.vnode_capture_mode = VnodeCaptureMode::Full;
         if present {
             self.add_resident_vnode(vnode);
         } else {
@@ -4791,8 +4838,6 @@ impl GraphOperator for ManagedTemporalJoinOperator {
                 limit_bytes: self.max_managed_state_bytes,
             });
         }
-        self.checkpointed_vnodes[vnode as usize] = false;
-        self.dirty_vnodes[vnode as usize] = false;
         if self.whole_restore == WholeRestoreState::Pending {
             let restored_has_work = self.vnode_states[vnode as usize]
                 .as_ref()
@@ -4840,9 +4885,9 @@ impl GraphOperator for ManagedTemporalJoinOperator {
         for (vnode, state) in &mut prepared.slots {
             let index = *vnode as usize;
             std::mem::swap(&mut self.vnode_states[index], state);
-            self.checkpointed_vnodes[index] = false;
-            self.dirty_vnodes[index] = false;
+            self.mark_vnode_dirty(*vnode);
         }
+        self.vnode_capture_mode = VnodeCaptureMode::Full;
         std::mem::swap(&mut self.local_assignment, &mut prepared.local_assignment);
         std::mem::swap(&mut self.resident_vnodes, &mut prepared.resident_vnodes);
         std::mem::swap(
@@ -4890,7 +4935,7 @@ impl GraphOperator for ManagedTemporalJoinOperator {
     }
 
     fn force_full_vnode_capture(&mut self) {
-        self.checkpointed_vnodes.fill(false);
+        self.vnode_capture_mode = VnodeCaptureMode::Full;
     }
 }
 
@@ -5440,7 +5485,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vnode_frames_preserve_absence_and_force_full_capture() {
+    async fn vnode_capture_is_full_then_sparse_and_forceable() {
         let key = key_for_vnode(1);
         let (mut donor, _, _) = operator(8);
         let right = right_batch(
@@ -5463,14 +5508,38 @@ mod tests {
             .into_iter()
             .map(|frame| (frame.vnode, frame.state.map(materialize_capture)))
             .collect::<Vec<_>>();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(
+            captured.iter().map(|(vnode, _)| *vnode).collect::<Vec<_>>(),
+            [0, 1]
+        );
         assert_eq!(captured[0].1.as_deref().unwrap(), &[ABSENT_VNODE]);
         assert_eq!(captured[1].1.as_deref().unwrap()[0], PRESENT_VNODE);
-        assert!(donor
+        let clean = donor
             .checkpoint_vnodes(&[0, 1], 2, u64::MAX)
             .unwrap()
+            .unwrap();
+        assert!(clean.is_empty());
+
+        let update = right_batch_at(
+            std::slice::from_ref(&key),
+            &["X"],
+            &[95],
+            &["new"],
+            &[SourceMutation::Put],
+            2,
+        );
+        donor
+            .process_with_frontiers(&[Vec::new(), vec![update]], &[InputFrontier::default(); 2])
+            .await
+            .unwrap();
+        let sparse = donor
+            .checkpoint_vnodes(&[0, 1], 2, u64::MAX)
             .unwrap()
-            .iter()
-            .all(|frame| frame.state.is_none()));
+            .unwrap();
+        assert_eq!(sparse.len(), 1);
+        assert_eq!(sparse[0].vnode, 1);
+        assert!(sparse[0].state.is_some());
 
         let (mut restored, _, _) = operator(8);
         restored.restore(whole).unwrap();
@@ -5487,6 +5556,14 @@ mod tests {
             .checkpoint_vnodes(&[0, 1], 2, u64::MAX)
             .unwrap()
             .unwrap();
+        assert_eq!(recaptured.len(), 2);
+        assert_eq!(
+            recaptured
+                .iter()
+                .map(|frame| frame.vnode)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
         assert!(recaptured.iter().all(|frame| frame.state.is_some()));
 
         let left = left_batch(std::slice::from_ref(&key), &["X"], &[100], &[7]);
