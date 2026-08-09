@@ -963,6 +963,7 @@ impl OperatorGraph {
                 && !matches!(
                     contract,
                     ManagedStateContract::BoundedIntervalJoinV1
+                        | ManagedStateContract::CoreWindowV1
                         | ManagedStateContract::TemporalJoinV1
                 )
             {
@@ -980,6 +981,7 @@ impl OperatorGraph {
                 || matches!(
                     contract,
                     ManagedStateContract::BoundedIntervalJoinV1
+                        | ManagedStateContract::CoreWindowV1
                         | ManagedStateContract::TemporalJoinV1
                 );
             if !relevant {

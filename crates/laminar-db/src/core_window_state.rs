@@ -374,7 +374,8 @@ pub(crate) struct PreparedCoreWindowVnodeTransition {
     final_active_vnode_positions: Box<[usize]>,
     final_window_group_counts: FxHashMap<i64, usize>,
     final_session_group_count: usize,
-    required_frontier_floor_ms: i64,
+    final_high_watermark_ms: i64,
+    final_required_frontier_floor_ms: i64,
 }
 
 pub(crate) struct RetiredCoreWindowVnodeTransition {
@@ -2486,6 +2487,7 @@ impl CoreWindowState {
         self.compiled_projection.as_ref()
     }
 
+    #[cfg(feature = "cluster")]
     pub(crate) const fn num_group_cols(&self) -> usize {
         self.num_group_cols
     }
@@ -3343,6 +3345,7 @@ impl CoreWindowState {
         &self,
         vnode: u32,
         checkpoint: &CoreWindowVnodeCheckpoint,
+        final_frontier_ms: i64,
     ) -> Result<PreparedCoreWindowRestore, DbError> {
         if checkpoint.vnode != vnode {
             return Err(DbError::Checkpoint(format!(
@@ -3379,14 +3382,14 @@ impl CoreWindowState {
                 assigner.offset_ms(),
             ),
         }?;
-        if self.high_watermark_ms < prepared.frontier_floor_ms {
+        if final_frontier_ms < prepared.frontier_floor_ms {
             return Err(DbError::Checkpoint(format!(
                 "Core window vnode {vnode} floor {} exceeds restored frontier {}",
-                prepared.frontier_floor_ms, self.high_watermark_ms
+                prepared.frontier_floor_ms, final_frontier_ms
             )));
         }
         if let Some(state) = prepared.state.as_deref() {
-            self.validate_vnode_state_frontier(state, self.high_watermark_ms)?;
+            self.validate_vnode_state_frontier(state, final_frontier_ms)?;
         }
         Ok(prepared)
     }
@@ -3462,10 +3465,23 @@ impl CoreWindowState {
     pub(crate) fn prepare_owned_vnode_transition(
         &self,
         vnode_count: u32,
+        final_frontier_ms: i64,
         restores: impl ExactSizeIterator<Item = Result<OwnedCoreWindowVnodeRestore, DbError>>,
         revoked: &FxHashSet<u32>,
     ) -> Result<PreparedCoreWindowVnodeTransition, DbError> {
         let vnode_count = self.validate_vnode_count(vnode_count)?;
+        if final_frontier_ms < self.high_watermark_ms {
+            return Err(DbError::Checkpoint(format!(
+                "Core window transition frontier {final_frontier_ms} regresses from {}",
+                self.high_watermark_ms
+            )));
+        }
+        if final_frontier_ms < self.required_frontier_floor_ms {
+            return Err(DbError::Checkpoint(format!(
+                "Core window transition frontier {final_frontier_ms} precedes vnode floor {}",
+                self.required_frontier_floor_ms
+            )));
+        }
         let restore_count = restores.len();
         let mut final_window_group_counts = FxHashMap::default();
         final_window_group_counts
@@ -3537,12 +3553,29 @@ impl CoreWindowState {
                 &mut final_session_group_count,
                 &state,
             )?;
-            let prepared = self.prepare_vnode_restore(vnode, &state)?;
+            let prepared = self.prepare_vnode_restore(vnode, &state, final_frontier_ms)?;
             required_frontier_floor_ms = required_frontier_floor_ms.max(prepared.frontier_floor_ms);
             if replacements.insert(vnode, prepared.state).is_some() {
                 return Err(DbError::Checkpoint(format!(
                     "Core window transition repeats restored vnode {vnode}"
                 )));
+            }
+        }
+        if final_frontier_ms > self.high_watermark_ms {
+            for &vnode in &self.active_vnodes {
+                if transitioned.contains(&vnode) {
+                    continue;
+                }
+                let state = self
+                    .vnode_states
+                    .get(vnode as usize)
+                    .and_then(Option::as_deref)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "Core window active vnode {vnode} has no retained state"
+                        ))
+                    })?;
+                self.validate_vnode_state_frontier(state, final_frontier_ms)?;
             }
         }
         let mut transitioned_vnodes = transitioned.into_iter().collect::<Vec<_>>();
@@ -3592,7 +3625,8 @@ impl CoreWindowState {
             final_active_vnode_positions: final_active_vnode_positions.into_boxed_slice(),
             final_window_group_counts,
             final_session_group_count,
-            required_frontier_floor_ms,
+            final_high_watermark_ms: final_frontier_ms,
+            final_required_frontier_floor_ms: required_frontier_floor_ms,
         })
     }
 
@@ -3617,8 +3651,12 @@ impl CoreWindowState {
             &mut prepared.final_session_group_count,
         );
         std::mem::swap(
+            &mut self.high_watermark_ms,
+            &mut prepared.final_high_watermark_ms,
+        );
+        std::mem::swap(
             &mut self.required_frontier_floor_ms,
-            &mut prepared.required_frontier_floor_ms,
+            &mut prepared.final_required_frontier_floor_ms,
         );
         self.force_full_vnode_capture();
         RetiredCoreWindowVnodeTransition {
@@ -3636,8 +3674,10 @@ impl CoreWindowState {
         vnode_count: u32,
         state: CoreWindowVnodeCheckpoint,
     ) -> Result<(), DbError> {
+        let final_frontier_ms = self.high_watermark_ms;
         let prepared = self.prepare_owned_vnode_transition(
             vnode_count,
+            final_frontier_ms,
             std::iter::once(Ok(OwnedCoreWindowVnodeRestore { vnode, state })),
             &FxHashSet::default(),
         )?;

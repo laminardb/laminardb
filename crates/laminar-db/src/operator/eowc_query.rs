@@ -28,19 +28,46 @@ use crate::operator::capability::{ManagedStateContract, OperatorCapability};
 use crate::operator::sql_query::ClusterShuffleConfig;
 #[cfg(feature = "cluster")]
 use crate::operator_graph::merge_input_frontier_iter;
-#[cfg(feature = "cluster")]
-use crate::operator_graph::ManagedVnodeTransition;
 use crate::operator_graph::{
     try_evaluate_compiled, EncodedStateFrame, GraphOperator, InputFrontier,
     ManagedStateAccountingSnapshot, OperatorCheckpoint, StateFrameCapture,
 };
+#[cfg(feature = "cluster")]
+use crate::operator_graph::{ManagedVnodeTransition, ManagedVnodeTransitionMode};
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::WindowOperatorConfig;
 
 #[cfg(feature = "cluster")]
+struct EowcTransitionTopology {
+    assignment: VnodeAssignmentSnapshot,
+    assignment_digest: [u8; 32],
+    peers: Arc<[u64]>,
+    channels: BTreeMap<u64, EowcPeerChannel>,
+    local_frontier: InputFrontier,
+    last_broadcast: InputFrontier,
+    effective_frontier: InputFrontier,
+    remote_peer_cursor: Option<u64>,
+    queued_payload_bytes: usize,
+    queued_event_capacity_bytes: usize,
+    queued_remote_events: usize,
+}
+
+#[cfg(feature = "cluster")]
+struct PreparedEowcTransition {
+    core: PreparedCoreWindowVnodeTransition,
+    topology: EowcTransitionTopology,
+}
+
+#[cfg(feature = "cluster")]
+struct RetiredEowcTransition {
+    core: RetiredCoreWindowVnodeTransition,
+    topology: EowcTransitionTopology,
+}
+
+#[cfg(feature = "cluster")]
 enum CoreWindowTransitionCleanup {
-    Aborted(PreparedCoreWindowVnodeTransition),
-    Published(RetiredCoreWindowVnodeTransition),
+    Aborted(PreparedEowcTransition),
+    Published(RetiredEowcTransition),
 }
 
 const OPERATOR_CHECKPOINT_VERSION: u8 = 2;
@@ -219,9 +246,50 @@ const ROW_VNODE_ARC_CHARGE: usize = 2 * std::mem::size_of::<usize>();
 #[cfg(feature = "cluster")]
 const PEER_CHANNEL_ENTRY_CHARGE: usize = 64;
 
+#[cfg(feature = "cluster")]
+impl EowcTransitionTopology {
+    fn accounted_state_bytes(&self) -> usize {
+        let assignment = self.assignment.owners().len().saturating_mul(
+            std::mem::size_of::<NodeId>().saturating_add(std::mem::size_of::<u64>()),
+        );
+        let peers = self.peers.len().saturating_mul(std::mem::size_of::<u64>());
+        let channels = self
+            .channels
+            .len()
+            .saturating_mul(
+                std::mem::size_of::<(u64, EowcPeerChannel)>()
+                    .saturating_add(PEER_CHANNEL_ENTRY_CHARGE),
+            )
+            .saturating_add(self.queued_event_capacity_bytes)
+            .saturating_add(self.queued_payload_bytes);
+        std::mem::size_of::<Self>()
+            .saturating_add(assignment)
+            .saturating_add(peers)
+            .saturating_add(channels)
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl PreparedEowcTransition {
+    fn accounted_state_bytes(&self) -> usize {
+        self.core
+            .accounted_state_bytes()
+            .saturating_add(self.topology.accounted_state_bytes())
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl RetiredEowcTransition {
+    fn accounted_state_bytes(&self) -> usize {
+        self.core
+            .accounted_state_bytes()
+            .saturating_add(self.topology.accounted_state_bytes())
+    }
+}
+
 impl EowcOperatorCheckpointCapture {
     fn encode(self, max_encoded_bytes: usize) -> Result<Vec<u8>, DbError> {
-        let mut remaining = max_encoded_bytes
+        let remaining = max_encoded_bytes
             .checked_sub(OPERATOR_CHECKPOINT_BASE_SCRATCH)
             .ok_or_else(|| {
                 DbError::Checkpoint(format!(
@@ -229,12 +297,11 @@ impl EowcOperatorCheckpointCapture {
                 ))
             })?;
         #[cfg(feature = "cluster")]
-        let cluster = if let Some(cluster) = self.cluster {
+        let (cluster, remaining) = if let Some(cluster) = self.cluster {
             let (cluster, next) = cluster.encode(remaining)?;
-            remaining = next;
-            Some(cluster)
+            (Some(cluster), next)
         } else {
-            None
+            (None, remaining)
         };
         #[cfg(not(feature = "cluster"))]
         let cluster = None;
@@ -445,7 +512,7 @@ pub(crate) struct EowcQueryOperator {
     #[cfg(feature = "cluster")]
     queued_remote_events: usize,
     #[cfg(feature = "cluster")]
-    prepared_vnode_transition: Option<PreparedCoreWindowVnodeTransition>,
+    prepared_vnode_transition: Option<PreparedEowcTransition>,
     #[cfg(feature = "cluster")]
     vnode_transition_cleanup: Option<CoreWindowTransitionCleanup>,
 }
@@ -632,6 +699,7 @@ impl EowcQueryOperator {
         }
     }
 
+    #[cfg(feature = "cluster")]
     fn validate_frontier(
         &self,
         previous: InputFrontier,
@@ -995,7 +1063,6 @@ impl EowcQueryOperator {
         input: InputFrontier,
         has_data: bool,
     ) -> Result<InputFrontier, DbError> {
-        self.validate_frontier(self.local_frontier, input, "local")?;
         if input.idle && has_data {
             return Err(DbError::InvalidOperation(format!(
                 "managed CoreWindow '{}' received data from an idle local channel",
@@ -1003,10 +1070,20 @@ impl EowcQueryOperator {
             )));
         }
         let mut normalized = input;
-        if self.local_frontier.idle && !normalized.idle {
-            normalized.watermark =
-                Self::max_watermark(normalized.watermark, self.effective_frontier.watermark);
+        if self.local_frontier.idle {
+            normalized.watermark = Self::max_watermark(
+                normalized.watermark,
+                if normalized.idle {
+                    self.local_frontier.watermark
+                } else {
+                    Self::max_watermark(
+                        self.local_frontier.watermark,
+                        self.effective_frontier.watermark,
+                    )
+                },
+            );
         }
+        self.validate_frontier(self.local_frontier, normalized, "local")?;
         Ok(normalized)
     }
 
@@ -1962,29 +2039,535 @@ impl EowcQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
-    fn validate_assignment_target(
+    fn validate_drained_transition_cut(
         &self,
-        target: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        assignment: &VnodeAssignmentSnapshot,
+        window: &CoreWindowState,
+        self_id: NodeId,
     ) -> Result<(), DbError> {
-        let scope = self.cluster_scope.as_ref().ok_or_else(|| {
-            DbError::Checkpoint(format!(
-                "managed CoreWindow '{}' has no cluster assignment scope",
-                self.op_name
-            ))
-        })?;
-        let assignment = scope.registry.versioned_snapshot();
-        let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
-        if target.vnode_count != scope.registry.vnode_count()
-            || target.assignment_version != assignment.version()
-            || !target.matches_owner_map(&owners)
+        let expected_peers = Self::remote_owner_peers(assignment, self_id);
+        if self.cluster_peers.as_ref() != expected_peers.as_slice()
+            || self.peer_channels.len() != expected_peers.len()
+            || !self
+                .peer_channels
+                .keys()
+                .copied()
+                .eq(expected_peers.iter().copied())
+            || self
+                .remote_peer_cursor
+                .is_some_and(|peer| expected_peers.binary_search(&peer).is_err())
+            || self.last_broadcast != self.local_frontier
+            || self.queued_payload_bytes != 0
+            || self.queued_remote_events != 0
+            || self.local_frontier.watermark == Some(i64::MIN)
+            || self.effective_frontier.watermark == Some(i64::MIN)
+            || self.cluster_assignment_digest != Some(self.owner_map_digest(assignment))
         {
             return Err(DbError::Checkpoint(format!(
-                "managed CoreWindow '{}' transition target does not match assignment {}",
-                self.op_name,
-                assignment.version()
+                "managed CoreWindow '{}' transition requires a drained frontier and channel cut",
+                self.op_name
+            )));
+        }
+        let mut event_capacity_bytes = 0usize;
+        for channel in self.peer_channels.values() {
+            if channel.applied.watermark == Some(i64::MIN)
+                || channel.accepted != channel.applied
+                || !channel.events.is_empty()
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "managed CoreWindow '{}' transition found retained ordered channel state",
+                    self.op_name
+                )));
+            }
+            event_capacity_bytes = event_capacity_bytes
+                .checked_add(
+                    channel
+                        .events
+                        .capacity()
+                        .checked_mul(REMOTE_EVENT_CHARGE)
+                        .ok_or_else(|| self.accounting_error())?,
+                )
+                .ok_or_else(|| self.accounting_error())?;
+        }
+        let merged = merge_input_frontier_iter(
+            std::iter::once(self.local_frontier)
+                .chain(self.peer_channels.values().map(|channel| channel.applied)),
+            i64::MIN,
+        );
+        if event_capacity_bytes != self.queued_event_capacity_bytes
+            || merged != self.effective_frontier
+            || window.high_watermark_ms() != Self::frontier_watermark(self.effective_frontier)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' transition found inconsistent channel accounting or frontier",
+                self.op_name
             )));
         }
         Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn portable_handoff_cut(
+        &self,
+        transition: &ManagedVnodeTransition<'_>,
+    ) -> Result<Option<InputFrontier>, DbError> {
+        let mut donors = BTreeSet::new();
+        for restore in transition.restores {
+            let predecessor_owner = match transition.mode {
+                ManagedVnodeTransitionMode::Live => self
+                    .cluster_assignment
+                    .as_ref()
+                    .and_then(|assignment| assignment.owners().get(restore.vnode as usize))
+                    .copied(),
+                ManagedVnodeTransitionMode::CheckpointBootstrap { predecessor_owners } => {
+                    predecessor_owners.get(restore.vnode as usize).copied()
+                }
+            };
+            if !transition.predecessor.contains(restore.participant_id)
+                || predecessor_owner.map(|owner| owner.0) != Some(restore.participant_id)
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "managed CoreWindow '{}' vnode {} restore has invalid donor {}",
+                    self.op_name, restore.vnode, restore.participant_id
+                )));
+            }
+            donors.insert(restore.participant_id);
+        }
+        if donors.is_empty() {
+            if transition.whole_restores.is_empty() {
+                return Ok(None);
+            }
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' has whole handoff frames without acquired vnodes",
+                self.op_name
+            )));
+        }
+
+        let predecessor_participants = transition.predecessor.participant_ids();
+        let mut whole_donors = BTreeSet::new();
+        let mut common = None;
+        for restore in transition.whole_restores {
+            if !whole_donors.insert(restore.participant_id)
+                || restore.state.len() > self.max_managed_state_bytes
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "managed CoreWindow '{}' has an invalid whole frame for donor {}",
+                    self.op_name, restore.participant_id
+                )));
+            }
+            let checkpoint =
+                rkyv::from_bytes::<EowcOperatorCheckpoint, rkyv::rancor::Error>(restore.state)
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "managed CoreWindow '{}' donor {} whole checkpoint: {error}",
+                            self.op_name, restore.participant_id
+                        ))
+                    })?;
+            if checkpoint.version != OPERATOR_CHECKPOINT_VERSION {
+                return Err(DbError::Checkpoint(format!(
+                    "managed CoreWindow '{}' donor {} uses unsupported checkpoint version {}",
+                    self.op_name, restore.participant_id, checkpoint.version
+                )));
+            }
+            let cluster = checkpoint.cluster.ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "managed CoreWindow '{}' donor {} whole checkpoint is not from cluster mode",
+                    self.op_name, restore.participant_id
+                ))
+            })?;
+            let local: InputFrontier = cluster.local_frontier.into();
+            let effective: InputFrontier = cluster.effective_frontier.into();
+            let expected_peers = predecessor_participants
+                .iter()
+                .copied()
+                .filter(|peer| *peer != restore.participant_id)
+                .collect::<Vec<_>>();
+            if cluster.assignment_version != transition.predecessor.assignment_version
+                || cluster.owner_map_digest != transition.predecessor.assignment_digest
+                || cluster.self_id != restore.participant_id
+                || local.watermark == Some(i64::MIN)
+                || effective.watermark == Some(i64::MIN)
+                || checkpoint.high_watermark_ms != Self::frontier_watermark(effective)
+                || cluster.channels.len() != expected_peers.len()
+                || !cluster.data_ipc.is_empty()
+                || cluster
+                    .remote_peer_cursor
+                    .is_some_and(|peer| expected_peers.binary_search(&peer).is_err())
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "managed CoreWindow '{}' donor {} whole checkpoint is not a portable predecessor cut",
+                    self.op_name, restore.participant_id
+                )));
+            }
+            let mut applied = Vec::with_capacity(cluster.channels.len());
+            for (expected_peer, channel) in expected_peers.iter().zip(cluster.channels) {
+                let frontier: InputFrontier = channel.applied.into();
+                if channel.peer != *expected_peer
+                    || frontier.watermark == Some(i64::MIN)
+                    || !channel.events.is_empty()
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "managed CoreWindow '{}' donor {} has retained ordered channel state",
+                        self.op_name, restore.participant_id
+                    )));
+                }
+                applied.push(frontier);
+            }
+            let merged = merge_input_frontier_iter(std::iter::once(local).chain(applied), i64::MIN);
+            if merged != effective {
+                return Err(DbError::Checkpoint(format!(
+                    "managed CoreWindow '{}' donor {} frontiers do not form one handoff cut",
+                    self.op_name, restore.participant_id
+                )));
+            }
+            if common.is_some_and(|expected| expected != effective) {
+                return Err(DbError::Checkpoint(format!(
+                    "managed CoreWindow '{}' donor whole checkpoints disagree on the handoff cut",
+                    self.op_name
+                )));
+            }
+            common = Some(effective);
+        }
+        if whole_donors != donors {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' whole checkpoints do not exactly cover acquired vnode donors",
+                self.op_name
+            )));
+        }
+        common.map(Some).ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' acquired vnodes without a portable whole cut",
+                self.op_name
+            ))
+        })
+    }
+
+    #[cfg(feature = "cluster")]
+    fn prepare_transition_image(
+        &self,
+        transition: &ManagedVnodeTransition<'_>,
+    ) -> Result<PreparedEowcTransition, DbError> {
+        let config = self.cluster_scope.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' cannot transition without cluster ownership",
+                self.op_name
+            ))
+        })?;
+        let window = self.state.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "managed CoreWindow transition targeted uninitialized operator '{}'",
+                self.op_name
+            ))
+        })?;
+        let installed = self.cluster_assignment.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' has no installed assignment",
+                self.op_name
+            ))
+        })?;
+        let assignment = config.registry.versioned_snapshot();
+        let owners = assignment
+            .owners()
+            .iter()
+            .map(|owner| owner.0)
+            .collect::<Vec<_>>();
+        let checkpoint_bootstrap = match transition.mode {
+            ManagedVnodeTransitionMode::Live => false,
+            ManagedVnodeTransitionMode::CheckpointBootstrap { predecessor_owners } => {
+                let predecessor = predecessor_owners
+                    .iter()
+                    .map(|owner| owner.0)
+                    .collect::<Vec<_>>();
+                if !transition.predecessor.matches_owner_map(&predecessor) {
+                    return Err(DbError::Checkpoint(format!(
+                        "managed CoreWindow '{}' checkpoint bootstrap has an invalid predecessor owner map",
+                        self.op_name
+                    )));
+                }
+                true
+            }
+        };
+        let target_contains_self = assignment.owners().contains(&config.self_id);
+        let endpoints_match_process = config.sender.local_id() == config.self_id.0
+            && config.receiver.local_id() == config.self_id.0
+            && config.sender.incarnation() == config.receiver.incarnation();
+        let active_transport = endpoints_match_process
+            && config.sender.assignment_version() == assignment.version()
+            && config.receiver.assignment_version() == assignment.version()
+            && config.sender.active_assignment_digest() == Some(transition.target.digest())
+            && config.receiver.active_assignment_digest()
+                == config.sender.active_assignment_digest()
+            && transition.target.participant_incarnation(config.self_id.0)
+                == Some(config.sender.incarnation());
+        let inactive_transport = endpoints_match_process
+            && config.sender.assignment_version() == 0
+            && config.receiver.assignment_version() == 0
+            && config.sender.active_assignment_digest().is_none()
+            && config.receiver.active_assignment_digest().is_none()
+            && !transition.target.contains(config.self_id.0);
+        let installed_owners = installed
+            .owners()
+            .iter()
+            .map(|owner| owner.0)
+            .collect::<Vec<_>>();
+        let bootstrap_pristine = window.is_pristine_for_restore()
+            && !self.whole_restore_applied
+            && self.local_frontier == InputFrontier::default()
+            && self.last_broadcast == InputFrontier::default()
+            && self.effective_frontier == InputFrontier::default()
+            && self.remote_peer_cursor.is_none()
+            && self.queued_payload_bytes == 0
+            && self.queued_event_capacity_bytes == 0
+            && self.queued_remote_events == 0
+            && self.peer_channels.values().all(|channel| {
+                channel.applied == InputFrontier::default()
+                    && channel.accepted == InputFrontier::default()
+                    && channel.events.is_empty()
+            });
+        if transition.target.vnode_count != u32::from(self.key_group_count)
+            || transition.predecessor.vnode_count != u32::from(self.key_group_count)
+            || transition.target.assignment_version != assignment.version()
+            || !transition.target.matches_owner_map(&owners)
+            || transition.predecessor.assignment_version.checked_add(1)
+                != Some(transition.target.assignment_version)
+            || config.sender.recovery_gen() != config.receiver.recovery_gen()
+            || target_contains_self != transition.target.contains(config.self_id.0)
+            || (target_contains_self && !active_transport)
+            || (!target_contains_self && !inactive_transport)
+            || if checkpoint_bootstrap {
+                installed.version() != assignment.version()
+                    || installed.owners() != assignment.owners()
+                    || !bootstrap_pristine
+            } else {
+                transition.predecessor.assignment_version != installed.version()
+                    || !transition.predecessor.matches_owner_map(&installed_owners)
+                    || self.cluster_assignment_digest
+                        != Some(transition.predecessor.assignment_digest)
+            }
+        {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' transition is outside its adjacent assignment",
+                self.op_name
+            )));
+        }
+        self.validate_drained_transition_cut(installed, window, config.self_id)?;
+
+        let predecessor_owned = if !checkpoint_bootstrap
+            && transition
+                .predecessor
+                .participant_incarnation(config.self_id.0)
+                == Some(config.sender.incarnation())
+        {
+            installed
+                .owners()
+                .iter()
+                .enumerate()
+                .filter(|(_, owner)| **owner == config.self_id)
+                .map(|(vnode, _)| {
+                    u32::try_from(vnode).expect("CoreWindow vnode topology must fit u32")
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let target_owned = assignment
+            .owners()
+            .iter()
+            .enumerate()
+            .filter(|(_, owner)| **owner == config.self_id)
+            .map(|(vnode, _)| u32::try_from(vnode).expect("CoreWindow vnode topology must fit u32"))
+            .collect::<Vec<_>>();
+        let expected_revoked = predecessor_owned
+            .iter()
+            .copied()
+            .filter(|vnode| target_owned.binary_search(vnode).is_err())
+            .collect::<rustc_hash::FxHashSet<_>>();
+        let expected_restored = target_owned
+            .iter()
+            .copied()
+            .filter(|vnode| predecessor_owned.binary_search(vnode).is_err())
+            .collect::<Vec<_>>();
+        let restored_vnodes = transition
+            .restores
+            .iter()
+            .map(|restore| restore.vnode)
+            .collect::<Vec<_>>();
+        if transition.revoked != &expected_revoked
+            || restored_vnodes != expected_restored
+            || restored_vnodes.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' transition does not match its exact ownership delta",
+                self.op_name
+            )));
+        }
+
+        let payload_bytes = transition
+            .restores
+            .iter()
+            .map(|restore| restore.state.len())
+            .chain(
+                transition
+                    .whole_restores
+                    .iter()
+                    .map(|restore| restore.state.len()),
+            )
+            .try_fold(0usize, usize::checked_add)
+            .ok_or_else(|| self.accounting_error())?;
+        if payload_bytes > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("managed CoreWindow '{}' transition payload", self.op_name),
+                accounted_bytes: payload_bytes,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+        let fresh_acquirer =
+            !target_owned.is_empty() && (checkpoint_bootstrap || predecessor_owned.is_empty());
+        let handoff_cut = self.portable_handoff_cut(transition)?;
+        if !fresh_acquirer
+            && handoff_cut.is_some_and(|frontier| frontier != self.effective_frontier)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' donor cut does not match the retained owner frontier",
+                self.op_name
+            )));
+        }
+        let transition_frontier = if fresh_acquirer {
+            handoff_cut.ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "managed CoreWindow '{}' fresh owner is missing its portable whole cut",
+                    self.op_name
+                ))
+            })?
+        } else {
+            self.effective_frontier
+        };
+        let final_frontier_ms = Self::frontier_watermark(transition_frontier);
+
+        let mut preflighted = Vec::new();
+        preflighted
+            .try_reserve_exact(transition.restores.len())
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "CoreWindow '{}' could not reserve vnode restore metadata: {error}",
+                    self.op_name
+                ))
+            })?;
+        for restore in transition.restores {
+            let state = window.preflight_vnode_bytes(
+                restore.vnode,
+                transition.target.vnode_count,
+                restore.state,
+            )?;
+            preflighted.push((restore.vnode, state));
+        }
+        let owned_restores = preflighted.into_iter().map(|(vnode, state)| {
+            let state = rkyv::deserialize::<CoreWindowVnodeCheckpoint, rkyv::rancor::Error>(
+                state.checkpoint,
+            )
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "CoreWindow '{}' vnode {vnode} transition deserialization: {error}",
+                    self.op_name
+                ))
+            })?;
+            Ok(crate::core_window_state::OwnedCoreWindowVnodeRestore { vnode, state })
+        });
+        let core = window.prepare_owned_vnode_transition(
+            transition.target.vnode_count,
+            final_frontier_ms,
+            owned_restores,
+            transition.revoked,
+        )?;
+
+        let target_peers = Self::remote_owner_peers(&assignment, config.self_id);
+        let reset_topology = fresh_acquirer || target_owned.is_empty();
+        let mut channels = BTreeMap::new();
+        for &peer in &target_peers {
+            let same_incarnation = transition.predecessor.participant_incarnation(peer)
+                == transition.target.participant_incarnation(peer);
+            let channel = if reset_topology || !same_incarnation {
+                EowcPeerChannel {
+                    applied: transition_frontier,
+                    accepted: transition_frontier,
+                    events: VecDeque::new(),
+                }
+            } else {
+                self.peer_channels.get(&peer).map_or(
+                    EowcPeerChannel {
+                        applied: transition_frontier,
+                        accepted: transition_frontier,
+                        events: VecDeque::new(),
+                    },
+                    |channel| EowcPeerChannel {
+                        applied: channel.applied,
+                        accepted: channel.accepted,
+                        events: VecDeque::new(),
+                    },
+                )
+            };
+            channels.insert(peer, channel);
+        }
+        let local_frontier = if reset_topology {
+            transition_frontier
+        } else if self.local_frontier.idle {
+            InputFrontier {
+                watermark: Self::max_watermark(
+                    self.local_frontier.watermark,
+                    transition_frontier.watermark,
+                ),
+                idle: true,
+            }
+        } else {
+            self.local_frontier
+        };
+        let merged = merge_input_frontier_iter(
+            std::iter::once(local_frontier).chain(channels.values().map(|channel| channel.applied)),
+            i64::MIN,
+        );
+        self.validate_frontier(transition_frontier, merged, "transition target")?;
+        if reset_topology && merged != transition_frontier {
+            return Err(DbError::Checkpoint(format!(
+                "managed CoreWindow '{}' reset target channels do not form the transition cut",
+                self.op_name
+            )));
+        }
+        let last_broadcast = if !target_owned.is_empty()
+            && (!target_peers.is_empty() || merged != transition_frontier)
+        {
+            InputFrontier::default()
+        } else {
+            local_frontier
+        };
+        let prepared = PreparedEowcTransition {
+            core,
+            topology: EowcTransitionTopology {
+                assignment,
+                assignment_digest: transition.target.assignment_digest,
+                peers: target_peers.into(),
+                channels,
+                local_frontier,
+                last_broadcast,
+                effective_frontier: transition_frontier,
+                remote_peer_cursor: None,
+                queued_payload_bytes: 0,
+                queued_event_capacity_bytes: 0,
+                queued_remote_events: 0,
+            },
+        };
+        let accounted = self
+            .checked_live_state_bytes()?
+            .checked_add(payload_bytes)
+            .and_then(|bytes| bytes.checked_add(prepared.accounted_state_bytes()))
+            .ok_or_else(|| self.accounting_error())?;
+        if accounted > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("managed CoreWindow '{}' prepared transition", self.op_name),
+                accounted_bytes: accounted,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+        Ok(prepared)
     }
 }
 
@@ -2004,7 +2587,7 @@ impl GraphOperator for EowcQueryOperator {
             let staged = self
                 .prepared_vnode_transition
                 .as_ref()
-                .map_or(0, PreparedCoreWindowVnodeTransition::accounted_state_bytes);
+                .map_or(0, PreparedEowcTransition::accounted_state_bytes);
             match self.vnode_transition_cleanup.as_ref() {
                 Some(CoreWindowTransitionCleanup::Aborted(cleanup)) => {
                     (staged.saturating_add(cleanup.accounted_state_bytes()), 0)
@@ -2264,14 +2847,11 @@ impl GraphOperator for EowcQueryOperator {
     #[cfg(feature = "cluster")]
     fn restored_output_frontier(&self) -> Option<InputFrontier> {
         self.cluster_scope.as_ref()?;
-        self.whole_restore_applied
-            .then_some(self.effective_frontier)
-            .map(|mut frontier| {
-                if self.queued_remote_events != 0 {
-                    frontier.idle = false;
-                }
-                frontier
-            })
+        let mut frontier = self.effective_frontier;
+        if self.queued_remote_events != 0 {
+            frontier.idle = false;
+        }
+        Some(frontier)
     }
 
     #[cfg(feature = "cluster")]
@@ -2505,50 +3085,7 @@ impl GraphOperator for EowcQueryOperator {
                 self.op_name
             )));
         }
-        self.validate_assignment_target(transition.target)?;
-        let Some(window) = self.state.as_ref() else {
-            return Err(DbError::Checkpoint(format!(
-                "managed CoreWindow transition targeted uninitialized operator '{}'",
-                self.op_name
-            )));
-        };
-        window.validate_vnode_count(transition.target.vnode_count)?;
-
-        let mut preflighted = Vec::new();
-        preflighted
-            .try_reserve_exact(transition.restores.len())
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "CoreWindow '{}' could not reserve vnode restore metadata: {error}",
-                    self.op_name
-                ))
-            })?;
-        for restore in transition.restores {
-            let state = window.preflight_vnode_bytes(
-                restore.vnode,
-                transition.target.vnode_count,
-                restore.state,
-            )?;
-            preflighted.push((restore.vnode, state));
-        }
-        let owned_restores = preflighted.into_iter().map(|(vnode, state)| {
-            let state = rkyv::deserialize::<CoreWindowVnodeCheckpoint, rkyv::rancor::Error>(
-                state.checkpoint,
-            )
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "CoreWindow '{}' vnode {vnode} transition deserialization: {error}",
-                    self.op_name
-                ))
-            })?;
-            Ok(crate::core_window_state::OwnedCoreWindowVnodeRestore { vnode, state })
-        });
-        let prepared = window.prepare_owned_vnode_transition(
-            transition.target.vnode_count,
-            owned_restores,
-            transition.revoked,
-        )?;
-        self.prepared_vnode_transition = Some(prepared);
+        self.prepared_vnode_transition = Some(self.prepare_transition_image(&transition)?);
         Ok(())
     }
 
@@ -2566,7 +3103,7 @@ impl GraphOperator for EowcQueryOperator {
 
     #[cfg(feature = "cluster")]
     fn publish_vnode_transition(&mut self) {
-        let prepared = self
+        let PreparedEowcTransition { core, mut topology } = self
             .prepared_vnode_transition
             .take()
             .expect("managed CoreWindow transition must be prepared before publication");
@@ -2578,8 +3115,46 @@ impl GraphOperator for EowcQueryOperator {
             .state
             .as_mut()
             .expect("managed CoreWindow publication targeted uninitialized state");
-        let retired = window.publish_prepared_vnode_transition(prepared);
-        self.vnode_transition_cleanup = Some(CoreWindowTransitionCleanup::Published(retired));
+        let core = window.publish_prepared_vnode_transition(core);
+        std::mem::swap(
+            self.cluster_assignment
+                .as_mut()
+                .expect("prepared CoreWindow transition has an installed assignment"),
+            &mut topology.assignment,
+        );
+        std::mem::swap(
+            self.cluster_assignment_digest
+                .as_mut()
+                .expect("prepared CoreWindow transition has an assignment digest"),
+            &mut topology.assignment_digest,
+        );
+        std::mem::swap(&mut self.cluster_peers, &mut topology.peers);
+        std::mem::swap(&mut self.peer_channels, &mut topology.channels);
+        std::mem::swap(&mut self.local_frontier, &mut topology.local_frontier);
+        std::mem::swap(&mut self.last_broadcast, &mut topology.last_broadcast);
+        std::mem::swap(
+            &mut self.effective_frontier,
+            &mut topology.effective_frontier,
+        );
+        std::mem::swap(
+            &mut self.remote_peer_cursor,
+            &mut topology.remote_peer_cursor,
+        );
+        std::mem::swap(
+            &mut self.queued_payload_bytes,
+            &mut topology.queued_payload_bytes,
+        );
+        std::mem::swap(
+            &mut self.queued_event_capacity_bytes,
+            &mut topology.queued_event_capacity_bytes,
+        );
+        std::mem::swap(
+            &mut self.queued_remote_events,
+            &mut topology.queued_remote_events,
+        );
+        self.vnode_transition_cleanup = Some(CoreWindowTransitionCleanup::Published(
+            RetiredEowcTransition { core, topology },
+        ));
     }
 
     #[cfg(feature = "cluster")]
@@ -2587,7 +3162,8 @@ impl GraphOperator for EowcQueryOperator {
         match self.vnode_transition_cleanup.take() {
             Some(CoreWindowTransitionCleanup::Aborted(prepared)) => drop(prepared),
             Some(CoreWindowTransitionCleanup::Published(retired)) => {
-                CoreWindowState::finish_vnode_transition(retired);
+                CoreWindowState::finish_vnode_transition(retired.core);
+                drop(retired.topology);
             }
             None => {}
         }
@@ -2664,7 +3240,6 @@ mod core_tests {
 
     #[cfg(feature = "cluster")]
     async fn cluster_scope(owners: [u64; 8]) -> ClusterShuffleConfig {
-        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
         use laminar_core::cluster::control::LeaseDeadline;
         use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
         use laminar_core::state::VnodeRegistry;
@@ -2682,21 +3257,7 @@ mod core_tests {
             .install_process_lease_deadline(Arc::clone(&deadline))
             .unwrap();
         sender.install_process_lease_deadline(deadline).unwrap();
-        let fence = CheckpointAssignmentFence::from_owner_map(
-            registry.assignment_version(),
-            &owners,
-            vec![
-                CheckpointParticipant {
-                    node_id: 1,
-                    boot_incarnation: uuid::Uuid::from_u128(1),
-                },
-                CheckpointParticipant {
-                    node_id: 2,
-                    boot_incarnation: uuid::Uuid::from_u128(2),
-                },
-            ],
-        )
-        .unwrap();
+        let fence = test_assignment_fence(registry.assignment_version(), &owners);
         sender.install_assignment_fence(&fence, &owners).unwrap();
         receiver.install_assignment_fence(&fence, &owners).unwrap();
         ClusterShuffleConfig {
@@ -2705,6 +3266,91 @@ mod core_tests {
             receiver,
             self_id: NodeId(1),
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn test_assignment_fence(
+        assignment_version: u64,
+        owners: &[u64; 8],
+    ) -> CheckpointAssignmentFence {
+        use laminar_core::checkpoint::CheckpointParticipant;
+
+        let participants = owners
+            .iter()
+            .copied()
+            .filter(|node_id| *node_id != 0)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|node_id| CheckpointParticipant {
+                node_id,
+                boot_incarnation: uuid::Uuid::from_u128(u128::from(node_id)),
+            })
+            .collect();
+        CheckpointAssignmentFence::from_owner_map(assignment_version, owners, participants).unwrap()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn install_next_assignment(
+        scope: &ClusterShuffleConfig,
+        owners: [u64; 8],
+    ) -> CheckpointAssignmentFence {
+        let fence = test_assignment_fence(scope.registry.assignment_version() + 1, &owners);
+        scope
+            .sender
+            .install_assignment_fence(&fence, &owners)
+            .unwrap();
+        scope
+            .receiver
+            .install_assignment_fence(&fence, &owners)
+            .unwrap();
+        scope
+            .registry
+            .set_assignment_and_version(Arc::from(owners.map(NodeId)), fence.assignment_version);
+        fence
+    }
+
+    #[cfg(feature = "cluster")]
+    fn encode_handoff_whole(
+        fence: &CheckpointAssignmentFence,
+        participant_id: u64,
+        frontier: InputFrontier,
+        queued: bool,
+    ) -> Vec<u8> {
+        let channels = fence
+            .participant_ids()
+            .into_iter()
+            .filter(|peer| *peer != participant_id)
+            .enumerate()
+            .map(|(index, peer)| EowcCheckpointChannel {
+                peer,
+                applied: frontier.into(),
+                events: if queued && index == 0 {
+                    vec![EowcCheckpointEvent::Frontier {
+                        recovery_gen: 0,
+                        frontier: frontier.into(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect();
+        let checkpoint = EowcOperatorCheckpoint {
+            version: OPERATOR_CHECKPOINT_VERSION,
+            high_watermark_ms: EowcQueryOperator::frontier_watermark(frontier),
+            cluster: Some(EowcClusterCheckpoint {
+                assignment_version: fence.assignment_version,
+                owner_map_digest: fence.assignment_digest,
+                self_id: participant_id,
+                local_frontier: frontier.into(),
+                effective_frontier: frontier.into(),
+                remote_peer_cursor: None,
+                channels,
+                data_ipc: Vec::new(),
+            }),
+        };
+        rkyv::to_bytes::<rkyv::rancor::Error>(&checkpoint)
+            .unwrap()
+            .to_vec()
     }
 
     #[cfg(feature = "cluster")]
@@ -3029,6 +3675,420 @@ mod core_tests {
         assert_eq!(restored.effective_frontier, close);
         assert_eq!(restored.state.as_ref().unwrap().high_watermark_ms(), 60_000);
         assert!(restored.wants_input());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn fresh_owner_reconciles_portable_cut_atomically() {
+        use crate::operator_graph::{ManagedVnodeRestore, ManagedWholeRestore};
+
+        let new_operator = || {
+            EowcQueryOperator::new(
+                "managed_window",
+                AGG_SQL,
+                Some(EmitClause::OnWindowClose),
+                Some(test_window_config()),
+                aggregate_context(),
+                key_groups(),
+                None,
+            )
+        };
+        let cut = InputFrontier {
+            watermark: Some(20_000),
+            idle: false,
+        };
+        let mut donor = new_operator();
+        donor.initialize_managed_state().await.unwrap();
+        let (_, projected) = projected_batch_for_vnode(&donor, 0, 42.0);
+        let output = EowcQueryOperator::apply_routed_and_close(
+            donor.state.as_mut().unwrap(),
+            &[(projected, Some(0))],
+            10_000,
+            "managed_window",
+        )
+        .unwrap();
+        assert!(output.is_empty());
+        let frames = donor
+            .checkpoint_vnodes(&[0, 1], u32::from(key_groups()), u64::MAX)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(materialize_capture)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            frames.iter().map(|(vnode, _)| *vnode).collect::<Vec<_>>(),
+            [0, 1]
+        );
+
+        let target_owners = [1, 1, 2, 2, 2, 2, 2, 2];
+        let scope = cluster_scope(target_owners).await;
+        let target_fence = install_next_assignment(&scope, target_owners);
+        let predecessor_owners = [2, 3, 2, 2, 2, 2, 2, 2];
+        let predecessor =
+            test_assignment_fence(target_fence.assignment_version - 1, &predecessor_owners);
+        let predecessor_nodes = predecessor_owners.map(NodeId);
+
+        let mut target = new_operator();
+        target.initialize_managed_state().await.unwrap();
+        target.attach_cluster_scope(scope);
+        let pristine_core_bytes = target.state.as_ref().unwrap().accounted_state_bytes();
+        let pristine_accounting = target.managed_state_accounting().unwrap();
+        let restores = [
+            ManagedVnodeRestore {
+                participant_id: 2,
+                vnode: 0,
+                state: frames[0].1.as_ref(),
+            },
+            ManagedVnodeRestore {
+                participant_id: 3,
+                vnode: 1,
+                state: frames[1].1.as_ref(),
+            },
+        ];
+
+        let queued_donor = encode_handoff_whole(&predecessor, 2, cut, true);
+        let donor3 = encode_handoff_whole(&predecessor, 3, cut, false);
+        let queued_whole = [
+            ManagedWholeRestore {
+                participant_id: 2,
+                state: &queued_donor,
+            },
+            ManagedWholeRestore {
+                participant_id: 3,
+                state: &donor3,
+            },
+        ];
+        target
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &target_fence,
+                revoked: &rustc_hash::FxHashSet::default(),
+                restores: &restores,
+                whole_restores: &queued_whole,
+                mode: ManagedVnodeTransitionMode::CheckpointBootstrap {
+                    predecessor_owners: &predecessor_nodes,
+                },
+            })
+            .unwrap_err();
+        assert_eq!(
+            target.managed_state_accounting().unwrap(),
+            pristine_accounting
+        );
+        assert_eq!(target.state.as_ref().unwrap().high_watermark_ms(), i64::MIN);
+        assert_eq!(
+            target.cluster_assignment.as_ref().unwrap().version(),
+            target_fence.assignment_version
+        );
+
+        let donor2 = encode_handoff_whole(&predecessor, 2, cut, false);
+        let idle_cut = InputFrontier {
+            watermark: cut.watermark,
+            idle: true,
+        };
+        let idle_donor = encode_handoff_whole(&predecessor, 3, idle_cut, false);
+        let disagreeing_whole = [
+            ManagedWholeRestore {
+                participant_id: 2,
+                state: &donor2,
+            },
+            ManagedWholeRestore {
+                participant_id: 3,
+                state: &idle_donor,
+            },
+        ];
+        target
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &target_fence,
+                revoked: &rustc_hash::FxHashSet::default(),
+                restores: &restores,
+                whole_restores: &disagreeing_whole,
+                mode: ManagedVnodeTransitionMode::CheckpointBootstrap {
+                    predecessor_owners: &predecessor_nodes,
+                },
+            })
+            .unwrap_err();
+        assert_eq!(
+            target.managed_state_accounting().unwrap(),
+            pristine_accounting
+        );
+        assert_eq!(
+            target.state.as_ref().unwrap().accounted_state_bytes(),
+            pristine_core_bytes
+        );
+        assert_eq!(target.local_frontier, InputFrontier::default());
+        assert_eq!(target.effective_frontier, InputFrontier::default());
+        assert_eq!(target.cluster_peers.as_ref(), &[2]);
+
+        let valid_whole = [
+            ManagedWholeRestore {
+                participant_id: 2,
+                state: &donor2,
+            },
+            ManagedWholeRestore {
+                participant_id: 3,
+                state: &donor3,
+            },
+        ];
+        target
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &target_fence,
+                revoked: &rustc_hash::FxHashSet::default(),
+                restores: &restores,
+                whole_restores: &valid_whole,
+                mode: ManagedVnodeTransitionMode::CheckpointBootstrap {
+                    predecessor_owners: &predecessor_nodes,
+                },
+            })
+            .unwrap();
+        assert!(target.managed_state_accounting().unwrap().prepared > 0);
+        assert_eq!(target.state.as_ref().unwrap().high_watermark_ms(), i64::MIN);
+        assert_eq!(
+            target.state.as_ref().unwrap().accounted_state_bytes(),
+            pristine_core_bytes
+        );
+        assert_eq!(target.local_frontier, InputFrontier::default());
+        assert_eq!(
+            target.cluster_assignment.as_ref().unwrap().version(),
+            target_fence.assignment_version
+        );
+
+        target.publish_vnode_transition();
+        assert_eq!(
+            target.cluster_assignment.as_ref().unwrap().version(),
+            target_fence.assignment_version
+        );
+        assert_eq!(
+            target.cluster_assignment.as_ref().unwrap().owners(),
+            target_owners.map(NodeId)
+        );
+        assert_eq!(
+            target.cluster_assignment_digest,
+            Some(target_fence.assignment_digest)
+        );
+        assert_eq!(target.cluster_peers.as_ref(), &[2]);
+        assert_eq!(target.peer_channels.len(), 1);
+        let channel = &target.peer_channels[&2];
+        assert_eq!(channel.applied, cut);
+        assert_eq!(channel.accepted, cut);
+        assert!(channel.events.is_empty());
+        assert_eq!(target.local_frontier, cut);
+        assert_eq!(target.effective_frontier, cut);
+        assert_eq!(target.last_broadcast, InputFrontier::default());
+        assert!(target.checkpoint_drain_pending());
+        assert_eq!(target.remote_peer_cursor, None);
+        assert_eq!(target.queued_payload_bytes, 0);
+        assert_eq!(target.queued_event_capacity_bytes, 0);
+        assert_eq!(target.queued_remote_events, 0);
+        assert_eq!(target.state.as_ref().unwrap().high_watermark_ms(), 20_000);
+        assert!(target.state.as_ref().unwrap().accounted_state_bytes() > pristine_core_bytes);
+        assert!(target.managed_state_accounting().unwrap().retired > 0);
+        target.finish_vnode_transition();
+        assert_eq!(target.managed_state_accounting().unwrap().retired, 0);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn surviving_owner_preserves_channel_and_bootstraps_new_peer() {
+        let predecessor_owners = [1, 2, 1, 4, 1, 5, 1, 5];
+        let scope = cluster_scope(predecessor_owners).await;
+        let predecessor =
+            test_assignment_fence(scope.registry.assignment_version(), &predecessor_owners);
+        let mut operator = EowcQueryOperator::new(
+            "managed_window",
+            AGG_SQL,
+            Some(EmitClause::OnWindowClose),
+            Some(test_window_config()),
+            aggregate_context(),
+            key_groups(),
+            None,
+        );
+        operator.initialize_managed_state().await.unwrap();
+        operator.attach_cluster_scope(scope.clone());
+        let effective = InputFrontier {
+            watermark: Some(100),
+            idle: false,
+        };
+        let local_before = InputFrontier {
+            watermark: Some(80),
+            idle: true,
+        };
+        let local_after = InputFrontier {
+            watermark: Some(100),
+            idle: true,
+        };
+        let surviving = InputFrontier {
+            watermark: Some(120),
+            idle: true,
+        };
+        let restarted = InputFrontier {
+            watermark: Some(140),
+            idle: true,
+        };
+        operator.local_frontier = local_before;
+        operator.last_broadcast = local_before;
+        operator.effective_frontier = effective;
+        operator
+            .state
+            .as_mut()
+            .unwrap()
+            .restore_high_watermark_ms(100)
+            .unwrap();
+        let channel = operator.peer_channels.get_mut(&2).unwrap();
+        channel.applied = surviving;
+        channel.accepted = surviving;
+        let channel = operator.peer_channels.get_mut(&4).unwrap();
+        channel.applied = restarted;
+        channel.accepted = restarted;
+        let channel = operator.peer_channels.get_mut(&5).unwrap();
+        channel.applied = effective;
+        channel.accepted = effective;
+
+        let target_owners = [1, 2, 1, 4, 1, 3, 1, 3];
+        let mut target =
+            test_assignment_fence(scope.registry.assignment_version() + 1, &target_owners);
+        target
+            .participants
+            .iter_mut()
+            .find(|participant| participant.node_id == 4)
+            .unwrap()
+            .boot_incarnation = uuid::Uuid::from_u128(44);
+        scope
+            .sender
+            .install_assignment_fence(&target, &target_owners)
+            .unwrap();
+        scope
+            .receiver
+            .install_assignment_fence(&target, &target_owners)
+            .unwrap();
+        scope.registry.set_assignment_and_version(
+            Arc::from(target_owners.map(NodeId)),
+            target.assignment_version,
+        );
+        operator
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &target,
+                revoked: &rustc_hash::FxHashSet::default(),
+                restores: &[],
+                whole_restores: &[],
+                mode: ManagedVnodeTransitionMode::Live,
+            })
+            .unwrap();
+        assert_eq!(
+            operator.cluster_assignment.as_ref().unwrap().version(),
+            predecessor.assignment_version
+        );
+        assert_eq!(operator.cluster_peers.as_ref(), &[2, 4, 5]);
+        assert!(!operator.peer_channels.contains_key(&3));
+        assert_eq!(operator.peer_channels[&2].applied, surviving);
+        assert_eq!(operator.peer_channels[&4].applied, restarted);
+        assert_eq!(operator.peer_channels[&5].applied, effective);
+        assert_eq!(operator.local_frontier, local_before);
+        assert_eq!(operator.last_broadcast, local_before);
+        assert_eq!(operator.effective_frontier, effective);
+        assert_eq!(operator.state.as_ref().unwrap().high_watermark_ms(), 100);
+
+        operator.publish_vnode_transition();
+        assert_eq!(
+            operator.cluster_assignment.as_ref().unwrap().version(),
+            target.assignment_version
+        );
+        assert_eq!(
+            operator.cluster_assignment.as_ref().unwrap().owners(),
+            target_owners.map(NodeId)
+        );
+        assert_eq!(
+            operator.cluster_assignment_digest,
+            Some(target.assignment_digest)
+        );
+        assert_eq!(operator.cluster_peers.as_ref(), &[2, 3, 4]);
+        assert_eq!(operator.peer_channels.len(), 3);
+        let surviving_channel = &operator.peer_channels[&2];
+        assert_eq!(surviving_channel.applied, surviving);
+        assert_eq!(surviving_channel.accepted, surviving);
+        assert!(surviving_channel.events.is_empty());
+        let new_channel = &operator.peer_channels[&3];
+        assert_eq!(new_channel.applied, effective);
+        assert_eq!(new_channel.accepted, effective);
+        assert!(new_channel.events.is_empty());
+        let restarted_channel = &operator.peer_channels[&4];
+        assert_eq!(restarted_channel.applied, effective);
+        assert_eq!(restarted_channel.accepted, effective);
+        assert!(restarted_channel.events.is_empty());
+        assert!(!operator.peer_channels.contains_key(&5));
+        assert_eq!(operator.local_frontier, local_after);
+        assert_eq!(operator.effective_frontier, effective);
+        assert_eq!(operator.last_broadcast, InputFrontier::default());
+        assert!(operator.checkpoint_drain_pending());
+        assert_eq!(
+            operator
+                .normalized_local_frontier(local_before, false)
+                .unwrap(),
+            local_after
+        );
+        assert_eq!(
+            operator
+                .normalized_local_frontier(
+                    InputFrontier {
+                        watermark: Some(90),
+                        idle: false,
+                    },
+                    false,
+                )
+                .unwrap(),
+            effective
+        );
+        assert_eq!(operator.remote_peer_cursor, None);
+        assert_eq!(operator.queued_payload_bytes, 0);
+        assert_eq!(operator.queued_event_capacity_bytes, 0);
+        assert_eq!(operator.queued_remote_events, 0);
+        assert_eq!(operator.state.as_ref().unwrap().high_watermark_ms(), 100);
+        operator.finish_vnode_transition();
+        assert_eq!(operator.managed_state_accounting().unwrap().retired, 0);
+
+        operator.last_broadcast = operator.local_frontier;
+        let exit_owners = [2, 2, 3, 4, 2, 3, 4, 2];
+        let exit = test_assignment_fence(scope.registry.assignment_version() + 1, &exit_owners);
+        scope.sender.invalidate_assignment_fence();
+        scope.receiver.invalidate_assignment_fence();
+        scope.registry.set_assignment_and_version(
+            Arc::from(exit_owners.map(NodeId)),
+            exit.assignment_version,
+        );
+        let revoked = [0_u32, 2, 4, 6]
+            .into_iter()
+            .collect::<rustc_hash::FxHashSet<_>>();
+        operator
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &target,
+                target: &exit,
+                revoked: &revoked,
+                restores: &[],
+                whole_restores: &[],
+                mode: ManagedVnodeTransitionMode::Live,
+            })
+            .unwrap();
+        operator.publish_vnode_transition();
+        assert_eq!(operator.cluster_peers.as_ref(), &[2, 3, 4]);
+        assert!(operator.peer_channels.values().all(|channel| {
+            channel.applied == effective
+                && channel.accepted == effective
+                && channel.events.is_empty()
+        }));
+        assert_eq!(operator.local_frontier, effective);
+        assert_eq!(operator.effective_frontier, effective);
+        assert_eq!(operator.last_broadcast, effective);
+        assert!(!operator.checkpoint_drain_pending());
+        operator
+            .validate_drained_transition_cut(
+                operator.cluster_assignment.as_ref().unwrap(),
+                operator.state.as_ref().unwrap(),
+                NodeId(1),
+            )
+            .unwrap();
+        operator.finish_vnode_transition();
     }
 
     #[tokio::test]
