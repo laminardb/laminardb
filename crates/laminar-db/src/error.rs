@@ -97,6 +97,9 @@ pub enum DbError {
     /// Pipeline error (start/shutdown lifecycle)
     Pipeline(String),
 
+    /// A deterministic record-path failure that retry or checkpoint recovery cannot repair.
+    PipelineTerminal(String),
+
     /// `BackpressurePolicy::Fail` tripped; coordinator halts the pipeline.
     BackpressureFail(String),
 
@@ -230,6 +233,7 @@ impl DbError {
             Self::UnresolvedConfigVar(_) => error_codes::UNRESOLVED_CONFIG_VAR,
             Self::Connector(_) | Self::ConnectorOp(_) => error_codes::CONNECTOR_CONNECTION_FAILED,
             Self::Pipeline(_)
+            | Self::PipelineTerminal(_)
             | Self::BackpressureFail(_)
             | Self::ShuffleNotReady(_)
             | Self::ShuffleTerminal(_)
@@ -254,7 +258,8 @@ impl DbError {
     pub fn requires_pipeline_halt(&self) -> bool {
         matches!(
             self,
-            Self::BackpressureFail(_)
+            Self::PipelineTerminal(_)
+                | Self::BackpressureFail(_)
                 | Self::ShuffleTerminal(_)
                 | Self::ManagedStateBudgetExceeded { .. }
         )
@@ -377,6 +382,9 @@ impl std::fmt::Display for DbError {
             }
             Self::Pipeline(msg) => {
                 write!(f, "[{}] Pipeline error: {msg}", self.code())
+            }
+            Self::PipelineTerminal(msg) => {
+                write!(f, "[{}] Terminal pipeline error: {msg}", self.code())
             }
             Self::BackpressureFail(msg) => {
                 write!(f, "[{}] Backpressure fail: {msg}", self.code())

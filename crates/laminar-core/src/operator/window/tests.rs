@@ -43,6 +43,36 @@ fn test_tumbling_assigner_offset() {
 }
 
 #[test]
+fn test_tumbling_try_assign_exact_i64_boundaries() {
+    let wide = TumblingWindowAssigner::from_millis(1).with_offset_ms(i64::MAX);
+    assert_eq!(
+        wide.try_assign(i64::MIN).unwrap(),
+        WindowId::new(i64::MIN, i64::MIN + 1)
+    );
+
+    let low = TumblingWindowAssigner::from_millis(2).with_offset_ms(i64::MIN + 2);
+    assert_eq!(
+        low.try_assign(i64::MIN + 1).unwrap(),
+        WindowId::new(i64::MIN, i64::MIN + 2)
+    );
+
+    let high = TumblingWindowAssigner::from_millis(2).with_offset_ms(i64::MAX - 2);
+    assert_eq!(
+        high.try_assign(i64::MAX - 1).unwrap(),
+        WindowId::new(i64::MAX - 2, i64::MAX)
+    );
+}
+
+#[test]
+fn test_tumbling_try_assign_rejects_unrepresentable_boundaries() {
+    let low = TumblingWindowAssigner::from_millis(2).with_offset_ms(i64::MAX);
+    assert!(low.try_assign(i64::MIN).is_err());
+
+    let high = TumblingWindowAssigner::from_millis(2).with_offset_ms(i64::MIN);
+    assert!(high.try_assign(i64::MAX).is_err());
+}
+
+#[test]
 fn test_window_assigner_trait() {
     let a = TumblingWindowAssigner::from_millis(1000);
     let windows = a.assign_windows(500);

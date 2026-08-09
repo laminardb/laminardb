@@ -18,7 +18,7 @@ use datafusion_common::{DFSchema, ScalarValue};
 use datafusion_optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 
 use laminar_core::operator::sliding_window::SlidingWindowAssigner;
-use laminar_core::operator::window::{TumblingWindowAssigner, WindowAssigner};
+use laminar_core::operator::window::TumblingWindowAssigner;
 use laminar_core::state::{KeyGroupCount, PartitionKeyCodecV1};
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{WindowOperatorConfig, WindowType};
@@ -35,6 +35,7 @@ use crate::error::DbError;
 const NULL_TIMESTAMP: i64 = i64::MIN;
 // Conservative sparse-node envelope used for managed-state admission, not RSS reporting.
 const BTREE_ENTRY_CHARGE: usize = 512;
+const MAX_HOP_WINDOWS_PER_EVENT: i64 = 128;
 
 fn extract_i64_timestamps(batch: &RecordBatch, col_index: usize) -> Result<Vec<i64>, DbError> {
     use arrow::array::{Array, Int64Array};
@@ -50,11 +51,17 @@ fn extract_i64_timestamps(batch: &RecordBatch, col_index: usize) -> Result<Vec<i
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| DbError::Pipeline("expected Int64Array".to_string()))?;
             for i in 0..arr.len() {
-                result.push(if arr.is_null(i) {
-                    NULL_TIMESTAMP
+                if arr.is_null(i) {
+                    result.push(NULL_TIMESTAMP);
                 } else {
-                    arr.value(i)
-                });
+                    let timestamp = arr.value(i);
+                    if timestamp == NULL_TIMESTAMP {
+                        return Err(DbError::PipelineTerminal(
+                            "event timestamp i64::MIN is reserved for null values".into(),
+                        ));
+                    }
+                    result.push(timestamp);
+                }
             }
         }
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
@@ -65,11 +72,17 @@ fn extract_i64_timestamps(batch: &RecordBatch, col_index: usize) -> Result<Vec<i
                     DbError::Pipeline("expected TimestampMillisecondArray".to_string())
                 })?;
             for i in 0..arr.len() {
-                result.push(if arr.is_null(i) {
-                    NULL_TIMESTAMP
+                if arr.is_null(i) {
+                    result.push(NULL_TIMESTAMP);
                 } else {
-                    arr.value(i)
-                });
+                    let timestamp = arr.value(i);
+                    if timestamp == NULL_TIMESTAMP {
+                        return Err(DbError::PipelineTerminal(
+                            "event timestamp i64::MIN is reserved for null values".into(),
+                        ));
+                    }
+                    result.push(timestamp);
+                }
             }
         }
         DataType::Timestamp(TimeUnit::Second, _) => {
@@ -78,11 +91,16 @@ fn extract_i64_timestamps(batch: &RecordBatch, col_index: usize) -> Result<Vec<i
                 .downcast_ref::<arrow::array::TimestampSecondArray>()
                 .ok_or_else(|| DbError::Pipeline("expected TimestampSecondArray".to_string()))?;
             for i in 0..arr.len() {
-                result.push(if arr.is_null(i) {
-                    NULL_TIMESTAMP
+                if arr.is_null(i) {
+                    result.push(NULL_TIMESTAMP);
                 } else {
-                    arr.value(i).saturating_mul(1000)
-                });
+                    let seconds = arr.value(i);
+                    result.push(seconds.checked_mul(1000).ok_or_else(|| {
+                        DbError::PipelineTerminal(format!(
+                            "event timestamp {seconds}s does not fit millisecond precision"
+                        ))
+                    })?);
+                }
             }
         }
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
@@ -96,7 +114,7 @@ fn extract_i64_timestamps(batch: &RecordBatch, col_index: usize) -> Result<Vec<i
                 result.push(if arr.is_null(i) {
                     NULL_TIMESTAMP
                 } else {
-                    arr.value(i) / 1000
+                    arr.value(i).div_euclid(1000)
                 });
             }
         }
@@ -111,7 +129,7 @@ fn extract_i64_timestamps(batch: &RecordBatch, col_index: usize) -> Result<Vec<i
                 result.push(if arr.is_null(i) {
                     NULL_TIMESTAMP
                 } else {
-                    arr.value(i) / 1_000_000
+                    arr.value(i).div_euclid(1_000_000)
                 });
             }
         }
@@ -423,7 +441,12 @@ impl CoreWindowState {
         emit_clause: Option<&EmitClause>,
         key_group_count: KeyGroupCount,
     ) -> Result<Option<Self>, DbError> {
-        let size_ms = i64::try_from(window_config.size.as_millis()).unwrap_or(i64::MAX);
+        let size_ms = i64::try_from(window_config.size.as_millis()).map_err(|_| {
+            DbError::Unsupported(format!(
+                "[{}] window size exceeds the i64 millisecond timestamp range",
+                laminar_core::error_codes::SQL_UNSUPPORTED,
+            ))
+        })?;
 
         let offset_ms = window_config.offset_ms;
         let assigner = match window_config.window_type {
@@ -449,18 +472,23 @@ impl CoreWindowState {
                         .map_or(window_config.size, |s| s)
                         .as_millis(),
                 )
-                .unwrap_or(i64::MAX);
+                .map_err(|_| {
+                    DbError::Unsupported(format!(
+                        "[{}] hopping window slide exceeds the i64 millisecond timestamp range",
+                        laminar_core::error_codes::SQL_UNSUPPORTED,
+                    ))
+                })?;
                 if size_ms <= 0 || slide_ms <= 0 || slide_ms > size_ms {
                     return Ok(None);
                 }
-                // OOM guard: cap windows-per-event (Flink/RW also warn here).
                 let wpe = (size_ms - 1) / slide_ms + 1;
-                if wpe > 10_000 {
+                if wpe > MAX_HOP_WINDOWS_PER_EVENT {
                     return Err(DbError::Unsupported(format!(
                         "[{}] hopping window size/slide ratio is {wpe} (size={size_ms}ms, \
                          slide={slide_ms}ms); each event would be assigned to that many \
-                         open windows. Cap is 10000 — widen `slide` or narrow `size`.",
-                        laminar_core::error_codes::SQL_UNSUPPORTED
+                         open windows. Cap is {MAX_HOP_WINDOWS_PER_EVENT} — widen `slide` or \
+                         narrow `size`.",
+                        laminar_core::error_codes::SQL_UNSUPPORTED,
                     )));
                 }
                 CoreWindowAssigner::Hopping(
@@ -474,12 +502,27 @@ impl CoreWindowState {
                         .map_or(std::time::Duration::ZERO, |g| g)
                         .as_millis(),
                 )
-                .unwrap_or(0);
+                .map_err(|_| {
+                    DbError::Unsupported(format!(
+                        "[{}] session window gap exceeds the i64 millisecond timestamp range",
+                        laminar_core::error_codes::SQL_UNSUPPORTED,
+                    ))
+                })?;
                 if gap_ms <= 0 {
                     return Ok(None);
                 }
                 CoreWindowAssigner::Session { gap_ms }
             }
+        };
+        let allowed_lateness_ms = if matches!(emit_clause, Some(EmitClause::Final)) {
+            0
+        } else {
+            i64::try_from(window_config.allowed_lateness.as_millis()).map_err(|_| {
+                DbError::Unsupported(format!(
+                    "[{}] allowed lateness exceeds the i64 millisecond timestamp range",
+                    laminar_core::error_codes::SQL_UNSUPPORTED,
+                ))
+            })?
         };
 
         let df = ctx
@@ -849,12 +892,7 @@ impl CoreWindowState {
             now_filter_cache: None,
             having_filter,
             max_groups_per_window: 1_000_000,
-            // EMIT FINAL drops late data; force lateness to 0.
-            allowed_lateness_ms: if matches!(emit_clause, Some(EmitClause::Final)) {
-                0
-            } else {
-                i64::try_from(window_config.allowed_lateness.as_millis()).unwrap_or(0)
-            },
+            allowed_lateness_ms,
             high_watermark_ms: i64::MIN,
             post_projection,
             prom: None,
@@ -1263,7 +1301,14 @@ impl CoreWindowState {
             let idx = row_idx as u32;
             match &self.assigner {
                 CoreWindowAssigner::Tumbling(a) => {
-                    let ws = a.assign(ts_ms).start;
+                    let ws = a
+                        .try_assign(ts_ms)
+                        .map_err(|error| {
+                            DbError::PipelineTerminal(format!(
+                                "Core tumbling window assignment failed: {error}"
+                            ))
+                        })?
+                        .start;
                     if self.is_window_closed(ws) {
                         self.record_late_drop(1);
                         continue;
@@ -1271,7 +1316,12 @@ impl CoreWindowState {
                     grouped.entry(ws).or_default().push(idx);
                 }
                 CoreWindowAssigner::Hopping(a) => {
-                    for wid in a.assign_windows(ts_ms) {
+                    let windows = a.try_iter_windows(ts_ms).map_err(|error| {
+                        DbError::PipelineTerminal(format!(
+                            "Core hopping window assignment failed: {error}"
+                        ))
+                    })?;
+                    for wid in windows {
                         if self.is_window_closed(wid.start) {
                             self.record_late_drop(1);
                             continue;
@@ -1354,7 +1404,14 @@ impl CoreWindowState {
             let (gid, idx) = (gid as u32, row_idx as u32);
             match &self.assigner {
                 CoreWindowAssigner::Tumbling(a) => {
-                    let ws = a.assign(ts_ms).start;
+                    let ws = a
+                        .try_assign(ts_ms)
+                        .map_err(|error| {
+                            DbError::PipelineTerminal(format!(
+                                "Core tumbling window assignment failed: {error}"
+                            ))
+                        })?
+                        .start;
                     if self.is_window_closed(ws) {
                         self.record_late_drop(1);
                         continue;
@@ -1362,7 +1419,12 @@ impl CoreWindowState {
                     grouped.entry((vnode, ws, gid)).or_default().push(idx);
                 }
                 CoreWindowAssigner::Hopping(a) => {
-                    for wid in a.assign_windows(ts_ms) {
+                    let windows = a.try_iter_windows(ts_ms).map_err(|error| {
+                        DbError::PipelineTerminal(format!(
+                            "Core hopping window assignment failed: {error}"
+                        ))
+                    })?;
+                    for wid in windows {
                         if self.is_window_closed(wid.start) {
                             self.record_late_drop(1);
                             continue;
@@ -1502,7 +1564,11 @@ impl CoreWindowState {
         index_array: &arrow::array::UInt32Array,
     ) -> Result<(), DbError> {
         let new_start = ts_ms;
-        let new_end = ts_ms.saturating_add(gap_ms);
+        let new_end = ts_ms.checked_add(gap_ms).ok_or_else(|| {
+            DbError::PipelineTerminal(format!(
+                "Core session window ending at {ts_ms} + {gap_ms}ms does not fit in i64"
+            ))
+        })?;
         let allowed_lateness_ms = self.allowed_lateness_ms;
 
         let mut overlapping: smallvec::SmallVec<[i64; 2]> = self.vnode_states[vnode as usize]
@@ -2300,20 +2366,29 @@ impl CoreWindowState {
                 "window boundary output is not a microsecond timestamp".into(),
             ));
         };
+        let to_micros = |value: i64| {
+            value.checked_mul(1000).ok_or_else(|| {
+                DbError::PipelineTerminal(format!(
+                    "window boundary {value}ms does not fit microsecond precision"
+                ))
+            })
+        };
         let array = match boundaries {
             WindowBoundaryValues::Fixed {
                 start: window_start,
                 end: window_end,
                 rows,
             } => arrow::array::TimestampMicrosecondArray::from_value(
-                (if start { *window_start } else { *window_end }).saturating_mul(1000),
+                to_micros(if start { *window_start } else { *window_end })?,
                 *rows,
             ),
             WindowBoundaryValues::PerRow { starts, ends } => {
                 let values = if start { *starts } else { *ends };
-                arrow::array::TimestampMicrosecondArray::from_iter_values(
-                    values.iter().map(|value| value.saturating_mul(1000)),
-                )
+                let micros = values
+                    .iter()
+                    .map(|&value| to_micros(value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                arrow::array::TimestampMicrosecondArray::from(micros)
             }
         }
         .with_timezone_opt(timezone.clone());
@@ -2339,12 +2414,17 @@ impl CoreWindowState {
         if self.group_output_sources.len() == self.num_group_cols {
             return Ok(Some(batch));
         }
+        let window_end = window_start.checked_add(window_size_ms).ok_or_else(|| {
+            DbError::PipelineTerminal(format!(
+                "window ending at {window_start} + {window_size_ms}ms does not fit in i64"
+            ))
+        })?;
 
         let mut columns = self.output_group_arrays(
             &batch.columns()[..self.num_group_cols],
             &WindowBoundaryValues::Fixed {
                 start: window_start,
-                end: window_start.saturating_add(window_size_ms),
+                end: window_end,
                 rows: batch.num_rows(),
             },
         )?;
@@ -2825,11 +2905,14 @@ impl CoreWindowState {
                     wc.window_start
                 )));
             }
+            let window_end = wc.window_start.checked_add(size_ms).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "fixed-window checkpoint start {} cannot fit its {size_ms}ms size",
+                    wc.window_start
+                ))
+            })?;
             if checkpoint.frontier_floor_ms != i64::MIN
-                && wc
-                    .window_start
-                    .saturating_add(size_ms)
-                    .saturating_add(self.allowed_lateness_ms)
+                && window_end.saturating_add(self.allowed_lateness_ms)
                     <= checkpoint.frontier_floor_ms
             {
                 return Err(DbError::Checkpoint(format!(
@@ -2932,7 +3015,13 @@ impl CoreWindowState {
             let mut sessions = BTreeMap::new();
             let mut previous_end = None;
             for sc in &sgc.sessions {
-                if sc.end < sc.start.saturating_add(gap_ms) {
+                let minimum_end = sc.start.checked_add(gap_ms).ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "session checkpoint interval starting at {} cannot fit its {gap_ms}ms gap",
+                        sc.start
+                    ))
+                })?;
+                if sc.end < minimum_end {
                     return Err(DbError::Checkpoint(format!(
                         "session checkpoint contains invalid interval [{}, {})",
                         sc.start, sc.end
@@ -3990,6 +4079,55 @@ mod tests {
         KeyGroupCount::try_from(1_u16).unwrap()
     }
 
+    #[test]
+    fn timestamp_extraction_rejects_reserved_and_overflowing_values() {
+        fn batch(array: ArrayRef) -> RecordBatch {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                array.data_type().clone(),
+                true,
+            )]));
+            RecordBatch::try_new(schema, vec![array]).unwrap()
+        }
+
+        let nullable = batch(Arc::new(Int64Array::from(vec![Some(42), None])));
+        assert_eq!(
+            extract_i64_timestamps(&nullable, 0).unwrap(),
+            [42, NULL_TIMESTAMP]
+        );
+
+        let reserved = [
+            batch(Arc::new(Int64Array::from(vec![i64::MIN]))),
+            batch(Arc::new(arrow::array::TimestampMillisecondArray::from(
+                vec![i64::MIN],
+            ))),
+        ];
+        for batch in reserved {
+            let error = extract_i64_timestamps(&batch, 0).unwrap_err();
+            assert!(matches!(&error, DbError::PipelineTerminal(_)));
+            assert!(error.requires_pipeline_halt());
+        }
+
+        let overflowing_seconds = batch(Arc::new(arrow::array::TimestampSecondArray::from(vec![
+            i64::MAX,
+        ])));
+        let error = extract_i64_timestamps(&overflowing_seconds, 0).unwrap_err();
+        assert!(matches!(&error, DbError::PipelineTerminal(_)));
+        assert!(error.requires_pipeline_halt());
+
+        let negative_submillisecond = [
+            batch(Arc::new(arrow::array::TimestampMicrosecondArray::from(
+                vec![-1],
+            ))),
+            batch(Arc::new(arrow::array::TimestampNanosecondArray::from(
+                vec![-1],
+            ))),
+        ];
+        for batch in negative_submillisecond {
+            assert_eq!(extract_i64_timestamps(&batch, 0).unwrap(), [-1]);
+        }
+    }
+
     fn checkpoint_all(state: &mut CoreWindowState) -> Vec<(u32, CoreWindowVnodeCheckpoint)> {
         let vnode_count = u32::from(state.key_group_count());
         let vnodes = (0..vnode_count).collect::<Vec<_>>();
@@ -4427,6 +4565,42 @@ mod tests {
             result.is_none(),
             "Sliding with slide > size should return None"
         );
+
+        let maximum_fanout = WindowOperatorConfig {
+            size: Duration::from_secs(128),
+            slide: Some(Duration::from_secs(1)),
+            ..window_config.clone()
+        };
+        assert!(
+            CoreWindowState::try_from_sql(&ctx, sql, &maximum_fanout, None, key_groups())
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let excessive_fanout = WindowOperatorConfig {
+            size: Duration::from_secs(129),
+            ..maximum_fanout
+        };
+        let error = CoreWindowState::try_from_sql(&ctx, sql, &excessive_fanout, None, key_groups())
+            .await
+            .err()
+            .expect("excessive hopping fan-out must be rejected");
+        assert!(error.to_string().contains("Cap is 128"));
+
+        let excessive_lateness = WindowOperatorConfig {
+            window_type: WindowType::Tumbling,
+            size: Duration::from_secs(1),
+            slide: None,
+            allowed_lateness: Duration::from_secs(u64::try_from(i64::MAX).unwrap() / 1000 + 1),
+            ..window_config
+        };
+        let error =
+            CoreWindowState::try_from_sql(&ctx, sql, &excessive_lateness, None, key_groups())
+                .await
+                .err()
+                .expect("excessive allowed lateness must be rejected");
+        assert!(error.to_string().contains("allowed lateness exceeds"));
     }
 
     #[tokio::test]
@@ -5097,6 +5271,20 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(total.value(0), 60);
+    }
+
+    #[test]
+    fn session_window_rejects_unrepresentable_end_before_mutation() {
+        let mut state = make_session_core_window_state(1);
+        let baseline = state.accounted_state_bytes();
+        let batch = make_pre_agg_batch(vec!["AAPL"], vec![10], vec![i64::MAX]);
+
+        let error = state.update_batch(&batch).unwrap_err();
+
+        assert!(matches!(&error, DbError::PipelineTerminal(_)));
+        assert!(error.requires_pipeline_halt());
+        assert_eq!(session_group_count(&state), 0);
+        assert_eq!(state.accounted_state_bytes(), baseline);
     }
 
     #[test]

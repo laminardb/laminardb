@@ -1,19 +1,52 @@
 //! Sliding (hopping) window assigner.
 
-use super::window::{WindowAssigner, WindowId, WindowIdVec};
+use super::window::{WindowAssigner, WindowAssignmentError, WindowId, WindowIdVec};
 use std::time::Duration;
+
+/// Lazy sliding-window assignments for one timestamp.
+#[derive(Debug, Clone)]
+pub struct SlidingWindowIter {
+    next_start: i64,
+    size_ms: i64,
+    slide_ms: i64,
+    remaining: usize,
+}
+
+impl Iterator for SlidingWindowIter {
+    type Item = WindowId;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        let start = self.next_start;
+        self.remaining -= 1;
+        if self.remaining != 0 {
+            self.next_start += self.slide_ms;
+        }
+        Some(WindowId::new(start, start + self.size_ms))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for SlidingWindowIter {}
 
 /// Sliding window assigner.
 ///
 /// Each event is assigned to one or more overlapping windows.
-/// The number of windows per event is `ceil(size / slide)`.
+/// The maximum number of windows per event is `ceil(size / slide)`.
 #[derive(Debug, Clone)]
 pub struct SlidingWindowAssigner {
     /// Window size in milliseconds
     size_ms: i64,
     /// Slide interval in milliseconds
     slide_ms: i64,
-    /// Number of windows per event (cached for performance)
+    /// Maximum windows per event (cached for admission)
     windows_per_event: usize,
     /// Offset in milliseconds for timezone-aligned windows
     offset_ms: i64,
@@ -37,7 +70,7 @@ impl SlidingWindowAssigner {
             "Slide must not exceed size (use tumbling windows for non-overlapping)"
         );
 
-        let windows_per_event = usize::try_from((size_ms + slide_ms - 1) / slide_ms)
+        let windows_per_event = usize::try_from(1 + (size_ms - 1) / slide_ms)
             .expect("Windows per event should fit in usize");
 
         Self {
@@ -54,7 +87,6 @@ impl SlidingWindowAssigner {
     ///
     /// Panics if size or slide is zero/negative, or if slide > size.
     #[must_use]
-    #[allow(clippy::cast_sign_loss)]
     pub fn from_millis(size_ms: i64, slide_ms: i64) -> Self {
         assert!(size_ms > 0, "Window size must be positive");
         assert!(slide_ms > 0, "Slide interval must be positive");
@@ -63,8 +95,8 @@ impl SlidingWindowAssigner {
             "Slide must not exceed size (use tumbling windows for non-overlapping)"
         );
 
-        let windows_per_event =
-            usize::try_from((size_ms + slide_ms - 1) / slide_ms).unwrap_or(usize::MAX);
+        let windows_per_event = usize::try_from(1 + (size_ms - 1) / slide_ms)
+            .expect("Windows per event should fit in usize");
 
         Self {
             size_ms,
@@ -93,7 +125,7 @@ impl SlidingWindowAssigner {
         self.slide_ms
     }
 
-    /// Returns the number of windows each event belongs to.
+    /// Returns the maximum number of windows an event can belong to.
     #[must_use]
     pub fn windows_per_event(&self) -> usize {
         self.windows_per_event
@@ -105,17 +137,77 @@ impl SlidingWindowAssigner {
         self.offset_ms
     }
 
-    /// Computes the last window start that could contain this timestamp.
+    /// Iterates over containing windows in ascending start-time order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any required boundary is outside the `i64` timestamp range.
     #[inline]
-    fn last_window_start(&self, timestamp: i64) -> i64 {
-        let adjusted = timestamp - self.offset_ms;
-        let base = if adjusted >= 0 {
-            (adjusted / self.slide_ms) * self.slide_ms
-        } else {
-            (adjusted.saturating_sub(self.slide_ms).saturating_add(1) / self.slide_ms)
-                * self.slide_ms
-        };
-        base + self.offset_ms
+    pub fn try_iter_windows(
+        &self,
+        timestamp: i64,
+    ) -> Result<SlidingWindowIter, WindowAssignmentError> {
+        if let Some(adjusted) = timestamp.checked_sub(self.offset_ms) {
+            let quotient = adjusted.div_euclid(self.slide_ms);
+            if let Some(last_start) = quotient
+                .checked_mul(self.slide_ms)
+                .and_then(|start| start.checked_add(self.offset_ms))
+            {
+                let since_last_start = timestamp - last_start;
+                let preceding_windows = (self.size_ms - since_last_start - 1) / self.slide_ms;
+                let size_remainder = self.size_ms % self.slide_ms;
+                let remaining = self.windows_per_event
+                    - usize::from(size_remainder != 0 && since_last_start >= size_remainder);
+                if let (Some(first_start), Some(_)) = (
+                    preceding_windows
+                        .checked_mul(self.slide_ms)
+                        .and_then(|delta| last_start.checked_sub(delta)),
+                    last_start.checked_add(self.size_ms),
+                ) {
+                    return Ok(SlidingWindowIter {
+                        next_start: first_start,
+                        size_ms: self.size_ms,
+                        slide_ms: self.slide_ms,
+                        remaining,
+                    });
+                }
+            }
+        }
+
+        self.iter_windows_wide(timestamp)
+    }
+
+    #[cold]
+    fn iter_windows_wide(
+        &self,
+        timestamp: i64,
+    ) -> Result<SlidingWindowIter, WindowAssignmentError> {
+        let timestamp_wide = i128::from(timestamp);
+        let size_ms = i128::from(self.size_ms);
+        let slide_ms = i128::from(self.slide_ms);
+        let offset_ms = i128::from(self.offset_ms);
+        let adjusted = timestamp_wide - offset_ms;
+        let last_start = adjusted.div_euclid(slide_ms) * slide_ms + offset_ms;
+        let since_last_start = timestamp_wide - last_start;
+        let preceding_windows = (size_ms - since_last_start - 1) / slide_ms;
+        let first_start = last_start - preceding_windows * slide_ms;
+        let last_end = last_start + size_ms;
+        let size_remainder = size_ms % slide_ms;
+        let remaining = self.windows_per_event
+            - usize::from(size_remainder != 0 && since_last_start >= size_remainder);
+
+        let first_start = i64::try_from(first_start).map_err(|_| {
+            WindowAssignmentError::new(timestamp, first_start, first_start + size_ms)
+        })?;
+        i64::try_from(last_end)
+            .map_err(|_| WindowAssignmentError::new(timestamp, last_start, last_end))?;
+
+        Ok(SlidingWindowIter {
+            next_start: first_start,
+            size_ms: self.size_ms,
+            slide_ms: self.slide_ms,
+            remaining,
+        })
     }
 }
 
@@ -125,23 +217,9 @@ impl WindowAssigner for SlidingWindowAssigner {
     /// Returns windows in order from earliest to latest start time.
     #[inline]
     fn assign_windows(&self, timestamp: i64) -> WindowIdVec {
-        let mut windows = WindowIdVec::new();
-
-        let last_start = self.last_window_start(timestamp);
-
-        let mut window_start = last_start;
-        while window_start + self.size_ms > timestamp {
-            let window_end = window_start + self.size_ms;
-            windows.push(WindowId::new(window_start, window_end));
-            let prev = window_start;
-            window_start = window_start.saturating_sub(self.slide_ms);
-            if window_start == prev {
-                break;
-            }
-        }
-
-        windows.reverse();
-        windows
+        self.try_iter_windows(timestamp)
+            .expect("sliding window boundaries must fit in i64")
+            .collect()
     }
 
     fn max_timestamp(&self, window_end: i64) -> i64 {
@@ -171,5 +249,62 @@ mod tests {
 
         let assigner = SlidingWindowAssigner::from_millis(15_000, 5_000);
         assert_eq!(assigner.windows_per_event(), 3);
+    }
+
+    #[test]
+    fn test_sliding_iterator_boundaries() {
+        let assigner = SlidingWindowAssigner::from_millis(10, 6).with_offset_ms(3);
+        let cases = [
+            (-3, vec![WindowId::new(-9, 1), WindowId::new(-3, 7)]),
+            (6, vec![WindowId::new(-3, 7), WindowId::new(3, 13)]),
+            (7, vec![WindowId::new(3, 13)]),
+            (9, vec![WindowId::new(3, 13), WindowId::new(9, 19)]),
+        ];
+
+        for (timestamp, expected) in cases {
+            let lazy = assigner
+                .try_iter_windows(timestamp)
+                .unwrap()
+                .collect::<Vec<_>>();
+            assert_eq!(lazy, expected);
+            assert_eq!(
+                lazy.as_slice(),
+                assigner.assign_windows(timestamp).as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn test_sliding_extreme_boundaries_are_checked() {
+        let wide = SlidingWindowAssigner::from_millis(1, 1).with_offset_ms(i64::MAX);
+        assert_eq!(
+            wide.try_iter_windows(i64::MIN).unwrap().collect::<Vec<_>>(),
+            [WindowId::new(i64::MIN, i64::MIN + 1)]
+        );
+
+        let maximum = SlidingWindowAssigner::from_millis(i64::MAX, i64::MAX);
+        assert_eq!(maximum.windows_per_event(), 1);
+        assert_eq!(
+            maximum.try_iter_windows(0).unwrap().collect::<Vec<_>>(),
+            [WindowId::new(0, i64::MAX)]
+        );
+
+        let assigner = SlidingWindowAssigner::from_millis(2, 1);
+        assert_eq!(
+            assigner
+                .try_iter_windows(i64::MIN + 1)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            [
+                WindowId::new(i64::MIN, i64::MIN + 2),
+                WindowId::new(i64::MIN + 1, i64::MIN + 3),
+            ]
+        );
+        assert!(assigner.try_iter_windows(i64::MIN).is_err());
+        assert!(assigner.try_iter_windows(i64::MAX - 1).is_err());
+        assert!(SlidingWindowAssigner::from_millis(10, 5)
+            .with_offset_ms(i64::MAX)
+            .try_iter_windows(i64::MIN)
+            .is_err());
     }
 }

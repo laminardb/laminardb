@@ -1209,6 +1209,10 @@ impl ConnectorPipelineCallback {
         use crate::pipeline::CycleError;
         if err.requires_pipeline_halt() {
             match err {
+                crate::error::DbError::PipelineTerminal(msg) => tracing::error!(
+                    reason = %msg,
+                    "deterministic record-path failure; halting pipeline"
+                ),
                 crate::error::DbError::BackpressureFail(msg) => tracing::error!(
                     reason = %msg,
                     "backpressure_policy=Fail tripped; halting pipeline"
@@ -3756,6 +3760,7 @@ impl ConnectorPipelineCallback {
                 }
             })?;
 
+        let capture_timer = self.prom.checkpoint_state_capture_duration.start_timer();
         if self
             .full_vnode_capture_needed
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -3824,6 +3829,7 @@ impl ConnectorPipelineCallback {
                 estimated_bytes,
             ))
         })();
+        capture_timer.observe_duration();
         let (image, estimated_bytes) = match capture {
             Ok(capture) => capture,
             Err(error) => {

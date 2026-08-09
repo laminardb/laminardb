@@ -2265,6 +2265,23 @@ async fn test_backpressure_fail_notifies_shutdown() {
 }
 
 #[tokio::test]
+async fn terminal_record_error_halts_and_notifies_shutdown() {
+    use crate::pipeline::CycleError;
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let error = DbError::PipelineTerminal("timestamp is outside the supported range".into());
+
+    let mapped = ConnectorPipelineCallback::map_graph_error(&error, &notify);
+
+    assert!(matches!(
+        &mapped,
+        CycleError::Halt(message) if message.contains("timestamp is outside the supported range")
+    ));
+    tokio::time::timeout(Duration::from_millis(50), notify.notified())
+        .await
+        .expect("terminal record error must notify shutdown");
+}
+
+#[tokio::test]
 async fn terminal_shuffle_routing_halts_and_notifies_shutdown() {
     use crate::pipeline::CycleError;
     let notify = Arc::new(tokio::sync::Notify::new());

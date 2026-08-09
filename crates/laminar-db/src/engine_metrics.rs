@@ -66,8 +66,8 @@ pub struct EngineMetrics {
     /// Rows dropped because the sink's WHERE filter failed to compile to
     /// a `PhysicalExpr` (fail-closed). Label: `sink`.
     pub sink_filter_rejected_rows: IntCounterVec,
-    /// Rows dropped at operator level past `allowed_lateness` (distinct
-    /// from `events_dropped`, which is source-side).
+    /// Window assignments dropped past `allowed_lateness`. A hopping-window row can contribute
+    /// more than one assignment.
     pub window_late_dropped: IntCounter,
     /// Source rows dropped because the event-time column was null.
     pub events_null_timestamp: IntCounter,
@@ -83,6 +83,8 @@ pub struct EngineMetrics {
     pub cycle_duration: Histogram,
     /// Checkpoint cycle duration.
     pub checkpoint_duration: Histogram,
+    /// Synchronous mutable checkpoint-state capture duration.
+    pub checkpoint_state_capture_duration: Histogram,
     /// Pipeline stall per barrier: sink write fence, shuffle alignment, state capture, and the
     /// Aligned resume gate. Exactly-once mode also includes its inline durable tail; other modes
     /// resume at Aligned while that tail remains supervised in the background.
@@ -259,7 +261,7 @@ impl EngineMetrics {
             .unwrap()),
             window_late_dropped: reg!(IntCounter::new(
                 "window_late_dropped_total",
-                "Rows dropped by window operators past allowed_lateness"
+                "Window assignments dropped past allowed_lateness"
             )
             .unwrap()),
             events_null_timestamp: reg!(IntCounter::new(
@@ -300,6 +302,14 @@ impl EngineMetrics {
             checkpoint_duration: reg!(Histogram::with_opts(
                 HistogramOpts::new("checkpoint_duration_seconds", "Checkpoint cycle duration")
                     .buckets(prometheus::exponential_buckets(0.01, 2.0, 15).unwrap()),
+            )
+            .unwrap()),
+            checkpoint_state_capture_duration: reg!(Histogram::with_opts(
+                HistogramOpts::new(
+                    "checkpoint_state_capture_duration_seconds",
+                    "Synchronous mutable checkpoint-state capture duration",
+                )
+                .buckets(prometheus::exponential_buckets(0.001, 2.0, 16).unwrap()),
             )
             .unwrap()),
             // Stall target is sub-second; the resume gate is bounded at
