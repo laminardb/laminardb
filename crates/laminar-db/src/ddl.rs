@@ -262,6 +262,7 @@ pub(crate) async fn validate_managed_aggregate_admission(
             query_sql,
             window,
             emit_clause,
+            key_group_count,
         )
         .await?;
         if state.is_none() {

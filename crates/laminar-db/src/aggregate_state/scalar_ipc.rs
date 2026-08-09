@@ -7,12 +7,13 @@ use std::sync::Arc;
 use arrow::array::ArrayRef;
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
-use arrow_ipc::reader::StreamReader;
+use arrow_ipc::reader::StreamDecoder;
 use datafusion_common::ScalarValue;
 
 use crate::error::DbError;
 
 /// Encode a scalar tuple as a one-row Arrow IPC stream; empty input → empty `Vec`.
+#[cfg(test)]
 pub(crate) fn scalars_to_ipc(scalars: &[ScalarValue]) -> Result<Vec<u8>, DbError> {
     scalars_to_ipc_bounded(scalars, usize::MAX)
 }
@@ -52,34 +53,37 @@ pub(crate) fn ipc_to_scalars(bytes: &[u8]) -> Result<Vec<ScalarValue>, DbError> 
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
-    let mut reader = StreamReader::try_new(std::io::Cursor::new(bytes), None)
+    let mut decoder = StreamDecoder::new();
+    let mut buffer = arrow::buffer::Buffer::from(bytes);
+    let mut batch = None;
+    while !buffer.is_empty() {
+        let next_batch = decoder.decode(&mut buffer).map_err(|error| {
+            if batch.is_some() {
+                DbError::Pipeline(format!(
+                    "scalar IPC contains trailing bytes after its record batch: {error}"
+                ))
+            } else {
+                DbError::Pipeline(format!("scalar IPC decode: {error}"))
+            }
+        })?;
+        if let Some(next_batch) = next_batch {
+            if batch.replace(next_batch).is_some() {
+                return Err(DbError::Pipeline(
+                    "scalar IPC contains more than one record batch".into(),
+                ));
+            }
+        }
+    }
+    decoder
+        .finish()
         .map_err(|error| DbError::Pipeline(format!("scalar IPC decode: {error}")))?;
-    let batch = reader
-        .next()
-        .transpose()
-        .map_err(|error| DbError::Pipeline(format!("scalar IPC decode: {error}")))?
-        .ok_or_else(|| DbError::Pipeline("scalar IPC contains no record batch".into()))?;
+    let batch =
+        batch.ok_or_else(|| DbError::Pipeline("scalar IPC contains no record batch".into()))?;
     if batch.num_rows() != 1 {
         return Err(DbError::Pipeline(format!(
             "scalar IPC contains {} rows; expected 1",
             batch.num_rows()
         )));
-    }
-    if reader
-        .next()
-        .transpose()
-        .map_err(|error| DbError::Pipeline(format!("scalar IPC decode: {error}")))?
-        .is_some()
-    {
-        return Err(DbError::Pipeline(
-            "scalar IPC contains more than one record batch".into(),
-        ));
-    }
-    let encoded_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    if reader.get_ref().position() != encoded_len {
-        return Err(DbError::Pipeline(
-            "scalar IPC contains trailing bytes after the stream terminator".into(),
-        ));
     }
     (0..batch.num_columns())
         .map(|i| {
@@ -183,5 +187,8 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("trailing bytes"));
+
+        let oversized_header = [0xff; 8];
+        assert!(ipc_to_scalars(&oversized_header).is_err());
     }
 }

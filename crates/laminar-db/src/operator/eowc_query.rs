@@ -6,29 +6,39 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
+use laminar_core::state::KeyGroupCount;
 
+use crate::core_window_state::{CoreWindowState, CoreWindowVnodeCheckpoint};
 #[cfg(feature = "cluster")]
-use crate::core_window_state::PreparedCoreWindowTransition;
-use crate::core_window_state::{CoreWindowCheckpoint, CoreWindowState};
+use crate::core_window_state::{
+    PreparedCoreWindowVnodeTransition, RetiredCoreWindowVnodeTransition,
+};
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
-use crate::operator::capability::{
-    ManagedStateContract, OperatorCapability, OperatorImplementation,
-};
+use crate::operator::capability::{ManagedStateContract, OperatorCapability};
 #[cfg(feature = "cluster")]
 use crate::operator::sql_query::ClusterShuffleConfig;
 #[cfg(feature = "cluster")]
 use crate::operator_graph::ManagedVnodeTransition;
 use crate::operator_graph::{
-    try_evaluate_compiled, GraphOperator, ManagedStateAccountingSnapshot, OperatorCheckpoint,
+    try_evaluate_compiled, EncodedStateFrame, GraphOperator, ManagedStateAccountingSnapshot,
+    OperatorCheckpoint, StateFrameCapture,
 };
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::WindowOperatorConfig;
 
 #[cfg(feature = "cluster")]
 enum CoreWindowTransitionCleanup {
-    Aborted(PreparedCoreWindowTransition),
-    Published(PreparedCoreWindowTransition),
+    Aborted(PreparedCoreWindowVnodeTransition),
+    Published(RetiredCoreWindowVnodeTransition),
+}
+
+const OPERATOR_CHECKPOINT_VERSION: u8 = 1;
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct EowcOperatorCheckpoint {
+    version: u8,
+    high_watermark_ms: i64,
 }
 
 /// EOWC query operator: suppresses intermediate results and emits only
@@ -40,16 +50,15 @@ pub(crate) struct EowcQueryOperator {
     window_config: Option<WindowOperatorConfig>,
     ctx: SessionContext,
     task_ctx: Arc<TaskContext>,
+    key_group_count: KeyGroupCount,
     capability: OperatorCapability,
     state: Option<Box<CoreWindowState>>,
-    pending_restore: Option<CoreWindowCheckpoint>,
-    vnode_checkpointed: bool,
-    vnode_dirty: bool,
+    whole_restore_applied: bool,
     prom: Option<Arc<EngineMetrics>>,
     #[cfg(feature = "cluster")]
     cluster_scope: Option<ClusterShuffleConfig>,
     #[cfg(feature = "cluster")]
-    prepared_vnode_transition: Option<PreparedCoreWindowTransition>,
+    prepared_vnode_transition: Option<PreparedCoreWindowVnodeTransition>,
     #[cfg(feature = "cluster")]
     vnode_transition_cleanup: Option<CoreWindowTransitionCleanup>,
 }
@@ -61,19 +70,10 @@ impl EowcQueryOperator {
         emit_clause: Option<EmitClause>,
         window_config: Option<WindowOperatorConfig>,
         ctx: SessionContext,
+        key_group_count: KeyGroupCount,
         prom: Option<Arc<EngineMetrics>>,
     ) -> Self {
         let task_ctx = ctx.task_ctx();
-        let capability = if window_config.as_ref().is_some_and(|config| {
-            matches!(
-                config.window_type,
-                laminar_sql::translator::WindowType::Tumbling
-            )
-        }) {
-            OperatorCapability::managed_global_tumbling_window()
-        } else {
-            OperatorCapability::fixed(OperatorImplementation::EowcQuery)
-        };
         Self {
             op_name: Arc::from(name),
             sql: Arc::from(sql),
@@ -81,11 +81,10 @@ impl EowcQueryOperator {
             window_config,
             ctx,
             task_ctx,
-            capability,
+            key_group_count,
+            capability: OperatorCapability::managed_core_window(),
             state: None,
-            pending_restore: None,
-            vnode_checkpointed: false,
-            vnode_dirty: false,
+            whole_restore_applied: false,
             prom,
             #[cfg(feature = "cluster")]
             cluster_scope: None,
@@ -103,9 +102,14 @@ impl EowcQueryOperator {
                 self.op_name
             ))
         })?;
-        let Some(mut window) =
-            CoreWindowState::try_from_sql(&self.ctx, &self.sql, cfg, self.emit_clause.as_ref())
-                .await?
+        let Some(mut window) = CoreWindowState::try_from_sql(
+            &self.ctx,
+            &self.sql,
+            cfg,
+            self.emit_clause.as_ref(),
+            self.key_group_count,
+        )
+        .await?
         else {
             return Err(DbError::Unsupported(format!(
                 "[LDB-1001] EOWC query '{}' is not a supported TUMBLE, HOP, or SESSION aggregate",
@@ -119,61 +123,13 @@ impl EowcQueryOperator {
             window_type = ?cfg.window_type,
             "EOWC operator: initialized core window state"
         );
-        self.capability = if window.supports_managed_global_tumbling() {
-            OperatorCapability::managed_global_tumbling_window()
-        } else {
-            OperatorCapability::fixed(OperatorImplementation::EowcQuery)
-        };
         self.state = Some(Box::new(window));
-        self.apply_pending_restore()?;
         Ok(())
     }
 
     #[cfg(feature = "cluster")]
     pub(crate) fn attach_cluster_scope(&mut self, scope: ClusterShuffleConfig) {
         self.cluster_scope = Some(scope);
-    }
-
-    fn resolve_managed_capability(&mut self) {
-        if self.capability.managed_state == Some(ManagedStateContract::CoreWindowV1)
-            && !self
-                .state
-                .as_ref()
-                .is_some_and(|window| window.supports_managed_global_tumbling())
-        {
-            self.capability = OperatorCapability::fixed(OperatorImplementation::EowcQuery);
-        }
-    }
-
-    fn apply_pending_restore(&mut self) -> Result<(), DbError> {
-        let Some(checkpoint) = self.pending_restore.take() else {
-            return Ok(());
-        };
-        if let Err(error) = self.apply_checkpoint(&checkpoint) {
-            // Keep recovery pending so a caller that mishandles the error cannot
-            // process or checkpoint an empty/partially restored operator.
-            self.pending_restore = Some(checkpoint);
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    fn apply_checkpoint(&mut self, checkpoint: &CoreWindowCheckpoint) -> Result<(), DbError> {
-        let window = self.state.as_mut().ok_or_else(|| {
-            DbError::Checkpoint(format!(
-                "EOWC CoreWindow restore for '{}' targeted uninitialized state",
-                self.op_name
-            ))
-        })?;
-        window
-            .restore_windows(checkpoint)
-            .map(|_| ())
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "EOWC CoreWindow restore for '{}': {error}",
-                    self.op_name
-                ))
-            })
     }
 
     fn core_window_apply_error(op_name: &str, phase: &str, error: DbError) -> DbError {
@@ -223,7 +179,7 @@ impl EowcQueryOperator {
         };
 
         for batch in &pre_agg_batches {
-            if let Err(error) = cw.update_batch(batch) {
+            if let Err(error) = cw.update_batch_for_vnode(batch, None) {
                 return Err(Self::core_window_apply_error(
                     op_name,
                     "state update",
@@ -239,24 +195,29 @@ impl EowcQueryOperator {
         Ok(batches)
     }
 
-    fn encode_checkpoint(
-        checkpoint: &CoreWindowCheckpoint,
+    fn encode_vnode_checkpoint(
+        checkpoint: &CoreWindowVnodeCheckpoint,
         op_name: &str,
-    ) -> Result<Vec<u8>, DbError> {
-        rkyv::to_bytes::<rkyv::rancor::Error>(checkpoint)
-            .map(|bytes| bytes.to_vec())
+        vnode: u32,
+        max_encoded_bytes: usize,
+    ) -> Result<EncodedStateFrame, DbError> {
+        let writer = rkyv::ser::writer::IoWriter::new(
+            laminar_core::serialization::BoundedBytesWriter::new(max_encoded_bytes),
+        );
+        rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(checkpoint, writer)
+            .map(|bytes| EncodedStateFrame::from_vec(bytes.into_inner().into_vec()))
             .map_err(|error| {
-                DbError::Pipeline(format!(
-                    "EOWC checkpoint serialization for '{op_name}': {error}"
+                DbError::Checkpoint(format!(
+                    "CoreWindow '{op_name}' vnode {vnode} checkpoint exceeded its {max_encoded_bytes}-byte archive limit: {error}"
                 ))
             })
     }
 
     #[cfg(feature = "cluster")]
-    fn target_owns_global_vnode(
+    fn validate_assignment_target(
         &self,
         target: &laminar_core::checkpoint::CheckpointAssignmentFence,
-    ) -> Result<bool, DbError> {
+    ) -> Result<(), DbError> {
         let scope = self.cluster_scope.as_ref().ok_or_else(|| {
             DbError::Checkpoint(format!(
                 "managed CoreWindow '{}' has no cluster assignment scope",
@@ -275,15 +236,7 @@ impl EowcQueryOperator {
                 assignment.version()
             )));
         }
-        Ok(assignment.owners()[0] == scope.self_id)
-    }
-
-    #[cfg(feature = "cluster")]
-    fn preflight_managed_restore<'a>(
-        window: &CoreWindowState,
-        bytes: &'a [u8],
-    ) -> Result<crate::core_window_state::PreflightedCoreWindowArchive<'a>, DbError> {
-        window.preflight_managed_tumbling_bytes(bytes)
+        Ok(())
     }
 }
 
@@ -303,7 +256,7 @@ impl GraphOperator for EowcQueryOperator {
             let staged = self
                 .prepared_vnode_transition
                 .as_ref()
-                .map_or(0, PreparedCoreWindowTransition::accounted_state_bytes);
+                .map_or(0, PreparedCoreWindowVnodeTransition::accounted_state_bytes);
             match self.vnode_transition_cleanup.as_ref() {
                 Some(CoreWindowTransitionCleanup::Aborted(cleanup)) => {
                     (staged.saturating_add(cleanup.accounted_state_bytes()), 0)
@@ -327,7 +280,6 @@ impl GraphOperator for EowcQueryOperator {
         if self.state.is_none() {
             self.initialize().await?;
         }
-        self.resolve_managed_capability();
         Ok(())
     }
 
@@ -341,12 +293,7 @@ impl GraphOperator for EowcQueryOperator {
 
         if self.state.is_none() {
             self.initialize().await?;
-        } else {
-            // A failed deferred restore remains pending. Retrying it here
-            // prevents processing against empty state if the first error was ignored.
-            self.apply_pending_restore()?;
         }
-        self.resolve_managed_capability();
 
         let window = self.state.as_mut().ok_or_else(|| {
             DbError::Pipeline(format!(
@@ -354,10 +301,7 @@ impl GraphOperator for EowcQueryOperator {
                 self.op_name
             ))
         })?;
-        let managed_state =
-            self.capability.managed_state == Some(ManagedStateContract::CoreWindowV1);
-        let prior_watermark = window.high_watermark_ms();
-        let output = Self::process_core_window(
+        Self::process_core_window(
             window,
             input_batches,
             watermark,
@@ -365,56 +309,58 @@ impl GraphOperator for EowcQueryOperator {
             &self.ctx,
             &self.task_ctx,
         )
-        .await?;
-        if managed_state
-            && (input_batches.iter().any(|batch| batch.num_rows() != 0)
-                || window.high_watermark_ms() != prior_watermark)
-        {
-            self.vnode_dirty = true;
-        }
-        Ok(output)
+        .await
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
-        if self.capability.managed_state == Some(ManagedStateContract::CoreWindowV1) {
+        let Some(window) = self.state.as_ref() else {
             return Ok(None);
-        }
-        if self.state.is_none() {
-            let Some(checkpoint) = self.pending_restore.as_ref() else {
-                return Ok(None);
-            };
-            let data = Self::encode_checkpoint(checkpoint, &self.op_name)?;
-            return Ok(Some(OperatorCheckpoint { data }));
-        }
-        // Never publish a checkpoint while recovery is unapplied.
-        self.apply_pending_restore()?;
-        let checkpoint = self
-            .state
-            .as_mut()
-            .expect("EOWC state was checked above")
-            .checkpoint_windows()?;
-        let data = Self::encode_checkpoint(&checkpoint, &self.op_name)?;
+        };
+        let checkpoint = EowcOperatorCheckpoint {
+            version: OPERATOR_CHECKPOINT_VERSION,
+            high_watermark_ms: window.high_watermark_ms(),
+        };
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&checkpoint)
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "EOWC whole checkpoint serialization for '{}': {error}",
+                    self.op_name
+                ))
+            })?
+            .to_vec();
         Ok(Some(OperatorCheckpoint { data }))
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
         let checkpoint =
-            rkyv::from_bytes::<CoreWindowCheckpoint, rkyv::rancor::Error>(&checkpoint.data)
-                .map_err(|e| {
+            rkyv::from_bytes::<EowcOperatorCheckpoint, rkyv::rancor::Error>(&checkpoint.data)
+                .map_err(|error| {
                     DbError::Checkpoint(format!(
-                        "EOWC checkpoint deserialization for '{}': {e}",
+                        "EOWC whole checkpoint deserialization for '{}': {error}",
                         self.op_name
                     ))
                 })?;
-
-        if self.state.is_none() {
-            self.pending_restore = Some(checkpoint);
-        } else {
-            self.apply_checkpoint(&checkpoint)?;
+        if checkpoint.version != OPERATOR_CHECKPOINT_VERSION {
+            return Err(DbError::Checkpoint(format!(
+                "EOWC whole checkpoint for '{}' has unsupported version {}",
+                self.op_name, checkpoint.version
+            )));
         }
-        self.vnode_checkpointed = false;
-        self.vnode_dirty = false;
-
+        let window = self.state.as_mut().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "EOWC whole restore for '{}' requires initialized state",
+                self.op_name
+            ))
+        })?;
+        window
+            .restore_high_watermark_ms(checkpoint.high_watermark_ms)
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "EOWC whole restore for '{}': {error}",
+                    self.op_name
+                ))
+            })?;
+        self.whole_restore_applied = true;
         Ok(())
     }
 
@@ -424,33 +370,6 @@ impl GraphOperator for EowcQueryOperator {
         vnode_count: u32,
         max_capture_bytes: u64,
     ) -> Result<Option<Vec<crate::operator_graph::CapturedVnodeState>>, DbError> {
-        if vnode_count == 0
-            || required_vnodes.windows(2).any(|pair| pair[0] >= pair[1])
-            || required_vnodes.iter().any(|vnode| *vnode != 0)
-        {
-            return Err(DbError::Checkpoint(format!(
-                "managed CoreWindow '{}' received invalid vnode roster {required_vnodes:?} for vnode_count {vnode_count}",
-                self.op_name
-            )));
-        }
-        #[cfg(feature = "cluster")]
-        if let Some(scope) = self.cluster_scope.as_ref() {
-            let assignment = scope.registry.versioned_snapshot();
-            let expected = if assignment.owners()[0] == scope.self_id {
-                &[0_u32][..]
-            } else {
-                &[][..]
-            };
-            if vnode_count != scope.registry.vnode_count() || required_vnodes != expected {
-                return Err(DbError::Checkpoint(format!(
-                    "managed CoreWindow '{}' capture roster does not match vnode-zero ownership",
-                    self.op_name
-                )));
-            }
-        }
-        if required_vnodes.is_empty() {
-            return Ok(Some(Vec::new()));
-        }
         if self.capability.managed_state != Some(ManagedStateContract::CoreWindowV1) {
             return Err(DbError::Checkpoint(format!(
                 "managed CoreWindow capture targeted unsupported operator '{}'",
@@ -463,41 +382,76 @@ impl GraphOperator for EowcQueryOperator {
                 self.op_name
             )));
         };
-        if self.vnode_checkpointed && !self.vnode_dirty {
-            return Ok(Some(Vec::new()));
+        let vnode_captures =
+            window.capture_checkpoint_vnodes(required_vnodes, vnode_count, max_capture_bytes)?;
+        let mut captured = Vec::with_capacity(vnode_captures.len());
+        for (vnode, capture) in vnode_captures {
+            let retained_bytes = u64::try_from(capture.retained_bytes()).unwrap_or(u64::MAX);
+            let op_name = Arc::clone(&self.op_name);
+            let state = StateFrameCapture::deferred(retained_bytes, move |max_encoded_bytes| {
+                let checkpoint = capture.encode(max_encoded_bytes)?;
+                let intermediate_bytes = checkpoint.retained_serialization_bytes()?;
+                let archive_budget = max_encoded_bytes
+                    .checked_sub(intermediate_bytes)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "CoreWindow '{op_name}' vnode {vnode} intermediate checkpoint exhausted its frame budget"
+                        ))
+                    })?;
+                Self::encode_vnode_checkpoint(&checkpoint, &op_name, vnode, archive_budget)
+            });
+            captured.push(crate::operator_graph::CapturedVnodeState {
+                vnode,
+                state: Some(state),
+            });
         }
-        if u64::try_from(window.accounted_state_bytes()).unwrap_or(u64::MAX) > max_capture_bytes {
-            return Err(DbError::Checkpoint(format!(
-                "managed CoreWindow '{}' state exceeds its capture budget",
-                self.op_name
-            )));
-        }
-        let checkpoint = window.checkpoint_windows()?;
-        let bytes = Self::encode_checkpoint(&checkpoint, &self.op_name)?;
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_capture_bytes {
-            return Err(DbError::Checkpoint(format!(
-                "managed CoreWindow '{}' checkpoint exceeded its capture budget",
-                self.op_name
-            )));
-        }
-        self.vnode_checkpointed = true;
-        self.vnode_dirty = false;
-        Ok(Some(vec![crate::operator_graph::CapturedVnodeState {
-            vnode: 0,
-            state: Some(crate::operator_graph::StateFrameCapture::encoded(bytes)),
-        }]))
+        Ok(Some(captured))
     }
 
     fn restore_vnode(&mut self, vnode: u32, vnode_count: u32, state: &[u8]) -> Result<(), DbError> {
-        if vnode != 0 || vnode_count == 0 {
+        if !self.whole_restore_applied {
             return Err(DbError::Checkpoint(format!(
-                "managed CoreWindow '{}' cannot restore vnode {vnode} in domain {vnode_count}",
+                "CoreWindow '{}' vnode restore requires its whole watermark frame",
                 self.op_name
             )));
         }
-        self.restore(OperatorCheckpoint {
-            data: state.to_vec(),
-        })
+        let window = self.state.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "managed CoreWindow vnode restore targeted uninitialized operator '{}'",
+                self.op_name
+            ))
+        })?;
+        let checkpoint = window.preflight_vnode_bytes(vnode, vnode_count, state)?;
+        let checkpoint = rkyv::deserialize::<CoreWindowVnodeCheckpoint, rkyv::rancor::Error>(
+            checkpoint.checkpoint,
+        )
+        .map_err(|error| {
+            DbError::Checkpoint(format!(
+                "CoreWindow '{}' vnode {vnode} checkpoint deserialization: {error}",
+                self.op_name
+            ))
+        })?;
+        let restored_high_watermark_ms = window.high_watermark_ms();
+        let window = self
+            .state
+            .as_mut()
+            .expect("CoreWindow restore state was checked above");
+        window
+            .restore_vnode(vnode, vnode_count, checkpoint)
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "CoreWindow '{}' vnode {vnode} restore: {error}",
+                    self.op_name
+                ))
+            })?;
+        window
+            .restore_high_watermark_ms(restored_high_watermark_ms)
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "CoreWindow '{}' vnode {vnode} frontier validation: {error}",
+                    self.op_name
+                ))
+            })
     }
 
     #[cfg(feature = "cluster")]
@@ -517,47 +471,49 @@ impl GraphOperator for EowcQueryOperator {
                 self.op_name
             )));
         }
-        if transition.revoked.len() > 1
-            || transition.revoked.iter().any(|vnode| *vnode != 0)
-            || transition.restores.len() > 1
-            || transition.restores.iter().any(|restore| restore.vnode != 0)
-        {
-            return Err(DbError::Checkpoint(format!(
-                "managed CoreWindow '{}' transition is not scoped exactly to vnode zero",
-                self.op_name
-            )));
-        }
-        let target_owns_global = self.target_owns_global_vnode(transition.target)?;
+        self.validate_assignment_target(transition.target)?;
         let Some(window) = self.state.as_ref() else {
             return Err(DbError::Checkpoint(format!(
                 "managed CoreWindow transition targeted uninitialized operator '{}'",
                 self.op_name
             )));
         };
-        let prepared = if target_owns_global {
-            if !transition.revoked.is_empty() {
-                return Err(DbError::Checkpoint(format!(
-                    "managed CoreWindow '{}' vnode-zero acquisition cannot also revoke vnode zero",
-                    self.op_name
-                )));
-            }
-            let restore = transition.restores.first().ok_or_else(|| {
+        window.validate_vnode_count(transition.target.vnode_count)?;
+
+        let mut preflighted = Vec::new();
+        preflighted
+            .try_reserve_exact(transition.restores.len())
+            .map_err(|error| {
                 DbError::Checkpoint(format!(
-                    "managed CoreWindow '{}' acquisition is missing its complete vnode-zero state",
+                    "CoreWindow '{}' could not reserve vnode restore metadata: {error}",
                     self.op_name
                 ))
             })?;
-            let archive = Self::preflight_managed_restore(window, restore.state)?;
-            window.prepare_managed_tumbling_restore(&archive)?
-        } else {
-            if !transition.restores.is_empty() || !transition.revoked.contains(&0) {
-                return Err(DbError::Checkpoint(format!(
-                    "managed CoreWindow '{}' owner exit requires exact vnode-zero revoke without restore",
+        for restore in transition.restores {
+            let state = window.preflight_vnode_bytes(
+                restore.vnode,
+                transition.target.vnode_count,
+                restore.state,
+            )?;
+            preflighted.push((restore.vnode, state));
+        }
+        let owned_restores = preflighted.into_iter().map(|(vnode, state)| {
+            let state = rkyv::deserialize::<CoreWindowVnodeCheckpoint, rkyv::rancor::Error>(
+                state.checkpoint,
+            )
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "CoreWindow '{}' vnode {vnode} transition deserialization: {error}",
                     self.op_name
-                )));
-            }
-            window.prepare_managed_tumbling_empty()
-        };
+                ))
+            })?;
+            Ok(crate::core_window_state::OwnedCoreWindowVnodeRestore { vnode, state })
+        });
+        let prepared = window.prepare_owned_vnode_transition(
+            transition.target.vnode_count,
+            owned_restores,
+            transition.revoked,
+        )?;
         self.prepared_vnode_transition = Some(prepared);
         Ok(())
     }
@@ -588,19 +544,25 @@ impl GraphOperator for EowcQueryOperator {
             .state
             .as_mut()
             .expect("managed CoreWindow publication targeted uninitialized state");
-        let retired = window.publish_managed_tumbling_transition(prepared);
-        self.vnode_checkpointed = false;
-        self.vnode_dirty = false;
+        let retired = window.publish_prepared_vnode_transition(prepared);
         self.vnode_transition_cleanup = Some(CoreWindowTransitionCleanup::Published(retired));
     }
 
     #[cfg(feature = "cluster")]
     fn finish_vnode_transition(&mut self) {
-        drop(self.vnode_transition_cleanup.take());
+        match self.vnode_transition_cleanup.take() {
+            Some(CoreWindowTransitionCleanup::Aborted(prepared)) => drop(prepared),
+            Some(CoreWindowTransitionCleanup::Published(retired)) => {
+                CoreWindowState::finish_vnode_transition(retired);
+            }
+            None => {}
+        }
     }
 
     fn force_full_vnode_capture(&mut self) {
-        self.vnode_checkpointed = false;
+        if let Some(window) = self.state.as_mut() {
+            window.force_full_vnode_capture();
+        }
     }
 }
 
@@ -662,134 +624,88 @@ mod core_tests {
         }
     }
 
-    fn checkpoint_from_core(checkpoint: &CoreWindowCheckpoint) -> OperatorCheckpoint {
-        OperatorCheckpoint {
-            data: rkyv::to_bytes::<rkyv::rancor::Error>(checkpoint)
-                .unwrap()
-                .to_vec(),
-        }
+    fn key_groups() -> KeyGroupCount {
+        KeyGroupCount::try_from(8_u32).unwrap()
     }
 
-    fn core_from_checkpoint(checkpoint: &OperatorCheckpoint) -> CoreWindowCheckpoint {
-        rkyv::from_bytes::<CoreWindowCheckpoint, rkyv::rancor::Error>(&checkpoint.data).unwrap()
+    fn materialize_capture(
+        capture: crate::operator_graph::CapturedVnodeState,
+    ) -> (u32, bytes::Bytes) {
+        let state = capture.state.unwrap();
+        let mut staged_bytes = state.retained_bytes();
+        let bytes = state.materialize(&mut staged_bytes, u64::MAX).unwrap();
+        (capture.vnode, bytes)
     }
 
-    async fn core_window_operator(
-        config: WindowOperatorConfig,
-        timestamps: Vec<i64>,
-    ) -> EowcQueryOperator {
-        let ctx = aggregate_context();
-        let state =
-            CoreWindowState::try_from_sql(&ctx, AGG_SQL, &config, Some(&EmitClause::OnWindowClose))
-                .await
-                .unwrap()
-                .unwrap();
-        let mut op = EowcQueryOperator::new(
-            "test_core_restore",
+    #[tokio::test]
+    async fn grouped_window_restores_exact_vnode_frames_and_frontier() {
+        let mut original = EowcQueryOperator::new(
+            "managed_window",
             AGG_SQL,
             Some(EmitClause::OnWindowClose),
-            Some(config),
-            ctx,
+            Some(test_window_config()),
+            aggregate_context(),
+            key_groups(),
             None,
         );
-        op.state = Some(Box::new(state));
-        op.process(&[vec![test_batch(timestamps)]], &[i64::MIN])
+        original.initialize_managed_state().await.unwrap();
+        original
+            .process(&[vec![test_batch(vec![100, 200])]], &[10_000])
             .await
             .unwrap();
-        op
-    }
 
-    #[tokio::test]
-    async fn malformed_hopping_restore_is_atomic() {
-        let mut config = test_window_config();
-        config.window_type = laminar_sql::translator::WindowType::Sliding;
-        config.size = Duration::from_secs(4);
-        config.slide = Some(Duration::from_secs(2));
-        let mut op = core_window_operator(config, vec![100, 2100]).await;
-        let before = op.checkpoint().unwrap().unwrap();
-        let mut corrupt = core_from_checkpoint(&before);
-        corrupt.high_watermark_ms = 1234;
-        corrupt.windows.last_mut().unwrap().groups[0].key = vec![0xff, 0x00, 0x7f];
+        let required = (0..u32::from(key_groups())).collect::<Vec<_>>();
+        let captures = original
+            .checkpoint_vnodes(&required, u32::from(key_groups()), u64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(captures.len(), required.len());
+        let frames = captures
+            .into_iter()
+            .map(materialize_capture)
+            .collect::<Vec<_>>();
+        assert!(original
+            .checkpoint_vnodes(&required, u32::from(key_groups()), u64::MAX)
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        original.process(&[vec![]], &[20_000]).await.unwrap();
+        assert!(original
+            .checkpoint_vnodes(&required, u32::from(key_groups()), u64::MAX)
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        let whole = original.checkpoint().unwrap().unwrap();
 
-        let error = op.restore(checkpoint_from_core(&corrupt)).unwrap_err();
-
-        assert!(error.to_string().contains("CoreWindow restore"));
-        assert!(error.requires_pipeline_recovery());
-        assert_eq!(op.checkpoint().unwrap().unwrap().data, before.data);
-    }
-
-    #[tokio::test]
-    async fn missing_session_accumulator_restore_is_atomic() {
-        let mut config = test_window_config();
-        config.window_type = laminar_sql::translator::WindowType::Session;
-        config.size = Duration::ZERO;
-        config.gap = Some(Duration::from_secs(3));
-        let mut op = core_window_operator(config, vec![100, 5000]).await;
-        let before = op.checkpoint().unwrap().unwrap();
-        let mut corrupt = core_from_checkpoint(&before);
-        corrupt.high_watermark_ms = 1234;
-        corrupt.session_state.last_mut().unwrap().sessions[0]
-            .acc_states
-            .clear();
-
-        let error = op.restore(checkpoint_from_core(&corrupt)).unwrap_err();
-
-        assert!(error.to_string().contains("accumulator states"));
-        assert!(error.requires_pipeline_recovery());
-        assert_eq!(op.checkpoint().unwrap().unwrap().data, before.data);
-    }
-
-    #[tokio::test]
-    async fn managed_window_captures_only_dirty_vnode_zero() {
-        let ctx = aggregate_context();
-        let config = test_window_config();
-        let sql = "SELECT SUM(price) AS total FROM trades";
-        let mut op = EowcQueryOperator::new(
+        let mut restored = EowcQueryOperator::new(
             "managed_window",
-            sql,
+            AGG_SQL,
             Some(EmitClause::OnWindowClose),
-            Some(config),
-            ctx,
+            Some(test_window_config()),
+            aggregate_context(),
+            key_groups(),
             None,
         );
-        op.initialize_managed_state().await.unwrap();
-        op.process(&[vec![test_batch(vec![100])]], &[i64::MIN])
-            .await
-            .unwrap();
+        restored.initialize_managed_state().await.unwrap();
+        assert!(restored
+            .restore_vnode(frames[0].0, u32::from(key_groups()), &frames[0].1)
+            .unwrap_err()
+            .to_string()
+            .contains("whole watermark frame"));
+        restored.restore(whole).unwrap();
+        assert_eq!(restored.state.as_ref().unwrap().high_watermark_ms(), 20_000);
+        assert!(restored
+            .restore_vnode(1, u32::from(key_groups()), &frames[0].1)
+            .is_err());
+        for (vnode, state) in &frames {
+            restored
+                .restore_vnode(*vnode, u32::from(key_groups()), state)
+                .unwrap();
+        }
 
-        let baseline = op.checkpoint_vnodes(&[0], 1, u64::MAX).unwrap().unwrap();
-        assert_eq!(baseline.len(), 1);
-        assert!(baseline[0].state.is_some());
-        assert!(op
-            .checkpoint_vnodes(&[0], 1, u64::MAX)
-            .unwrap()
-            .unwrap()
-            .is_empty());
-
-        op.process(&[vec![test_batch(vec![200])]], &[i64::MIN])
-            .await
-            .unwrap();
-        assert_eq!(
-            op.checkpoint_vnodes(&[0], 1, u64::MAX)
-                .unwrap()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(op
-            .checkpoint_vnodes(&[0], 1, u64::MAX)
-            .unwrap()
-            .unwrap()
-            .is_empty());
-
-        op.force_full_vnode_capture();
-        assert_eq!(
-            op.checkpoint_vnodes(&[0], 1, u64::MAX)
-                .unwrap()
-                .unwrap()
-                .len(),
-            1
-        );
+        let expected = original.process(&[vec![]], &[60_000]).await.unwrap();
+        let actual = restored.process(&[vec![]], &[60_000]).await.unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -801,6 +717,7 @@ mod core_tests {
             Some(EmitClause::OnWindowClose),
             None,
             ctx,
+            key_groups(),
             None,
         );
         assert_eq!(&*op.op_name, "test_eowc");
@@ -816,6 +733,7 @@ mod core_tests {
             Some(EmitClause::OnWindowClose),
             None,
             ctx,
+            key_groups(),
             None,
         );
         let cp = op.checkpoint().unwrap();
@@ -831,6 +749,7 @@ mod core_tests {
             Some(EmitClause::OnWindowClose),
             Some(test_window_config()),
             ctx,
+            key_groups(),
             None,
         );
         op.initialize_managed_state().await.unwrap();

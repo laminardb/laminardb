@@ -12,7 +12,6 @@ use crate::error::DbError;
 pub(crate) struct GroupCheckpoint {
     pub key: Vec<u8>,
     pub acc_states: Vec<Vec<u8>>,
-    pub last_updated_ms: i64,
 }
 
 /// Columnar running-aggregate state: all keys in one IPC batch, each accumulator's

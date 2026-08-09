@@ -29,7 +29,7 @@ pub(crate) enum OperatorStateClass {
 pub(crate) enum ManagedStateContract {
     /// The existing incremental SQL aggregate checkpoint codec.
     SqlAggregateV1,
-    /// Whole-image event-time state for the bounded vnode-zero tumbling-window profile.
+    /// Vnode-local event-time windows, sessions, accumulators, and implicit timers.
     CoreWindowV1,
     /// Whole-image state for the bounded, append-only vnode-keyed interval join.
     BoundedIntervalJoinV1,
@@ -167,8 +167,8 @@ impl OperatorCapability {
             ),
             Implementation::EowcQuery => Self::rejected(
                 implementation,
-                State::LocalOnly,
-                "whole-operator window state has no vnode ownership and timer lifecycle",
+                State::VnodeKeyed,
+                "window queries require the managed CoreWindow construction path",
             ),
             Implementation::LookupEnrich => Self::rejected(
                 implementation,
@@ -212,16 +212,14 @@ impl OperatorCapability {
         .with_managed_state(ManagedStateContract::SqlAggregateV1)
     }
 
-    /// Lifecycle-only descriptor for the bounded vnode-zero tumbling-window profile.
+    /// Managed vnode state for TUMBLE, HOP, and SESSION aggregates.
     ///
-    /// Cluster admission remains rejected because EOWC input routing and a cluster-wide source
-    /// watermark frontier are not implemented. The managed contract only makes the existing
-    /// production operator exercise capture and fenced whole-image replacement.
-    pub(crate) const fn managed_global_tumbling_window() -> Self {
+    /// Cluster admission remains closed until the ordered data/frontier shuffle is installed.
+    pub(crate) const fn managed_core_window() -> Self {
         Self::rejected(
             OperatorImplementation::EowcQuery,
-            OperatorStateClass::GlobalSingleton,
-            "window state has a vnode-zero lifecycle, but distributed input routing and global watermark authority are not certified",
+            OperatorStateClass::VnodeKeyed,
+            "window state is vnode-scoped, but distributed input routing and global watermark authority are not certified",
         )
         .with_managed_state(ManagedStateContract::CoreWindowV1)
     }
@@ -325,10 +323,9 @@ mod tests {
             ),
             (
                 Implementation::EowcQuery,
-                State::LocalOnly,
+                State::VnodeKeyed,
                 Rejected {
-                    reason:
-                        "whole-operator window state has no vnode ownership and timer lifecycle",
+                    reason: "window queries require the managed CoreWindow construction path",
                 },
             ),
             (

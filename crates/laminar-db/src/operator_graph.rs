@@ -2473,6 +2473,7 @@ impl OperatorGraph {
                 emit_clause.cloned(),
                 window_config.cloned(),
                 self.ctx.clone(),
+                self.key_group_count,
                 self.prom.clone(),
             );
             #[cfg(feature = "cluster")]

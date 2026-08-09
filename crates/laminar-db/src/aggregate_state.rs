@@ -43,7 +43,9 @@ pub(crate) use concrete::{ConcreteAggregateState, ConcreteInputMode};
 pub(crate) use keys::{
     global_aggregate_key, row_to_scalar_key_with_types, scalar_key_to_owned_row,
 };
-pub(crate) use scalar_ipc::{ipc_to_scalars, scalars_to_ipc, scalars_to_ipc_bounded};
+#[cfg(test)]
+pub(crate) use scalar_ipc::scalars_to_ipc;
+pub(crate) use scalar_ipc::{ipc_to_scalars, scalars_to_ipc_bounded};
 use vnode_state::{AggregateVnodeSlots, AggregateVnodeState};
 
 /// Builds the per-window result batch for one closed window.
@@ -162,16 +164,6 @@ impl AggFuncSpec {
             ))
         })
     }
-}
-
-/// Encode one admitted built-in window accumulator for checkpointing.
-pub(crate) fn snapshot_window_accumulator(
-    acc: &mut Box<dyn datafusion_expr::Accumulator>,
-) -> Result<Vec<u8>, DbError> {
-    let state = acc
-        .state()
-        .map_err(|e| DbError::Pipeline(format!("accumulator state: {e}")))?;
-    scalars_to_ipc(&state)
 }
 
 fn arrays_to_ipc_bounded(arrays: &[ArrayRef], max_bytes: usize) -> Result<Vec<u8>, DbError> {

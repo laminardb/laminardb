@@ -2,9 +2,10 @@
 
 //! Core window state for tumbling/hopping/session aggregate queries.
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use arrow::array::ArrayRef;
 use arrow::compute;
@@ -18,6 +19,7 @@ use datafusion_optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 
 use laminar_core::operator::sliding_window::SlidingWindowAssigner;
 use laminar_core::operator::window::{TumblingWindowAssigner, WindowAssigner};
+use laminar_core::state::{KeyGroupCount, PartitionKeyCodecV1};
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
@@ -246,10 +248,14 @@ type FixedWindows = BTreeMap<i64, FixedWindowGroups>;
 type SessionGroups = FxHashMap<arrow::row::OwnedRow, SessionGroupState>;
 
 struct PreparedCoreWindowRestore {
+    state: Option<Box<CoreWindowVnodeState>>,
+    frontier_floor_ms: i64,
+}
+
+struct CoreWindowVnodeState {
     windows: FixedWindows,
     session_groups: SessionGroups,
-    high_watermark_ms: i64,
-    restored_entries: usize,
+    accounted_state_bytes: usize,
 }
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -266,42 +272,83 @@ pub(crate) struct SessionGroupCheckpoint {
 }
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub(crate) struct CoreWindowCheckpoint {
+pub(crate) struct CoreWindowVnodeCheckpoint {
     pub fingerprint: u64,
+    pub vnode: u32,
     pub windows: Vec<WindowCheckpoint>,
     pub session_state: Vec<SessionGroupCheckpoint>,
-    pub window_type: String,
-    pub high_watermark_ms: i64,
+    pub window_type: u8,
+    pub frontier_floor_ms: i64,
 }
 
-/// Off-side mutable image for the lifecycle-only vnode-zero tumbling-window profile.
-#[cfg(feature = "cluster")]
-pub(crate) struct PreparedCoreWindowTransition {
-    windows: FixedWindows,
-    session_groups: SessionGroups,
-    high_watermark_ms: i64,
-    scratch_nogroup: FxHashMap<i64, Vec<u32>>,
-    scratch_grouped: FxHashMap<(i64, u32), Vec<u32>>,
-    scratch_group_keys: indexmap::IndexSet<arrow::row::OwnedRow, FxBuildHasher>,
-    accounted_state_bytes: usize,
+struct CapturedCoreWindowGroup {
+    key: arrow::row::OwnedRow,
+    accumulator_states: Vec<Vec<ScalarValue>>,
 }
 
-/// Checked borrowed checkpoint retained until all archive structure has passed preflight.
-#[cfg(feature = "cluster")]
-pub(crate) struct PreflightedCoreWindowArchive<'a> {
-    checkpoint: &'a ArchivedCoreWindowCheckpoint,
+struct CapturedFixedWindow {
+    window_start: i64,
+    groups: Vec<CapturedCoreWindowGroup>,
+}
+
+struct CapturedSession {
+    start: i64,
+    end: i64,
+    accumulator_states: Vec<Vec<ScalarValue>>,
+}
+
+struct CapturedSessionGroup {
+    key: arrow::row::OwnedRow,
+    sessions: Vec<CapturedSession>,
+}
+
+pub(crate) struct CoreWindowVnodeCheckpointCapture {
+    fingerprint: u64,
+    vnode: u32,
+    frontier_floor_ms: i64,
+    window_type: u8,
+    group_types: Arc<[DataType]>,
+    row_converter: Arc<arrow::row::RowConverter>,
+    windows: Vec<CapturedFixedWindow>,
+    session_state: Vec<CapturedSessionGroup>,
+    retained_bytes: usize,
+}
+
+pub(crate) struct OwnedCoreWindowVnodeRestore {
+    pub(crate) vnode: u32,
+    pub(crate) state: CoreWindowVnodeCheckpoint,
+}
+
+pub(crate) struct PreparedCoreWindowVnodeTransition {
+    replacements: Vec<(u32, Option<Box<CoreWindowVnodeState>>)>,
+    final_active_vnodes: Vec<u32>,
+    final_active_vnode_positions: Box<[usize]>,
+    final_window_group_counts: FxHashMap<i64, usize>,
+    final_session_group_count: usize,
+    required_frontier_floor_ms: i64,
+}
+
+pub(crate) struct RetiredCoreWindowVnodeTransition {
+    retired_state: PreparedCoreWindowVnodeTransition,
+}
+
+pub(crate) struct PreflightedCoreWindowVnodeArchive<'a> {
+    pub(crate) checkpoint: &'a ArchivedCoreWindowVnodeCheckpoint,
 }
 
 /// Core window state for tumbling/hopping/session aggregate queries.
 pub(crate) struct CoreWindowState {
     assigner: CoreWindowAssigner,
-    windows: FixedWindows,
-    // Only populated for session windows.
-    session_groups: FxHashMap<arrow::row::OwnedRow, SessionGroupState>,
-    row_converter: arrow::row::RowConverter,
+    key_group_count: KeyGroupCount,
+    vnode_states: Box<[Option<Box<CoreWindowVnodeState>>]>,
+    active_vnodes: Vec<u32>,
+    active_vnode_positions: Box<[usize]>,
+    window_group_counts: FxHashMap<i64, usize>,
+    session_group_count: usize,
+    row_converter: Arc<arrow::row::RowConverter>,
     agg_specs: Vec<AggFuncSpec>,
     num_group_cols: usize,
-    group_types: Vec<DataType>,
+    group_types: Arc<[DataType]>,
     query_sql: String,
     #[cfg(test)]
     pre_agg_sql: String,
@@ -326,10 +373,12 @@ pub(crate) struct CoreWindowState {
     prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
     scratch_nogroup: FxHashMap<i64, Vec<u32>>,
     // Group ids are dense within a batch and index into scratch_group_keys.
-    scratch_grouped: FxHashMap<(i64, u32), Vec<u32>>,
+    scratch_grouped: FxHashMap<(u32, i64, u32), Vec<u32>>,
     scratch_group_keys: indexmap::IndexSet<arrow::row::OwnedRow, FxBuildHasher>,
-    managed_global_tumbling: bool,
-    accounted_state_bytes: usize,
+    checkpoint_dirty_vnodes: Box<[bool]>,
+    checkpoint_dirty_vnode_roster: Vec<u32>,
+    full_vnode_capture_required: bool,
+    required_frontier_floor_ms: i64,
 }
 
 impl CoreWindowState {
@@ -341,6 +390,7 @@ impl CoreWindowState {
         sql: &str,
         window_config: &WindowOperatorConfig,
         emit_clause: Option<&EmitClause>,
+        key_group_count: KeyGroupCount,
     ) -> Result<Option<Self>, DbError> {
         let size_ms = i64::try_from(window_config.size.as_millis()).unwrap_or(i64::MAX);
 
@@ -717,21 +767,44 @@ impl CoreWindowState {
             .iter()
             .map(|dt| arrow::row::SortField::new(dt.clone()))
             .collect();
-        let row_converter = arrow::row::RowConverter::new(sort_fields)
-            .map_err(|e| DbError::Pipeline(format!("row converter init: {e}")))?;
-
-        let managed_global_tumbling = matches!(assigner, CoreWindowAssigner::Tumbling(_))
-            && window_config.offset_ms == 0
-            && num_group_cols == 0;
+        let row_converter = Arc::new(
+            arrow::row::RowConverter::new(sort_fields)
+                .map_err(|e| DbError::Pipeline(format!("row converter init: {e}")))?,
+        );
+        let vnode_count = usize::from(key_group_count.get());
+        let vnode_states = std::iter::repeat_with(|| None)
+            .take(vnode_count)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let checkpoint_dirty_vnodes = vec![false; vnode_count].into_boxed_slice();
+        let active_vnode_positions = vec![usize::MAX; vnode_count].into_boxed_slice();
+        let mut active_vnodes = Vec::new();
+        active_vnodes
+            .try_reserve_exact(vnode_count)
+            .map_err(|error| {
+                DbError::Pipeline(format!("Core window vnode roster reserve failed: {error}"))
+            })?;
+        let mut checkpoint_dirty_vnode_roster = Vec::new();
+        checkpoint_dirty_vnode_roster
+            .try_reserve_exact(vnode_count)
+            .map_err(|error| {
+                DbError::Pipeline(format!(
+                    "Core window dirty vnode roster reserve failed: {error}"
+                ))
+            })?;
 
         Ok(Some(Self {
             assigner,
-            windows: BTreeMap::new(),
-            session_groups: FxHashMap::default(),
+            key_group_count,
+            vnode_states,
+            active_vnodes,
+            active_vnode_positions,
+            window_group_counts: FxHashMap::default(),
+            session_group_count: 0,
             row_converter,
             agg_specs,
             num_group_cols,
-            group_types,
+            group_types: Arc::from(group_types),
             query_sql: sql.to_string(),
             #[cfg(test)]
             pre_agg_sql,
@@ -757,14 +830,11 @@ impl CoreWindowState {
             scratch_nogroup: FxHashMap::default(),
             scratch_grouped: FxHashMap::default(),
             scratch_group_keys: indexmap::IndexSet::default(),
-            managed_global_tumbling,
-            accounted_state_bytes: 0,
+            checkpoint_dirty_vnodes,
+            checkpoint_dirty_vnode_roster,
+            full_vnode_capture_required: true,
+            required_frontier_floor_ms: i64::MIN,
         }))
-    }
-
-    #[must_use]
-    pub(crate) const fn supports_managed_global_tumbling(&self) -> bool {
-        self.managed_global_tumbling
     }
 
     fn accumulator_vector_bytes(
@@ -802,51 +872,265 @@ impl CoreWindowState {
             }))
     }
 
+    fn scratch_grouped_bytes(scratch: &FxHashMap<(u32, i64, u32), Vec<u32>>) -> usize {
+        scratch
+            .capacity()
+            .saturating_mul(std::mem::size_of::<((u32, i64, u32), Vec<u32>)>())
+            .saturating_add(scratch.values().fold(0_usize, |bytes, rows| {
+                bytes.saturating_add(rows.capacity().saturating_mul(std::mem::size_of::<u32>()))
+            }))
+    }
+
+    fn scratch_group_keys_bytes(
+        keys: &indexmap::IndexSet<arrow::row::OwnedRow, FxBuildHasher>,
+    ) -> usize {
+        keys.capacity()
+            .saturating_mul(std::mem::size_of::<arrow::row::OwnedRow>())
+            .saturating_add(keys.iter().fold(0_usize, |bytes, key| {
+                bytes.saturating_add(key.as_ref().len())
+            }))
+    }
+
     fn fixed_windows_bytes(windows: &FixedWindows) -> usize {
         windows.values().fold(0_usize, |bytes, groups| {
             bytes.saturating_add(Self::fixed_window_bytes(groups))
         })
     }
 
-    fn replace_accounted_component(&mut self, previous: usize, current: usize) {
-        if self.managed_global_tumbling {
-            self.accounted_state_bytes = self
-                .accounted_state_bytes
-                .saturating_sub(previous)
-                .saturating_add(current);
-        }
+    fn session_group_bytes(key: &arrow::row::OwnedRow, group: &SessionGroupState) -> usize {
+        key.as_ref()
+            .len()
+            .saturating_add(group.sessions.values().fold(0_usize, |bytes, session| {
+                bytes
+                    .saturating_add(std::mem::size_of::<(i64, SessionAccState)>())
+                    .saturating_add(Self::accumulator_vector_bytes(&session.accs))
+            }))
     }
 
-    fn refresh_managed_accounting(&mut self) {
-        if self.managed_global_tumbling {
-            self.accounted_state_bytes = Self::fixed_windows_bytes(&self.windows)
-                .saturating_add(Self::scratch_nogroup_bytes(&self.scratch_nogroup));
-        }
+    fn session_groups_bytes(groups: &SessionGroups) -> usize {
+        groups
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(arrow::row::OwnedRow, SessionGroupState)>())
+            .saturating_add(groups.iter().fold(0_usize, |bytes, (key, group)| {
+                bytes.saturating_add(Self::session_group_bytes(key, group))
+            }))
+    }
+
+    fn window_group_counts_bytes(counts: &FxHashMap<i64, usize>) -> usize {
+        counts
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(i64, usize)>())
     }
 
     #[must_use]
-    pub(crate) const fn accounted_state_bytes(&self) -> usize {
-        self.accounted_state_bytes
+    pub(crate) fn accounted_state_bytes(&self) -> usize {
+        self.active_vnodes
+            .iter()
+            .filter_map(|vnode| self.vnode_states[*vnode as usize].as_deref())
+            .fold(0_usize, |bytes, state| {
+                bytes
+                    .saturating_add(std::mem::size_of::<CoreWindowVnodeState>())
+                    .saturating_add(state.accounted_state_bytes)
+            })
+            .saturating_add(Self::scratch_nogroup_bytes(&self.scratch_nogroup))
+            .saturating_add(Self::scratch_grouped_bytes(&self.scratch_grouped))
+            .saturating_add(Self::scratch_group_keys_bytes(&self.scratch_group_keys))
+            .saturating_add(Self::window_group_counts_bytes(&self.window_group_counts))
+            .saturating_add(
+                self.vnode_states
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Option<Box<CoreWindowVnodeState>>>()),
+            )
+            .saturating_add(
+                self.active_vnodes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(
+                self.active_vnode_positions
+                    .len()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            )
+            .saturating_add(
+                self.checkpoint_dirty_vnodes
+                    .len()
+                    .saturating_mul(std::mem::size_of::<bool>()),
+            )
+            .saturating_add(
+                self.checkpoint_dirty_vnode_roster
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) const fn key_group_count(&self) -> KeyGroupCount {
+        self.key_group_count
+    }
+
+    fn routing_vnode_count(&self) -> NonZeroU32 {
+        NonZeroU32::from(self.key_group_count.into_non_zero())
+    }
+
+    pub(crate) fn validate_vnode_count(&self, requested: u32) -> Result<NonZeroU32, DbError> {
+        let requested = KeyGroupCount::try_from(requested)
+            .map_err(|error| DbError::Pipeline(format!("Core window vnode_count: {error}")))?;
+        if requested != self.key_group_count {
+            return Err(DbError::Pipeline(format!(
+                "Core window key-group count mismatch: state={}, requested={requested}",
+                self.key_group_count
+            )));
+        }
+        Ok(self.routing_vnode_count())
+    }
+
+    #[inline]
+    fn vnode_for_group_key(&self, key: &arrow::row::OwnedRow) -> u32 {
+        if self.num_group_cols == 0 || self.key_group_count.get() == 1 {
+            0
+        } else {
+            PartitionKeyCodecV1::vnode_for_encoded(key.as_ref(), self.routing_vnode_count())
+        }
+    }
+
+    fn validate_vnode_hint(&self, vnode: u32) -> Result<(), DbError> {
+        if vnode >= u32::from(self.key_group_count) {
+            return Err(DbError::Pipeline(format!(
+                "Core window vnode {vnode} is outside vnode_count {}",
+                self.key_group_count
+            )));
+        }
+        Ok(())
+    }
+
+    fn vnode_state_mut(&mut self, vnode: u32) -> &mut CoreWindowVnodeState {
+        let slot = &mut self.vnode_states[vnode as usize];
+        if slot.is_none() {
+            *slot = Some(Box::new(CoreWindowVnodeState {
+                windows: BTreeMap::new(),
+                session_groups: FxHashMap::default(),
+                accounted_state_bytes: 0,
+            }));
+            debug_assert!(self.active_vnodes.len() < self.active_vnodes.capacity());
+            let index = self.active_vnodes.len();
+            debug_assert_eq!(self.active_vnode_positions[vnode as usize], usize::MAX);
+            self.active_vnodes.push(vnode);
+            self.active_vnode_positions[vnode as usize] = index;
+        }
+        slot.as_deref_mut().expect("Core window vnode was inserted")
+    }
+
+    fn insert_fixed_group(
+        &mut self,
+        vnode: u32,
+        window_start: i64,
+        key: arrow::row::OwnedRow,
+        accumulators: Vec<Box<dyn datafusion_expr::Accumulator>>,
+    ) {
+        let key_bytes = key.as_ref().len();
+        let accumulator_bytes = Self::accumulator_vector_bytes(&accumulators);
+        let state = self.vnode_state_mut(vnode);
+        let new_window = !state.windows.contains_key(&window_start);
+        let groups = state.windows.entry(window_start).or_default();
+        let previous_capacity = groups.capacity();
+        assert!(
+            groups.insert(key, accumulators).is_none(),
+            "Core window group insertion must target a vacant key"
+        );
+        let roster_growth = groups
+            .capacity()
+            .saturating_sub(previous_capacity)
+            .saturating_mul(std::mem::size_of::<(
+                arrow::row::OwnedRow,
+                Vec<Box<dyn datafusion_expr::Accumulator>>,
+            )>());
+        state.accounted_state_bytes = state
+            .accounted_state_bytes
+            .saturating_add(roster_growth)
+            .saturating_add(key_bytes)
+            .saturating_add(accumulator_bytes)
+            .saturating_add(if new_window {
+                std::mem::size_of::<(i64, FixedWindowGroups)>()
+            } else {
+                0
+            });
+        *self.window_group_counts.entry(window_start).or_default() += 1;
+    }
+
+    fn drop_empty_vnode(&mut self, vnode: u32) {
+        let empty = self.vnode_states[vnode as usize]
+            .as_ref()
+            .is_some_and(|state| state.windows.is_empty() && state.session_groups.is_empty());
+        if empty {
+            self.vnode_states[vnode as usize] = None;
+            let index =
+                std::mem::replace(&mut self.active_vnode_positions[vnode as usize], usize::MAX);
+            assert_ne!(index, usize::MAX, "empty Core window vnode must be active");
+            let removed = self.active_vnodes.swap_remove(index);
+            debug_assert_eq!(removed, vnode);
+            if index < self.active_vnodes.len() {
+                let moved = self.active_vnodes[index];
+                self.active_vnode_positions[moved as usize] = index;
+            }
+        }
+    }
+
+    #[inline]
+    fn mark_checkpoint_vnode_dirty(&mut self, vnode: u32) {
+        let dirty = &mut self.checkpoint_dirty_vnodes[vnode as usize];
+        if !*dirty {
+            *dirty = true;
+            debug_assert!(
+                self.checkpoint_dirty_vnode_roster.len()
+                    < self.checkpoint_dirty_vnode_roster.capacity()
+            );
+            self.checkpoint_dirty_vnode_roster.push(vnode);
+        }
+    }
+
+    fn clear_checkpoint_dirty_vnodes(&mut self) {
+        for &vnode in &self.checkpoint_dirty_vnode_roster {
+            self.checkpoint_dirty_vnodes[vnode as usize] = false;
+        }
+        self.checkpoint_dirty_vnode_roster.clear();
     }
 
     /// Update per-window accumulators with a new pre-aggregation batch.
     ///
     /// Session windows use per-row processing because merge depends on insertion order.
+    #[cfg(test)]
     pub fn update_batch(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
+        self.update_batch_for_vnode(batch, None)
+    }
+
+    pub(crate) fn update_batch_for_vnode(
+        &mut self,
+        batch: &RecordBatch,
+        vnode_hint: Option<u32>,
+    ) -> Result<(), DbError> {
         if batch.num_rows() == 0 {
             return Ok(());
+        }
+        if let Some(vnode) = vnode_hint {
+            self.validate_vnode_hint(vnode)?;
         }
 
         let ts_array = extract_i64_timestamps(batch, self.time_col_index)?;
 
         if matches!(self.assigner, CoreWindowAssigner::Session { .. }) {
-            return self.update_batch_session(batch, &ts_array);
+            return self.update_batch_session(batch, &ts_array, vnode_hint);
         }
 
         if self.num_group_cols == 0 {
+            if vnode_hint.is_some_and(|vnode| vnode != 0) {
+                return Err(DbError::Pipeline(
+                    "global Core window batch was routed outside vnode zero".into(),
+                ));
+            }
             self.update_batch_nogroup(batch, &ts_array)
         } else {
-            self.update_batch_grouped(batch, &ts_array)
+            self.update_batch_grouped(batch, &ts_array, vnode_hint)
         }
     }
 
@@ -857,8 +1141,6 @@ impl CoreWindowState {
     ) -> Result<(), DbError> {
         let empty_key = crate::aggregate_state::global_aggregate_key();
         let mut grouped = std::mem::take(&mut self.scratch_nogroup);
-        let previous_scratch_bytes = Self::scratch_nogroup_bytes(&grouped);
-        self.replace_accounted_component(previous_scratch_bytes, 0);
         grouped.clear();
         for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
             if ts_ms == NULL_TIMESTAMP {
@@ -888,45 +1170,38 @@ impl CoreWindowState {
             }
         }
         for (window_start, indices) in &grouped {
-            let previous_window_bytes = self
-                .windows
-                .get(window_start)
-                .map_or(0, Self::fixed_window_bytes);
-            let needs_insert = self
-                .windows
-                .get(window_start)
+            let needs_insert = self.vnode_states[0]
+                .as_ref()
+                .and_then(|state| state.windows.get(window_start))
                 .is_none_or(|groups| !groups.contains_key(&empty_key));
             if needs_insert {
                 let accs = self.create_fresh_accumulators()?;
-                self.windows
-                    .entry(*window_start)
-                    .or_default()
-                    .insert(empty_key.clone(), accs);
+                self.insert_fixed_group(0, *window_start, empty_key.clone(), accs);
             }
-            let Some(accs) = self
-                .windows
-                .get_mut(window_start)
-                .and_then(|g| g.get_mut(&empty_key))
-            else {
-                continue;
+            let agg_specs = &self.agg_specs;
+            let state = self.vnode_states[0]
+                .as_deref_mut()
+                .expect("global Core window vnode must exist");
+            let (previous_accumulator_bytes, update, current_accumulator_bytes) = {
+                let accs = state
+                    .windows
+                    .get_mut(window_start)
+                    .and_then(|groups| groups.get_mut(&empty_key))
+                    .expect("global Core window group must exist");
+                let previous = Self::accumulator_vector_bytes(accs);
+                let update = crate::aggregate_state::IncrementalAggState::update_group_accumulators(
+                    accs, batch, indices, agg_specs, None,
+                );
+                (previous, update, Self::accumulator_vector_bytes(accs))
             };
-            let update = crate::aggregate_state::IncrementalAggState::update_group_accumulators(
-                accs,
-                batch,
-                indices,
-                &self.agg_specs,
-                None,
-            );
-            let current_window_bytes = self
-                .windows
-                .get(window_start)
-                .map_or(0, Self::fixed_window_bytes);
-            self.replace_accounted_component(previous_window_bytes, current_window_bytes);
+            state.accounted_state_bytes = state
+                .accounted_state_bytes
+                .saturating_sub(previous_accumulator_bytes)
+                .saturating_add(current_accumulator_bytes);
             update?;
+            self.mark_checkpoint_vnode_dirty(0);
         }
-        let scratch_bytes = Self::scratch_nogroup_bytes(&grouped);
         self.scratch_nogroup = grouped;
-        self.replace_accounted_component(0, scratch_bytes);
         Ok(())
     }
 
@@ -934,6 +1209,7 @@ impl CoreWindowState {
         &mut self,
         batch: &RecordBatch,
         ts_array: &[i64],
+        vnode_hint: Option<u32>,
     ) -> Result<(), DbError> {
         let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
             .map(|i| Arc::clone(batch.column(i)))
@@ -952,7 +1228,15 @@ impl CoreWindowState {
             if ts_ms == NULL_TIMESTAMP {
                 continue;
             }
-            let (gid, _) = group_keys.insert_full(rows.row(row_idx).owned());
+            let row_key = rows.row(row_idx).owned();
+            let vnode = self.vnode_for_group_key(&row_key);
+            if vnode_hint.is_some_and(|hint| hint != vnode) {
+                return Err(DbError::Pipeline(format!(
+                    "Core window batch routed to vnode {} contains a key for vnode {vnode}",
+                    vnode_hint.expect("checked as Some")
+                )));
+            }
+            let (gid, _) = group_keys.insert_full(row_key);
             #[allow(clippy::cast_possible_truncation)]
             let (gid, idx) = (gid as u32, row_idx as u32);
             match &self.assigner {
@@ -962,7 +1246,7 @@ impl CoreWindowState {
                         self.record_late_drop(1);
                         continue;
                     }
-                    grouped.entry((ws, gid)).or_default().push(idx);
+                    grouped.entry((vnode, ws, gid)).or_default().push(idx);
                 }
                 CoreWindowAssigner::Hopping(a) => {
                     for wid in a.assign_windows(ts_ms) {
@@ -970,22 +1254,33 @@ impl CoreWindowState {
                             self.record_late_drop(1);
                             continue;
                         }
-                        grouped.entry((wid.start, gid)).or_default().push(idx);
+                        grouped
+                            .entry((vnode, wid.start, gid))
+                            .or_default()
+                            .push(idx);
                     }
                 }
                 CoreWindowAssigner::Session { .. } => unreachable!("handled above"),
             }
         }
 
-        for ((window_start, gid), indices) in &grouped {
+        for ((vnode, window_start, gid), indices) in &grouped {
             let row_key = group_keys
                 .get_index(*gid as usize)
                 .expect("gid was just produced by insert_full");
             let needs_insert = {
-                let window_groups = self.windows.entry(*window_start).or_default();
-                if window_groups.contains_key(row_key) {
+                let window_groups = self.vnode_states[*vnode as usize]
+                    .as_ref()
+                    .and_then(|state| state.windows.get(window_start));
+                if window_groups.is_some_and(|groups| groups.contains_key(row_key)) {
                     false
-                } else if window_groups.len() >= self.max_groups_per_window {
+                } else if self
+                    .window_group_counts
+                    .get(window_start)
+                    .copied()
+                    .unwrap_or(0)
+                    >= self.max_groups_per_window
+                {
                     return Err(DbError::Pipeline(format!(
                         "Core window {window_start} group cardinality limit {} reached",
                         self.max_groups_per_window
@@ -996,27 +1291,31 @@ impl CoreWindowState {
             };
             if needs_insert {
                 let accs = self.create_fresh_accumulators()?;
-                self.windows
-                    .entry(*window_start)
-                    .or_default()
-                    .insert(row_key.clone(), accs);
+                self.insert_fixed_group(*vnode, *window_start, row_key.clone(), accs);
             }
 
-            let Some(accs) = self
-                .windows
-                .get_mut(window_start)
-                .and_then(|g| g.get_mut(row_key))
-            else {
-                continue;
+            let agg_specs = &self.agg_specs;
+            let state = self.vnode_states[*vnode as usize]
+                .as_deref_mut()
+                .expect("Core window vnode must exist");
+            let (previous_accumulator_bytes, update, current_accumulator_bytes) = {
+                let accs = state
+                    .windows
+                    .get_mut(window_start)
+                    .and_then(|groups| groups.get_mut(row_key))
+                    .expect("Core window group must exist");
+                let previous = Self::accumulator_vector_bytes(accs);
+                let update = crate::aggregate_state::IncrementalAggState::update_group_accumulators(
+                    accs, batch, indices, agg_specs, None,
+                );
+                (previous, update, Self::accumulator_vector_bytes(accs))
             };
-
-            crate::aggregate_state::IncrementalAggState::update_group_accumulators(
-                accs,
-                batch,
-                indices,
-                &self.agg_specs,
-                None,
-            )?;
+            state.accounted_state_bytes = state
+                .accounted_state_bytes
+                .saturating_sub(previous_accumulator_bytes)
+                .saturating_add(current_accumulator_bytes);
+            update?;
+            self.mark_checkpoint_vnode_dirty(*vnode);
         }
 
         self.scratch_grouped = grouped;
@@ -1029,46 +1328,60 @@ impl CoreWindowState {
         &mut self,
         batch: &RecordBatch,
         ts_array: &[i64],
+        vnode_hint: Option<u32>,
     ) -> Result<(), DbError> {
         let CoreWindowAssigner::Session { gap_ms } = self.assigner else {
             unreachable!("update_batch_session called on non-session assigner");
         };
+        let keys = if self.num_group_cols == 0 {
+            vec![crate::aggregate_state::global_aggregate_key(); batch.num_rows()]
+        } else {
+            let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
+                .map(|index| Arc::clone(batch.column(index)))
+                .collect();
+            let rows = self
+                .row_converter
+                .convert_columns(&group_cols)
+                .map_err(|error| {
+                    DbError::Pipeline(format!("session group key conversion: {error}"))
+                })?;
+            (0..batch.num_rows())
+                .map(|row| rows.row(row).owned())
+                .collect()
+        };
+        let mut vnodes = Vec::with_capacity(batch.num_rows());
+        for (key, &ts_ms) in keys.iter().zip(ts_array) {
+            let vnode = self.vnode_for_group_key(key);
+            if ts_ms != NULL_TIMESTAMP && vnode_hint.is_some_and(|hint| hint != vnode) {
+                return Err(DbError::Pipeline(format!(
+                    "Core window batch routed to vnode {} contains a key for vnode {vnode}",
+                    vnode_hint.expect("checked as Some")
+                )));
+            }
+            vnodes.push(vnode);
+        }
         for (row, &ts_ms) in ts_array.iter().enumerate() {
             if ts_ms == NULL_TIMESTAMP {
                 continue;
             }
             #[allow(clippy::cast_possible_truncation)]
             let index_array = arrow::array::UInt32Array::from_value(row as u32, 1);
-            let key = self.extract_group_key_row(batch, &index_array)?;
-            self.update_session_window(ts_ms, gap_ms, &key, batch, &index_array)?;
+            self.update_session_window(
+                vnodes[row],
+                ts_ms,
+                gap_ms,
+                &keys[row],
+                batch,
+                &index_array,
+            )?;
         }
         Ok(())
-    }
-
-    fn extract_group_key_row(
-        &self,
-        batch: &RecordBatch,
-        index_array: &arrow::array::UInt32Array,
-    ) -> Result<arrow::row::OwnedRow, DbError> {
-        if self.num_group_cols == 0 {
-            return Ok(crate::aggregate_state::global_aggregate_key());
-        }
-        let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
-            .map(|i| {
-                compute::take(batch.column(i), index_array, None)
-                    .map_err(|e| DbError::Pipeline(format!("group key take: {e}")))
-            })
-            .collect::<Result<_, _>>()?;
-        let rows = self
-            .row_converter
-            .convert_columns(&group_cols)
-            .map_err(|e| DbError::Pipeline(format!("group key row conversion: {e}")))?;
-        Ok(rows.row(0).owned())
     }
 
     /// Update accumulators for a session window, merging overlapping sessions.
     fn update_session_window(
         &mut self,
+        vnode: u32,
         ts_ms: i64,
         gap_ms: i64,
         key: &arrow::row::OwnedRow,
@@ -1078,17 +1391,19 @@ impl CoreWindowState {
         let new_start = ts_ms;
         let new_end = ts_ms.saturating_add(gap_ms);
 
-        let overlapping: Vec<i64> = self
-            .session_groups
-            .get(key)
+        let mut overlapping: smallvec::SmallVec<[i64; 2]> = self.vnode_states[vnode as usize]
+            .as_ref()
+            .and_then(|state| state.session_groups.get(key))
             .map(|g| {
                 g.sessions
                     .range(..=new_end)
-                    .filter(|(_, s)| s.end >= new_start)
+                    .rev()
+                    .take_while(|(_, session)| session.end >= new_start)
                     .map(|(&k, _)| k)
                     .collect()
             })
             .unwrap_or_default();
+        overlapping.reverse();
 
         debug_assert!(
             overlapping
@@ -1097,24 +1412,28 @@ impl CoreWindowState {
                 .all(|(a, b)| a < b),
             "session window: overlapping keys must be unique and sorted"
         );
-        let candidate_end = self.session_groups.get(key).map_or(new_end, |group| {
-            overlapping.iter().fold(new_end, |end, session_start| {
-                end.max(
-                    group
-                        .sessions
-                        .get(session_start)
-                        .expect("overlapping session was read from this group")
-                        .end,
-                )
-            })
-        });
+        let candidate_end = self.vnode_states[vnode as usize]
+            .as_ref()
+            .and_then(|state| state.session_groups.get(key))
+            .map_or(new_end, |group| {
+                overlapping.iter().fold(new_end, |end, session_start| {
+                    end.max(
+                        group
+                            .sessions
+                            .get(session_start)
+                            .expect("overlapping session was read from this group")
+                            .end,
+                    )
+                })
+            });
         if self.is_session_end_closed(candidate_end) {
             self.record_late_drop(1);
             return Ok(());
         }
-        if !self.session_groups.contains_key(key)
-            && self.session_groups.len() >= self.max_groups_per_window
-        {
+        let new_group = self.vnode_states[vnode as usize]
+            .as_ref()
+            .is_none_or(|state| !state.session_groups.contains_key(key));
+        if new_group && self.session_group_count >= self.max_groups_per_window {
             return Err(DbError::Pipeline(format!(
                 "Core window session group cardinality limit {} reached",
                 self.max_groups_per_window
@@ -1125,23 +1444,54 @@ impl CoreWindowState {
             0 => {
                 let mut accs = self.create_fresh_accumulators()?;
                 Self::update_accumulators(&mut accs, &self.agg_specs, batch, index_array)?;
+                let accumulator_bytes = Self::accumulator_vector_bytes(&accs);
+                let state = self.vnode_state_mut(vnode);
+                let previous_capacity = state.session_groups.capacity();
                 let group =
-                    self.session_groups
+                    state
+                        .session_groups
                         .entry(key.clone())
                         .or_insert_with(|| SessionGroupState {
                             sessions: BTreeMap::new(),
                         });
-                group.sessions.insert(
-                    new_start,
-                    SessionAccState {
-                        start: new_start,
-                        end: new_end,
-                        accs,
-                    },
+                assert!(
+                    group
+                        .sessions
+                        .insert(
+                            new_start,
+                            SessionAccState {
+                                start: new_start,
+                                end: new_end,
+                                accs,
+                            },
+                        )
+                        .is_none(),
+                    "new Core session must have a vacant start"
                 );
+                state.accounted_state_bytes = state
+                    .accounted_state_bytes
+                    .saturating_add(
+                        state
+                            .session_groups
+                            .capacity()
+                            .saturating_sub(previous_capacity)
+                            .saturating_mul(std::mem::size_of::<(
+                                arrow::row::OwnedRow,
+                                SessionGroupState,
+                            )>()),
+                    )
+                    .saturating_add(if new_group { key.as_ref().len() } else { 0 })
+                    .saturating_add(std::mem::size_of::<(i64, SessionAccState)>())
+                    .saturating_add(accumulator_bytes);
+                if new_group {
+                    self.session_group_count += 1;
+                }
             }
             1 => {
-                let group = self
+                let state = self.vnode_states[vnode as usize]
+                    .as_deref_mut()
+                    .expect("session vnode must exist");
+                let group = state
                     .session_groups
                     .get_mut(key)
                     .expect("invariant: key present (overlapping derived from same group)");
@@ -1150,21 +1500,30 @@ impl CoreWindowState {
                     .sessions
                     .get_mut(&sess_key)
                     .expect("invariant: session key sourced from this map");
+                let previous_accumulator_bytes = Self::accumulator_vector_bytes(&sess.accs);
                 let merged_start = sess.start.min(new_start);
                 let merged_end = sess.end.max(new_end);
                 sess.start = merged_start;
                 sess.end = merged_end;
-                Self::update_accumulators(&mut sess.accs, &self.agg_specs, batch, index_array)?;
-                if merged_start != sess_key {
+                let update =
+                    Self::update_accumulators(&mut sess.accs, &self.agg_specs, batch, index_array);
+                let current_accumulator_bytes = Self::accumulator_vector_bytes(&sess.accs);
+                if update.is_ok() && merged_start != sess_key {
                     let sess = group
                         .sessions
                         .remove(&sess_key)
                         .expect("invariant: session key just observed above");
                     group.sessions.insert(merged_start, sess);
                 }
+                state.accounted_state_bytes = state
+                    .accounted_state_bytes
+                    .saturating_sub(previous_accumulator_bytes)
+                    .saturating_add(current_accumulator_bytes);
+                update?;
             }
             _ => {
                 self.merge_overlapping_sessions(
+                    vnode,
                     key,
                     &overlapping,
                     new_start,
@@ -1175,11 +1534,14 @@ impl CoreWindowState {
             }
         }
 
+        self.mark_checkpoint_vnode_dirty(vnode);
+
         Ok(())
     }
 
     fn merge_overlapping_sessions(
         &mut self,
+        vnode: u32,
         key: &arrow::row::OwnedRow,
         overlapping: &[i64],
         new_start: i64,
@@ -1193,17 +1555,24 @@ impl CoreWindowState {
         // mid-merge failure leaves the existing sessions intact.
         let mut accs = self.create_fresh_accumulators()?;
 
-        let group = self
+        let state = self.vnode_states[vnode as usize]
+            .as_deref_mut()
+            .expect("session vnode must exist");
+        let group = state
             .session_groups
             .get_mut(key)
             .expect("invariant: key present (overlapping derived from same group)");
         let mut merged_start = new_start;
         let mut merged_end = new_end;
+        let mut retired_bytes = 0_usize;
         for &sess_key in overlapping {
             let sess = group
                 .sessions
                 .get_mut(&sess_key)
                 .expect("invariant: overlapping keys are unique BTreeMap entries");
+            retired_bytes = retired_bytes
+                .saturating_add(std::mem::size_of::<(i64, SessionAccState)>())
+                .saturating_add(Self::accumulator_vector_bytes(&sess.accs));
             merged_start = merged_start.min(sess.start);
             merged_end = merged_end.max(sess.end);
             for (i, acc) in sess.accs.iter_mut().enumerate() {
@@ -1227,6 +1596,8 @@ impl CoreWindowState {
         for &sess_key in overlapping {
             group.sessions.remove(&sess_key);
         }
+        let replacement_bytes = std::mem::size_of::<(i64, SessionAccState)>()
+            .saturating_add(Self::accumulator_vector_bytes(&accs));
         group.sessions.insert(
             merged_start,
             SessionAccState {
@@ -1235,6 +1606,10 @@ impl CoreWindowState {
                 accs,
             },
         );
+        state.accounted_state_bytes = state
+            .accounted_state_bytes
+            .saturating_sub(retired_bytes)
+            .saturating_add(replacement_bytes);
         Ok(())
     }
 
@@ -1317,12 +1692,29 @@ impl CoreWindowState {
 
     /// Close and emit all windows whose end (plus lateness grace) <= watermark.
     pub fn close_windows(&mut self, watermark_ms: i64) -> Result<Vec<RecordBatch>, DbError> {
-        self.high_watermark_ms = self.high_watermark_ms.max(watermark_ms);
-        let batches = match &self.assigner {
-            CoreWindowAssigner::Tumbling(a) => self.close_fixed_windows(watermark_ms, a.size_ms()),
-            CoreWindowAssigner::Hopping(a) => self.close_fixed_windows(watermark_ms, a.size_ms()),
-            CoreWindowAssigner::Session { .. } => self.close_session_windows(watermark_ms),
-        }?;
+        if watermark_ms <= self.high_watermark_ms {
+            return Ok(Vec::new());
+        }
+        self.high_watermark_ms = watermark_ms;
+        let fixed_size = match &self.assigner {
+            CoreWindowAssigner::Tumbling(assigner) => Some(assigner.size_ms()),
+            CoreWindowAssigner::Hopping(assigner) => Some(assigner.size_ms()),
+            CoreWindowAssigner::Session { .. } => None,
+        };
+        let mut batches = Vec::new();
+        let mut active_index = 0;
+        while active_index < self.active_vnodes.len() {
+            let vnode = self.active_vnodes[active_index];
+            let mut closed = if let Some(size_ms) = fixed_size {
+                self.close_fixed_windows(vnode, watermark_ms, size_ms)?
+            } else {
+                self.close_session_windows(vnode, watermark_ms)?
+            };
+            batches.append(&mut closed);
+            if self.active_vnodes.get(active_index).copied() == Some(vnode) {
+                active_index += 1;
+            }
+        }
         let batches = if let Some(filter) = &self.having_filter {
             apply_compiled_having(&batches, filter)?
         } else {
@@ -1333,10 +1725,14 @@ impl CoreWindowState {
 
     fn close_fixed_windows(
         &mut self,
+        vnode: u32,
         watermark_ms: i64,
         size_ms: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        if let Some((&first_ws, _)) = self.windows.first_key_value() {
+        let state = self.vnode_states[vnode as usize]
+            .as_ref()
+            .expect("active Core window vnode must exist");
+        if let Some((&first_ws, _)) = state.windows.first_key_value() {
             if first_ws
                 .saturating_add(size_ms)
                 .saturating_add(self.allowed_lateness_ms)
@@ -1348,7 +1744,9 @@ impl CoreWindowState {
             return Ok(Vec::new());
         }
 
-        let to_close: Vec<i64> = self
+        let to_close: Vec<i64> = self.vnode_states[vnode as usize]
+            .as_ref()
+            .expect("active Core window vnode must exist")
             .windows
             .keys()
             .copied()
@@ -1360,13 +1758,29 @@ impl CoreWindowState {
             .collect();
 
         let mut result_batches = Vec::new();
+        let mutated = !to_close.is_empty();
 
         for window_start in to_close {
-            let Some(groups) = self.windows.remove(&window_start) else {
+            let state = self.vnode_states[vnode as usize]
+                .as_deref_mut()
+                .expect("active Core window vnode must exist");
+            let Some(groups) = state.windows.remove(&window_start) else {
                 continue;
             };
             let retired_bytes = Self::fixed_window_bytes(&groups);
-            self.replace_accounted_component(retired_bytes, 0);
+            state.accounted_state_bytes = state.accounted_state_bytes.saturating_sub(retired_bytes);
+            let remaining_groups = self
+                .window_group_counts
+                .get(&window_start)
+                .copied()
+                .and_then(|count| count.checked_sub(groups.len()))
+                .expect("Core window cardinality accounting must cover closed groups");
+            if remaining_groups == 0 {
+                self.window_group_counts.remove(&window_start);
+            } else {
+                self.window_group_counts
+                    .insert(window_start, remaining_groups);
+            }
             if groups.is_empty() {
                 continue;
             }
@@ -1374,20 +1788,19 @@ impl CoreWindowState {
                 result_batches.push(b);
             }
         }
+        if mutated {
+            self.mark_checkpoint_vnode_dirty(vnode);
+            self.drop_empty_vnode(vnode);
+        }
 
         Ok(result_batches)
     }
 
-    fn close_session_windows(&mut self, watermark_ms: i64) -> Result<Vec<RecordBatch>, DbError> {
-        let any_closeable = self.session_groups.values().any(|g| {
-            g.sessions
-                .values()
-                .any(|s| s.end.saturating_add(self.allowed_lateness_ms) <= watermark_ms)
-        });
-        if !any_closeable {
-            return Ok(Vec::new());
-        }
-
+    fn close_session_windows(
+        &mut self,
+        vnode: u32,
+        watermark_ms: i64,
+    ) -> Result<Vec<RecordBatch>, DbError> {
         #[allow(clippy::type_complexity)]
         let mut rows: Vec<(
             i64,
@@ -1397,8 +1810,12 @@ impl CoreWindowState {
         )> = Vec::new();
 
         let mut empty_groups = Vec::new();
+        let mut retired_bytes = 0_usize;
 
-        for (key, group) in &mut self.session_groups {
+        let state = self.vnode_states[vnode as usize]
+            .as_deref_mut()
+            .expect("active Core window vnode must exist");
+        for (key, group) in &mut state.session_groups {
             let to_close: Vec<i64> = group
                 .sessions
                 .iter()
@@ -1411,6 +1828,9 @@ impl CoreWindowState {
                     .sessions
                     .remove(&sess_key)
                     .expect("invariant: to_close keys collected from this map this iteration");
+                retired_bytes = retired_bytes
+                    .saturating_add(std::mem::size_of::<(i64, SessionAccState)>())
+                    .saturating_add(Self::accumulator_vector_bytes(&sess.accs));
                 rows.push((sess.start, sess.end, key.clone(), sess.accs));
             }
 
@@ -1419,13 +1839,23 @@ impl CoreWindowState {
             }
         }
 
+        let removed_groups = empty_groups.len();
         for key in empty_groups {
-            self.session_groups.remove(&key);
+            retired_bytes = retired_bytes.saturating_add(key.as_ref().len());
+            state.session_groups.remove(&key);
         }
 
         if rows.is_empty() {
             return Ok(Vec::new());
         }
+
+        state.accounted_state_bytes = state.accounted_state_bytes.saturating_sub(retired_bytes);
+        self.session_group_count = self
+            .session_group_count
+            .checked_sub(removed_groups)
+            .expect("Core session cardinality accounting invariant failed");
+        self.mark_checkpoint_vnode_dirty(vnode);
+        self.drop_empty_vnode(vnode);
 
         rows.sort_by_key(|(ws, we, _, _)| (*ws, *we));
 
@@ -1743,17 +2173,21 @@ impl CoreWindowState {
     }
 
     pub(crate) fn query_fingerprint(&self) -> u64 {
-        let mut config = Vec::with_capacity(26);
-        config.push(2);
+        let mut config = Vec::with_capacity(38);
+        config.push(4);
+        config.extend_from_slice(&laminar_core::state::PARTITIONING_ABI_VERSION.to_le_bytes());
+        config.extend_from_slice(&self.key_group_count.get().to_le_bytes());
         match &self.assigner {
             CoreWindowAssigner::Tumbling(t) => {
                 config.push(1);
                 config.extend_from_slice(&t.size_ms().to_le_bytes());
+                config.extend_from_slice(&t.offset_ms().to_le_bytes());
             }
             CoreWindowAssigner::Hopping(s) => {
                 config.push(2);
                 config.extend_from_slice(&s.size_ms().to_le_bytes());
                 config.extend_from_slice(&s.slide_ms().to_le_bytes());
+                config.extend_from_slice(&s.offset_ms().to_le_bytes());
             }
             CoreWindowAssigner::Session { gap_ms } => {
                 config.push(3);
@@ -1764,145 +2198,291 @@ impl CoreWindowState {
         query_fingerprint_with_config(&self.query_sql, &self.output_schema, &config)
     }
 
-    fn window_type_tag(&self) -> &'static str {
+    fn window_type_tag(&self) -> u8 {
         match &self.assigner {
-            CoreWindowAssigner::Tumbling(_) => "tumbling",
-            CoreWindowAssigner::Hopping(_) => "hopping",
-            CoreWindowAssigner::Session { .. } => "session",
+            CoreWindowAssigner::Tumbling(_) => 1,
+            CoreWindowAssigner::Hopping(_) => 2,
+            CoreWindowAssigner::Session { .. } => 3,
         }
     }
 
-    pub(crate) fn checkpoint_windows(&mut self) -> Result<CoreWindowCheckpoint, DbError> {
-        use crate::aggregate_state::scalars_to_ipc;
-
-        let fingerprint = self.query_fingerprint();
-        let window_type = self.window_type_tag().to_string();
-
-        match &self.assigner {
-            CoreWindowAssigner::Tumbling(_) | CoreWindowAssigner::Hopping(_) => {
-                let mut windows = Vec::with_capacity(self.windows.len());
-                for (&window_start, groups) in &mut self.windows {
-                    let mut group_checkpoints = Vec::with_capacity(groups.len());
-                    for (key, accs) in groups {
-                        let sv_key = crate::aggregate_state::row_to_scalar_key_with_types(
-                            &self.row_converter,
-                            key,
-                            &self.group_types,
-                        )?;
-                        let key_ipc = scalars_to_ipc(&sv_key)?;
-                        let mut acc_states = Vec::with_capacity(accs.len());
-                        for acc in accs.iter_mut() {
-                            acc_states
-                                .push(crate::aggregate_state::snapshot_window_accumulator(acc)?);
-                        }
-                        group_checkpoints.push(GroupCheckpoint {
-                            key: key_ipc,
-                            acc_states,
-                            last_updated_ms: i64::MIN,
-                        });
-                    }
-                    windows.push(WindowCheckpoint {
-                        window_start,
-                        groups: group_checkpoints,
-                    });
-                }
-                Ok(CoreWindowCheckpoint {
-                    fingerprint,
-                    windows,
-                    session_state: Vec::new(),
-                    window_type,
-                    high_watermark_ms: self.high_watermark_ms,
-                })
-            }
-            CoreWindowAssigner::Session { .. } => {
-                let mut session_state = Vec::with_capacity(self.session_groups.len());
-                for (key, group) in &mut self.session_groups {
-                    let sv_key = crate::aggregate_state::row_to_scalar_key_with_types(
-                        &self.row_converter,
-                        key,
-                        &self.group_types,
-                    )?;
-                    let key_ipc = scalars_to_ipc(&sv_key)?;
-                    let mut sessions = Vec::with_capacity(group.sessions.len());
-                    for sess in group.sessions.values_mut() {
-                        let mut acc_states = Vec::with_capacity(sess.accs.len());
-                        for acc in &mut sess.accs {
-                            acc_states
-                                .push(crate::aggregate_state::snapshot_window_accumulator(acc)?);
-                        }
-                        sessions.push(SessionCheckpoint {
-                            start: sess.start,
-                            end: sess.end,
-                            acc_states,
-                        });
-                    }
-                    session_state.push(SessionGroupCheckpoint {
-                        key: key_ipc,
-                        sessions,
-                    });
-                }
-                Ok(CoreWindowCheckpoint {
-                    fingerprint,
-                    windows: Vec::new(),
-                    session_state,
-                    window_type,
-                    high_watermark_ms: self.high_watermark_ms,
-                })
-            }
-        }
-    }
-
-    pub(crate) fn restore_windows(
+    fn capture_full_vnode(
         &mut self,
-        checkpoint: &CoreWindowCheckpoint,
-    ) -> Result<usize, DbError> {
-        let current_fp = self.query_fingerprint();
-        if checkpoint.fingerprint != current_fp {
-            return Err(DbError::Pipeline(format!(
-                "Core window checkpoint fingerprint mismatch: saved={}, current={}",
-                checkpoint.fingerprint, current_fp
-            )));
+        vnode: u32,
+        fingerprint: u64,
+        group_types: Arc<[DataType]>,
+        max_retained_bytes: usize,
+    ) -> Result<CoreWindowVnodeCheckpointCapture, DbError> {
+        fn charge(remaining: &mut usize, bytes: usize, component: &str) -> Result<(), DbError> {
+            *remaining = remaining.checked_sub(bytes).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "Core window {component} exceeded the remaining capture budget"
+                ))
+            })?;
+            Ok(())
         }
 
-        let expected_type = self.window_type_tag();
-        if checkpoint.window_type != expected_type {
-            return Err(DbError::Checkpoint(format!(
-                "Core window checkpoint type mismatch: saved={}, current={expected_type}",
-                checkpoint.window_type
-            )));
-        }
-
-        let mut prepared = match &self.assigner {
-            CoreWindowAssigner::Session { gap_ms } => {
-                self.prepare_session_window_restore(checkpoint, *gap_ms)?
+        fn reserve_roster<T>(
+            values: &mut Vec<T>,
+            len: usize,
+            remaining: &mut usize,
+            component: &str,
+        ) -> Result<(), DbError> {
+            let admitted = len.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "Core window {component} capture accounting overflow"
+                ))
+            })?;
+            charge(remaining, admitted, component)?;
+            values.try_reserve_exact(len).map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "Core window {component} capture reserve failed: {error}"
+                ))
+            })?;
+            let retained = values
+                .capacity()
+                .checked_mul(std::mem::size_of::<T>())
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "Core window {component} capture accounting overflow"
+                    ))
+                })?;
+            if retained > admitted {
+                charge(remaining, retained - admitted, component)?;
             }
-            CoreWindowAssigner::Tumbling(assigner) => self.prepare_fixed_window_restore(
-                checkpoint,
-                assigner.size_ms(),
-                assigner.size_ms(),
-                assigner.offset_ms(),
-            )?,
-            CoreWindowAssigner::Hopping(assigner) => self.prepare_fixed_window_restore(
-                checkpoint,
-                assigner.size_ms(),
-                assigner.slide_ms(),
-                assigner.offset_ms(),
-            )?,
+            Ok(())
+        }
+
+        fn capture_accumulator_states(
+            accumulators: &mut [Box<dyn datafusion_expr::Accumulator>],
+            remaining: &mut usize,
+            component: &str,
+        ) -> Result<Vec<Vec<ScalarValue>>, DbError> {
+            let mut states = Vec::new();
+            reserve_roster(&mut states, accumulators.len(), remaining, component)?;
+            for accumulator in accumulators {
+                let state = accumulator.state().map_err(|error| {
+                    DbError::Checkpoint(format!("Core window {component} capture failed: {error}"))
+                })?;
+                let retained = state
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<ScalarValue>())
+                    .and_then(|bytes| {
+                        state.iter().try_fold(bytes, |bytes, scalar| {
+                            bytes.checked_add(
+                                scalar
+                                    .size()
+                                    .saturating_sub(std::mem::size_of::<ScalarValue>()),
+                            )
+                        })
+                    })
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "Core window {component} capture accounting overflow"
+                        ))
+                    })?;
+                charge(remaining, retained, component)?;
+                states.push(state);
+            }
+            Ok(states)
+        }
+
+        let mut remaining = max_retained_bytes;
+        charge(
+            &mut remaining,
+            std::mem::size_of::<CoreWindowVnodeCheckpointCapture>(),
+            "vnode snapshot",
+        )?;
+        let mut windows = Vec::new();
+        let mut session_state = Vec::new();
+        if let Some(state) = self.vnode_states[vnode as usize].as_deref_mut() {
+            reserve_roster(
+                &mut windows,
+                state.windows.len(),
+                &mut remaining,
+                "window roster",
+            )?;
+            for (&window_start, groups) in &mut state.windows {
+                let mut captured_groups = Vec::new();
+                reserve_roster(
+                    &mut captured_groups,
+                    groups.len(),
+                    &mut remaining,
+                    "group roster",
+                )?;
+                for (key, accumulators) in groups {
+                    charge(&mut remaining, key.as_ref().len(), "group key")?;
+                    let accumulator_states = capture_accumulator_states(
+                        accumulators,
+                        &mut remaining,
+                        "accumulator state",
+                    )?;
+                    captured_groups.push(CapturedCoreWindowGroup {
+                        key: key.clone(),
+                        accumulator_states,
+                    });
+                }
+                captured_groups
+                    .sort_unstable_by(|left, right| left.key.as_ref().cmp(right.key.as_ref()));
+                windows.push(CapturedFixedWindow {
+                    window_start,
+                    groups: captured_groups,
+                });
+            }
+            reserve_roster(
+                &mut session_state,
+                state.session_groups.len(),
+                &mut remaining,
+                "session group roster",
+            )?;
+            for (key, group) in &mut state.session_groups {
+                charge(&mut remaining, key.as_ref().len(), "session group key")?;
+                let mut sessions = Vec::new();
+                reserve_roster(
+                    &mut sessions,
+                    group.sessions.len(),
+                    &mut remaining,
+                    "session roster",
+                )?;
+                for session in group.sessions.values_mut() {
+                    let accumulator_states = capture_accumulator_states(
+                        &mut session.accs,
+                        &mut remaining,
+                        "session accumulator state",
+                    )?;
+                    sessions.push(CapturedSession {
+                        start: session.start,
+                        end: session.end,
+                        accumulator_states,
+                    });
+                }
+                session_state.push(CapturedSessionGroup {
+                    key: key.clone(),
+                    sessions,
+                });
+            }
+            session_state.sort_unstable_by(|left, right| left.key.as_ref().cmp(right.key.as_ref()));
+        }
+        let retained_bytes = max_retained_bytes - remaining;
+        Ok(CoreWindowVnodeCheckpointCapture {
+            fingerprint,
+            vnode,
+            frontier_floor_ms: self.high_watermark_ms,
+            window_type: self.window_type_tag(),
+            group_types,
+            row_converter: Arc::clone(&self.row_converter),
+            windows,
+            session_state,
+            retained_bytes,
+        })
+    }
+
+    pub(crate) fn capture_checkpoint_vnodes(
+        &mut self,
+        required_vnodes: &[u32],
+        vnode_count: u32,
+        max_capture_bytes: u64,
+    ) -> Result<Vec<(u32, CoreWindowVnodeCheckpointCapture)>, DbError> {
+        let vnode_count = self.validate_vnode_count(vnode_count)?;
+        if required_vnodes.windows(2).any(|pair| pair[0] >= pair[1])
+            || required_vnodes
+                .iter()
+                .any(|vnode| *vnode >= vnode_count.get())
+        {
+            return Err(DbError::Checkpoint(format!(
+                "Core window received a non-canonical vnode roster {required_vnodes:?}"
+            )));
+        }
+        let full_capture = self.full_vnode_capture_required;
+        if full_capture {
+            if let Some(unowned) = self
+                .active_vnodes
+                .iter()
+                .find(|vnode| required_vnodes.binary_search(vnode).is_err())
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "Core window retained state for unowned vnode {unowned}"
+                )));
+            }
+        } else {
+            self.checkpoint_dirty_vnode_roster.sort_unstable();
+            if let Some(unowned) = self
+                .checkpoint_dirty_vnode_roster
+                .iter()
+                .find(|vnode| required_vnodes.binary_search(vnode).is_err())
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "Core window retained dirty state for unowned vnode {unowned}"
+                )));
+            }
+        }
+        let capture_count = if full_capture {
+            required_vnodes.len()
+        } else {
+            self.checkpoint_dirty_vnode_roster.len()
         };
-        let restored_entries = prepared.restored_entries;
-        std::mem::swap(&mut self.windows, &mut prepared.windows);
-        std::mem::swap(&mut self.session_groups, &mut prepared.session_groups);
-        self.scratch_nogroup.clear();
-        self.scratch_grouped.clear();
-        self.scratch_group_keys.clear();
-        self.high_watermark_ms = prepared.high_watermark_ms;
-        self.refresh_managed_accounting();
-        Ok(restored_entries)
+        if capture_count == 0 {
+            self.clear_checkpoint_dirty_vnodes();
+            self.full_vnode_capture_required = false;
+            return Ok(Vec::new());
+        }
+        let mut captures = Vec::new();
+        captures.try_reserve_exact(capture_count).map_err(|error| {
+            DbError::Checkpoint(format!(
+                "Core window capture roster reserve failed: {error}"
+            ))
+        })?;
+        let fingerprint = self.query_fingerprint();
+        let group_types = Arc::clone(&self.group_types);
+        let mut remaining = max_capture_bytes;
+        let mut index = 0;
+        while index < capture_count {
+            let vnode = if full_capture {
+                required_vnodes[index]
+            } else {
+                self.checkpoint_dirty_vnode_roster[index]
+            };
+            let capture = self.capture_full_vnode(
+                vnode,
+                fingerprint,
+                Arc::clone(&group_types),
+                usize::try_from(remaining).unwrap_or(usize::MAX),
+            )?;
+            remaining = remaining
+                .checked_sub(u64::try_from(capture.retained_bytes()).unwrap_or(u64::MAX))
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "Core window vnode {vnode} capture exceeded its budget"
+                    ))
+                })?;
+            captures.push((vnode, capture));
+            index += 1;
+        }
+        self.clear_checkpoint_dirty_vnodes();
+        self.full_vnode_capture_required = false;
+        Ok(captures)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint_vnodes(
+        &mut self,
+        required_vnodes: &[u32],
+        vnode_count: u32,
+    ) -> Result<Vec<(u32, CoreWindowVnodeCheckpoint)>, DbError> {
+        self.capture_checkpoint_vnodes(required_vnodes, vnode_count, u64::MAX)?
+            .into_iter()
+            .map(|(vnode, capture)| capture.encode(usize::MAX).map(|state| (vnode, state)))
+            .collect()
+    }
+
+    pub(crate) fn force_full_vnode_capture(&mut self) {
+        self.full_vnode_capture_required = true;
     }
 
     fn prepare_fixed_window_restore(
         &self,
-        checkpoint: &CoreWindowCheckpoint,
+        checkpoint: &CoreWindowVnodeCheckpoint,
+        vnode: u32,
         size_ms: i64,
         alignment_ms: i64,
         offset_ms: i64,
@@ -1914,7 +2494,6 @@ impl CoreWindowState {
         }
 
         let mut windows = BTreeMap::new();
-        let mut total_groups = 0usize;
         let mut previous_start = None;
         for wc in &checkpoint.windows {
             if previous_start.is_some_and(|previous| previous >= wc.window_start) {
@@ -1932,12 +2511,12 @@ impl CoreWindowState {
                     wc.window_start
                 )));
             }
-            if checkpoint.high_watermark_ms != i64::MIN
+            if checkpoint.frontier_floor_ms != i64::MIN
                 && wc
                     .window_start
                     .saturating_add(size_ms)
                     .saturating_add(self.allowed_lateness_ms)
-                    <= checkpoint.high_watermark_ms
+                    <= checkpoint.frontier_floor_ms
             {
                 return Err(DbError::Checkpoint(format!(
                     "fixed-window checkpoint retains already-closed window {}",
@@ -1966,13 +2545,12 @@ impl CoreWindowState {
                 ))
             })?;
             for gc in &wc.groups {
-                if gc.last_updated_ms != i64::MIN {
+                let row_key = self.decode_checkpoint_key(&gc.key)?;
+                if self.vnode_for_group_key(&row_key) != vnode {
                     return Err(DbError::Checkpoint(format!(
-                        "fixed-window checkpoint window {} has non-canonical group metadata",
-                        wc.window_start
+                        "Core window vnode {vnode} checkpoint contains a key for another vnode"
                     )));
                 }
-                let row_key = self.decode_checkpoint_key(&gc.key)?;
                 let accs = self.decode_checkpoint_accumulators(&gc.acc_states, "fixed window")?;
                 if groups.insert(row_key, accs).is_some() {
                     return Err(DbError::Checkpoint(format!(
@@ -1980,24 +2558,28 @@ impl CoreWindowState {
                         wc.window_start
                     )));
                 }
-                total_groups = total_groups.checked_add(1).ok_or_else(|| {
-                    DbError::Checkpoint("fixed-window checkpoint group count overflow".into())
-                })?;
             }
             windows.insert(wc.window_start, groups);
         }
 
+        let state = (!windows.is_empty()).then(|| {
+            let accounted_state_bytes = Self::fixed_windows_bytes(&windows);
+            Box::new(CoreWindowVnodeState {
+                windows,
+                session_groups: FxHashMap::default(),
+                accounted_state_bytes,
+            })
+        });
         Ok(PreparedCoreWindowRestore {
-            windows,
-            session_groups: FxHashMap::default(),
-            high_watermark_ms: checkpoint.high_watermark_ms,
-            restored_entries: total_groups,
+            state,
+            frontier_floor_ms: checkpoint.frontier_floor_ms,
         })
     }
 
     fn prepare_session_window_restore(
         &self,
-        checkpoint: &CoreWindowCheckpoint,
+        checkpoint: &CoreWindowVnodeCheckpoint,
+        vnode: u32,
         gap_ms: i64,
     ) -> Result<PreparedCoreWindowRestore, DbError> {
         if !checkpoint.windows.is_empty() {
@@ -2019,7 +2601,6 @@ impl CoreWindowState {
             .map_err(|error| {
                 DbError::Checkpoint(format!("session checkpoint group reserve failed: {error}"))
             })?;
-        let mut total_sessions = 0usize;
         for sgc in &checkpoint.session_state {
             if sgc.sessions.is_empty() {
                 return Err(DbError::Checkpoint(
@@ -2027,6 +2608,11 @@ impl CoreWindowState {
                 ));
             }
             let row_key = self.decode_checkpoint_key(&sgc.key)?;
+            if self.vnode_for_group_key(&row_key) != vnode {
+                return Err(DbError::Checkpoint(format!(
+                    "Core window vnode {vnode} checkpoint contains a key for another vnode"
+                )));
+            }
             let mut sessions = BTreeMap::new();
             let mut previous_end = None;
             for sc in &sgc.sessions {
@@ -2041,9 +2627,9 @@ impl CoreWindowState {
                         "session checkpoint intervals are not strictly ordered and disjoint".into(),
                     ));
                 }
-                if checkpoint.high_watermark_ms != i64::MIN
+                if checkpoint.frontier_floor_ms != i64::MIN
                     && sc.end.saturating_add(self.allowed_lateness_ms)
-                        <= checkpoint.high_watermark_ms
+                        <= checkpoint.frontier_floor_ms
                 {
                     return Err(DbError::Checkpoint(format!(
                         "session checkpoint retains already-closed interval [{}, {})",
@@ -2060,9 +2646,6 @@ impl CoreWindowState {
                     },
                 );
                 previous_end = Some(sc.end);
-                total_sessions = total_sessions.checked_add(1).ok_or_else(|| {
-                    DbError::Checkpoint("session checkpoint interval count overflow".into())
-                })?;
             }
             if session_groups
                 .insert(row_key, SessionGroupState { sessions })
@@ -2074,11 +2657,17 @@ impl CoreWindowState {
             }
         }
 
+        let state = (!session_groups.is_empty()).then(|| {
+            let accounted_state_bytes = Self::session_groups_bytes(&session_groups);
+            Box::new(CoreWindowVnodeState {
+                windows: BTreeMap::new(),
+                session_groups,
+                accounted_state_bytes,
+            })
+        });
         Ok(PreparedCoreWindowRestore {
-            windows: BTreeMap::new(),
-            session_groups,
-            high_watermark_ms: checkpoint.high_watermark_ms,
-            restored_entries: total_sessions,
+            state,
+            frontier_floor_ms: checkpoint.frontier_floor_ms,
         })
     }
 
@@ -2099,7 +2688,7 @@ impl CoreWindowState {
                 self.group_types.len()
             )));
         }
-        for (index, (scalar, expected)) in scalars.iter().zip(&self.group_types).enumerate() {
+        for (index, (scalar, expected)) in scalars.iter().zip(self.group_types.iter()).enumerate() {
             if scalar.data_type() != *expected {
                 return Err(DbError::Checkpoint(format!(
                     "Core window checkpoint group key column {index} has type {}; expected {expected}",
@@ -2186,245 +2775,826 @@ impl CoreWindowState {
         Ok(accumulators)
     }
 
-    /// Validate the complete managed archive without allocating its owned checkpoint containers.
-    #[cfg(feature = "cluster")]
-    pub(crate) fn preflight_managed_tumbling_bytes<'a>(
+    pub(crate) fn preflight_vnode_bytes<'a>(
         &self,
+        vnode: u32,
+        vnode_count: u32,
         bytes: &'a [u8],
-    ) -> Result<PreflightedCoreWindowArchive<'a>, DbError> {
-        let checkpoint = rkyv::access::<ArchivedCoreWindowCheckpoint, rkyv::rancor::Error>(bytes)
-            .map_err(|error| {
+    ) -> Result<PreflightedCoreWindowVnodeArchive<'a>, DbError> {
+        let vnode_count = self.validate_vnode_count(vnode_count)?;
+        if vnode >= vnode_count.get() {
+            return Err(DbError::Checkpoint(format!(
+                "Core window vnode {vnode} is outside vnode_count {}",
+                vnode_count.get()
+            )));
+        }
+        let checkpoint = rkyv::access::<ArchivedCoreWindowVnodeCheckpoint, rkyv::rancor::Error>(
+            bytes,
+        )
+        .map_err(|error| {
             DbError::Checkpoint(format!(
-                "managed CoreWindow checkpoint validation failed: {error}"
+                "Core window vnode {vnode} checkpoint validation failed: {error}"
             ))
         })?;
-        self.preflight_managed_tumbling_archive(checkpoint, bytes.len())
+        if checkpoint.vnode.to_native() != vnode {
+            return Err(DbError::Checkpoint(format!(
+                "Core window vnode frame identity mismatch: frame={}, expected={vnode}",
+                checkpoint.vnode.to_native()
+            )));
+        }
+        if checkpoint.fingerprint.to_native() != self.query_fingerprint() {
+            return Err(DbError::Checkpoint(format!(
+                "Core window vnode {vnode} checkpoint fingerprint mismatch"
+            )));
+        }
+        if checkpoint.window_type != self.window_type_tag() {
+            return Err(DbError::Checkpoint(format!(
+                "Core window vnode {vnode} checkpoint type mismatch"
+            )));
+        }
+        let session = matches!(self.assigner, CoreWindowAssigner::Session { .. });
+        if (session && !checkpoint.windows.is_empty())
+            || (!session && !checkpoint.session_state.is_empty())
+        {
+            return Err(DbError::Checkpoint(format!(
+                "Core window vnode {vnode} checkpoint has non-canonical state payloads"
+            )));
+        }
+        let expected_accumulators = self.agg_specs.len();
+        if session {
+            if checkpoint.session_state.len() > self.max_groups_per_window {
+                return Err(DbError::Checkpoint(format!(
+                    "Core window session group cardinality exceeds limit {}",
+                    self.max_groups_per_window
+                )));
+            }
+            let mut total_sessions = 0_usize;
+            for group in checkpoint.session_state.iter() {
+                if group.sessions.is_empty() || (self.num_group_cols == 0) != group.key.is_empty() {
+                    return Err(DbError::Checkpoint(format!(
+                        "Core window vnode {vnode} session checkpoint has a non-canonical group"
+                    )));
+                }
+                total_sessions = total_sessions
+                    .checked_add(group.sessions.len())
+                    .filter(|count| *count <= bytes.len())
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "Core window vnode {vnode} session roster exceeds its frame"
+                        ))
+                    })?;
+                for interval in group.sessions.iter() {
+                    if interval.acc_states.len() != expected_accumulators
+                        || interval
+                            .acc_states
+                            .iter()
+                            .any(rkyv::vec::ArchivedVec::is_empty)
+                    {
+                        return Err(DbError::Checkpoint(format!(
+                            "Core window vnode {vnode} session accumulator roster is invalid"
+                        )));
+                    }
+                }
+            }
+        } else {
+            let mut previous_start = None;
+            let mut total_groups = 0_usize;
+            for window in checkpoint.windows.iter() {
+                let window_start = window.window_start.to_native();
+                if previous_start.is_some_and(|previous| previous >= window_start) {
+                    return Err(DbError::Checkpoint(format!(
+                        "Core window vnode {vnode} checkpoint starts are not canonical"
+                    )));
+                }
+                previous_start = Some(window_start);
+                if window.groups.len() > self.max_groups_per_window {
+                    return Err(DbError::Checkpoint(format!(
+                        "Core window {window_start} group cardinality exceeds limit {}",
+                        self.max_groups_per_window
+                    )));
+                }
+                total_groups = total_groups
+                    .checked_add(window.groups.len())
+                    .filter(|count| *count <= bytes.len())
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "Core window vnode {vnode} group roster exceeds its frame"
+                        ))
+                    })?;
+                for group in window.groups.iter() {
+                    if (self.num_group_cols == 0) != group.key.is_empty()
+                        || group.acc_states.len() != expected_accumulators
+                        || group
+                            .acc_states
+                            .iter()
+                            .any(rkyv::vec::ArchivedVec::is_empty)
+                    {
+                        return Err(DbError::Checkpoint(format!(
+                            "Core window vnode {vnode} accumulator roster is invalid"
+                        )));
+                    }
+                }
+            }
+        }
+        if checkpoint
+            .windows
+            .len()
+            .saturating_add(checkpoint.session_state.len())
+            > bytes.len()
+        {
+            return Err(DbError::Checkpoint(format!(
+                "Core window vnode {vnode} checkpoint declares an impossible state roster"
+            )));
+        }
+        Ok(PreflightedCoreWindowVnodeArchive { checkpoint })
     }
 
-    #[cfg(feature = "cluster")]
-    fn preflight_managed_tumbling_archive<'a>(
+    fn prepare_vnode_restore(
         &self,
-        checkpoint: &'a ArchivedCoreWindowCheckpoint,
-        encoded_bytes: usize,
-    ) -> Result<PreflightedCoreWindowArchive<'a>, DbError> {
-        if !self.managed_global_tumbling {
-            return Err(DbError::Checkpoint(
-                "managed CoreWindow restore targeted an unsupported query shape".into(),
-            ));
+        vnode: u32,
+        checkpoint: &CoreWindowVnodeCheckpoint,
+    ) -> Result<PreparedCoreWindowRestore, DbError> {
+        if checkpoint.vnode != vnode {
+            return Err(DbError::Checkpoint(format!(
+                "Core window vnode frame identity mismatch: frame={}, expected={vnode}",
+                checkpoint.vnode
+            )));
         }
         if checkpoint.fingerprint != self.query_fingerprint() {
             return Err(DbError::Checkpoint(format!(
-                "Core window checkpoint fingerprint mismatch: saved={}, current={}",
-                checkpoint.fingerprint,
-                self.query_fingerprint()
+                "Core window vnode {vnode} checkpoint fingerprint mismatch"
             )));
         }
-        if checkpoint.window_type.as_str() != "tumbling" || !checkpoint.session_state.is_empty() {
-            return Err(DbError::Checkpoint(
-                "managed CoreWindow archive is not a canonical tumbling-window image".into(),
-            ));
-        }
-        if checkpoint.windows.len() > encoded_bytes {
-            return Err(DbError::Checkpoint(
-                "managed CoreWindow archive declares more windows than its encoded body can contain"
-                    .into(),
-            ));
-        }
-
-        let CoreWindowAssigner::Tumbling(assigner) = &self.assigner else {
-            unreachable!("managed CoreWindow profile is tumbling-only");
-        };
-        let mut previous_start = None;
-        let mut nested_payload_bytes = 0_usize;
-        for window in checkpoint.windows.iter() {
-            let window_start = window.window_start.to_native();
-            if previous_start.is_some_and(|previous| previous >= window_start) {
-                return Err(DbError::Checkpoint(
-                    "managed CoreWindow archive window starts are not strictly increasing".into(),
-                ));
-            }
-            previous_start = Some(window_start);
-            let aligned = (i128::from(window_start) - i128::from(assigner.offset_ms()))
-                .rem_euclid(i128::from(assigner.size_ms()))
-                == 0;
-            if !aligned {
-                return Err(DbError::Checkpoint(format!(
-                    "managed CoreWindow archive window {window_start} is not aligned to the configured tumbling assigner"
-                )));
-            }
-            if window_start
-                .saturating_add(assigner.size_ms())
-                .saturating_add(self.allowed_lateness_ms)
-                <= checkpoint.high_watermark_ms.to_native()
-            {
-                return Err(DbError::Checkpoint(format!(
-                    "managed CoreWindow archive retains already-closed window {window_start}"
-                )));
-            }
-            if window.groups.len() != 1 {
-                return Err(DbError::Checkpoint(format!(
-                    "managed global CoreWindow archive window {} contains {} groups",
-                    window_start,
-                    window.groups.len()
-                )));
-            }
-            let group = &window.groups[0];
-            if !group.key.is_empty() || group.last_updated_ms != i64::MIN {
-                return Err(DbError::Checkpoint(format!(
-                    "managed global CoreWindow archive window {window_start} has non-canonical group metadata"
-                )));
-            }
-            if group.acc_states.len() != self.agg_specs.len() {
-                return Err(DbError::Checkpoint(format!(
-                    "managed CoreWindow archive window {} contains {} accumulator states; expected {}",
-                    window_start,
-                    group.acc_states.len(),
-                    self.agg_specs.len()
-                )));
-            }
-            for state in group.acc_states.iter() {
-                nested_payload_bytes =
-                    nested_payload_bytes
-                        .checked_add(state.len())
-                        .ok_or_else(|| {
-                            DbError::Checkpoint(
-                                "managed CoreWindow archive nested byte accounting overflow".into(),
-                            )
-                        })?;
-            }
-        }
-        if nested_payload_bytes > encoded_bytes {
+        if checkpoint.window_type != self.window_type_tag() {
             return Err(DbError::Checkpoint(format!(
-                "managed CoreWindow archive aliases {nested_payload_bytes} nested payload bytes inside a {encoded_bytes}-byte body"
+                "Core window vnode {vnode} checkpoint type mismatch"
             )));
         }
-        Ok(PreflightedCoreWindowArchive { checkpoint })
+        let prepared = match &self.assigner {
+            CoreWindowAssigner::Session { gap_ms } => {
+                self.prepare_session_window_restore(checkpoint, vnode, *gap_ms)
+            }
+            CoreWindowAssigner::Tumbling(assigner) => self.prepare_fixed_window_restore(
+                checkpoint,
+                vnode,
+                assigner.size_ms(),
+                assigner.size_ms(),
+                assigner.offset_ms(),
+            ),
+            CoreWindowAssigner::Hopping(assigner) => self.prepare_fixed_window_restore(
+                checkpoint,
+                vnode,
+                assigner.size_ms(),
+                assigner.slide_ms(),
+                assigner.offset_ms(),
+            ),
+        }?;
+        if self.high_watermark_ms < prepared.frontier_floor_ms {
+            return Err(DbError::Checkpoint(format!(
+                "Core window vnode {vnode} floor {} exceeds restored frontier {}",
+                prepared.frontier_floor_ms, self.high_watermark_ms
+            )));
+        }
+        if let Some(state) = prepared.state.as_deref() {
+            self.validate_vnode_state_frontier(state, self.high_watermark_ms)?;
+        }
+        Ok(prepared)
     }
 
-    /// Decode a checked global tumbling image directly into off-side live structures.
-    #[cfg(feature = "cluster")]
-    pub(crate) fn prepare_managed_tumbling_restore(
-        &self,
-        archive: &PreflightedCoreWindowArchive<'_>,
-    ) -> Result<PreparedCoreWindowTransition, DbError> {
-        use crate::aggregate_state::ipc_to_scalars;
-
-        let mut windows = BTreeMap::new();
-        for window in archive.checkpoint.windows.iter() {
-            let window_start = window.window_start.to_native();
-            let group = &window.groups[0];
-            let key_scalars = ipc_to_scalars(group.key.as_slice()).map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "managed CoreWindow key decode for window {window_start} failed: {error}"
-                ))
+    fn subtract_vnode_cardinality(
+        window_group_counts: &mut FxHashMap<i64, usize>,
+        session_group_count: &mut usize,
+        state: &CoreWindowVnodeState,
+    ) -> Result<(), DbError> {
+        for (&window_start, groups) in &state.windows {
+            let remaining = window_group_counts
+                .get(&window_start)
+                .copied()
+                .and_then(|count| count.checked_sub(groups.len()))
+                .ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "Core window cardinality accounting invariant failed".into(),
+                    )
+                })?;
+            if remaining == 0 {
+                window_group_counts.remove(&window_start);
+            } else {
+                window_group_counts.insert(window_start, remaining);
+            }
+        }
+        *session_group_count = session_group_count
+            .checked_sub(state.session_groups.len())
+            .ok_or_else(|| {
+                DbError::Checkpoint("Core session cardinality accounting invariant failed".into())
             })?;
-            let row_key = crate::aggregate_state::scalar_key_to_owned_row(
-                &self.row_converter,
-                &key_scalars,
-                &self.group_types,
-            )?;
-            let mut accumulators = Vec::new();
-            accumulators
-                .try_reserve_exact(self.agg_specs.len())
-                .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "managed CoreWindow accumulator reserve failed: {error}"
-                    ))
-                })?;
-            for (spec, state) in self.agg_specs.iter().zip(group.acc_states.iter()) {
-                let state_scalars = ipc_to_scalars(state.as_slice()).map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "managed CoreWindow accumulator decode for window {window_start} failed: {error}"
-                    ))
-                })?;
-                let mut arrays = Vec::new();
-                arrays
-                    .try_reserve_exact(state_scalars.len())
-                    .map_err(|error| {
+        Ok(())
+    }
+
+    fn add_checkpoint_cardinality(
+        &self,
+        window_group_counts: &mut FxHashMap<i64, usize>,
+        session_group_count: &mut usize,
+        checkpoint: &CoreWindowVnodeCheckpoint,
+    ) -> Result<(), DbError> {
+        match &self.assigner {
+            CoreWindowAssigner::Session { .. } => {
+                *session_group_count = session_group_count
+                    .checked_add(checkpoint.session_state.len())
+                    .filter(|count| *count <= self.max_groups_per_window)
+                    .ok_or_else(|| {
                         DbError::Checkpoint(format!(
-                            "managed CoreWindow scalar-array reserve failed: {error}"
+                            "Core window session group cardinality exceeds limit {}",
+                            self.max_groups_per_window
                         ))
                     })?;
-                for value in &state_scalars {
-                    arrays.push(value.to_array().map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "managed CoreWindow scalar materialization failed: {error}"
-                        ))
-                    })?);
-                }
-                let mut accumulator = spec.create_accumulator()?;
-                accumulator.merge_batch(&arrays).map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "managed CoreWindow accumulator merge for window {window_start} failed: {error}"
-                    ))
-                })?;
-                accumulators.push(accumulator);
             }
-            let mut groups = FxHashMap::default();
-            groups.try_reserve(1).map_err(|error| {
-                DbError::Checkpoint(format!("managed CoreWindow group reserve failed: {error}"))
-            })?;
-            groups.insert(row_key, accumulators);
-            windows.insert(window_start, groups);
+            CoreWindowAssigner::Tumbling(_) | CoreWindowAssigner::Hopping(_) => {
+                for window in &checkpoint.windows {
+                    let count = window_group_counts
+                        .get(&window.window_start)
+                        .copied()
+                        .unwrap_or(0)
+                        .checked_add(window.groups.len())
+                        .filter(|count| *count <= self.max_groups_per_window)
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "Core window {} group cardinality exceeds limit {}",
+                                window.window_start, self.max_groups_per_window
+                            ))
+                        })?;
+                    window_group_counts.insert(window.window_start, count);
+                }
+            }
         }
-        let accounted_state_bytes = Self::fixed_windows_bytes(&windows);
-        Ok(PreparedCoreWindowTransition {
-            windows,
-            session_groups: FxHashMap::default(),
-            high_watermark_ms: archive.checkpoint.high_watermark_ms.to_native(),
-            scratch_nogroup: FxHashMap::default(),
-            scratch_grouped: FxHashMap::default(),
-            scratch_group_keys: indexmap::IndexSet::default(),
-            accounted_state_bytes,
+        Ok(())
+    }
+
+    pub(crate) fn prepare_owned_vnode_transition(
+        &self,
+        vnode_count: u32,
+        restores: impl ExactSizeIterator<Item = Result<OwnedCoreWindowVnodeRestore, DbError>>,
+        revoked: &FxHashSet<u32>,
+    ) -> Result<PreparedCoreWindowVnodeTransition, DbError> {
+        let vnode_count = self.validate_vnode_count(vnode_count)?;
+        let restore_count = restores.len();
+        let mut final_window_group_counts = FxHashMap::default();
+        final_window_group_counts
+            .try_reserve(self.window_group_counts.len())
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "Core window cardinality roster reserve failed: {error}"
+                ))
+            })?;
+        final_window_group_counts.extend(
+            self.window_group_counts
+                .iter()
+                .map(|(&window_start, &count)| (window_start, count)),
+        );
+        let mut final_session_group_count = self.session_group_count;
+        let mut transitioned = FxHashSet::default();
+        transitioned
+            .try_reserve(restore_count.saturating_add(revoked.len()))
+            .map_err(|error| {
+                DbError::Checkpoint(format!("Core window transition roster reserve: {error}"))
+            })?;
+        for &vnode in revoked {
+            if vnode >= vnode_count.get() {
+                return Err(DbError::Checkpoint(format!(
+                    "revoked Core window vnode {vnode} is outside vnode_count {}",
+                    vnode_count.get()
+                )));
+            }
+            transitioned.insert(vnode);
+        }
+        for &vnode in revoked {
+            if let Some(state) = self.vnode_states[vnode as usize].as_deref() {
+                Self::subtract_vnode_cardinality(
+                    &mut final_window_group_counts,
+                    &mut final_session_group_count,
+                    state,
+                )?;
+            }
+        }
+        let mut replacements = FxHashMap::default();
+        replacements.try_reserve(restore_count).map_err(|error| {
+            DbError::Checkpoint(format!("Core window replacement roster reserve: {error}"))
+        })?;
+        let mut restored_vnodes = FxHashSet::default();
+        restored_vnodes
+            .try_reserve(restore_count)
+            .map_err(|error| {
+                DbError::Checkpoint(format!("Core window restored roster reserve: {error}"))
+            })?;
+        let mut required_frontier_floor_ms = self.required_frontier_floor_ms;
+        for restore in restores {
+            let OwnedCoreWindowVnodeRestore { vnode, state } = restore?;
+            if vnode >= vnode_count.get() || !restored_vnodes.insert(vnode) {
+                return Err(DbError::Checkpoint(format!(
+                    "Core window transition repeats or exceeds vnode {vnode}"
+                )));
+            }
+            if transitioned.insert(vnode) {
+                if let Some(current) = self.vnode_states[vnode as usize].as_deref() {
+                    Self::subtract_vnode_cardinality(
+                        &mut final_window_group_counts,
+                        &mut final_session_group_count,
+                        current,
+                    )?;
+                }
+            }
+            self.add_checkpoint_cardinality(
+                &mut final_window_group_counts,
+                &mut final_session_group_count,
+                &state,
+            )?;
+            let prepared = self.prepare_vnode_restore(vnode, &state)?;
+            required_frontier_floor_ms = required_frontier_floor_ms.max(prepared.frontier_floor_ms);
+            if replacements.insert(vnode, prepared.state).is_some() {
+                return Err(DbError::Checkpoint(format!(
+                    "Core window transition repeats restored vnode {vnode}"
+                )));
+            }
+        }
+        let mut transitioned_vnodes = transitioned.into_iter().collect::<Vec<_>>();
+        transitioned_vnodes.sort_unstable();
+        let mut replacement_slots = Vec::new();
+        replacement_slots
+            .try_reserve_exact(transitioned_vnodes.len())
+            .map_err(|error| {
+                DbError::Checkpoint(format!("Core window transition slot reserve: {error}"))
+            })?;
+        for &vnode in &transitioned_vnodes {
+            replacement_slots.push((vnode, replacements.remove(&vnode).flatten()));
+        }
+        let mut final_active_vnodes = Vec::new();
+        final_active_vnodes
+            .try_reserve_exact(usize::from(self.key_group_count.get()))
+            .map_err(|error| {
+                DbError::Checkpoint(format!("Core window active roster reserve: {error}"))
+            })?;
+        final_active_vnodes.extend(
+            self.active_vnodes
+                .iter()
+                .copied()
+                .filter(|vnode| transitioned_vnodes.binary_search(vnode).is_err()),
+        );
+        final_active_vnodes.extend(
+            replacement_slots
+                .iter()
+                .filter_map(|(vnode, state)| state.is_some().then_some(*vnode)),
+        );
+        final_active_vnodes.sort_unstable();
+        let mut final_active_vnode_positions = Vec::new();
+        final_active_vnode_positions
+            .try_reserve_exact(usize::from(self.key_group_count.get()))
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "Core window active position roster reserve failed: {error}"
+                ))
+            })?;
+        final_active_vnode_positions.resize(usize::from(self.key_group_count.get()), usize::MAX);
+        for (index, &vnode) in final_active_vnodes.iter().enumerate() {
+            final_active_vnode_positions[vnode as usize] = index;
+        }
+        Ok(PreparedCoreWindowVnodeTransition {
+            replacements: replacement_slots,
+            final_active_vnodes,
+            final_active_vnode_positions: final_active_vnode_positions.into_boxed_slice(),
+            final_window_group_counts,
+            final_session_group_count,
+            required_frontier_floor_ms,
         })
     }
 
-    #[cfg(feature = "cluster")]
-    pub(crate) fn prepare_managed_tumbling_empty(&self) -> PreparedCoreWindowTransition {
-        debug_assert!(self.managed_global_tumbling);
-        PreparedCoreWindowTransition {
-            windows: BTreeMap::new(),
-            session_groups: FxHashMap::default(),
-            high_watermark_ms: i64::MIN,
-            scratch_nogroup: FxHashMap::default(),
-            scratch_grouped: FxHashMap::default(),
-            scratch_group_keys: indexmap::IndexSet::default(),
-            accounted_state_bytes: 0,
+    pub(crate) fn publish_prepared_vnode_transition(
+        &mut self,
+        mut prepared: PreparedCoreWindowVnodeTransition,
+    ) -> RetiredCoreWindowVnodeTransition {
+        for (vnode, replacement) in &mut prepared.replacements {
+            std::mem::swap(&mut self.vnode_states[*vnode as usize], replacement);
+        }
+        std::mem::swap(&mut self.active_vnodes, &mut prepared.final_active_vnodes);
+        std::mem::swap(
+            &mut self.active_vnode_positions,
+            &mut prepared.final_active_vnode_positions,
+        );
+        std::mem::swap(
+            &mut self.window_group_counts,
+            &mut prepared.final_window_group_counts,
+        );
+        std::mem::swap(
+            &mut self.session_group_count,
+            &mut prepared.final_session_group_count,
+        );
+        std::mem::swap(
+            &mut self.required_frontier_floor_ms,
+            &mut prepared.required_frontier_floor_ms,
+        );
+        self.force_full_vnode_capture();
+        RetiredCoreWindowVnodeTransition {
+            retired_state: prepared,
         }
     }
 
-    /// Publish with fixed-count ownership swaps; every allocation and decode happened in prepare.
-    #[cfg(feature = "cluster")]
-    pub(crate) fn publish_managed_tumbling_transition(
+    pub(crate) fn finish_vnode_transition(retired: RetiredCoreWindowVnodeTransition) {
+        drop(retired.retired_state);
+    }
+
+    pub(crate) fn restore_vnode(
         &mut self,
-        mut prepared: PreparedCoreWindowTransition,
-    ) -> PreparedCoreWindowTransition {
-        assert!(
-            self.managed_global_tumbling,
-            "managed CoreWindow publication targeted an unsupported shape"
-        );
-        std::mem::swap(&mut self.windows, &mut prepared.windows);
-        std::mem::swap(&mut self.session_groups, &mut prepared.session_groups);
-        std::mem::swap(&mut self.high_watermark_ms, &mut prepared.high_watermark_ms);
-        std::mem::swap(&mut self.scratch_nogroup, &mut prepared.scratch_nogroup);
-        std::mem::swap(&mut self.scratch_grouped, &mut prepared.scratch_grouped);
-        std::mem::swap(
-            &mut self.scratch_group_keys,
-            &mut prepared.scratch_group_keys,
-        );
-        std::mem::swap(
-            &mut self.accounted_state_bytes,
-            &mut prepared.accounted_state_bytes,
-        );
-        prepared
+        vnode: u32,
+        vnode_count: u32,
+        state: CoreWindowVnodeCheckpoint,
+    ) -> Result<(), DbError> {
+        let prepared = self.prepare_owned_vnode_transition(
+            vnode_count,
+            std::iter::once(Ok(OwnedCoreWindowVnodeRestore { vnode, state })),
+            &FxHashSet::default(),
+        )?;
+        let retired = self.publish_prepared_vnode_transition(prepared);
+        Self::finish_vnode_transition(retired);
+        Ok(())
+    }
+
+    pub(crate) fn restore_high_watermark_ms(&mut self, watermark_ms: i64) -> Result<(), DbError> {
+        if watermark_ms < self.required_frontier_floor_ms {
+            return Err(DbError::Checkpoint(format!(
+                "Core window restored frontier {watermark_ms} precedes vnode floor {}",
+                self.required_frontier_floor_ms
+            )));
+        }
+        for state in self.vnode_states.iter().filter_map(Option::as_deref) {
+            self.validate_vnode_state_frontier(state, watermark_ms)?;
+        }
+        self.high_watermark_ms = watermark_ms;
+        Ok(())
+    }
+
+    fn validate_vnode_state_frontier(
+        &self,
+        state: &CoreWindowVnodeState,
+        watermark_ms: i64,
+    ) -> Result<(), DbError> {
+        if state
+            .windows
+            .keys()
+            .any(|window_start| self.is_window_closed_at(*window_start, watermark_ms))
+            || state.session_groups.values().any(|group| {
+                group.sessions.values().any(|session| {
+                    session.end.saturating_add(self.allowed_lateness_ms) <= watermark_ms
+                })
+            })
+        {
+            return Err(DbError::Checkpoint(
+                "Core window restored frontier closes retained vnode state".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_window_closed_at(&self, window_start: i64, watermark_ms: i64) -> bool {
+        let size_ms = match &self.assigner {
+            CoreWindowAssigner::Tumbling(assigner) => assigner.size_ms(),
+            CoreWindowAssigner::Hopping(assigner) => assigner.size_ms(),
+            CoreWindowAssigner::Session { .. } => return false,
+        };
+        window_start
+            .saturating_add(size_ms)
+            .saturating_add(self.allowed_lateness_ms)
+            <= watermark_ms
     }
 }
 
-#[cfg(feature = "cluster")]
-impl PreparedCoreWindowTransition {
+impl CoreWindowVnodeCheckpoint {
+    pub(crate) fn retained_serialization_bytes(&self) -> Result<usize, DbError> {
+        fn add(total: &mut usize, bytes: usize) -> Result<(), DbError> {
+            *total = total.checked_add(bytes).ok_or_else(|| {
+                DbError::Checkpoint("Core window checkpoint byte accounting overflow".into())
+            })?;
+            Ok(())
+        }
+
+        fn roster<T>(capacity: usize) -> Result<usize, DbError> {
+            capacity
+                .checked_mul(std::mem::size_of::<T>())
+                .ok_or_else(|| {
+                    DbError::Checkpoint("Core window checkpoint roster accounting overflow".into())
+                })
+        }
+
+        let mut bytes = roster::<WindowCheckpoint>(self.windows.capacity())?;
+        for window in &self.windows {
+            add(
+                &mut bytes,
+                roster::<GroupCheckpoint>(window.groups.capacity())?,
+            )?;
+            for group in &window.groups {
+                add(&mut bytes, group.key.capacity())?;
+                add(&mut bytes, roster::<Vec<u8>>(group.acc_states.capacity())?)?;
+                for state in &group.acc_states {
+                    add(&mut bytes, state.capacity())?;
+                }
+            }
+        }
+        add(
+            &mut bytes,
+            roster::<SessionGroupCheckpoint>(self.session_state.capacity())?,
+        )?;
+        for group in &self.session_state {
+            add(&mut bytes, group.key.capacity())?;
+            add(
+                &mut bytes,
+                roster::<SessionCheckpoint>(group.sessions.capacity())?,
+            )?;
+            for session in &group.sessions {
+                add(
+                    &mut bytes,
+                    roster::<Vec<u8>>(session.acc_states.capacity())?,
+                )?;
+                for state in &session.acc_states {
+                    add(&mut bytes, state.capacity())?;
+                }
+            }
+        }
+        Ok(bytes)
+    }
+}
+
+impl CoreWindowVnodeCheckpointCapture {
     #[must_use]
-    pub(crate) const fn accounted_state_bytes(&self) -> usize {
-        self.accounted_state_bytes
+    pub(crate) const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    pub(crate) fn encode(
+        self,
+        max_working_bytes: usize,
+    ) -> Result<CoreWindowVnodeCheckpoint, DbError> {
+        use crate::aggregate_state::{row_to_scalar_key_with_types, scalars_to_ipc_bounded};
+
+        fn checked_product(left: usize, right: usize, component: &str) -> Result<usize, DbError> {
+            left.checked_mul(right).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "Core window {component} checkpoint accounting overflow"
+                ))
+            })
+        }
+
+        fn checked_sum(
+            values: impl IntoIterator<Item = usize>,
+            component: &str,
+        ) -> Result<usize, DbError> {
+            values.into_iter().try_fold(0_usize, |total, value| {
+                total.checked_add(value).ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "Core window {component} checkpoint accounting overflow"
+                    ))
+                })
+            })
+        }
+
+        fn array_scratch_bytes(scalars: &[ScalarValue], component: &str) -> Result<usize, DbError> {
+            let payload = checked_sum(scalars.iter().map(ScalarValue::size), component)?;
+            checked_sum(
+                [
+                    checked_product(payload, 2, component)?,
+                    checked_product(scalars.len(), 32, component)?,
+                    checked_product(scalars.len(), std::mem::size_of::<ArrayRef>(), component)?,
+                ],
+                component,
+            )
+        }
+
+        fn row_scratch_bytes(
+            payload_bytes: usize,
+            columns: usize,
+            component: &str,
+        ) -> Result<usize, DbError> {
+            checked_sum(
+                [
+                    checked_product(payload_bytes, 2, component)?,
+                    checked_product(columns, 32, component)?,
+                    checked_product(columns, std::mem::size_of::<ArrayRef>(), component)?,
+                ],
+                component,
+            )
+        }
+
+        fn retain_roster<T>(
+            remaining: &mut usize,
+            capacity: usize,
+            component: &str,
+        ) -> Result<(), DbError> {
+            let bytes = checked_product(capacity, std::mem::size_of::<T>(), component)?;
+            *remaining = remaining.checked_sub(bytes).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "Core window {component} exceeded its cumulative encode budget"
+                ))
+            })?;
+            Ok(())
+        }
+
+        fn encode_scalars(
+            scalars: &[ScalarValue],
+            scratch_bytes: usize,
+            remaining: &mut usize,
+            context: &str,
+        ) -> Result<Vec<u8>, DbError> {
+            let limit = remaining.checked_sub(scratch_bytes).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "Core window {context} scratch exceeded its cumulative encode budget"
+                ))
+            })?;
+            let encoded = scalars_to_ipc_bounded(scalars, limit).map_err(|error| {
+                DbError::Checkpoint(format!("Core window {context} encode failed: {error}"))
+            })?;
+            *remaining = remaining.checked_sub(encoded.capacity()).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "Core window {context} exceeded its cumulative encode budget"
+                ))
+            })?;
+            Ok(encoded)
+        }
+
+        let mut remaining = max_working_bytes;
+        retain_roster::<WindowCheckpoint>(&mut remaining, self.windows.len(), "window roster")?;
+        let mut windows = Vec::new();
+        windows
+            .try_reserve_exact(self.windows.len())
+            .map_err(|error| {
+                DbError::Checkpoint(format!("Core window checkpoint roster reserve: {error}"))
+            })?;
+        for window in self.windows {
+            retain_roster::<GroupCheckpoint>(&mut remaining, window.groups.len(), "group roster")?;
+            let mut groups = Vec::new();
+            groups
+                .try_reserve_exact(window.groups.len())
+                .map_err(|error| {
+                    DbError::Checkpoint(format!("Core window checkpoint group reserve: {error}"))
+                })?;
+            for group in window.groups {
+                let key_scratch = row_scratch_bytes(
+                    group.key.as_ref().len(),
+                    self.group_types.len(),
+                    "group key",
+                )?;
+                let key_scalars = row_to_scalar_key_with_types(
+                    &self.row_converter,
+                    &group.key,
+                    &self.group_types,
+                )?;
+                let key = encode_scalars(&key_scalars, key_scratch, &mut remaining, "group key")?;
+                drop(key_scalars);
+                retain_roster::<Vec<u8>>(
+                    &mut remaining,
+                    group.accumulator_states.len(),
+                    "accumulator roster",
+                )?;
+                let mut acc_states = Vec::new();
+                acc_states
+                    .try_reserve_exact(group.accumulator_states.len())
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "Core window accumulator roster reserve failed: {error}"
+                        ))
+                    })?;
+                for state in &group.accumulator_states {
+                    let scratch = array_scratch_bytes(state, "accumulator")?;
+                    acc_states.push(encode_scalars(
+                        state,
+                        scratch,
+                        &mut remaining,
+                        "accumulator",
+                    )?);
+                }
+                groups.push(GroupCheckpoint { key, acc_states });
+            }
+            windows.push(WindowCheckpoint {
+                window_start: window.window_start,
+                groups,
+            });
+        }
+        retain_roster::<SessionGroupCheckpoint>(
+            &mut remaining,
+            self.session_state.len(),
+            "session group roster",
+        )?;
+        let mut session_state = Vec::new();
+        session_state
+            .try_reserve_exact(self.session_state.len())
+            .map_err(|error| {
+                DbError::Checkpoint(format!("Core window session roster reserve: {error}"))
+            })?;
+        for group in self.session_state {
+            let key_scratch = row_scratch_bytes(
+                group.key.as_ref().len(),
+                self.group_types.len(),
+                "session key",
+            )?;
+            let key_scalars =
+                row_to_scalar_key_with_types(&self.row_converter, &group.key, &self.group_types)?;
+            let key = encode_scalars(&key_scalars, key_scratch, &mut remaining, "session key")?;
+            drop(key_scalars);
+            retain_roster::<SessionCheckpoint>(
+                &mut remaining,
+                group.sessions.len(),
+                "session roster",
+            )?;
+            let mut sessions = Vec::new();
+            sessions
+                .try_reserve_exact(group.sessions.len())
+                .map_err(|error| {
+                    DbError::Checkpoint(format!("Core window interval roster reserve: {error}"))
+                })?;
+            for session in group.sessions {
+                retain_roster::<Vec<u8>>(
+                    &mut remaining,
+                    session.accumulator_states.len(),
+                    "session accumulator roster",
+                )?;
+                let mut acc_states = Vec::new();
+                acc_states
+                    .try_reserve_exact(session.accumulator_states.len())
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "Core window session accumulator roster reserve failed: {error}"
+                        ))
+                    })?;
+                for state in &session.accumulator_states {
+                    let scratch = array_scratch_bytes(state, "session accumulator")?;
+                    acc_states.push(encode_scalars(
+                        state,
+                        scratch,
+                        &mut remaining,
+                        "session accumulator",
+                    )?);
+                }
+                sessions.push(SessionCheckpoint {
+                    start: session.start,
+                    end: session.end,
+                    acc_states,
+                });
+            }
+            session_state.push(SessionGroupCheckpoint { key, sessions });
+        }
+        let checkpoint = CoreWindowVnodeCheckpoint {
+            fingerprint: self.fingerprint,
+            vnode: self.vnode,
+            windows,
+            session_state,
+            window_type: self.window_type,
+            frontier_floor_ms: self.frontier_floor_ms,
+        };
+        debug_assert!(checkpoint
+            .retained_serialization_bytes()
+            .is_ok_and(|bytes| bytes <= max_working_bytes));
+        Ok(checkpoint)
+    }
+}
+
+impl PreparedCoreWindowVnodeTransition {
+    #[must_use]
+    #[cfg(feature = "cluster")]
+    pub(crate) fn accounted_state_bytes(&self) -> usize {
+        let roster_bytes = std::mem::size_of::<Self>()
+            .saturating_add(
+                self.replacements
+                    .capacity()
+                    .saturating_mul(
+                        std::mem::size_of::<(u32, Option<Box<CoreWindowVnodeState>>)>(),
+                    ),
+            )
+            .saturating_add(
+                self.final_active_vnodes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(
+                self.final_active_vnode_positions
+                    .len()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            )
+            .saturating_add(
+                self.final_window_group_counts
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(i64, usize)>()),
+            );
+        self.replacements
+            .iter()
+            .filter_map(|(_, state)| state.as_deref())
+            .fold(roster_bytes, |bytes, state| {
+                bytes
+                    .saturating_add(std::mem::size_of::<CoreWindowVnodeState>())
+                    .saturating_add(state.accounted_state_bytes)
+            })
+    }
+}
+
+impl RetiredCoreWindowVnodeTransition {
+    #[must_use]
+    #[cfg(feature = "cluster")]
+    pub(crate) fn accounted_state_bytes(&self) -> usize {
+        self.retired_state.accounted_state_bytes()
     }
 }
 
@@ -2486,6 +3656,42 @@ mod tests {
             .value(0)
     }
 
+    fn key_groups() -> KeyGroupCount {
+        KeyGroupCount::try_from(1_u16).unwrap()
+    }
+
+    fn checkpoint_all(state: &mut CoreWindowState) -> Vec<(u32, CoreWindowVnodeCheckpoint)> {
+        let vnode_count = u32::from(state.key_group_count());
+        let vnodes = (0..vnode_count).collect::<Vec<_>>();
+        state.checkpoint_vnodes(&vnodes, vnode_count).unwrap()
+    }
+
+    fn restore_all(
+        state: &mut CoreWindowState,
+        checkpoints: Vec<(u32, CoreWindowVnodeCheckpoint)>,
+    ) -> Result<(), DbError> {
+        let frontier = checkpoints
+            .first()
+            .map_or(i64::MIN, |(_, checkpoint)| checkpoint.frontier_floor_ms);
+        let vnode_count = u32::from(state.key_group_count());
+        state.restore_high_watermark_ms(frontier)?;
+        for (vnode, checkpoint) in checkpoints {
+            state.restore_vnode(vnode, vnode_count, checkpoint)?;
+        }
+        Ok(())
+    }
+
+    fn session_group_count(state: &CoreWindowState) -> usize {
+        let count = state
+            .vnode_states
+            .iter()
+            .filter_map(Option::as_deref)
+            .map(|state| state.session_groups.len())
+            .sum();
+        assert_eq!(count, state.session_group_count);
+        count
+    }
+
     /// Build a `CoreWindowState` for SUM(Int64) with 1-second tumbling
     /// windows and a single Utf8 group-by column.
     fn make_core_window_state(size_ms: i64) -> CoreWindowState {
@@ -2509,15 +3715,22 @@ mod tests {
 
         CoreWindowState {
             assigner: CoreWindowAssigner::Tumbling(TumblingWindowAssigner::from_millis(size_ms)),
-            windows: BTreeMap::new(),
-            session_groups: FxHashMap::default(),
+            key_group_count: KeyGroupCount::try_from(1_u16).unwrap(),
+            vnode_states: std::iter::repeat_with(|| None)
+                .take(1)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            active_vnodes: Vec::with_capacity(1),
+            active_vnode_positions: vec![usize::MAX; 1].into_boxed_slice(),
+            window_group_counts: FxHashMap::default(),
+            session_group_count: 0,
             agg_specs,
             num_group_cols: 1,
-            group_types: vec![DataType::Utf8],
-            row_converter: arrow::row::RowConverter::new(vec![arrow::row::SortField::new(
-                DataType::Utf8,
-            )])
-            .unwrap(),
+            group_types: Arc::from(vec![DataType::Utf8]),
+            row_converter: Arc::new(
+                arrow::row::RowConverter::new(vec![arrow::row::SortField::new(DataType::Utf8)])
+                    .unwrap(),
+            ),
             query_sql: String::new(),
             #[cfg(test)]
             pre_agg_sql: String::new(),
@@ -2538,8 +3751,10 @@ mod tests {
             scratch_nogroup: FxHashMap::default(),
             scratch_grouped: FxHashMap::default(),
             scratch_group_keys: indexmap::IndexSet::default(),
-            managed_global_tumbling: false,
-            accounted_state_bytes: 0,
+            checkpoint_dirty_vnodes: vec![false; 1].into_boxed_slice(),
+            checkpoint_dirty_vnode_roster: Vec::with_capacity(1),
+            full_vnode_capture_required: true,
+            required_frontier_floor_ms: i64::MIN,
         }
     }
 
@@ -2578,15 +3793,22 @@ mod tests {
 
         CoreWindowState {
             assigner: CoreWindowAssigner::Tumbling(TumblingWindowAssigner::from_millis(size_ms)),
-            windows: BTreeMap::new(),
-            session_groups: FxHashMap::default(),
+            key_group_count: KeyGroupCount::try_from(1_u16).unwrap(),
+            vnode_states: std::iter::repeat_with(|| None)
+                .take(1)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            active_vnodes: Vec::with_capacity(1),
+            active_vnode_positions: vec![usize::MAX; 1].into_boxed_slice(),
+            window_group_counts: FxHashMap::default(),
+            session_group_count: 0,
             agg_specs,
             num_group_cols: 1,
-            group_types: vec![DataType::Utf8],
-            row_converter: arrow::row::RowConverter::new(vec![arrow::row::SortField::new(
-                DataType::Utf8,
-            )])
-            .unwrap(),
+            group_types: Arc::from(vec![DataType::Utf8]),
+            row_converter: Arc::new(
+                arrow::row::RowConverter::new(vec![arrow::row::SortField::new(DataType::Utf8)])
+                    .unwrap(),
+            ),
             query_sql: String::new(),
             #[cfg(test)]
             pre_agg_sql: String::new(),
@@ -2607,8 +3829,10 @@ mod tests {
             scratch_nogroup: FxHashMap::default(),
             scratch_grouped: FxHashMap::default(),
             scratch_group_keys: indexmap::IndexSet::default(),
-            managed_global_tumbling: false,
-            accounted_state_bytes: 0,
+            checkpoint_dirty_vnodes: vec![false; 1].into_boxed_slice(),
+            checkpoint_dirty_vnode_roster: Vec::with_capacity(1),
+            full_vnode_capture_required: true,
+            required_frontier_floor_ms: i64::MIN,
         }
     }
 
@@ -2636,15 +3860,22 @@ mod tests {
             assigner: CoreWindowAssigner::Hopping(SlidingWindowAssigner::from_millis(
                 size_ms, slide_ms,
             )),
-            windows: BTreeMap::new(),
-            session_groups: FxHashMap::default(),
+            key_group_count: KeyGroupCount::try_from(1_u16).unwrap(),
+            vnode_states: std::iter::repeat_with(|| None)
+                .take(1)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            active_vnodes: Vec::with_capacity(1),
+            active_vnode_positions: vec![usize::MAX; 1].into_boxed_slice(),
+            window_group_counts: FxHashMap::default(),
+            session_group_count: 0,
             agg_specs,
             num_group_cols: 1,
-            group_types: vec![DataType::Utf8],
-            row_converter: arrow::row::RowConverter::new(vec![arrow::row::SortField::new(
-                DataType::Utf8,
-            )])
-            .unwrap(),
+            group_types: Arc::from(vec![DataType::Utf8]),
+            row_converter: Arc::new(
+                arrow::row::RowConverter::new(vec![arrow::row::SortField::new(DataType::Utf8)])
+                    .unwrap(),
+            ),
             query_sql: String::new(),
             #[cfg(test)]
             pre_agg_sql: String::new(),
@@ -2665,8 +3896,10 @@ mod tests {
             scratch_nogroup: FxHashMap::default(),
             scratch_grouped: FxHashMap::default(),
             scratch_group_keys: indexmap::IndexSet::default(),
-            managed_global_tumbling: false,
-            accounted_state_bytes: 0,
+            checkpoint_dirty_vnodes: vec![false; 1].into_boxed_slice(),
+            checkpoint_dirty_vnode_roster: Vec::with_capacity(1),
+            full_vnode_capture_required: true,
+            required_frontier_floor_ms: i64::MIN,
         }
     }
 
@@ -2692,15 +3925,22 @@ mod tests {
 
         CoreWindowState {
             assigner: CoreWindowAssigner::Session { gap_ms },
-            windows: BTreeMap::new(),
-            session_groups: FxHashMap::default(),
+            key_group_count: KeyGroupCount::try_from(1_u16).unwrap(),
+            vnode_states: std::iter::repeat_with(|| None)
+                .take(1)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            active_vnodes: Vec::with_capacity(1),
+            active_vnode_positions: vec![usize::MAX; 1].into_boxed_slice(),
+            window_group_counts: FxHashMap::default(),
+            session_group_count: 0,
             agg_specs,
             num_group_cols: 1,
-            group_types: vec![DataType::Utf8],
-            row_converter: arrow::row::RowConverter::new(vec![arrow::row::SortField::new(
-                DataType::Utf8,
-            )])
-            .unwrap(),
+            group_types: Arc::from(vec![DataType::Utf8]),
+            row_converter: Arc::new(
+                arrow::row::RowConverter::new(vec![arrow::row::SortField::new(DataType::Utf8)])
+                    .unwrap(),
+            ),
             query_sql: String::new(),
             #[cfg(test)]
             pre_agg_sql: String::new(),
@@ -2721,8 +3961,10 @@ mod tests {
             scratch_nogroup: FxHashMap::default(),
             scratch_grouped: FxHashMap::default(),
             scratch_group_keys: indexmap::IndexSet::default(),
-            managed_global_tumbling: false,
-            accounted_state_bytes: 0,
+            checkpoint_dirty_vnodes: vec![false; 1].into_boxed_slice(),
+            checkpoint_dirty_vnode_roster: Vec::with_capacity(1),
+            full_vnode_capture_required: true,
+            required_frontier_floor_ms: i64::MIN,
         }
     }
 
@@ -2757,7 +3999,7 @@ mod tests {
 
         let sql = "SELECT symbol, SUM(price) AS total FROM trades \
                    GROUP BY symbol HAVING SUM(price) > 100";
-        let result = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None)
+        let result = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None, key_groups())
             .await
             .unwrap();
         assert!(result.is_some(), "Tumbling aggregate should return Some");
@@ -2795,7 +4037,7 @@ mod tests {
         };
 
         let sql = "SELECT id, SUM(val) AS total FROM events GROUP BY id";
-        let result = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None)
+        let result = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None, key_groups())
             .await
             .unwrap();
         assert!(
@@ -2834,7 +4076,7 @@ mod tests {
 
         // No aggregate → should return None
         let sql = "SELECT id, val FROM events";
-        let result = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None)
+        let result = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None, key_groups())
             .await
             .unwrap();
         assert!(result.is_none(), "Projection-only should return None");
@@ -2938,9 +4180,11 @@ mod tests {
     #[test]
     fn test_late_events_with_window_offset_are_dropped() {
         let mut state = make_core_window_state(1000);
+        let unshifted_fingerprint = state.query_fingerprint();
         state.assigner = CoreWindowAssigner::Tumbling(
             TumblingWindowAssigner::from_millis(1000).with_offset_ms(200),
         );
+        assert_ne!(state.query_fingerprint(), unshifted_fingerprint);
 
         let batch = make_pre_agg_batch(vec!["A"], vec![10], vec![500]);
         state.update_batch(&batch).unwrap();
@@ -3022,13 +4266,17 @@ mod tests {
         state.update_batch(&batch).unwrap();
 
         // Checkpoint
-        let cp = state.checkpoint_windows().unwrap();
-        assert_eq!(cp.windows.len(), 2);
+        let cp = checkpoint_all(&mut state);
+        assert_eq!(
+            cp.iter()
+                .map(|(_, checkpoint)| checkpoint.windows.len())
+                .sum::<usize>(),
+            2
+        );
 
         // Create fresh state and restore
         let mut state2 = make_core_window_state(1000);
-        let restored = state2.restore_windows(&cp).unwrap();
-        assert!(restored > 0, "Should have restored groups");
+        restore_all(&mut state2, cp).unwrap();
 
         // Close first window and verify SUM.
         let batches = state2.close_windows(1000).unwrap();
@@ -3061,11 +4309,11 @@ mod tests {
         let batch = make_pre_agg_batch(vec!["AAPL"], vec![10], vec![100]);
         state.update_batch(&batch).unwrap();
 
-        let mut cp = state.checkpoint_windows().unwrap();
-        cp.fingerprint = 12345; // tamper
+        let mut cp = checkpoint_all(&mut state);
+        cp[0].1.fingerprint = 12345;
 
         let mut state2 = make_core_window_state(1000);
-        let result = state2.restore_windows(&cp);
+        let result = restore_all(&mut state2, cp);
         assert!(result.is_err(), "Should fail on fingerprint mismatch");
     }
 
@@ -3073,13 +4321,12 @@ mod tests {
     fn core_window_checkpoint_rejects_a_different_state_query() {
         let mut state = make_core_window_state(1000);
         state.query_sql = "SELECT symbol, SUM(value) FROM trades GROUP BY symbol".into();
-        let checkpoint = state.checkpoint_windows().unwrap();
+        let checkpoint = checkpoint_all(&mut state);
 
         let mut restored = make_core_window_state(1000);
         restored.query_sql = "SELECT symbol, MAX(value) FROM trades GROUP BY symbol".into();
 
-        assert!(restored
-            .restore_windows(&checkpoint)
+        assert!(restore_all(&mut restored, checkpoint)
             .unwrap_err()
             .to_string()
             .contains("fingerprint mismatch"));
@@ -3114,7 +4361,7 @@ mod tests {
         };
 
         let sql = "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol";
-        let result = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None)
+        let result = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None, key_groups())
             .await
             .unwrap();
         assert!(result.is_some(), "Sliding aggregate should return Some");
@@ -3149,7 +4396,7 @@ mod tests {
         };
 
         let sql = "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol";
-        let result = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None)
+        let result = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None, key_groups())
             .await
             .unwrap();
         assert!(result.is_some(), "Session aggregate should return Some");
@@ -3184,7 +4431,7 @@ mod tests {
         };
 
         let sql = "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol";
-        let result = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None)
+        let result = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None, key_groups())
             .await
             .unwrap();
         assert!(result.is_none(), "Session with gap=0 should return None");
@@ -3212,7 +4459,7 @@ mod tests {
                    FROM events \
                    GROUP BY HOP(ts, INTERVAL '2' SECOND, INTERVAL '4' SECOND), \
                             HOP_END(ts, INTERVAL '2' SECOND, INTERVAL '4' SECOND)";
-        let mut state = CoreWindowState::try_from_sql(&ctx, sql, &config, None)
+        let mut state = CoreWindowState::try_from_sql(&ctx, sql, &config, None, key_groups())
             .await
             .unwrap()
             .unwrap();
@@ -3282,7 +4529,7 @@ mod tests {
                           SUM(amount) AS total \
                    FROM events \
                    GROUP BY user_id, SESSION(ts, INTERVAL '3' SECOND)";
-        let mut state = CoreWindowState::try_from_sql(&ctx, sql, &config, None)
+        let mut state = CoreWindowState::try_from_sql(&ctx, sql, &config, None, key_groups())
             .await
             .unwrap()
             .unwrap();
@@ -3539,13 +4786,13 @@ mod tests {
         assert_eq!(emitted.len(), 1);
         assert_eq!(sum_total(&emitted[0]), 30);
 
-        let checkpoint = state.checkpoint_windows().unwrap();
+        let checkpoint = checkpoint_all(&mut state);
         let mut restored = make_session_core_window_state(3000);
-        restored.restore_windows(&checkpoint).unwrap();
+        restore_all(&mut restored, checkpoint).unwrap();
         restored
             .update_batch(&make_pre_agg_batch(vec!["A"], vec![10], vec![2000]))
             .unwrap();
-        assert!(restored.session_groups.is_empty());
+        assert_eq!(session_group_count(&restored), 0);
         assert!(restored.close_windows(10_000).unwrap().is_empty());
     }
 
@@ -3594,12 +4841,12 @@ mod tests {
 
         let batch1 = make_pre_agg_batch(vec!["A", "B"], vec![10, 100], vec![1000, 1000]);
         state.update_batch(&batch1).unwrap();
-        assert_eq!(state.session_groups.len(), 2);
+        assert_eq!(session_group_count(&state), 2);
 
         let batch2 = make_pre_agg_batch(vec!["C", "A"], vec![999, 20], vec![1500, 1500]);
         let error = state.update_batch(&batch2).unwrap_err();
         assert!(error.to_string().contains("cardinality limit"));
-        assert_eq!(state.session_groups.len(), 2);
+        assert_eq!(session_group_count(&state), 2);
 
         let batches = state.close_windows(10_000).unwrap();
         assert_eq!(batches.len(), 1);
@@ -3628,13 +4875,14 @@ mod tests {
         let batch = make_pre_agg_batch(vec!["A", "A"], vec![10, 20], vec![1000, 3000]);
         state.update_batch(&batch).unwrap();
 
-        let cp = state.checkpoint_windows().unwrap();
-        assert_eq!(cp.window_type, "hopping");
-        assert!(!cp.windows.is_empty());
+        let cp = checkpoint_all(&mut state);
+        assert!(cp.iter().all(|(_, checkpoint)| checkpoint.window_type == 2));
+        assert!(cp
+            .iter()
+            .any(|(_, checkpoint)| !checkpoint.windows.is_empty()));
 
         let mut state2 = make_hopping_core_window_state(4000, 2000);
-        let restored = state2.restore_windows(&cp).unwrap();
-        assert!(restored > 0);
+        restore_all(&mut state2, cp).unwrap();
 
         let total = |b: &arrow_array::RecordBatch| -> i64 {
             b.column(1)
@@ -3665,13 +4913,14 @@ mod tests {
         let batch2 = make_pre_agg_batch(vec!["A"], vec![30], vec![3500]);
         state.update_batch(&batch2).unwrap();
 
-        let cp = state.checkpoint_windows().unwrap();
-        assert_eq!(cp.window_type, "session");
-        assert!(!cp.session_state.is_empty());
+        let cp = checkpoint_all(&mut state);
+        assert!(cp.iter().all(|(_, checkpoint)| checkpoint.window_type == 3));
+        assert!(cp
+            .iter()
+            .any(|(_, checkpoint)| !checkpoint.session_state.is_empty()));
 
         let mut state2 = make_session_core_window_state(3000);
-        let restored = state2.restore_windows(&cp).unwrap();
-        assert!(restored > 0);
+        restore_all(&mut state2, cp).unwrap();
 
         let batches = state2.close_windows(8000).unwrap();
         assert_eq!(batches.len(), 1);
@@ -3737,6 +4986,7 @@ mod tests {
              TUMBLE(ts, INTERVAL '10' SECOND)",
             &config,
             Some(&laminar_sql::parser::EmitClause::OnWindowClose),
+            key_groups(),
         )
         .await
         .unwrap();
@@ -3802,6 +5052,7 @@ mod tests {
              HAVING SUM(a) > 0 AND SUM(b) > 0",
             &config,
             Some(&laminar_sql::parser::EmitClause::OnWindowClose),
+            key_groups(),
         )
         .await
         .unwrap()
@@ -3882,6 +5133,7 @@ mod tests {
              SESSION(ts, INTERVAL '5' SECOND)",
             &config,
             Some(&laminar_sql::parser::EmitClause::OnWindowClose),
+            key_groups(),
         )
         .await
         .unwrap();
@@ -3938,7 +5190,7 @@ mod tests {
                    WHERE ts > now() - INTERVAL '10' MINUTE \
                      AND ts < now() + INTERVAL '2' MINUTE \
                    GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE)";
-        let mut cw = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None)
+        let mut cw = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None, key_groups())
             .await
             .expect("now() in WHERE must build, not error")
             .expect("tumbling aggregate => Some");
@@ -4006,7 +5258,9 @@ mod tests {
         let sql =
             "SELECT TUMBLE(ts, INTERVAL '1' MINUTE) AS w, COUNT(*) AS c, now() AS planned_at \
                    FROM evt GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE)";
-        let Err(err) = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None).await else {
+        let Err(err) =
+            CoreWindowState::try_from_sql(&ctx, sql, &window_config, None, key_groups()).await
+        else {
             panic!("now() outside WHERE must be rejected at build");
         };
         assert!(
