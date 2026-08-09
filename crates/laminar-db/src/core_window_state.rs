@@ -1,7 +1,7 @@
 #![deny(clippy::disallowed_types)]
 
 //! Core window state for tumbling/hopping/session aggregate queries.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -33,6 +33,8 @@ use crate::error::DbError;
 /// Sentinel for null timestamps; callers must skip these rows rather than
 /// assigning them to the epoch-zero window.
 const NULL_TIMESTAMP: i64 = i64::MIN;
+// Conservative sparse-node envelope used for managed-state admission, not RSS reporting.
+const BTREE_ENTRY_CHARGE: usize = 512;
 
 fn extract_i64_timestamps(batch: &RecordBatch, col_index: usize) -> Result<Vec<i64>, DbError> {
     use arrow::array::{Array, Int64Array};
@@ -242,10 +244,38 @@ struct SessionGroupState {
     sessions: BTreeMap<i64, SessionAccState>,
 }
 
+type SessionGroupKey = Arc<arrow::row::OwnedRow>;
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct SessionDeadline {
+    deadline_ms: i64,
+    session_start: i64,
+    key: SessionGroupKey,
+}
+
+impl SessionDeadline {
+    fn new(
+        key: SessionGroupKey,
+        session_start: i64,
+        session_end: i64,
+        allowed_lateness_ms: i64,
+    ) -> Self {
+        Self {
+            deadline_ms: session_end.saturating_add(allowed_lateness_ms),
+            session_start,
+            key,
+        }
+    }
+
+    const fn accounted_state_bytes(&self) -> usize {
+        BTREE_ENTRY_CHARGE
+    }
+}
+
 type FixedWindowGroups =
     FxHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>;
 type FixedWindows = BTreeMap<i64, FixedWindowGroups>;
-type SessionGroups = FxHashMap<arrow::row::OwnedRow, SessionGroupState>;
+type SessionGroups = FxHashMap<SessionGroupKey, SessionGroupState>;
 
 struct PreparedCoreWindowRestore {
     state: Option<Box<CoreWindowVnodeState>>,
@@ -255,6 +285,7 @@ struct PreparedCoreWindowRestore {
 struct CoreWindowVnodeState {
     windows: FixedWindows,
     session_groups: SessionGroups,
+    session_deadlines: BTreeSet<SessionDeadline>,
     accounted_state_bytes: usize,
 }
 
@@ -298,7 +329,7 @@ struct CapturedSession {
 }
 
 struct CapturedSessionGroup {
-    key: arrow::row::OwnedRow,
+    key: SessionGroupKey,
     sessions: Vec<CapturedSession>,
 }
 
@@ -860,7 +891,7 @@ impl CoreWindowState {
                     .saturating_add(key.as_ref().len())
                     .saturating_add(Self::accumulator_vector_bytes(accumulators))
             }))
-            .saturating_add(std::mem::size_of::<(i64, FixedWindowGroups)>())
+            .saturating_add(BTREE_ENTRY_CHARGE)
     }
 
     fn scratch_nogroup_bytes(scratch: &FxHashMap<i64, Vec<u32>>) -> usize {
@@ -897,23 +928,102 @@ impl CoreWindowState {
         })
     }
 
-    fn session_group_bytes(key: &arrow::row::OwnedRow, group: &SessionGroupState) -> usize {
+    fn session_group_key_bytes(key: &SessionGroupKey) -> usize {
         key.as_ref()
+            .as_ref()
             .len()
-            .saturating_add(group.sessions.values().fold(0_usize, |bytes, session| {
-                bytes
-                    .saturating_add(std::mem::size_of::<(i64, SessionAccState)>())
-                    .saturating_add(Self::accumulator_vector_bytes(&session.accs))
-            }))
+            .saturating_add(std::mem::size_of::<arrow::row::OwnedRow>())
+            .saturating_add(2 * std::mem::size_of::<usize>())
     }
 
-    fn session_groups_bytes(groups: &SessionGroups) -> usize {
+    fn session_group_bytes(key: &SessionGroupKey, group: &SessionGroupState) -> usize {
+        Self::session_group_key_bytes(key).saturating_add(group.sessions.values().fold(
+            0_usize,
+            |bytes, session| {
+                bytes
+                    .saturating_add(BTREE_ENTRY_CHARGE)
+                    .saturating_add(Self::accumulator_vector_bytes(&session.accs))
+            },
+        ))
+    }
+
+    fn session_groups_bytes(
+        groups: &SessionGroups,
+        deadlines: &BTreeSet<SessionDeadline>,
+    ) -> usize {
         groups
             .capacity()
-            .saturating_mul(std::mem::size_of::<(arrow::row::OwnedRow, SessionGroupState)>())
+            .saturating_mul(std::mem::size_of::<(SessionGroupKey, SessionGroupState)>())
             .saturating_add(groups.iter().fold(0_usize, |bytes, (key, group)| {
                 bytes.saturating_add(Self::session_group_bytes(key, group))
             }))
+            .saturating_add(deadlines.iter().fold(0_usize, |bytes, deadline| {
+                bytes.saturating_add(deadline.accounted_state_bytes())
+            }))
+    }
+
+    fn insert_session_deadline(state: &mut CoreWindowVnodeState, deadline: SessionDeadline) {
+        let retained_bytes = deadline.accounted_state_bytes();
+        assert!(
+            state.session_deadlines.insert(deadline),
+            "Core session deadline insertion must target a vacant entry"
+        );
+        state.accounted_state_bytes = state.accounted_state_bytes.saturating_add(retained_bytes);
+    }
+
+    fn remove_session_deadline(state: &mut CoreWindowVnodeState, deadline: &SessionDeadline) {
+        assert!(
+            state.session_deadlines.remove(deadline),
+            "Core session deadline removal must target a live entry"
+        );
+        state.accounted_state_bytes = state
+            .accounted_state_bytes
+            .checked_sub(deadline.accounted_state_bytes())
+            .expect("Core session deadline accounting invariant failed");
+    }
+
+    fn validate_session_deadline_replacement(
+        state: &CoreWindowVnodeState,
+        retired: &[SessionDeadline],
+        replacement: &SessionDeadline,
+    ) -> Result<(), DbError> {
+        let retired_bytes = retired
+            .len()
+            .checked_mul(BTREE_ENTRY_CHARGE)
+            .ok_or_else(|| DbError::Pipeline("Core session deadline accounting overflow".into()))?;
+        if state.accounted_state_bytes < retired_bytes {
+            return Err(DbError::Pipeline(
+                "Core session deadline accounting invariant failed".into(),
+            ));
+        }
+        if retired
+            .iter()
+            .any(|deadline| !state.session_deadlines.contains(deadline))
+        {
+            return Err(DbError::Pipeline(
+                "Core session deadline index is missing a live interval".into(),
+            ));
+        }
+        if !retired.contains(replacement) && state.session_deadlines.contains(replacement) {
+            return Err(DbError::Pipeline(
+                "Core session deadline index contains a conflicting interval".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn commit_session_deadline_replacement(
+        state: &mut CoreWindowVnodeState,
+        retired: &[SessionDeadline],
+        replacement: SessionDeadline,
+    ) {
+        if retired == std::slice::from_ref(&replacement) {
+            return;
+        }
+        for deadline in retired {
+            Self::remove_session_deadline(state, deadline);
+        }
+        Self::insert_session_deadline(state, replacement);
     }
 
     fn window_group_counts_bytes(counts: &FxHashMap<i64, usize>) -> usize {
@@ -1010,6 +1120,7 @@ impl CoreWindowState {
             *slot = Some(Box::new(CoreWindowVnodeState {
                 windows: BTreeMap::new(),
                 session_groups: FxHashMap::default(),
+                session_deadlines: BTreeSet::new(),
                 accounted_state_bytes: 0,
             }));
             debug_assert!(self.active_vnodes.len() < self.active_vnodes.capacity());
@@ -1050,11 +1161,7 @@ impl CoreWindowState {
             .saturating_add(roster_growth)
             .saturating_add(key_bytes)
             .saturating_add(accumulator_bytes)
-            .saturating_add(if new_window {
-                std::mem::size_of::<(i64, FixedWindowGroups)>()
-            } else {
-                0
-            });
+            .saturating_add(if new_window { BTREE_ENTRY_CHARGE } else { 0 });
         *self.window_group_counts.entry(window_start).or_default() += 1;
     }
 
@@ -1063,6 +1170,12 @@ impl CoreWindowState {
             .as_ref()
             .is_some_and(|state| state.windows.is_empty() && state.session_groups.is_empty());
         if empty {
+            assert!(
+                self.vnode_states[vnode as usize]
+                    .as_ref()
+                    .is_some_and(|state| state.session_deadlines.is_empty()),
+                "empty Core window vnode retained session deadlines"
+            );
             self.vnode_states[vnode as usize] = None;
             let index =
                 std::mem::replace(&mut self.active_vnode_positions[vnode as usize], usize::MAX);
@@ -1390,6 +1503,7 @@ impl CoreWindowState {
     ) -> Result<(), DbError> {
         let new_start = ts_ms;
         let new_end = ts_ms.saturating_add(gap_ms);
+        let allowed_lateness_ms = self.allowed_lateness_ms;
 
         let mut overlapping: smallvec::SmallVec<[i64; 2]> = self.vnode_states[vnode as usize]
             .as_ref()
@@ -1445,15 +1559,27 @@ impl CoreWindowState {
                 let mut accs = self.create_fresh_accumulators()?;
                 Self::update_accumulators(&mut accs, &self.agg_specs, batch, index_array)?;
                 let accumulator_bytes = Self::accumulator_vector_bytes(&accs);
+                let group_key = self.vnode_states[vnode as usize]
+                    .as_ref()
+                    .and_then(|state| state.session_groups.get_key_value(key))
+                    .map_or_else(|| Arc::new(key.clone()), |(key, _)| Arc::clone(key));
+                let deadline = SessionDeadline::new(
+                    Arc::clone(&group_key),
+                    new_start,
+                    new_end,
+                    allowed_lateness_ms,
+                );
+                if let Some(state) = self.vnode_states[vnode as usize].as_deref() {
+                    Self::validate_session_deadline_replacement(state, &[], &deadline)?;
+                }
                 let state = self.vnode_state_mut(vnode);
                 let previous_capacity = state.session_groups.capacity();
-                let group =
-                    state
-                        .session_groups
-                        .entry(key.clone())
-                        .or_insert_with(|| SessionGroupState {
-                            sessions: BTreeMap::new(),
-                        });
+                let group = state
+                    .session_groups
+                    .entry(Arc::clone(&group_key))
+                    .or_insert_with(|| SessionGroupState {
+                        sessions: BTreeMap::new(),
+                    });
                 assert!(
                     group
                         .sessions
@@ -1476,49 +1602,119 @@ impl CoreWindowState {
                             .capacity()
                             .saturating_sub(previous_capacity)
                             .saturating_mul(std::mem::size_of::<(
-                                arrow::row::OwnedRow,
+                                SessionGroupKey,
                                 SessionGroupState,
                             )>()),
                     )
-                    .saturating_add(if new_group { key.as_ref().len() } else { 0 })
-                    .saturating_add(std::mem::size_of::<(i64, SessionAccState)>())
+                    .saturating_add(if new_group {
+                        Self::session_group_key_bytes(&group_key)
+                    } else {
+                        0
+                    })
+                    .saturating_add(BTREE_ENTRY_CHARGE)
                     .saturating_add(accumulator_bytes);
+                Self::commit_session_deadline_replacement(state, &[], deadline);
                 if new_group {
-                    self.session_group_count += 1;
+                    self.session_group_count = self
+                        .session_group_count
+                        .checked_add(1)
+                        .expect("Core session cardinality accounting overflow");
                 }
             }
             1 => {
+                let sess_key = overlapping[0];
+                let previous_end = self.vnode_states[vnode as usize]
+                    .as_ref()
+                    .and_then(|state| state.session_groups.get(key))
+                    .and_then(|group| group.sessions.get(&sess_key))
+                    .map(|session| session.end)
+                    .expect("invariant: session key sourced from this map");
+                let merged_start = sess_key.min(new_start);
+                let merged_end = previous_end.max(new_end);
+                let deadline_change = (merged_start != sess_key
+                    || merged_end.saturating_add(allowed_lateness_ms)
+                        != previous_end.saturating_add(allowed_lateness_ms))
+                .then(|| {
+                    let group_key = self.vnode_states[vnode as usize]
+                        .as_ref()
+                        .and_then(|state| state.session_groups.get_key_value(key))
+                        .map(|(key, _)| Arc::clone(key))
+                        .expect("session group key must exist");
+                    (
+                        SessionDeadline::new(
+                            Arc::clone(&group_key),
+                            sess_key,
+                            previous_end,
+                            allowed_lateness_ms,
+                        ),
+                        SessionDeadline::new(
+                            group_key,
+                            merged_start,
+                            merged_end,
+                            allowed_lateness_ms,
+                        ),
+                    )
+                });
+                if let Some((previous_deadline, replacement_deadline)) = &deadline_change {
+                    Self::validate_session_deadline_replacement(
+                        self.vnode_states[vnode as usize]
+                            .as_deref()
+                            .expect("session vnode must exist"),
+                        std::slice::from_ref(previous_deadline),
+                        replacement_deadline,
+                    )?;
+                }
                 let state = self.vnode_states[vnode as usize]
                     .as_deref_mut()
                     .expect("session vnode must exist");
-                let group = state
-                    .session_groups
-                    .get_mut(key)
-                    .expect("invariant: key present (overlapping derived from same group)");
-                let sess_key = overlapping[0];
-                let sess = group
-                    .sessions
-                    .get_mut(&sess_key)
-                    .expect("invariant: session key sourced from this map");
-                let previous_accumulator_bytes = Self::accumulator_vector_bytes(&sess.accs);
-                let merged_start = sess.start.min(new_start);
-                let merged_end = sess.end.max(new_end);
-                sess.start = merged_start;
-                sess.end = merged_end;
-                let update =
-                    Self::update_accumulators(&mut sess.accs, &self.agg_specs, batch, index_array);
-                let current_accumulator_bytes = Self::accumulator_vector_bytes(&sess.accs);
-                if update.is_ok() && merged_start != sess_key {
+                let (previous_accumulator_bytes, current_accumulator_bytes, update) = {
+                    let group = state
+                        .session_groups
+                        .get_mut(key)
+                        .expect("invariant: key present (overlapping derived from same group)");
                     let sess = group
                         .sessions
-                        .remove(&sess_key)
-                        .expect("invariant: session key just observed above");
-                    group.sessions.insert(merged_start, sess);
-                }
+                        .get_mut(&sess_key)
+                        .expect("invariant: session key sourced from this map");
+                    let previous_accumulator_bytes = Self::accumulator_vector_bytes(&sess.accs);
+                    let update = Self::update_accumulators(
+                        &mut sess.accs,
+                        &self.agg_specs,
+                        batch,
+                        index_array,
+                    );
+                    let current_accumulator_bytes = Self::accumulator_vector_bytes(&sess.accs);
+                    if update.is_ok() {
+                        sess.start = merged_start;
+                        sess.end = merged_end;
+                        if merged_start != sess_key {
+                            let sess = group
+                                .sessions
+                                .remove(&sess_key)
+                                .expect("invariant: session key just observed above");
+                            group.sessions.insert(merged_start, sess);
+                        }
+                    }
+                    (
+                        previous_accumulator_bytes,
+                        current_accumulator_bytes,
+                        update,
+                    )
+                };
                 state.accounted_state_bytes = state
                     .accounted_state_bytes
-                    .saturating_sub(previous_accumulator_bytes)
+                    .checked_sub(previous_accumulator_bytes)
+                    .expect("Core session state must cover its accumulator charge")
                     .saturating_add(current_accumulator_bytes);
+                if update.is_ok() {
+                    if let Some((previous_deadline, replacement_deadline)) = deadline_change {
+                        Self::commit_session_deadline_replacement(
+                            state,
+                            std::slice::from_ref(&previous_deadline),
+                            replacement_deadline,
+                        );
+                    }
+                }
                 update?;
             }
             _ => {
@@ -1554,62 +1750,107 @@ impl CoreWindowState {
         // row, and only remove + insert once all fallible steps succeed — so a
         // mid-merge failure leaves the existing sessions intact.
         let mut accs = self.create_fresh_accumulators()?;
+        let allowed_lateness_ms = self.allowed_lateness_ms;
+        let group_key = self.vnode_states[vnode as usize]
+            .as_ref()
+            .and_then(|state| state.session_groups.get_key_value(key))
+            .map(|(key, _)| Arc::clone(key))
+            .expect("invariant: key present (overlapping derived from same group)");
+        let (merged_start, merged_end, retired_bytes, retired_deadlines) = {
+            let state = self.vnode_states[vnode as usize]
+                .as_deref_mut()
+                .expect("session vnode must exist");
+            let group = state
+                .session_groups
+                .get_mut(key)
+                .expect("invariant: key present (overlapping derived from same group)");
+            let mut merged_start = new_start;
+            let mut merged_end = new_end;
+            let mut retired_bytes = 0_usize;
+            let mut retired_deadlines: smallvec::SmallVec<[SessionDeadline; 2]> =
+                smallvec::SmallVec::new();
+            for &sess_key in overlapping {
+                let sess = group
+                    .sessions
+                    .get_mut(&sess_key)
+                    .expect("invariant: overlapping keys are unique BTreeMap entries");
+                retired_bytes = retired_bytes
+                    .saturating_add(BTREE_ENTRY_CHARGE)
+                    .saturating_add(Self::accumulator_vector_bytes(&sess.accs));
+                retired_deadlines.push(SessionDeadline::new(
+                    Arc::clone(&group_key),
+                    sess_key,
+                    sess.end,
+                    allowed_lateness_ms,
+                ));
+                merged_start = merged_start.min(sess.start);
+                merged_end = merged_end.max(sess.end);
+                for (i, acc) in sess.accs.iter_mut().enumerate() {
+                    let state = acc
+                        .state()
+                        .map_err(|e| DbError::Pipeline(format!("session merge state: {e}")))?;
+                    let arrays: Vec<ArrayRef> = state
+                        .iter()
+                        .map(|sv| {
+                            sv.to_array()
+                                .map_err(|e| DbError::Pipeline(format!("session merge array: {e}")))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    accs[i]
+                        .merge_batch(&arrays)
+                        .map_err(|e| DbError::Pipeline(format!("session merge: {e}")))?;
+                }
+            }
+            (merged_start, merged_end, retired_bytes, retired_deadlines)
+        };
+        let replacement_deadline =
+            SessionDeadline::new(group_key, merged_start, merged_end, allowed_lateness_ms);
+        Self::validate_session_deadline_replacement(
+            self.vnode_states[vnode as usize]
+                .as_deref()
+                .expect("session vnode must exist"),
+            &retired_deadlines,
+            &replacement_deadline,
+        )?;
+        Self::update_accumulators(&mut accs, &self.agg_specs, batch, index_array)?;
 
+        let replacement_bytes =
+            BTREE_ENTRY_CHARGE.saturating_add(Self::accumulator_vector_bytes(&accs));
         let state = self.vnode_states[vnode as usize]
             .as_deref_mut()
             .expect("session vnode must exist");
-        let group = state
-            .session_groups
-            .get_mut(key)
-            .expect("invariant: key present (overlapping derived from same group)");
-        let mut merged_start = new_start;
-        let mut merged_end = new_end;
-        let mut retired_bytes = 0_usize;
-        for &sess_key in overlapping {
-            let sess = group
-                .sessions
-                .get_mut(&sess_key)
-                .expect("invariant: overlapping keys are unique BTreeMap entries");
-            retired_bytes = retired_bytes
-                .saturating_add(std::mem::size_of::<(i64, SessionAccState)>())
-                .saturating_add(Self::accumulator_vector_bytes(&sess.accs));
-            merged_start = merged_start.min(sess.start);
-            merged_end = merged_end.max(sess.end);
-            for (i, acc) in sess.accs.iter_mut().enumerate() {
-                let state = acc
-                    .state()
-                    .map_err(|e| DbError::Pipeline(format!("session merge state: {e}")))?;
-                let arrays: Vec<ArrayRef> = state
-                    .iter()
-                    .map(|sv| {
-                        sv.to_array()
-                            .map_err(|e| DbError::Pipeline(format!("session merge array: {e}")))
-                    })
-                    .collect::<Result<_, _>>()?;
-                accs[i]
-                    .merge_batch(&arrays)
-                    .map_err(|e| DbError::Pipeline(format!("session merge: {e}")))?;
+        {
+            let group = state
+                .session_groups
+                .get_mut(key)
+                .expect("invariant: key present (overlapping derived from same group)");
+            for &sess_key in overlapping {
+                assert!(
+                    group.sessions.remove(&sess_key).is_some(),
+                    "merged Core session removal must target a live interval"
+                );
             }
+            assert!(
+                group
+                    .sessions
+                    .insert(
+                        merged_start,
+                        SessionAccState {
+                            start: merged_start,
+                            end: merged_end,
+                            accs,
+                        },
+                    )
+                    .is_none(),
+                "merged Core session must have a vacant start"
+            );
         }
-        Self::update_accumulators(&mut accs, &self.agg_specs, batch, index_array)?;
-
-        for &sess_key in overlapping {
-            group.sessions.remove(&sess_key);
-        }
-        let replacement_bytes = std::mem::size_of::<(i64, SessionAccState)>()
-            .saturating_add(Self::accumulator_vector_bytes(&accs));
-        group.sessions.insert(
-            merged_start,
-            SessionAccState {
-                start: merged_start,
-                end: merged_end,
-                accs,
-            },
-        );
         state.accounted_state_bytes = state
             .accounted_state_bytes
-            .saturating_sub(retired_bytes)
+            .checked_sub(retired_bytes)
+            .expect("Core session state must cover merged intervals")
             .saturating_add(replacement_bytes);
+        Self::commit_session_deadline_replacement(state, &retired_deadlines, replacement_deadline);
         Ok(())
     }
 
@@ -1801,55 +2042,119 @@ impl CoreWindowState {
         vnode: u32,
         watermark_ms: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        let allowed_lateness_ms = self.allowed_lateness_ms;
+        let due_count = {
+            let state = self.vnode_states[vnode as usize]
+                .as_deref()
+                .expect("active Core window vnode must exist");
+            let mut count = 0_usize;
+            for deadline in state
+                .session_deadlines
+                .iter()
+                .take_while(|deadline| deadline.deadline_ms <= watermark_ms)
+            {
+                let (group_key, group) = state
+                    .session_groups
+                    .get_key_value(deadline.key.as_ref())
+                    .ok_or_else(|| {
+                        DbError::Pipeline(
+                            "Core session deadline index references a missing group".into(),
+                        )
+                    })?;
+                if !Arc::ptr_eq(group_key, &deadline.key) {
+                    return Err(DbError::Pipeline(
+                        "Core session deadline index does not share its group key".into(),
+                    ));
+                }
+                let session = group.sessions.get(&deadline.session_start).ok_or_else(|| {
+                    DbError::Pipeline(
+                        "Core session deadline index references a missing interval".into(),
+                    )
+                })?;
+                if session.start != deadline.session_start
+                    || session.end.saturating_add(allowed_lateness_ms) != deadline.deadline_ms
+                {
+                    return Err(DbError::Pipeline(
+                        "Core session deadline index does not match its interval".into(),
+                    ));
+                }
+                count = count.checked_add(1).ok_or_else(|| {
+                    DbError::Pipeline("Core session deadline count overflow".into())
+                })?;
+            }
+            let deadline_bytes = count.checked_mul(BTREE_ENTRY_CHARGE).ok_or_else(|| {
+                DbError::Pipeline("Core session deadline accounting overflow".into())
+            })?;
+            if state.accounted_state_bytes < deadline_bytes {
+                return Err(DbError::Pipeline(
+                    "Core session deadline accounting invariant failed".into(),
+                ));
+            }
+            count
+        };
+        if due_count == 0 {
+            return Ok(Vec::new());
+        }
+
         #[allow(clippy::type_complexity)]
         let mut rows: Vec<(
             i64,
             i64,
-            arrow::row::OwnedRow,
+            SessionGroupKey,
             Vec<Box<dyn datafusion_expr::Accumulator>>,
         )> = Vec::new();
+        rows.try_reserve_exact(due_count).map_err(|error| {
+            DbError::Pipeline(format!("Core session close roster reserve failed: {error}"))
+        })?;
 
-        let mut empty_groups = Vec::new();
         let mut retired_bytes = 0_usize;
+        let mut removed_groups = 0_usize;
 
         let state = self.vnode_states[vnode as usize]
             .as_deref_mut()
             .expect("active Core window vnode must exist");
-        for (key, group) in &mut state.session_groups {
-            let to_close: Vec<i64> = group
-                .sessions
-                .iter()
-                .filter(|(_, s)| s.end.saturating_add(self.allowed_lateness_ms) <= watermark_ms)
-                .map(|(&k, _)| k)
-                .collect();
-
-            for sess_key in to_close {
-                let sess = group
+        for _ in 0..due_count {
+            let deadline = state
+                .session_deadlines
+                .pop_first()
+                .expect("due Core session deadlines were validated above");
+            state.accounted_state_bytes = state
+                .accounted_state_bytes
+                .checked_sub(deadline.accounted_state_bytes())
+                .expect("Core session deadline accounting was validated above");
+            let (session, empty_group) = {
+                let group = state
+                    .session_groups
+                    .get_mut(&deadline.key)
+                    .expect("Core session deadline groups were validated above");
+                let session = group
                     .sessions
-                    .remove(&sess_key)
-                    .expect("invariant: to_close keys collected from this map this iteration");
-                retired_bytes = retired_bytes
-                    .saturating_add(std::mem::size_of::<(i64, SessionAccState)>())
-                    .saturating_add(Self::accumulator_vector_bytes(&sess.accs));
-                rows.push((sess.start, sess.end, key.clone(), sess.accs));
+                    .remove(&deadline.session_start)
+                    .expect("Core session deadline intervals were validated above");
+                (session, group.sessions.is_empty())
+            };
+            retired_bytes = retired_bytes
+                .saturating_add(BTREE_ENTRY_CHARGE)
+                .saturating_add(Self::accumulator_vector_bytes(&session.accs));
+            if empty_group {
+                let removed = state
+                    .session_groups
+                    .remove(&deadline.key)
+                    .expect("empty Core session group was observed above");
+                debug_assert!(removed.sessions.is_empty());
+                retired_bytes =
+                    retired_bytes.saturating_add(Self::session_group_key_bytes(&deadline.key));
+                removed_groups = removed_groups
+                    .checked_add(1)
+                    .expect("Core session group closure count overflow");
             }
-
-            if group.sessions.is_empty() {
-                empty_groups.push(key.clone());
-            }
+            rows.push((session.start, session.end, deadline.key, session.accs));
         }
 
-        let removed_groups = empty_groups.len();
-        for key in empty_groups {
-            retired_bytes = retired_bytes.saturating_add(key.as_ref().len());
-            state.session_groups.remove(&key);
-        }
-
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        state.accounted_state_bytes = state.accounted_state_bytes.saturating_sub(retired_bytes);
+        state.accounted_state_bytes = state
+            .accounted_state_bytes
+            .checked_sub(retired_bytes)
+            .expect("Core session state accounting must cover closed intervals");
         self.session_group_count = self
             .session_group_count
             .checked_sub(removed_groups)
@@ -1857,7 +2162,12 @@ impl CoreWindowState {
         self.mark_checkpoint_vnode_dirty(vnode);
         self.drop_empty_vnode(vnode);
 
-        rows.sort_by_key(|(ws, we, _, _)| (*ws, *we));
+        rows.sort_unstable_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.as_ref().cmp(right.2.as_ref()))
+        });
 
         self.emit_session_rows(rows)
     }
@@ -1869,13 +2179,13 @@ impl CoreWindowState {
         rows: Vec<(
             i64,
             i64,
-            arrow::row::OwnedRow,
+            SessionGroupKey,
             Vec<Box<dyn datafusion_expr::Accumulator>>,
         )>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let num_rows = rows.len();
 
-        let mut row_keys: Vec<arrow::row::OwnedRow> = Vec::with_capacity(num_rows);
+        let mut row_keys: Vec<SessionGroupKey> = Vec::with_capacity(num_rows);
         let mut window_starts = Vec::with_capacity(num_rows);
         let mut window_ends = Vec::with_capacity(num_rows);
         let mut agg_scalars: Vec<Vec<ScalarValue>> = (0..self.agg_specs.len())
@@ -2336,7 +2646,11 @@ impl CoreWindowState {
                 "session group roster",
             )?;
             for (key, group) in &mut state.session_groups {
-                charge(&mut remaining, key.as_ref().len(), "session group key")?;
+                charge(
+                    &mut remaining,
+                    Self::session_group_key_bytes(key),
+                    "session group key",
+                )?;
                 let mut sessions = Vec::new();
                 reserve_roster(
                     &mut sessions,
@@ -2357,7 +2671,7 @@ impl CoreWindowState {
                     });
                 }
                 session_state.push(CapturedSessionGroup {
-                    key: key.clone(),
+                    key: Arc::clone(key),
                     sessions,
                 });
             }
@@ -2567,6 +2881,7 @@ impl CoreWindowState {
             Box::new(CoreWindowVnodeState {
                 windows,
                 session_groups: FxHashMap::default(),
+                session_deadlines: BTreeSet::new(),
                 accounted_state_bytes,
             })
         });
@@ -2596,6 +2911,7 @@ impl CoreWindowState {
         }
 
         let mut session_groups = FxHashMap::default();
+        let mut session_deadlines = BTreeSet::new();
         session_groups
             .try_reserve(checkpoint.session_state.len())
             .map_err(|error| {
@@ -2607,8 +2923,8 @@ impl CoreWindowState {
                     "session checkpoint contains an empty group".into(),
                 ));
             }
-            let row_key = self.decode_checkpoint_key(&sgc.key)?;
-            if self.vnode_for_group_key(&row_key) != vnode {
+            let row_key = Arc::new(self.decode_checkpoint_key(&sgc.key)?);
+            if self.vnode_for_group_key(row_key.as_ref()) != vnode {
                 return Err(DbError::Checkpoint(format!(
                     "Core window vnode {vnode} checkpoint contains a key for another vnode"
                 )));
@@ -2637,6 +2953,16 @@ impl CoreWindowState {
                     )));
                 }
                 let accs = self.decode_checkpoint_accumulators(&sc.acc_states, "session window")?;
+                if !session_deadlines.insert(SessionDeadline::new(
+                    Arc::clone(&row_key),
+                    sc.start,
+                    sc.end,
+                    self.allowed_lateness_ms,
+                )) {
+                    return Err(DbError::Checkpoint(
+                        "session checkpoint contains a duplicate deadline".into(),
+                    ));
+                }
                 sessions.insert(
                     sc.start,
                     SessionAccState {
@@ -2658,10 +2984,12 @@ impl CoreWindowState {
         }
 
         let state = (!session_groups.is_empty()).then(|| {
-            let accounted_state_bytes = Self::session_groups_bytes(&session_groups);
+            let accounted_state_bytes =
+                Self::session_groups_bytes(&session_groups, &session_deadlines);
             Box::new(CoreWindowVnodeState {
                 windows: BTreeMap::new(),
                 session_groups,
+                session_deadlines,
                 accounted_state_bytes,
             })
         });
@@ -3239,11 +3567,10 @@ impl CoreWindowState {
             .windows
             .keys()
             .any(|window_start| self.is_window_closed_at(*window_start, watermark_ms))
-            || state.session_groups.values().any(|group| {
-                group.sessions.values().any(|session| {
-                    session.end.saturating_add(self.allowed_lateness_ms) <= watermark_ms
-                })
-            })
+            || state
+                .session_deadlines
+                .first()
+                .is_some_and(|deadline| deadline.deadline_ms <= watermark_ms)
         {
             return Err(DbError::Checkpoint(
                 "Core window restored frontier closes retained vnode state".into(),
@@ -3487,12 +3814,15 @@ impl CoreWindowVnodeCheckpointCapture {
             })?;
         for group in self.session_state {
             let key_scratch = row_scratch_bytes(
-                group.key.as_ref().len(),
+                group.key.as_ref().as_ref().len(),
                 self.group_types.len(),
                 "session key",
             )?;
-            let key_scalars =
-                row_to_scalar_key_with_types(&self.row_converter, &group.key, &self.group_types)?;
+            let key_scalars = row_to_scalar_key_with_types(
+                &self.row_converter,
+                group.key.as_ref(),
+                &self.group_types,
+            )?;
             let key = encode_scalars(&key_scalars, key_scratch, &mut remaining, "session key")?;
             drop(key_scalars);
             retain_roster::<SessionCheckpoint>(
@@ -3681,7 +4011,60 @@ mod tests {
         Ok(())
     }
 
+    fn assert_session_deadline_index(state: &CoreWindowState) {
+        let session_window = matches!(state.assigner, CoreWindowAssigner::Session { .. });
+        for vnode_state in state.vnode_states.iter().filter_map(Option::as_deref) {
+            if !session_window {
+                assert!(vnode_state.session_deadlines.is_empty());
+                continue;
+            }
+
+            let session_count = vnode_state
+                .session_groups
+                .values()
+                .map(|group| group.sessions.len())
+                .sum::<usize>();
+            assert_eq!(vnode_state.session_deadlines.len(), session_count);
+            assert_eq!(
+                vnode_state.accounted_state_bytes,
+                CoreWindowState::session_groups_bytes(
+                    &vnode_state.session_groups,
+                    &vnode_state.session_deadlines,
+                )
+            );
+            for (key, group) in &vnode_state.session_groups {
+                for (&start, session) in &group.sessions {
+                    assert_eq!(start, session.start);
+                    assert!(vnode_state
+                        .session_deadlines
+                        .contains(&SessionDeadline::new(
+                            Arc::clone(key),
+                            start,
+                            session.end,
+                            state.allowed_lateness_ms,
+                        )));
+                }
+            }
+            for deadline in &vnode_state.session_deadlines {
+                let (key, group) = vnode_state
+                    .session_groups
+                    .get_key_value(deadline.key.as_ref())
+                    .expect("deadline group must exist");
+                assert!(Arc::ptr_eq(key, &deadline.key));
+                let session = group
+                    .sessions
+                    .get(&deadline.session_start)
+                    .expect("deadline interval must exist");
+                assert_eq!(
+                    deadline.deadline_ms,
+                    session.end.saturating_add(state.allowed_lateness_ms)
+                );
+            }
+        }
+    }
+
     fn session_group_count(state: &CoreWindowState) -> usize {
+        assert_session_deadline_index(state);
         let count = state
             .vnode_states
             .iter()
@@ -4697,6 +5080,9 @@ mod tests {
             vec![1000, 3000, 4000],
         );
         state.update_batch(&batch).unwrap();
+        assert_session_deadline_index(&state);
+        assert!(state.close_windows(6000).unwrap().is_empty());
+        assert_session_deadline_index(&state);
 
         // Session: start=1000, end=4000+5000=9000.
         // Watermark at 9000 → session closes.
@@ -4756,6 +5142,7 @@ mod tests {
         // Late event at ts=3500 bridges the two sessions
         let batch2 = make_pre_agg_batch(vec!["A"], vec![30], vec![3500]);
         state.update_batch(&batch2).unwrap();
+        assert_session_deadline_index(&state);
         // Merged: [1000, 8000) with SUM = 10+20+30 = 60.
 
         let batches = state.close_windows(8000).unwrap();
@@ -4921,6 +5308,7 @@ mod tests {
 
         let mut state2 = make_session_core_window_state(3000);
         restore_all(&mut state2, cp).unwrap();
+        assert_session_deadline_index(&state2);
 
         let batches = state2.close_windows(8000).unwrap();
         assert_eq!(batches.len(), 1);
