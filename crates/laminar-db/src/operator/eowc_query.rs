@@ -165,28 +165,15 @@ impl EowcQueryOperator {
                 self.op_name
             ))
         })?;
-        let previous = window.checkpoint_windows().map_err(|error| {
-            DbError::Checkpoint(format!(
-                "EOWC CoreWindow restore snapshot for '{}': {error}",
-                self.op_name
-            ))
-        })?;
-        if let Err(apply_error) = window.restore_windows(checkpoint) {
-            window
-                .restore_windows(&previous)
-                .map_err(|rollback_error| {
-                    DbError::Checkpoint(format!(
-                        "EOWC CoreWindow restore for '{}' failed: {apply_error}; \
-                         rollback also failed: {rollback_error}",
-                        self.op_name
-                    ))
-                })?;
-            return Err(DbError::Checkpoint(format!(
-                "EOWC CoreWindow restore for '{}': {apply_error}",
-                self.op_name
-            )));
-        }
-        Ok(())
+        window
+            .restore_windows(checkpoint)
+            .map(|_| ())
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "EOWC CoreWindow restore for '{}': {error}",
+                    self.op_name
+                ))
+            })
     }
 
     fn core_window_apply_error(op_name: &str, phase: &str, error: DbError) -> DbError {
@@ -687,9 +674,11 @@ mod core_tests {
         rkyv::from_bytes::<CoreWindowCheckpoint, rkyv::rancor::Error>(&checkpoint.data).unwrap()
     }
 
-    async fn core_window_operator() -> EowcQueryOperator {
+    async fn core_window_operator(
+        config: WindowOperatorConfig,
+        timestamps: Vec<i64>,
+    ) -> EowcQueryOperator {
         let ctx = aggregate_context();
-        let config = test_window_config();
         let state =
             CoreWindowState::try_from_sql(&ctx, AGG_SQL, &config, Some(&EmitClause::OnWindowClose))
                 .await
@@ -704,23 +693,48 @@ mod core_tests {
             None,
         );
         op.state = Some(Box::new(state));
-        op.process(&[vec![test_batch(vec![100])]], &[i64::MIN])
+        op.process(&[vec![test_batch(timestamps)]], &[i64::MIN])
             .await
             .unwrap();
         op
     }
 
     #[tokio::test]
-    async fn corrupt_core_window_payload_rolls_back_all_state() {
-        let mut op = core_window_operator().await;
+    async fn malformed_hopping_restore_is_atomic() {
+        let mut config = test_window_config();
+        config.window_type = laminar_sql::translator::WindowType::Sliding;
+        config.size = Duration::from_secs(4);
+        config.slide = Some(Duration::from_secs(2));
+        let mut op = core_window_operator(config, vec![100, 2100]).await;
         let before = op.checkpoint().unwrap().unwrap();
         let mut corrupt = core_from_checkpoint(&before);
         corrupt.high_watermark_ms = 1234;
-        corrupt.windows[0].groups[0].key = vec![0xff, 0x00, 0x7f];
+        corrupt.windows.last_mut().unwrap().groups[0].key = vec![0xff, 0x00, 0x7f];
 
         let error = op.restore(checkpoint_from_core(&corrupt)).unwrap_err();
 
         assert!(error.to_string().contains("CoreWindow restore"));
+        assert!(error.requires_pipeline_recovery());
+        assert_eq!(op.checkpoint().unwrap().unwrap().data, before.data);
+    }
+
+    #[tokio::test]
+    async fn missing_session_accumulator_restore_is_atomic() {
+        let mut config = test_window_config();
+        config.window_type = laminar_sql::translator::WindowType::Session;
+        config.size = Duration::ZERO;
+        config.gap = Some(Duration::from_secs(3));
+        let mut op = core_window_operator(config, vec![100, 5000]).await;
+        let before = op.checkpoint().unwrap().unwrap();
+        let mut corrupt = core_from_checkpoint(&before);
+        corrupt.high_watermark_ms = 1234;
+        corrupt.session_state.last_mut().unwrap().sessions[0]
+            .acc_states
+            .clear();
+
+        let error = op.restore(checkpoint_from_core(&corrupt)).unwrap_err();
+
+        assert!(error.to_string().contains("accumulator states"));
         assert!(error.requires_pipeline_recovery());
         assert_eq!(op.checkpoint().unwrap().unwrap().data, before.data);
     }

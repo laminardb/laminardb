@@ -243,6 +243,14 @@ struct SessionGroupState {
 type FixedWindowGroups =
     FxHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>;
 type FixedWindows = BTreeMap<i64, FixedWindowGroups>;
+type SessionGroups = FxHashMap<arrow::row::OwnedRow, SessionGroupState>;
+
+struct PreparedCoreWindowRestore {
+    windows: FixedWindows,
+    session_groups: SessionGroups,
+    high_watermark_ms: i64,
+    restored_entries: usize,
+}
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct SessionCheckpoint {
@@ -270,7 +278,7 @@ pub(crate) struct CoreWindowCheckpoint {
 #[cfg(feature = "cluster")]
 pub(crate) struct PreparedCoreWindowTransition {
     windows: FixedWindows,
-    session_groups: FxHashMap<arrow::row::OwnedRow, SessionGroupState>,
+    session_groups: SessionGroups,
     high_watermark_ms: i64,
     scratch_nogroup: FxHashMap<i64, Vec<u32>>,
     scratch_grouped: FxHashMap<(i64, u32), Vec<u32>>,
@@ -1856,98 +1864,193 @@ impl CoreWindowState {
             )));
         }
 
-        self.high_watermark_ms = checkpoint.high_watermark_ms;
-        let restored = match checkpoint.window_type.as_str() {
-            "session" => self.restore_session_windows(checkpoint),
-            "tumbling" | "hopping" => self.restore_fixed_windows(checkpoint),
-            other => Err(DbError::Pipeline(format!(
-                "core window checkpoint has unknown window_type `{other}` — \
-                 refusing to silently route to the wrong restore path"
-            ))),
-        };
-        // Restore can fail after replacing part of the image. The whole-image caller rolls that
-        // back, but accounting must describe whichever live image exists between those calls.
-        self.refresh_managed_accounting();
-        restored
-    }
-
-    fn restore_fixed_windows(
-        &mut self,
-        checkpoint: &CoreWindowCheckpoint,
-    ) -> Result<usize, DbError> {
-        use crate::aggregate_state::ipc_to_scalars;
-
-        self.windows.clear();
-        let mut total_groups = 0usize;
-        for wc in &checkpoint.windows {
-            let mut groups = FxHashMap::default();
-            for gc in &wc.groups {
-                let sv_key = ipc_to_scalars(&gc.key)?;
-                let row_key = crate::aggregate_state::scalar_key_to_owned_row(
-                    &self.row_converter,
-                    &sv_key,
-                    &self.group_types,
-                )?;
-                let mut accs = Vec::with_capacity(self.agg_specs.len());
-                for (i, spec) in self.agg_specs.iter().enumerate() {
-                    let mut acc = spec.create_accumulator()?;
-                    if i < gc.acc_states.len() {
-                        let state_scalars = ipc_to_scalars(&gc.acc_states[i])?;
-                        let arrays: Vec<arrow::array::ArrayRef> = state_scalars
-                            .iter()
-                            .map(|sv| {
-                                sv.to_array()
-                                    .map_err(|e| DbError::Pipeline(format!("scalar to array: {e}")))
-                            })
-                            .collect::<Result<_, _>>()?;
-                        acc.merge_batch(&arrays)
-                            .map_err(|e| DbError::Pipeline(format!("accumulator merge: {e}")))?;
-                    }
-                    accs.push(acc);
-                }
-                groups.insert(row_key, accs);
-                total_groups += 1;
-            }
-            self.windows.insert(wc.window_start, groups);
+        let expected_type = self.window_type_tag();
+        if checkpoint.window_type != expected_type {
+            return Err(DbError::Checkpoint(format!(
+                "Core window checkpoint type mismatch: saved={}, current={expected_type}",
+                checkpoint.window_type
+            )));
         }
-        Ok(total_groups)
+
+        let mut prepared = match &self.assigner {
+            CoreWindowAssigner::Session { gap_ms } => {
+                self.prepare_session_window_restore(checkpoint, *gap_ms)?
+            }
+            CoreWindowAssigner::Tumbling(assigner) => self.prepare_fixed_window_restore(
+                checkpoint,
+                assigner.size_ms(),
+                assigner.size_ms(),
+                assigner.offset_ms(),
+            )?,
+            CoreWindowAssigner::Hopping(assigner) => self.prepare_fixed_window_restore(
+                checkpoint,
+                assigner.size_ms(),
+                assigner.slide_ms(),
+                assigner.offset_ms(),
+            )?,
+        };
+        let restored_entries = prepared.restored_entries;
+        std::mem::swap(&mut self.windows, &mut prepared.windows);
+        std::mem::swap(&mut self.session_groups, &mut prepared.session_groups);
+        self.scratch_nogroup.clear();
+        self.scratch_grouped.clear();
+        self.scratch_group_keys.clear();
+        self.high_watermark_ms = prepared.high_watermark_ms;
+        self.refresh_managed_accounting();
+        Ok(restored_entries)
     }
 
-    fn restore_session_windows(
-        &mut self,
+    fn prepare_fixed_window_restore(
+        &self,
         checkpoint: &CoreWindowCheckpoint,
-    ) -> Result<usize, DbError> {
-        use crate::aggregate_state::ipc_to_scalars;
+        size_ms: i64,
+        alignment_ms: i64,
+        offset_ms: i64,
+    ) -> Result<PreparedCoreWindowRestore, DbError> {
+        if !checkpoint.session_state.is_empty() {
+            return Err(DbError::Checkpoint(
+                "fixed-window checkpoint contains session state".into(),
+            ));
+        }
 
-        self.session_groups.clear();
+        let mut windows = BTreeMap::new();
+        let mut total_groups = 0usize;
+        let mut previous_start = None;
+        for wc in &checkpoint.windows {
+            if previous_start.is_some_and(|previous| previous >= wc.window_start) {
+                return Err(DbError::Checkpoint(
+                    "fixed-window checkpoint starts are not strictly increasing".into(),
+                ));
+            }
+            previous_start = Some(wc.window_start);
+            if (i128::from(wc.window_start) - i128::from(offset_ms))
+                .rem_euclid(i128::from(alignment_ms))
+                != 0
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "fixed-window checkpoint start {} is not aligned to the configured assigner",
+                    wc.window_start
+                )));
+            }
+            if checkpoint.high_watermark_ms != i64::MIN
+                && wc
+                    .window_start
+                    .saturating_add(size_ms)
+                    .saturating_add(self.allowed_lateness_ms)
+                    <= checkpoint.high_watermark_ms
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "fixed-window checkpoint retains already-closed window {}",
+                    wc.window_start
+                )));
+            }
+            if wc.groups.is_empty() {
+                return Err(DbError::Checkpoint(format!(
+                    "fixed-window checkpoint contains empty window {}",
+                    wc.window_start
+                )));
+            }
+            if wc.groups.len() > self.max_groups_per_window {
+                return Err(DbError::Checkpoint(format!(
+                    "fixed-window checkpoint window {} has {} groups; limit={}",
+                    wc.window_start,
+                    wc.groups.len(),
+                    self.max_groups_per_window
+                )));
+            }
+
+            let mut groups = FxHashMap::default();
+            groups.try_reserve(wc.groups.len()).map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "fixed-window checkpoint group reserve failed: {error}"
+                ))
+            })?;
+            for gc in &wc.groups {
+                if gc.last_updated_ms != i64::MIN {
+                    return Err(DbError::Checkpoint(format!(
+                        "fixed-window checkpoint window {} has non-canonical group metadata",
+                        wc.window_start
+                    )));
+                }
+                let row_key = self.decode_checkpoint_key(&gc.key)?;
+                let accs = self.decode_checkpoint_accumulators(&gc.acc_states, "fixed window")?;
+                if groups.insert(row_key, accs).is_some() {
+                    return Err(DbError::Checkpoint(format!(
+                        "fixed-window checkpoint window {} contains a duplicate group key",
+                        wc.window_start
+                    )));
+                }
+                total_groups = total_groups.checked_add(1).ok_or_else(|| {
+                    DbError::Checkpoint("fixed-window checkpoint group count overflow".into())
+                })?;
+            }
+            windows.insert(wc.window_start, groups);
+        }
+
+        Ok(PreparedCoreWindowRestore {
+            windows,
+            session_groups: FxHashMap::default(),
+            high_watermark_ms: checkpoint.high_watermark_ms,
+            restored_entries: total_groups,
+        })
+    }
+
+    fn prepare_session_window_restore(
+        &self,
+        checkpoint: &CoreWindowCheckpoint,
+        gap_ms: i64,
+    ) -> Result<PreparedCoreWindowRestore, DbError> {
+        if !checkpoint.windows.is_empty() {
+            return Err(DbError::Checkpoint(
+                "session checkpoint contains fixed-window state".into(),
+            ));
+        }
+        if checkpoint.session_state.len() > self.max_groups_per_window {
+            return Err(DbError::Checkpoint(format!(
+                "session checkpoint has {} groups; limit={}",
+                checkpoint.session_state.len(),
+                self.max_groups_per_window
+            )));
+        }
+
+        let mut session_groups = FxHashMap::default();
+        session_groups
+            .try_reserve(checkpoint.session_state.len())
+            .map_err(|error| {
+                DbError::Checkpoint(format!("session checkpoint group reserve failed: {error}"))
+            })?;
         let mut total_sessions = 0usize;
         for sgc in &checkpoint.session_state {
-            let sv_key = ipc_to_scalars(&sgc.key)?;
-            let row_key = crate::aggregate_state::scalar_key_to_owned_row(
-                &self.row_converter,
-                &sv_key,
-                &self.group_types,
-            )?;
+            if sgc.sessions.is_empty() {
+                return Err(DbError::Checkpoint(
+                    "session checkpoint contains an empty group".into(),
+                ));
+            }
+            let row_key = self.decode_checkpoint_key(&sgc.key)?;
             let mut sessions = BTreeMap::new();
+            let mut previous_end = None;
             for sc in &sgc.sessions {
-                let mut accs = Vec::with_capacity(self.agg_specs.len());
-                for (i, spec) in self.agg_specs.iter().enumerate() {
-                    let mut acc = spec.create_accumulator()?;
-                    if i < sc.acc_states.len() {
-                        let state_scalars = ipc_to_scalars(&sc.acc_states[i])?;
-                        let arrays: Vec<arrow::array::ArrayRef> = state_scalars
-                            .iter()
-                            .map(|sv| {
-                                sv.to_array()
-                                    .map_err(|e| DbError::Pipeline(format!("scalar to array: {e}")))
-                            })
-                            .collect::<Result<_, _>>()?;
-                        acc.merge_batch(&arrays).map_err(|e| {
-                            DbError::Pipeline(format!("session accumulator merge: {e}"))
-                        })?;
-                    }
-                    accs.push(acc);
+                if sc.end < sc.start.saturating_add(gap_ms) {
+                    return Err(DbError::Checkpoint(format!(
+                        "session checkpoint contains invalid interval [{}, {})",
+                        sc.start, sc.end
+                    )));
                 }
+                if previous_end.is_some_and(|end| end >= sc.start) {
+                    return Err(DbError::Checkpoint(
+                        "session checkpoint intervals are not strictly ordered and disjoint".into(),
+                    ));
+                }
+                if checkpoint.high_watermark_ms != i64::MIN
+                    && sc.end.saturating_add(self.allowed_lateness_ms)
+                        <= checkpoint.high_watermark_ms
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "session checkpoint retains already-closed interval [{}, {})",
+                        sc.start, sc.end
+                    )));
+                }
+                let accs = self.decode_checkpoint_accumulators(&sc.acc_states, "session window")?;
                 sessions.insert(
                     sc.start,
                     SessionAccState {
@@ -1956,12 +2059,131 @@ impl CoreWindowState {
                         accs,
                     },
                 );
-                total_sessions += 1;
+                previous_end = Some(sc.end);
+                total_sessions = total_sessions.checked_add(1).ok_or_else(|| {
+                    DbError::Checkpoint("session checkpoint interval count overflow".into())
+                })?;
             }
-            self.session_groups
-                .insert(row_key, SessionGroupState { sessions });
+            if session_groups
+                .insert(row_key, SessionGroupState { sessions })
+                .is_some()
+            {
+                return Err(DbError::Checkpoint(
+                    "session checkpoint contains a duplicate group key".into(),
+                ));
+            }
         }
-        Ok(total_sessions)
+
+        Ok(PreparedCoreWindowRestore {
+            windows: BTreeMap::new(),
+            session_groups,
+            high_watermark_ms: checkpoint.high_watermark_ms,
+            restored_entries: total_sessions,
+        })
+    }
+
+    fn decode_checkpoint_key(&self, bytes: &[u8]) -> Result<arrow::row::OwnedRow, DbError> {
+        use crate::aggregate_state::ipc_to_scalars;
+
+        if (self.num_group_cols == 0) != bytes.is_empty() {
+            return Err(DbError::Checkpoint(
+                "Core window checkpoint group key has a non-canonical encoding".into(),
+            ));
+        }
+        let scalars = ipc_to_scalars(bytes)
+            .map_err(|error| DbError::Checkpoint(format!("window group key decode: {error}")))?;
+        if scalars.len() != self.group_types.len() {
+            return Err(DbError::Checkpoint(format!(
+                "Core window checkpoint group key has {} columns; expected {}",
+                scalars.len(),
+                self.group_types.len()
+            )));
+        }
+        for (index, (scalar, expected)) in scalars.iter().zip(&self.group_types).enumerate() {
+            if scalar.data_type() != *expected {
+                return Err(DbError::Checkpoint(format!(
+                    "Core window checkpoint group key column {index} has type {}; expected {expected}",
+                    scalar.data_type()
+                )));
+            }
+        }
+        crate::aggregate_state::scalar_key_to_owned_row(
+            &self.row_converter,
+            &scalars,
+            &self.group_types,
+        )
+        .map_err(|error| DbError::Checkpoint(format!("window group key materialization: {error}")))
+    }
+
+    fn decode_checkpoint_accumulators(
+        &self,
+        states: &[Vec<u8>],
+        context: &str,
+    ) -> Result<Vec<Box<dyn datafusion_expr::Accumulator>>, DbError> {
+        use crate::aggregate_state::ipc_to_scalars;
+
+        if states.len() != self.agg_specs.len() {
+            return Err(DbError::Checkpoint(format!(
+                "{context} checkpoint contains {} accumulator states; expected {}",
+                states.len(),
+                self.agg_specs.len()
+            )));
+        }
+
+        let mut accumulators = Vec::new();
+        accumulators
+            .try_reserve_exact(self.agg_specs.len())
+            .map_err(|error| {
+                DbError::Checkpoint(format!("{context} accumulator reserve failed: {error}"))
+            })?;
+        for (spec, bytes) in self.agg_specs.iter().zip(states) {
+            if bytes.is_empty() {
+                return Err(DbError::Checkpoint(format!(
+                    "{context} checkpoint contains an empty accumulator state"
+                )));
+            }
+            let state_scalars = ipc_to_scalars(bytes).map_err(|error| {
+                DbError::Checkpoint(format!("{context} accumulator decode failed: {error}"))
+            })?;
+            if state_scalars.is_empty() {
+                return Err(DbError::Checkpoint(format!(
+                    "{context} checkpoint contains an empty accumulator tuple"
+                )));
+            }
+            let mut accumulator = spec.create_accumulator().map_err(|error| {
+                DbError::Checkpoint(format!("{context} accumulator creation failed: {error}"))
+            })?;
+            let expected_state = accumulator.state().map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "{context} accumulator schema inspection failed: {error}"
+                ))
+            })?;
+            if state_scalars.len() != expected_state.len()
+                || state_scalars
+                    .iter()
+                    .zip(&expected_state)
+                    .any(|(saved, expected)| saved.data_type() != expected.data_type())
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "{context} checkpoint accumulator schema does not match the query"
+                )));
+            }
+            let arrays = state_scalars
+                .iter()
+                .map(|scalar| {
+                    scalar.to_array().map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "{context} accumulator scalar materialization failed: {error}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            accumulator.merge_batch(&arrays).map_err(|error| {
+                DbError::Checkpoint(format!("{context} accumulator merge failed: {error}"))
+            })?;
+            accumulators.push(accumulator);
+        }
+        Ok(accumulators)
     }
 
     /// Validate the complete managed archive without allocating its owned checkpoint containers.
