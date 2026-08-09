@@ -205,7 +205,6 @@ impl EowcQueryOperator {
         op_name: &str,
         ctx: &SessionContext,
         task_ctx: &Arc<TaskContext>,
-        recovery_fenced: bool,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let now_filtered = cw.apply_dynamic_now_filter(ctx, inputs, watermark)?;
         let inputs: &[RecordBatch] = now_filtered.as_deref().unwrap_or(inputs);
@@ -238,21 +237,17 @@ impl EowcQueryOperator {
 
         for batch in &pre_agg_batches {
             if let Err(error) = cw.update_batch(batch) {
-                return Err(if recovery_fenced {
-                    Self::core_window_apply_error(op_name, "state update", error)
-                } else {
-                    error
-                });
+                return Err(Self::core_window_apply_error(
+                    op_name,
+                    "state update",
+                    error,
+                ));
             }
         }
 
-        let batches = cw.close_windows(watermark).map_err(|error| {
-            if recovery_fenced {
-                Self::core_window_apply_error(op_name, "window close", error)
-            } else {
-                error
-            }
-        })?;
+        let batches = cw
+            .close_windows(watermark)
+            .map_err(|error| Self::core_window_apply_error(op_name, "window close", error))?;
 
         Ok(batches)
     }
@@ -372,7 +367,7 @@ impl GraphOperator for EowcQueryOperator {
                 self.op_name
             ))
         })?;
-        let recovery_fenced =
+        let managed_state =
             self.capability.managed_state == Some(ManagedStateContract::CoreWindowV1);
         let prior_watermark = window.high_watermark_ms();
         let output = Self::process_core_window(
@@ -382,10 +377,9 @@ impl GraphOperator for EowcQueryOperator {
             &self.op_name,
             &self.ctx,
             &self.task_ctx,
-            recovery_fenced,
         )
         .await?;
-        if recovery_fenced
+        if managed_state
             && (input_batches.iter().any(|batch| batch.num_rows() != 0)
                 || window.high_watermark_ms() != prior_watermark)
         {

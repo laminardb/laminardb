@@ -127,6 +127,57 @@ enum CoreWindowAssigner {
     Session { gap_ms: i64 },
 }
 
+#[derive(Clone, Copy)]
+enum GroupOutputSource {
+    Key(usize),
+    WindowStart,
+    WindowEnd,
+}
+
+enum WindowBoundaryValues<'a> {
+    Fixed { start: i64, end: i64, rows: usize },
+    PerRow { starts: &'a [i64], ends: &'a [i64] },
+}
+
+fn window_group_source(
+    expr: &datafusion_expr::Expr,
+    assigner: &CoreWindowAssigner,
+) -> Result<Option<GroupOutputSource>, DbError> {
+    let expr = match expr {
+        datafusion_expr::Expr::Alias(alias) => alias.expr.as_ref(),
+        other => other,
+    };
+    let datafusion_expr::Expr::ScalarFunction(function) = expr else {
+        return Ok(None);
+    };
+    let name = function.func.name();
+    let source = match name {
+        "tumble" if matches!(assigner, CoreWindowAssigner::Tumbling(_)) => {
+            Some(GroupOutputSource::WindowStart)
+        }
+        "tumble_end" if matches!(assigner, CoreWindowAssigner::Tumbling(_)) => {
+            Some(GroupOutputSource::WindowEnd)
+        }
+        "hop" if matches!(assigner, CoreWindowAssigner::Hopping(_)) => {
+            Some(GroupOutputSource::WindowStart)
+        }
+        "hop_end" if matches!(assigner, CoreWindowAssigner::Hopping(_)) => {
+            Some(GroupOutputSource::WindowEnd)
+        }
+        "session" if matches!(assigner, CoreWindowAssigner::Session { .. }) => {
+            Some(GroupOutputSource::WindowStart)
+        }
+        "tumble" | "tumble_end" | "hop" | "hop_end" | "session" => {
+            return Err(DbError::Unsupported(format!(
+                "[{}] SQL window marker `{name}` does not match the configured window",
+                laminar_core::error_codes::SQL_UNSUPPORTED
+            )));
+        }
+        _ => None,
+    };
+    Ok(source)
+}
+
 /// Pre-compiled post-aggregate projection (e.g., `SUM(a)/SUM(b) AS ratio`).
 struct PostProjection {
     exprs: Vec<Arc<dyn PhysicalExpr>>,
@@ -248,6 +299,8 @@ pub(crate) struct CoreWindowState {
     pre_agg_sql: String,
     time_col_index: usize,
     output_schema: SchemaRef,
+    state_output_schema: SchemaRef,
+    group_output_sources: Vec<GroupOutputSource>,
     compiled_projection: Option<CompiledProjection>,
     // Built once; LiveSourceExec leaves carry fresh data per execute.
     cached_pre_agg_physical: Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
@@ -420,20 +473,56 @@ impl CoreWindowState {
             .as_ref()
             .is_some_and(expr_uses_wallclock);
 
-        let num_group_cols = group_exprs.len();
-
-        let mut group_col_names = Vec::new();
-        let mut group_types = Vec::new();
-        for i in 0..num_group_cols {
+        let logical_num_group_cols = group_exprs.len();
+        let mut group_output_sources = Vec::with_capacity(logical_num_group_cols);
+        let mut output_group_fields = Vec::with_capacity(logical_num_group_cols);
+        let mut state_group_fields = Vec::with_capacity(logical_num_group_cols);
+        let mut state_group_exprs = Vec::with_capacity(logical_num_group_cols);
+        let mut group_types = Vec::with_capacity(logical_num_group_cols);
+        let mut has_window_start = false;
+        let mut has_window_end = false;
+        for (i, group_expr) in group_exprs.iter().enumerate() {
             let name_field = if has_projection {
                 agg_schema.field(i)
             } else {
                 top_schema.field(i)
             };
             let agg_field = agg_schema.field(i);
-            group_col_names.push(name_field.name().clone());
-            group_types.push(agg_field.data_type().clone());
+            let output_field = Field::new(name_field.name(), agg_field.data_type().clone(), true);
+            if let Some(source) = window_group_source(group_expr, &assigner)? {
+                let duplicate = match source {
+                    GroupOutputSource::WindowStart => {
+                        std::mem::replace(&mut has_window_start, true)
+                    }
+                    GroupOutputSource::WindowEnd => std::mem::replace(&mut has_window_end, true),
+                    GroupOutputSource::Key(_) => false,
+                };
+                if duplicate {
+                    return Err(DbError::Unsupported(format!(
+                        "[{}] duplicate SQL window boundary in GROUP BY",
+                        laminar_core::error_codes::SQL_UNSUPPORTED
+                    )));
+                }
+                if !matches!(
+                    agg_field.data_type(),
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, _)
+                ) {
+                    return Err(DbError::Unsupported(format!(
+                        "[{}] SQL window markers must produce microsecond timestamps",
+                        laminar_core::error_codes::SQL_UNSUPPORTED
+                    )));
+                }
+                group_output_sources.push(source);
+            } else {
+                let key_index = state_group_exprs.len();
+                group_output_sources.push(GroupOutputSource::Key(key_index));
+                state_group_exprs.push(group_expr);
+                state_group_fields.push(output_field.clone());
+                group_types.push(agg_field.data_type().clone());
+            }
+            output_group_fields.push(output_field);
         }
+        let num_group_cols = state_group_exprs.len();
 
         let compile = |e: &datafusion_expr::Expr| {
             create_physical_expr(e, input_df_schema, compile_props).ok()
@@ -445,12 +534,12 @@ impl CoreWindowState {
             compile_source.is_some(),
         );
 
-        for (i, group_expr) in group_exprs.iter().enumerate() {
+        for (i, group_expr) in state_group_exprs.into_iter().enumerate() {
             builder.push_group_expr(i, group_expr, &compile);
         }
 
         for (i, expr) in aggr_exprs.iter().enumerate() {
-            let agg_schema_idx = num_group_cols + i;
+            let agg_schema_idx = logical_num_group_cols + i;
             let agg_field = agg_schema.field(agg_schema_idx);
             let output_name = if has_projection {
                 agg_field.name().clone()
@@ -556,18 +645,19 @@ impl CoreWindowState {
             None
         };
 
-        let mut output_fields: Vec<Field> = Vec::new();
-        for (name, dt) in group_col_names.iter().zip(group_types.iter()) {
-            output_fields.push(Field::new(name, dt.clone(), true));
-        }
+        let mut output_fields = output_group_fields;
+        let mut state_output_fields = state_group_fields;
         for spec in &agg_specs {
-            output_fields.push(Field::new(
-                &spec.output_name,
-                spec.return_type.clone(),
-                true,
-            ));
+            let field = Field::new(&spec.output_name, spec.return_type.clone(), true);
+            output_fields.push(field.clone());
+            state_output_fields.push(field);
         }
         let output_schema = Arc::new(Schema::new(output_fields));
+        let state_output_schema = if logical_num_group_cols == num_group_cols {
+            Arc::clone(&output_schema)
+        } else {
+            Arc::new(Schema::new(state_output_fields))
+        };
 
         let post_projection = if let Some((proj_exprs, agg_df_schema)) = projection_info {
             // NULLIF/CASE accept `(any, any)` and skip DataFusion's normal cast insertion.
@@ -638,6 +728,8 @@ impl CoreWindowState {
             #[cfg(test)]
             pre_agg_sql,
             output_schema,
+            state_output_schema,
+            group_output_sources,
             time_col_index,
             compiled_projection,
             cached_pre_agg_physical,
@@ -886,12 +978,10 @@ impl CoreWindowState {
                 if window_groups.contains_key(row_key) {
                     false
                 } else if window_groups.len() >= self.max_groups_per_window {
-                    tracing::warn!(
-                        max_groups = self.max_groups_per_window,
-                        window_start,
-                        "Core window per-window group cardinality limit reached"
-                    );
-                    continue;
+                    return Err(DbError::Pipeline(format!(
+                        "Core window {window_start} group cardinality limit {} reached",
+                        self.max_groups_per_window
+                    )));
                 } else {
                     true
                 }
@@ -942,16 +1032,6 @@ impl CoreWindowState {
             #[allow(clippy::cast_possible_truncation)]
             let index_array = arrow::array::UInt32Array::from_value(row as u32, 1);
             let key = self.extract_group_key_row(batch, &index_array)?;
-            // Drop new keys past the cap; existing keys still accumulate.
-            if !self.session_groups.contains_key(&key)
-                && self.session_groups.len() >= self.max_groups_per_window
-            {
-                tracing::warn!(
-                    max_groups = self.max_groups_per_window,
-                    "Core window session group cardinality limit reached"
-                );
-                continue;
-            }
             self.update_session_window(ts_ms, gap_ms, &key, batch, &index_array)?;
         }
         Ok(())
@@ -1009,6 +1089,29 @@ impl CoreWindowState {
                 .all(|(a, b)| a < b),
             "session window: overlapping keys must be unique and sorted"
         );
+        let candidate_end = self.session_groups.get(key).map_or(new_end, |group| {
+            overlapping.iter().fold(new_end, |end, session_start| {
+                end.max(
+                    group
+                        .sessions
+                        .get(session_start)
+                        .expect("overlapping session was read from this group")
+                        .end,
+                )
+            })
+        });
+        if self.is_session_end_closed(candidate_end) {
+            self.record_late_drop(1);
+            return Ok(());
+        }
+        if !self.session_groups.contains_key(key)
+            && self.session_groups.len() >= self.max_groups_per_window
+        {
+            return Err(DbError::Pipeline(format!(
+                "Core window session group cardinality limit {} reached",
+                self.max_groups_per_window
+            )));
+        }
 
         match overlapping.len() {
             0 => {
@@ -1194,6 +1297,12 @@ impl CoreWindowState {
             <= self.high_watermark_ms
     }
 
+    #[inline]
+    fn is_session_end_closed(&self, session_end_ms: i64) -> bool {
+        self.high_watermark_ms != i64::MIN
+            && session_end_ms.saturating_add(self.allowed_lateness_ms) <= self.high_watermark_ms
+    }
+
     pub(crate) const fn high_watermark_ms(&self) -> i64 {
         self.high_watermark_ms
     }
@@ -1253,7 +1362,7 @@ impl CoreWindowState {
             if groups.is_empty() {
                 continue;
             }
-            if let Some(b) = self.emit_window(groups)? {
+            if let Some(b) = self.emit_window(window_start, size_ms, groups)? {
                 result_batches.push(b);
             }
         }
@@ -1329,12 +1438,16 @@ impl CoreWindowState {
         let num_rows = rows.len();
 
         let mut row_keys: Vec<arrow::row::OwnedRow> = Vec::with_capacity(num_rows);
+        let mut window_starts = Vec::with_capacity(num_rows);
+        let mut window_ends = Vec::with_capacity(num_rows);
         let mut agg_scalars: Vec<Vec<ScalarValue>> = (0..self.agg_specs.len())
             .map(|_| Vec::with_capacity(num_rows))
             .collect();
 
-        for (_ws, _we, key, mut accs) in rows {
+        for (window_start, window_end, key, mut accs) in rows {
             row_keys.push(key);
+            window_starts.push(window_start);
+            window_ends.push(window_end);
             for (i, acc) in accs.iter_mut().enumerate() {
                 let sv = acc
                     .evaluate()
@@ -1343,26 +1456,21 @@ impl CoreWindowState {
             }
         }
 
-        let group_arrays: Vec<ArrayRef> = if self.num_group_cols > 0 {
+        let key_arrays: Vec<ArrayRef> = if self.num_group_cols > 0 {
             let row_refs: Vec<arrow::row::Row<'_>> = row_keys.iter().map(|r| r.row()).collect();
-            let cols = self
-                .row_converter
+            self.row_converter
                 .convert_rows(row_refs)
-                .map_err(|e| DbError::Pipeline(format!("session group key arrays: {e}")))?;
-            cols.into_iter()
-                .enumerate()
-                .map(|(col_idx, arr)| {
-                    let dt = &self.group_types[col_idx];
-                    if arr.data_type() == dt {
-                        arr
-                    } else {
-                        arrow::compute::cast(&arr, dt).unwrap_or(arr)
-                    }
-                })
-                .collect()
+                .map_err(|e| DbError::Pipeline(format!("session group key arrays: {e}")))?
         } else {
             Vec::new()
         };
+        let group_arrays = self.output_group_arrays(
+            &key_arrays,
+            &WindowBoundaryValues::PerRow {
+                starts: &window_starts,
+                ends: &window_ends,
+            },
+        )?;
 
         let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(self.agg_specs.len());
         for (agg_idx, scalars) in agg_scalars.into_iter().enumerate() {
@@ -1387,17 +1495,115 @@ impl CoreWindowState {
         Ok(vec![batch])
     }
 
+    fn output_group_arrays(
+        &self,
+        key_arrays: &[ArrayRef],
+        boundaries: &WindowBoundaryValues<'_>,
+    ) -> Result<Vec<ArrayRef>, DbError> {
+        if key_arrays.len() != self.num_group_cols {
+            return Err(DbError::Pipeline(format!(
+                "window output has {} key columns; expected {}",
+                key_arrays.len(),
+                self.num_group_cols
+            )));
+        }
+        if self.group_output_sources.len() == self.num_group_cols {
+            return Ok(key_arrays.to_vec());
+        }
+
+        if let WindowBoundaryValues::PerRow { starts, ends } = boundaries {
+            if starts.len() != ends.len() {
+                return Err(DbError::Pipeline(
+                    "window output boundary vectors have different lengths".into(),
+                ));
+            }
+        }
+
+        let mut output = Vec::with_capacity(self.group_output_sources.len());
+        for (output_index, source) in self.group_output_sources.iter().enumerate() {
+            match source {
+                GroupOutputSource::Key(key_index) => output.push(
+                    key_arrays
+                        .get(*key_index)
+                        .cloned()
+                        .ok_or_else(|| DbError::Pipeline("window key layout is invalid".into()))?,
+                ),
+                GroupOutputSource::WindowStart => {
+                    output.push(self.window_boundary_array(output_index, boundaries, true)?);
+                }
+                GroupOutputSource::WindowEnd => {
+                    output.push(self.window_boundary_array(output_index, boundaries, false)?);
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    fn window_boundary_array(
+        &self,
+        output_index: usize,
+        boundaries: &WindowBoundaryValues<'_>,
+        start: bool,
+    ) -> Result<ArrayRef, DbError> {
+        let DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, timezone) =
+            self.output_schema.field(output_index).data_type()
+        else {
+            return Err(DbError::Pipeline(
+                "window boundary output is not a microsecond timestamp".into(),
+            ));
+        };
+        let array = match boundaries {
+            WindowBoundaryValues::Fixed {
+                start: window_start,
+                end: window_end,
+                rows,
+            } => arrow::array::TimestampMicrosecondArray::from_value(
+                (if start { *window_start } else { *window_end }).saturating_mul(1000),
+                *rows,
+            ),
+            WindowBoundaryValues::PerRow { starts, ends } => {
+                let values = if start { *starts } else { *ends };
+                arrow::array::TimestampMicrosecondArray::from_iter_values(
+                    values.iter().map(|value| value.saturating_mul(1000)),
+                )
+            }
+        }
+        .with_timezone_opt(timezone.clone());
+        Ok(Arc::new(array))
+    }
+
     fn emit_window(
         &self,
+        window_start: i64,
+        window_size_ms: i64,
         groups: FxHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
     ) -> Result<Option<RecordBatch>, DbError> {
-        crate::aggregate_state::emit_window_batch(
+        let Some(batch) = crate::aggregate_state::emit_window_batch(
             groups,
             &self.row_converter,
             self.num_group_cols,
             &self.agg_specs,
-            &self.output_schema,
-        )
+            &self.state_output_schema,
+        )?
+        else {
+            return Ok(None);
+        };
+        if self.group_output_sources.len() == self.num_group_cols {
+            return Ok(Some(batch));
+        }
+
+        let mut columns = self.output_group_arrays(
+            &batch.columns()[..self.num_group_cols],
+            &WindowBoundaryValues::Fixed {
+                start: window_start,
+                end: window_start.saturating_add(window_size_ms),
+                rows: batch.num_rows(),
+            },
+        )?;
+        columns.extend_from_slice(&batch.columns()[self.num_group_cols..]);
+        RecordBatch::try_new(Arc::clone(&self.output_schema), columns)
+            .map(Some)
+            .map_err(|error| DbError::Pipeline(format!("window result batch: {error}")))
     }
 
     fn apply_post_projection(
@@ -1529,7 +1735,8 @@ impl CoreWindowState {
     }
 
     pub(crate) fn query_fingerprint(&self) -> u64 {
-        let mut config = Vec::with_capacity(25);
+        let mut config = Vec::with_capacity(26);
+        config.push(2);
         match &self.assigner {
             CoreWindowAssigner::Tumbling(t) => {
                 config.push(1);
@@ -2033,6 +2240,20 @@ mod tests {
         .unwrap()
     }
 
+    fn sql_window_context() -> (SessionContext, SchemaRef) {
+        let ctx = laminar_sql::create_session_context();
+        laminar_sql::register_streaming_functions(&ctx);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![]]).unwrap();
+        ctx.register_table("events", Arc::new(table)).unwrap();
+        (ctx, schema)
+    }
+
     fn sum_total(batch: &RecordBatch) -> i64 {
         batch
             .column_by_name("total")
@@ -2078,6 +2299,8 @@ mod tests {
             query_sql: String::new(),
             #[cfg(test)]
             pre_agg_sql: String::new(),
+            state_output_schema: Arc::clone(&output_schema),
+            group_output_sources: vec![GroupOutputSource::Key(0)],
             output_schema,
             time_col_index: 2,
             compiled_projection: None,
@@ -2145,6 +2368,8 @@ mod tests {
             query_sql: String::new(),
             #[cfg(test)]
             pre_agg_sql: String::new(),
+            state_output_schema: Arc::clone(&output_schema),
+            group_output_sources: vec![GroupOutputSource::Key(0)],
             output_schema,
             time_col_index: 2,
             compiled_projection: None,
@@ -2201,6 +2426,8 @@ mod tests {
             query_sql: String::new(),
             #[cfg(test)]
             pre_agg_sql: String::new(),
+            state_output_schema: Arc::clone(&output_schema),
+            group_output_sources: vec![GroupOutputSource::Key(0)],
             output_schema,
             time_col_index: 2,
             compiled_projection: None,
@@ -2255,6 +2482,8 @@ mod tests {
             query_sql: String::new(),
             #[cfg(test)]
             pre_agg_sql: String::new(),
+            state_output_schema: Arc::clone(&output_schema),
+            group_output_sources: vec![GroupOutputSource::Key(0)],
             output_schema,
             time_col_index: 2,
             compiled_projection: None,
@@ -2739,6 +2968,144 @@ mod tests {
         assert!(result.is_none(), "Session with gap=0 should return None");
     }
 
+    #[tokio::test]
+    async fn sql_hop_emits_each_assigned_boundary() {
+        use std::time::Duration;
+
+        let (ctx, schema) = sql_window_context();
+        let config = WindowOperatorConfig {
+            window_type: WindowType::Sliding,
+            time_column: "ts".to_string(),
+            size: Duration::from_secs(4),
+            slide: Some(Duration::from_secs(2)),
+            gap: None,
+            offset_ms: 0,
+            allowed_lateness: Duration::ZERO,
+            emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
+            late_data_side_output: None,
+        };
+        let sql = "SELECT HOP(ts, INTERVAL '2' SECOND, INTERVAL '4' SECOND) AS window_start, \
+                          HOP_END(ts, INTERVAL '2' SECOND, INTERVAL '4' SECOND) AS window_end, \
+                          SUM(amount) AS total \
+                   FROM events \
+                   GROUP BY HOP(ts, INTERVAL '2' SECOND, INTERVAL '4' SECOND), \
+                            HOP_END(ts, INTERVAL '2' SECOND, INTERVAL '4' SECOND)";
+        let mut state = CoreWindowState::try_from_sql(&ctx, sql, &config, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let input = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(Int64Array::from(vec![7])),
+                Arc::new(Int64Array::from(vec![3000])),
+            ],
+        )
+        .unwrap();
+        let projected = state
+            .compiled_projection()
+            .unwrap()
+            .evaluate(&input)
+            .unwrap();
+        state.update_batch(&projected).unwrap();
+
+        let mut actual = state
+            .close_windows(6000)
+            .unwrap()
+            .into_iter()
+            .map(|batch| {
+                let starts = batch
+                    .column_by_name("window_start")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+                    .unwrap();
+                let ends = batch
+                    .column_by_name("window_end")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+                    .unwrap();
+                let totals = batch
+                    .column_by_name("total")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                (starts.value(0), ends.value(0), totals.value(0))
+            })
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(actual, vec![(0, 4_000_000, 7), (2_000_000, 6_000_000, 7)]);
+    }
+
+    #[tokio::test]
+    async fn sql_session_marker_does_not_split_a_session_key() {
+        use std::time::Duration;
+
+        let (ctx, schema) = sql_window_context();
+        let config = WindowOperatorConfig {
+            window_type: WindowType::Session,
+            time_column: "ts".to_string(),
+            size: Duration::ZERO,
+            slide: None,
+            gap: Some(Duration::from_secs(3)),
+            offset_ms: 0,
+            allowed_lateness: Duration::ZERO,
+            emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
+            late_data_side_output: None,
+        };
+        let sql = "SELECT user_id, SESSION(ts, INTERVAL '3' SECOND) AS window_start, \
+                          SUM(amount) AS total \
+                   FROM events \
+                   GROUP BY user_id, SESSION(ts, INTERVAL '3' SECOND)";
+        let mut state = CoreWindowState::try_from_sql(&ctx, sql, &config, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let input = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["A", "A", "A"])),
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+                Arc::new(Int64Array::from(vec![1000, 5000, 3500])),
+            ],
+        )
+        .unwrap();
+        let projected = state
+            .compiled_projection()
+            .unwrap()
+            .evaluate(&input)
+            .unwrap();
+        state.update_batch(&projected).unwrap();
+
+        let batches = state.close_windows(8000).unwrap();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(
+            batch
+                .column_by_name("window_start")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+                .unwrap()
+                .value(0),
+            1_000_000
+        );
+        assert_eq!(
+            batch
+                .column_by_name("total")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            60
+        );
+    }
+
     #[test]
     fn test_hopping_basic_sum() {
         // 4s window, 2s slide → each event in 2 windows
@@ -2936,6 +3303,31 @@ mod tests {
     }
 
     #[test]
+    fn restored_watermark_prevents_closed_session_recreation() {
+        let mut state = make_session_core_window_state(3000);
+        state
+            .update_batch(&make_pre_agg_batch(vec!["A"], vec![20], vec![5000]))
+            .unwrap();
+        assert!(state.close_windows(5000).unwrap().is_empty());
+
+        state
+            .update_batch(&make_pre_agg_batch(vec!["A"], vec![10], vec![2000]))
+            .unwrap();
+        let emitted = state.close_windows(8000).unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(sum_total(&emitted[0]), 30);
+
+        let checkpoint = state.checkpoint_windows().unwrap();
+        let mut restored = make_session_core_window_state(3000);
+        restored.restore_windows(&checkpoint).unwrap();
+        restored
+            .update_batch(&make_pre_agg_batch(vec!["A"], vec![10], vec![2000]))
+            .unwrap();
+        assert!(restored.session_groups.is_empty());
+        assert!(restored.close_windows(10_000).unwrap().is_empty());
+    }
+
+    #[test]
     fn test_session_multi_group_independent() {
         let mut state = make_session_core_window_state(3000);
 
@@ -2974,7 +3366,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_group_cardinality_cap() {
+    fn test_session_group_cardinality_cap_fails_closed() {
         let mut state = make_session_core_window_state(3000);
         state.max_groups_per_window = 2;
 
@@ -2982,10 +3374,9 @@ mod tests {
         state.update_batch(&batch1).unwrap();
         assert_eq!(state.session_groups.len(), 2);
 
-        // C is new and should be dropped at the cap; A already exists and
-        // continues to aggregate.
         let batch2 = make_pre_agg_batch(vec!["C", "A"], vec![999, 20], vec![1500, 1500]);
-        state.update_batch(&batch2).unwrap();
+        let error = state.update_batch(&batch2).unwrap_err();
+        assert!(error.to_string().contains("cardinality limit"));
         assert_eq!(state.session_groups.len(), 2);
 
         let batches = state.close_windows(10_000).unwrap();
@@ -3005,7 +3396,7 @@ mod tests {
             .map(|i| (syms.value(i).to_string(), totals.value(i)))
             .collect();
         out.sort();
-        assert_eq!(out, vec![("A".to_string(), 30), ("B".to_string(), 100)]);
+        assert_eq!(out, vec![("A".to_string(), 10), ("B".to_string(), 100)]);
     }
 
     #[test]
