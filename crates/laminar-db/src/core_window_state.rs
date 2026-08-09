@@ -1997,6 +1997,15 @@ impl CoreWindowState {
         self.high_watermark_ms
     }
 
+    pub(crate) fn is_pristine_for_restore(&self) -> bool {
+        self.high_watermark_ms == i64::MIN
+            && self.required_frontier_floor_ms == i64::MIN
+            && self.active_vnodes.is_empty()
+            && self.vnode_states.iter().all(Option::is_none)
+            && self.checkpoint_dirty_vnode_roster.is_empty()
+            && self.checkpoint_dirty_vnodes.iter().all(|dirty| !dirty)
+    }
+
     /// Close and emit all windows whose end (plus lateness grace) <= watermark.
     pub fn close_windows(&mut self, watermark_ms: i64) -> Result<Vec<RecordBatch>, DbError> {
         if watermark_ms <= self.high_watermark_ms {
@@ -2475,6 +2484,10 @@ impl CoreWindowState {
 
     pub fn compiled_projection(&self) -> Option<&CompiledProjection> {
         self.compiled_projection.as_ref()
+    }
+
+    pub(crate) const fn num_group_cols(&self) -> usize {
+        self.num_group_cols
     }
 
     pub fn cached_pre_agg_physical(

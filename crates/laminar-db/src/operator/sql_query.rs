@@ -862,7 +862,7 @@ async fn shuffle_pre_agg_batches(
 }
 
 #[cfg(feature = "cluster")]
-fn hash_rows_to_vnodes(
+pub(crate) fn hash_rows_to_vnodes(
     batch: &RecordBatch,
     num_group_cols: usize,
     vnode_count: u32,
