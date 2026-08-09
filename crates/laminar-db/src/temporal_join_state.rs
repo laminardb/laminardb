@@ -4245,4 +4245,35 @@ mod tests {
             .unwrap();
         assert_eq!(prices(&drained.output), vec![Some(9)]);
     }
+
+    #[test]
+    fn deferred_checkpoint_preserves_history_removed_by_post_cut_gc() {
+        let mut cfg = config(TemporalJoinKind::Left, TemporalProbeSchedule::as_of());
+        cfg.history_retention_ms = 50;
+        let mut state =
+            TemporalJoinVnodeState::try_new(schema("left"), schema("right"), cfg.clone()).unwrap();
+        let right = batch(
+            schema("right"),
+            vec![Some("A"), Some("A"), Some("A")],
+            vec![Some(1), Some(2), Some(3)],
+            vec![Some(10), Some(20), Some(100)],
+            vec![1, 2, 3],
+        );
+        state.apply_right_batch(&right, None).unwrap();
+        let capture = state.capture_checkpoint(usize::MAX).unwrap();
+
+        state.advance_right_frontier(Some(200), false).unwrap();
+        state.advance_left_frontier(Some(200), false).unwrap();
+        let drained = state
+            .drain_history_gc(NonZeroUsize::new(16).unwrap())
+            .unwrap();
+        assert_eq!(drained.removed_versions, 2);
+        assert_eq!(state.retained_versions(), 1);
+
+        let checkpoint = capture.encode(4 * 1024 * 1024, None).unwrap();
+        let restored =
+            TemporalJoinVnodeState::restore(schema("left"), schema("right"), cfg, &checkpoint)
+                .unwrap();
+        assert_eq!(restored.retained_versions(), 3);
+    }
 }
