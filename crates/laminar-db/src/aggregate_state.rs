@@ -764,6 +764,7 @@ impl IncrementalAggState {
     }
 
     /// Reject an impossible final transition cardinality before decoding Arrow payloads.
+    #[cfg(feature = "cluster")]
     pub(crate) fn preflight_vnode_transition_cardinality(
         &self,
         vnode_count: u32,
@@ -1023,6 +1024,7 @@ pub(crate) struct RetiredAggVnodeTransition {
 }
 
 impl PreparedAggVnodeTransition {
+    #[cfg(feature = "cluster")]
     fn accounted_usage(&self) -> accounting::AggregateStateUsage {
         let usage = accounting::topology_element_usage::<Self>(1)
             .saturating_add(accounting::topology_element_usage::<(
@@ -1040,6 +1042,7 @@ impl PreparedAggVnodeTransition {
 
     /// Retained aggregate bytes owned off-side while a vnode transition is prepared.
     /// Saturated accounting reports `usize::MAX`; observability never faults the data plane.
+    #[cfg(feature = "cluster")]
     pub(crate) fn accounted_state_bytes(&self) -> usize {
         let usage = self.accounted_usage();
         if usage.is_saturated() {
@@ -1052,6 +1055,7 @@ impl PreparedAggVnodeTransition {
 
 impl RetiredAggVnodeTransition {
     /// Retained aggregate bytes displaced by publication and awaiting post-fence cleanup.
+    #[cfg(feature = "cluster")]
     pub(crate) fn accounted_state_bytes(&self) -> usize {
         self.retired_state.accounted_state_bytes()
     }
@@ -2686,7 +2690,7 @@ impl IncrementalAggState {
     /// Release state retired by [`Self::publish_prepared_vnode_transition`] after the graph leaves
     /// its publication fence.
     pub(crate) fn finish_vnode_transition(retired: RetiredAggVnodeTransition) {
-        drop(retired);
+        drop(retired.retired_state);
     }
 
     pub(crate) fn restore_vnode(

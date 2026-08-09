@@ -544,7 +544,7 @@ struct MockCallback {
     retained_results: Option<FxHashMap<Arc<str>, Vec<RecordBatch>>>,
     cycle_input_rows: Arc<Mutex<Vec<usize>>>,
     cycle_errors: Arc<AtomicU64>,
-    /// Whether a fatal cycle error should fault (exactly-once) vs drop-and-continue.
+    /// Whether a fatal cycle error requires recovery instead of a best-effort drop.
     fault_on_error: bool,
     /// Returned once by `take_pipeline_fault`.
     pipeline_fault: Option<String>,
@@ -7619,7 +7619,7 @@ async fn sink_publication_failure_does_not_advance_source_cursor() {
 }
 
 #[tokio::test]
-async fn fatal_cycle_error_continues_at_least_once() {
+async fn fatal_cycle_error_faults_at_least_once_before_publication() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let (tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
@@ -7634,7 +7634,9 @@ async fn fatal_cycle_error_continues_at_least_once() {
 
     let mut callback = MockCallback::new();
     callback.fatal_at_cycle = Some(1);
+    callback.fault_on_error = true;
     let errors = Arc::clone(&callback.cycle_errors);
+    let written_rows = Arc::clone(&callback.written_rows);
 
     tx.send(SourceMsg::Batch {
         source_idx: 0,
@@ -7644,24 +7646,23 @@ async fn fatal_cycle_error_continues_at_least_once() {
     .await
     .unwrap();
 
-    let shutdown_clone = Arc::clone(&shutdown);
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        shutdown_clone.notify_one();
-    });
-
     let exit = tokio::time::timeout(Duration::from_secs(5), coordinator.run(callback))
         .await
-        .expect("run() must return on shutdown");
+        .expect("run() must return after a fatal cycle error");
 
     assert!(
-        matches!(exit, ExitReason::Shutdown),
-        "at-least-once must not fault on a cycle error, got {exit:?}"
+        matches!(exit, ExitReason::Fault(_)),
+        "at-least-once must recover from a fatal cycle error, got {exit:?}"
     );
     assert_eq!(
         errors.load(Ordering::SeqCst),
-        1,
-        "at-least-once must drop-and-continue and count the error"
+        0,
+        "a recovery fault must not be counted as a best-effort drop"
+    );
+    assert_eq!(
+        written_rows.load(Ordering::SeqCst),
+        0,
+        "the failed cycle must not publish output or settle its cursor"
     );
     drop(tx);
 }

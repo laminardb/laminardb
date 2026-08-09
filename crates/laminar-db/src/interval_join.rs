@@ -1232,6 +1232,7 @@ impl IntervalJoinState {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "cluster"))]
     pub(crate) const fn buffered_rows(&self) -> (usize, usize) {
         (self.left.row_count, self.right.row_count)
     }

@@ -1006,7 +1006,9 @@ impl GraphOperator for SqlQueryOperator {
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
         #[cfg(not(feature = "cluster"))]
-        return Ok(None);
+        {
+            Ok(None)
+        }
 
         #[cfg(feature = "cluster")]
         {
@@ -1034,7 +1036,7 @@ impl GraphOperator for SqlQueryOperator {
         #[cfg(not(feature = "cluster"))]
         {
             let _ = max_capture_bytes;
-            return Ok(None);
+            Ok(None)
         }
 
         #[cfg(feature = "cluster")]

@@ -44,8 +44,10 @@ pub struct RecoveredState {
     /// Whether the active assignment is the committed assignment's direct successor.
     pub(crate) reassigned: bool,
     /// Committed owner of every vnode, in vnode order.
+    #[cfg(any(feature = "cluster", test))]
     pub(crate) predecessor_owners: Vec<NodeId>,
     /// Vnodes owned by this participant in the active assignment.
+    #[cfg(any(feature = "cluster", test))]
     pub(crate) target_vnodes: Vec<u32>,
 }
 
@@ -93,7 +95,9 @@ pub(crate) struct ClusterRecoveryTarget {
 struct RecoveryFrameSelection {
     plans: Vec<VerifiedStateFramePlan>,
     reassigned: bool,
+    #[cfg(any(feature = "cluster", test))]
     predecessor_owners: Vec<NodeId>,
+    #[cfg(any(feature = "cluster", test))]
     target_vnodes: Vec<u32>,
 }
 
@@ -267,7 +271,9 @@ impl<'a> RecoveryManager<'a> {
             manifests,
             state_frames,
             reassigned: selection.reassigned,
+            #[cfg(any(feature = "cluster", test))]
             predecessor_owners: selection.predecessor_owners,
+            #[cfg(any(feature = "cluster", test))]
             target_vnodes: selection.target_vnodes,
         })
     }
@@ -294,7 +300,9 @@ impl<'a> RecoveryManager<'a> {
                     &local_manifest.state_frames,
                 )?],
                 reassigned: false,
+                #[cfg(any(feature = "cluster", test))]
                 predecessor_owners: Vec::new(),
+                #[cfg(any(feature = "cluster", test))]
                 target_vnodes: Vec::new(),
             });
         };
@@ -350,7 +358,9 @@ impl<'a> RecoveryManager<'a> {
             return Ok(RecoveryFrameSelection {
                 plans,
                 reassigned: false,
+                #[cfg(any(feature = "cluster", test))]
                 predecessor_owners,
+                #[cfg(any(feature = "cluster", test))]
                 target_vnodes: target.owned_vnodes.clone(),
             });
         }
@@ -421,7 +431,9 @@ impl<'a> RecoveryManager<'a> {
         Ok(RecoveryFrameSelection {
             plans,
             reassigned: true,
+            #[cfg(any(feature = "cluster", test))]
             predecessor_owners,
+            #[cfg(any(feature = "cluster", test))]
             target_vnodes: target.owned_vnodes.clone(),
         })
     }
@@ -694,24 +706,12 @@ pub(crate) async fn load_verified_state_frames(
                     "state frames reference undeclared node object {chunk:?}"
                 ))
             })?;
-            let actual_len = store
-                .node_data_len(chunk)
-                .await
-                .map_err(|error| checkpoint_error(format!("node object {chunk:?}: {error}")))?
-                .ok_or_else(|| checkpoint_error(format!("node object {chunk:?} is missing")))?;
-            if actual_len != expected.object_length {
-                return Err(checkpoint_error(format!(
-                    "node object {chunk:?} length {actual_len} differs from declared length {}",
-                    expected.object_length
-                )));
-            }
-
             let ranges = requests
                 .iter()
                 .map(|request| request.range)
                 .collect::<Vec<_>>();
             let payloads = store
-                .load_node_data_ranges(chunk, &ranges)
+                .load_node_data_ranges(chunk, expected.object_length, &ranges)
                 .await
                 .map_err(|error| checkpoint_error(format!("node object {chunk:?}: {error}")))?
                 .ok_or_else(|| checkpoint_error(format!("node object {chunk:?} is missing")))?;

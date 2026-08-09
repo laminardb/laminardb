@@ -6077,9 +6077,11 @@ fn temporal_join_source_config(
     .into_iter()
     .map(|(name, topic, primary_key)| {
         let side = name.trim_start_matches("temporal_");
-        let primary_key = primary_key
-            .then_some("primary_key = [\"join_key\"]\n")
-            .unwrap_or_default();
+        let primary_key = if primary_key {
+            "primary_key = [\"join_key\"]\n"
+        } else {
+            ""
+        };
         format!(
             r#"
 [[source]]
@@ -10690,7 +10692,6 @@ fn timing_test_metrics(timing: &CheckpointBarrierTimingGeneration) -> Checkpoint
         aligned_resume_seconds: aligned * 0.005,
         aligned_resume_observations: aligned,
         aligned_resume_within_slo: timing.aligned_resume_within_slo as f64,
-        ..CheckpointLatencySnapshot::default()
     }
 }
 

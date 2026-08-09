@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::checkpoint::canonical_json_bytes;
 use crate::checkpoint::checkpoint_manifest::{
     checkpoint_descriptor_sha256, ByteRange, CheckpointManifest, NodeDataObject,
-    PreparedSinkDescriptor, StateChunkId, StateFrame,
+    PreparedSinkDescriptor, StateChunkId,
 };
 use crate::state::{KeyGroupCount, DEFAULT_KEY_GROUP_COUNT, LOCAL_NODE_ID};
 
@@ -115,16 +115,13 @@ pub trait CheckpointStore: Send + Sync {
         expected_sha256: &str,
     ) -> Result<Option<CheckpointManifest>, CheckpointStoreError>;
 
-    /// Read exact ranges from a known immutable object.
+    /// Read exact ranges after verifying the immutable object's declared length.
     async fn load_node_data_ranges(
         &self,
         chunk: StateChunkId,
+        expected_object_length: u64,
         ranges: &[ByteRange],
     ) -> Result<Option<Vec<Bytes>>, CheckpointStoreError>;
-
-    /// Read immutable object length without downloading its body.
-    async fn node_data_len(&self, chunk: StateChunkId)
-        -> Result<Option<u64>, CheckpointStoreError>;
 
     /// Delete an explicitly identified manifest. GC must supply the identity from durable
     /// checkpoint metadata, never from object listing.
@@ -132,40 +129,6 @@ pub trait CheckpointStore: Send + Sync {
 
     /// Delete an explicitly identified node object after its durable reference count reaches zero.
     async fn delete_node_data(&self, chunk: StateChunkId) -> Result<(), CheckpointStoreError>;
-
-    /// Read one exact range.
-    async fn load_node_data_range(
-        &self,
-        chunk: StateChunkId,
-        range: ByteRange,
-    ) -> Result<Option<Bytes>, CheckpointStoreError> {
-        let Some(mut values) = self.load_node_data_ranges(chunk, &[range]).await? else {
-            return Ok(None);
-        };
-        if values.len() != 1 {
-            return Err(CheckpointStoreError::Invalid(format!(
-                "one range produced {} payloads",
-                values.len()
-            )));
-        }
-        Ok(values.pop())
-    }
-
-    /// Read and verify one state frame without loading unrelated vnodes.
-    async fn load_state_frame(&self, frame: &StateFrame) -> Result<Bytes, CheckpointStoreError> {
-        let bytes = self
-            .load_node_data_range(frame.chunk, frame.range)
-            .await?
-            .ok_or_else(|| missing_node_data(frame.chunk))?;
-        let actual = sha256(&bytes);
-        if actual != frame.sha256 {
-            return Err(CheckpointStoreError::Invalid(format!(
-                "state frame {:?} checksum mismatch: expected {}, got {actual}",
-                frame.key, frame.sha256
-            )));
-        }
-        Ok(bytes)
-    }
 
     /// Read and verify one prepared sink descriptor.
     async fn load_prepared_sink_descriptor(
@@ -183,10 +146,23 @@ pub trait CheckpointStore: Send + Sync {
             }
             return Ok(None);
         };
-        let bytes = self
-            .load_node_data_range(manifest.node_data.chunk, range)
+        let mut payloads = self
+            .load_node_data_ranges(
+                manifest.node_data.chunk,
+                manifest.node_data.object_length,
+                &[range],
+            )
             .await?
             .ok_or_else(|| missing_node_data(manifest.node_data.chunk))?;
+        if payloads.len() != 1 {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "one descriptor range produced {} payloads",
+                payloads.len()
+            )));
+        }
+        let bytes = payloads
+            .pop()
+            .expect("one descriptor payload was validated");
         let actual = checkpoint_descriptor_sha256(Some(&bytes));
         if actual != descriptor.sha256 {
             return Err(CheckpointStoreError::Invalid(format!(
@@ -386,6 +362,85 @@ impl ObjectStoreCheckpointStore {
             Err(error) => Err(error.into()),
         }
     }
+
+    async fn load_node_data_ranges_inner(
+        &self,
+        chunk: StateChunkId,
+        expected_object_length: u64,
+        ranges: &[ByteRange],
+    ) -> Result<Option<Vec<Bytes>>, CheckpointStoreError> {
+        let path = self.node_data_path(chunk);
+        let meta = match self.store.head(&path).await {
+            Ok(meta) => meta,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if meta.size > self.max_node_data_bytes {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "node data object is {} bytes, exceeding the {}-byte limit",
+                meta.size, self.max_node_data_bytes
+            )));
+        }
+        if meta.size != expected_object_length {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "node data object is {} bytes, expected {expected_object_length}",
+                meta.size
+            )));
+        }
+
+        let mut nonempty = Vec::new();
+        for range in ranges {
+            let Some(end) = range.end() else {
+                return Err(CheckpointStoreError::Invalid(
+                    "node data range overflows".into(),
+                ));
+            };
+            if end > meta.size {
+                return Err(CheckpointStoreError::Invalid(format!(
+                    "node data range {}..{end} exceeds {} bytes",
+                    range.offset, meta.size
+                )));
+            }
+            if range.length != 0 {
+                nonempty.push(range.offset..end);
+            }
+        }
+        let loaded = if nonempty.is_empty() {
+            Vec::new()
+        } else {
+            object_store::coalesce_ranges(
+                &nonempty,
+                |range| self.store.get_range(&path, range),
+                0, // non-adjacent reads must not pin unaccounted gap bytes
+            )
+            .await?
+        };
+        let mut loaded = loaded.into_iter();
+        let mut result = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            if range.length == 0 {
+                result.push(Bytes::new());
+            } else {
+                let bytes = loaded.next().ok_or_else(|| {
+                    CheckpointStoreError::Invalid(
+                        "object store returned too few range payloads".into(),
+                    )
+                })?;
+                if u64::try_from(bytes.len()).ok() != Some(range.length) {
+                    return Err(CheckpointStoreError::Invalid(
+                        "object store returned a range with the wrong length".into(),
+                    ));
+                }
+                result.push(bytes);
+            }
+        }
+        if loaded.next().is_some() {
+            return Err(CheckpointStoreError::Invalid(
+                "object store returned too many range payloads".into(),
+            ));
+        }
+        Ok(Some(result))
+    }
 }
 
 #[async_trait]
@@ -511,85 +566,11 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
     async fn load_node_data_ranges(
         &self,
         chunk: StateChunkId,
+        expected_object_length: u64,
         ranges: &[ByteRange],
     ) -> Result<Option<Vec<Bytes>>, CheckpointStoreError> {
-        let path = self.node_data_path(chunk);
-        let meta = match self.store.head(&path).await {
-            Ok(meta) => meta,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        if meta.size > self.max_node_data_bytes {
-            return Err(CheckpointStoreError::Invalid(format!(
-                "node data object is {} bytes, exceeding the {}-byte limit",
-                meta.size, self.max_node_data_bytes
-            )));
-        }
-
-        let mut nonempty = Vec::new();
-        for range in ranges {
-            let Some(end) = range.end() else {
-                return Err(CheckpointStoreError::Invalid(
-                    "node data range overflows".into(),
-                ));
-            };
-            if end > meta.size {
-                return Err(CheckpointStoreError::Invalid(format!(
-                    "node data range {}..{end} exceeds {} bytes",
-                    range.offset, meta.size
-                )));
-            }
-            if range.length != 0 {
-                nonempty.push(range.offset..end);
-            }
-        }
-        let loaded = if nonempty.is_empty() {
-            Vec::new()
-        } else {
-            object_store::coalesce_ranges(&nonempty, |range| self.store.get_range(&path, range), 0)
-                .await?
-        };
-        let mut loaded = loaded.into_iter();
-        let mut result = Vec::with_capacity(ranges.len());
-        for range in ranges {
-            if range.length == 0 {
-                result.push(Bytes::new());
-            } else {
-                let bytes = loaded.next().ok_or_else(|| {
-                    CheckpointStoreError::Invalid(
-                        "object store returned too few range payloads".into(),
-                    )
-                })?;
-                if u64::try_from(bytes.len()).ok() != Some(range.length) {
-                    return Err(CheckpointStoreError::Invalid(
-                        "object store returned a range with the wrong length".into(),
-                    ));
-                }
-                result.push(bytes);
-            }
-        }
-        if loaded.next().is_some() {
-            return Err(CheckpointStoreError::Invalid(
-                "object store returned too many range payloads".into(),
-            ));
-        }
-        Ok(Some(result))
-    }
-
-    async fn node_data_len(
-        &self,
-        chunk: StateChunkId,
-    ) -> Result<Option<u64>, CheckpointStoreError> {
-        let path = self.node_data_path(chunk);
-        match self.store.head(&path).await {
-            Ok(meta) if meta.size <= self.max_node_data_bytes => Ok(Some(meta.size)),
-            Ok(meta) => Err(CheckpointStoreError::Invalid(format!(
-                "node data object is {} bytes, exceeding the {}-byte limit",
-                meta.size, self.max_node_data_bytes
-            ))),
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+        self.load_node_data_ranges_inner(chunk, expected_object_length, ranges)
+            .await
     }
 
     async fn delete_manifest(&self, chunk: StateChunkId) -> Result<(), CheckpointStoreError> {

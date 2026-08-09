@@ -5303,14 +5303,15 @@ impl StreamingCoordinator {
                 }
                 match callback.execute_cycle(&self.source_batches_buf, wm).await {
                     Ok(out) => {
-                        // Exactly-once / coordinated recovery rewinds the whole pipeline, so
-                        // don't partial-commit siblings — recover instead.
+                        // Durable delivery rewinds the whole pipeline, so don't partial-commit
+                        // siblings — recover instead.
                         if out.any_failed && callback.fault_on_cycle_error() {
                             self.discard_pending_offsets();
                             tracing::error!(
                                 "[LDB-3021] failure domain faulted; faulting for recovery"
                             );
-                            state.fault = Some("isolated domain fault (exactly-once)".to_string());
+                            state.fault =
+                                Some("isolated domain fault (durable delivery)".to_string());
                             break;
                         }
                         if let Err(error) = self.publish_cycle_outputs(&mut callback, &out).await {
@@ -5345,8 +5346,8 @@ impl StreamingCoordinator {
                                 tracing::warn!(reason = %msg, "[LDB-3022] cycle halted");
                                 break;
                             }
-                            // Continuing would drop the drained rows (EO gap), so fault for
-                            // recovery under exactly-once or coordinated recovery.
+                            // Continuing would drop drained rows, so durable delivery faults for
+                            // recovery.
                             CycleError::Fatal(msg) if callback.fault_on_cycle_error() => {
                                 tracing::error!(
                                     error = %msg,

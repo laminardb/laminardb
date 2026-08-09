@@ -5004,17 +5004,29 @@ impl LaminarDB {
             checkpoint_timeout,
             checkpoint_cleanup_timeout,
             max_node_data_bytes,
+            full_vnode_capture_needed,
         ) = {
             let coordinator = self.coordinator.lock().await;
             match coordinator.as_ref() {
                 Some(coordinator) => {
                     let checkpoint = coordinator.config();
+                    let full_vnode_capture_needed = coordinator
+                        .last_committed_manifest()
+                        .is_some_and(|manifest| {
+                            coordinator.committed_manifest_needs_vnode_rebase(
+                                laminar_core::checkpoint::CheckpointAttempt::new(
+                                    manifest.epoch,
+                                    manifest.checkpoint_id,
+                                ),
+                            )
+                        });
                     (
                         Some(coordinator.epoch_allocator()),
                         checkpoint.quorum_timeout,
                         checkpoint.checkpoint_timeout,
                         checkpoint.cleanup_timeout,
                         checkpoint.max_node_data_bytes,
+                        full_vnode_capture_needed,
                     )
                 }
                 None => (
@@ -5023,6 +5035,7 @@ impl LaminarDB {
                     std::time::Duration::from_secs(120),
                     crate::checkpoint_coordinator::CheckpointConfig::default().cleanup_timeout,
                     u64::MAX,
+                    false,
                 ),
             }
         };
@@ -5111,7 +5124,9 @@ impl LaminarDB {
             checkpoint_tail_runtime: self.control_runtime.handle()?,
             checkpoint_tail_tasks: tokio::task::JoinSet::new(),
             checkpoint_in_flight: Arc::clone(&checkpoint_in_flight),
-            full_vnode_capture_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            full_vnode_capture_needed: Arc::new(std::sync::atomic::AtomicBool::new(
+                full_vnode_capture_needed,
+            )),
             epoch_allocator,
             #[cfg(feature = "cluster")]
             quorum_timeout,

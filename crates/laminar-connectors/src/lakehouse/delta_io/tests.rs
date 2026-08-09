@@ -1122,7 +1122,7 @@ async fn coordinated_batch_filters_overlap_only_after_refreshing_stale_handle() 
         target: first_attempt,
         entries: vec![CoordinatedCommitPayload {
             attempt: first_attempt,
-            participant_id: 0,
+            participant_id: 1,
             payload: Some(first_descriptor.clone()),
         }],
     };
@@ -1148,12 +1148,12 @@ async fn coordinated_batch_filters_overlap_only_after_refreshing_stale_handle() 
         entries: vec![
             CoordinatedCommitPayload {
                 attempt: first_attempt,
-                participant_id: 0,
+                participant_id: 1,
                 payload: Some(first_descriptor),
             },
             CoordinatedCommitPayload {
                 attempt: second_attempt,
-                participant_id: 0,
+                participant_id: 1,
                 payload: Some(second_descriptor),
             },
         ],
@@ -1266,7 +1266,7 @@ async fn coordinated_late_exact_commit_and_higher_batch_cannot_both_win() {
         target: second,
         entries: vec![CoordinatedCommitPayload {
             attempt: second,
-            participant_id: 0,
+            participant_id: 1,
             payload: Some(pending_descriptor.clone()),
         }],
     };
@@ -1281,12 +1281,12 @@ async fn coordinated_late_exact_commit_and_higher_batch_cannot_both_win() {
         entries: vec![
             CoordinatedCommitPayload {
                 attempt: second,
-                participant_id: 0,
+                participant_id: 1,
                 payload: Some(pending_descriptor),
             },
             CoordinatedCommitPayload {
                 attempt: third,
-                participant_id: 0,
+                participant_id: 1,
                 payload: Some(higher_descriptor),
             },
         ],
@@ -1365,7 +1365,7 @@ async fn coordinated_empty_batch_commits_cursor_without_object_io() {
         target,
         entries: vec![CoordinatedCommitPayload {
             attempt: target,
-            participant_id: 0,
+            participant_id: 1,
             payload: None,
         }],
     };

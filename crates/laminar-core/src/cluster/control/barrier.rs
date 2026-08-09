@@ -1756,13 +1756,16 @@ enum PeerFailure {
     Nack(String),
 }
 
+#[cfg(feature = "cluster")]
+type PrepareTaskResult = Result<(NodeId, CheckpointWatermark, bool), (NodeId, PeerFailure)>;
+
 /// Exact announcement and participant roster bound to one eager Prepare round.
 #[cfg(feature = "cluster")]
 struct PrepareFanoutBatch {
     announcement: BarrierAnnouncement,
     expected: Vec<NodeId>,
     // `JoinSet` aborts all remaining tasks when the batch or quorum future is dropped.
-    tasks: tokio::task::JoinSet<Result<(NodeId, CheckpointWatermark, bool), (NodeId, PeerFailure)>>,
+    tasks: tokio::task::JoinSet<PrepareTaskResult>,
 }
 
 #[cfg(feature = "cluster")]
@@ -2089,7 +2092,7 @@ fn validate_prepare_ack(
     peer: NodeId,
     prepare: &BarrierAnnouncement,
     assignment_digest: Option<&[u8; 32]>,
-    ack: barrier_v1::Ack,
+    ack: &barrier_v1::Ack,
 ) -> Result<(NodeId, CheckpointWatermark, bool), (NodeId, PeerFailure)> {
     if ack.epoch != prepare.epoch
         || ack.checkpoint_id != prepare.checkpoint_id
@@ -2222,7 +2225,7 @@ async fn prepare_peer_until_deadline(
                     peer,
                     &prepare,
                     assignment_digest.as_ref(),
-                    response.into_inner(),
+                    &response.into_inner(),
                 );
             }
             Ok(Err(status)) => {
@@ -2933,14 +2936,10 @@ impl BarrierCoordinator {
                     drop(publication);
                 } else {
                     drop(publication);
-                    let expected = if let Some(roster) = phase_roster {
-                        // The checkpoint certificate, not mutable membership, is the phase roster.
-                        // This also removes a discovery/object-store scan from the clustered hot
-                        // path and excludes Active processes outside the frozen cut.
-                        roster
-                    } else {
-                        Vec::new()
-                    };
+                    // The checkpoint certificate, not mutable membership, is the phase roster.
+                    // This also removes a discovery/object-store scan from the clustered hot
+                    // path and excludes Active processes outside the frozen cut.
+                    let expected = phase_roster.unwrap_or_default();
 
                     let results = send_phase_notifications(&state, &self.kv, ann, expected).await;
                     for res in results {

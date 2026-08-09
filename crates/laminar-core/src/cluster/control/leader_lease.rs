@@ -5251,6 +5251,10 @@ impl LeaderLeaseStore {
     }
 
     /// Store one immutable committed-checkpoint index before publishing its Commit outcome.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the durable authority cannot create the immutable index.
     pub async fn create_committed_checkpoint(
         &self,
         index: &CommittedCheckpointIndex,
@@ -5262,6 +5266,10 @@ impl LeaderLeaseStore {
     }
 
     /// Load one exact content-addressed committed-checkpoint index.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the durable authority cannot load or validate the index.
     pub async fn load_committed_checkpoint(
         &self,
         reference: &CommittedCheckpointRef,

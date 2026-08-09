@@ -5,6 +5,7 @@ use crate::checkpoint::checkpoint_manifest::{
     checkpoint_sha256, PreparedSinkDescriptor, ReferencedStateChunk, StateFrameKey,
     PREPARED_SINK_DESCRIPTOR_VERSION,
 };
+use crate::checkpoint::StateFrame;
 
 fn manifest_with_payload(payload: &[u8]) -> CheckpointManifest {
     let one = KeyGroupCount::try_from(1_u16).unwrap();
@@ -60,11 +61,25 @@ async fn one_node_object_supports_verified_range_reads() {
     );
     assert_eq!(
         store
-            .load_state_frame(&manifest.state_frames[0])
+            .load_node_data_ranges(
+                manifest.node_data.chunk,
+                manifest.node_data.object_length,
+                &[manifest.state_frames[0].range],
+            )
             .await
             .unwrap(),
-        Bytes::from_static(b"bc")
+        Some(vec![Bytes::from_static(b"bc")])
     );
+    assert!(matches!(
+        store
+            .load_node_data_ranges(
+                manifest.node_data.chunk,
+                manifest.node_data.object_length + 1,
+                &[manifest.state_frames[0].range],
+            )
+            .await,
+        Err(CheckpointStoreError::Invalid(message)) if message.contains("expected 6")
+    ));
     assert_eq!(
         store
             .load_prepared_sink_descriptor(&manifest, &manifest.prepared_sinks[0])
@@ -193,10 +208,14 @@ async fn prior_chunk_ranges_use_explicit_identity_without_listing() {
 
     assert_eq!(
         store
-            .load_state_frame(&current.state_frames[0])
+            .load_node_data_ranges(
+                current.state_frames[0].chunk,
+                prior.node_data.object_length,
+                &[current.state_frames[0].range],
+            )
             .await
             .unwrap(),
-        Bytes::from_static(b"ld")
+        Some(vec![Bytes::from_static(b"ld")])
     );
 }
 

@@ -86,6 +86,7 @@ pub(crate) struct AggStateArchiveRestoreProfile {
 /// A checked archive retained in borrowed form until the complete roster passes.
 pub(crate) struct PreflightedAggStateArchive<'a> {
     archived: &'a ArchivedAggStateCheckpoint,
+    #[cfg(feature = "cluster")]
     group_count: usize,
 }
 
@@ -201,12 +202,14 @@ impl AggStateArchiveRestoreProfile {
 
         Ok(PreflightedAggStateArchive {
             archived,
+            #[cfg(feature = "cluster")]
             group_count,
         })
     }
 }
 
 impl PreflightedAggStateArchive<'_> {
+    #[cfg(feature = "cluster")]
     pub(crate) const fn group_count(&self) -> usize {
         self.group_count
     }

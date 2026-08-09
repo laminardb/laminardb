@@ -159,7 +159,8 @@ struct LeaderTail {
     checkpoint_timeout: Duration,
     serialization_timeout: Duration,
     checkpoint_cleanup_timeout: Duration,
-    fault_on_failure: bool,
+    fault_on_retryable_failure: bool,
+    fault_on_unclassified_error: bool,
     checkpoint_fault: Arc<parking_lot::Mutex<Option<String>>>,
     #[cfg(feature = "cluster")]
     controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
@@ -176,6 +177,34 @@ fn checkpoint_failure_requires_pipeline_fault(
     fault_on_retryable_failure: bool,
 ) -> bool {
     result.requires_recovery() || fault_on_retryable_failure
+}
+
+fn validate_durable_source_checkpoint_roster(
+    expected: &[String],
+    checkpoints: &FxHashMap<String, SourceCheckpoint>,
+) -> Result<(), String> {
+    if expected.len() == checkpoints.len()
+        && expected
+            .iter()
+            .all(|source| checkpoints.contains_key(source))
+    {
+        return Ok(());
+    }
+
+    let missing = expected
+        .iter()
+        .filter(|source| !checkpoints.contains_key(*source))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut unexpected = checkpoints
+        .keys()
+        .filter(|source| !expected.iter().any(|expected| expected == *source))
+        .cloned()
+        .collect::<Vec<_>>();
+    unexpected.sort_unstable();
+    Err(format!(
+        "durable checkpoint source roster mismatch: missing {missing:?}, unexpected {unexpected:?}"
+    ))
 }
 
 /// Captured follower state and the runtime handles that own its decision-led durable tail.
@@ -419,7 +448,7 @@ async fn fail_reserved_leader_attempt(
     cleanup_reason: String,
 ) {
     let attempt = tail.attempt;
-    if tail.fault_on_failure {
+    if tail.fault_on_retryable_failure {
         set_checkpoint_fault(&tail.checkpoint_fault, terminal_error.clone());
     }
     tail.full_vnode_capture_needed
@@ -1566,6 +1595,12 @@ impl ConnectorPipelineCallback {
                 tail.attempt_started,
             )
             .await;
+        if result.as_ref().is_ok_and(|result| result.success)
+            && coordinator.committed_manifest_needs_vnode_rebase(attempt)
+        {
+            tail.full_vnode_capture_needed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         // Completion delivery may wait on a bounded channel; it must not hold
         // the FIFO checkpoint coordinator lock while doing so.
         drop(guard);
@@ -1598,7 +1633,10 @@ impl ConnectorPipelineCallback {
                         .as_deref()
                         .unwrap_or("unknown checkpoint failure")
                 );
-                if checkpoint_failure_requires_pipeline_fault(&result, tail.fault_on_failure) {
+                if checkpoint_failure_requires_pipeline_fault(
+                    &result,
+                    tail.fault_on_retryable_failure,
+                ) {
                     set_checkpoint_fault(&tail.checkpoint_fault, terminal_error.clone());
                 }
                 deliver_checkpoint_failure(
@@ -1614,7 +1652,7 @@ impl ConnectorPipelineCallback {
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 tracing::warn!(%error, "Barrier-aligned checkpoint error");
                 let terminal_error = error.to_string();
-                if tail.fault_on_failure {
+                if tail.fault_on_unclassified_error {
                     set_checkpoint_fault(&tail.checkpoint_fault, terminal_error.clone());
                 }
                 deliver_checkpoint_failure(
@@ -1928,6 +1966,7 @@ impl ConnectorPipelineCallback {
         let attempt = tail.attempt;
         let assignment_fence = tail.assignment_fence.clone();
         let coordinator = Arc::clone(&tail.coordinator);
+        let full_vnode_capture_needed = Arc::clone(&tail.full_vnode_capture_needed);
         let attempt_started = tail.attempt_started;
         let checkpoint_cleanup_timeout = tail.checkpoint_cleanup_timeout;
         let decision_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1950,7 +1989,7 @@ impl ConnectorPipelineCallback {
                         .into(),
                 )
             })?;
-            coordinator
+            let committed = coordinator
                 .follower_finish(
                     attempt.epoch,
                     attempt.checkpoint_id,
@@ -1958,6 +1997,9 @@ impl ConnectorPipelineCallback {
                     attempt_started,
                 )
                 .await?;
+            if committed && coordinator.committed_manifest_needs_vnode_rebase(attempt) {
+                full_vnode_capture_needed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             Ok(committed)
         })
         .await
@@ -2883,6 +2925,15 @@ impl ConnectorPipelineCallback {
             FollowerPrepareAdmission::CaptureNow(announcement) => announcement,
         };
         let attempt = CheckpointAttempt::new(ann.epoch, ann.checkpoint_id);
+        if self.delivery_guarantee != laminar_connectors::connector::DeliveryGuarantee::BestEffort {
+            if let Err(error) = validate_durable_source_checkpoint_roster(
+                &self.checkpoint_source_names,
+                &source_offsets,
+            ) {
+                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+                return self.fail_pending_follower_control(attempt, error).await;
+            }
+        }
         if let Err(error) = self.require_process_authority("follower checkpoint capture") {
             return self
                 .fail_pending_follower_control(attempt, error.to_string())
@@ -5507,6 +5558,17 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     ) -> crate::pipeline::BarrierOutcome {
         use crate::pipeline::BarrierOutcome;
 
+        if self.delivery_guarantee != laminar_connectors::connector::DeliveryGuarantee::BestEffort {
+            if let Err(error) = validate_durable_source_checkpoint_roster(
+                &self.checkpoint_source_names,
+                &source_checkpoints,
+            ) {
+                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+                tracing::warn!(%error, "checkpoint source cut is incomplete");
+                return BarrierOutcome::Failed;
+            }
+        }
+
         #[cfg(feature = "cluster")]
         let source_checkpoints = match self
             .route_follower_checkpoint_barrier(source_checkpoints, attempt, attempt_started, flags)
@@ -5686,8 +5748,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             checkpoint_timeout: self.checkpoint_timeout,
             serialization_timeout: self.serialization_timeout,
             checkpoint_cleanup_timeout: self.checkpoint_cleanup_timeout,
-            fault_on_failure: self.delivery_guarantee
+            fault_on_retryable_failure: self.delivery_guarantee
                 == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce,
+            fault_on_unclassified_error: self.delivery_guarantee
+                != laminar_connectors::connector::DeliveryGuarantee::BestEffort,
             checkpoint_fault: Arc::clone(&self.checkpoint_fault),
             #[cfg(feature = "cluster")]
             controller: self.cluster_controller.clone(),

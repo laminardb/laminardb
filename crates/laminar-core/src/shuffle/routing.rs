@@ -20,6 +20,10 @@ pub const ROUTE_MAX_BATCH_ROWS: usize = 65_536;
 /// Logical Arrow bytes referenced by this slice, independent of backing-buffer capacity or owner.
 /// This is the stable bound for IPC content; transport reservations account the retained backing
 /// allocation separately.
+///
+/// # Errors
+///
+/// Returns an Arrow compute error when buffer-size accounting overflows.
 pub fn logical_batch_bytes(batch: &RecordBatch) -> Result<usize, arrow_schema::ArrowError> {
     batch.columns().iter().try_fold(0usize, |total, column| {
         let data = column.to_data();
@@ -372,6 +376,14 @@ fn bounded_slices(
 }
 
 fn take_rows(batch: &RecordBatch, indices: &[u32]) -> Result<RecordBatch, ShuffleRoutingError> {
+    if indices.len() == batch.num_rows() && batch.get_array_memory_size() <= ROUTE_MAX_BATCH_BYTES {
+        debug_assert!(indices
+            .iter()
+            .enumerate()
+            .all(|(offset, &index)| u32::try_from(offset).ok() == Some(index)));
+        return Ok(batch.clone());
+    }
+
     let indices = UInt32Array::from(indices.to_vec());
     let columns = batch
         .columns()
@@ -403,6 +415,65 @@ mod tests {
             vec![Arc::new(Int64Array::from(values.to_vec()))],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn take_rows_reuses_bounded_identity_and_compacts_retained_backing() {
+        let batch = values(&[10, 20, 30, 40]);
+        let identity = take_rows(&batch, &[0, 1, 2, 3]).unwrap();
+        let contiguous = take_rows(&batch, &[1, 2]).unwrap();
+
+        let backing = Int64Array::from(vec![1; 2_000_000]);
+        let sliced = RecordBatch::try_new(
+            batch.schema(),
+            vec![Arc::new(backing.slice(1, 1)) as ArrayRef],
+        )
+        .unwrap();
+        assert!(sliced.get_array_memory_size() > ROUTE_MAX_BATCH_BYTES);
+        let compacted_identity = take_rows(&sliced, &[0]).unwrap();
+
+        let original = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let identity_values = identity
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let contiguous_values = contiguous
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let sliced_values = sliced
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let compacted_values = compacted_identity
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        assert_eq!(identity_values.values(), &[10, 20, 30, 40]);
+        assert_eq!(contiguous_values.values(), &[20, 30]);
+        assert!(Arc::ptr_eq(batch.column(0), identity.column(0)));
+        assert_eq!(
+            identity_values.values().as_ptr(),
+            original.values().as_ptr()
+        );
+        assert_ne!(
+            contiguous_values.values().as_ptr(),
+            original.values()[1..].as_ptr()
+        );
+        assert_ne!(
+            compacted_values.values().as_ptr(),
+            sliced_values.values().as_ptr()
+        );
+        assert!(compacted_identity.get_array_memory_size() <= ROUTE_MAX_BATCH_BYTES);
     }
 
     #[test]

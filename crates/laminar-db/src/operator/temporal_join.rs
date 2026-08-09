@@ -48,6 +48,7 @@ use crate::temporal_join_state::{
 const ABSENT_VNODE: u8 = 0;
 const PRESENT_VNODE: u8 = 1;
 const OPERATOR_CHECKPOINT_VERSION: u8 = 2;
+#[cfg(feature = "cluster")]
 const OPERATOR_CAPTURE_ALLOCATION_CHARGE: usize = 32;
 const OPERATOR_CHECKPOINT_BASE_SCRATCH: usize = 512;
 const PENDING_HOLD_ENTRY_CHARGE: usize = 64;
@@ -180,8 +181,12 @@ impl TemporalJoinOperatorCheckpointCapture {
         self.retained_bytes
     }
 
-    fn encode(mut self, max_encoded_bytes: usize) -> Result<Vec<u8>, DbError> {
-        let mut remaining = max_encoded_bytes
+    fn encode(self, max_encoded_bytes: usize) -> Result<Vec<u8>, DbError> {
+        #[cfg(feature = "cluster")]
+        let mut capture = self;
+        #[cfg(not(feature = "cluster"))]
+        let capture = self;
+        let remaining = max_encoded_bytes
             .checked_sub(OPERATOR_CHECKPOINT_BASE_SCRATCH)
             .ok_or_else(|| {
                 DbError::Checkpoint(format!(
@@ -189,15 +194,17 @@ impl TemporalJoinOperatorCheckpointCapture {
                 ))
             })?;
         #[cfg(feature = "cluster")]
-        if let Some(cluster) = self.cluster.take() {
-            let (encoded, cluster_remaining) = cluster.encode(remaining)?;
-            self.checkpoint.cluster = Some(encoded);
-            remaining = cluster_remaining;
-        }
+        let remaining = if let Some(cluster) = capture.cluster.take() {
+            let (encoded, remaining) = cluster.encode(remaining)?;
+            capture.checkpoint.cluster = Some(encoded);
+            remaining
+        } else {
+            remaining
+        };
         let writer = rkyv::ser::writer::IoWriter::new(
             laminar_core::serialization::BoundedBytesWriter::new(remaining),
         );
-        rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(&self.checkpoint, writer)
+        rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(&capture.checkpoint, writer)
             .map(|bytes| bytes.into_inner().into_vec())
             .map_err(|error| {
                 DbError::Checkpoint(format!("temporal join operator checkpoint: {error}"))
@@ -423,6 +430,7 @@ enum TemporalInputSide {
 }
 
 impl TemporalInputSide {
+    #[cfg(feature = "cluster")]
     const fn port(self) -> usize {
         match self {
             Self::Left => 0,
@@ -1145,14 +1153,16 @@ impl ManagedTemporalJoinOperator {
             return Ok(None);
         }
         let base_bytes = std::mem::size_of::<TemporalJoinOperatorCheckpointCapture>();
-        let cluster_headroom = max_capture_bytes.checked_sub(base_bytes).ok_or_else(|| {
-            DbError::Checkpoint(format!(
-                "temporal join [{}] operator capture metadata exceeds its {max_capture_bytes}-byte headroom",
-                self.name
-            ))
-        })?;
         #[cfg(feature = "cluster")]
-        let cluster = self.capture_cluster_checkpoint(cluster_headroom)?;
+        let cluster = {
+            let cluster_headroom = max_capture_bytes.checked_sub(base_bytes).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "temporal join [{}] operator capture metadata exceeds its {max_capture_bytes}-byte headroom",
+                    self.name
+                ))
+            })?;
+            self.capture_cluster_checkpoint(cluster_headroom)?
+        };
         let maintenance_cursor = u32::try_from(self.maintenance_cursor).map_err(|_| {
             DbError::Checkpoint(format!(
                 "temporal join [{}] maintenance cursor exceeds u32",
@@ -4952,6 +4962,7 @@ fn column_index(
     })
 }
 
+#[cfg(feature = "cluster")]
 fn max_watermark(current: Option<i64>, floor: Option<i64>) -> Option<i64> {
     match (current, floor) {
         (Some(current), Some(floor)) => Some(current.max(floor)),

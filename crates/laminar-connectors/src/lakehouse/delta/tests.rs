@@ -1106,7 +1106,7 @@ async fn coordinated_epoch_over_four_times_buffer_cap_commits_once() {
             target: attempt,
             entries: vec![CoordinatedCommitPayload {
                 attempt,
-                participant_id: 0,
+                participant_id: 1,
                 payload: Some(descriptor),
             }],
         },
@@ -1179,7 +1179,7 @@ async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
                     target: attempt,
                     entries: vec![CoordinatedCommitPayload {
                         attempt,
-                        participant_id: 0,
+                        participant_id: 1,
                         payload: Some(descriptor),
                     }],
                 },
@@ -1259,7 +1259,7 @@ async fn coordinated_failover_overlap_does_not_duplicate_committed_attempt() {
                 target: first_attempt,
                 entries: vec![CoordinatedCommitPayload {
                     attempt: first_attempt,
-                    participant_id: 0,
+                    participant_id: 1,
                     payload: Some(first_descriptor.clone()),
                 }],
             },
@@ -1299,12 +1299,12 @@ async fn coordinated_failover_overlap_does_not_duplicate_committed_attempt() {
                 entries: vec![
                     CoordinatedCommitPayload {
                         attempt: first_attempt,
-                        participant_id: 0,
+                        participant_id: 1,
                         payload: Some(first_descriptor),
                     },
                     CoordinatedCommitPayload {
                         attempt: second_attempt,
-                        participant_id: 0,
+                        participant_id: 1,
                         payload: Some(second_descriptor),
                     },
                 ],
@@ -1406,7 +1406,7 @@ async fn coordinated_unresolved_publication_allows_only_the_exact_batch_retry() 
             target: attempt,
             entries: vec![CoordinatedCommitPayload {
                 attempt,
-                participant_id: 0,
+                participant_id: 1,
                 payload: None,
             }],
         },
@@ -1424,7 +1424,7 @@ async fn coordinated_unresolved_publication_allows_only_the_exact_batch_retry() 
         target: second,
         entries: vec![CoordinatedCommitPayload {
             attempt: second,
-            participant_id: 0,
+            participant_id: 1,
             payload: None,
         }],
     };
@@ -1452,12 +1452,12 @@ async fn coordinated_unresolved_publication_allows_only_the_exact_batch_retry() 
         entries: vec![
             CoordinatedCommitPayload {
                 attempt: second,
-                participant_id: 0,
+                participant_id: 1,
                 payload: None,
             },
             CoordinatedCommitPayload {
                 attempt: third,
-                participant_id: 0,
+                participant_id: 1,
                 payload: None,
             },
         ],
@@ -1489,7 +1489,7 @@ async fn coordinated_unresolved_publication_allows_only_the_exact_batch_retry() 
             target: third,
             entries: vec![CoordinatedCommitPayload {
                 attempt: third,
-                participant_id: 0,
+                participant_id: 1,
                 payload: None,
             }],
         },
@@ -1543,7 +1543,7 @@ async fn coordinated_catalog_commit_timeout_fences_later_work_until_cursor_read(
         target: attempt,
         entries: vec![CoordinatedCommitPayload {
             attempt,
-            participant_id: 0,
+            participant_id: 1,
             payload: None,
         }],
     };

@@ -1667,9 +1667,9 @@ mod tests {
                  ON t.tenant = q.tenant AND t.symbol = q.symbol",
             )
             .unwrap();
-            let planned = planner.plan(&statement[0]);
+            let plan_result = planner.plan(&statement[0]);
             if accepted {
-                let StreamingPlan::Query(plan) = planned.unwrap() else {
+                let StreamingPlan::Query(plan) = plan_result.unwrap() else {
                     panic!("expected temporal query plan");
                 };
                 let Some(JoinOperatorConfig::Temporal(config)) =
@@ -1680,7 +1680,7 @@ mod tests {
                 assert_eq!(config.left_key_columns, ["tenant", "symbol"]);
                 assert_eq!(config.right_key_columns, ["tenant", "symbol"]);
             } else {
-                let error = planned.unwrap_err().to_string();
+                let error = plan_result.unwrap_err().to_string();
                 assert!(error.contains("PRIMARY KEY (tenant, symbol)"), "{error}");
             }
         }

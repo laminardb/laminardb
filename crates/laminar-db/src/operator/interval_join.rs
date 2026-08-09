@@ -253,6 +253,7 @@ struct IntervalHandoffCut {
     right_watermark: i64,
 }
 
+#[cfg(feature = "cluster")]
 struct PreparedIntervalJoinTransition {
     replacements: Vec<(u32, Option<Box<IntervalJoinState>>)>,
     local_assignment: VnodeAssignmentSnapshot,
@@ -260,6 +261,7 @@ struct PreparedIntervalJoinTransition {
     handoff_cut: Option<IntervalHandoffCut>,
 }
 
+#[cfg(feature = "cluster")]
 enum IntervalJoinTransitionCleanup {
     Aborted(PreparedIntervalJoinTransition),
     Published(PreparedIntervalJoinTransition),
@@ -281,7 +283,9 @@ pub(crate) struct IntervalJoinOperator {
     cluster_shuffle: Option<ClusterShuffleConfig>,
     #[cfg(feature = "cluster")]
     aligned_replay: VecDeque<(u64, JoinInputSide, i64, crate::operator::RetainedBatch)>,
+    #[cfg(feature = "cluster")]
     prepared_vnode_transition: Option<PreparedIntervalJoinTransition>,
+    #[cfg(feature = "cluster")]
     vnode_transition_cleanup: Option<IntervalJoinTransitionCleanup>,
     applied_left_watermark: i64,
     applied_right_watermark: i64,
@@ -334,7 +338,9 @@ impl IntervalJoinOperator {
             cluster_shuffle: None,
             #[cfg(feature = "cluster")]
             aligned_replay: VecDeque::new(),
+            #[cfg(feature = "cluster")]
             prepared_vnode_transition: None,
+            #[cfg(feature = "cluster")]
             vnode_transition_cleanup: None,
             applied_left_watermark: i64::MIN,
             applied_right_watermark: i64::MIN,
@@ -392,6 +398,7 @@ impl IntervalJoinOperator {
             }))
     }
 
+    #[cfg(feature = "cluster")]
     fn transition_accounted_bytes(transition: &PreparedIntervalJoinTransition) -> usize {
         transition
             .replacements
@@ -1554,6 +1561,7 @@ impl GraphOperator for IntervalJoinOperator {
     }
 
     fn managed_state_accounting(&self) -> Option<ManagedStateAccountingSnapshot> {
+        #[cfg(feature = "cluster")]
         let (prepared, retired) = {
             let prepared = self
                 .prepared_vnode_transition
@@ -1571,6 +1579,8 @@ impl GraphOperator for IntervalJoinOperator {
             };
             (prepared, retired)
         };
+        #[cfg(not(feature = "cluster"))]
+        let (prepared, retired) = (0, 0);
         Some(ManagedStateAccountingSnapshot {
             live: self.accounted_state_bytes(),
             prepared,

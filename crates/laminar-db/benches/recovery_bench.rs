@@ -112,13 +112,25 @@ fn bench_verified_state_range_read(c: &mut Criterion) {
             .block_on(store.save_checkpoint(&manifest, std::slice::from_ref(&payload)))
             .unwrap();
         let frame = manifest.state_frames[1].clone();
+        let object_length = manifest.node_data.object_length;
 
         group.throughput(Throughput::Bytes(state_bytes as u64));
         group.bench_function(
             BenchmarkId::new("load", humanize_bytes(state_bytes)),
             |bencher| {
-                bencher
-                    .iter(|| black_box(runtime.block_on(store.load_state_frame(&frame)).unwrap()))
+                bencher.iter(|| {
+                    let mut payloads = runtime
+                        .block_on(store.load_node_data_ranges(
+                            frame.chunk,
+                            object_length,
+                            &[frame.range],
+                        ))
+                        .unwrap()
+                        .unwrap();
+                    let bytes = payloads.pop().unwrap();
+                    assert_eq!(checkpoint_sha256(&bytes), frame.sha256);
+                    black_box(bytes)
+                })
             },
         );
     }

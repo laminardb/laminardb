@@ -452,6 +452,7 @@ async fn checkpoint_admission_failure_reporting_is_edge_deduplicated() {
 #[tokio::test]
 async fn zero_cycle_barrier_is_not_suppressed_by_process_metrics() {
     let mut callback = empty_callback_fixture();
+    callback.checkpoint_source_names = vec!["gen".into()];
     callback.sink_timed_out = true;
     let mut source_checkpoint = SourceCheckpoint::new();
     source_checkpoint.set_offset("seq", "4096");
@@ -1078,9 +1079,11 @@ async fn retained_follower_capture_keeps_ownership_after_promotion() {
     let coordinator = Arc::clone(&fixture.callback.coordinator);
     let coordinator_guard = coordinator.lock().await;
 
+    let source_checkpoints =
+        FxHashMap::from_iter([("orders".to_string(), SourceCheckpoint::new())]);
     let mut checkpoint = Box::pin(crate::pipeline::PipelineCallback::checkpoint_with_barrier(
         &mut fixture.callback,
-        FxHashMap::default(),
+        source_checkpoints,
         attempt,
         std::time::Instant::now(),
         laminar_core::checkpoint::flags::NONE,
@@ -2113,6 +2116,74 @@ fn ambiguous_decision_faults_at_least_once_pipeline() {
     };
 
     assert!(checkpoint_failure_requires_pipeline_fault(&result, false));
+}
+
+#[tokio::test]
+async fn unclassified_checkpoint_tail_error_faults_only_durable_delivery() {
+    for durable_delivery in [false, true] {
+        let (complete_tx, _complete_rx) =
+            crossfire::mpsc::bounded_async::<crate::pipeline::CheckpointCompletion>(1);
+        let in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let checkpoint_fault = Arc::new(parking_lot::Mutex::new(None));
+        let full_vnode_capture_needed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tail = LeaderTail {
+            _in_flight: EpochInFlightGuard::claim(&in_flight),
+            coordinator: Arc::new(tokio::sync::Mutex::new(None)),
+            complete_tx,
+            request: crate::checkpoint_coordinator::CheckpointRequest::default(),
+            operator_state: None,
+            operator_state_staged_cap_bytes: 0,
+            mutable_operator_capture_guard: None,
+            fan_out: FxHashMap::default(),
+            local_watermark: CheckpointWatermark::Uninitialized,
+            handoff_replay_pending: false,
+            attempt: CheckpointAttempt::canonical(7),
+            attempt_started: std::time::Instant::now(),
+            checkpoint_timeout: Duration::from_secs(1),
+            serialization_timeout: Duration::from_secs(1),
+            checkpoint_cleanup_timeout: Duration::from_secs(1),
+            fault_on_retryable_failure: false,
+            fault_on_unclassified_error: durable_delivery,
+            checkpoint_fault: Arc::clone(&checkpoint_fault),
+            #[cfg(feature = "cluster")]
+            controller: None,
+            #[cfg(feature = "cluster")]
+            leader_proof: None,
+            #[cfg(feature = "cluster")]
+            quorum_timeout: Duration::from_secs(1),
+            full_vnode_capture_needed: Arc::clone(&full_vnode_capture_needed),
+        };
+
+        ConnectorPipelineCallback::handle_leader_result(
+            &mut tail,
+            Err(DbError::Checkpoint(
+                "injected unclassified tail error".into(),
+            )),
+        )
+        .await;
+
+        assert_eq!(checkpoint_fault.lock().is_some(), durable_delivery);
+        assert!(full_vnode_capture_needed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
+
+#[test]
+fn durable_checkpoint_requires_the_exact_source_roster() {
+    let expected = vec!["orders".to_string(), "payments".to_string()];
+    let mut checkpoints = FxHashMap::default();
+    checkpoints.insert("orders".to_string(), SourceCheckpoint::new());
+    checkpoints.insert("payments".to_string(), SourceCheckpoint::new());
+    assert!(validate_durable_source_checkpoint_roster(&expected, &checkpoints).is_ok());
+
+    checkpoints.remove("payments");
+    let missing = validate_durable_source_checkpoint_roster(&expected, &checkpoints).unwrap_err();
+    assert!(missing.contains("payments"));
+
+    checkpoints.insert("payments".to_string(), SourceCheckpoint::new());
+    checkpoints.insert("unknown".to_string(), SourceCheckpoint::new());
+    let unexpected =
+        validate_durable_source_checkpoint_roster(&expected, &checkpoints).unwrap_err();
+    assert!(unexpected.contains("unknown"));
 }
 use crate::error::DbError;
 
@@ -3240,7 +3311,8 @@ async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement() {
         checkpoint_timeout: Duration::from_secs(2),
         serialization_timeout: Duration::from_secs(1),
         checkpoint_cleanup_timeout: Duration::from_secs(1),
-        fault_on_failure: false,
+        fault_on_retryable_failure: false,
+        fault_on_unclassified_error: true,
         checkpoint_fault: Arc::new(parking_lot::Mutex::new(None)),
         controller: Some(Arc::clone(&leader)),
         leader_proof: Some(leader_proof),

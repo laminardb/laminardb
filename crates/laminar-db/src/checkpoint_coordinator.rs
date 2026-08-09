@@ -36,6 +36,7 @@ use crate::recovery_manager::{
 
 const MAX_SINK_PHASE_ONE_CONCURRENCY: usize = 8;
 const MAX_RETENTION_IO_CONCURRENCY: usize = 8;
+const REFERENCED_CHUNK_REBASE_THRESHOLD: usize = 64;
 const RETENTION_RETRY_DELAY: Duration = Duration::from_secs(30);
 #[cfg(feature = "cluster")]
 const FOLLOWER_DECISION_POLL: Duration = Duration::from_millis(250);
@@ -399,16 +400,14 @@ impl EpochAllocator {
 
 #[cfg(feature = "cluster")]
 pub(crate) type QuorumPeer = laminar_core::cluster::discovery::NodeId;
-#[cfg(not(feature = "cluster"))]
-pub(crate) type QuorumPeer = u64;
 
 #[derive(Debug, Clone)]
 pub(crate) enum QuorumStage {
     RunInline,
+    #[cfg(feature = "cluster")]
     Done {
         cluster_watermark: laminar_core::checkpoint::CheckpointWatermark,
         participants: Vec<QuorumPeer>,
-        #[cfg(feature = "cluster")]
         leader_proof: LeaderProof,
     },
 }
@@ -1035,6 +1034,18 @@ mod artifact_tests {
         }
     }
 
+    async fn node_data_exists(
+        store: &dyn CheckpointStore,
+        chunk: StateChunkId,
+        object_length: u64,
+    ) -> bool {
+        store
+            .load_node_data_ranges(chunk, object_length, &[])
+            .await
+            .unwrap()
+            .is_some()
+    }
+
     #[tokio::test]
     async fn retention_reclaims_last_referenced_chunk_and_keeps_latest_cut() {
         use laminar_core::checkpoint_decision::CheckpointVerdict;
@@ -1137,16 +1148,19 @@ mod artifact_tests {
                 participant_id: 1,
                 checkpoint_id,
             };
-            assert_eq!(store.node_data_len(chunk).await.unwrap(), None);
+            assert!(!node_data_exists(store.as_ref(), chunk, 1).await);
         }
-        assert!(store
-            .node_data_len(StateChunkId {
-                participant_id: 1,
-                checkpoint_id: 3,
-            })
+        assert!(
+            node_data_exists(
+                store.as_ref(),
+                StateChunkId {
+                    participant_id: 1,
+                    checkpoint_id: 3,
+                },
+                1,
+            )
             .await
-            .unwrap()
-            .is_some());
+        );
         for checkpoint_id in 1..=5 {
             assert_eq!(
                 store
@@ -1252,15 +1266,17 @@ mod artifact_tests {
         .unwrap();
 
         for checkpoint_id in [3, 6] {
-            assert_eq!(
-                store
-                    .node_data_len(StateChunkId {
+            let object_length = u64::from(checkpoint_id == 3);
+            assert!(
+                !node_data_exists(
+                    store.as_ref(),
+                    StateChunkId {
                         participant_id: 1,
                         checkpoint_id,
-                    })
-                    .await
-                    .unwrap(),
-                None
+                    },
+                    object_length,
+                )
+                .await
             );
         }
         assert!(store
@@ -1344,13 +1360,13 @@ mod artifact_tests {
                 .unwrap(),
             None
         );
-        assert_eq!(
-            coordinator
-                .store
-                .node_data_len(aborted.node_data.chunk)
-                .await
-                .unwrap(),
-            None
+        assert!(
+            !node_data_exists(
+                coordinator.store.as_ref(),
+                aborted.node_data.chunk,
+                aborted.node_data.object_length,
+            )
+            .await
         );
         assert!(coordinator
             .store
@@ -1358,12 +1374,14 @@ mod artifact_tests {
             .await
             .unwrap()
             .is_some());
-        assert!(coordinator
-            .store
-            .node_data_len(unrelated.node_data.chunk)
+        assert!(
+            node_data_exists(
+                coordinator.store.as_ref(),
+                unrelated.node_data.chunk,
+                unrelated.node_data.object_length,
+            )
             .await
-            .unwrap()
-            .is_some());
+        );
     }
 
     #[tokio::test]
@@ -1396,12 +1414,14 @@ mod artifact_tests {
             .await
             .unwrap()
             .is_none());
-        assert!(restarted
-            .store
-            .node_data_len(manifest.node_data.chunk)
+        assert!(
+            !node_data_exists(
+                restarted.store.as_ref(),
+                manifest.node_data.chunk,
+                manifest.node_data.object_length,
+            )
             .await
-            .unwrap()
-            .is_none());
+        );
     }
 
     #[tokio::test]
@@ -1457,12 +1477,14 @@ mod artifact_tests {
             .await
             .unwrap()
             .is_some());
-        assert!(coordinator
-            .store
-            .node_data_len(manifest.node_data.chunk)
+        assert!(
+            node_data_exists(
+                coordinator.store.as_ref(),
+                manifest.node_data.chunk,
+                manifest.node_data.object_length,
+            )
             .await
-            .unwrap()
-            .is_some());
+        );
     }
 }
 
@@ -1634,6 +1656,67 @@ mod sparse_capture_tests {
         assert_eq!(packed.manifest.referenced_chunks.len(), 1);
         assert_eq!(packed.manifest.referenced_chunks[0].ref_count.get(), 3);
         assert_eq!(packed.node_data, vec![Bytes::from_static(b"new-two")]);
+    }
+
+    #[tokio::test]
+    async fn committed_manifest_rebases_at_referenced_chunk_threshold() {
+        let key_groups = KeyGroupCount::try_from(1_u16).unwrap();
+        let mut coordinator = CheckpointCoordinator::new(
+            CheckpointConfig::default(),
+            Box::new(
+                ObjectStoreCheckpointStore::new(Arc::new(InMemory::new()), "chunk-threshold")
+                    .with_key_group_count(key_groups),
+            ),
+        )
+        .unwrap();
+        let mut manifest = CheckpointManifest::new_with_key_group_count(65, 65, key_groups);
+        manifest.deployment_id = uuid::Uuid::from_u128(1).to_string();
+        manifest.referenced_chunks = (1..=REFERENCED_CHUNK_REBASE_THRESHOLD)
+            .map(|checkpoint_id| ReferencedStateChunk {
+                chunk: StateChunkId {
+                    participant_id: 1,
+                    checkpoint_id: u64::try_from(checkpoint_id).unwrap(),
+                },
+                object_length: 1,
+                sha256: checkpoint_sha256(b"x"),
+                ref_count: NonZeroU32::new(1).unwrap(),
+            })
+            .collect();
+        manifest.state_frames = (1..=REFERENCED_CHUNK_REBASE_THRESHOLD)
+            .map(|checkpoint_id| StateFrame {
+                key: StateFrameKey::Vnode {
+                    operator_id: format!("graph:{checkpoint_id:020}"),
+                    vnode: 0,
+                },
+                chunk: StateChunkId {
+                    participant_id: 1,
+                    checkpoint_id: u64::try_from(checkpoint_id).unwrap(),
+                },
+                range: ByteRange {
+                    offset: 0,
+                    length: 1,
+                },
+                sha256: checkpoint_sha256(b"x"),
+            })
+            .collect();
+        assert!(manifest.validate(key_groups).is_empty());
+        coordinator.last_committed_manifest = Some(Arc::new(manifest));
+
+        assert!(coordinator.committed_manifest_needs_vnode_rebase(CheckpointAttempt::canonical(65)));
+        assert!(
+            !coordinator.committed_manifest_needs_vnode_rebase(CheckpointAttempt::canonical(66))
+        );
+        Arc::make_mut(
+            coordinator
+                .last_committed_manifest
+                .as_mut()
+                .expect("installed manifest"),
+        )
+        .referenced_chunks
+        .pop();
+        assert!(
+            !coordinator.committed_manifest_needs_vnode_rebase(CheckpointAttempt::canonical(65))
+        );
     }
 }
 
@@ -1991,7 +2074,7 @@ impl CheckpointCoordinator {
     fn schedule_retention(
         &self,
         current: CommittedCheckpointIndex,
-        leader_proof: Option<LeaderProof>,
+        leader_proof: Option<&LeaderProof>,
     ) {
         let Some(decision_store) = self.decision_store.as_ref() else {
             return;
@@ -2001,7 +2084,7 @@ impl CheckpointCoordinator {
             CheckpointScope::Cluster => {
                 #[cfg(feature = "cluster")]
                 {
-                    let Some(proof) = leader_proof else {
+                    let Some(proof) = leader_proof.cloned() else {
                         warn!("cluster checkpoint retention has no live leader proof");
                         return;
                     };
@@ -2530,7 +2613,7 @@ impl CheckpointCoordinator {
                 deadline,
             )
             .await?;
-            self.schedule_retention(committed.clone(), continuation_proof);
+            self.schedule_retention(committed.clone(), continuation_proof.as_ref());
         }
 
         let reference = outcome.committed_checkpoint.clone().ok_or_else(|| {
@@ -4568,7 +4651,7 @@ impl CheckpointCoordinator {
             .await;
         let continuation = match continuation {
             Ok(()) => {
-                self.schedule_retention(index.clone(), leader_proof.clone());
+                self.schedule_retention(index.clone(), leader_proof.as_ref());
                 if let Err(error) = self.clear_sink_witness_until(continuation_deadline).await {
                     Err(error)
                 } else if self.has_checkpoint_committable_sinks() {
@@ -5264,6 +5347,16 @@ pub struct CheckpointStats {
 impl CheckpointCoordinator {
     pub(crate) fn last_committed_manifest(&self) -> Option<&CheckpointManifest> {
         self.last_committed_manifest.as_deref()
+    }
+
+    pub(crate) fn committed_manifest_needs_vnode_rebase(&self, attempt: CheckpointAttempt) -> bool {
+        self.last_committed_manifest
+            .as_ref()
+            .is_some_and(|manifest| {
+                manifest.checkpoint_id == attempt.checkpoint_id
+                    && manifest.epoch == attempt.epoch
+                    && manifest.referenced_chunks.len() >= REFERENCED_CHUNK_REBASE_THRESHOLD
+            })
     }
 
     #[must_use]

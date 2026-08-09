@@ -1363,6 +1363,7 @@ impl OperatorGraph {
         }
     }
 
+    #[cfg(feature = "cluster")]
     fn owned_vnodes_for_managed_state(&mut self) -> Result<Option<Arc<[u32]>>, DbError> {
         let has_participants = self
             .nodes
@@ -1371,7 +1372,6 @@ impl OperatorGraph {
         if !has_participants {
             return Ok(None);
         }
-        #[cfg(feature = "cluster")]
         if let Some(config) = &self.cluster_shuffle {
             let assignment = config.registry.versioned_snapshot();
             if u32::try_from(assignment.owners().len()).ok()
@@ -1401,7 +1401,7 @@ impl OperatorGraph {
             self.owned_vnodes_cache = Some((cache_key, Arc::clone(&owned_vnodes)));
             return Ok(Some(owned_vnodes));
         }
-        #[cfg(all(test, feature = "cluster"))]
+        #[cfg(test)]
         if let Some(vnodes) = &self.test_owned_vnodes {
             let cache_key = OwnedVnodeRosterCacheKey::Test {
                 vnode_count: u32::from(self.key_group_count),
@@ -1415,16 +1415,27 @@ impl OperatorGraph {
             self.owned_vnodes_cache = Some((cache_key, Arc::clone(&owned_vnodes)));
             return Ok(Some(owned_vnodes));
         }
+        Ok(self.local_owned_vnodes_for_managed_state())
+    }
+
+    fn local_owned_vnodes_for_managed_state(&mut self) -> Option<Arc<[u32]>> {
+        let has_participants = self
+            .nodes
+            .iter()
+            .any(|node| !node.removed && node.capability.managed_state.is_some());
+        if !has_participants {
+            return None;
+        }
         let vnode_count = u32::from(self.key_group_count);
         let cache_key = OwnedVnodeRosterCacheKey::Local { vnode_count };
         if let Some((cached_key, cached)) = &self.owned_vnodes_cache {
             if *cached_key == cache_key {
-                return Ok(Some(Arc::clone(cached)));
+                return Some(Arc::clone(cached));
             }
         }
         let owned_vnodes = Arc::<[u32]>::from((0..vnode_count).collect::<Vec<_>>());
         self.owned_vnodes_cache = Some((cache_key, Arc::clone(&owned_vnodes)));
-        Ok(Some(owned_vnodes))
+        Some(owned_vnodes)
     }
 
     /// Bind the graph to the logical pipeline and recovery-state ABI.
@@ -4545,7 +4556,10 @@ impl OperatorGraph {
             })?;
 
         let vnode_count = u32::from(self.key_group_count);
+        #[cfg(feature = "cluster")]
         let owned_vnodes = self.owned_vnodes_for_managed_state()?;
+        #[cfg(not(feature = "cluster"))]
+        let owned_vnodes = self.local_owned_vnodes_for_managed_state();
         let owned_vnodes = owned_vnodes.as_deref().unwrap_or(&[]);
         let mut capture = GraphStateCapture::default();
         let mut names = std::collections::BTreeSet::new();
@@ -4706,7 +4720,10 @@ impl OperatorGraph {
             }
         }
 
+        #[cfg(feature = "cluster")]
         let owned_vnodes = self.owned_vnodes_for_managed_state()?;
+        #[cfg(not(feature = "cluster"))]
+        let owned_vnodes = self.local_owned_vnodes_for_managed_state();
         let owned_vnodes = owned_vnodes.as_deref().unwrap_or(&[]);
         let mut actual_vnodes: FxHashMap<&str, Vec<u32>> = FxHashMap::default();
         for (name, vnode, _) in vnodes {
