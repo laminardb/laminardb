@@ -1805,6 +1805,84 @@ async fn shuffle_scope_cancellation_preserves_holdover_for_the_next_attempt() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shuffle_alignment_stages_inbound_while_barrier_fan_out_is_blocked() {
+    use laminar_core::checkpoint::CheckpointAttempt;
+    use laminar_core::shuffle::ShuffleMessage;
+
+    let mut harness = three_node_alignment_harness().await;
+    let attempt = CheckpointAttempt::new(70, 70);
+    let sender = Arc::clone(
+        &harness
+            .graph
+            .cluster_shuffle_config()
+            .expect("cluster shuffle")
+            .sender,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    sender.register_peer(3, listener.local_addr().unwrap());
+    let accepted = Arc::new(tokio::sync::Notify::new());
+    let stalled_peer = {
+        let accepted = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            accepted.notify_one();
+            std::future::pending::<()>().await;
+        })
+    };
+    let fence = harness.fence.clone();
+    let alignment = harness.graph.align_shuffle_barriers(
+        attempt,
+        0,
+        &fence,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+        None,
+    );
+    tokio::pin!(alignment);
+    tokio::select! {
+        biased;
+        result = &mut alignment => panic!("alignment completed before peer fan-out stalled: {result:?}"),
+        () = accepted.notified() => {}
+    }
+
+    harness
+        .peer_two_sender
+        .send_to(
+            1,
+            &ShuffleMessage::checkpointed("out".into(), 0, test_batch()),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if harness.recorded.lock().len() == 1 {
+                break;
+            }
+            tokio::select! {
+                biased;
+                result = &mut alignment => {
+                    panic!("alignment completed before staging inbound work: {result:?}");
+                }
+                () = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await
+    .expect("blocked barrier fan-out prevented inbound staging");
+
+    sender.suspend_assignment_fence();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), &mut alignment)
+        .await
+        .expect("scope cancellation did not release blocked barrier fan-out")
+        .expect_err("scope cancellation after staging must require recovery");
+    assert!(error.requires_pipeline_recovery(), "{error}");
+    let recorded = harness.recorded.lock();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].num_rows(), test_batch().num_rows());
+    stalled_peer.abort();
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn receiver_scope_suspension_preserves_holdover_before_graph_staging() {
     use laminar_core::checkpoint::CheckpointAttempt;
 
@@ -1907,28 +1985,26 @@ async fn shuffle_alignment_retains_resumed_peer_data_on_durable_abort() {
         .iter()
         .map(|batch| batch.batch().clone())
         .collect();
-    assert!(
-        matches!(retained.len(), 1 | 2),
-        "the pre-barrier batch must be staged before Abort"
-    );
-    if retained.len() == 1 {
-        let receiver_owned = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let batches = harness.local_receiver.drain_checkpointed_data_for("out");
-                if !batches.is_empty() {
-                    break batches;
-                }
+    harness
+        .local_receiver
+        .retire_checkpoint_barriers(attempt, harness.fence.digest())
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while retained.len() < 2 {
+            retained.extend(
+                harness
+                    .local_receiver
+                    .drain_checkpointed_data_for("out")
+                    .into_iter()
+                    .map(|batch| batch.batch().clone()),
+            );
+            if retained.len() < 2 {
                 tokio::task::yield_now().await;
             }
-        })
-        .await
-        .expect("post-barrier batch remained in flight after Abort");
-        retained.extend(
-            receiver_owned
-                .into_iter()
-                .map(|batch| batch.batch().clone()),
-        );
-    }
+        }
+    })
+    .await
+    .expect("receiver-owned batches remained blocked after Abort cleanup");
     assert_eq!(
         retained.len(),
         2,

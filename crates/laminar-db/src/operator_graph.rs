@@ -908,6 +908,13 @@ pub(crate) enum ShuffleAlignmentOutcome {
     ScopeCancelledBeforeStaging,
 }
 
+#[cfg(feature = "cluster")]
+enum ShuffleFanOutGate {
+    Sent,
+    WorkReady,
+    Terminal(ShuffleAlignmentOutcome),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OwnedVnodeRosterCacheKey {
     Local {
@@ -4210,7 +4217,124 @@ impl OperatorGraph {
     }
 
     #[cfg(feature = "cluster")]
-    async fn wait_for_remaining_shuffle_barriers(
+    async fn gate_shuffle_barrier_fan_out<F>(
+        cfg: &crate::operator::sql_query::ClusterShuffleConfig,
+        attempt: laminar_core::checkpoint::CheckpointAttempt,
+        assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        deadline: tokio::time::Instant,
+        controller: Option<&laminar_core::cluster::control::ClusterController>,
+        recovery_gen: u64,
+        mut fan_out: std::pin::Pin<&mut F>,
+    ) -> Result<ShuffleFanOutGate, DbError>
+    where
+        F: std::future::Future<Output = std::io::Result<()>>,
+    {
+        const RECHECK: std::time::Duration = std::time::Duration::from_millis(500);
+        let mut check_interval =
+            tokio::time::interval_at(tokio::time::Instant::now() + RECHECK, RECHECK);
+        check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut ignored_terminal_hint = None;
+        let terminal_hint = Self::wait_for_shuffle_alignment_terminal_hint(
+            controller,
+            attempt,
+            ignored_terminal_hint,
+            deadline,
+        );
+        let deadline_sleep = tokio::time::sleep_until(deadline);
+        let work_ready = cfg.receiver.work_ready_notify();
+        tokio::pin!(deadline_sleep);
+        tokio::pin!(terminal_hint);
+
+        loop {
+            let notified = work_ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let queued_work_ready = cfg.receiver.queued_work_ready();
+            tokio::select! {
+                biased;
+                () = &mut deadline_sleep => {
+                    return Err(DbError::Checkpoint(format!(
+                        "shuffle barrier alignment exhausted the absolute deadline for checkpoint {} epoch {}",
+                        attempt.checkpoint_id, attempt.epoch
+                    )));
+                }
+                hint = &mut terminal_hint => {
+                    let Some(hint) = hint? else {
+                        return Err(DbError::Checkpoint(format!(
+                            "shuffle barrier control wait exhausted the absolute deadline for checkpoint {} epoch {}",
+                            attempt.checkpoint_id, attempt.epoch
+                        )));
+                    };
+                    ignored_terminal_hint = Some((
+                        hint.epoch,
+                        hint.checkpoint_id,
+                        hint.phase,
+                    ));
+                    Self::validate_shuffle_attempt_scope(
+                        cfg,
+                        assignment_fence,
+                        recovery_gen,
+                        controller,
+                    )?;
+                    Self::ensure_shuffle_delivery_intact(cfg)?;
+                    if let Some(outcome) = Self::audit_shuffle_alignment_settlement(
+                        controller,
+                        attempt,
+                        assignment_fence,
+                    )
+                    .await?
+                    {
+                        return Ok(ShuffleFanOutGate::Terminal(outcome));
+                    }
+                    check_interval.reset_at(tokio::time::Instant::now() + RECHECK);
+                    terminal_hint.set(Self::wait_for_shuffle_alignment_terminal_hint(
+                        controller,
+                        attempt,
+                        ignored_terminal_hint,
+                        deadline,
+                    ));
+                }
+                result = fan_out.as_mut() => {
+                    return match result {
+                        Ok(()) => Ok(ShuffleFanOutGate::Sent),
+                        Err(error) if laminar_core::shuffle::is_scope_cancelled(&error) => Ok(
+                            ShuffleFanOutGate::Terminal(
+                                ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging,
+                            ),
+                        ),
+                        Err(error) => Err(DbError::Pipeline(format!(
+                            "shuffle barrier fan-out: {error}"
+                        ))),
+                    };
+                }
+                () = std::future::ready(()), if queued_work_ready => {
+                    return Ok(ShuffleFanOutGate::WorkReady);
+                }
+                _ = check_interval.tick() => {
+                    Self::validate_shuffle_attempt_scope(
+                        cfg,
+                        assignment_fence,
+                        recovery_gen,
+                        controller,
+                    )?;
+                    Self::ensure_shuffle_delivery_intact(cfg)?;
+                    if let Some(outcome) = Self::audit_shuffle_alignment_settlement(
+                        controller,
+                        attempt,
+                        assignment_fence,
+                    )
+                    .await?
+                    {
+                        return Ok(ShuffleFanOutGate::Terminal(outcome));
+                    }
+                }
+                () = &mut notified => {}
+            }
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn wait_for_remaining_shuffle_barriers<F>(
         &mut self,
         cfg: &crate::operator::sql_query::ClusterShuffleConfig,
         attempt: laminar_core::checkpoint::CheckpointAttempt,
@@ -4222,7 +4346,14 @@ impl OperatorGraph {
         mut remaining: rustc_hash::FxHashSet<u64>,
         mut barrier_cuts: rustc_hash::FxHashMap<u64, u64>,
         staged_graph_state: &mut bool,
-    ) -> Result<ShuffleAlignmentOutcome, DbError> {
+        irreversible_dequeue: &mut bool,
+        mut queued_work_pending: bool,
+        mut fan_out_complete: bool,
+        mut fan_out: std::pin::Pin<&mut F>,
+    ) -> Result<ShuffleAlignmentOutcome, DbError>
+    where
+        F: std::future::Future<Output = std::io::Result<()>>,
+    {
         use laminar_core::shuffle::ShuffleMessage;
 
         const RECHECK: std::time::Duration = std::time::Duration::from_millis(500);
@@ -4236,13 +4367,108 @@ impl OperatorGraph {
             ignored_terminal_hint,
             deadline,
         );
+        let deadline_sleep = tokio::time::sleep_until(deadline);
+        tokio::pin!(deadline_sleep);
         tokio::pin!(terminal_hint);
         loop {
+            if fan_out_complete && remaining.is_empty() && !queued_work_pending {
+                break;
+            }
             tokio::select! {
+                biased;
+                () = &mut deadline_sleep => {
+                    return Err(DbError::Checkpoint(format!(
+                        "shuffle barrier alignment exhausted the absolute deadline for checkpoint {} epoch {}",
+                        attempt.checkpoint_id, attempt.epoch
+                    )));
+                }
+                hint = &mut terminal_hint => {
+                    let Some(hint) = hint? else {
+                        return Err(DbError::Checkpoint(format!(
+                            "shuffle barrier control wait exhausted the absolute deadline for checkpoint {} epoch {}",
+                            attempt.checkpoint_id, attempt.epoch
+                        )));
+                    };
+                    ignored_terminal_hint = Some((
+                        hint.epoch,
+                        hint.checkpoint_id,
+                        hint.phase,
+                    ));
+                    Self::validate_shuffle_attempt_scope(
+                        cfg,
+                        assignment_fence,
+                        recovery_gen,
+                        controller,
+                    )?;
+                    Self::ensure_shuffle_delivery_intact(cfg)?;
+                    if let Some(outcome) = Self::audit_shuffle_alignment_settlement(
+                        controller,
+                        attempt,
+                        assignment_fence,
+                    )
+                    .await?
+                    {
+                        return Ok(outcome);
+                    }
+                    check_interval.reset_at(tokio::time::Instant::now() + RECHECK);
+                    terminal_hint.set(Self::wait_for_shuffle_alignment_terminal_hint(
+                        controller,
+                        attempt,
+                        ignored_terminal_hint,
+                        deadline,
+                    ));
+                }
+                result = fan_out.as_mut(), if !fan_out_complete => {
+                    match result {
+                        Ok(()) => fan_out_complete = true,
+                        Err(error) => {
+                            let scope_cancelled =
+                                laminar_core::shuffle::is_scope_cancelled(&error);
+                            if scope_cancelled
+                                && !*staged_graph_state
+                                && !*irreversible_dequeue
+                            {
+                                return Ok(ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging);
+                            }
+                            let error = DbError::Pipeline(format!(
+                                "shuffle barrier fan-out: {error}"
+                            ));
+                            return Err(if *staged_graph_state || *irreversible_dequeue {
+                                Self::post_dequeue_shuffle_error(
+                                    "shuffle barrier fan-out after inbound dequeue or graph staging",
+                                    error,
+                                )
+                            } else {
+                                error
+                            });
+                        }
+                    }
+                }
+                _ = check_interval.tick() => {
+                    Self::validate_shuffle_attempt_scope(
+                        cfg,
+                        assignment_fence,
+                        recovery_gen,
+                        controller,
+                    )?;
+                    Self::ensure_shuffle_delivery_intact(cfg)?;
+                    if let Some(outcome) =
+                        Self::audit_shuffle_alignment_settlement(
+                            controller,
+                            attempt,
+                            assignment_fence,
+                        )
+                        .await?
+                    {
+                        return Ok(outcome);
+                    }
+                }
                 res = cfg.receiver.recv() => {
                     let received = res.ok_or_else(|| DbError::Pipeline(
                         "shuffle receiver closed during barrier alignment".into(),
                     ))?;
+                    queued_work_pending = false;
+                    *irreversible_dequeue = true;
                     Self::validate_received_shuffle_scope(
                         &received,
                         cfg.self_id.0,
@@ -4339,7 +4565,7 @@ impl OperatorGraph {
                                 }
                             }
                             let first_observation = remaining.remove(&peer);
-                            if first_observation && remaining.is_empty() {
+                            if first_observation && remaining.is_empty() && fan_out_complete {
                                 break;
                             }
                         }
@@ -4347,61 +4573,6 @@ impl OperatorGraph {
                             cfg.receiver.stash_barrier(received);
                         }
                         std::cmp::Ordering::Less => {}
-                    }
-                }
-                hint = &mut terminal_hint => {
-                    let Some(hint) = hint? else {
-                        return Err(DbError::Checkpoint(format!(
-                            "shuffle barrier control wait exhausted the absolute deadline for checkpoint {} epoch {}",
-                            attempt.checkpoint_id, attempt.epoch
-                        )));
-                    };
-                    ignored_terminal_hint = Some((
-                        hint.epoch,
-                        hint.checkpoint_id,
-                        hint.phase,
-                    ));
-                    Self::validate_shuffle_attempt_scope(
-                        cfg,
-                        assignment_fence,
-                        recovery_gen,
-                        controller,
-                    )?;
-                    Self::ensure_shuffle_delivery_intact(cfg)?;
-                    if let Some(outcome) = Self::audit_shuffle_alignment_settlement(
-                        controller,
-                        attempt,
-                        assignment_fence,
-                    )
-                    .await?
-                    {
-                        return Ok(outcome);
-                    }
-                    check_interval.reset_at(tokio::time::Instant::now() + RECHECK);
-                    terminal_hint.set(Self::wait_for_shuffle_alignment_terminal_hint(
-                        controller,
-                        attempt,
-                        ignored_terminal_hint,
-                        deadline,
-                    ));
-                }
-                _ = check_interval.tick() => {
-                    Self::validate_shuffle_attempt_scope(
-                        cfg,
-                        assignment_fence,
-                        recovery_gen,
-                        controller,
-                    )?;
-                    Self::ensure_shuffle_delivery_intact(cfg)?;
-                    if let Some(outcome) =
-                        Self::audit_shuffle_alignment_settlement(
-                            controller,
-                            attempt,
-                            assignment_fence,
-                        )
-                        .await?
-                    {
-                        return Ok(outcome);
                     }
                 }
             }
@@ -4450,6 +4621,7 @@ impl OperatorGraph {
             return Ok(ShuffleAlignmentOutcome::Aligned);
         };
         let mut staged_graph_state = false;
+        let mut irreversible_dequeue = false;
         let alignment = tokio::time::timeout_at(deadline, async {
             if cfg.receiver.assignment_version() == 0 || cfg.sender.assignment_version() == 0 {
                 return Ok(ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging);
@@ -4473,21 +4645,28 @@ impl OperatorGraph {
             }
 
             let barrier = CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch);
-            if let Err(error) = cfg
+            let fan_out = cfg
                 .sender
-                .fan_out_barrier(&peers, barrier, assignment_fence)
-                .await
+                .fan_out_barrier(&peers, barrier, assignment_fence);
+            tokio::pin!(fan_out);
+            let (fan_out_complete, queued_work_pending) = match Self::gate_shuffle_barrier_fan_out(
+                &cfg,
+                attempt,
+                assignment_fence,
+                deadline,
+                controller,
+                recovery_gen,
+                fan_out.as_mut(),
+            )
+            .await?
             {
-                if laminar_core::shuffle::is_scope_cancelled(&error) {
-                    return Ok(ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging);
-                }
-                return Err(DbError::Pipeline(format!(
-                    "shuffle barrier fan-out: {error}"
-                )));
-            }
+                ShuffleFanOutGate::Sent => (true, false),
+                ShuffleFanOutGate::WorkReady => (false, true),
+                ShuffleFanOutGate::Terminal(outcome) => return Ok(outcome),
+            };
 
-            // Fan-out can cancel while waiting on admission. Keep holdover ownership in the
-            // receiver until every failed peer has either accepted or explicitly left the scope.
+            // Once fan-out succeeds or live input needs queue space, transfer the already bounded
+            // holdover before dequeuing later frames from the shared receive queue.
             let exposed_frontiers = cfg.receiver.drain_staged_frontiers();
             let exposed_frontiers_staged = !exposed_frontiers.is_empty();
             self.validate_received_frontier_cuts(&cfg, &exposed_frontiers)
@@ -4542,7 +4721,9 @@ impl OperatorGraph {
                 "shuffle align: start"
             );
 
-            for received in cfg.receiver.drain_staged_barriers() {
+            let staged_barriers = cfg.receiver.drain_staged_barriers();
+            irreversible_dequeue |= !staged_barriers.is_empty();
+            for received in staged_barriers {
                 Self::validate_received_shuffle_scope(
                     &received,
                     cfg.self_id.0,
@@ -4686,45 +4867,7 @@ impl OperatorGraph {
                     DbError::Pipeline(error),
                 ));
             }
-            if remaining.is_empty() {
-                Self::validate_shuffle_attempt_scope(
-                    &cfg,
-                    assignment_fence,
-                    recovery_gen,
-                    controller,
-                )
-                .map_err(|error| {
-                    Self::post_dequeue_shuffle_error(
-                        "checkpoint shuffle attempt validation after staging",
-                        error,
-                    )
-                })?;
-                Self::ensure_shuffle_delivery_intact(&cfg).map_err(|error| {
-                    Self::post_dequeue_shuffle_error(
-                        "checkpoint shuffle delivery validation after alignment",
-                        error,
-                    )
-                })?;
-                if let Some(outcome) =
-                    Self::audit_shuffle_alignment_settlement(
-                        controller,
-                        attempt,
-                        assignment_fence,
-                    )
-                    .await
-                    .map_err(|error| {
-                        Self::post_dequeue_shuffle_error(
-                            "checkpoint shuffle aligned settlement audit",
-                            error,
-                        )
-                    })?
-                {
-                    return Ok(outcome);
-                }
-                return Ok(ShuffleAlignmentOutcome::Aligned);
-            }
-
-            return self
+            self
                 .wait_for_remaining_shuffle_barriers(
                     &cfg,
                     attempt,
@@ -4736,8 +4879,12 @@ impl OperatorGraph {
                     remaining,
                     barrier_cuts,
                     &mut staged_graph_state,
+                    &mut irreversible_dequeue,
+                    queued_work_pending,
+                    fan_out_complete,
+                    fan_out.as_mut(),
                 )
-                .await;
+                .await
         })
         .await
         .map_err(|_| {
