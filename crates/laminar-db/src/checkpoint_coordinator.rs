@@ -164,6 +164,15 @@ pub enum CheckpointFailureDisposition {
     RequiresRecovery,
 }
 
+/// Determines who publishes a prepared successor sink epoch as writable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SinkEpochPublication {
+    /// Startup and direct coordinator APIs have no callback-owned transition guard.
+    Immediate,
+    /// A spawned pipeline tail publishes only after its terminal result is known successful.
+    DeferredToTail,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CheckpointResult {
     pub success: bool,
@@ -3456,6 +3465,7 @@ impl CheckpointCoordinator {
     async fn begin_sink_epoch_until(
         &mut self,
         deadline: tokio::time::Instant,
+        publication: SinkEpochPublication,
     ) -> Result<(), DbError> {
         if !self.has_checkpoint_committable_sinks() {
             return Ok(());
@@ -3491,8 +3501,93 @@ impl CheckpointCoordinator {
             .filter_map(|(name, result)| result.err().map(|error| format!("{name}: {error}")))
             .collect::<Vec<_>>();
         if failures.is_empty() {
-            self.allocator.mark_sink_epoch_ready(attempt)?;
+            let admissions = self
+                .sinks
+                .iter()
+                .filter(|sink| sink.handle.checkpoint_committable())
+                .map(|sink| {
+                    (
+                        sink.name.as_str(),
+                        sink.handle.begun_epoch_admission(attempt.epoch),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let expected = admissions.first().and_then(|(_, admission)| *admission);
+            let invalid = admissions
+                .iter()
+                .filter_map(|(name, admission)| {
+                    (*admission != expected || admission.is_none()).then_some(*name)
+                })
+                .collect::<Vec<_>>();
+            if !invalid.is_empty() {
+                for sink in self
+                    .sinks
+                    .iter()
+                    .filter(|sink| sink.handle.checkpoint_committable())
+                {
+                    sink.handle.fail_epoch_gate();
+                }
+                self.allocator.mark_sink_epoch_in_doubt(attempt);
+                self.failure_requires_recovery = true;
+                return Err(DbError::Checkpoint(format!(
+                    "sink epoch {} begin acknowledgement did not leave every gate Begun: {}",
+                    attempt.epoch,
+                    invalid.join(", ")
+                )));
+            }
+            let admission = expected.ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "sink epoch {} has no committable gate admission",
+                    attempt.epoch
+                ))
+            })?;
+            if let Err(error) = self.allocator.mark_sink_epoch_ready(attempt) {
+                for sink in self
+                    .sinks
+                    .iter()
+                    .filter(|sink| sink.handle.checkpoint_committable())
+                {
+                    sink.handle.fail_epoch_gate();
+                }
+                self.failure_requires_recovery = true;
+                return Err(error);
+            }
+            if publication == SinkEpochPublication::Immediate {
+                let mut publication_error = None;
+                for sink in self
+                    .sinks
+                    .iter()
+                    .filter(|sink| sink.handle.checkpoint_committable())
+                {
+                    if let Err(error) = sink.handle.publish_open_epoch(admission) {
+                        publication_error = Some(DbError::Checkpoint(format!(
+                            "sink '{}' epoch {} publication failed: {error}",
+                            sink.name, attempt.epoch
+                        )));
+                        break;
+                    }
+                }
+                if let Some(error) = publication_error {
+                    for sink in self
+                        .sinks
+                        .iter()
+                        .filter(|sink| sink.handle.checkpoint_committable())
+                    {
+                        sink.handle.fail_epoch_gate();
+                    }
+                    self.failure_requires_recovery = true;
+                    return Err(error);
+                }
+            }
             return Ok(());
+        }
+
+        for sink in self
+            .sinks
+            .iter()
+            .filter(|sink| sink.handle.checkpoint_committable())
+        {
+            sink.handle.fail_epoch_gate();
         }
 
         if let Err(rollback) = self.rollback_sinks_until(attempt.epoch, deadline).await {
@@ -3515,7 +3610,8 @@ impl CheckpointCoordinator {
 
     pub async fn begin_initial_epoch(&mut self) -> Result<(), DbError> {
         let deadline = tokio::time::Instant::now() + self.config.checkpoint_timeout;
-        self.begin_sink_epoch_until(deadline).await
+        self.begin_sink_epoch_until(deadline, SinkEpochPublication::Immediate)
+            .await
     }
 
     async fn allocate_attempt_until(
@@ -3552,8 +3648,67 @@ impl CheckpointCoordinator {
         if failures.is_empty() {
             Ok(())
         } else {
+            for sink in self
+                .sinks
+                .iter()
+                .filter(|sink| sink.handle.checkpoint_committable())
+            {
+                sink.handle.fail_epoch_gate();
+            }
             Err(DbError::Checkpoint(format!(
                 "sink rollback failed: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+
+    async fn seal_sink_epoch_until(
+        &self,
+        epoch: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        let results = futures::future::join_all(
+            self.sinks
+                .iter()
+                .filter(|sink| sink.handle.checkpoint_committable())
+                .map(|sink| {
+                    let name = sink.name.clone();
+                    let handle = sink.handle.clone();
+                    async move {
+                        (
+                            name,
+                            handle.seal_epoch_for_protocol_until(epoch, deadline).await,
+                        )
+                    }
+                }),
+        )
+        .await;
+        let mut admission = None;
+        let mut failures = Vec::new();
+        for (name, result) in results {
+            match result {
+                Ok(Some(current)) if admission.is_none_or(|expected| expected == current) => {
+                    admission = Some(current);
+                }
+                Ok(Some(current)) => failures.push(format!(
+                    "{name}: mismatched sink transition admission {current:?}"
+                )),
+                Ok(None) => {}
+                Err(error) => failures.push(format!("{name}: {error}")),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            for sink in self
+                .sinks
+                .iter()
+                .filter(|sink| sink.handle.checkpoint_committable())
+            {
+                sink.handle.fail_epoch_gate();
+            }
+            Err(DbError::Checkpoint(format!(
+                "sink epoch {epoch} seal failed: {}",
                 failures.join("; ")
             )))
         }
@@ -3636,6 +3791,9 @@ impl CheckpointCoordinator {
         epoch: u64,
         deadline: tokio::time::Instant,
     ) -> Result<BTreeMap<String, Option<Vec<u8>>>, DbError> {
+        // Phase one is a group boundary: no connector may enter PreCommit while a peer can still
+        // admit an epoch write. Each handle repeats this seal idempotently at command admission.
+        self.seal_sink_epoch_until(epoch, deadline).await?;
         let mut pending = self.sinks.iter();
         let mut active = FuturesUnordered::new();
         for sink in pending.by_ref().take(MAX_SINK_PHASE_ONE_CONCURRENCY) {
@@ -5155,10 +5313,15 @@ impl CheckpointCoordinator {
         assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
         leader_proof: Option<LeaderProof>,
         deadline: tokio::time::Instant,
+        sink_epoch_publication: SinkEpochPublication,
     ) -> CheckpointResult {
         #[cfg(not(feature = "cluster"))]
         let _ = flags;
-        let message = error.to_string();
+        let mut message = error.to_string();
+        if let Err(seal) = self.seal_sink_epoch_until(attempt.epoch, deadline).await {
+            self.failure_requires_recovery = true;
+            message = format!("{message}; {seal}");
+        }
         match self
             .abort_attempt_until(
                 attempt,
@@ -5185,7 +5348,9 @@ impl CheckpointCoordinator {
                 }
                 let requires_recovery = self.failure_requires_recovery;
                 let successor = if !requires_recovery && self.has_checkpoint_committable_sinks() {
-                    self.begin_sink_epoch_until(deadline).await.err()
+                    self.begin_sink_epoch_until(deadline, sink_epoch_publication)
+                        .await
+                        .err()
                 } else {
                     None
                 };
@@ -5214,6 +5379,7 @@ impl CheckpointCoordinator {
         attempt: CheckpointAttempt,
         quorum: QuorumStage,
         started: Instant,
+        sink_epoch_publication: SinkEpochPublication,
     ) -> Result<CheckpointResult, DbError> {
         require_canonical_attempt(attempt, "checkpoint admission")?;
         let flags = request.flags;
@@ -5256,6 +5422,7 @@ impl CheckpointCoordinator {
                     assignment_fence,
                     validation_proof,
                     deadline,
+                    sink_epoch_publication,
                 )
                 .await);
         }
@@ -5282,6 +5449,7 @@ impl CheckpointCoordinator {
                                 assignment_fence,
                                 validation_proof,
                                 deadline,
+                                sink_epoch_publication,
                             )
                             .await);
                     }
@@ -5315,6 +5483,7 @@ impl CheckpointCoordinator {
                             assignment_fence,
                             Some(proof),
                             deadline,
+                            sink_epoch_publication,
                         )
                         .await);
                 }
@@ -5346,6 +5515,7 @@ impl CheckpointCoordinator {
                         assignment_fence,
                         leader_proof,
                         deadline,
+                        sink_epoch_publication,
                     )
                     .await);
             }
@@ -5362,6 +5532,7 @@ impl CheckpointCoordinator {
                         assignment_fence,
                         leader_proof,
                         deadline,
+                        sink_epoch_publication,
                     )
                     .await);
             }
@@ -5378,6 +5549,7 @@ impl CheckpointCoordinator {
                         assignment_fence,
                         leader_proof,
                         deadline,
+                        sink_epoch_publication,
                     )
                     .await);
             }
@@ -5403,6 +5575,7 @@ impl CheckpointCoordinator {
                         assignment_fence,
                         leader_proof,
                         deadline,
+                        sink_epoch_publication,
                     )
                     .await);
             }
@@ -5422,6 +5595,7 @@ impl CheckpointCoordinator {
                         assignment_fence,
                         leader_proof,
                         deadline,
+                        sink_epoch_publication,
                     )
                     .await);
             }
@@ -5445,6 +5619,7 @@ impl CheckpointCoordinator {
                         assignment_fence,
                         leader_proof,
                         deadline,
+                        sink_epoch_publication,
                     )
                     .await);
             }
@@ -5470,6 +5645,7 @@ impl CheckpointCoordinator {
                         assignment_fence,
                         leader_proof,
                         deadline,
+                        sink_epoch_publication,
                     )
                     .await);
             }
@@ -5553,7 +5729,8 @@ impl CheckpointCoordinator {
                 if let Err(error) = self.clear_sink_witness_until(continuation_deadline).await {
                     Err(error)
                 } else if self.has_checkpoint_committable_sinks() {
-                    self.begin_sink_epoch_until(continuation_deadline).await
+                    self.begin_sink_epoch_until(continuation_deadline, sink_epoch_publication)
+                        .await
                 } else {
                     Ok(())
                 }
@@ -5615,11 +5792,18 @@ impl CheckpointCoordinator {
                     request.assignment_fence.clone(),
                     None,
                     deadline,
+                    SinkEpochPublication::Immediate,
                 )
                 .await);
         }
-        self.run_checkpoint_attempt(request, attempt, QuorumStage::RunInline, started)
-            .await
+        self.run_checkpoint_attempt(
+            request,
+            attempt,
+            QuorumStage::RunInline,
+            started,
+            SinkEpochPublication::Immediate,
+        )
+        .await
     }
 
     pub async fn checkpoint_with_offsets(
@@ -5636,8 +5820,14 @@ impl CheckpointCoordinator {
         quorum: QuorumStage,
         started: Instant,
     ) -> Result<CheckpointResult, DbError> {
-        self.run_checkpoint_attempt(request, attempt, quorum, started)
-            .await
+        self.run_checkpoint_attempt(
+            request,
+            attempt,
+            quorum,
+            started,
+            SinkEpochPublication::DeferredToTail,
+        )
+        .await
     }
 
     pub(crate) async fn abandon_epoch_until(
@@ -5649,6 +5839,7 @@ impl CheckpointCoordinator {
         assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
         leader_proof: Option<LeaderProof>,
         deadline: tokio::time::Instant,
+        sink_epoch_publication: SinkEpochPublication,
     ) -> Result<CheckpointResult, DbError> {
         let attempt = require_canonical_attempt(
             CheckpointAttempt::new(epoch, checkpoint_id),
@@ -5664,6 +5855,7 @@ impl CheckpointCoordinator {
                 assignment_fence,
                 leader_proof,
                 deadline,
+                sink_epoch_publication,
             )
             .await)
     }
@@ -6097,6 +6289,43 @@ impl CheckpointCoordinator {
         committed: bool,
         started: Instant,
     ) -> Result<bool, DbError> {
+        self.follower_finish_with_publication(
+            epoch,
+            checkpoint_id,
+            committed,
+            started,
+            SinkEpochPublication::Immediate,
+        )
+        .await
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn follower_finish_deferred(
+        &mut self,
+        epoch: u64,
+        checkpoint_id: u64,
+        committed: bool,
+        started: Instant,
+    ) -> Result<bool, DbError> {
+        self.follower_finish_with_publication(
+            epoch,
+            checkpoint_id,
+            committed,
+            started,
+            SinkEpochPublication::DeferredToTail,
+        )
+        .await
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn follower_finish_with_publication(
+        &mut self,
+        epoch: u64,
+        checkpoint_id: u64,
+        committed: bool,
+        started: Instant,
+        sink_epoch_publication: SinkEpochPublication,
+    ) -> Result<bool, DbError> {
         let attempt = require_canonical_attempt(
             CheckpointAttempt::new(epoch, checkpoint_id),
             "follower completion",
@@ -6184,7 +6413,8 @@ impl CheckpointCoordinator {
         )?);
         let continuation =
             if !self.failure_requires_recovery && self.has_checkpoint_committable_sinks() {
-                self.begin_sink_epoch_until(deadline).await
+                self.begin_sink_epoch_until(deadline, sink_epoch_publication)
+                    .await
             } else {
                 Ok(())
             };

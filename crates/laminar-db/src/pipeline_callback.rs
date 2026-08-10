@@ -119,23 +119,182 @@ async fn await_sink_publication<T>(
 /// at the attempt deadline must still release its manual caller and exact-attempt bookkeeping.
 const CHECKPOINT_FAILURE_REPORT_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// RAII guard that releases an epoch's admission slot on drop.
+struct SinkEpochTransition {
+    handles: Vec<(
+        crate::sink_task::SinkTaskHandle,
+        crate::sink_task::SinkEpochAdmission,
+    )>,
+}
+
+impl SinkEpochTransition {
+    fn capture_open(
+        handles: impl IntoIterator<Item = crate::sink_task::SinkTaskHandle>,
+        epoch: u64,
+    ) -> Result<Option<Self>, String> {
+        let sink_handles = handles.into_iter().collect::<Vec<_>>();
+        let mut captured = Vec::with_capacity(sink_handles.len());
+        for handle in &sink_handles {
+            match handle.open_epoch_admission(epoch) {
+                Ok(admission) => captured.push((handle.clone(), admission)),
+                Err(error) => {
+                    for handle in &sink_handles {
+                        handle.fail_epoch_gate();
+                    }
+                    return Err(format!("sink '{}' epoch capture: {error}", handle.name()));
+                }
+            }
+        }
+        let Some((_, expected)) = captured.first() else {
+            return Ok(None);
+        };
+        if captured.iter().any(|(_, admission)| admission != expected) {
+            for handle in &sink_handles {
+                handle.fail_epoch_gate();
+            }
+            return Err(format!(
+                "checkpoint epoch {epoch} sink gates have mismatched transition generations"
+            ));
+        }
+        Ok(Some(Self { handles: captured }))
+    }
+
+    async fn seal_until(&mut self, deadline: tokio::time::Instant) -> Result<(), String> {
+        // Pipeline publication owns `&mut PipelineCallback`, so no normal producer can race the
+        // earlier sink Sync/capture. Admission still linearizes direct handle users with each
+        // exact close, and the actor's Prepared phase is the final protocol backstop.
+        for (handle, admission) in &mut self.handles {
+            *admission = handle
+                .seal_epoch_until(*admission, deadline)
+                .await
+                .map_err(|error| format!("sink '{}' epoch seal failed: {error}", handle.name()))?;
+        }
+        let expected = self.handles.first().map(|(_, admission)| *admission);
+        if self
+            .handles
+            .iter()
+            .any(|(_, admission)| Some(*admission) != expected)
+        {
+            return Err("sink epoch seals produced mismatched transition generations".into());
+        }
+        Ok(())
+    }
+
+    fn publish_successor(&mut self) -> Result<(), String> {
+        let admissions = self
+            .handles
+            .iter()
+            .map(|(handle, sealed)| {
+                let begun = handle.current_begun_epoch_admission().ok_or_else(|| {
+                    format!(
+                        "sink '{}' has no prepared successor for sealed epoch {}",
+                        handle.name(),
+                        sealed.epoch
+                    )
+                })?;
+                if begun.generation != sealed.generation {
+                    return Err(format!(
+                        "sink '{}' successor generation {} does not match sealed generation {}",
+                        handle.name(),
+                        begun.generation,
+                        sealed.generation
+                    ));
+                }
+                Ok(begun)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let expected = admissions
+            .first()
+            .copied()
+            .ok_or_else(|| "checkpoint-committable sink transition has no handles".to_string())?;
+        if admissions.iter().any(|admission| *admission != expected) {
+            return Err("prepared successor sink gates do not share one exact admission".into());
+        }
+        for ((handle, _), admission) in self.handles.iter().zip(admissions) {
+            handle.publish_open_epoch(admission).map_err(|error| {
+                format!("sink '{}' successor publication: {error}", handle.name())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn fail(&self) {
+        for (handle, admission) in &self.handles {
+            handle.fail_epoch_transition(*admission);
+        }
+    }
+}
+
+/// RAII guard that fails an unresolved sink transition before releasing epoch admission.
 struct EpochInFlightGuard {
     in_flight: Arc<std::sync::atomic::AtomicU64>,
+    sink_transition: Option<SinkEpochTransition>,
+    checkpoint_fault: Arc<parking_lot::Mutex<Option<String>>>,
+    attempt: CheckpointAttempt,
 }
 
 impl EpochInFlightGuard {
     /// Claim one admission slot.
-    fn claim(in_flight: &Arc<std::sync::atomic::AtomicU64>) -> Self {
+    fn claim(
+        in_flight: &Arc<std::sync::atomic::AtomicU64>,
+        checkpoint_fault: &Arc<parking_lot::Mutex<Option<String>>>,
+        attempt: CheckpointAttempt,
+        sink_handles: impl IntoIterator<Item = crate::sink_task::SinkTaskHandle>,
+    ) -> Result<Self, String> {
+        let sink_transition = SinkEpochTransition::capture_open(sink_handles, attempt.epoch)?;
         in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        Self {
+        Ok(Self {
             in_flight: Arc::clone(in_flight),
+            sink_transition,
+            checkpoint_fault: Arc::clone(checkpoint_fault),
+            attempt,
+        })
+    }
+
+    async fn seal_sink_epoch_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        if let Some(transition) = self.sink_transition.as_mut() {
+            transition.seal_until(deadline).await?;
+        }
+        Ok(())
+    }
+
+    fn publish_successor(&mut self) -> Result<(), String> {
+        let Some(transition) = self.sink_transition.as_mut() else {
+            return Ok(());
+        };
+        if let Err(error) = transition.publish_successor() {
+            transition.fail();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn disarm_sink_epoch(&mut self) {
+        self.sink_transition = None;
+    }
+
+    fn fail_sink_epoch(&mut self, reason: impl Into<String>) {
+        if let Some(transition) = self.sink_transition.take() {
+            transition.fail();
+            set_checkpoint_fault(&self.checkpoint_fault, reason);
         }
     }
 }
 
 impl Drop for EpochInFlightGuard {
     fn drop(&mut self) {
+        if let Some(transition) = self.sink_transition.take() {
+            transition.fail();
+            set_checkpoint_fault(
+                &self.checkpoint_fault,
+                format!(
+                    "checkpoint {} epoch {} ended without publishing a writable successor sink epoch",
+                    self.attempt.checkpoint_id, self.attempt.epoch
+                ),
+            );
+        }
         self.in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
@@ -143,7 +302,7 @@ impl Drop for EpochInFlightGuard {
 
 /// State for the leader's spawned durable tail.
 struct LeaderTail {
-    _in_flight: EpochInFlightGuard,
+    in_flight: EpochInFlightGuard,
     coordinator:
         Arc<tokio::sync::Mutex<Option<crate::checkpoint_coordinator::CheckpointCoordinator>>>,
     complete_tx: crossfire::MAsyncTx<crossfire::mpsc::Array<CheckpointCompletion>>,
@@ -210,7 +369,7 @@ fn validate_durable_source_checkpoint_roster(
 /// Captured follower state and the runtime handles that own its decision-led durable tail.
 #[cfg(feature = "cluster")]
 struct FollowerDurableTail {
-    _in_flight: EpochInFlightGuard,
+    in_flight: EpochInFlightGuard,
     coordinator:
         Arc<tokio::sync::Mutex<Option<crate::checkpoint_coordinator::CheckpointCoordinator>>>,
     state: Arc<FollowerTailState>,
@@ -345,6 +504,7 @@ async fn cleanup_reserved_attempt_until(
     assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
     leader_proof: Option<laminar_core::checkpoint::LeaderProof>,
     deadline: tokio::time::Instant,
+    sink_epoch_publication: crate::checkpoint_coordinator::SinkEpochPublication,
 ) -> Result<(), String> {
     tokio::time::timeout_at(deadline, async {
         let mut guard = coordinator.lock().await;
@@ -363,6 +523,7 @@ async fn cleanup_reserved_attempt_until(
                 assignment_fence,
                 leader_proof,
                 deadline,
+                sink_epoch_publication,
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -448,6 +609,7 @@ async fn fail_reserved_leader_attempt(
     cleanup_reason: String,
 ) {
     let attempt = tail.attempt;
+    tail.in_flight.fail_sink_epoch(terminal_error.clone());
     if tail.fault_on_retryable_failure {
         set_checkpoint_fault(&tail.checkpoint_fault, terminal_error.clone());
     }
@@ -476,6 +638,7 @@ async fn fail_reserved_leader_attempt(
         assignment_fence,
         leader_proof,
         cleanup_deadline,
+        crate::checkpoint_coordinator::SinkEpochPublication::DeferredToTail,
     );
 
     let ((), cleanup_result) = tokio::join!(report, cleanup);
@@ -654,7 +817,7 @@ impl OperatorStateCapture {
 }
 
 /// Immutable operator image captured at the aligned cut. Encoding is deliberately deferred to
-/// the durable tail so at-least-once sources can resume while Arrow IPC and rkyv run off-thread.
+/// the spawned durable tail so the callback can resume while Arrow IPC and rkyv run off-thread.
 struct CapturedOperatorState {
     image: OperatorStateCapture,
     estimated_bytes: u64,
@@ -1078,10 +1241,10 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) named_stream_names: rustc_hash::FxHashSet<Arc<str>>,
     pub(crate) checkpoint_complete_tx:
         crossfire::MAsyncTx<crossfire::mpsc::Array<CheckpointCompletion>>,
-    /// Existing database-owned I/O runtime used by asynchronous ALO checkpoint tails.
+    /// Existing database-owned I/O runtime used by spawned checkpoint tails.
     pub(crate) checkpoint_tail_runtime: tokio::runtime::Handle,
-    /// Every asynchronous ALO checkpoint tail. `JoinSet` keeps shutdown from racing state/sink
-    /// work that has not reached a terminal result.
+    /// Every spawned checkpoint tail. `JoinSet` keeps shutdown from racing state/sink work that
+    /// has not reached a terminal result.
     pub(crate) checkpoint_tail_tasks: tokio::task::JoinSet<()>,
     /// In-flight epoch count; the coordinator serializes durable checkpoint tails.
     pub(crate) checkpoint_in_flight: Arc<std::sync::atomic::AtomicU64>,
@@ -1093,8 +1256,7 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) epoch_allocator: Option<Arc<crate::checkpoint_coordinator::EpochAllocator>>,
     #[cfg(feature = "cluster")]
     pub(crate) quorum_timeout: Duration,
-    /// When true, durable tails run inline so post-barrier rows cannot enter an epoch-N open
-    /// transaction or staged descriptor.
+    /// Whether checkpoint attempts consume a committable sink epoch reservation.
     pub(crate) checkpoint_committable_sinks: bool,
     /// Cluster startup/recovery fence. While set, neither source nor shuffle input may be folded.
     pub(crate) intake_gate: Arc<std::sync::atomic::AtomicBool>,
@@ -1637,6 +1799,7 @@ impl ConnectorPipelineCallback {
                         .as_deref()
                         .unwrap_or("unknown checkpoint failure")
                 );
+                tail.in_flight.fail_sink_epoch(terminal_error.clone());
                 if checkpoint_failure_requires_pipeline_fault(
                     &result,
                     tail.fault_on_retryable_failure,
@@ -1656,6 +1819,7 @@ impl ConnectorPipelineCallback {
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 tracing::warn!(%error, "Barrier-aligned checkpoint error");
                 let terminal_error = error.to_string();
+                tail.in_flight.fail_sink_epoch(terminal_error.clone());
                 if tail.fault_on_unclassified_error {
                     set_checkpoint_fault(&tail.checkpoint_fault, terminal_error.clone());
                 }
@@ -1674,7 +1838,7 @@ impl ConnectorPipelineCallback {
         tail: &mut LeaderTail,
         result: crate::checkpoint_coordinator::CheckpointResult,
     ) {
-        let continuation_error = result.continuation_error().map(str::to_owned);
+        let mut continuation_error = result.continuation_error().map(str::to_owned);
         match CheckpointCompletion::validated(
             tail.attempt,
             result,
@@ -1682,6 +1846,16 @@ impl ConnectorPipelineCallback {
             tail.handoff_replay_pending,
         ) {
             Ok(completion) => {
+                if let Some(error) = continuation_error.as_ref() {
+                    tail.in_flight.fail_sink_epoch(error.clone());
+                } else if let Err(error) = tail.in_flight.publish_successor() {
+                    let error = format!(
+                        "checkpoint {} epoch {} committed, but successor sink publication failed: {error}",
+                        tail.attempt.checkpoint_id, tail.attempt.epoch
+                    );
+                    set_checkpoint_fault(&tail.checkpoint_fault, error.clone());
+                    continuation_error = Some(error);
+                }
                 if let Some(guard) = tail.mutable_operator_capture_guard.as_mut() {
                     guard.disarm();
                 }
@@ -1702,10 +1876,10 @@ impl ConnectorPipelineCallback {
                     );
                     return;
                 }
-                // Completion is enqueued first so the durable source cut is acknowledged before a
-                // successor-epoch continuation fault fences further writes.
                 if let Some(error) = continuation_error {
                     set_checkpoint_fault(&tail.checkpoint_fault, error);
+                } else {
+                    tail.in_flight.disarm_sink_epoch();
                 }
             }
             Err(reason) => {
@@ -1713,6 +1887,7 @@ impl ConnectorPipelineCallback {
                     error = %reason,
                     "[LDB-6048] refusing mismatched checkpoint completion"
                 );
+                tail.in_flight.fail_sink_epoch(reason.clone());
                 set_checkpoint_fault(&tail.checkpoint_fault, reason.clone());
                 deliver_checkpoint_failure(
                     &tail.complete_tx,
@@ -1725,9 +1900,7 @@ impl ConnectorPipelineCallback {
         }
     }
 
-    /// Build the follower's durable tail future (ack → prepare → decision wait → 2PC).
-    ///
-    /// Spawned for at-least-once (resumes on `Aligned`) or awaited inline for exactly-once.
+    /// Build the follower's durable tail (ack → prepare → decision wait → 2PC).
     #[cfg(feature = "cluster")]
     fn follower_tail_future(
         &mut self,
@@ -1736,7 +1909,7 @@ impl ConnectorPipelineCallback {
         identity: CertifiedCheckpointAttempt,
         fan_out: FxHashMap<String, SourceCheckpoint>,
         attempt_started: std::time::Instant,
-    ) -> Result<impl std::future::Future<Output = ()> + Send + 'static, String> {
+    ) -> Result<FollowerDurableTail, String> {
         let assignment_fence = request.assignment_fence.clone().ok_or_else(|| {
             "[LDB-6055] follower durable tail has no assignment certificate".to_string()
         })?;
@@ -1770,9 +1943,17 @@ impl ConnectorPipelineCallback {
             );
         }
 
-        let in_flight = EpochInFlightGuard::claim(&self.checkpoint_in_flight);
+        let in_flight = EpochInFlightGuard::claim(
+            &self.checkpoint_in_flight,
+            &self.checkpoint_fault,
+            attempt,
+            self.sinks
+                .iter()
+                .filter(|(_, handle, _, _, _)| handle.checkpoint_committable())
+                .map(|(_, handle, _, _, _)| handle.clone()),
+        )?;
         let tail = FollowerDurableTail {
-            _in_flight: in_flight,
+            in_flight,
             coordinator: Arc::clone(&self.coordinator),
             state: Arc::clone(&self.follower_tail),
             complete_tx: self.checkpoint_complete_tx.clone(),
@@ -1794,7 +1975,7 @@ impl ConnectorPipelineCallback {
             serialization_timeout: self.serialization_timeout,
             checkpoint_cleanup_timeout: self.checkpoint_cleanup_timeout,
         };
-        Ok(Self::run_follower_tail(tail))
+        Ok(tail)
     }
 
     #[cfg(feature = "cluster")]
@@ -1861,6 +2042,7 @@ impl ConnectorPipelineCallback {
         error: String,
         deadline: tokio::time::Instant,
     ) {
+        tail.in_flight.fail_sink_epoch(error.clone());
         let controller = tail.controller.clone();
         let checkpoint_fault = Arc::clone(&tail.checkpoint_fault);
         let state = Arc::clone(&tail.state);
@@ -1990,7 +2172,7 @@ impl ConnectorPipelineCallback {
                 )
             })?;
             let committed = coordinator
-                .follower_finish(
+                .follower_finish_deferred(
                     attempt.epoch,
                     attempt.checkpoint_id,
                     committed,
@@ -2019,6 +2201,9 @@ impl ConnectorPipelineCallback {
             Ok(Some(committed)) => committed,
             Ok(None) => {
                 let Err(error) = outcome else {
+                    tail.in_flight.fail_sink_epoch(
+                        "follower terminal bookkeeping lost an authoritative outcome",
+                    );
                     set_checkpoint_fault(
                         &tail.checkpoint_fault,
                         "follower terminal bookkeeping lost an authoritative outcome",
@@ -2031,13 +2216,36 @@ impl ConnectorPipelineCallback {
                     %error,
                     "follower checkpoint is in-doubt; faulting pipeline",
                 );
+                tail.in_flight.fail_sink_epoch(error.to_string());
                 set_checkpoint_fault(&tail.checkpoint_fault, error.to_string());
                 return;
             }
             Err(error) => {
+                tail.in_flight.fail_sink_epoch(error.clone());
                 set_checkpoint_fault(&tail.checkpoint_fault, error);
                 return;
             }
+        };
+        let successor_published = if committed {
+            match tail.in_flight.publish_successor() {
+                Ok(()) => true,
+                Err(error) => {
+                    set_checkpoint_fault(
+                        &tail.checkpoint_fault,
+                        format!(
+                            "follower checkpoint {} epoch {} committed, but successor sink publication failed: {error}",
+                            attempt.checkpoint_id, attempt.epoch
+                        ),
+                    );
+                    false
+                }
+            }
+        } else {
+            tail.in_flight.fail_sink_epoch(format!(
+                "follower checkpoint {} epoch {} aborted",
+                attempt.checkpoint_id, attempt.epoch
+            ));
+            false
         };
         if committed {
             if let Some(guard) = tail.mutable_operator_capture_guard.as_mut() {
@@ -2056,7 +2264,9 @@ impl ConnectorPipelineCallback {
             CheckpointCompletion::failed(attempt, "checkpoint aborted by the cluster leader")
         };
         let report_deadline = tokio::time::Instant::now() + CHECKPOINT_FAILURE_REPORT_TIMEOUT;
-        if !deliver_checkpoint_completion(&tail.complete_tx, completion, report_deadline).await {
+        let reported =
+            deliver_checkpoint_completion(&tail.complete_tx, completion, report_deadline).await;
+        if !reported {
             set_checkpoint_fault(
                 &tail.checkpoint_fault,
                 format!(
@@ -2065,6 +2275,9 @@ impl ConnectorPipelineCallback {
                     attempt.checkpoint_id, attempt.epoch, CHECKPOINT_FAILURE_REPORT_TIMEOUT,
                 ),
             );
+        }
+        if reported && successor_published {
+            tail.in_flight.disarm_sink_epoch();
         }
         if !committed {
             // Follower capture is destructive; every uncommitted outcome must re-base FULL next.
@@ -3101,7 +3314,7 @@ impl ConnectorPipelineCallback {
         }
 
         let has_shuffle = self.graph.cluster_shuffle_config().is_some();
-        let tail = match self.follower_tail_future(
+        let mut tail = match self.follower_tail_future(
             request,
             operator_state,
             identity.clone(),
@@ -3110,38 +3323,45 @@ impl ConnectorPipelineCallback {
         ) {
             Ok(tail) => tail,
             Err(error) => {
+                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
                 drop(checkpoint_rotation_guard);
                 return self.fail_pending_follower_control(attempt, error).await;
             }
         };
+        if let Err(error) = tail.in_flight.seal_sink_epoch_until(attempt_deadline).await {
+            drop(checkpoint_rotation_guard);
+            Self::fail_follower_tail_before_prepare(
+                &mut tail,
+                format!("follower sink epoch seal failed: {error}"),
+                attempt_deadline,
+            )
+            .await;
+            return CheckpointControlOutcome::Failed { attempt, error };
+        }
         drop(checkpoint_rotation_guard);
         if let Err(error) = self.clear_pending_follower_checkpoint(attempt) {
             set_checkpoint_fault(&self.checkpoint_fault, error.clone());
             return CheckpointControlOutcome::Failed { attempt, error };
         }
         barrier_timing.finish_local_barrier_with_handoff();
-        if self.checkpoint_committable_sinks {
-            tail.await;
-        } else {
-            self.spawn_checkpoint_tail(tail);
-            if has_shuffle {
-                barrier_timing.begin_aligned_resume();
-            }
-            let aligned = Self::wait_for_aligned_resume_until(
-                has_shuffle,
-                &controller,
-                identity,
-                assignment_fence,
-                self.quorum_timeout,
-                attempt_deadline,
-            )
-            .await;
-            if has_shuffle {
-                barrier_timing.finish_aligned_resume();
-            }
-            if let Err(error) = aligned {
-                set_checkpoint_fault(&self.checkpoint_fault, error);
-            }
+        self.spawn_checkpoint_tail(Self::run_follower_tail(tail));
+        if has_shuffle {
+            barrier_timing.begin_aligned_resume();
+        }
+        let aligned = Self::wait_for_aligned_resume_until(
+            has_shuffle,
+            &controller,
+            identity,
+            assignment_fence,
+            self.quorum_timeout,
+            attempt_deadline,
+        )
+        .await;
+        if has_shuffle {
+            barrier_timing.finish_aligned_resume();
+        }
+        if let Err(error) = aligned {
+            set_checkpoint_fault(&self.checkpoint_fault, error);
         }
         CheckpointControlOutcome::Started {
             attempt,
@@ -3289,7 +3509,7 @@ impl ConnectorPipelineCallback {
         }
 
         let has_shuffle = self.graph.cluster_shuffle_config().is_some();
-        let tail = match self.follower_tail_future(
+        let mut tail = match self.follower_tail_future(
             request,
             operator_state,
             identity.clone(),
@@ -3299,33 +3519,40 @@ impl ConnectorPipelineCallback {
             Ok(tail) => tail,
             Err(error) => {
                 tracing::warn!(%error, "follower deferred checkpoint tail construction failed");
+                set_checkpoint_fault(&self.checkpoint_fault, error);
                 return BarrierOutcome::Failed;
             }
         };
-        drop(checkpoint_rotation_guard);
-        barrier_timing.finish_local_barrier_with_handoff();
-        if self.checkpoint_committable_sinks {
-            tail.await;
-        } else {
-            self.spawn_checkpoint_tail(tail);
-            if has_shuffle {
-                barrier_timing.begin_aligned_resume();
-            }
-            let aligned = Self::wait_for_aligned_resume_until(
-                has_shuffle,
-                &controller,
-                identity,
-                assignment_fence,
-                self.quorum_timeout,
+        if let Err(error) = tail.in_flight.seal_sink_epoch_until(attempt_deadline).await {
+            drop(checkpoint_rotation_guard);
+            Self::fail_follower_tail_before_prepare(
+                &mut tail,
+                format!("deferred follower sink epoch seal failed: {error}"),
                 attempt_deadline,
             )
             .await;
-            if has_shuffle {
-                barrier_timing.finish_aligned_resume();
-            }
-            if let Err(error) = aligned {
-                set_checkpoint_fault(&self.checkpoint_fault, error);
-            }
+            return BarrierOutcome::Failed;
+        }
+        drop(checkpoint_rotation_guard);
+        barrier_timing.finish_local_barrier_with_handoff();
+        self.spawn_checkpoint_tail(Self::run_follower_tail(tail));
+        if has_shuffle {
+            barrier_timing.begin_aligned_resume();
+        }
+        let aligned = Self::wait_for_aligned_resume_until(
+            has_shuffle,
+            &controller,
+            identity,
+            assignment_fence,
+            self.quorum_timeout,
+            attempt_deadline,
+        )
+        .await;
+        if has_shuffle {
+            barrier_timing.finish_aligned_resume();
+        }
+        if let Err(error) = aligned {
+            set_checkpoint_fault(&self.checkpoint_fault, error);
         }
         BarrierOutcome::Async
     }
@@ -3442,6 +3669,7 @@ impl ConnectorPipelineCallback {
             assignment_fence,
             leader_proof,
             deadline,
+            crate::checkpoint_coordinator::SinkEpochPublication::Immediate,
         );
         let cleanup_result = cleanup_result.await;
         if let Err(error) = cleanup_result {
@@ -4914,6 +5142,57 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     ) -> Result<(), crate::pipeline::CycleError> {
         #[cfg(feature = "cluster")]
         let controller = self.cluster_controller.clone();
+        let has_committable_output = self.sinks.iter().any(|(_, handle, _, sink_input, _)| {
+            handle.checkpoint_committable()
+                && results
+                    .get(sink_input.as_str())
+                    .is_some_and(|batches| !batches.is_empty())
+        });
+        if has_committable_output {
+            let gate_result: Result<(), String> = 'gate: {
+                let mut group_admission = None;
+                for (sink_name, handle, _, _, _) in self
+                    .sinks
+                    .iter()
+                    .filter(|(_, handle, _, _, _)| handle.checkpoint_committable())
+                {
+                    let gate = handle.wait_for_write_gate_until(deadline);
+                    let observed = await_sink_publication(
+                        #[cfg(feature = "cluster")]
+                        controller.as_deref(),
+                        deadline,
+                        "coordinated sink epoch gate",
+                        gate,
+                    )
+                    .await;
+                    let admission = match observed {
+                        Ok(Ok(Some(admission))) => admission,
+                        Ok(Ok(None)) => {
+                            break 'gate Err(format!(
+                                "checkpoint-committable sink '{sink_name}' has no epoch gate"
+                            ))
+                        }
+                        Ok(Err(error)) => {
+                            break 'gate Err(format!(
+                                "sink '{sink_name}' epoch gate failed: {error}"
+                            ))
+                        }
+                        Err(error) => break 'gate Err(error),
+                    };
+                    if group_admission.is_some_and(|expected| expected != admission) {
+                        break 'gate Err(format!(
+                            "checkpoint-committable sink '{sink_name}' opened admission {admission:?}, which does not match group admission {group_admission:?}"
+                        ));
+                    }
+                    group_admission = Some(admission);
+                }
+                Ok(())
+            };
+            if let Err(error) = gate_result {
+                self.record_dropped_sink_write(error.clone());
+                return Err(crate::pipeline::CycleError::Recovery(error));
+            }
+        }
         let compile = self.compile_pending_sink_filters(results);
         let compile_result = await_sink_publication(
             #[cfg(feature = "cluster")]
@@ -5785,6 +6064,24 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             tracing::warn!(%error);
             return BarrierOutcome::Failed;
         }
+        let in_flight = match EpochInFlightGuard::claim(
+            &self.checkpoint_in_flight,
+            &self.checkpoint_fault,
+            attempt,
+            self.sinks
+                .iter()
+                .filter(|(_, handle, _, _, _)| handle.checkpoint_committable())
+                .map(|(_, handle, _, _, _)| handle.clone()),
+        ) {
+            Ok(guard) => guard,
+            Err(error) => {
+                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+                let _ = self
+                    .abandon_reserved_attempt(attempt, error, flags, assignment_fence.clone())
+                    .await;
+                return BarrierOutcome::Failed;
+            }
+        };
         #[cfg(feature = "cluster")]
         drop(checkpoint_rotation_guard);
         #[cfg(feature = "cluster")]
@@ -5809,10 +6106,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     )
                 });
         request.assignment_fence = assignment_fence;
-
-        let in_flight = EpochInFlightGuard::claim(&self.checkpoint_in_flight);
-        let tail = LeaderTail {
-            _in_flight: in_flight,
+        let mut tail = LeaderTail {
+            in_flight,
             coordinator: Arc::clone(&self.coordinator),
             complete_tx: self.checkpoint_complete_tx.clone(),
             request,
@@ -5840,6 +6135,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             quorum_timeout: self.quorum_timeout,
             full_vnode_capture_needed: Arc::clone(&self.full_vnode_capture_needed),
         };
+        if let Err(error) = tail.in_flight.seal_sink_epoch_until(attempt_deadline).await {
+            let error = format!("leader sink epoch seal failed: {error}");
+            fail_reserved_leader_attempt(&mut tail, error.clone(), error).await;
+            return BarrierOutcome::Failed;
+        }
         #[cfg(feature = "cluster")]
         if let Some(timing) = barrier_timing.as_mut() {
             timing.finish_local_barrier_with_handoff();
@@ -5848,41 +6148,37 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
         #[cfg(not(feature = "cluster"))]
         drop(local_barrier_timer);
-        if self.checkpoint_committable_sinks {
-            Self::run_leader_tail(tail).await;
-        } else {
-            self.spawn_checkpoint_tail(Self::run_leader_tail(tail));
+        self.spawn_checkpoint_tail(Self::run_leader_tail(tail));
 
-            #[cfg(feature = "cluster")]
-            if let (Some(cc), Some((identity, assignment_fence))) =
-                (self.cluster_controller.clone(), resume_certificate)
-            {
-                let has_shuffle = self.graph.cluster_shuffle_config().is_some();
-                if has_shuffle {
-                    if let Some(timing) = barrier_timing.as_mut() {
-                        timing.begin_aligned_resume();
-                    }
+        #[cfg(feature = "cluster")]
+        if let (Some(cc), Some((identity, assignment_fence))) =
+            (self.cluster_controller.clone(), resume_certificate)
+        {
+            let has_shuffle = self.graph.cluster_shuffle_config().is_some();
+            if has_shuffle {
+                if let Some(timing) = barrier_timing.as_mut() {
+                    timing.begin_aligned_resume();
                 }
-                let resume_timer = (has_shuffle && barrier_timing.is_none())
-                    .then(|| self.prom.checkpoint_aligned_resume_wait.start_timer());
-                let aligned = Self::wait_for_aligned_resume_until(
-                    has_shuffle,
-                    &cc,
-                    identity,
-                    &assignment_fence,
-                    self.quorum_timeout,
-                    attempt_deadline,
-                )
-                .await;
-                if has_shuffle {
-                    if let Some(timing) = barrier_timing.as_mut() {
-                        timing.finish_aligned_resume();
-                    }
+            }
+            let resume_timer = (has_shuffle && barrier_timing.is_none())
+                .then(|| self.prom.checkpoint_aligned_resume_wait.start_timer());
+            let aligned = Self::wait_for_aligned_resume_until(
+                has_shuffle,
+                &cc,
+                identity,
+                &assignment_fence,
+                self.quorum_timeout,
+                attempt_deadline,
+            )
+            .await;
+            if has_shuffle {
+                if let Some(timing) = barrier_timing.as_mut() {
+                    timing.finish_aligned_resume();
                 }
-                drop(resume_timer);
-                if let Err(error) = aligned {
-                    set_checkpoint_fault(&self.checkpoint_fault, error);
-                }
+            }
+            drop(resume_timer);
+            if let Err(error) = aligned {
+                set_checkpoint_fault(&self.checkpoint_fault, error);
             }
         }
         BarrierOutcome::Async

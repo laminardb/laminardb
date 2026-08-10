@@ -85,9 +85,9 @@ pub struct EngineMetrics {
     pub checkpoint_duration: Histogram,
     /// Synchronous mutable checkpoint-state capture duration.
     pub checkpoint_state_capture_duration: Histogram,
-    /// Pipeline stall per barrier: sink write fence, shuffle alignment, state capture, and the
-    /// Aligned resume gate. Exactly-once mode also includes its inline durable tail; other modes
-    /// resume at Aligned while that tail remains supervised in the background.
+    /// Pipeline stall per barrier: sink write fence, shuffle alignment, state capture, durable-tail
+    /// handoff, and the Aligned resume gate. Every durable tail remains supervised in the
+    /// background; committable sink writes wait on its exact successor-epoch gate.
     pub checkpoint_pipeline_stall_duration: Histogram,
     /// Local barrier work while the pipeline is paused: sink fencing, shuffle alignment, state
     /// capture, and construction of the immutable durable-tail handoff.

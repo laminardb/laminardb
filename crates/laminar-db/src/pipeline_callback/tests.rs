@@ -319,44 +319,6 @@ fn install_checkpoint_rotation_fence_audit(
     (fence, whole_capture_observed, vnode_capture_observed)
 }
 
-#[cfg(feature = "cluster")]
-async fn assignment_writer_after_checkpoint_tail_handoff<F>(
-    route: &str,
-    mut checkpoint: std::pin::Pin<&mut F>,
-    checkpoint_in_flight: &std::sync::atomic::AtomicU64,
-    rotation_fence: &Arc<tokio::sync::RwLock<()>>,
-) -> tokio::sync::OwnedRwLockWriteGuard<()>
-where
-    F: std::future::Future + ?Sized,
-{
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if checkpoint_in_flight.load(std::sync::atomic::Ordering::Acquire) == 1 {
-                break;
-            }
-            tokio::select! {
-                _ = checkpoint.as_mut() => {
-                    panic!("{route} completed before its durable tail blocked")
-                }
-                () = tokio::task::yield_now() => {}
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("{route} did not hand off its durable tail"));
-
-    tokio::time::timeout(Duration::from_secs(1), async {
-        tokio::select! {
-            guard = Arc::clone(rotation_fence).write_owned() => guard,
-            _ = checkpoint.as_mut() => {
-                panic!("{route} completed before the blocked tail released")
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("{route} retained the rotation token in its durable tail"))
-}
-
 fn empty_callback_fixture() -> ConnectorPipelineCallback {
     let (_sink_event_tx, sink_event_rx) =
         laminar_core::streaming::channel::channel::<crate::sink_task::SinkEvent>(1);
@@ -1078,20 +1040,22 @@ async fn source_less_immediate_follower_holds_rotation_fence_through_capture() {
         FxHashMap::default(),
     );
     tokio::pin!(checkpoint);
-    let assignment_writer = assignment_writer_after_checkpoint_tail_handoff(
-        "immediate follower",
-        checkpoint.as_mut(),
-        &checkpoint_in_flight,
-        &rotation_fence,
-    )
-    .await;
-    assert!(whole_capture_observed.load(std::sync::atomic::Ordering::Acquire));
-    assert!(vnode_capture_observed.load(std::sync::atomic::Ordering::Acquire));
-
-    drop(coordinator_guard);
     let outcome = tokio::time::timeout(Duration::from_secs(1), &mut checkpoint)
         .await
-        .expect("immediate follower tail did not finish after coordinator release");
+        .expect("immediate follower did not return after spawning its durable tail");
+    assert_eq!(
+        checkpoint_in_flight.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the spawned follower tail must retain exact-attempt ownership"
+    );
+    let assignment_writer = tokio::time::timeout(
+        Duration::from_secs(1),
+        Arc::clone(&rotation_fence).write_owned(),
+    )
+    .await
+    .expect("immediate follower retained the rotation token after capture");
+    assert!(whole_capture_observed.load(std::sync::atomic::Ordering::Acquire));
+    assert!(vnode_capture_observed.load(std::sync::atomic::Ordering::Acquire));
     assert!(matches!(
         outcome,
         crate::pipeline::CheckpointControlOutcome::Started {
@@ -1100,6 +1064,7 @@ async fn source_less_immediate_follower_holds_rotation_fence_through_capture() {
             flags: laminar_core::checkpoint::flags::NONE,
         } if observed == attempt
     ));
+    drop(coordinator_guard);
     drop(assignment_writer);
 }
 
@@ -1158,21 +1123,24 @@ async fn retained_follower_capture_keeps_ownership_after_promotion() {
         laminar_core::checkpoint::flags::NONE,
         None,
     ));
-    let assignment_writer = assignment_writer_after_checkpoint_tail_handoff(
-        "deferred follower",
-        checkpoint.as_mut(),
-        &checkpoint_in_flight,
-        &rotation_fence,
-    )
-    .await;
-    assert!(whole_capture_observed.load(std::sync::atomic::Ordering::Acquire));
-    assert!(vnode_capture_observed.load(std::sync::atomic::Ordering::Acquire));
-
-    drop(coordinator_guard);
     let outcome = tokio::time::timeout(Duration::from_secs(1), &mut checkpoint)
         .await
-        .expect("deferred follower tail did not finish after coordinator release");
+        .expect("deferred follower did not return after spawning its durable tail");
+    assert_eq!(
+        checkpoint_in_flight.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the spawned deferred tail must retain exact-attempt ownership"
+    );
+    let assignment_writer = tokio::time::timeout(
+        Duration::from_secs(1),
+        Arc::clone(&rotation_fence).write_owned(),
+    )
+    .await
+    .expect("deferred follower retained the rotation token after capture");
+    assert!(whole_capture_observed.load(std::sync::atomic::Ordering::Acquire));
+    assert!(vnode_capture_observed.load(std::sync::atomic::Ordering::Acquire));
     assert!(matches!(outcome, crate::pipeline::BarrierOutcome::Async));
+    drop(coordinator_guard);
     drop(assignment_writer);
     drop(checkpoint);
     assert!(fixture.callback.pending_follower_checkpoint.is_none());
@@ -2320,7 +2288,13 @@ async fn unclassified_checkpoint_tail_error_faults_only_durable_delivery() {
         let checkpoint_fault = Arc::new(parking_lot::Mutex::new(None));
         let full_vnode_capture_needed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut tail = LeaderTail {
-            _in_flight: EpochInFlightGuard::claim(&in_flight),
+            in_flight: EpochInFlightGuard::claim(
+                &in_flight,
+                &checkpoint_fault,
+                CheckpointAttempt::canonical(7),
+                std::iter::empty(),
+            )
+            .unwrap(),
             coordinator: Arc::new(tokio::sync::Mutex::new(None)),
             complete_tx,
             request: crate::checkpoint_coordinator::CheckpointRequest::default(),
@@ -2624,6 +2598,7 @@ async fn reserved_attempt_cleanup_deadline_includes_coordinator_lock() {
         None,
         None,
         deadline,
+        crate::checkpoint_coordinator::SinkEpochPublication::Immediate,
     )
     .await
     .unwrap_err();
@@ -3500,10 +3475,17 @@ async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement() {
     let (complete_tx, _complete_rx) =
         crossfire::mpsc::bounded_async::<crate::pipeline::CheckpointCompletion>(1);
     let in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let checkpoint_fault = Arc::new(parking_lot::Mutex::new(None));
     let mut request = crate::checkpoint_coordinator::CheckpointRequest::default();
     request.assignment_fence = Some(fence.clone());
     let mut tail = LeaderTail {
-        _in_flight: EpochInFlightGuard::claim(&in_flight),
+        in_flight: EpochInFlightGuard::claim(
+            &in_flight,
+            &checkpoint_fault,
+            attempt,
+            std::iter::empty(),
+        )
+        .unwrap(),
         coordinator,
         complete_tx,
         request,
@@ -3520,7 +3502,7 @@ async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement() {
         checkpoint_cleanup_timeout: Duration::from_secs(1),
         fault_on_retryable_failure: false,
         fault_on_unclassified_error: true,
-        checkpoint_fault: Arc::new(parking_lot::Mutex::new(None)),
+        checkpoint_fault,
         controller: Some(Arc::clone(&leader)),
         leader_proof: Some(leader_proof),
         quorum_timeout: Duration::from_secs(1),
