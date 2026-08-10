@@ -575,6 +575,37 @@ struct ClusterInputPlan {
     effective_frontiers: [InputFrontier; 2],
 }
 
+#[cfg(feature = "cluster")]
+type TemporalSendTask = tokio::task::JoinHandle<(
+    Result<(), DbError>,
+    Option<Vec<(u64, laminar_core::shuffle::ShuffleMessage)>>,
+)>;
+
+#[cfg(feature = "cluster")]
+struct PendingTemporalClusterInput {
+    routed: BTreeMap<u32, [Vec<RoutedTemporalBatch>; 2]>,
+    outbound: Option<Vec<(u64, laminar_core::shuffle::ShuffleMessage)>>,
+    local_frontiers: [InputFrontier; 2],
+    send: Option<TemporalSendTask>,
+    accounted_bytes: usize,
+}
+
+#[cfg(feature = "cluster")]
+enum PendingTemporalCompletion {
+    Waiting,
+    RetryLater,
+    Applied(Vec<RecordBatch>),
+}
+
+#[cfg(feature = "cluster")]
+impl Drop for PendingTemporalClusterInput {
+    fn drop(&mut self) {
+        if let Some(send) = &self.send {
+            send.abort();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WholeRestoreState {
     Pending,
@@ -647,6 +678,8 @@ pub(crate) struct ManagedTemporalJoinOperator {
     queued_remote_events: usize,
     #[cfg(feature = "cluster")]
     queued_event_capacity_bytes: usize,
+    #[cfg(feature = "cluster")]
+    pending_cluster_input: Option<PendingTemporalClusterInput>,
     #[cfg(feature = "cluster")]
     prepared_vnode_transition: Option<PreparedTemporalJoinTransition>,
     #[cfg(feature = "cluster")]
@@ -787,6 +820,8 @@ impl ManagedTemporalJoinOperator {
             #[cfg(feature = "cluster")]
             queued_event_capacity_bytes: 0,
             #[cfg(feature = "cluster")]
+            pending_cluster_input: None,
+            #[cfg(feature = "cluster")]
             prepared_vnode_transition: None,
             #[cfg(feature = "cluster")]
             vnode_transition_cleanup: None,
@@ -881,7 +916,8 @@ impl ManagedTemporalJoinOperator {
         };
         let (_, assignment, peers) = self.active_cluster_scope()?;
         let expected_peers = Self::remote_owner_peers(&assignment, cluster.self_id);
-        if peers.as_ref() != expected_peers.as_slice()
+        if self.pending_cluster_input.is_some()
+            || peers.as_ref() != expected_peers.as_slice()
             || self.last_broadcasts != self.local_frontiers
         {
             return Err(DbError::Checkpoint(format!(
@@ -1131,6 +1167,13 @@ impl ManagedTemporalJoinOperator {
         &self,
         max_capture_bytes: usize,
     ) -> Result<Option<TemporalJoinOperatorCheckpointCapture>, DbError> {
+        #[cfg(feature = "cluster")]
+        if self.pending_cluster_input.is_some() {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] cannot checkpoint while a shuffle send is pending",
+                self.name
+            )));
+        }
         if self.pending_frontiers.is_some() {
             return Err(DbError::Checkpoint(format!(
                 "temporal join [{}] cannot checkpoint during bounded frontier fanout",
@@ -1930,8 +1973,112 @@ impl ManagedTemporalJoinOperator {
         #[cfg(feature = "cluster")]
         let accounted = accounted
             .checked_add(self.queued_shuffle_bytes)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.pending_cluster_input
+                        .as_ref()
+                        .map_or(0, |pending| pending.accounted_bytes),
+                )
+            })
             .ok_or_else(|| self.accounting_error())?;
         Ok(accounted)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn batch_plan_bytes(&self, batch: &RecordBatch) -> Result<usize, DbError> {
+        batch
+            .num_columns()
+            .checked_mul(std::mem::size_of::<Arc<dyn arrow::array::Array>>())
+            .and_then(|bytes| bytes.checked_add(batch.get_array_memory_size()))
+            .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
+            .ok_or_else(|| self.accounting_error())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn cluster_input_plan_bytes(&self, plan: &ClusterInputPlan) -> Result<usize, DbError> {
+        let routed_entries = plan
+            .routed
+            .len()
+            .checked_mul(
+                std::mem::size_of::<(u32, [Vec<RoutedTemporalBatch>; 2])>()
+                    + PENDING_HOLD_ENTRY_CHARGE,
+            )
+            .ok_or_else(|| self.accounting_error())?;
+        let mut bytes = plan
+            .outbound
+            .capacity()
+            .checked_mul(std::mem::size_of::<(
+                u64,
+                laminar_core::shuffle::ShuffleMessage,
+            )>())
+            .and_then(|outbound| outbound.checked_add(routed_entries))
+            .and_then(|bytes| {
+                plan.outbound
+                    .len()
+                    .checked_mul(
+                        std::mem::size_of::<usize>()
+                            + std::mem::size_of::<(u64, usize)>()
+                            + std::mem::size_of::<(u64, Vec<usize>)>(),
+                    )
+                    .and_then(|grouping| bytes.checked_add(grouping))
+            })
+            .ok_or_else(|| self.accounting_error())?;
+        let mut charged_keys = rustc_hash::FxHashSet::default();
+        for sides in plan.routed.values() {
+            for side in sides {
+                bytes = bytes
+                    .checked_add(
+                        side.capacity()
+                            .checked_mul(std::mem::size_of::<RoutedTemporalBatch>())
+                            .ok_or_else(|| self.accounting_error())?,
+                    )
+                    .ok_or_else(|| self.accounting_error())?;
+                for routed in side {
+                    bytes = bytes
+                        .checked_add(self.batch_plan_bytes(&routed.batch)?)
+                        .ok_or_else(|| self.accounting_error())?;
+                    if charged_keys.insert(Arc::as_ptr(&routed.keys)) {
+                        bytes = bytes
+                            .checked_add(routed.keys.size())
+                            .and_then(|value| value.checked_add(2 * std::mem::size_of::<usize>()))
+                            .ok_or_else(|| self.accounting_error())?;
+                    }
+                    let source_rows = routed
+                        .source_rows
+                        .len()
+                        .checked_mul(std::mem::size_of::<u32>())
+                        .and_then(|value| value.checked_add(2 * std::mem::size_of::<usize>()))
+                        .ok_or_else(|| self.accounting_error())?;
+                    bytes = bytes
+                        .checked_add(source_rows)
+                        .ok_or_else(|| self.accounting_error())?;
+                }
+            }
+        }
+        for (_, message) in &plan.outbound {
+            let message_bytes = match message {
+                laminar_core::shuffle::ShuffleMessage::Barrier(_) => 0,
+                laminar_core::shuffle::ShuffleMessage::Frontier { stage, .. } => stage.capacity(),
+                laminar_core::shuffle::ShuffleMessage::Data {
+                    stage,
+                    routed_vnodes,
+                    batch,
+                } => self
+                    .batch_plan_bytes(batch)?
+                    .checked_add(stage.capacity())
+                    .and_then(|value| {
+                        routed_vnodes
+                            .len()
+                            .checked_mul(std::mem::size_of::<u32>())
+                            .and_then(|routes| value.checked_add(routes))
+                    })
+                    .ok_or_else(|| self.accounting_error())?,
+            };
+            bytes = bytes
+                .checked_add(message_bytes)
+                .ok_or_else(|| self.accounting_error())?;
+        }
+        Ok(bytes)
     }
 
     #[cfg(feature = "cluster")]
@@ -2334,6 +2481,12 @@ impl ManagedTemporalJoinOperator {
                 merge_input_frontier_iter(std::iter::once(local[port]).chain(peers), i64::MIN);
             let side = if port == 0 { "left" } else { "right" };
             validate_frontier(self.frontiers[port], merged, side, &self.name)?;
+            if self.pending_cluster_input.is_some() {
+                return Ok(InputFrontier {
+                    watermark: self.frontiers[port].watermark,
+                    idle: false,
+                });
+            }
             Ok(merged)
         };
         Ok([merge_side(0)?, merge_side(1)?])
@@ -3318,11 +3471,12 @@ impl ManagedTemporalJoinOperator {
                 .unwrap_or(i64::MIN)
         });
         #[cfg(feature = "cluster")]
-        let remote_hold = self.has_remote_events().then(|| {
-            self.published_output_frontier
-                .and_then(|frontier| frontier.watermark)
-                .unwrap_or(i64::MIN)
-        });
+        let remote_hold =
+            (self.pending_cluster_input.is_some() || self.has_remote_events()).then(|| {
+                self.published_output_frontier
+                    .and_then(|frontier| frontier.watermark)
+                    .unwrap_or(i64::MIN)
+            });
         #[cfg(not(feature = "cluster"))]
         let remote_hold = None;
         pending_hold
@@ -3428,8 +3582,8 @@ impl ManagedTemporalJoinOperator {
     }
 
     #[cfg(feature = "cluster")]
-    fn post_cluster_send_error(&self, admitted: bool, error: DbError) -> DbError {
-        if !admitted || error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
+    fn outbound_finalize_error(&self, error: DbError) -> DbError {
+        if error.requires_pipeline_recovery() {
             return error;
         }
         DbError::ShufflePartialSend(format!(
@@ -3440,7 +3594,7 @@ impl ManagedTemporalJoinOperator {
 
     #[cfg(feature = "cluster")]
     fn remote_replay_error(&self, error: DbError) -> DbError {
-        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
+        if error.requires_pipeline_recovery() {
             error
         } else {
             DbError::Checkpoint(format!(
@@ -3466,6 +3620,7 @@ impl ManagedTemporalJoinOperator {
                 Some(&plan.consumed),
             )
             .map_err(|error| self.remote_replay_error(error))?;
+        self.commit_remote_drain(&plan);
         let output = self
             .execute_routed(&plan.routed, effective)
             .map_err(|error| self.remote_replay_error(error))?;
@@ -3473,9 +3628,95 @@ impl ManagedTemporalJoinOperator {
             .project_output(output)
             .await
             .map_err(|error| self.remote_replay_error(error))?;
-        self.commit_remote_drain(&plan);
         self.record_published_output_frontier(&effective);
         Ok(output)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn start_pending_cluster_send(
+        &mut self,
+        config: &ClusterShuffleConfig,
+        assignment_version: u64,
+    ) {
+        let pending = self
+            .pending_cluster_input
+            .as_mut()
+            .expect("temporal send plan must be installed before it starts");
+        debug_assert!(pending.send.is_none());
+        let outbound = pending
+            .outbound
+            .take()
+            .expect("idle temporal send plan must retain its outbound cut");
+        let sender = Arc::clone(&config.sender);
+        let wake = config.receiver.work_ready_notify();
+        let context = format!("temporal join [{}] shuffle", self.name);
+        pending.send = Some(tokio::spawn(async move {
+            let result = crate::operator::send_shuffle_plan_retaining(
+                &sender,
+                assignment_version,
+                outbound,
+                &context,
+            )
+            .await;
+            if !matches!(&result.0, Err(error) if error.is_shuffle_not_ready()) {
+                wake.notify_one();
+            }
+            result
+        }));
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn finish_pending_cluster_input(&mut self) -> Result<PendingTemporalCompletion, DbError> {
+        let finished = self
+            .pending_cluster_input
+            .as_ref()
+            .and_then(|pending| pending.send.as_ref())
+            .is_some_and(tokio::task::JoinHandle::is_finished);
+        if !finished {
+            return Ok(PendingTemporalCompletion::Waiting);
+        }
+        let mut pending = self
+            .pending_cluster_input
+            .take()
+            .expect("finished temporal send plan");
+        let send = pending.send.take().expect("pending temporal send task");
+        let (result, outbound) = send.await.map_err(|error| {
+            DbError::ShufflePartialSend(format!(
+                "temporal join [{}] send task ended without a delivery outcome: {error}",
+                self.name
+            ))
+        })?;
+        if let Err(error) = result {
+            if error.is_shuffle_not_ready() {
+                pending.outbound = Some(outbound.ok_or_else(|| {
+                    DbError::ShufflePartialSend(format!(
+                        "temporal join [{}] safe send failure lost its retry plan",
+                        self.name
+                    ))
+                })?);
+                self.pending_cluster_input = Some(pending);
+                return Ok(PendingTemporalCompletion::RetryLater);
+            }
+            return Err(error);
+        }
+        debug_assert!(outbound.is_none());
+
+        let effective = self
+            .effective_cluster_frontiers(pending.local_frontiers, None, None)
+            .map_err(|error| self.outbound_finalize_error(error))?;
+        let routed = std::mem::take(&mut pending.routed);
+        let local_frontiers = pending.local_frontiers;
+        drop(pending);
+        let output = self
+            .execute_routed(&routed, effective)
+            .map_err(|error| self.outbound_finalize_error(error))?;
+        let output = self
+            .project_output(output)
+            .await
+            .map_err(|error| self.outbound_finalize_error(self.post_projection_error(error)))?;
+        self.local_frontiers = local_frontiers;
+        self.last_broadcasts = local_frontiers;
+        Ok(PendingTemporalCompletion::Applied(output))
     }
 
     #[cfg(feature = "cluster")]
@@ -3484,48 +3725,127 @@ impl ManagedTemporalJoinOperator {
         inputs: &[Vec<RecordBatch>],
         frontiers: [InputFrontier; 2],
     ) -> Result<Vec<RecordBatch>, DbError> {
-        let (config, assignment, peers) = self.active_cluster_scope()?;
+        let scope = self.active_cluster_scope();
+        let (config, assignment, peers) = match scope {
+            Ok(scope) => scope,
+            Err(error) if self.pending_cluster_input.is_some() => {
+                return Err(self.outbound_finalize_error(error));
+            }
+            Err(error) => return Err(error),
+        };
+        let mut deferred_output = Vec::new();
+        let mut processed_deferred_work = false;
         if self.pending_frontiers.is_some() || self.maintenance_pending {
             if inputs.iter().any(|batches| !batches.is_empty()) {
-                return Err(DbError::InvalidOperation(format!(
+                let error = DbError::InvalidOperation(format!(
                     "temporal join [{}] received input while bounded work was pending",
                     self.name
-                )));
+                ));
+                return Err(if self.pending_cluster_input.is_some() {
+                    self.outbound_finalize_error(error)
+                } else {
+                    error
+                });
             }
             let target = self.pending_frontiers.unwrap_or(self.frontiers);
-            return self
+            deferred_output = self
                 .process_and_project(&[], target)
                 .await
-                .map_err(|error| self.remote_replay_error(error));
+                .map_err(|error| self.remote_replay_error(error))?;
+            processed_deferred_work = true;
+            if self.pending_frontiers.is_some() || self.maintenance_pending {
+                return Ok(deferred_output);
+            }
         }
         if self.has_remote_events() {
             if inputs.iter().any(|batches| !batches.is_empty()) {
-                return Err(DbError::InvalidOperation(format!(
+                let error = DbError::InvalidOperation(format!(
                     "temporal join [{}] received local input while ordered shuffle replay was pending",
                     self.name
-                )));
+                ));
+                return Err(if self.pending_cluster_input.is_some() {
+                    self.outbound_finalize_error(error)
+                } else {
+                    error
+                });
             }
-            return self.drain_remote_events(&config, &assignment).await;
+            deferred_output.extend(self.drain_remote_events(&config, &assignment).await?);
+            processed_deferred_work = true;
+            if self.pending_frontiers.is_some() || self.maintenance_pending {
+                return Ok(deferred_output);
+            }
+        }
+        let completion = self.finish_pending_cluster_input().await.map_err(|error| {
+            if processed_deferred_work {
+                self.remote_replay_error(error)
+            } else {
+                error
+            }
+        })?;
+        match completion {
+            PendingTemporalCompletion::Applied(output) => {
+                deferred_output.extend(output);
+                return Ok(deferred_output);
+            }
+            PendingTemporalCompletion::Waiting | PendingTemporalCompletion::RetryLater => {}
+        }
+        if self.pending_cluster_input.is_some() {
+            if inputs.iter().any(|batches| !batches.is_empty()) {
+                return Err(
+                    self.outbound_finalize_error(DbError::InvalidOperation(format!(
+                        "temporal join [{}] received local input while a shuffle send was pending",
+                        self.name
+                    ))),
+                );
+            }
+            if self
+                .pending_cluster_input
+                .as_ref()
+                .is_some_and(|pending| pending.send.is_none())
+            {
+                self.start_pending_cluster_send(&config, assignment.version());
+            }
+            return Ok(deferred_output);
+        }
+        if processed_deferred_work {
+            return Ok(deferred_output);
         }
 
         let plan = self.plan_cluster_inputs(inputs, frontiers, &config, &assignment, &peers)?;
-        let outbound_admitted = !plan.outbound.is_empty();
-        if outbound_admitted {
-            crate::operator::send_shuffle_plan(
-                &config.sender,
-                assignment.version(),
-                plan.outbound,
-                self.name.as_ref(),
-            )
-            .await?;
+        if !plan.outbound.is_empty() {
+            let accounted_bytes = self.cluster_input_plan_bytes(&plan)?;
+            let total = self
+                .checked_accounted_state_bytes()?
+                .checked_add(accounted_bytes)
+                .ok_or_else(|| self.accounting_error())?;
+            if total > self.max_managed_state_bytes {
+                return Err(DbError::ManagedStateBudgetExceeded {
+                    context: format!("temporal join [{}] pending shuffle send", self.name),
+                    accounted_bytes: total,
+                    limit_bytes: self.max_managed_state_bytes,
+                });
+            }
+            let ClusterInputPlan {
+                routed,
+                outbound,
+                local_frontiers,
+                effective_frontiers: _,
+            } = plan;
+            self.pending_cluster_input = Some(PendingTemporalClusterInput {
+                routed,
+                outbound: Some(outbound),
+                local_frontiers,
+                send: None,
+                accounted_bytes,
+            });
+            self.start_pending_cluster_send(&config, assignment.version());
+            return Ok(Vec::new());
         }
+        let output = self.execute_routed(&plan.routed, plan.effective_frontiers)?;
         let output = self
-            .execute_routed(&plan.routed, plan.effective_frontiers)
-            .map_err(|error| self.post_cluster_send_error(outbound_admitted, error))?;
-        let output = self.project_output(output).await.map_err(|error| {
-            let error = self.post_projection_error(error);
-            self.post_cluster_send_error(outbound_admitted, error)
-        })?;
+            .project_output(output)
+            .await
+            .map_err(|error| self.post_projection_error(error))?;
         self.local_frontiers = plan.local_frontiers;
         self.last_broadcasts = plan.local_frontiers;
         Ok(output)
@@ -3550,7 +3870,7 @@ impl ManagedTemporalJoinOperator {
     }
 
     fn post_projection_error(&self, error: DbError) -> DbError {
-        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
+        if error.requires_pipeline_recovery() {
             error
         } else {
             DbError::StatefulOperatorPartialApply(format!(
@@ -3561,7 +3881,7 @@ impl ManagedTemporalJoinOperator {
     }
 
     fn after_apply_error(&self, applied: bool, vnode: u32, error: DbError) -> DbError {
-        if !applied || error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
+        if !applied || error.requires_pipeline_recovery() {
             return error;
         }
         DbError::StatefulOperatorPartialApply(format!(
@@ -3925,6 +4245,7 @@ impl ManagedTemporalJoinOperator {
                     || self.local_frontiers != [InputFrontier::default(); 2]
                     || self.published_output_frontier.is_some()
                     || self.whole_restore == WholeRestoreState::Applied
+                    || self.pending_cluster_input.is_some()
                     || self.maintenance_pending
                     || self.maintenance_remaining != 0
                     || self.maintenance_rescan
@@ -3998,7 +4319,8 @@ impl ManagedTemporalJoinOperator {
                 cut.published_output_frontier
             });
 
-        if self.pending_frontiers.is_some()
+        if self.pending_cluster_input.is_some()
+            || self.pending_frontiers.is_some()
             || self.frontier_remaining != 0
             || self.frontier_has_work
             || self.queued_shuffle_bytes != 0
@@ -4399,6 +4721,7 @@ impl GraphOperator for ManagedTemporalJoinOperator {
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
         #[cfg(feature = "cluster")]
         let cluster_pristine = self.local_frontiers == [InputFrontier::default(); 2]
+            && self.pending_cluster_input.is_none()
             && self.last_broadcasts == [InputFrontier::default(); 2]
             && self.remote_peer_cursors == [None; 2]
             && self.queued_shuffle_bytes == 0
@@ -4546,21 +4869,38 @@ impl GraphOperator for ManagedTemporalJoinOperator {
     fn wants_input(&self) -> bool {
         let ready = self.pending_frontiers.is_none() && !self.maintenance_pending;
         #[cfg(feature = "cluster")]
-        let ready =
-            ready && !self.has_remote_events() && self.last_broadcasts == self.local_frontiers;
+        let ready = ready
+            && self.pending_cluster_input.is_none()
+            && !self.has_remote_events()
+            && self.last_broadcasts == self.local_frontiers;
         ready
     }
 
     #[cfg(feature = "cluster")]
     fn checkpoint_aligned_replay_pending(&self) -> bool {
-        self.has_remote_events()
+        self.pending_cluster_input.is_some() || self.has_remote_events()
     }
 
     fn checkpoint_drain_pending(&self) -> bool {
         let pending = self.pending_frontiers.is_some();
         #[cfg(feature = "cluster")]
-        let pending = pending || self.last_broadcasts != self.local_frontiers;
+        let pending = pending
+            || self.pending_cluster_input.is_some()
+            || self.last_broadcasts != self.local_frontiers;
         pending
+    }
+
+    #[cfg(feature = "cluster")]
+    fn deferred_work_is_runnable(&self) -> bool {
+        self.pending_frontiers.is_some()
+            || self.maintenance_pending
+            || self.has_remote_events()
+            || (self.pending_cluster_input.is_none()
+                && self.last_broadcasts != self.local_frontiers)
+    }
+
+    fn advances_frontier_without_input(&self) -> bool {
+        true
     }
 
     #[cfg(feature = "cluster")]
@@ -4650,7 +4990,7 @@ impl GraphOperator for ManagedTemporalJoinOperator {
             output.idle = false;
         }
         #[cfg(feature = "cluster")]
-        if self.has_remote_events() {
+        if self.pending_cluster_input.is_some() || self.has_remote_events() {
             output.idle = false;
         }
         output
@@ -4659,7 +4999,10 @@ impl GraphOperator for ManagedTemporalJoinOperator {
     #[cfg(feature = "cluster")]
     fn restored_output_frontier(&self) -> Option<InputFrontier> {
         self.published_output_frontier.map(|mut frontier| {
-            if self.maintenance_pending || self.has_remote_events() {
+            if self.maintenance_pending
+                || self.pending_cluster_input.is_some()
+                || self.has_remote_events()
+            {
                 frontier.idle = false;
             }
             frontier
@@ -4672,6 +5015,13 @@ impl GraphOperator for ManagedTemporalJoinOperator {
         vnode_count: u32,
         max_capture_bytes: u64,
     ) -> Result<Option<Vec<CapturedVnodeState>>, DbError> {
+        #[cfg(feature = "cluster")]
+        if self.pending_cluster_input.is_some() {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] cannot capture vnodes while a shuffle send is pending",
+                self.name
+            )));
+        }
         if self.pending_frontiers.is_some() {
             return Err(DbError::Checkpoint(format!(
                 "temporal join [{}] cannot capture vnodes during bounded frontier fanout",
@@ -4764,6 +5114,13 @@ impl GraphOperator for ManagedTemporalJoinOperator {
     }
 
     fn restore_vnode(&mut self, vnode: u32, vnode_count: u32, bytes: &[u8]) -> Result<(), DbError> {
+        #[cfg(feature = "cluster")]
+        if self.pending_cluster_input.is_some() {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] cannot restore vnode state while a shuffle send is pending",
+                self.name
+            )));
+        }
         let current_bytes = self
             .vnode_states
             .get(vnode as usize)
@@ -6000,6 +6357,7 @@ mod tests {
     #[tokio::test]
     async fn vnode_transition_is_atomic_and_publishes_target_topology() {
         use laminar_core::checkpoint::CheckpointParticipant;
+        use laminar_core::shuffle::ShuffleMessage;
 
         use crate::operator_graph::ManagedVnodeRestore;
 
@@ -6084,6 +6442,30 @@ mod tests {
             vnode: 1,
             state: frame.as_ref(),
         }];
+        let send = tokio::spawn(std::future::pending::<(
+            Result<(), DbError>,
+            Option<Vec<(u64, ShuffleMessage)>>,
+        )>());
+        target.pending_cluster_input = Some(PendingTemporalClusterInput {
+            routed: BTreeMap::new(),
+            outbound: None,
+            local_frontiers: cut,
+            send: Some(send),
+            accounted_bytes: 0,
+        });
+        let error = target
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &fence,
+                revoked: &rustc_hash::FxHashSet::default(),
+                restores: &restores,
+                whole_restores: &[],
+                mode: ManagedVnodeTransitionMode::Live,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("drained frontier"));
+        target.pending_cluster_input.take();
+
         target
             .prepare_vnode_transition(ManagedVnodeTransition {
                 predecessor: &predecessor,
@@ -6287,6 +6669,229 @@ mod tests {
                 false,
             )
             .is_err());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn zero_admission_send_restarts_once_without_becoming_runnable() {
+        use laminar_core::shuffle::ShuffleMessage;
+
+        let (mut operator, _, _) = operator(8);
+        let scope = two_owner_scope().await;
+        operator.initialize_managed_state().await.unwrap();
+        operator.attach_cluster_shuffle(scope);
+
+        let retry_plan = vec![(
+            2,
+            ShuffleMessage::Frontier {
+                stage: "temporal::left".to_owned(),
+                watermark: None,
+                idle: false,
+            },
+        )];
+        let send = tokio::spawn(async move {
+            (
+                Err(DbError::ShuffleNotReady("injected zero admission".into())),
+                Some(retry_plan),
+            )
+        });
+        operator.pending_cluster_input = Some(PendingTemporalClusterInput {
+            routed: BTreeMap::new(),
+            outbound: None,
+            local_frontiers: [InputFrontier::default(); 2],
+            send: Some(send),
+            accounted_bytes: 0,
+        });
+
+        while !operator
+            .pending_cluster_input
+            .as_ref()
+            .unwrap()
+            .send
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            tokio::task::yield_now().await;
+        }
+        assert!(!operator.deferred_work_is_runnable());
+
+        let output = operator
+            .process_cluster(&[Vec::new(), Vec::new()], [InputFrontier::default(); 2])
+            .await
+            .unwrap();
+        assert!(output.is_empty());
+        let pending = operator.pending_cluster_input.as_ref().unwrap();
+        assert!(pending.send.is_some());
+        assert!(pending.outbound.is_none());
+        assert!(!operator.deferred_work_is_runnable());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn pending_send_drains_remote_history_before_local_probe() {
+        use laminar_core::shuffle::ShuffleMessage;
+
+        let local_key = key_for_vnode(0);
+        let outbound_key = key_for_vnode(1);
+        let (mut operator, _, _) = operator(8);
+        let scope = two_owner_scope().await;
+        operator.initialize_managed_state().await.unwrap();
+        operator.attach_cluster_shuffle(scope.clone());
+        let close = frontier(300);
+        let assignment = scope.registry.versioned_snapshot();
+        let plan = operator
+            .plan_cluster_inputs(
+                &[
+                    vec![
+                        left_batch(std::slice::from_ref(&local_key), &["X"], &[220], &[7]),
+                        left_batch(std::slice::from_ref(&outbound_key), &["X"], &[220], &[8]),
+                    ],
+                    Vec::new(),
+                ],
+                close,
+                &scope,
+                &assignment,
+                &[2],
+            )
+            .unwrap();
+        assert!(plan.routed.contains_key(&0));
+        assert!(plan
+            .outbound
+            .iter()
+            .any(|(_, message)| matches!(message, ShuffleMessage::Data { .. })));
+        let accounted_bytes = operator.cluster_input_plan_bytes(&plan).unwrap();
+        let ClusterInputPlan {
+            routed,
+            outbound,
+            local_frontiers,
+            effective_frontiers: _,
+        } = plan;
+        let baseline = operator.managed_state_accounting().unwrap().live;
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let send = tokio::spawn(async move {
+            let _ = wait.await;
+            drop(outbound);
+            (Ok(()), None)
+        });
+        operator.pending_cluster_input = Some(PendingTemporalClusterInput {
+            routed,
+            outbound: None,
+            local_frontiers,
+            send: Some(send),
+            accounted_bytes,
+        });
+
+        let assignment_version = scope.registry.assignment_version();
+        let recovery_gen = scope.receiver.recovery_gen();
+        operator
+            .stage_checkpointed_shuffle(
+                "temporal::right",
+                crate::operator::RetainedBatch::restored_channel(
+                    right_batch(
+                        std::slice::from_ref(&local_key),
+                        &["X"],
+                        &[210],
+                        &["live"],
+                        &[SourceMutation::Put],
+                    ),
+                    2,
+                    assignment_version,
+                    recovery_gen,
+                    Arc::from([0_u32]),
+                ),
+                i64::MIN,
+            )
+            .unwrap();
+        operator
+            .stage_checkpointed_shuffle_frontier(
+                "temporal::right",
+                2,
+                close[1],
+                assignment_version,
+                recovery_gen,
+            )
+            .unwrap();
+        operator
+            .stage_checkpointed_shuffle_frontier(
+                "temporal::left",
+                2,
+                close[0],
+                assignment_version,
+                recovery_gen,
+            )
+            .unwrap();
+        assert!(operator.deferred_work_is_runnable());
+        assert!(operator.managed_state_accounting().unwrap().live >= baseline + accounted_bytes);
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            operator.process_cluster(&[Vec::new(), Vec::new()], [InputFrontier::default(); 2]),
+        )
+        .await
+        .expect("pending temporal send blocked the graph task")
+        .unwrap();
+        assert!(output.is_empty());
+        assert_eq!(operator.queued_remote_events, 0);
+        let local_state = operator.vnode_states[0].as_ref().unwrap();
+        assert_eq!(local_state.retained_versions(), 1);
+        assert_eq!(local_state.pending_probes(), 0);
+        assert_eq!(operator.frontiers, [InputFrontier::default(); 2]);
+        assert_eq!(operator.local_frontiers, [InputFrontier::default(); 2]);
+        assert_eq!(operator.last_broadcasts, [InputFrontier::default(); 2]);
+        assert!(operator.pending_cluster_input.is_some());
+        assert!(!operator.wants_input());
+        assert!(!operator.deferred_work_is_runnable());
+        assert!(operator.capture_operator_checkpoint(usize::MAX).is_err());
+        assert!(operator.checkpoint_vnodes(&[0], 2, u64::MAX).is_err());
+
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !operator
+                .pending_cluster_input
+                .as_ref()
+                .unwrap()
+                .send
+                .as_ref()
+                .unwrap()
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending temporal send task did not finish");
+        let output = operator
+            .process_cluster(&[Vec::new(), Vec::new()], [InputFrontier::default(); 2])
+            .await
+            .unwrap();
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let ids = output[0]
+            .column_by_name("trade_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let values = output[0]
+            .column_by_name("value_quotes")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(ids.value(0), 7);
+        assert_eq!(values.value(0), "live");
+        assert!(operator.pending_cluster_input.is_none());
+        assert_eq!(operator.local_frontiers, close);
+        assert_eq!(operator.last_broadcasts, close);
+        assert_eq!(operator.frontiers, close);
+
+        let output = operator
+            .process_cluster(&[Vec::new(), Vec::new()], close)
+            .await
+            .unwrap();
+        assert!(output.is_empty());
+        assert!(operator.wants_input());
+        assert!(!operator.checkpoint_drain_pending());
     }
 
     #[cfg(feature = "cluster")]
