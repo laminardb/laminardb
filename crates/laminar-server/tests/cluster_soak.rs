@@ -140,6 +140,10 @@ const CHECKPOINT_PIPELINE_STALL_SLO_NS: u64 = 1_024_000_000;
 #[cfg(feature = "kafka")]
 const MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS: u64 = 100;
 #[cfg(feature = "kafka")]
+const CHECKPOINT_STATE_CAPTURE_SLO_SECONDS: f64 = 0.064;
+#[cfg(feature = "kafka")]
+const MIN_CHECKPOINT_STATE_CAPTURE_OBSERVATIONS: u64 = 100;
+#[cfg(feature = "kafka")]
 const MIN_CONTINUOUS_AGGREGATE_STATE_BYTES: u64 = 64 * 1_024;
 #[cfg(feature = "kafka")]
 const RECOVERY_RELEASE_LOG: &str = "coordinated recovery: releasing source gate";
@@ -1761,6 +1765,17 @@ impl Node {
         Some(CheckpointLatencySnapshot {
             checkpoint_seconds: value("laminardb_checkpoint_duration_seconds_sum")?,
             checkpoint_observations: value("laminardb_checkpoint_duration_seconds_count")?,
+            state_capture_seconds: value(
+                "laminardb_checkpoint_state_capture_duration_seconds_sum",
+            )?,
+            state_capture_observations: value(
+                "laminardb_checkpoint_state_capture_duration_seconds_count",
+            )?,
+            state_capture_within_slo: prometheus_histogram_bucket_value(
+                &body,
+                "laminardb_checkpoint_state_capture_duration_seconds_bucket",
+                CHECKPOINT_STATE_CAPTURE_SLO_SECONDS,
+            )?,
             pipeline_stall_observations: value(
                 "laminardb_checkpoint_pipeline_stall_duration_seconds_count",
             )?,
@@ -3018,6 +3033,9 @@ struct CheckpointBarrierTimingEvidence {
 struct CheckpointLatencySnapshot {
     checkpoint_seconds: f64,
     checkpoint_observations: f64,
+    state_capture_seconds: f64,
+    state_capture_observations: f64,
+    state_capture_within_slo: f64,
     pipeline_stall_observations: f64,
     pipeline_stall_within_slo: f64,
     barrier_local_seconds: f64,
@@ -3034,6 +3052,15 @@ impl CheckpointLatencySnapshot {
         for (name, value) in [
             ("checkpoint duration sum", self.checkpoint_seconds),
             ("checkpoint duration count", self.checkpoint_observations),
+            ("checkpoint state-capture sum", self.state_capture_seconds),
+            (
+                "checkpoint state-capture count",
+                self.state_capture_observations,
+            ),
+            (
+                "checkpoint state-capture SLO bucket",
+                self.state_capture_within_slo,
+            ),
             (
                 "checkpoint pipeline-stall count",
                 self.pipeline_stall_observations,
@@ -3067,6 +3094,20 @@ impl CheckpointLatencySnapshot {
                 ));
             }
         }
+        exact_prometheus_count(
+            self.state_capture_observations,
+            "checkpoint state-capture count",
+        )?;
+        exact_prometheus_count(
+            self.state_capture_within_slo,
+            "checkpoint state-capture SLO bucket",
+        )?;
+        if self.state_capture_within_slo > self.state_capture_observations {
+            return Err(format!(
+                "checkpoint state-capture SLO bucket {} exceeds histogram count {}",
+                self.state_capture_within_slo, self.state_capture_observations
+            ));
+        }
         if self.pipeline_stall_within_slo > self.pipeline_stall_observations {
             return Err(format!(
                 "checkpoint pipeline-stall SLO bucket {} exceeds histogram count {}",
@@ -3091,6 +3132,9 @@ impl CheckpointLatencySnapshot {
     fn merge(&mut self, other: Self) {
         self.checkpoint_seconds += other.checkpoint_seconds;
         self.checkpoint_observations += other.checkpoint_observations;
+        self.state_capture_seconds += other.state_capture_seconds;
+        self.state_capture_observations += other.state_capture_observations;
+        self.state_capture_within_slo += other.state_capture_within_slo;
         self.pipeline_stall_observations += other.pipeline_stall_observations;
         self.pipeline_stall_within_slo += other.pipeline_stall_within_slo;
         self.barrier_local_seconds += other.barrier_local_seconds;
@@ -3104,6 +3148,25 @@ impl CheckpointLatencySnapshot {
     fn pipeline_stall_within_slo_percent(self) -> Option<f64> {
         (self.pipeline_stall_observations > 0.0)
             .then(|| self.pipeline_stall_within_slo / self.pipeline_stall_observations * 100.0)
+    }
+
+    fn state_capture_within_slo_percent(self) -> Option<f64> {
+        (self.state_capture_observations > 0.0)
+            .then(|| self.state_capture_within_slo / self.state_capture_observations * 100.0)
+    }
+
+    fn validate_state_capture_slo(self, label: &str) -> Result<(), String> {
+        let within_slo_percent = self
+            .state_capture_within_slo_percent()
+            .ok_or_else(|| format!("{label} captured no checkpoint state-capture observations"))?;
+        if within_slo_percent < 99.0 {
+            return Err(format!(
+                "{label} checkpoint state-capture SLO requires 99.00% of observations at or below {:.0}ms; only {within_slo_percent:.2}% of {} observations complied",
+                CHECKPOINT_STATE_CAPTURE_SLO_SECONDS * 1_000.0,
+                self.state_capture_observations as u64,
+            ));
+        }
+        Ok(())
     }
 
     fn validate_pipeline_stall_slo(self, label: &str) -> Result<(), String> {
@@ -3128,6 +3191,18 @@ impl CheckpointLatencySnapshot {
             "<= {:.0}ms={within_slo_percent:.2}% of {} obs",
             CHECKPOINT_PIPELINE_STALL_SLO_SECONDS * 1_000.0,
             self.pipeline_stall_observations as u64,
+        )
+    }
+
+    fn state_capture_profile(self) -> String {
+        let Some(within_slo_percent) = self.state_capture_within_slo_percent() else {
+            return "no observations".into();
+        };
+        format!(
+            "avg={:.0}ms, <= {:.0}ms={within_slo_percent:.2}% of {} obs",
+            self.state_capture_seconds / self.state_capture_observations * 1_000.0,
+            CHECKPOINT_STATE_CAPTURE_SLO_SECONDS * 1_000.0,
+            self.state_capture_observations as u64,
         )
     }
 
@@ -3205,12 +3280,26 @@ impl CheckpointLatencyEvidence {
         Ok(nodes)
     }
 
-    fn validate_slos(&self) -> Result<CheckpointLatencySnapshot, String> {
+    fn validate_slos(
+        &self,
+        certify_state_capture: bool,
+    ) -> Result<CheckpointLatencySnapshot, String> {
         let aggregate = self.aggregate()?;
         if aggregate.checkpoint_observations <= 0.0 {
             return Err("aggregate captured no checkpoint latency observations".into());
         }
-        for (node_id, snapshot) in self.aggregate_by_node()? {
+        let nodes = self.aggregate_by_node()?;
+        if certify_state_capture {
+            for (generation, snapshot) in &self.generations {
+                if snapshot.state_capture_observations <= 0.0 {
+                    return Err(format!(
+                        "node{} process generation {} captured no checkpoint state-capture observations",
+                        generation.node_id, generation.generation
+                    ));
+                }
+            }
+        }
+        for (node_id, snapshot) in nodes {
             if snapshot.pipeline_stall_observations
                 < MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS as f64
             {
@@ -3222,18 +3311,30 @@ impl CheckpointLatencyEvidence {
             snapshot.validate_pipeline_stall_slo(&format!(
                 "node{node_id} across process generations"
             ))?;
+            if snapshot.state_capture_observations
+                < MIN_CHECKPOINT_STATE_CAPTURE_OBSERVATIONS as f64
+            {
+                return Err(format!(
+                    "node{node_id} captured only {} checkpoint state-capture observations across process generations; at least {MIN_CHECKPOINT_STATE_CAPTURE_OBSERVATIONS} are required for the observed 99% SLO",
+                    snapshot.state_capture_observations as u64,
+                ));
+            }
+            snapshot
+                .validate_state_capture_slo(&format!("node{node_id} across process generations"))?;
         }
         aggregate.validate_pipeline_stall_slo("aggregate")?;
+        aggregate.validate_state_capture_slo("aggregate")?;
         Ok(aggregate)
     }
 
-    fn report(&self) {
+    fn report(&self, minimum_live_state_bytes: u64) {
         let aggregate = self.aggregate().unwrap_or_else(|error| panic!("{error}"));
         for (generation, snapshot) in &self.generations {
             eprintln!(
-                "soak: PROFILE node{} process generation {}: total stall {}; local barrier {}; aligned resume {}",
+                "soak: PROFILE node{} process generation {}: state capture {}; total stall {}; local barrier {}; aligned resume {}",
                 generation.node_id,
                 generation.generation,
+                snapshot.state_capture_profile(),
                 snapshot.pipeline_stall_profile(),
                 CheckpointLatencySnapshot::phase_profile(
                     snapshot.barrier_local_seconds,
@@ -3251,12 +3352,17 @@ impl CheckpointLatencyEvidence {
         let checkpoint_average_ms =
             aggregate.checkpoint_seconds / aggregate.checkpoint_observations * 1_000.0;
         eprintln!(
-            "soak: PROFILE pipeline-stall <= {:.0}ms for {within_slo_percent:.2}% of {} obs; checkpoint_duration avg={checkpoint_average_ms:.0}ms over {} obs (finalized pre-restart generations plus observed cuts of live generations)",
+            "soak: PROFILE state-capture {}; pipeline-stall <= {:.0}ms for {within_slo_percent:.2}% of {} obs; checkpoint_duration avg={checkpoint_average_ms:.0}ms over {} obs (finalized pre-restart generations plus observed cuts of live generations)",
+            if minimum_live_state_bytes == 0 {
+                "non-certifying because retained-state floor is disabled".into()
+            } else {
+                aggregate.state_capture_profile()
+            },
             CHECKPOINT_PIPELINE_STALL_SLO_SECONDS * 1_000.0,
             aggregate.pipeline_stall_observations as u64,
             aggregate.checkpoint_observations as u64,
         );
-        self.validate_slos()
+        self.validate_slos(minimum_live_state_bytes > 0)
             .unwrap_or_else(|error| panic!("{error}"));
     }
 }
@@ -9600,25 +9706,31 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         &format!("single {delivery_label} continuous join aggregate"),
     );
 
+    let finalized_latency = latency_evidence
+        .aggregate()
+        .unwrap_or_else(|error| panic!("single {delivery_label} checkpoint latency: {error}"));
     let finalized_stalls = exact_prometheus_count(
-        latency_evidence
-            .aggregate()
-            .unwrap_or_else(|error| panic!("single {delivery_label} checkpoint latency: {error}"))
-            .pipeline_stall_observations,
+        finalized_latency.pipeline_stall_observations,
         "finalized checkpoint pipeline-stall observations",
+    )
+    .unwrap_or_else(|error| panic!("single {delivery_label} checkpoint latency: {error}"));
+    let finalized_captures = exact_prometheus_count(
+        finalized_latency.state_capture_observations,
+        "finalized checkpoint state-capture observations",
     )
     .unwrap_or_else(|error| panic!("single {delivery_label} checkpoint latency: {error}"));
     let required_live_stalls = MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS
         .saturating_sub(finalized_stalls)
         .max(1);
+    let required_live_captures = MIN_CHECKPOINT_STATE_CAPTURE_OBSERVATIONS
+        .saturating_sub(finalized_captures)
+        .max(1);
     let observation_window_ms = interval_ms
         .saturating_add(CHECKPOINT_PIPELINE_STALL_SLO_NS / 1_000_000)
-        .saturating_mul(required_live_stalls)
+        .saturating_mul(required_live_stalls.max(required_live_captures))
         .saturating_add(u64::try_from(recovery_ceiling.as_millis()).unwrap_or(u64::MAX));
     wait_for(
-        &format!(
-            "single {delivery_label} to capture {MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS} checkpoint stalls under active load"
-        ),
+        &format!("single {delivery_label} checkpoint latency observations under active load"),
         Duration::from_millis(observation_window_ms),
         || {
             producer.assert_running();
@@ -9627,6 +9739,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
                 .checkpoint_latency_metrics()
                 .is_some_and(|metrics| {
                     metrics.pipeline_stall_observations >= required_live_stalls as f64
+                        && metrics.state_capture_observations >= required_live_captures as f64
                 })
         },
     );
@@ -9658,7 +9771,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
             panic!("single {delivery_label} exact checkpoint evidence: {error}")
         });
     exact_timing_evidence.report();
-    latency_evidence.report();
+    latency_evidence.report(minimum_live_state_bytes);
 
     let (produced_prefix, _bounded_frozen_input_at) = producer.stop();
     #[cfg(feature = "delta-lake-s3")]
@@ -10746,13 +10859,13 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         assert_explicit_fault_recovery_evidence(&nodes, evidence);
     }
 
-    let finalized_stalls_by_node = latency_evidence
+    let finalized_latency_by_node = latency_evidence
         .aggregate_by_node()
         .unwrap_or_else(|error| panic!("three-node {delivery_label} checkpoint latency: {error}"));
-    let required_live_stalls = nodes
+    let required_live_observations = nodes
         .iter()
         .map(|node| {
-            let finalized = finalized_stalls_by_node
+            let finalized_stalls = finalized_latency_by_node
                 .get(&node.id)
                 .map(|snapshot| {
                     exact_prometheus_count(
@@ -10764,31 +10877,53 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
                     })
                 })
                 .unwrap_or(0);
-            MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS
-                .saturating_sub(finalized)
-                .max(1)
+            let finalized_captures = finalized_latency_by_node
+                .get(&node.id)
+                .map(|snapshot| {
+                    exact_prometheus_count(
+                        snapshot.state_capture_observations,
+                        "finalized checkpoint state-capture observations",
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("three-node {delivery_label} checkpoint latency: {error}")
+                    })
+                })
+                .unwrap_or(0);
+            let stalls = MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS
+                .saturating_sub(finalized_stalls)
+                .max(1);
+            let captures = MIN_CHECKPOINT_STATE_CAPTURE_OBSERVATIONS
+                .saturating_sub(finalized_captures)
+                .max(1);
+            (stalls, captures)
         })
         .collect::<Vec<_>>();
     let observation_window_ms = interval_ms
         .saturating_add(CHECKPOINT_PIPELINE_STALL_SLO_NS / 1_000_000)
-        .saturating_mul(required_live_stalls.iter().copied().max().unwrap_or(1))
+        .saturating_mul(
+            required_live_observations
+                .iter()
+                .map(|(stalls, captures)| (*stalls).max(*captures))
+                .max()
+                .unwrap_or(1),
+        )
         .saturating_add(u64::try_from(recovery_ceiling.as_millis()).unwrap_or(u64::MAX));
     wait_for(
         &format!(
-            "three-node {delivery_label} to capture {MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS} checkpoint stalls per node under active load"
+            "three-node {delivery_label} checkpoint latency observations per node under active load"
         ),
         Duration::from_millis(observation_window_ms),
         || {
             assert_running_nodes(&mut nodes);
             producer.assert_running();
-            nodes
-                .iter()
-                .zip(&required_live_stalls)
-                .all(|(node, required)| {
+            nodes.iter().zip(&required_live_observations).all(
+                |(node, (required_stalls, required_captures))| {
                     node.checkpoint_latency_metrics().is_some_and(|metrics| {
-                        metrics.pipeline_stall_observations >= *required as f64
+                        metrics.pipeline_stall_observations >= *required_stalls as f64
+                            && metrics.state_capture_observations >= *required_captures as f64
                     })
-                })
+                },
+            )
         },
     );
     let final_fence = local_convergence
@@ -10824,7 +10959,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
             panic!("incomplete exact checkpoint observed-cut evidence: {error}")
         });
     exact_timing_evidence.report();
-    latency_evidence.report();
+    latency_evidence.report(minimum_live_state_bytes);
 
     // Freeze the exact broker-acknowledged input offsets and require source commits to cover them.
     observe_live_join_state(
@@ -12487,6 +12622,7 @@ fn prometheus_bucket_parser_accepts_registry_labels() {
         "laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{instance=\"node0\",pipeline=\"soak\",le=\"0.512\"} 38\n",
         "laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{instance=\"node0\",pipeline=\"soak\",le=\"1.024\"} 41\n",
         "laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{instance=\"node0\",pipeline=\"soak\",le=\"+Inf\"} 43\n",
+        "laminardb_checkpoint_state_capture_duration_seconds_bucket{instance=\"node0\",pipeline=\"soak\",le=\"0.064\"} 39\n",
     );
     assert_eq!(
         prometheus_histogram_bucket_value(
@@ -12495,6 +12631,14 @@ fn prometheus_bucket_parser_accepts_registry_labels() {
             CHECKPOINT_PIPELINE_STALL_SLO_SECONDS,
         ),
         Some(41.0)
+    );
+    assert_eq!(
+        prometheus_histogram_bucket_value(
+            body,
+            "laminardb_checkpoint_state_capture_duration_seconds_bucket",
+            CHECKPOINT_STATE_CAPTURE_SLO_SECONDS,
+        ),
+        Some(39.0)
     );
 }
 
@@ -12615,6 +12759,9 @@ fn timing_test_metrics(timing: &CheckpointBarrierTimingGeneration) -> Checkpoint
     CheckpointLatencySnapshot {
         checkpoint_seconds: count * 0.1,
         checkpoint_observations: count,
+        state_capture_seconds: count * 0.01,
+        state_capture_observations: count,
+        state_capture_within_slo: count,
         pipeline_stall_observations: count,
         pipeline_stall_within_slo: timing.pipeline_stall_within_slo as f64,
         barrier_local_seconds: count * 0.01,
@@ -13139,6 +13286,9 @@ fn test_checkpoint_latency_snapshot(
     CheckpointLatencySnapshot {
         checkpoint_seconds: checkpoint_observations * 0.1,
         checkpoint_observations,
+        state_capture_seconds: pipeline_stall_observations * 0.01,
+        state_capture_observations: pipeline_stall_observations,
+        state_capture_within_slo: pipeline_stall_observations,
         pipeline_stall_observations,
         pipeline_stall_within_slo,
         barrier_local_seconds: pipeline_stall_observations * 0.025,
@@ -13166,6 +13316,20 @@ fn checkpoint_latency_snapshot_rejects_malformed_histograms() {
         .validate()
         .unwrap_err()
         .contains("exceeds histogram count"));
+
+    let mut fractional_capture_count = test_checkpoint_latency_snapshot(1.0, 10.0, 10.0);
+    fractional_capture_count.state_capture_observations = 9.5;
+    assert!(fractional_capture_count
+        .validate()
+        .unwrap_err()
+        .contains("exact non-negative integer"));
+
+    let mut impossible_capture_bucket = test_checkpoint_latency_snapshot(1.0, 10.0, 10.0);
+    impossible_capture_bucket.state_capture_within_slo = 11.0;
+    assert!(impossible_capture_bucket
+        .validate()
+        .unwrap_err()
+        .contains("state-capture SLO bucket"));
 
     let mut impossible_local_bucket = test_checkpoint_latency_snapshot(1.0, 10.0, 10.0);
     impossible_local_bucket.barrier_local_within_slo = 11.0;
@@ -13216,7 +13380,7 @@ fn checkpoint_latency_node_gate_prevents_cluster_dilution() {
 
     let aggregate = evidence.aggregate().unwrap();
     assert!(aggregate.pipeline_stall_within_slo_percent().unwrap() > 99.0);
-    let error = evidence.validate_slos().unwrap_err();
+    let error = evidence.validate_slos(true).unwrap_err();
     assert!(error.contains("node0 across process generations"));
     assert!(error.contains("98.33%"));
 
@@ -13239,7 +13403,7 @@ fn checkpoint_latency_node_gate_prevents_cluster_dilution() {
             test_checkpoint_latency_snapshot(1.0, 0.0, 0.0),
         )
         .unwrap();
-    let error = missing_generation.validate_slos().unwrap_err();
+    let error = missing_generation.validate_slos(true).unwrap_err();
     assert!(error.contains("node1 process generation 1"), "{error}");
     assert!(
         error.contains("no checkpoint pipeline-stall observations"),
@@ -13265,7 +13429,7 @@ fn checkpoint_latency_node_gate_prevents_cluster_dilution() {
             test_checkpoint_latency_snapshot(0.0, 100.0, 100.0),
         )
         .unwrap();
-    let error = missing_follower_duration.validate_slos().unwrap_err();
+    let error = missing_follower_duration.validate_slos(true).unwrap_err();
     assert!(
         error.contains("node1 process generation 1 captured no checkpoint-duration observations"),
         "{error}"
@@ -13283,7 +13447,93 @@ fn checkpoint_latency_node_gate_prevents_cluster_dilution() {
             )
             .unwrap();
     }
-    assert!(healthy_follower.validate_slos().is_ok());
+    assert!(healthy_follower.validate_slos(true).is_ok());
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn checkpoint_state_capture_gate_survives_restarts_without_cluster_dilution() {
+    let mut evidence = CheckpointLatencyEvidence::default();
+    for generation in 1..=2 {
+        let mut snapshot = test_checkpoint_latency_snapshot(60.0, 60.0, 60.0);
+        snapshot.state_capture_within_slo = 59.0;
+        evidence
+            .record_generation(
+                ProcessGeneration {
+                    node_id: 0,
+                    generation,
+                },
+                snapshot,
+            )
+            .unwrap();
+    }
+    evidence
+        .record_generation(
+            ProcessGeneration {
+                node_id: 1,
+                generation: 1,
+            },
+            test_checkpoint_latency_snapshot(200.0, 200.0, 200.0),
+        )
+        .unwrap();
+
+    let aggregate = evidence.aggregate().unwrap();
+    assert!(aggregate.state_capture_within_slo_percent().unwrap() > 99.0);
+    let error = evidence.validate_slos(true).unwrap_err();
+    assert!(
+        error.contains("node0 across process generations"),
+        "{error}"
+    );
+    assert!(error.contains("state-capture SLO"), "{error}");
+    assert!(error.contains("98.33%"), "{error}");
+
+    let mut missing_generation = CheckpointLatencyEvidence::default();
+    let mut empty_capture = test_checkpoint_latency_snapshot(1.0, 100.0, 100.0);
+    empty_capture.state_capture_seconds = 0.0;
+    empty_capture.state_capture_observations = 0.0;
+    empty_capture.state_capture_within_slo = 0.0;
+    missing_generation
+        .record_generation(
+            ProcessGeneration {
+                node_id: 0,
+                generation: 1,
+            },
+            empty_capture,
+        )
+        .unwrap();
+    missing_generation
+        .record_generation(
+            ProcessGeneration {
+                node_id: 0,
+                generation: 2,
+            },
+            test_checkpoint_latency_snapshot(100.0, 100.0, 100.0),
+        )
+        .unwrap();
+    let error = missing_generation.validate_slos(true).unwrap_err();
+    assert!(error.contains("node0 process generation 1"), "{error}");
+    assert!(error.contains("no checkpoint state-capture"), "{error}");
+    assert!(missing_generation.validate_slos(false).is_ok());
+
+    let mut insufficient = CheckpointLatencyEvidence::default();
+    let mut snapshot = test_checkpoint_latency_snapshot(100.0, 100.0, 100.0);
+    snapshot.state_capture_seconds = 0.99;
+    snapshot.state_capture_observations = 99.0;
+    snapshot.state_capture_within_slo = 99.0;
+    insufficient
+        .record_generation(
+            ProcessGeneration {
+                node_id: 0,
+                generation: 1,
+            },
+            snapshot,
+        )
+        .unwrap();
+    let error = insufficient.validate_slos(false).unwrap_err();
+    assert!(
+        error.contains("captured only 99 checkpoint state-capture observations"),
+        "{error}"
+    );
 }
 
 #[cfg(feature = "kafka")]
@@ -13313,7 +13563,9 @@ fn checkpoint_latency_slo_window_survives_process_restart() {
     let node = nodes.get(&0).unwrap();
     assert_eq!(node.pipeline_stall_observations, 122.0);
     assert_eq!(node.pipeline_stall_within_slo, 121.0);
-    assert!(evidence.validate_slos().is_ok());
+    assert_eq!(node.state_capture_observations, 122.0);
+    assert_eq!(node.state_capture_within_slo, 122.0);
+    assert!(evidence.validate_slos(true).is_ok());
 }
 
 #[cfg(feature = "kafka")]
@@ -13343,6 +13595,8 @@ fn checkpoint_latency_aggregation_preserves_restart_generations_once() {
     assert!(duplicate.contains("captured more than once"));
     let aggregate = evidence.aggregate().unwrap();
     assert_eq!(aggregate.checkpoint_observations, 30.0);
+    assert_eq!(aggregate.state_capture_observations, 30.0);
+    assert_eq!(aggregate.state_capture_within_slo, 30.0);
     assert_eq!(aggregate.pipeline_stall_observations, 30.0);
     assert_eq!(aggregate.pipeline_stall_within_slo, 30.0);
 }
