@@ -30,6 +30,14 @@ const MAX_MESSAGE_SIZE: usize = 1_048_576;
 const LEFT_REAP_THRESHOLD: u32 = 30;
 
 const DISCOVERY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const STATIC_DISCOVERY_PROTOCOL_VERSION: u16 = 2;
+
+fn current_node_metadata() -> NodeMetadata {
+    NodeMetadata {
+        version: env!("CARGO_PKG_VERSION").into(),
+        ..NodeMetadata::default()
+    }
+}
 
 struct AbortTaskOnDrop(tokio::task::AbortHandle);
 
@@ -94,7 +102,7 @@ impl Default for StaticDiscoveryConfig {
                 name: "node-1".into(),
                 rpc_address: "127.0.0.1:9000".into(),
                 state: NodeState::Active,
-                metadata: NodeMetadata::default(),
+                metadata: current_node_metadata(),
                 last_heartbeat_ms: 0,
             },
             seeds: Vec::new(),
@@ -110,6 +118,7 @@ impl Default for StaticDiscoveryConfig {
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct StaticHeartbeat {
+    protocol_version: u16,
     node: NodeInfo,
     process_generation: u64,
     process_incarnation: [u8; 16],
@@ -118,6 +127,7 @@ struct StaticHeartbeat {
 impl StaticHeartbeat {
     fn new(node: NodeInfo, process_generation: u64, process_incarnation: uuid::Uuid) -> Self {
         Self {
+            protocol_version: STATIC_DISCOVERY_PROTOCOL_VERSION,
             node,
             process_generation,
             process_incarnation: process_incarnation.into_bytes(),
@@ -132,6 +142,11 @@ impl StaticHeartbeat {
     }
 
     fn validate(&self) -> Result<(), DiscoveryError> {
+        if self.protocol_version != STATIC_DISCOVERY_PROTOCOL_VERSION {
+            return Err(DiscoveryError::Serialization(format!(
+                "static discovery protocol version must be {STATIC_DISCOVERY_PROTOCOL_VERSION}"
+            )));
+        }
         if self.process_generation == 0 {
             return Err(DiscoveryError::Serialization(
                 "static discovery process generation must be nonzero".into(),
@@ -141,6 +156,12 @@ impl StaticHeartbeat {
             return Err(DiscoveryError::Serialization(
                 "static discovery process incarnation must be a non-nil UUID".into(),
             ));
+        }
+        if self.node.metadata.version != env!("CARGO_PKG_VERSION") {
+            return Err(DiscoveryError::Serialization(format!(
+                "static discovery node version must be {:?}",
+                env!("CARGO_PKG_VERSION")
+            )));
         }
         Ok(())
     }
@@ -491,6 +512,7 @@ impl StaticDiscovery {
                                 if remote_heartbeat.node.id == local_snapshot.id {
                                     // Still respond so the heartbeater gets a reply
                                     let heartbeat = StaticHeartbeat {
+                                        protocol_version: STATIC_DISCOVERY_PROTOCOL_VERSION,
                                         node: local_snapshot,
                                         process_generation: local_identity.generation,
                                         process_incarnation: local_identity.incarnation,
@@ -514,6 +536,7 @@ impl StaticDiscovery {
 
                             let local_snapshot = local_info.read().clone();
                             let heartbeat = StaticHeartbeat {
+                                protocol_version: STATIC_DISCOVERY_PROTOCOL_VERSION,
                                 node: local_snapshot,
                                 process_generation: local_identity.generation,
                                 process_incarnation: local_identity.incarnation,
@@ -787,6 +810,12 @@ impl Discovery for StaticDiscovery {
         if !self.started {
             return Err(DiscoveryError::NotStarted);
         }
+        StaticHeartbeat::new(
+            info.clone(),
+            self.config.process_generation,
+            self.config.process_incarnation,
+        )
+        .validate()?;
         let mut local = self.local_info.write();
         let current_state = local.state;
         *local = info;
@@ -837,7 +866,7 @@ mod tests {
             name: format!("node-{id}"),
             rpc_address: address.into(),
             state,
-            metadata: NodeMetadata::default(),
+            metadata: current_node_metadata(),
             last_heartbeat_ms: 0,
         }
     }
@@ -921,6 +950,10 @@ mod tests {
         assert_eq!(config.heartbeat_interval, Duration::from_secs(1));
         assert_eq!(config.suspect_threshold, 3);
         assert_eq!(config.dead_threshold, 10);
+        assert_eq!(
+            config.local_node.metadata.version,
+            env!("CARGO_PKG_VERSION")
+        );
     }
 
     #[test]
@@ -930,7 +963,7 @@ mod tests {
             name: "test".into(),
             rpc_address: "127.0.0.1:9000".into(),
             state: NodeState::Active,
-            metadata: NodeMetadata::default(),
+            metadata: current_node_metadata(),
             last_heartbeat_ms: 1000,
         };
 
@@ -950,6 +983,16 @@ mod tests {
     fn test_deserialize_invalid() {
         let result = StaticDiscovery::deserialize_heartbeat(&[0xff, 0xff]);
         assert!(result.is_err());
+
+        let mut heartbeat = test_heartbeat(test_node(1, "node:9000", NodeState::Active), 1, 1);
+        heartbeat.node.metadata.version = "0.0.0".into();
+        let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&heartbeat).unwrap();
+        assert!(StaticDiscovery::deserialize_heartbeat(&encoded).is_err());
+
+        let mut heartbeat = test_heartbeat(test_node(1, "node:9000", NodeState::Active), 1, 1);
+        heartbeat.protocol_version = STATIC_DISCOVERY_PROTOCOL_VERSION - 1;
+        let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&heartbeat).unwrap();
+        assert!(StaticDiscovery::deserialize_heartbeat(&encoded).is_err());
     }
 
     #[test]
@@ -1112,6 +1155,11 @@ mod tests {
         disc.start().await.unwrap();
 
         let mut local = disc.local_info.read().clone();
+        local.metadata.version = "0.0.0".into();
+        assert!(disc.announce(local.clone()).await.is_err());
+        assert_ne!(disc.local_info.read().metadata.version, "0.0.0");
+
+        local.metadata.version = env!("CARGO_PKG_VERSION").into();
         local.state = NodeState::Draining;
         disc.announce(local).await.unwrap();
 
@@ -1136,7 +1184,7 @@ mod tests {
                 name: "node-1".into(),
                 rpc_address: addr1.clone(),
                 state: NodeState::Active,
-                metadata: NodeMetadata::default(),
+                metadata: current_node_metadata(),
                 last_heartbeat_ms: 0,
             },
             seeds: vec![addr2.clone()],
@@ -1151,7 +1199,7 @@ mod tests {
                 name: "node-2".into(),
                 rpc_address: addr2.clone(),
                 state: NodeState::Active,
-                metadata: NodeMetadata::default(),
+                metadata: current_node_metadata(),
                 last_heartbeat_ms: 0,
             },
             seeds: vec![addr1],

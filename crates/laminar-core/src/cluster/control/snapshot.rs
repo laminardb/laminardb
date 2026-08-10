@@ -107,6 +107,7 @@ fn version_from_file(name: &str, kind: &str, minimum: u64) -> Result<u64, Snapsh
 
 /// Durable vnode-to-instance assignment snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssignmentSnapshot {
     /// Monotonic version. Writers bump on each update.
     pub version: u64,
@@ -126,12 +127,20 @@ pub struct AssignmentSnapshot {
     /// they are about to lose as draining (pausing those source partitions) so the
     /// pre-rotation checkpoint is a clean cut; the leader then publishes the same
     /// assignment with `draining = false` to commit the rotation.
-    #[serde(default)]
     pub draining: bool,
     /// Exact predecessor, successor, and durable leader term for a draining generation.
     /// Present if and only if `draining` is true.
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_drain_transition")]
     pub drain_transition: Option<AssignmentDrainTransition>,
+}
+
+fn deserialize_drain_transition<'de, D>(
+    deserializer: D,
+) -> Result<Option<AssignmentDrainTransition>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer)
 }
 
 /// Exact immutable reference to a staged failure-recovery successor.
@@ -1433,6 +1442,37 @@ mod tests {
             .unwrap()
             .remove("partitioning_abi_version");
         assert!(serde_json::from_value::<AssignmentSnapshot>(value).is_err());
+    }
+
+    #[test]
+    fn assignment_snapshot_requires_the_current_wire_shape() {
+        let value = serde_json::to_value(snapshot(BTreeMap::from([(0, NodeId(1))]))).unwrap();
+
+        for field in ["draining", "drain_transition"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<AssignmentSnapshot>(missing).is_err());
+        }
+
+        let mut nested_unknown = value.clone();
+        nested_unknown["participants"][0]["retired_field"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<AssignmentSnapshot>(nested_unknown).is_err());
+
+        let draining = snapshot(BTreeMap::from([(0, NodeId(1))]))
+            .next_draining(
+                BTreeMap::from([(0, NodeId(1))]),
+                vec![participant(1, 1)],
+                leader(1, 1, 1),
+            )
+            .unwrap();
+        let mut nested_unknown = serde_json::to_value(draining).unwrap();
+        nested_unknown["drain_transition"]["leader"]["owner"]["retired_field"] =
+            serde_json::Value::Null;
+        assert!(serde_json::from_value::<AssignmentSnapshot>(nested_unknown).is_err());
+
+        let mut unknown = value;
+        unknown["retired_field"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<AssignmentSnapshot>(unknown).is_err());
     }
 
     #[test]

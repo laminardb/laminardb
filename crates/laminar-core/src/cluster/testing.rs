@@ -397,6 +397,7 @@ fn minicluster_metadata(instance_id: NodeId, process_generation: u64) -> NodeMet
         uuid::Uuid::from_u128((u128::from(process_generation) << 64) | u128::from(instance_id.0));
     let mut metadata = NodeMetadata {
         cores: 1,
+        version: env!("CARGO_PKG_VERSION").into(),
         ..NodeMetadata::default()
     };
     metadata.tags.insert(

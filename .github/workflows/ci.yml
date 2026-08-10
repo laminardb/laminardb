@@ -390,7 +390,7 @@ jobs:
           grep -Fqx 'NOT CERTIFICATION EVIDENCE' <<< "$draft_output"
           grep -Fq 'VALID_INELIGIBLE_DRAFT' <<< "$draft_output"
 
-          fixture_output="$(cargo run --quiet --locked --manifest-path tools/independent-soak-contract/Cargo.toml -- verify-oracle-fixture tools/independent-soak-contract/fixtures/grouped-count-sum-alo-v1.json 2>&1)"
+          fixture_output="$(cargo run --quiet --locked --manifest-path tools/independent-soak-contract/Cargo.toml -- verify-oracle-fixture tools/independent-soak-contract/fixtures/grouped-count-sum-alo-v2.json 2>&1)"
           echo "$fixture_output"
           grep -Fqx 'NOT CERTIFICATION EVIDENCE' <<< "$fixture_output"
           grep -Fq 'ORACLE_FIXTURE_OK' <<< "$fixture_output"

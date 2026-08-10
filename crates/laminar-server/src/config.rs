@@ -1034,6 +1034,7 @@ pub struct SinkConfig {
 
 /// `[discovery]` section: cluster node discovery.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiscoverySection {
     pub strategy: String,
     #[serde(default)]
@@ -1403,6 +1404,16 @@ task = "classify"
         .expect_err("removed coordination settings must not be silently ignored");
         assert!(error.to_string().contains("unknown field"), "{error}");
         assert!(error.to_string().contains("coordination"), "{error}");
+    }
+
+    #[test]
+    fn test_removed_discovery_key_is_rejected() {
+        let error = toml::from_str::<ServerConfig>(
+            "[server]\nmode = \"cluster\"\n[discovery]\nstrategy = \"gossip\"\nraft_address = \"127.0.0.1:9001\"\n",
+        )
+        .expect_err("retired discovery settings must not be silently ignored");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+        assert!(error.to_string().contains("raft_address"), "{error}");
     }
 
     #[test]

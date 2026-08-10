@@ -14,6 +14,7 @@ pub const MAX_CHECKPOINT_PARTICIPANTS: usize = 128 + 1;
 
 /// One exact process participating in a checkpoint cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointParticipant {
     /// Stable logical node identifier.
     pub node_id: u64,
@@ -42,6 +43,7 @@ pub struct CheckpointAssignmentAdoption {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UncheckedCheckpointAssignmentAdoption {
     participant: CheckpointParticipant,
     assignment_version: u64,
@@ -111,6 +113,7 @@ pub struct CheckpointAssignmentFence {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UncheckedCheckpointAssignmentFence {
     assignment_version: u64,
     partitioning_abi_version: u16,
@@ -332,6 +335,7 @@ pub struct AssignmentDrainTransition {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UncheckedAssignmentDrainTransition {
     predecessor: CheckpointAssignmentFence,
     target: CheckpointAssignmentFence,

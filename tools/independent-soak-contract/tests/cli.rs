@@ -28,19 +28,6 @@ fn valid_draft_prints_ineligible_notice() {
 fn fixture_check_prints_non_certification_notice() {
     let output = binary()
         .arg("verify-oracle-fixture")
-        .arg(manifest_path("fixtures/grouped-count-sum-alo-v1.json"))
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with(NOTICE));
-    assert!(stdout.contains("ORACLE_FIXTURE_OK"));
-}
-
-#[test]
-fn v2_fixture_dispatch_prints_non_certification_notice() {
-    let output = binary()
-        .arg("verify-oracle-fixture")
         .arg(manifest_path("fixtures/grouped-count-sum-alo-v2.json"))
         .output()
         .unwrap();

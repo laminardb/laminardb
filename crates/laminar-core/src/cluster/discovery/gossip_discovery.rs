@@ -21,6 +21,7 @@ const MAX_METADATA_TAG_KEY_BYTES: usize = 128;
 const MAX_METADATA_TAG_VALUE_BYTES: usize = 1_024;
 const MAX_METADATA_TAGS_ENCODED_BYTES: usize = 8 * 1_024;
 const PROCESS_INCARNATION_TAG: &str = "laminardb.process-incarnation";
+const DISCOVERY_PROTOCOL_VERSION: &str = "2";
 const DISCOVERY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct AbortTaskOnDrop(tokio::task::AbortHandle);
@@ -131,6 +132,7 @@ fn is_node_info_key(key: &str) -> bool {
             | keys::LOAD_MEMORY
             | keys::FAILURE_DOMAIN
             | keys::NODE_VERSION
+            | keys::PROTOCOL_VERSION
             | keys::METADATA_TAGS
     )
 }
@@ -151,6 +153,8 @@ pub mod keys {
     pub const FAILURE_DOMAIN: &str = "node:failure_domain";
     /// Version key.
     pub const NODE_VERSION: &str = "node:version";
+    /// Exact discovery wire revision.
+    pub const PROTOCOL_VERSION: &str = "node:discovery_protocol";
     /// Canonical JSON object containing the complete user/runtime metadata-tag map.
     pub const METADATA_TAGS: &str = "node:metadata_tags";
 }
@@ -182,7 +186,10 @@ pub struct GossipDiscoveryConfig {
 
 impl Default for GossipDiscoveryConfig {
     fn default() -> Self {
-        let mut metadata = NodeMetadata::default();
+        let mut metadata = NodeMetadata {
+            version: env!("CARGO_PKG_VERSION").into(),
+            ..NodeMetadata::default()
+        };
         metadata.tags.insert(
             PROCESS_INCARNATION_TAG.into(),
             uuid::Uuid::from_u128(1).to_string(),
@@ -253,8 +260,8 @@ impl GossipDiscovery {
         let rpc_address = kvs.get(keys::RPC_ADDRESS)?.clone();
         let name = kvs
             .get(keys::NODE_NAME)
-            .cloned()
-            .unwrap_or_else(|| format!("node-{id}"));
+            .filter(|name| !name.is_empty())?
+            .clone();
         let state = kvs.get(keys::NODE_STATE).and_then(|s| match s.as_str() {
             "joining" => Some(NodeState::Joining),
             "active" => Some(NodeState::Active),
@@ -264,16 +271,15 @@ impl GossipDiscovery {
             _ => None,
         })?;
 
-        let cores: u32 = kvs
-            .get(keys::LOAD_CORES)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
-        let memory_bytes: u64 = kvs
-            .get(keys::LOAD_MEMORY)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let cores: u32 = kvs.get(keys::LOAD_CORES)?.parse().ok()?;
+        let memory_bytes: u64 = kvs.get(keys::LOAD_MEMORY)?.parse().ok()?;
         let failure_domain = kvs.get(keys::FAILURE_DOMAIN).cloned();
-        let version = kvs.get(keys::NODE_VERSION).cloned().unwrap_or_default();
+        let version = kvs
+            .get(keys::NODE_VERSION)
+            .filter(|version| version.as_str() == env!("CARGO_PKG_VERSION"))?
+            .clone();
+        kvs.get(keys::PROTOCOL_VERSION)
+            .filter(|version| version.as_str() == DISCOVERY_PROTOCOL_VERSION)?;
         let tags: HashMap<String, String> = {
             let encoded = kvs.get(keys::METADATA_TAGS)?;
             if encoded.len() > MAX_METADATA_TAGS_ENCODED_BYTES {
@@ -347,6 +353,12 @@ impl GossipDiscovery {
 
     /// Build the chitchat key-value set for the local node.
     fn local_kvs(info: &NodeInfo) -> Result<Vec<(String, String)>, DiscoveryError> {
+        if info.name.is_empty() || info.metadata.version != env!("CARGO_PKG_VERSION") {
+            return Err(DiscoveryError::Serialization(format!(
+                "gossip node name must be nonempty and version must be {:?}",
+                env!("CARGO_PKG_VERSION")
+            )));
+        }
         Self::validate_metadata_tags(&info.metadata.tags, 0)?;
         Self::validate_process_incarnation(&info.metadata.tags)?;
         let canonical_tags: BTreeMap<&str, &str> = info
@@ -368,6 +380,10 @@ impl GossipDiscovery {
                 info.metadata.memory_bytes.to_string(),
             ),
             (keys::NODE_VERSION.into(), info.metadata.version.clone()),
+            (
+                keys::PROTOCOL_VERSION.into(),
+                DISCOVERY_PROTOCOL_VERSION.into(),
+            ),
             (keys::METADATA_TAGS.into(), encoded_tags),
         ];
         if let Some(ref fd) = info.metadata.failure_domain {
@@ -730,6 +746,23 @@ mod tests {
         );
     }
 
+    fn current_node_kvs(boot: u128) -> HashMap<String, String> {
+        let mut kvs = HashMap::from([
+            (keys::RPC_ADDRESS.into(), "127.0.0.1:9000".into()),
+            (keys::NODE_NAME.into(), "test-node".into()),
+            (keys::NODE_STATE.into(), "active".into()),
+            (keys::LOAD_CORES.into(), "4".into()),
+            (keys::LOAD_MEMORY.into(), "0".into()),
+            (keys::NODE_VERSION.into(), env!("CARGO_PKG_VERSION").into()),
+            (
+                keys::PROTOCOL_VERSION.into(),
+                DISCOVERY_PROTOCOL_VERSION.into(),
+            ),
+        ]);
+        add_process_identity(&mut kvs, boot);
+        kvs
+    }
+
     #[test]
     fn test_key_namespace() {
         assert_eq!(keys::NODE_STATE, "node:state");
@@ -746,18 +779,14 @@ mod tests {
 
     #[test]
     fn test_parse_node_info() {
-        let mut kvs = HashMap::new();
-        kvs.insert(keys::RPC_ADDRESS.into(), "127.0.0.1:9000".into());
-        kvs.insert(keys::NODE_NAME.into(), "test-node".into());
-        kvs.insert(keys::NODE_STATE.into(), "active".into());
-        kvs.insert(keys::LOAD_CORES.into(), "4".into());
-        kvs.insert(keys::LOAD_MEMORY.into(), "8589934592".into());
-        add_process_identity(&mut kvs, 42);
+        let kvs = current_node_kvs(42);
 
         let info = GossipDiscovery::parse_node_info("node-42", &kvs).unwrap();
         assert_eq!(info.id, NodeId(42));
         assert_eq!(info.name, "test-node");
         assert_eq!(info.metadata.cores, 4);
+        assert_eq!(info.metadata.memory_bytes, 0);
+        assert_eq!(info.metadata.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(info.state, NodeState::Active);
     }
 
@@ -768,8 +797,43 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_node_info_missing_rpc() {
-        let kvs = HashMap::new();
+    fn test_parse_node_info_requires_current_fields() {
+        for key in [
+            keys::RPC_ADDRESS,
+            keys::NODE_NAME,
+            keys::NODE_STATE,
+            keys::LOAD_CORES,
+            keys::LOAD_MEMORY,
+            keys::NODE_VERSION,
+            keys::PROTOCOL_VERSION,
+            keys::METADATA_TAGS,
+        ] {
+            let mut kvs = current_node_kvs(1);
+            kvs.remove(key);
+            assert!(GossipDiscovery::parse_node_info("node-1", &kvs).is_none());
+        }
+    }
+
+    #[test]
+    fn test_parse_node_info_rejects_invalid_current_identity() {
+        let mut kvs = current_node_kvs(1);
+        kvs.insert(keys::NODE_NAME.into(), String::new());
+        assert!(GossipDiscovery::parse_node_info("node-1", &kvs).is_none());
+
+        let mut kvs = current_node_kvs(1);
+        kvs.insert(keys::LOAD_CORES.into(), "four".into());
+        assert!(GossipDiscovery::parse_node_info("node-1", &kvs).is_none());
+
+        let mut kvs = current_node_kvs(1);
+        kvs.insert(keys::LOAD_MEMORY.into(), "unknown".into());
+        assert!(GossipDiscovery::parse_node_info("node-1", &kvs).is_none());
+
+        let mut kvs = current_node_kvs(1);
+        kvs.insert(keys::NODE_VERSION.into(), "0.0.0".into());
+        assert!(GossipDiscovery::parse_node_info("node-1", &kvs).is_none());
+
+        let mut kvs = current_node_kvs(1);
+        kvs.insert(keys::PROTOCOL_VERSION.into(), "1".into());
         assert!(GossipDiscovery::parse_node_info("node-1", &kvs).is_none());
     }
 
@@ -792,13 +856,16 @@ mod tests {
                 memory_bytes: 1024,
                 failure_domain: Some("us-east-1a".into()),
                 tags,
-                version: "test".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
             },
             last_heartbeat_ms: 0,
         };
         let kvs = GossipDiscovery::local_kvs(&info).unwrap();
         assert!(kvs.iter().any(|(k, _)| k == keys::RPC_ADDRESS));
         assert!(kvs.iter().any(|(k, _)| k == keys::FAILURE_DOMAIN));
+        assert!(kvs.iter().any(|(key, value)| {
+            key == keys::PROTOCOL_VERSION && value == DISCOVERY_PROTOCOL_VERSION
+        }));
         let encoded_tags = kvs
             .iter()
             .find_map(|(key, value)| (key == keys::METADATA_TAGS).then_some(value))
@@ -810,6 +877,10 @@ mod tests {
                 .map(String::as_str),
             Some("00000000-0000-0000-0000-000000000007")
         );
+
+        let mut invalid = info;
+        invalid.metadata.version = "0.0.0".into();
+        assert!(GossipDiscovery::local_kvs(&invalid).is_err());
     }
 
     #[test]
@@ -934,9 +1005,14 @@ mod tests {
         .unwrap();
         assert!(oversized.len() > MAX_METADATA_TAGS_ENCODED_BYTES);
         for invalid_tags in [None, Some("not-json".to_string()), Some(oversized)] {
-            let mut kvs = HashMap::from([(keys::RPC_ADDRESS.into(), "127.0.0.1:9000".into())]);
-            if let Some(tags) = invalid_tags {
-                kvs.insert(keys::METADATA_TAGS.into(), tags);
+            let mut kvs = current_node_kvs(71);
+            match invalid_tags {
+                Some(tags) => {
+                    kvs.insert(keys::METADATA_TAGS.into(), tags);
+                }
+                None => {
+                    kvs.remove(keys::METADATA_TAGS);
+                }
             }
             let invalid_newest = GossipDiscovery::parse_node_info("node-7", &kvs);
             assert!(invalid_newest.is_none());
@@ -954,8 +1030,7 @@ mod tests {
         let mut old = GossipDiscoveryConfig::default().local_node;
         old.id = NodeId(7);
 
-        let mut base = HashMap::from([(keys::RPC_ADDRESS.into(), "127.0.0.1:9000".into())]);
-        add_process_identity(&mut base, 71);
+        let base = current_node_kvs(71);
 
         for invalid_state in [
             None,
@@ -965,8 +1040,13 @@ mod tests {
             Some("retired"),
         ] {
             let mut kvs = base.clone();
-            if let Some(state) = invalid_state {
-                kvs.insert(keys::NODE_STATE.into(), state.into());
+            match invalid_state {
+                Some(state) => {
+                    kvs.insert(keys::NODE_STATE.into(), state.into());
+                }
+                None => {
+                    kvs.remove(keys::NODE_STATE);
+                }
             }
 
             let invalid_newest = GossipDiscovery::parse_node_info("node-7", &kvs);
@@ -982,10 +1062,8 @@ mod tests {
 
     #[test]
     fn malformed_metadata_tags_reject_peer_identity() {
-        let mut kvs = HashMap::from([
-            (keys::RPC_ADDRESS.into(), "127.0.0.1:9000".into()),
-            (keys::METADATA_TAGS.into(), "not-json".into()),
-        ]);
+        let mut kvs = current_node_kvs(1);
+        kvs.insert(keys::METADATA_TAGS.into(), "not-json".into());
         assert!(GossipDiscovery::parse_node_info("node-1", &kvs).is_none());
 
         kvs.insert(keys::METADATA_TAGS.into(), "[]".into());
@@ -1033,10 +1111,8 @@ mod tests {
         )
         .unwrap();
         assert!(encoded.len() > MAX_METADATA_TAGS_ENCODED_BYTES);
-        let kvs = HashMap::from([
-            (keys::RPC_ADDRESS.into(), "127.0.0.1:9000".into()),
-            (keys::METADATA_TAGS.into(), encoded),
-        ]);
+        let mut kvs = current_node_kvs(1);
+        kvs.insert(keys::METADATA_TAGS.into(), encoded);
         assert!(GossipDiscovery::parse_node_info("node-1", &kvs).is_none());
     }
 
@@ -1049,10 +1125,8 @@ mod tests {
             ("draining", NodeState::Draining),
             ("left", NodeState::Left),
         ] {
-            let mut kvs = HashMap::new();
-            kvs.insert(keys::RPC_ADDRESS.into(), "127.0.0.1:9000".into());
+            let mut kvs = current_node_kvs(1);
             kvs.insert(keys::NODE_STATE.into(), state_str.into());
-            add_process_identity(&mut kvs, 1);
 
             let info = GossipDiscovery::parse_node_info("node-1", &kvs).unwrap();
             assert_eq!(info.state, expected);
