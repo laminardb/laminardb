@@ -407,6 +407,21 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Mark inactive watermarked sources and input channels idle after this duration.
+    #[must_use]
+    pub fn source_idle_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.config.source_idle_timeout = Some(timeout);
+        self
+    }
+
+    /// Event timestamps farther ahead of wall clock do not advance source watermarks.
+    /// Zero disables the guard.
+    #[must_use]
+    pub fn event_time_max_future_skew(mut self, skew: std::time::Duration) -> Self {
+        self.config.event_time_max_future_skew = skew;
+        self
+    }
+
     /// Backpressure policy (default `Backpressure`).
     #[must_use]
     pub fn pipeline_backpressure_policy(
@@ -876,12 +891,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn managed_state_budget_builder_option_is_preserved() {
-        let builder = LaminarDbBuilder::new().pipeline_max_managed_state_bytes(123_456);
+    fn runtime_builder_options_are_preserved() {
+        let builder = LaminarDbBuilder::new()
+            .pipeline_max_managed_state_bytes(123_456)
+            .source_idle_timeout(std::time::Duration::from_secs(5))
+            .event_time_max_future_skew(std::time::Duration::from_secs(30));
 
         assert_eq!(
             builder.config.pipeline_max_managed_state_bytes,
             Some(123_456)
+        );
+        assert_eq!(
+            builder.config.source_idle_timeout,
+            Some(std::time::Duration::from_secs(5))
+        );
+        assert_eq!(
+            builder.config.event_time_max_future_skew,
+            std::time::Duration::from_secs(30)
         );
     }
 

@@ -400,6 +400,12 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     {
         errors.push(format!("server.{error}"));
     }
+    if let Err(error) = config.server.validated_source_idle_timeout() {
+        errors.push(format!("server.{error}"));
+    }
+    if let Err(error) = config.server.validated_event_time_max_future_skew() {
+        errors.push(format!("server.{error}"));
+    }
     // 0 prunes every prior timestamp, so the restart-rate budget never trips (unbounded restart loop).
     if config.supervision.window_secs == Some(0) {
         errors.push("supervision.window_secs must be > 0".to_string());
@@ -500,6 +506,16 @@ pub struct ServerSection {
     /// Right-side history retained while a temporal join input is idle.
     #[serde(default, with = "humantime_serde")]
     pub temporal_join_idle_history_retention: Option<Duration>,
+    /// Mark inactive watermarked sources and input channels idle after this duration.
+    #[serde(default, with = "humantime_serde")]
+    pub source_idle_timeout: Option<Duration>,
+    /// Event timestamps farther ahead of wall clock do not advance source watermarks.
+    /// Zero disables the guard.
+    #[serde(
+        default = "default_event_time_max_future_skew",
+        with = "humantime_serde"
+    )]
+    pub event_time_max_future_skew: Duration,
     /// Postgres wire bind address; `None` disables it.
     #[serde(default)]
     pub pgwire_bind: Option<String>,
@@ -559,6 +575,8 @@ impl Default for ServerSection {
             delivery: default_delivery(),
             incremental_emit: default_incremental_emit(),
             temporal_join_idle_history_retention: None,
+            source_idle_timeout: None,
+            event_time_max_future_skew: default_event_time_max_future_skew(),
             pgwire_bind: None,
             pgwire_users: std::collections::HashMap::new(),
             pgwire_allow_remote: false,
@@ -596,6 +614,31 @@ impl ServerSection {
         }
         Ok(Some(retention))
     }
+
+    pub(crate) fn validated_source_idle_timeout(&self) -> Result<Option<Duration>, &'static str> {
+        let Some(timeout) = self.source_idle_timeout else {
+            return Ok(None);
+        };
+        let timeout_ms = u64::try_from(timeout.as_millis())
+            .map_err(|_| "source_idle_timeout exceeds the supported millisecond range")?;
+        if timeout_ms == 0 {
+            return Err("source_idle_timeout must be at least 1ms");
+        }
+        Ok(Some(Duration::from_millis(timeout_ms)))
+    }
+
+    pub(crate) fn validated_event_time_max_future_skew(&self) -> Result<Duration, &'static str> {
+        let skew_ms = i64::try_from(self.event_time_max_future_skew.as_millis())
+            .map_err(|_| "event_time_max_future_skew exceeds the supported millisecond range")?;
+        if !self.event_time_max_future_skew.is_zero() && skew_ms == 0 {
+            return Err("event_time_max_future_skew must be zero or at least 1ms");
+        }
+        Ok(Duration::from_millis(skew_ms.unsigned_abs()))
+    }
+}
+
+fn default_event_time_max_future_skew() -> Duration {
+    Duration::from_millis(laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS.unsigned_abs())
 }
 
 /// `[supervision]` — auto-restart policy; unset fields fall back to engine defaults.
@@ -2402,17 +2445,32 @@ alice = "wonderland-key"
     }
 
     #[test]
-    fn temporal_join_idle_history_retention_uses_engine_millisecond_bounds() {
-        let parsed: ServerConfig =
-            toml::from_str("[server]\ntemporal_join_idle_history_retention = \"24h\"\n").unwrap();
+    fn event_time_durations_use_engine_millisecond_bounds() {
+        let parsed: ServerConfig = toml::from_str(
+            "[server]\ntemporal_join_idle_history_retention = \"24h\"\nsource_idle_timeout = \"5s\"\nevent_time_max_future_skew = \"30s\"\n",
+        )
+        .unwrap();
         assert_eq!(
             parsed.server.temporal_join_idle_history_retention,
             Some(Duration::from_secs(24 * 60 * 60))
+        );
+        assert_eq!(
+            parsed.server.source_idle_timeout,
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            parsed.server.event_time_max_future_skew,
+            Duration::from_secs(30)
         );
         validate_config(&parsed).unwrap();
 
         let default: ServerConfig = toml::from_str("").unwrap();
         assert_eq!(default.server.temporal_join_idle_history_retention, None);
+        assert_eq!(default.server.source_idle_timeout, None);
+        assert_eq!(
+            default.server.event_time_max_future_skew,
+            Duration::from_millis(laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS.unsigned_abs())
+        );
 
         for (retention, expected) in [
             (
@@ -2433,6 +2491,42 @@ alice = "wonderland-key"
             let error = validate_config(&config).unwrap_err().to_string();
             assert!(error.contains(expected), "{error}");
         }
+
+        for (timeout, expected) in [
+            (Duration::ZERO, "source_idle_timeout must be at least 1ms"),
+            (
+                Duration::from_nanos(999_999),
+                "source_idle_timeout must be at least 1ms",
+            ),
+            (
+                Duration::MAX,
+                "source_idle_timeout exceeds the supported millisecond range",
+            ),
+        ] {
+            let mut config: ServerConfig = toml::from_str("").unwrap();
+            config.server.source_idle_timeout = Some(timeout);
+            let error = validate_config(&config).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+
+        for (skew, expected) in [
+            (
+                Duration::from_nanos(1),
+                "event_time_max_future_skew must be zero or at least 1ms",
+            ),
+            (
+                Duration::MAX,
+                "event_time_max_future_skew exceeds the supported millisecond range",
+            ),
+        ] {
+            let mut config: ServerConfig = toml::from_str("").unwrap();
+            config.server.event_time_max_future_skew = skew;
+            let error = validate_config(&config).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        let mut disabled: ServerConfig = toml::from_str("").unwrap();
+        disabled.server.event_time_max_future_skew = Duration::ZERO;
+        validate_config(&disabled).unwrap();
     }
 
     #[test]

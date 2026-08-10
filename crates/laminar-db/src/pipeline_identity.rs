@@ -33,6 +33,8 @@ struct CanonicalPipeline {
     state_layout: &'static str,
     vnode_count: u16,
     delivery_guarantee: String,
+    source_idle_timeout_ms: Option<u64>,
+    event_time_max_future_skew_ms: i64,
     sources: Vec<CanonicalSource>,
     streams: Vec<CanonicalStream>,
     tables: Vec<CanonicalTable>,
@@ -167,6 +169,14 @@ pub(crate) fn compute(context: &PipelineIdentityContext<'_>) -> Result<PipelineI
         state_layout: STATE_LAYOUT,
         vnode_count: context.vnode_count,
         delivery_guarantee: context.config.delivery_guarantee.to_string(),
+        source_idle_timeout_ms: crate::config::source_idle_timeout_ms(
+            context.config.source_idle_timeout,
+        )
+        .map_err(|reason| DbError::Config(reason.to_string()))?,
+        event_time_max_future_skew_ms: crate::config::event_time_max_future_skew_ms(
+            context.config.event_time_max_future_skew,
+        )
+        .map_err(|reason| DbError::Config(reason.to_string()))?,
         sources: canonical_sources(
             context.catalog,
             context.connector_registry,
@@ -468,6 +478,8 @@ mod tests {
             state_layout: STATE_LAYOUT,
             vnode_count: 1,
             delivery_guarantee: "at-least-once".into(),
+            source_idle_timeout_ms: None,
+            event_time_max_future_skew_ms: laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
             sources: vec![CanonicalSource {
                 name: "events".into(),
                 connector_type: "test".into(),
@@ -488,14 +500,18 @@ mod tests {
     }
 
     #[test]
-    fn canonical_identity_digest_changes_with_the_partitioning_abi() {
-        let payload = |partitioning_abi_version| CanonicalPipeline {
+    fn canonical_identity_digest_changes_with_root_execution_config() {
+        let payload = |partitioning_abi_version,
+                       source_idle_timeout_ms,
+                       event_time_max_future_skew_ms| CanonicalPipeline {
             canonical_version: PIPELINE_IDENTITY_VERSION,
             state_abi_version: STATE_ABI_VERSION,
             partitioning_abi_version,
             state_layout: STATE_LAYOUT,
             vnode_count: 1,
             delivery_guarantee: "best_effort".into(),
+            source_idle_timeout_ms,
+            event_time_max_future_skew_ms,
             sources: Vec::new(),
             streams: Vec::new(),
             tables: Vec::new(),
@@ -503,13 +519,40 @@ mod tests {
         };
 
         let current = Sha256::digest(
-            serde_json::to_vec(&payload(laminar_core::state::PARTITIONING_ABI_VERSION)).unwrap(),
+            serde_json::to_vec(&payload(
+                laminar_core::state::PARTITIONING_ABI_VERSION,
+                None,
+                laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
+            ))
+            .unwrap(),
         );
         let changed = Sha256::digest(
-            serde_json::to_vec(&payload(laminar_core::state::PARTITIONING_ABI_VERSION + 1))
-                .unwrap(),
+            serde_json::to_vec(&payload(
+                laminar_core::state::PARTITIONING_ABI_VERSION + 1,
+                None,
+                laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
+            ))
+            .unwrap(),
         );
         assert_ne!(current, changed);
+        let idle_timeout = Sha256::digest(
+            serde_json::to_vec(&payload(
+                laminar_core::state::PARTITIONING_ABI_VERSION,
+                Some(5_000),
+                laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
+            ))
+            .unwrap(),
+        );
+        assert_ne!(current, idle_timeout);
+        let future_skew = Sha256::digest(
+            serde_json::to_vec(&payload(
+                laminar_core::state::PARTITIONING_ABI_VERSION,
+                None,
+                30_000,
+            ))
+            .unwrap(),
+        );
+        assert_ne!(current, future_skew);
     }
 
     #[test]

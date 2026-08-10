@@ -1047,6 +1047,14 @@ pub async fn start_cluster(
         .server
         .validated_temporal_join_idle_history_retention()
         .map_err(|error| ClusterStartupError::EngineConstruction(format!("server.{error}")))?;
+    let source_idle_timeout = config
+        .server
+        .validated_source_idle_timeout()
+        .map_err(|error| ClusterStartupError::EngineConstruction(format!("server.{error}")))?;
+    let event_time_max_future_skew = config
+        .server
+        .validated_event_time_max_future_skew()
+        .map_err(|error| ClusterStartupError::EngineConstruction(format!("server.{error}")))?;
     let node_id_str = cluster_cfg.node_id.as_str().to_string();
     let node_id_num = numeric_node_id(&node_id_str);
     let node_id = NodeId(node_id_num);
@@ -1516,6 +1524,10 @@ pub async fn start_cluster(
     if let Some(retention) = temporal_join_idle_history_retention {
         builder = builder.temporal_join_idle_history_retention(retention);
     }
+    if let Some(timeout) = source_idle_timeout {
+        builder = builder.source_idle_timeout(timeout);
+    }
+    builder = builder.event_time_max_future_skew(event_time_max_future_skew);
     builder = server::apply_verified_cluster_checkpoint_config(
         builder,
         &config.checkpoint,

@@ -1451,6 +1451,15 @@ impl LaminarDB {
         target_partitions: Option<usize>,
         runtime_mode: RuntimeMode,
     ) -> Result<Self, DbError> {
+        config.source_idle_timeout =
+            crate::config::source_idle_timeout_ms(config.source_idle_timeout)
+                .map_err(|error| DbError::Config(error.to_string()))?
+                .map(std::time::Duration::from_millis);
+        let future_skew_ms =
+            crate::config::event_time_max_future_skew_ms(config.event_time_max_future_skew)
+                .map_err(|error| DbError::Config(error.to_string()))?;
+        config.event_time_max_future_skew =
+            std::time::Duration::from_millis(future_skew_ms.unsigned_abs());
         let max_managed_state_bytes = config
             .pipeline_max_managed_state_bytes
             .unwrap_or(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES);

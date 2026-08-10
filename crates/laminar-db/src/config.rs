@@ -12,6 +12,31 @@ use laminar_core::streaming::{BackpressureStrategy, StreamCheckpointConfig};
 /// This execution budget is independent of checkpoint storage.
 pub const DEFAULT_MAX_MANAGED_STATE_BYTES: usize = 256 * 1024 * 1024;
 
+pub(crate) fn event_time_max_future_skew_ms(
+    skew: std::time::Duration,
+) -> Result<i64, &'static str> {
+    let skew_ms = i64::try_from(skew.as_millis())
+        .map_err(|_| "event_time_max_future_skew exceeds the supported millisecond range")?;
+    if !skew.is_zero() && skew_ms == 0 {
+        return Err("event_time_max_future_skew must be zero or at least 1ms");
+    }
+    Ok(skew_ms)
+}
+
+pub(crate) fn source_idle_timeout_ms(
+    timeout: Option<std::time::Duration>,
+) -> Result<Option<u64>, &'static str> {
+    let Some(timeout) = timeout else {
+        return Ok(None);
+    };
+    let timeout_ms = u64::try_from(timeout.as_millis())
+        .map_err(|_| "source_idle_timeout exceeds the supported millisecond range")?;
+    if timeout_ms == 0 {
+        return Err("source_idle_timeout must be at least 1ms");
+    }
+    Ok(Some(timeout_ms))
+}
+
 pub(crate) fn temporal_join_idle_history_retention_ms(
     retention: Option<std::time::Duration>,
 ) -> Result<i64, &'static str> {
@@ -126,6 +151,12 @@ pub struct LaminarConfig {
     /// Retention contract for right-side history while a temporal join input is idle.
     /// Required only when the pipeline contains a temporal join.
     pub temporal_join_idle_history_retention: Option<std::time::Duration>,
+    /// Mark inactive watermarked sources and input channels idle after this duration.
+    /// `None` disables automatic idle detection.
+    pub source_idle_timeout: Option<std::time::Duration>,
+    /// Event timestamps farther ahead of wall clock do not advance source watermarks.
+    /// Zero disables the guard.
+    pub event_time_max_future_skew: std::time::Duration,
     /// Backpressure policy. See [`BackpressurePolicy`].
     pub pipeline_backpressure_policy: BackpressurePolicy,
     /// Auto-restart policy applied when supervision is enabled.
@@ -155,6 +186,10 @@ impl Default for LaminarConfig {
             pipeline_max_input_buf_bytes: None,
             pipeline_max_managed_state_bytes: None,
             temporal_join_idle_history_retention: None,
+            source_idle_timeout: None,
+            event_time_max_future_skew: std::time::Duration::from_millis(
+                laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS.unsigned_abs(),
+            ),
             pipeline_backpressure_policy: BackpressurePolicy::default(),
             restart_policy: RestartPolicy::default(),
             shared_source_isolation: false,

@@ -184,6 +184,14 @@ pub async fn run_server(
         .server
         .validated_temporal_join_idle_history_retention()
         .map_err(|error| ServerError::Build(format!("server.{error}")))?;
+    let source_idle_timeout = config
+        .server
+        .validated_source_idle_timeout()
+        .map_err(|error| ServerError::Build(format!("server.{error}")))?;
+    let event_time_max_future_skew = config
+        .server
+        .validated_event_time_max_future_skew()
+        .map_err(|error| ServerError::Build(format!("server.{error}")))?;
     resolved_checkpoint_node_data_bytes(&config.checkpoint)
         .map_err(|error| ServerError::Build(format!("checkpoint.max_node_data_bytes: {error}")))?;
 
@@ -221,6 +229,10 @@ pub async fn run_server(
     if let Some(retention) = temporal_join_idle_history_retention {
         builder = builder.temporal_join_idle_history_retention(retention);
     }
+    if let Some(timeout) = source_idle_timeout {
+        builder = builder.source_idle_timeout(timeout);
+    }
+    builder = builder.event_time_max_future_skew(event_time_max_future_skew);
     builder = apply_local_checkpoint_config(builder, &config.checkpoint.url, &config.checkpoint)
         .map_err(|error| ServerError::Build(format!("checkpoint storage: {error}")))?;
 

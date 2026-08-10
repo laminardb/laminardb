@@ -4725,32 +4725,10 @@ impl LaminarDB {
             })
             .collect::<Result<_, _>>()?;
 
-        // A zero value explicitly disables the future-skew ceiling.
-        let future_skew_ms = match std::env::var("LAMINAR_MAX_FUTURE_SKEW_MS") {
-            Ok(v) => v.parse::<i64>().unwrap_or_else(|_| {
-                tracing::warn!(
-                    value = %v,
-                    "invalid LAMINAR_MAX_FUTURE_SKEW_MS (expected an integer); \
-                     using the default"
-                );
-                laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS
-            }),
-            Err(_) => laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
-        };
-        let idle_timeout = match std::env::var("LAMINAR_SOURCE_IDLE_TIMEOUT_MS") {
-            Ok(value) => match value.parse::<u64>() {
-                Ok(0) => None,
-                Ok(milliseconds) => Some(std::time::Duration::from_millis(milliseconds)),
-                Err(_) => {
-                    tracing::warn!(
-                        %value,
-                        "invalid LAMINAR_SOURCE_IDLE_TIMEOUT_MS; idle-source detection disabled"
-                    );
-                    None
-                }
-            },
-            Err(_) => None,
-        };
+        let future_skew_ms =
+            crate::config::event_time_max_future_skew_ms(self.config.event_time_max_future_skew)
+                .map_err(|error| DbError::Config(error.to_string()))?;
+        let idle_timeout = self.config.source_idle_timeout;
         let source_contracts: FxHashMap<&str, SourceContract> = sources
             .iter()
             .map(|source| (source.name.as_str(), source.contract()))
