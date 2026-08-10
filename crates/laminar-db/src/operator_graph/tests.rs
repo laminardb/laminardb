@@ -1533,7 +1533,6 @@ async fn alignment_abort_controller_with_announcement(
         id: NodeId(id),
         name: format!("node-{id}"),
         rpc_address: String::new(),
-        raft_address: String::new(),
         state: NodeState::Active,
         metadata: NodeMetadata::default(),
         last_heartbeat_ms: 0,

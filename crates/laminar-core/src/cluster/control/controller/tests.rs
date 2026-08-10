@@ -342,7 +342,6 @@ fn info(id: u64) -> NodeInfo {
         id: NodeId(id),
         name: format!("n{id}"),
         rpc_address: String::new(),
-        raft_address: String::new(),
         state: NodeState::Active,
         metadata: NodeMetadata::default(),
         last_heartbeat_ms: 0,

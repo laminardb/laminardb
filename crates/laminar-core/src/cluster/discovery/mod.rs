@@ -30,7 +30,6 @@ pub(crate) fn publish_if_changed(tx: &watch::Sender<Vec<NodeInfo>>, mut peer_lis
                 id,
                 name,
                 rpc_address,
-                raft_address,
                 state,
                 metadata,
                 last_heartbeat_ms: _,
@@ -38,7 +37,6 @@ pub(crate) fn publish_if_changed(tx: &watch::Sender<Vec<NodeInfo>>, mut peer_lis
             id == &b.id
                 && name == &b.name
                 && rpc_address == &b.rpc_address
-                && raft_address == &b.raft_address
                 && state == &b.state
                 && metadata == &b.metadata
         }
@@ -145,8 +143,6 @@ pub struct NodeInfo {
     pub name: String,
     /// Address for gRPC communication.
     pub rpc_address: String,
-    /// Legacy wire-schema field; current runtimes publish it empty and do not bind a Raft service.
-    pub raft_address: String,
     /// Current lifecycle state.
     pub state: NodeState,
     /// Hardware/deployment metadata.
@@ -277,7 +273,6 @@ mod tests {
             id: NodeId(id),
             name: format!("n{id}"),
             rpc_address: String::new(),
-            raft_address: String::new(),
             state,
             metadata: NodeMetadata::default(),
             last_heartbeat_ms: 0,
@@ -329,7 +324,6 @@ mod tests {
             id: NodeId(1),
             name: "test-node".into(),
             rpc_address: "127.0.0.1:9000".into(),
-            raft_address: "127.0.0.1:9001".into(),
             state: NodeState::Active,
             metadata: NodeMetadata::default(),
             last_heartbeat_ms: 1000,

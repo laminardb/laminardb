@@ -93,7 +93,6 @@ impl Default for StaticDiscoveryConfig {
                 id: NodeId(1),
                 name: "node-1".into(),
                 rpc_address: "127.0.0.1:9000".into(),
-                raft_address: "127.0.0.1:9001".into(),
                 state: NodeState::Active,
                 metadata: NodeMetadata::default(),
                 last_heartbeat_ms: 0,
@@ -184,7 +183,6 @@ impl StaticState {
 
     fn update_identity(info: &mut NodeInfo, remote: &NodeInfo, now: i64) {
         info.rpc_address.clone_from(&remote.rpc_address);
-        info.raft_address.clone_from(&remote.raft_address);
         info.name.clone_from(&remote.name);
         info.metadata = remote.metadata.clone();
         info.last_heartbeat_ms = now;
@@ -838,7 +836,6 @@ mod tests {
             id: NodeId(id),
             name: format!("node-{id}"),
             rpc_address: address.into(),
-            raft_address: address.into(),
             state,
             metadata: NodeMetadata::default(),
             last_heartbeat_ms: 0,
@@ -932,7 +929,6 @@ mod tests {
             id: NodeId(42),
             name: "test".into(),
             rpc_address: "127.0.0.1:9000".into(),
-            raft_address: "127.0.0.1:9001".into(),
             state: NodeState::Active,
             metadata: NodeMetadata::default(),
             last_heartbeat_ms: 1000,
@@ -1139,7 +1135,6 @@ mod tests {
                 id: NodeId(1),
                 name: "node-1".into(),
                 rpc_address: addr1.clone(),
-                raft_address: addr1.clone(),
                 state: NodeState::Active,
                 metadata: NodeMetadata::default(),
                 last_heartbeat_ms: 0,
@@ -1155,7 +1150,6 @@ mod tests {
                 id: NodeId(2),
                 name: "node-2".into(),
                 rpc_address: addr2.clone(),
-                raft_address: addr2.clone(),
                 state: NodeState::Active,
                 metadata: NodeMetadata::default(),
                 last_heartbeat_ms: 0,

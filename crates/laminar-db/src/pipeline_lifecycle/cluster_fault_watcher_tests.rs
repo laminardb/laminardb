@@ -374,7 +374,6 @@ async fn zero_vnode_worker_finishes_startup_idle_and_data_plane_fenced() {
         id: NodeId(owner.0),
         name: "owner".into(),
         rpc_address: String::new(),
-        raft_address: String::new(),
         state: NodeState::Active,
         metadata: NodeMetadata::default(),
         last_heartbeat_ms: 0,

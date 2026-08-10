@@ -126,7 +126,6 @@ fn is_node_info_key(key: &str) -> bool {
         key,
         keys::NODE_STATE
             | keys::RPC_ADDRESS
-            | keys::RAFT_ADDRESS
             | keys::NODE_NAME
             | keys::LOAD_CORES
             | keys::LOAD_MEMORY
@@ -142,8 +141,6 @@ pub mod keys {
     pub const NODE_STATE: &str = "node:state";
     /// RPC address key.
     pub const RPC_ADDRESS: &str = "node:rpc_addr";
-    /// Legacy wire key; current runtimes publish an empty value.
-    pub const RAFT_ADDRESS: &str = "node:raft_addr";
     /// Node name key.
     pub const NODE_NAME: &str = "node:name";
     /// CPU core count key.
@@ -203,7 +200,6 @@ impl Default for GossipDiscoveryConfig {
                 id: NodeId(1),
                 name: "node-1".into(),
                 rpc_address: "127.0.0.1:9000".into(),
-                raft_address: "127.0.0.1:9001".into(),
                 state: NodeState::Active,
                 metadata,
                 last_heartbeat_ms: 0,
@@ -255,7 +251,6 @@ impl GossipDiscovery {
     fn parse_node_info(node_id_str: &str, kvs: &HashMap<String, String>) -> Option<NodeInfo> {
         let id = stable_node_id(node_id_str)?;
         let rpc_address = kvs.get(keys::RPC_ADDRESS)?.clone();
-        let raft_address = kvs.get(keys::RAFT_ADDRESS).cloned().unwrap_or_default();
         let name = kvs
             .get(keys::NODE_NAME)
             .cloned()
@@ -294,7 +289,6 @@ impl GossipDiscovery {
             id: NodeId(id),
             name,
             rpc_address,
-            raft_address,
             state,
             metadata: NodeMetadata {
                 cores,
@@ -367,7 +361,6 @@ impl GossipDiscovery {
         let mut kvs = vec![
             (keys::NODE_STATE.into(), info.state.to_string()),
             (keys::RPC_ADDRESS.into(), info.rpc_address.clone()),
-            (keys::RAFT_ADDRESS.into(), info.raft_address.clone()),
             (keys::NODE_NAME.into(), info.name.clone()),
             (keys::LOAD_CORES.into(), info.metadata.cores.to_string()),
             (
@@ -755,7 +748,6 @@ mod tests {
     fn test_parse_node_info() {
         let mut kvs = HashMap::new();
         kvs.insert(keys::RPC_ADDRESS.into(), "127.0.0.1:9000".into());
-        kvs.insert(keys::RAFT_ADDRESS.into(), "127.0.0.1:9001".into());
         kvs.insert(keys::NODE_NAME.into(), "test-node".into());
         kvs.insert(keys::NODE_STATE.into(), "active".into());
         kvs.insert(keys::LOAD_CORES.into(), "4".into());
@@ -794,7 +786,6 @@ mod tests {
             id: NodeId(1),
             name: "n1".into(),
             rpc_address: "127.0.0.1:9000".into(),
-            raft_address: "127.0.0.1:9001".into(),
             state: NodeState::Active,
             metadata: NodeMetadata {
                 cores: 4,

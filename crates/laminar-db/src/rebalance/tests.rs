@@ -302,7 +302,6 @@ fn member(
         id,
         name: format!("node-{}", id.0),
         rpc_address: String::new(),
-        raft_address: String::new(),
         state,
         metadata: laminar_core::cluster::discovery::NodeMetadata::default(),
         last_heartbeat_ms: 0,

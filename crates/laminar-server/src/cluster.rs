@@ -1194,9 +1194,6 @@ pub async fn start_cluster(
         id: node_id,
         name: node_id_str.clone(),
         rpc_address: format!("{advertise_host}:{http_port}"),
-        // `NodeInfo` retains this legacy wire field, but LaminarDB has no Raft
-        // transport and must not advertise a service that is not bound.
-        raft_address: String::new(),
         state: NodeState::Joining,
         metadata: NodeMetadata {
             cores: num_cpus(),

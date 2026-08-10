@@ -2985,7 +2985,6 @@ mod grpc_tests {
             id: NodeId(node_id),
             name: format!("node-{node_id}"),
             rpc_address: String::new(),
-            raft_address: String::new(),
             state,
             metadata: crate::cluster::discovery::NodeMetadata::default(),
             last_heartbeat_ms: 0,
