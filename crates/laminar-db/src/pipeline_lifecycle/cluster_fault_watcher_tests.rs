@@ -138,6 +138,7 @@ async fn startup_db() -> (
     RecoveryRound,
     Arc<CatalogManifestStore>,
     laminar_core::checkpoint::LeaderProof,
+    String,
 ) {
     let node_id = NodeId(7);
     let kv = Arc::new(InMemoryKv::new(node_id));
@@ -145,6 +146,12 @@ async fn startup_db() -> (
     let (members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
     let checkpoint_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
+    let deployment_id = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+        Arc::clone(&checkpoint_store),
+    )
+    .load_or_create_deployment_id()
+    .await
+    .unwrap();
     let assignment_store = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&checkpoint_store)));
     let controller = Arc::new(ClusterController::new(
         node_id,
@@ -287,12 +294,14 @@ async fn startup_db() -> (
         round,
         manifest_store,
         lease.proof(),
+        deployment_id,
     )
 }
 
 #[tokio::test]
 async fn fresh_certified_cluster_startup_opens_intake() {
-    let (db, controller, _kv, _members, _round, _manifest_store, _proof) = startup_db().await;
+    let (db, controller, _kv, _members, _round, _manifest_store, _proof, _deployment_id) =
+        startup_db().await;
 
     assert_eq!(
         db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
@@ -306,7 +315,8 @@ async fn fresh_certified_cluster_startup_opens_intake() {
 
 #[tokio::test]
 async fn durable_fault_before_startup_audit_keeps_intake_closed() {
-    let (db, controller, _kv, _members, _round, _manifest_store, _proof) = startup_db().await;
+    let (db, controller, _kv, _members, _round, _manifest_store, _proof, _deployment_id) =
+        startup_db().await;
     let request = controller.next_recovery_fault_request().unwrap();
     controller.report_fault(request).await.unwrap();
 
@@ -318,6 +328,40 @@ async fn durable_fault_before_startup_audit_keeps_intake_closed() {
     );
     assert!(db.cluster_intake_fenced());
     assert!(controller.is_recovering());
+}
+
+#[tokio::test]
+async fn unresolved_checkpoint_artifacts_request_startup_recovery() {
+    let (db, controller, _kv, _members, round, _manifest_store, proof, deployment_id) =
+        startup_db().await;
+    controller
+        .checkpoint_authority()
+        .unwrap()
+        .begin_cluster_checkpoint_artifacts(
+            &proof,
+            laminar_core::checkpoint_decision::CheckpointArtifactInventory {
+                deployment_id,
+                pipeline_identity: laminar_core::checkpoint::PipelineIdentity::empty(),
+                attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(1),
+                assignment_fence: Some(round.assignment_fence),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        ClusterStartupDisposition::RecoveryFenced
+    );
+    assert!(db.cluster_intake_fenced());
+    assert!(controller.is_recovering());
+    assert_ne!(
+        db.pending_recovery_fault
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
 }
 
 #[tokio::test]
@@ -435,7 +479,8 @@ async fn zero_vnode_worker_finishes_startup_idle_and_data_plane_fenced() {
 #[tokio::test]
 async fn splittable_source_without_assignment_hook_fails_before_start() {
     REJECTING_SPLITTABLE_STARTED.store(false, Ordering::Release);
-    let (db, _controller, _kv, _members, _round, manifest_store, proof) = startup_db().await;
+    let (db, _controller, _kv, _members, _round, manifest_store, proof, _deployment_id) =
+        startup_db().await;
     manifest_store
         .seal(
             &CatalogManifest::new(vec![
@@ -476,7 +521,8 @@ async fn splittable_source_without_assignment_hook_fails_before_start() {
 #[tokio::test]
 async fn cluster_source_start_failure_does_not_leave_graph_ready_vnode_state() {
     FAILING_CLUSTER_SOURCE_STARTED.store(false, Ordering::Release);
-    let (db, _controller, _kv, _members, _round, manifest_store, proof) = startup_db().await;
+    let (db, _controller, _kv, _members, _round, manifest_store, proof, _deployment_id) =
+        startup_db().await;
     manifest_store
         .seal(
             &CatalogManifest::new(vec![
@@ -515,7 +561,8 @@ async fn cluster_source_start_failure_does_not_leave_graph_ready_vnode_state() {
 
 #[tokio::test]
 async fn manifest_replay_cleanup_fault_remains_terminal_after_start_returns() {
-    let (db, _controller, _kv, _members, _round, manifest_store, proof) = startup_db().await;
+    let (db, _controller, _kv, _members, _round, manifest_store, proof, _deployment_id) =
+        startup_db().await;
     manifest_store
         .seal(
             &CatalogManifest::new(vec![
@@ -568,7 +615,8 @@ async fn manifest_replay_cleanup_fault_remains_terminal_after_start_returns() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assignment_closure_wins_while_startup_waits_to_open_intake() {
-    let (db, controller, _kv, _members, _round, _manifest_store, _proof) = startup_db().await;
+    let (db, controller, _kv, _members, _round, _manifest_store, _proof, _deployment_id) =
+        startup_db().await;
     let execution = Arc::clone(&db.rotation_execution_fence).read_owned().await;
     let starting = {
         let db = Arc::clone(&db);
@@ -603,7 +651,8 @@ async fn assignment_closure_wins_while_startup_waits_to_open_intake() {
 
 #[tokio::test]
 async fn restored_or_active_recovery_startup_stays_fenced_and_reports() {
-    let (restored, controller, _kv, _members, _round, _manifest_store, _proof) = startup_db().await;
+    let (restored, controller, _kv, _members, _round, _manifest_store, _proof, _deployment_id) =
+        startup_db().await;
     *restored.last_recovery_epoch.lock() = Some(9);
     assert_eq!(
         restored
@@ -617,7 +666,8 @@ async fn restored_or_active_recovery_startup_stays_fenced_and_reports() {
         .load(std::sync::atomic::Ordering::Acquire));
     assert!(!controller.read_fault_reports().await.unwrap().is_empty());
 
-    let (active, controller, _kv, _members, round, _manifest_store, _proof) = startup_db().await;
+    let (active, controller, _kv, _members, round, _manifest_store, _proof, _deployment_id) =
+        startup_db().await;
     controller.announce_recover_prepare(&round).await.unwrap();
     assert_eq!(
         active
@@ -634,7 +684,8 @@ async fn restored_or_active_recovery_startup_stays_fenced_and_reports() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn active_recovery_does_not_block_compute_fault_handoff() {
-    let (_db, controller, _kv, _members, round, _manifest_store, _proof) = startup_db().await;
+    let (_db, controller, _kv, _members, round, _manifest_store, _proof, _deployment_id) =
+        startup_db().await;
     controller.announce_recover_prepare(&round).await.unwrap();
     assert_eq!(
         controller.observe_recover().await.unwrap(),
@@ -668,7 +719,8 @@ async fn active_recovery_does_not_block_compute_fault_handoff() {
 
 #[tokio::test]
 async fn lifecycle_arbitration_queues_only_a_live_generation_that_won_faulted() {
-    let (_db, controller, _kv, _members, _round, _manifest_store, _proof) = startup_db().await;
+    let (_db, controller, _kv, _members, _round, _manifest_store, _proof, _deployment_id) =
+        startup_db().await;
     let pending = AtomicU64::new(0);
     let stopped_state = std::sync::atomic::AtomicU8::new(DbState::ShuttingDown as u8);
     let stopped_generation = tokio_util::sync::CancellationToken::new();

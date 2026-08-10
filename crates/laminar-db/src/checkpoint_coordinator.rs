@@ -18,12 +18,16 @@ use laminar_connectors::connector::{
 #[cfg(feature = "cluster")]
 use laminar_core::checkpoint::{channel_progress_frontier, CheckpointAttemptRelation};
 use laminar_core::checkpoint::{
-    checkpoint_descriptor_sha256, checkpoint_manifest_bytes, checkpoint_sha256,
-    classify_channel_progress, ByteRange, ChannelProgress, CheckpointAttempt, CheckpointManifest,
-    CheckpointScope, CheckpointStore, CheckpointWatermark, CommittedCheckpointIndex,
-    CommittedCheckpointRef, CommittedParticipantRef, ConnectorCheckpoint, LeaderProof,
-    PipelineIdentity, PreparedSinkDescriptor, ReferencedStateChunk, StateChunkId, StateFrame,
-    StateFrameKey, COMMITTED_CHECKPOINT_INDEX_VERSION, PREPARED_SINK_DESCRIPTOR_VERSION,
+    checkpoint_artifact_identity_sha256, checkpoint_descriptor_sha256, checkpoint_manifest_bytes,
+    checkpoint_sha256, classify_channel_progress, ByteRange, ChannelProgress, CheckpointAttempt,
+    CheckpointManifest, CheckpointScope, CheckpointStore, CheckpointWatermark,
+    CommittedCheckpointIndex, CommittedCheckpointRef, CommittedParticipantRef, ConnectorCheckpoint,
+    LeaderProof, PipelineIdentity, PreparedSinkDescriptor, ReferencedStateChunk, StateChunkId,
+    StateFrame, StateFrameKey, COMMITTED_CHECKPOINT_INDEX_VERSION,
+    PREPARED_SINK_DESCRIPTOR_VERSION,
+};
+use laminar_core::checkpoint_decision::{
+    CheckpointArtifactInventory, CheckpointArtifactInventoryUpdateResult,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -979,9 +983,17 @@ async fn run_gc_request(
 mod artifact_tests {
     use super::*;
     use laminar_core::checkpoint::ObjectStoreCheckpointStore;
+    #[cfg(feature = "cluster")]
+    use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
     use laminar_core::checkpoint_decision::{
         CheckpointDecisionStore, CheckpointRetentionState, CheckpointRetentionUpdateResult,
     };
+    #[cfg(feature = "cluster")]
+    use laminar_core::cluster::control::{
+        ClusterController, ClusterKv, InMemoryKv, LeaderLeaseOwner, LeaderLeaseStore, LeaseOutcome,
+    };
+    #[cfg(feature = "cluster")]
+    use laminar_core::cluster::discovery::{NodeId, NodeInfo};
     use laminar_core::state::KeyGroupCount;
     use object_store::memory::InMemory;
 
@@ -1026,6 +1038,73 @@ mod artifact_tests {
         (manifest, payload)
     }
 
+    #[cfg(feature = "cluster")]
+    fn cluster_manifest(
+        checkpoint_id: u64,
+        participant_id: u64,
+        vnode: u16,
+        deployment_id: &str,
+        fence: &CheckpointAssignmentFence,
+        key_groups: KeyGroupCount,
+    ) -> (CheckpointManifest, Bytes) {
+        let payload = Bytes::from(vec![
+            u8::try_from(checkpoint_id).unwrap(),
+            u8::try_from(participant_id).unwrap(),
+        ]);
+        let mut manifest =
+            CheckpointManifest::new_with_key_group_count(checkpoint_id, checkpoint_id, key_groups);
+        manifest.bind_participant(participant_id);
+        manifest.deployment_id = deployment_id.into();
+        manifest.assignment_fence = Some(fence.clone());
+        manifest.owned_vnodes = vec![vnode];
+        manifest.state_frames.push(StateFrame {
+            key: StateFrameKey::Vnode {
+                operator_id: "join".into(),
+                vnode,
+            },
+            chunk: manifest.node_data.chunk,
+            range: ByteRange {
+                offset: 0,
+                length: payload.len() as u64,
+            },
+            sha256: checkpoint_sha256(&payload),
+        });
+        manifest.node_data.object_length = payload.len() as u64;
+        manifest.node_data.sha256 = checkpoint_sha256(&payload);
+        (manifest, payload)
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn save_cluster_manifests(
+        objects: Arc<dyn object_store::ObjectStore>,
+        prefix: &str,
+        checkpoint_id: u64,
+        deployment_id: &str,
+        fence: &CheckpointAssignmentFence,
+        key_groups: KeyGroupCount,
+    ) -> Vec<(CheckpointManifest, Bytes)> {
+        let mut manifests = Vec::with_capacity(2);
+        for (participant_id, vnode) in [(1, 0), (2, 1)] {
+            let store = ObjectStoreCheckpointStore::new(Arc::clone(&objects), prefix)
+                .with_key_group_count(key_groups)
+                .with_participant_id(participant_id);
+            let (manifest, payload) = cluster_manifest(
+                checkpoint_id,
+                participant_id,
+                vnode,
+                deployment_id,
+                fence,
+                key_groups,
+            );
+            let encoded = store
+                .save_checkpoint(&manifest, std::slice::from_ref(&payload))
+                .await
+                .unwrap();
+            manifests.push((manifest, encoded));
+        }
+        manifests
+    }
+
     fn retention_state(result: CheckpointRetentionUpdateResult) -> CheckpointRetentionState {
         match result {
             CheckpointRetentionUpdateResult::Applied(state)
@@ -1046,6 +1125,28 @@ mod artifact_tests {
             .is_some()
     }
 
+    async fn admit_local_artifacts(
+        decisions: &CheckpointDecisionStore,
+        deployment_id: &str,
+        checkpoint_id: u64,
+        pipeline_identity: PipelineIdentity,
+    ) {
+        let result = decisions
+            .begin_checkpoint_artifact_inventory(CheckpointArtifactInventory {
+                deployment_id: deployment_id.to_owned(),
+                pipeline_identity,
+                attempt: CheckpointAttempt::canonical(checkpoint_id),
+                assignment_fence: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            CheckpointArtifactInventoryUpdateResult::Applied
+                | CheckpointArtifactInventoryUpdateResult::Unchanged
+        ));
+    }
+
     #[tokio::test]
     async fn retention_reclaims_last_referenced_chunk_and_keeps_latest_cut() {
         use laminar_core::checkpoint_decision::CheckpointVerdict;
@@ -1063,6 +1164,13 @@ mod artifact_tests {
         let mut latest = None;
         let mut checkpoint_three = None;
         for checkpoint_id in 1..=6 {
+            admit_local_artifacts(
+                decisions.as_ref(),
+                &deployment_id,
+                checkpoint_id,
+                PipelineIdentity::empty(),
+            )
+            .await;
             let retained_chunk = (checkpoint_id == 6)
                 .then(|| checkpoint_three.clone().expect("checkpoint three metadata"));
             let (manifest, payload) = manifest(checkpoint_id, &deployment_id, retained_chunk);
@@ -1176,6 +1284,13 @@ mod artifact_tests {
             .unwrap()
             .is_some());
 
+        admit_local_artifacts(
+            decisions.as_ref(),
+            &deployment_id,
+            7,
+            PipelineIdentity::empty(),
+        )
+        .await;
         let (manifest, payload) = manifest(7, &deployment_id, None);
         store
             .save_checkpoint(&manifest, std::slice::from_ref(&payload))
@@ -1298,6 +1413,9 @@ mod artifact_tests {
             .bind_durable_decision_store(Arc::clone(&decisions))
             .await
             .unwrap();
+        coordinator
+            .bind_pipeline_identity(PipelineIdentity::empty())
+            .unwrap();
         let deployment_id = coordinator.expected_deployment_id().unwrap().to_owned();
         (coordinator, decisions, deployment_id)
     }
@@ -1307,6 +1425,15 @@ mod artifact_tests {
         checkpoint_id: u64,
         deployment_id: &str,
     ) -> (CheckpointManifest, Bytes) {
+        coordinator
+            .begin_checkpoint_artifacts_until(
+                CheckpointAttempt::canonical(checkpoint_id),
+                None,
+                None,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
         let (manifest, payload) = manifest(checkpoint_id, deployment_id, None);
         let encoded = coordinator
             .store
@@ -1321,7 +1448,7 @@ mod artifact_tests {
     }
 
     #[tokio::test]
-    async fn durable_abort_deletes_only_its_exact_prepared_artifact_and_is_idempotent() {
+    async fn durable_abort_seals_only_its_exact_prepared_artifact_and_is_idempotent() {
         let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let (mut coordinator, _decisions, deployment_id) = coordinator_with_store(objects).await;
         let (aborted, _) = save_prepared(&mut coordinator, 1, &deployment_id).await;
@@ -1352,22 +1479,20 @@ mod artifact_tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            coordinator
-                .store
-                .load_manifest_for_participant(1, 1)
-                .await
-                .unwrap(),
-            None
-        );
-        assert!(
-            !node_data_exists(
-                coordinator.store.as_ref(),
+        assert!(coordinator
+            .store
+            .load_manifest_for_participant(1, 1)
+            .await
+            .is_err());
+        assert!(coordinator
+            .store
+            .load_node_data_ranges(
                 aborted.node_data.chunk,
                 aborted.node_data.object_length,
+                &[],
             )
             .await
-        );
+            .is_err());
         assert!(coordinator
             .store
             .load_manifest_for_participant(1, 2)
@@ -1385,47 +1510,69 @@ mod artifact_tests {
     }
 
     #[tokio::test]
-    async fn recovery_reclaims_artifact_left_after_durable_abort() {
-        use laminar_core::checkpoint_decision::CheckpointVerdict;
-
+    async fn recovery_aborts_and_seals_unresolved_candidate_index() {
         let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let (mut interrupted, decisions, deployment_id) =
             coordinator_with_store(Arc::clone(&objects)).await;
-        let (manifest, _) = save_prepared(&mut interrupted, 1, &deployment_id).await;
-        decisions
-            .record_outcome(
-                1,
-                1,
-                CheckpointScope::Local,
-                None,
-                None,
-                CheckpointVerdict::Abort,
-                None,
-            )
+        let committed = interrupted
+            .checkpoint(CheckpointRequest::default())
             .await
             .unwrap();
+        assert!(committed.success, "{committed:?}");
+        let predecessor = interrupted.last_committed_ref.clone().unwrap();
+        let (manifest, encoded) = save_prepared(&mut interrupted, 2, &deployment_id).await;
+        let index = CommittedCheckpointIndex {
+            version: COMMITTED_CHECKPOINT_INDEX_VERSION,
+            deployment_id,
+            pipeline_identity: manifest.pipeline_identity.clone(),
+            epoch: 2,
+            checkpoint_id: 2,
+            scope: CheckpointScope::Local,
+            vnode_count: 1,
+            assignment_fence: None,
+            predecessor: Some(predecessor.clone()),
+            participants: vec![CommittedParticipantRef::from_manifest(&manifest, &encoded).unwrap()],
+            source_names: Vec::new(),
+            source_offsets: BTreeMap::new(),
+            channel_progress: Vec::new(),
+            checkpoint_watermark: None,
+        };
+        let candidate = decisions.create_committed_checkpoint(&index).await.unwrap();
         drop(interrupted);
 
         let (mut restarted, _, _) = coordinator_with_store(objects).await;
-        assert!(restarted.recover().await.unwrap().is_none());
+        assert_eq!(restarted.recover().await.unwrap().unwrap().epoch(), 1);
+        assert!(decisions
+            .load_committed_checkpoint(&candidate)
+            .await
+            .is_err());
+        assert!(decisions
+            .load_committed_checkpoint(&predecessor)
+            .await
+            .is_ok());
+        let head = decisions.checkpoint_decision_head().await.unwrap().unwrap();
+        assert!(head.active_artifacts.is_none());
+        assert!(head
+            .latest_terminal
+            .is_some_and(|outcome| !outcome.is_commit() && outcome.checkpoint_id == 2));
         assert!(restarted
             .store
-            .load_manifest_for_participant(1, 1)
+            .load_manifest_for_participant(1, 2)
             .await
-            .unwrap()
-            .is_none());
-        assert!(
-            !node_data_exists(
-                restarted.store.as_ref(),
+            .is_err());
+        assert!(restarted
+            .store
+            .load_node_data_ranges(
                 manifest.node_data.chunk,
                 manifest.node_data.object_length,
+                &[],
             )
             .await
-        );
+            .is_err());
     }
 
     #[tokio::test]
-    async fn commit_winner_prevents_prepared_artifact_deletion() {
+    async fn commit_winner_prevents_prepared_artifact_sealing() {
         use laminar_core::checkpoint_decision::CheckpointVerdict;
 
         let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -1485,6 +1632,267 @@ mod artifact_tests {
             )
             .await
         );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn cluster_settlement_resumes_exact_seals_before_genesis_reset() {
+        let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let decisions = Arc::new(CheckpointDecisionStore::new(Arc::clone(&objects)));
+        let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+        let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&objects), 1_000));
+        let leader_boot = uuid::Uuid::from_u128(1);
+        let owner = LeaderLeaseOwner {
+            node: NodeId(1),
+            boot: leader_boot,
+            process_term: 1,
+        };
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
+        else {
+            panic!("empty cluster authority must grant its first leader term");
+        };
+        let proof = lease.proof();
+        let key_groups = KeyGroupCount::try_from(2_u16).unwrap();
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[1, 2],
+            vec![
+                CheckpointParticipant {
+                    node_id: 1,
+                    boot_incarnation: leader_boot,
+                },
+                CheckpointParticipant {
+                    node_id: 2,
+                    boot_incarnation: uuid::Uuid::from_u128(2),
+                },
+            ],
+        )
+        .unwrap();
+
+        let control_kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(NodeId(1)));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+        let controller = Arc::new(ClusterController::new(
+            NodeId(1),
+            control_kv,
+            None,
+            members_rx,
+        ));
+        controller.set_leader_lease_store(Arc::clone(&authority));
+
+        let prefix = "cluster-aborted-artifacts";
+        let store = ObjectStoreCheckpointStore::new(Arc::clone(&objects), prefix)
+            .with_key_group_count(key_groups)
+            .with_participant_id(1);
+        let mut coordinator =
+            CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+        coordinator
+            .bind_durable_decision_store(Arc::clone(&decisions))
+            .await
+            .unwrap();
+        coordinator
+            .bind_pipeline_identity(PipelineIdentity::empty())
+            .unwrap();
+        coordinator.set_cluster_controller(controller);
+
+        let predecessor_attempt = CheckpointAttempt::canonical(1);
+        let predecessor_inventory = CheckpointArtifactInventory {
+            deployment_id: deployment_id.clone(),
+            pipeline_identity: PipelineIdentity::empty(),
+            attempt: predecessor_attempt,
+            assignment_fence: Some(fence.clone()),
+        };
+        authority
+            .begin_cluster_checkpoint_artifacts(&proof, predecessor_inventory)
+            .await
+            .unwrap();
+        let predecessor_manifests = save_cluster_manifests(
+            Arc::clone(&objects),
+            prefix,
+            1,
+            &deployment_id,
+            &fence,
+            key_groups,
+        )
+        .await;
+        let predecessor_index = coordinator
+            .build_committed_index(
+                predecessor_attempt,
+                CheckpointScope::Cluster,
+                Some(fence.clone()),
+                None,
+                &predecessor_manifests,
+                None,
+            )
+            .unwrap();
+        let predecessor = decisions
+            .create_committed_checkpoint(&predecessor_index)
+            .await
+            .unwrap();
+        authority
+            .record_cluster_outcome(
+                &proof,
+                1,
+                1,
+                fence.clone(),
+                laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
+                Some(predecessor.clone()),
+            )
+            .await
+            .unwrap();
+        assert!(coordinator.last_committed_ref.is_none());
+        assert_eq!(
+            coordinator
+                .authoritative_committed_predecessor_until(
+                    CheckpointScope::Cluster,
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                )
+                .await
+                .unwrap(),
+            Some(predecessor.clone())
+        );
+
+        let attempt = CheckpointAttempt::canonical(2);
+        let inventory = CheckpointArtifactInventory {
+            deployment_id: deployment_id.clone(),
+            pipeline_identity: PipelineIdentity::empty(),
+            attempt,
+            assignment_fence: Some(fence.clone()),
+        };
+        authority
+            .begin_cluster_checkpoint_artifacts(&proof, inventory.clone())
+            .await
+            .unwrap();
+        let manifests = save_cluster_manifests(
+            Arc::clone(&objects),
+            prefix,
+            2,
+            &deployment_id,
+            &fence,
+            key_groups,
+        )
+        .await;
+        let candidate_index = coordinator
+            .build_committed_index(
+                attempt,
+                CheckpointScope::Cluster,
+                Some(fence.clone()),
+                Some(predecessor.clone()),
+                &manifests,
+                None,
+            )
+            .unwrap();
+        let candidate = decisions
+            .create_committed_checkpoint(&candidate_index)
+            .await
+            .unwrap();
+        authority
+            .record_cluster_outcome(
+                &proof,
+                2,
+                2,
+                fence,
+                laminar_core::checkpoint_decision::CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap();
+
+        coordinator.prepared.insert(
+            attempt,
+            (Arc::new(manifests[0].0.clone()), manifests[0].1.clone()),
+        );
+        coordinator.failure_requires_recovery = true;
+        coordinator.local_watermark = CheckpointWatermark::Active(42);
+        coordinator.allocator.advance_epoch_to(9);
+        let allocator_epoch = coordinator.allocator.peek_epoch();
+        let genesis_error = coordinator.recover_to_epoch(0).await.unwrap_err();
+        assert!(
+            genesis_error
+                .to_string()
+                .contains("checkpoint artifacts remain"),
+            "{genesis_error}"
+        );
+        assert!(coordinator.prepared.contains_key(&attempt));
+        assert!(coordinator.failure_requires_recovery);
+        assert_eq!(coordinator.local_watermark, CheckpointWatermark::Active(42));
+        assert_eq!(coordinator.allocator.peek_epoch(), allocator_epoch);
+
+        let first_chunk = manifests[0].0.node_data.chunk;
+        let first_identity = checkpoint_artifact_identity_sha256(&inventory, first_chunk).unwrap();
+        let sealer = ObjectStoreCheckpointStore::new(Arc::clone(&objects), prefix)
+            .with_key_group_count(key_groups)
+            .with_participant_id(1);
+        assert!(sealer
+            .seal_aborted_manifest(first_chunk, &first_identity)
+            .await
+            .unwrap()
+            .is_some());
+
+        assert!(coordinator
+            .settle_cluster_checkpoint_artifacts_until(
+                &proof,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap());
+        assert!(authority
+            .cluster_checkpoint_artifacts()
+            .await
+            .unwrap()
+            .is_none());
+        assert!(decisions
+            .load_committed_checkpoint(&candidate)
+            .await
+            .is_err());
+        assert_eq!(
+            decisions
+                .load_committed_checkpoint(&predecessor)
+                .await
+                .unwrap(),
+            predecessor_index
+        );
+        for (manifest, _) in &manifests {
+            assert!(coordinator
+                .store
+                .load_manifest_for_participant(manifest.participant_id, attempt.checkpoint_id)
+                .await
+                .is_err());
+            assert!(coordinator
+                .store
+                .load_node_data_ranges(
+                    manifest.node_data.chunk,
+                    manifest.node_data.object_length,
+                    &[],
+                )
+                .await
+                .is_err());
+        }
+        assert!(!coordinator
+            .settle_cluster_checkpoint_artifacts_until(
+                &proof,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap());
+
+        coordinator.prepared.insert(
+            attempt,
+            (Arc::new(manifests[0].0.clone()), manifests[0].1.clone()),
+        );
+        coordinator.last_committed_manifest = Some(Arc::new(predecessor_manifests[0].0.clone()));
+        coordinator.last_committed_ref = Some(predecessor);
+        coordinator.failure_requires_recovery = true;
+        coordinator.local_watermark = CheckpointWatermark::Active(42);
+        assert!(coordinator.recover_to_epoch(0).await.unwrap().is_none());
+        assert!(coordinator.prepared.is_empty());
+        assert!(coordinator.last_committed_manifest.is_none());
+        assert!(coordinator.last_committed_ref.is_none());
+        assert!(!coordinator.failure_requires_recovery);
+        assert_eq!(
+            coordinator.local_watermark,
+            CheckpointWatermark::Uninitialized
+        );
+        assert_eq!(coordinator.allocator.peek_epoch(), allocator_epoch);
     }
 }
 
@@ -1921,6 +2329,161 @@ impl CheckpointCoordinator {
         self.deployment_id.as_deref().ok_or_else(|| {
             DbError::Checkpoint("checkpoint deployment identity is not bound".into())
         })
+    }
+
+    fn checkpoint_artifact_inventory(
+        &self,
+        attempt: CheckpointAttempt,
+        assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
+    ) -> Result<CheckpointArtifactInventory, DbError> {
+        if assignment_fence.is_none()
+            && self.store.participant_id() != laminar_core::state::LOCAL_NODE_ID.0
+        {
+            return Err(DbError::Checkpoint(
+                "local checkpoint artifacts require the singleton local participant".into(),
+            ));
+        }
+        let inventory = CheckpointArtifactInventory {
+            deployment_id: self.expected_deployment_id()?.to_owned(),
+            pipeline_identity: self.expected_pipeline_identity()?,
+            attempt: require_canonical_attempt(attempt, "checkpoint artifact admission")?,
+            assignment_fence,
+        };
+        inventory.validate().map_err(DbError::Checkpoint)?;
+        Ok(inventory)
+    }
+
+    fn validate_checkpoint_artifact_inventory(
+        &self,
+        inventory: &CheckpointArtifactInventory,
+    ) -> Result<(), DbError> {
+        inventory.validate().map_err(DbError::Checkpoint)?;
+        if inventory.deployment_id != self.expected_deployment_id()?
+            || inventory.pipeline_identity != self.expected_pipeline_identity()?
+        {
+            return Err(DbError::Checkpoint(
+                "checkpoint artifact inventory does not belong to this pipeline deployment".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn authoritative_committed_predecessor_until(
+        &self,
+        scope: CheckpointScope,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<CommittedCheckpointRef>, DbError> {
+        #[cfg(feature = "cluster")]
+        if scope == CheckpointScope::Cluster {
+            let controller = self.cluster_controller.as_ref().ok_or_else(|| {
+                DbError::Checkpoint("cluster checkpoint has no cluster controller".into())
+            })?;
+            let authority = controller.checkpoint_authority().map_err(|error| {
+                DbError::Checkpoint(format!("cluster checkpoint authority: {error}"))
+            })?;
+            let outcome =
+                tokio::time::timeout_at(deadline, authority.highest_cluster_committed_outcome())
+                    .await
+                    .map_err(|_| DbError::Checkpoint("cluster predecessor read timed out".into()))?
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!("cluster predecessor read failed: {error}"))
+                    })?;
+            return outcome
+                .map(|outcome| {
+                    outcome.committed_checkpoint.ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "cluster predecessor Commit has no checkpoint reference".into(),
+                        )
+                    })
+                })
+                .transpose();
+        }
+
+        if scope != CheckpointScope::Local {
+            return Err(DbError::Checkpoint(
+                "cluster checkpointing requires the cluster feature".into(),
+            ));
+        }
+        let store = self.decision_store.as_ref().ok_or_else(|| {
+            DbError::Checkpoint("local predecessor read requires a decision store".into())
+        })?;
+        let head = tokio::time::timeout_at(deadline, store.checkpoint_decision_head())
+            .await
+            .map_err(|_| DbError::Checkpoint("local predecessor read timed out".into()))?
+            .map_err(|error| {
+                DbError::Checkpoint(format!("local predecessor read failed: {error}"))
+            })?;
+        head.and_then(|head| head.latest_commit)
+            .map(|outcome| {
+                outcome.committed_checkpoint.ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "local predecessor Commit has no checkpoint reference".into(),
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    pub(crate) async fn begin_checkpoint_artifacts_until(
+        &self,
+        attempt: CheckpointAttempt,
+        assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
+        leader_proof: Option<&LeaderProof>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        let inventory = self.checkpoint_artifact_inventory(attempt, assignment_fence)?;
+
+        #[cfg(feature = "cluster")]
+        if let Some(controller) = self.cluster_controller.as_ref() {
+            let proof = leader_proof.ok_or_else(|| {
+                DbError::Checkpoint("cluster artifact admission has no leader proof".into())
+            })?;
+            let authority = controller.checkpoint_authority().map_err(|error| {
+                DbError::Checkpoint(format!("cluster checkpoint authority: {error}"))
+            })?;
+            let admitted = tokio::time::timeout_at(
+                deadline,
+                authority.begin_cluster_checkpoint_artifacts(proof, inventory.clone()),
+            )
+            .await
+            .map_err(|_| DbError::Checkpoint("cluster artifact admission timed out".into()))?
+            .map_err(|error| {
+                DbError::Checkpoint(format!("cluster artifact admission failed: {error}"))
+            })?;
+            if admitted != inventory {
+                return Err(DbError::Checkpoint(
+                    "cluster artifact admission returned a different inventory".into(),
+                ));
+            }
+            return Ok(());
+        }
+
+        if inventory.assignment_fence.is_some() || leader_proof.is_some() {
+            return Err(DbError::Checkpoint(
+                "local artifact admission cannot carry cluster authority".into(),
+            ));
+        }
+        let store = self.decision_store.as_ref().ok_or_else(|| {
+            DbError::Checkpoint("checkpoint artifact admission requires a decision store".into())
+        })?;
+        let result = tokio::time::timeout_at(
+            deadline,
+            store.begin_checkpoint_artifact_inventory(inventory),
+        )
+        .await
+        .map_err(|_| DbError::Checkpoint("checkpoint artifact admission timed out".into()))?
+        .map_err(|error| {
+            DbError::Checkpoint(format!("checkpoint artifact admission failed: {error}"))
+        })?;
+        match result {
+            CheckpointArtifactInventoryUpdateResult::Applied
+            | CheckpointArtifactInventoryUpdateResult::Unchanged => Ok(()),
+            CheckpointArtifactInventoryUpdateResult::Conflict { current } => {
+                Err(DbError::Checkpoint(format!(
+                    "checkpoint artifact admission conflicts with {current:?}"
+                )))
+            }
+        }
     }
 
     #[cfg(feature = "cluster")]
@@ -2665,20 +3228,6 @@ impl CheckpointCoordinator {
             let authority = controller.checkpoint_authority().map_err(|error| {
                 DbError::Checkpoint(format!("cluster checkpoint authority: {error}"))
             })?;
-            let latest_terminal =
-                tokio::time::timeout_at(deadline, authority.highest_cluster_terminal_outcome())
-                    .await
-                    .map_err(|_| DbError::Checkpoint("cluster terminal read timed out".into()))?
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!("cluster terminal read failed: {error}"))
-                    })?;
-            if let Some(outcome) = latest_terminal.filter(|outcome| !outcome.is_commit()) {
-                self.delete_prepared_artifact_until(
-                    CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id),
-                    deadline,
-                )
-                .await?;
-            }
             let Some(selected) =
                 tokio::time::timeout_at(deadline, authority.highest_cluster_committed_outcome())
                     .await
@@ -2716,22 +3265,56 @@ impl CheckpointCoordinator {
         let store = Arc::clone(self.decision_store.as_ref().ok_or_else(|| {
             DbError::Checkpoint("checkpoint recovery requires a decision store".into())
         })?);
-        let head = tokio::time::timeout_at(deadline, store.checkpoint_decision_head())
+        let mut head = tokio::time::timeout_at(deadline, store.checkpoint_decision_head())
             .await
             .map_err(|_| DbError::Checkpoint("checkpoint recovery selection timed out".into()))?
             .map_err(|error| {
                 DbError::Checkpoint(format!("checkpoint recovery selection: {error}"))
             })?;
-        if let Some(outcome) = head
-            .as_ref()
-            .map(|head| &head.latest_terminal)
-            .filter(|outcome| !outcome.is_commit())
-        {
-            self.delete_prepared_artifact_until(
-                CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id),
-                deadline,
-            )
-            .await?;
+        if let Some(inventory) = head.as_ref().and_then(|head| head.active_artifacts.clone()) {
+            self.validate_checkpoint_artifact_inventory(&inventory)?;
+            if inventory.assignment_fence.is_some() {
+                return Err(DbError::Checkpoint(
+                    "local recovery found cluster artifact inventory".into(),
+                ));
+            }
+            let exact_abort = head
+                .as_ref()
+                .and_then(|head| head.latest_terminal.as_ref())
+                .is_some_and(|outcome| {
+                    !outcome.is_commit()
+                        && outcome.epoch == inventory.attempt.epoch
+                        && outcome.checkpoint_id == inventory.attempt.checkpoint_id
+                });
+            if !exact_abort {
+                if head
+                    .as_ref()
+                    .and_then(|head| head.latest_terminal.as_ref())
+                    .is_some_and(|outcome| outcome.epoch >= inventory.attempt.epoch)
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "checkpoint {} has incompatible terminal authority while artifacts remain",
+                        inventory.attempt.checkpoint_id
+                    )));
+                }
+                self.record_outcome_until(
+                    inventory.attempt,
+                    laminar_core::checkpoint_decision::CheckpointVerdict::Abort,
+                    None,
+                    None,
+                    None,
+                    deadline,
+                )
+                .await?;
+            }
+            self.cleanup_local_checkpoint_artifacts_until(inventory.attempt, deadline)
+                .await?;
+            head = tokio::time::timeout_at(deadline, store.checkpoint_decision_head())
+                .await
+                .map_err(|_| DbError::Checkpoint("checkpoint recovery selection timed out".into()))?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!("checkpoint recovery selection: {error}"))
+                })?;
         }
         let Some(outcome) = head.and_then(|head| head.latest_commit) else {
             return Ok(None);
@@ -2756,15 +3339,43 @@ impl CheckpointCoordinator {
         &mut self,
         epoch: u64,
     ) -> Result<Option<crate::recovery_manager::RecoveredState>, DbError> {
-        if epoch == 0 {
-            return Ok(None);
-        }
         if self.phase != CheckpointPhase::Idle {
             return Err(DbError::Checkpoint(
                 "cannot recover while a checkpoint is in progress".into(),
             ));
         }
         let deadline = tokio::time::Instant::now() + self.config.checkpoint_timeout;
+        if epoch == 0 {
+            let controller = self.cluster_controller.as_ref().ok_or_else(|| {
+                DbError::Checkpoint(
+                    "epoch-targeted recovery requires cluster checkpoint authority".into(),
+                )
+            })?;
+            let authority = controller.checkpoint_authority().map_err(|error| {
+                DbError::Checkpoint(format!("cluster checkpoint authority: {error}"))
+            })?;
+            if tokio::time::timeout_at(deadline, authority.cluster_checkpoint_artifacts())
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint("genesis recovery artifact audit timed out".into())
+                })?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!("genesis recovery artifact audit failed: {error}"))
+                })?
+                .is_some()
+            {
+                return Err(DbError::Checkpoint(
+                    "genesis recovery cannot install while checkpoint artifacts remain".into(),
+                ));
+            }
+            self.prepared.clear();
+            self.last_committed_manifest = None;
+            self.last_committed_ref = None;
+            self.local_watermark = CheckpointWatermark::Uninitialized;
+            self.failure_requires_recovery = false;
+            self.phase = CheckpointPhase::Idle;
+            return Ok(None);
+        }
         if let Some(controller) = self.cluster_controller.as_ref() {
             let authority = controller.checkpoint_authority().map_err(|error| {
                 DbError::Checkpoint(format!("cluster checkpoint authority: {error}"))
@@ -2986,7 +3597,7 @@ impl CheckpointCoordinator {
             .await
             .map_err(|_| DbError::Checkpoint("sink-open outcome read timed out".into()))?
             .map_err(|error| DbError::Checkpoint(format!("sink-open outcome read: {error}")))?;
-        match head.map(|head| head.latest_terminal) {
+        match head.and_then(|head| head.latest_terminal) {
             Some(outcome) if outcome.epoch > witness.attempt.epoch => {
                 return Err(DbError::Checkpoint(
                     "sink-open witness remained open past a newer terminal outcome".into(),
@@ -3673,6 +4284,11 @@ impl CheckpointCoordinator {
         deadline: tokio::time::Instant,
     ) -> Result<Bytes, DbError> {
         self.phase = CheckpointPhase::Persisting;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DbError::Checkpoint(
+                "checkpoint persistence timed out".into(),
+            ));
+        }
         let persisted = tokio::time::timeout_at(
             deadline,
             self.store
@@ -3680,17 +4296,17 @@ impl CheckpointCoordinator {
         )
         .await;
         let manifest_bytes = match persisted {
-            Ok(Ok(bytes)) => bytes,
-            Ok(Err(error)) => {
-                self.retain_ambiguous_prepared(packed)?;
-                return Err(DbError::from(error));
-            }
             Err(_) => {
                 self.retain_ambiguous_prepared(packed)?;
                 return Err(DbError::Checkpoint(
                     "checkpoint persistence timed out".into(),
                 ));
             }
+            Ok(Err(error)) => {
+                self.retain_ambiguous_prepared(packed)?;
+                return Err(DbError::from(error));
+            }
+            Ok(Ok(bytes)) => bytes,
         };
         self.total_bytes_written = self
             .total_bytes_written
@@ -3712,43 +4328,289 @@ impl CheckpointCoordinator {
         Ok(())
     }
 
-    fn prepared_chunk(&self, attempt: CheckpointAttempt) -> Result<StateChunkId, DbError> {
-        let attempt = require_canonical_attempt(attempt, "prepared artifact cleanup")?;
-        let expected = StateChunkId {
-            participant_id: self.store.participant_id(),
-            checkpoint_id: attempt.checkpoint_id,
-        };
-        if let Some((manifest, _)) = self.prepared.get(&attempt) {
-            if manifest.epoch != attempt.epoch
-                || manifest.checkpoint_id != attempt.checkpoint_id
-                || manifest.participant_id != expected.participant_id
-                || manifest.node_data.chunk != expected
-            {
-                return Err(DbError::Checkpoint(format!(
-                    "prepared checkpoint {} does not match its local artifact identity",
-                    attempt.checkpoint_id
-                )));
+    async fn seal_checkpoint_artifacts_until(
+        &mut self,
+        inventory: &CheckpointArtifactInventory,
+        predecessor: Option<CommittedCheckpointRef>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        self.validate_checkpoint_artifact_inventory(inventory)?;
+        let participant_ids = inventory.assignment_fence.as_ref().map_or_else(
+            || vec![laminar_core::state::LOCAL_NODE_ID.0],
+            laminar_core::checkpoint::CheckpointAssignmentFence::participant_ids,
+        );
+        let mut manifest_seals = futures::stream::iter(participant_ids.iter().copied())
+            .map(|participant_id| {
+                let store = Arc::clone(&self.store);
+                let chunk = StateChunkId {
+                    participant_id,
+                    checkpoint_id: inventory.attempt.checkpoint_id,
+                };
+                let artifact_identity =
+                    checkpoint_artifact_identity_sha256(inventory, chunk).map_err(DbError::from);
+                async move {
+                    let artifact_identity = artifact_identity?;
+                    let manifest = tokio::time::timeout_at(deadline, async {
+                        store.seal_aborted_manifest(chunk, &artifact_identity).await
+                    })
+                    .await
+                    .map_err(|_| {
+                        DbError::Checkpoint(format!(
+                            "participant {participant_id} artifact manifest seal timed out"
+                        ))
+                    })?
+                    .map_err(DbError::from)?;
+                    Ok::<_, DbError>((participant_id, manifest))
+                }
+            })
+            .buffer_unordered(MAX_RETENTION_IO_CONCURRENCY);
+        let mut loaded = BTreeMap::new();
+        while let Some(result) = manifest_seals.next().await {
+            let (participant_id, manifest) = result?;
+            if let Some((manifest, encoded)) = manifest {
+                if manifest.deployment_id != inventory.deployment_id
+                    || manifest.pipeline_identity != inventory.pipeline_identity
+                    || manifest.epoch != inventory.attempt.epoch
+                    || manifest.checkpoint_id != inventory.attempt.checkpoint_id
+                    || manifest.participant_id != participant_id
+                    || manifest.vnode_count != self.store.key_group_count().get()
+                    || manifest.node_data.chunk
+                        != (StateChunkId {
+                            participant_id,
+                            checkpoint_id: inventory.attempt.checkpoint_id,
+                        })
+                    || manifest.assignment_fence != inventory.assignment_fence
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "participant {participant_id} manifest does not match the active artifact inventory"
+                    )));
+                }
+                loaded.insert(participant_id, (manifest, encoded));
             }
         }
-        Ok(expected)
+
+        if loaded.len() == participant_ids.len() {
+            let manifests = loaded.into_values().collect::<Vec<_>>();
+            let scope = if inventory.assignment_fence.is_some() {
+                CheckpointScope::Cluster
+            } else {
+                CheckpointScope::Local
+            };
+            let candidate = self.build_committed_index(
+                inventory.attempt,
+                scope,
+                inventory.assignment_fence.clone(),
+                predecessor,
+                &manifests,
+                None,
+            )?;
+            let decisions = self.decision_store.as_ref().ok_or_else(|| {
+                DbError::Checkpoint("artifact sealing requires a decision store".into())
+            })?;
+            tokio::time::timeout_at(
+                deadline,
+                decisions.seal_aborted_committed_checkpoint_candidate(&candidate),
+            )
+            .await
+            .map_err(|_| DbError::Checkpoint("candidate checkpoint index seal timed out".into()))?
+            .map_err(|error| {
+                DbError::Checkpoint(format!("candidate checkpoint index seal failed: {error}"))
+            })?;
+        }
+
+        let mut data_seals = futures::stream::iter(participant_ids.iter().copied())
+            .map(|participant_id| {
+                let store = Arc::clone(&self.store);
+                let chunk = StateChunkId {
+                    participant_id,
+                    checkpoint_id: inventory.attempt.checkpoint_id,
+                };
+                let artifact_identity =
+                    checkpoint_artifact_identity_sha256(inventory, chunk).map_err(DbError::from);
+                async move {
+                    let artifact_identity = artifact_identity?;
+                    tokio::time::timeout_at(deadline, async {
+                        store
+                            .seal_aborted_node_data(chunk, &artifact_identity)
+                            .await
+                    })
+                    .await
+                    .map_err(|_| {
+                        DbError::Checkpoint(format!(
+                            "participant {participant_id} node-data seal timed out"
+                        ))
+                    })?
+                    .map_err(DbError::from)
+                }
+            })
+            .buffer_unordered(MAX_RETENTION_IO_CONCURRENCY);
+        while let Some(result) = data_seals.next().await {
+            result?;
+        }
+        self.prepared.remove(&inventory.attempt);
+        Ok(())
     }
 
-    async fn delete_prepared_artifact_until(
+    async fn cleanup_local_checkpoint_artifacts_until(
         &mut self,
         attempt: CheckpointAttempt,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
-        let chunk = self.prepared_chunk(attempt)?;
-        tokio::time::timeout_at(deadline, self.store.delete_manifest(chunk))
+        let store = Arc::clone(self.decision_store.as_ref().ok_or_else(|| {
+            DbError::Checkpoint("local artifact cleanup requires a decision store".into())
+        })?);
+        let Some(head) = tokio::time::timeout_at(deadline, store.checkpoint_decision_head())
             .await
-            .map_err(|_| DbError::Checkpoint("prepared manifest cleanup timed out".into()))?
-            .map_err(DbError::from)?;
-        tokio::time::timeout_at(deadline, self.store.delete_node_data(chunk))
-            .await
-            .map_err(|_| DbError::Checkpoint("prepared node-data cleanup timed out".into()))?
-            .map_err(DbError::from)?;
-        self.prepared.remove(&attempt);
-        Ok(())
+            .map_err(|_| DbError::Checkpoint("local artifact cleanup read timed out".into()))?
+            .map_err(|error| {
+                DbError::Checkpoint(format!("local artifact cleanup read failed: {error}"))
+            })?
+        else {
+            return Ok(());
+        };
+        let Some(inventory) = head.active_artifacts else {
+            return Ok(());
+        };
+        if inventory.attempt != attempt || inventory.assignment_fence.is_some() {
+            return Err(DbError::Checkpoint(format!(
+                "checkpoint {} does not match the active local artifact inventory",
+                attempt.checkpoint_id
+            )));
+        }
+        if !head.latest_terminal.as_ref().is_some_and(|outcome| {
+            !outcome.is_commit()
+                && outcome.epoch == attempt.epoch
+                && outcome.checkpoint_id == attempt.checkpoint_id
+        }) {
+            return Err(DbError::Checkpoint(format!(
+                "checkpoint {} artifacts cannot be cleaned without its durable Abort",
+                attempt.checkpoint_id
+            )));
+        }
+        let predecessor = head
+            .latest_commit
+            .and_then(|outcome| outcome.committed_checkpoint);
+        self.seal_checkpoint_artifacts_until(&inventory, predecessor, deadline)
+            .await?;
+        let result = tokio::time::timeout_at(
+            deadline,
+            store.complete_checkpoint_artifact_cleanup(&inventory),
+        )
+        .await
+        .map_err(|_| DbError::Checkpoint("local artifact inventory cleanup timed out".into()))?
+        .map_err(|error| {
+            DbError::Checkpoint(format!("local artifact inventory cleanup failed: {error}"))
+        })?;
+        match result {
+            CheckpointArtifactInventoryUpdateResult::Applied
+            | CheckpointArtifactInventoryUpdateResult::Unchanged => Ok(()),
+            CheckpointArtifactInventoryUpdateResult::Conflict { current } => {
+                Err(DbError::Checkpoint(format!(
+                    "local artifact inventory cleanup conflicted with {current:?}"
+                )))
+            }
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn settle_cluster_checkpoint_artifacts_until(
+        &mut self,
+        proof: &LeaderProof,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, DbError> {
+        let controller = self.cluster_controller.as_ref().ok_or_else(|| {
+            DbError::Checkpoint("cluster artifact cleanup has no cluster controller".into())
+        })?;
+        let authority = controller.checkpoint_authority().map_err(|error| {
+            DbError::Checkpoint(format!("cluster checkpoint authority: {error}"))
+        })?;
+        let Some(inventory) =
+            tokio::time::timeout_at(deadline, authority.cluster_checkpoint_artifacts())
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint("cluster artifact inventory read timed out".into())
+                })?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!("cluster artifact inventory read failed: {error}"))
+                })?
+        else {
+            return Ok(false);
+        };
+        self.validate_checkpoint_artifact_inventory(&inventory)?;
+        let assignment_fence = inventory.assignment_fence.clone().ok_or_else(|| {
+            DbError::Checkpoint("cluster artifact inventory has no assignment fence".into())
+        })?;
+        let settlement = tokio::time::timeout_at(
+            deadline,
+            authority.cluster_attempt_settlement(inventory.attempt),
+        )
+        .await
+        .map_err(|_| DbError::Checkpoint("cluster artifact settlement read timed out".into()))?
+        .map_err(|error| {
+            DbError::Checkpoint(format!("cluster artifact settlement read failed: {error}"))
+        })?;
+        match settlement {
+            None => {
+                self.record_outcome_until(
+                    inventory.attempt,
+                    laminar_core::checkpoint_decision::CheckpointVerdict::Abort,
+                    None,
+                    Some(assignment_fence),
+                    Some(proof.clone()),
+                    deadline,
+                )
+                .await?;
+            }
+            Some(outcome)
+                if outcome.epoch == inventory.attempt.epoch
+                    && outcome.checkpoint_id == inventory.attempt.checkpoint_id
+                    && !outcome.is_commit()
+                    && outcome.deployment_id == inventory.deployment_id
+                    && outcome.scope == CheckpointScope::Cluster
+                    && outcome.assignment_fence.as_ref() == inventory.assignment_fence.as_ref() => {
+            }
+            Some(_) => {
+                return Err(DbError::Checkpoint(format!(
+                    "checkpoint {} has incompatible terminal authority while artifacts remain",
+                    inventory.attempt.checkpoint_id
+                )));
+            }
+        }
+        let latest_commit =
+            tokio::time::timeout_at(deadline, authority.highest_cluster_committed_outcome())
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint("cluster committed predecessor read timed out".into())
+                })?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "cluster committed predecessor read failed: {error}"
+                    ))
+                })?;
+        if latest_commit
+            .as_ref()
+            .is_some_and(|outcome| outcome.epoch >= inventory.attempt.epoch)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "checkpoint {} artifact cleanup does not follow the committed head",
+                inventory.attempt.checkpoint_id
+            )));
+        }
+        let predecessor = latest_commit.and_then(|outcome| outcome.committed_checkpoint);
+        self.seal_checkpoint_artifacts_until(&inventory, predecessor, deadline)
+            .await?;
+        tokio::time::timeout_at(
+            deadline,
+            authority.finish_cluster_checkpoint_artifact_cleanup(proof, &inventory),
+        )
+        .await
+        .map_err(|_| DbError::Checkpoint("cluster artifact inventory cleanup timed out".into()))?
+        .map_err(|error| {
+            DbError::Checkpoint(format!(
+                "cluster artifact inventory cleanup failed: {error}"
+            ))
+        })?;
+        Ok(true)
     }
 
     async fn load_prepared_participant_manifests(
@@ -3876,6 +4738,7 @@ impl CheckpointCoordinator {
         attempt: CheckpointAttempt,
         scope: CheckpointScope,
         assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
+        predecessor: Option<CommittedCheckpointRef>,
         manifests: &[(CheckpointManifest, Bytes)],
         quorum_watermark: Option<CheckpointWatermark>,
     ) -> Result<CommittedCheckpointIndex, DbError> {
@@ -3937,7 +4800,7 @@ impl CheckpointCoordinator {
             scope,
             vnode_count: self.store.key_group_count().get(),
             assignment_fence,
-            predecessor: self.last_committed_ref.clone(),
+            predecessor,
             participants,
             source_names: manifests
                 .first()
@@ -4099,6 +4962,11 @@ impl CheckpointCoordinator {
         let store = self.decision_store.as_ref().ok_or_else(|| {
             DbError::Checkpoint("committed checkpoint publication requires a decision store".into())
         })?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DbError::Checkpoint(
+                "committed checkpoint index create timed out".into(),
+            ));
+        }
         tokio::time::timeout_at(deadline, store.create_committed_checkpoint(index))
             .await
             .map_err(|_| DbError::Checkpoint("committed checkpoint index create timed out".into()))?
@@ -4215,6 +5083,10 @@ impl CheckpointCoordinator {
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
         self.phase = CheckpointPhase::Deciding;
+        #[cfg(feature = "cluster")]
+        let cluster_scope = self.cluster_controller.is_some();
+        #[cfg(not(feature = "cluster"))]
+        let cluster_scope = false;
         self.record_outcome_until(
             attempt,
             laminar_core::checkpoint_decision::CheckpointVerdict::Abort,
@@ -4233,9 +5105,13 @@ impl CheckpointCoordinator {
         } else {
             Ok(())
         };
-        let artifact_cleanup = self
-            .delete_prepared_artifact_until(attempt, cleanup_deadline)
-            .await;
+        let artifact_cleanup = if cluster_scope {
+            self.failure_requires_recovery = true;
+            Ok(())
+        } else {
+            self.cleanup_local_checkpoint_artifacts_until(attempt, cleanup_deadline)
+                .await
+        };
         rollback?;
         witness_cleanup?;
         artifact_cleanup?;
@@ -4307,17 +5183,19 @@ impl CheckpointCoordinator {
                         })
                         .await;
                 }
-                let successor = if self.has_checkpoint_committable_sinks() {
+                let requires_recovery = self.failure_requires_recovery;
+                let successor = if !requires_recovery && self.has_checkpoint_committable_sinks() {
                     self.begin_sink_epoch_until(deadline).await.err()
                 } else {
                     None
                 };
-                let (error, disposition) = match successor {
-                    Some(successor) => (
+                let (error, disposition) = match (requires_recovery, successor) {
+                    (true, _) => (message, CheckpointFailureDisposition::RequiresRecovery),
+                    (false, Some(successor)) => (
                         format!("{message}; successor sink epoch failed: {successor}"),
                         CheckpointFailureDisposition::RequiresRecovery,
                     ),
-                    None => (message, CheckpointFailureDisposition::Retryable),
+                    (false, None) => (message, CheckpointFailureDisposition::Retryable),
                 };
                 self.failed_result(attempt, started, error, disposition)
             }
@@ -4529,10 +5407,30 @@ impl CheckpointCoordinator {
                     .await);
             }
         };
+        let predecessor = match self
+            .authoritative_committed_predecessor_until(scope, deadline)
+            .await
+        {
+            Ok(predecessor) => predecessor,
+            Err(error) => {
+                return Ok(self
+                    .fail_before_commit(
+                        attempt,
+                        started,
+                        error,
+                        flags,
+                        assignment_fence,
+                        leader_proof,
+                        deadline,
+                    )
+                    .await);
+            }
+        };
         let index = match self.build_committed_index(
             attempt,
             scope,
             assignment_fence.clone(),
+            predecessor.clone(),
             &manifests,
             quorum_watermark,
         ) {
@@ -4555,7 +5453,7 @@ impl CheckpointCoordinator {
         checkpoint_kill_gate(
             "leader",
             attempt,
-            self.last_committed_ref
+            predecessor
                 .as_ref()
                 .map(|reference| (reference.checkpoint_id, reference.epoch)),
         )
@@ -4597,8 +5495,8 @@ impl CheckpointCoordinator {
             ));
         }
 
-        let predecessor_checkpoint_id = self
-            .last_committed_ref
+        let predecessor_checkpoint_id = index
+            .predecessor
             .as_ref()
             .map_or(0, |reference| reference.checkpoint_id);
         self.last_committed_ref = Some(reference);
@@ -4693,7 +5591,33 @@ impl CheckpointCoordinator {
     ) -> Result<CheckpointResult, DbError> {
         let started = Instant::now();
         let deadline = tokio::time::Instant::from_std(started) + self.config.checkpoint_timeout;
+        #[cfg(feature = "cluster")]
+        let local = self.cluster_controller.is_none();
+        #[cfg(not(feature = "cluster"))]
+        let local = true;
+        if !local {
+            return Err(DbError::Checkpoint(
+                "cluster checkpoints require reserved pipeline admission and certified Prepare"
+                    .into(),
+            ));
+        }
         let attempt = self.allocate_attempt_until(deadline).await?;
+        if let Err(error) = self
+            .begin_checkpoint_artifacts_until(attempt, None, None, deadline)
+            .await
+        {
+            return Ok(self
+                .fail_before_commit(
+                    attempt,
+                    started,
+                    error,
+                    request.flags,
+                    request.assignment_fence.clone(),
+                    None,
+                    deadline,
+                )
+                .await);
+        }
         self.run_checkpoint_attempt(request, attempt, QuorumStage::RunInline, started)
             .await
     }
@@ -4927,7 +5851,25 @@ impl CheckpointCoordinator {
                 "follower Prepare authority is no longer current".into(),
             ));
         }
-        let was_prepared = self.prepared.contains_key(&attempt);
+        let authority = controller.checkpoint_authority().map_err(|error| {
+            DbError::Checkpoint(format!("follower checkpoint authority: {error}"))
+        })?;
+        let expected_inventory =
+            self.checkpoint_artifact_inventory(attempt, Some(fence.clone()))?;
+        let active_inventory =
+            tokio::time::timeout_at(deadline, authority.cluster_checkpoint_artifacts())
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint("follower artifact admission read timed out".into())
+                })?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!("follower artifact admission read failed: {error}"))
+                })?;
+        if active_inventory.as_ref() != Some(&expected_inventory) {
+            return Err(DbError::Checkpoint(
+                "follower checkpoint has no exact durable artifact admission".into(),
+            ));
+        }
         let flags = request.flags;
         self.allocator.advance_epoch_to(epoch);
         self.phase = CheckpointPhase::PreCommitting;
@@ -4955,26 +5897,15 @@ impl CheckpointCoordinator {
                 })
                 .await;
             let rollback = self.rollback_sinks_until(epoch, deadline).await;
-            // This invocation never returned success, so its newly-created artifact cannot have
-            // contributed a positive Prepare acknowledgement. An older acknowledged retry must
-            // remain until the authoritative decision is observed.
-            let artifact_cleanup = if was_prepared {
-                Ok(())
-            } else {
-                self.delete_prepared_artifact_until(attempt, deadline).await
-            };
             if let Err(rollback) = rollback {
                 self.failure_requires_recovery = true;
                 return Err(DbError::Checkpoint(format!(
                     "follower Prepare failed ({error}); rollback also failed ({rollback})"
                 )));
             }
-            if let Err(cleanup) = artifact_cleanup {
-                self.failure_requires_recovery = true;
-                return Err(DbError::Checkpoint(format!(
-                    "follower Prepare failed ({error}); prepared artifact cleanup also failed ({cleanup})"
-                )));
-            }
+            // The durable active inventory owns every ambiguous Create until coordinated Abort
+            // replaces the exact paths with permanent seals. Deleting here would reopen a path
+            // for a late writer and discard manifest evidence needed to locate a candidate index.
             self.phase = CheckpointPhase::Idle;
             return Err(error);
         }
@@ -5244,19 +6175,19 @@ impl CheckpointCoordinator {
                 }
             }
             let rollback = self.rollback_sinks_until(epoch, deadline).await;
-            let artifact_cleanup = self.delete_prepared_artifact_until(attempt, deadline).await;
             rollback?;
-            artifact_cleanup?;
+            self.failure_requires_recovery = true;
         }
         self.allocator.advance_epoch_to(checked_successor_epoch(
             epoch,
             "closing a follower checkpoint",
         )?);
-        let continuation = if self.has_checkpoint_committable_sinks() {
-            self.begin_sink_epoch_until(deadline).await
-        } else {
-            Ok(())
-        };
+        let continuation =
+            if !self.failure_requires_recovery && self.has_checkpoint_committable_sinks() {
+                self.begin_sink_epoch_until(deadline).await
+            } else {
+                Ok(())
+            };
         let duration = started.elapsed();
         self.phase = CheckpointPhase::Idle;
         let checkpoint_bytes = if committed {

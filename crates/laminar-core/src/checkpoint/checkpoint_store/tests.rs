@@ -149,6 +149,126 @@ async fn immutable_manifest_and_node_conflicts_fail_closed() {
 }
 
 #[tokio::test]
+async fn abort_seals_preserve_manifest_and_block_late_creates() {
+    let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let store = store(Arc::clone(&backing));
+    let payload = Bytes::from_static(b"bcdef");
+    let manifest = manifest_with_payload(&payload);
+    let inventory = CheckpointArtifactInventory {
+        deployment_id: manifest.deployment_id.clone(),
+        pipeline_identity: manifest.pipeline_identity.clone(),
+        attempt: crate::checkpoint::CheckpointAttempt::new(manifest.epoch, manifest.checkpoint_id),
+        assignment_fence: manifest.assignment_fence.clone(),
+    };
+    let chunk = manifest.node_data.chunk;
+    let identity = checkpoint_artifact_identity_sha256(&inventory, chunk).unwrap();
+    let canonical = Bytes::from(checkpoint_manifest_bytes(&manifest).unwrap());
+    store
+        .save_checkpoint(&manifest, std::slice::from_ref(&payload))
+        .await
+        .unwrap();
+
+    let wrong_identity = checkpoint_sha256(b"different artifact identity");
+    assert!(matches!(
+        store
+            .seal_aborted_manifest(chunk, &wrong_identity)
+            .await,
+        Err(CheckpointStoreError::Invalid(message)) if message.contains("different artifact identity")
+    ));
+    assert_eq!(
+        store.load_manifest(7).await.unwrap(),
+        Some(manifest.clone())
+    );
+
+    let expected = Some((manifest.clone(), canonical.clone()));
+    assert_eq!(
+        store.seal_aborted_manifest(chunk, &identity).await.unwrap(),
+        expected
+    );
+    store
+        .seal_aborted_node_data(chunk, &identity)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.seal_aborted_manifest(chunk, &identity).await.unwrap(),
+        expected
+    );
+    store
+        .seal_aborted_node_data(chunk, &identity)
+        .await
+        .unwrap();
+
+    let manifest_seal: CheckpointArtifactAbortSeal = serde_json::from_slice(
+        &backing
+            .get(&store.manifest_path(chunk))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest_seal.artifact_identity_sha256, identity);
+    assert_eq!(manifest_seal.chunk, chunk);
+    assert_eq!(manifest_seal.original_manifest, Some(manifest));
+    let node_seal: CheckpointArtifactAbortSeal = serde_json::from_slice(
+        &backing
+            .get(&store.node_data_path(chunk))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(node_seal.original_manifest, None);
+
+    for path in [store.manifest_path(chunk), store.node_data_path(chunk)] {
+        assert!(matches!(
+            backing
+                .put_opts(
+                    &path,
+                    PutPayload::from_static(b"late artifact create"),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..PutOptions::default()
+                    },
+                )
+                .await,
+            Err(object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. })
+        ));
+    }
+
+    let mut missing_inventory = inventory;
+    missing_inventory.attempt = crate::checkpoint::CheckpointAttempt::new(8, 8);
+    let missing_chunk = StateChunkId {
+        participant_id: chunk.participant_id,
+        checkpoint_id: 8,
+    };
+    let missing_identity =
+        checkpoint_artifact_identity_sha256(&missing_inventory, missing_chunk).unwrap();
+    assert_eq!(
+        store
+            .seal_aborted_manifest(missing_chunk, &missing_identity)
+            .await
+            .unwrap(),
+        None
+    );
+    store
+        .seal_aborted_node_data(missing_chunk, &missing_identity)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .seal_aborted_manifest(missing_chunk, &missing_identity)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn manifest_conflict_requires_exact_canonical_bytes() {
     let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let payload = Bytes::from_static(b"bcdef");

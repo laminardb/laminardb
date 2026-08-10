@@ -44,9 +44,9 @@ pub use checkpoint_manifest::{
     PIPELINE_IDENTITY_VERSION, PREPARED_SINK_DESCRIPTOR_VERSION,
 };
 pub use checkpoint_store::{
-    checkpoint_manifest_bytes, probe_object_store_conditional_create,
-    probe_object_store_conditional_update, CheckpointStore, CheckpointStoreError,
-    ObjectStoreCheckpointStore,
+    checkpoint_artifact_identity_sha256, checkpoint_manifest_bytes,
+    probe_object_store_conditional_create, probe_object_store_conditional_update, CheckpointStore,
+    CheckpointStoreError, ObjectStoreCheckpointStore,
 };
 pub use committed_checkpoint::{
     canonical_json_bytes, canonical_json_sha256, CheckpointScope, CheckpointWatermark,

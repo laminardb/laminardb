@@ -43,11 +43,36 @@ async fn local_index(
     }
 }
 
+async fn local_artifact_inventory(
+    store: &CheckpointDecisionStore,
+    checkpoint_id: u64,
+) -> CheckpointArtifactInventory {
+    CheckpointArtifactInventory {
+        deployment_id: store.load_or_create_deployment_id().await.unwrap(),
+        pipeline_identity: PipelineIdentity::empty(),
+        attempt: CheckpointAttempt::canonical(checkpoint_id),
+        assignment_fence: None,
+    }
+}
+
+async fn begin_local_artifacts(store: &CheckpointDecisionStore, checkpoint_id: u64) {
+    assert_eq!(
+        store
+            .begin_checkpoint_artifact_inventory(
+                local_artifact_inventory(store, checkpoint_id).await,
+            )
+            .await
+            .unwrap(),
+        CheckpointArtifactInventoryUpdateResult::Applied
+    );
+}
+
 async fn publish_local_commit(
     store: &CheckpointDecisionStore,
     checkpoint_id: u64,
     predecessor: Option<CommittedCheckpointRef>,
 ) -> CommittedCheckpointRef {
+    begin_local_artifacts(store, checkpoint_id).await;
     let index = local_index(store, checkpoint_id, predecessor).await;
     let reference = store.create_committed_checkpoint(&index).await.unwrap();
     store
@@ -79,6 +104,7 @@ fn retention_state(result: CheckpointRetentionUpdateResult) -> CheckpointRetenti
 async fn committed_index_create_is_idempotent_and_exactly_verified() {
     let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let store = CheckpointDecisionStore::local_single_writer(raw);
+    begin_local_artifacts(&store, 1).await;
     let index = local_index(&store, 1, None).await;
 
     let reference = store.create_committed_checkpoint(&index).await.unwrap();
@@ -97,9 +123,76 @@ async fn committed_index_create_is_idempotent_and_exactly_verified() {
 }
 
 #[tokio::test]
+async fn aborted_candidate_seal_blocks_create_and_replaces_an_existing_candidate() {
+    let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let store = CheckpointDecisionStore::local_single_writer(Arc::clone(&raw));
+
+    let missing = local_index(&store, 1, None).await;
+    let (_, missing_ref) = missing.encode_and_reference().unwrap();
+    store
+        .seal_aborted_committed_checkpoint_candidate(&missing)
+        .await
+        .unwrap();
+    store
+        .seal_aborted_committed_checkpoint_candidate(&missing)
+        .await
+        .unwrap();
+    assert!(store.create_committed_checkpoint(&missing).await.is_err());
+    assert!(store.load_committed_checkpoint(&missing_ref).await.is_err());
+
+    let existing = local_index(&store, 2, None).await;
+    let existing_ref = store.create_committed_checkpoint(&existing).await.unwrap();
+    store
+        .seal_aborted_committed_checkpoint_candidate(&existing)
+        .await
+        .unwrap();
+    store
+        .seal_aborted_committed_checkpoint_candidate(&existing)
+        .await
+        .unwrap();
+    assert!(store
+        .load_committed_checkpoint(&existing_ref)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn aborted_candidate_seal_rejects_foreign_or_unrecognized_content() {
+    let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let store = CheckpointDecisionStore::local_single_writer(Arc::clone(&raw));
+    let index = local_index(&store, 1, None).await;
+    let mut foreign = index.clone();
+    foreign.deployment_id = "00000000-0000-0000-0000-000000000001".into();
+    assert!(matches!(
+        store
+            .seal_aborted_committed_checkpoint_candidate(&foreign)
+            .await,
+        Err(DecisionError::Conflict(_))
+    ));
+
+    let (_, reference) = index.encode_and_reference().unwrap();
+    let path = CheckpointDecisionStore::committed_checkpoint_path(&reference);
+    raw.put(&path, PutPayload::from_static(b"not-a-checkpoint"))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store
+            .seal_aborted_committed_checkpoint_candidate(&index)
+            .await,
+        Err(DecisionError::Conflict(_))
+    ));
+    assert_eq!(
+        raw.get(&path).await.unwrap().bytes().await.unwrap(),
+        Bytes::from_static(b"not-a-checkpoint")
+    );
+}
+
+#[tokio::test]
 async fn local_commit_requires_the_content_addressed_index() {
     let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let store = CheckpointDecisionStore::local_single_writer(raw);
+    begin_local_artifacts(&store, 1).await;
     let index = local_index(&store, 1, None).await;
     let reference = store.create_committed_checkpoint(&index).await.unwrap();
 
@@ -152,6 +245,7 @@ async fn abort_forbids_a_committed_index_reference() {
 async fn decision_head_keeps_latest_commit_across_a_later_abort() {
     let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let store = CheckpointDecisionStore::new(raw);
+    begin_local_artifacts(&store, 1).await;
     let first = local_index(&store, 1, None).await;
     let first_ref = store.create_committed_checkpoint(&first).await.unwrap();
     store
@@ -203,6 +297,7 @@ async fn decision_head_keeps_latest_commit_across_a_later_abort() {
 async fn local_commit_must_extend_the_authoritative_commit() {
     let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let store = CheckpointDecisionStore::new(raw);
+    begin_local_artifacts(&store, 1).await;
     let first = local_index(&store, 1, None).await;
     let first_ref = store.create_committed_checkpoint(&first).await.unwrap();
     store
@@ -218,6 +313,7 @@ async fn local_commit_must_extend_the_authoritative_commit() {
         .await
         .unwrap();
 
+    begin_local_artifacts(&store, 2).await;
     let fork = local_index(&store, 2, None).await;
     let fork_ref = store.create_committed_checkpoint(&fork).await.unwrap();
     assert!(store
@@ -255,6 +351,187 @@ async fn local_commit_must_extend_the_authoritative_commit() {
             .unwrap()
             .epoch,
         2
+    );
+}
+
+#[tokio::test]
+async fn artifact_inventory_admits_one_exact_first_attempt() {
+    let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let first_store = CheckpointDecisionStore::new(Arc::clone(&raw));
+    let second_store = CheckpointDecisionStore::new(raw);
+    let first = local_artifact_inventory(&first_store, 1).await;
+
+    assert_eq!(
+        first_store
+            .begin_checkpoint_artifact_inventory(first.clone())
+            .await
+            .unwrap(),
+        CheckpointArtifactInventoryUpdateResult::Applied
+    );
+    let head = first_store
+        .checkpoint_decision_head()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.latest_terminal, None);
+    assert_eq!(head.active_artifacts, Some(first.clone()));
+    assert_eq!(
+        second_store
+            .begin_checkpoint_artifact_inventory(first.clone())
+            .await
+            .unwrap(),
+        CheckpointArtifactInventoryUpdateResult::Unchanged
+    );
+
+    let second = local_artifact_inventory(&first_store, 2).await;
+    assert_eq!(
+        second_store
+            .begin_checkpoint_artifact_inventory(second)
+            .await
+            .unwrap(),
+        CheckpointArtifactInventoryUpdateResult::Conflict {
+            current: Some(first)
+        }
+    );
+}
+
+#[tokio::test]
+async fn local_commit_requires_and_clears_the_exact_inventory() {
+    let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let store = CheckpointDecisionStore::new(raw);
+    let inventory = local_artifact_inventory(&store, 1).await;
+    store
+        .begin_checkpoint_artifact_inventory(inventory.clone())
+        .await
+        .unwrap();
+
+    assert!(store
+        .record_outcome(
+            2,
+            2,
+            CheckpointScope::Local,
+            None,
+            None,
+            CheckpointVerdict::Abort,
+            None,
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        store
+            .checkpoint_decision_head()
+            .await
+            .unwrap()
+            .and_then(|head| head.active_artifacts),
+        Some(inventory)
+    );
+
+    let index = local_index(&store, 1, None).await;
+    let reference = store.create_committed_checkpoint(&index).await.unwrap();
+    assert!(matches!(
+        store
+            .record_outcome(
+                1,
+                1,
+                CheckpointScope::Local,
+                None,
+                None,
+                CheckpointVerdict::Commit,
+                Some(reference),
+            )
+            .await
+            .unwrap(),
+        RecordOutcomeResult::Created(_)
+    ));
+    assert_eq!(
+        store
+            .checkpoint_decision_head()
+            .await
+            .unwrap()
+            .and_then(|head| head.active_artifacts),
+        None
+    );
+}
+
+#[tokio::test]
+async fn local_abort_retains_inventory_until_exact_cleanup() {
+    let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let store = CheckpointDecisionStore::new(raw);
+    let first = local_artifact_inventory(&store, 1).await;
+    let second = local_artifact_inventory(&store, 2).await;
+    store
+        .begin_checkpoint_artifact_inventory(first.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .complete_checkpoint_artifact_cleanup(&first)
+            .await
+            .unwrap(),
+        CheckpointArtifactInventoryUpdateResult::Conflict {
+            current: Some(first.clone())
+        }
+    );
+    store
+        .record_outcome(
+            1,
+            1,
+            CheckpointScope::Local,
+            None,
+            None,
+            CheckpointVerdict::Abort,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .complete_checkpoint_artifact_cleanup(&second)
+            .await
+            .unwrap(),
+        CheckpointArtifactInventoryUpdateResult::Conflict {
+            current: Some(first.clone())
+        }
+    );
+    assert_eq!(
+        store
+            .begin_checkpoint_artifact_inventory(first.clone())
+            .await
+            .unwrap(),
+        CheckpointArtifactInventoryUpdateResult::Conflict {
+            current: Some(first.clone())
+        }
+    );
+    assert_eq!(
+        store
+            .begin_checkpoint_artifact_inventory(second.clone())
+            .await
+            .unwrap(),
+        CheckpointArtifactInventoryUpdateResult::Conflict {
+            current: Some(first.clone())
+        }
+    );
+    assert_eq!(
+        store
+            .complete_checkpoint_artifact_cleanup(&first)
+            .await
+            .unwrap(),
+        CheckpointArtifactInventoryUpdateResult::Applied
+    );
+    assert_eq!(
+        store
+            .complete_checkpoint_artifact_cleanup(&first)
+            .await
+            .unwrap(),
+        CheckpointArtifactInventoryUpdateResult::Unchanged
+    );
+    assert_eq!(
+        store
+            .begin_checkpoint_artifact_inventory(second)
+            .await
+            .unwrap(),
+        CheckpointArtifactInventoryUpdateResult::Applied
     );
 }
 
@@ -443,8 +720,9 @@ fn abort_cannot_share_an_epoch_with_latest_commit() {
     let head = DurableCheckpointDecisionHead {
         version: CHECKPOINT_DECISION_HEAD_VERSION,
         deployment_id: deployment_id.clone(),
-        latest_terminal: terminal,
+        latest_terminal: Some(terminal),
         latest_commit: Some(commit),
+        active_artifacts: None,
     };
 
     assert!(CheckpointDecisionStore::validate_decision_head_shape(&head, &deployment_id).is_err());

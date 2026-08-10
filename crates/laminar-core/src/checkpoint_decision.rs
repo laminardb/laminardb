@@ -191,10 +191,18 @@ pub enum CheckpointRetentionUpdateResult {
 }
 
 const CHECKPOINT_OUTCOME_VERSION: u32 = 3;
-const CHECKPOINT_DECISION_HEAD_VERSION: u32 = 1;
+const CHECKPOINT_DECISION_HEAD_VERSION: u32 = 2;
 const CHECKPOINT_DECISION_HEAD_MAX_BYTES: u64 = 128 * 1_024;
 const CHECKPOINT_RETENTION_HEAD_VERSION: u32 = 1;
 const CHECKPOINT_RETENTION_HEAD_MAX_BYTES: u64 = 64 * 1_024;
+const ABORTED_COMMITTED_CHECKPOINT_SEAL_VERSION: u32 = 1;
+
+#[derive(Debug, serde::Serialize)]
+struct AbortedCommittedCheckpointSeal<'a> {
+    version: u32,
+    deployment_id: &'a str,
+    candidate: &'a CommittedCheckpointRef,
+}
 
 impl CheckpointOutcome {
     pub(crate) fn validate_shape(&self, path_epoch: u64) -> Result<(), DecisionError> {
@@ -248,10 +256,7 @@ impl CheckpointOutcome {
                 )));
             }
             (CheckpointScope::Cluster, Some(fence), Some(proof))
-                if fence.is_canonical()
-                    && proof.is_canonical()
-                    && fence.participant_incarnation(proof.owner.node_id)
-                        == Some(proof.owner.boot_id) => {}
+                if fence.is_canonical() && proof.is_canonical() => {}
             (CheckpointScope::Cluster, Some(fence), Some(proof))
                 if !fence.is_canonical() || !proof.is_canonical() =>
             {
@@ -260,19 +265,26 @@ impl CheckpointOutcome {
                      or leader proof"
                 )));
             }
-            (CheckpointScope::Cluster, Some(_), Some(proof)) => {
-                return Err(DecisionError::Conflict(format!(
-                    "cluster outcome for epoch {path_epoch} leader node {} boot {} is absent from \
-                     the assignment fence",
-                    proof.owner.node_id, proof.owner.boot_id
-                )));
-            }
             (CheckpointScope::Cluster, _, _) => {
                 return Err(DecisionError::Conflict(format!(
                     "cluster outcome for epoch {path_epoch} requires an assignment fence and \
                      leader proof"
                 )));
             }
+        }
+        if self.is_commit()
+            && self.scope == CheckpointScope::Cluster
+            && self
+                .assignment_fence
+                .as_ref()
+                .zip(self.leader_proof.as_ref())
+                .is_some_and(|(fence, proof)| {
+                    fence.participant_incarnation(proof.owner.node_id) != Some(proof.owner.boot_id)
+                })
+        {
+            return Err(DecisionError::Conflict(format!(
+                "cluster Commit for epoch {path_epoch} requires its leader proof in the assignment fence"
+            )));
         }
 
         match (&self.verdict, self.committed_checkpoint.as_ref()) {
@@ -423,13 +435,71 @@ struct LocalReservation {
 
 const LOCAL_RESERVATION_SIZE: u64 = 65_536;
 
-/// Exact local recovery cursor published as one authoritative terminal decision.
+/// Durable inventory for one checkpoint attempt that may have written artifacts.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointArtifactInventory {
+    /// Durable deployment incarnation that owns the artifacts.
+    pub deployment_id: String,
+    /// Logical pipeline and recovery-state ABI identity.
+    pub pipeline_identity: PipelineIdentity,
+    /// Exact canonical checkpoint attempt.
+    pub attempt: CheckpointAttempt,
+    /// Exact cluster assignment, absent for local checkpoints.
+    pub assignment_fence: Option<CheckpointAssignmentFence>,
+}
+
+impl CheckpointArtifactInventory {
+    /// Validate the canonical persisted shape.
+    ///
+    /// # Errors
+    /// Returns an error for a foreign format or non-canonical identity.
+    pub fn validate(&self) -> Result<(), String> {
+        let deployment = uuid::Uuid::parse_str(&self.deployment_id)
+            .map_err(|error| format!("invalid deployment identity: {error}"))?;
+        if deployment.is_nil() || deployment.to_string() != self.deployment_id {
+            return Err("deployment identity must be a canonical non-nil UUID".into());
+        }
+        if !self.pipeline_identity.is_canonical() {
+            return Err("pipeline identity is not canonical".into());
+        }
+        if !self.attempt.is_canonical() {
+            return Err("checkpoint attempt is not canonical".into());
+        }
+        if self
+            .assignment_fence
+            .as_ref()
+            .is_some_and(|fence| !fence.is_canonical())
+        {
+            return Err("checkpoint assignment fence is not canonical".into());
+        }
+        Ok(())
+    }
+}
+
+/// Result of a conditional checkpoint artifact-inventory transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointArtifactInventoryUpdateResult {
+    /// This call durably changed the decision head.
+    Applied,
+    /// The exact requested state was already durable.
+    Unchanged,
+    /// Another attempt or terminal transition changed the decision head.
+    Conflict {
+        /// Active inventory observed after the failed transition.
+        current: Option<CheckpointArtifactInventory>,
+    },
+}
+
+/// Exact local recovery cursor and unresolved artifact inventory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointDecisionHead {
     /// Greatest terminal local outcome.
-    pub latest_terminal: CheckpointOutcome,
+    pub latest_terminal: Option<CheckpointOutcome>,
     /// Greatest committed local outcome, including its exact committed-index reference.
     pub latest_commit: Option<CheckpointOutcome>,
+    /// Exact unresolved attempt whose artifacts require a terminal decision or cleanup.
+    pub active_artifacts: Option<CheckpointArtifactInventory>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -437,14 +507,22 @@ pub struct CheckpointDecisionHead {
 struct DurableCheckpointDecisionHead {
     version: u32,
     deployment_id: String,
-    latest_terminal: CheckpointOutcome,
+    latest_terminal: Option<CheckpointOutcome>,
     latest_commit: Option<CheckpointOutcome>,
+    active_artifacts: Option<CheckpointArtifactInventory>,
 }
 
 #[derive(Debug)]
 struct VersionedCheckpointDecisionHead {
     head: DurableCheckpointDecisionHead,
     update_version: UpdateVersion,
+}
+
+#[derive(Debug)]
+enum DecisionHeadCasResult {
+    Applied,
+    Unchanged,
+    Conflict(Option<Box<DurableCheckpointDecisionHead>>),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -672,6 +750,33 @@ impl CheckpointDecisionStore {
         OsPath::from("checkpoint-sink-open-witness/witness.json")
     }
 
+    async fn load_committed_checkpoint_bytes(
+        &self,
+        reference: &CommittedCheckpointRef,
+        expected_len: Option<u64>,
+    ) -> Result<Option<Bytes>, DecisionError> {
+        reference.validate().map_err(DecisionError::Conflict)?;
+        let record = format!("committed checkpoint '{}'", reference.sha256);
+        let Some(result) = self
+            .get_control_record(
+                &Self::committed_checkpoint_path(reference),
+                &record,
+                u64::try_from(MAX_COMMITTED_CHECKPOINT_INDEX_BYTES).unwrap_or(u64::MAX),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        Self::read_control_record_bytes(
+            result,
+            &record,
+            u64::try_from(MAX_COMMITTED_CHECKPOINT_INDEX_BYTES).unwrap_or(u64::MAX),
+            expected_len,
+        )
+        .await
+        .map(Some)
+    }
+
     /// Create the canonical content-addressed body for a committed checkpoint index.
     ///
     /// Identical retries converge on the existing immutable body. The returned reference is safe
@@ -743,25 +848,12 @@ impl CheckpointDecisionStore {
         &self,
         reference: &CommittedCheckpointRef,
     ) -> Result<Option<CommittedCheckpointIndex>, DecisionError> {
-        reference.validate().map_err(DecisionError::Conflict)?;
-        let record = format!("committed checkpoint '{}'", reference.sha256);
-        let Some(result) = self
-            .get_control_record(
-                &Self::committed_checkpoint_path(reference),
-                &record,
-                u64::try_from(MAX_COMMITTED_CHECKPOINT_INDEX_BYTES).unwrap_or(u64::MAX),
-            )
+        let Some(bytes) = self
+            .load_committed_checkpoint_bytes(reference, Some(reference.len))
             .await?
         else {
             return Ok(None);
         };
-        let bytes = Self::read_control_record_bytes(
-            result,
-            &record,
-            u64::try_from(MAX_COMMITTED_CHECKPOINT_INDEX_BYTES).unwrap_or(u64::MAX),
-            Some(reference.len),
-        )
-        .await?;
         let index: CommittedCheckpointIndex = serde_json::from_slice(&bytes).map_err(|error| {
             DecisionError::Conflict(format!(
                 "committed checkpoint '{}': {error}",
@@ -785,6 +877,112 @@ impl CheckpointDecisionStore {
             )));
         }
         Ok(Some(index))
+    }
+
+    /// Permanently seal the exact content-addressed candidate for an aborted attempt.
+    ///
+    /// The seal occupies the candidate's existing path, so an in-flight conditional create can
+    /// either win and be replaced or lose to the seal. Identical retries converge.
+    ///
+    /// # Errors
+    /// The candidate is malformed or foreign, the path contains different content, or object-store
+    /// I/O cannot be reconciled to the exact seal.
+    pub async fn seal_aborted_committed_checkpoint_candidate(
+        &self,
+        index: &CommittedCheckpointIndex,
+    ) -> Result<(), DecisionError> {
+        let (candidate_bytes, reference) = index
+            .encode_and_reference()
+            .map_err(DecisionError::Conflict)?;
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        if index.deployment_id != deployment_id {
+            return Err(DecisionError::Conflict(format!(
+                "committed checkpoint belongs to deployment {}, current deployment is {deployment_id}",
+                index.deployment_id
+            )));
+        }
+        let seal_bytes = crate::checkpoint::canonical_json_bytes(&AbortedCommittedCheckpointSeal {
+            version: ABORTED_COMMITTED_CHECKPOINT_SEAL_VERSION,
+            deployment_id: &deployment_id,
+            candidate: &reference,
+        })
+        .map_err(|error| DecisionError::Conflict(error.to_string()))?;
+        let path = Self::committed_checkpoint_path(&reference);
+
+        let observed = self
+            .load_committed_checkpoint_bytes(&reference, None)
+            .await?;
+        let mode = match observed.as_deref() {
+            None => PutMode::Create,
+            Some(bytes) if bytes == seal_bytes.as_slice() => return Ok(()),
+            Some(bytes) if bytes == candidate_bytes.as_slice() => PutMode::Overwrite,
+            Some(_) => {
+                return Err(DecisionError::Conflict(format!(
+                    "committed checkpoint '{}' contains neither the exact candidate nor its abort seal",
+                    reference.sha256
+                )));
+            }
+        };
+        let Err(mut write_error) = self
+            .store
+            .put_opts(
+                &path,
+                PutPayload::from(Bytes::from(seal_bytes.clone())),
+                PutOptions {
+                    mode: mode.clone(),
+                    ..PutOptions::default()
+                },
+            )
+            .await
+        else {
+            return Ok(());
+        };
+
+        let mut reconciled = self
+            .load_committed_checkpoint_bytes(&reference, None)
+            .await?;
+        if reconciled.as_deref() == Some(seal_bytes.as_slice()) {
+            return Ok(());
+        }
+        if matches!(mode, PutMode::Create)
+            && reconciled.as_deref() == Some(candidate_bytes.as_slice())
+        {
+            let Err(error) = self
+                .store
+                .put_opts(
+                    &path,
+                    PutPayload::from(Bytes::from(seal_bytes.clone())),
+                    PutOptions {
+                        mode: PutMode::Overwrite,
+                        ..PutOptions::default()
+                    },
+                )
+                .await
+            else {
+                return Ok(());
+            };
+            write_error = error;
+            reconciled = self
+                .load_committed_checkpoint_bytes(&reference, None)
+                .await?;
+            if reconciled.as_deref() == Some(seal_bytes.as_slice()) {
+                return Ok(());
+            }
+        }
+
+        if reconciled
+            .as_deref()
+            .is_some_and(|bytes| bytes != candidate_bytes.as_slice())
+        {
+            return Err(DecisionError::Conflict(format!(
+                "committed checkpoint '{}' changed to content other than its exact abort seal",
+                reference.sha256
+            )));
+        }
+        Err(DecisionError::Io(format!(
+            "committed checkpoint '{}' abort seal write failed and did not become durable: {write_error}",
+            reference.sha256
+        )))
     }
 
     /// Delete one exact committed index after validating any extant body.
@@ -2157,41 +2355,78 @@ impl CheckpointDecisionStore {
                 "checkpoint decision head has a foreign deployment or unsupported version".into(),
             ));
         }
-        head.latest_terminal
-            .validate_shape(head.latest_terminal.epoch)?;
-        if head.latest_terminal.scope != CheckpointScope::Local
-            || head.latest_terminal.deployment_id != deployment_id
-        {
+        if head.latest_terminal.is_none() && head.active_artifacts.is_none() {
             return Err(DecisionError::Conflict(
-                "checkpoint decision head contains a non-local terminal outcome".into(),
+                "checkpoint decision head has neither a terminal outcome nor active artifacts"
+                    .into(),
             ));
+        }
+        if let Some(terminal) = head.latest_terminal.as_ref() {
+            terminal.validate_shape(terminal.epoch)?;
+            if terminal.scope != CheckpointScope::Local || terminal.deployment_id != deployment_id {
+                return Err(DecisionError::Conflict(
+                    "checkpoint decision head contains a non-local terminal outcome".into(),
+                ));
+            }
         }
         match head.latest_commit.as_ref() {
             Some(commit) => {
                 commit.validate_shape(commit.epoch)?;
+                let terminal = head.latest_terminal.as_ref().ok_or_else(|| {
+                    DecisionError::Conflict(
+                        "checkpoint decision head has a Commit but no terminal outcome".into(),
+                    )
+                })?;
                 if commit.scope != CheckpointScope::Local
                     || commit.deployment_id != deployment_id
                     || !commit.is_commit()
-                    || commit.epoch > head.latest_terminal.epoch
-                    || (!head.latest_terminal.is_commit()
-                        && commit.epoch == head.latest_terminal.epoch)
+                    || commit.epoch > terminal.epoch
+                    || (!terminal.is_commit() && commit.epoch == terminal.epoch)
                 {
                     return Err(DecisionError::Conflict(
                         "checkpoint decision head contains an invalid latest Commit".into(),
                     ));
                 }
-                if head.latest_terminal.is_commit() && commit != &head.latest_terminal {
+                if terminal.is_commit() && commit != terminal {
                     return Err(DecisionError::Conflict(
                         "terminal Commit does not match the decision head's latest Commit".into(),
                     ));
                 }
             }
-            None if head.latest_terminal.is_commit() => {
+            None if head
+                .latest_terminal
+                .as_ref()
+                .is_some_and(CheckpointOutcome::is_commit) =>
+            {
                 return Err(DecisionError::Conflict(
                     "checkpoint decision head lost its terminal Commit".into(),
                 ));
             }
             None => {}
+        }
+        if let Some(inventory) = head.active_artifacts.as_ref() {
+            inventory.validate().map_err(|error| {
+                DecisionError::Conflict(format!(
+                    "checkpoint decision head contains invalid active artifacts: {error}"
+                ))
+            })?;
+            if inventory.deployment_id != deployment_id || inventory.assignment_fence.is_some() {
+                return Err(DecisionError::Conflict(
+                    "local checkpoint decision head contains foreign or cluster artifacts".into(),
+                ));
+            }
+            if let Some(terminal) = head.latest_terminal.as_ref() {
+                if inventory.attempt.epoch < terminal.epoch
+                    || (inventory.attempt.epoch == terminal.epoch
+                        && (terminal.is_commit()
+                            || inventory.attempt.checkpoint_id != terminal.checkpoint_id))
+                {
+                    return Err(DecisionError::Conflict(
+                        "active checkpoint artifacts conflict with the latest terminal outcome"
+                            .into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -2241,6 +2476,267 @@ impl CheckpointDecisionStore {
         }))
     }
 
+    async fn put_decision_head(
+        &self,
+        observed: Option<VersionedCheckpointDecisionHead>,
+        candidate: DurableCheckpointDecisionHead,
+    ) -> Result<DecisionHeadCasResult, DecisionError> {
+        Self::validate_decision_head_shape(&candidate, &candidate.deployment_id)?;
+        let mode = match (self.update_mode, observed.as_ref()) {
+            (_, None) => PutMode::Create,
+            (DecisionStoreUpdateMode::NativeCas, Some(current)) => {
+                PutMode::Update(current.update_version.clone())
+            }
+            (DecisionStoreUpdateMode::LocalSingleWriter, Some(_)) => PutMode::Overwrite,
+        };
+        let payload = Self::encode_control_record(
+            "checkpoint decision head",
+            &candidate,
+            CHECKPOINT_DECISION_HEAD_MAX_BYTES,
+        )?;
+        let result = self
+            .store
+            .put_opts(
+                &Self::decision_head_path(&candidate.deployment_id),
+                PutPayload::from(payload),
+                PutOptions {
+                    mode,
+                    ..PutOptions::default()
+                },
+            )
+            .await
+            .map(|_| ());
+        if result.is_ok() {
+            return Ok(DecisionHeadCasResult::Applied);
+        }
+
+        let winner = self.read_decision_head(&candidate.deployment_id).await?;
+        if winner
+            .as_ref()
+            .is_some_and(|winner| winner.head == candidate)
+        {
+            return Ok(DecisionHeadCasResult::Unchanged);
+        }
+        let changed = winner.as_ref().map(|winner| &winner.head)
+            != observed.as_ref().map(|current| &current.head);
+        let error = result.expect_err("failed decision-head write has an error");
+        if changed
+            || matches!(
+                error,
+                object_store::Error::Precondition { .. }
+                    | object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::NotFound { .. }
+            )
+        {
+            return Ok(DecisionHeadCasResult::Conflict(
+                winner.map(|winner| Box::new(winner.head)),
+            ));
+        }
+        Err(DecisionError::Io(error.to_string()))
+    }
+
+    fn terminal_aborts_inventory(
+        head: &DurableCheckpointDecisionHead,
+        inventory: &CheckpointArtifactInventory,
+    ) -> bool {
+        head.latest_terminal.as_ref().is_some_and(|terminal| {
+            !terminal.is_commit()
+                && terminal.epoch == inventory.attempt.epoch
+                && terminal.checkpoint_id == inventory.attempt.checkpoint_id
+        })
+    }
+
+    async fn begin_checkpoint_artifact_inventory_inner(
+        &self,
+        inventory: CheckpointArtifactInventory,
+    ) -> Result<CheckpointArtifactInventoryUpdateResult, DecisionError> {
+        inventory.validate().map_err(DecisionError::Conflict)?;
+        if inventory.assignment_fence.is_some() {
+            return Err(DecisionError::Conflict(
+                "local checkpoint artifact inventory cannot carry an assignment fence".into(),
+            ));
+        }
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        if inventory.deployment_id != deployment_id {
+            return Err(DecisionError::Conflict(
+                "checkpoint artifact inventory belongs to a foreign deployment".into(),
+            ));
+        }
+        let observed = self.read_decision_head(&deployment_id).await?;
+        if let Some(active) = observed
+            .as_ref()
+            .and_then(|current| current.head.active_artifacts.as_ref())
+        {
+            return Ok(
+                if active == &inventory
+                    && !observed.as_ref().is_some_and(|current| {
+                        Self::terminal_aborts_inventory(&current.head, &inventory)
+                    })
+                {
+                    CheckpointArtifactInventoryUpdateResult::Unchanged
+                } else {
+                    CheckpointArtifactInventoryUpdateResult::Conflict {
+                        current: Some(active.clone()),
+                    }
+                },
+            );
+        }
+        if observed
+            .as_ref()
+            .and_then(|current| current.head.latest_terminal.as_ref())
+            .is_some_and(|terminal| terminal.epoch >= inventory.attempt.epoch)
+        {
+            return Ok(CheckpointArtifactInventoryUpdateResult::Conflict { current: None });
+        }
+
+        let candidate = DurableCheckpointDecisionHead {
+            version: CHECKPOINT_DECISION_HEAD_VERSION,
+            deployment_id,
+            latest_terminal: observed
+                .as_ref()
+                .and_then(|current| current.head.latest_terminal.clone()),
+            latest_commit: observed
+                .as_ref()
+                .and_then(|current| current.head.latest_commit.clone()),
+            active_artifacts: Some(inventory.clone()),
+        };
+        match self.put_decision_head(observed, candidate).await? {
+            DecisionHeadCasResult::Applied => Ok(CheckpointArtifactInventoryUpdateResult::Applied),
+            DecisionHeadCasResult::Unchanged => {
+                Ok(CheckpointArtifactInventoryUpdateResult::Unchanged)
+            }
+            DecisionHeadCasResult::Conflict(current) => {
+                let exact_unaborted = current.as_ref().is_some_and(|head| {
+                    head.active_artifacts.as_ref() == Some(&inventory)
+                        && !Self::terminal_aborts_inventory(head, &inventory)
+                });
+                let active = current.and_then(|head| head.active_artifacts);
+                if exact_unaborted {
+                    Ok(CheckpointArtifactInventoryUpdateResult::Unchanged)
+                } else {
+                    Ok(CheckpointArtifactInventoryUpdateResult::Conflict { current: active })
+                }
+            }
+        }
+    }
+
+    /// Durably admit one exact local attempt before any checkpoint artifact is written.
+    ///
+    /// Equal retries converge. A different active attempt or a reused terminal attempt conflicts.
+    ///
+    /// # Errors
+    /// Object-store I/O or a malformed, cluster, or foreign-deployment inventory.
+    pub async fn begin_checkpoint_artifact_inventory(
+        &self,
+        inventory: CheckpointArtifactInventory,
+    ) -> Result<CheckpointArtifactInventoryUpdateResult, DecisionError> {
+        if self.update_mode == DecisionStoreUpdateMode::LocalSingleWriter {
+            let lock = self.local_metadata_rmw_lock.as_ref().ok_or_else(|| {
+                DecisionError::Conflict(
+                    "local decision store is missing its namespace write lock".into(),
+                )
+            })?;
+            let _guard = lock.lock().await;
+            self.begin_checkpoint_artifact_inventory_inner(inventory)
+                .await
+        } else {
+            self.begin_checkpoint_artifact_inventory_inner(inventory)
+                .await
+        }
+    }
+
+    async fn complete_checkpoint_artifact_cleanup_inner(
+        &self,
+        expected: &CheckpointArtifactInventory,
+    ) -> Result<CheckpointArtifactInventoryUpdateResult, DecisionError> {
+        expected.validate().map_err(DecisionError::Conflict)?;
+        if expected.assignment_fence.is_some() {
+            return Err(DecisionError::Conflict(
+                "local checkpoint artifact inventory cannot carry an assignment fence".into(),
+            ));
+        }
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        if expected.deployment_id != deployment_id {
+            return Err(DecisionError::Conflict(
+                "checkpoint artifact inventory belongs to a foreign deployment".into(),
+            ));
+        }
+        let observed = self.read_decision_head(&deployment_id).await?;
+        let Some(current) = observed.as_ref() else {
+            return Ok(CheckpointArtifactInventoryUpdateResult::Conflict { current: None });
+        };
+        match current.head.active_artifacts.as_ref() {
+            Some(active) if active != expected => {
+                return Ok(CheckpointArtifactInventoryUpdateResult::Conflict {
+                    current: Some(active.clone()),
+                });
+            }
+            None if Self::terminal_aborts_inventory(&current.head, expected) => {
+                return Ok(CheckpointArtifactInventoryUpdateResult::Unchanged);
+            }
+            None => {
+                return Ok(CheckpointArtifactInventoryUpdateResult::Conflict { current: None });
+            }
+            Some(_) => {}
+        }
+        if !Self::terminal_aborts_inventory(&current.head, expected) {
+            return Ok(CheckpointArtifactInventoryUpdateResult::Conflict {
+                current: Some(expected.clone()),
+            });
+        }
+
+        let candidate = DurableCheckpointDecisionHead {
+            version: CHECKPOINT_DECISION_HEAD_VERSION,
+            deployment_id,
+            latest_terminal: current.head.latest_terminal.clone(),
+            latest_commit: current.head.latest_commit.clone(),
+            active_artifacts: None,
+        };
+        match self.put_decision_head(observed, candidate).await? {
+            DecisionHeadCasResult::Applied => Ok(CheckpointArtifactInventoryUpdateResult::Applied),
+            DecisionHeadCasResult::Unchanged => {
+                Ok(CheckpointArtifactInventoryUpdateResult::Unchanged)
+            }
+            DecisionHeadCasResult::Conflict(current) => {
+                let active = current
+                    .as_ref()
+                    .and_then(|head| head.active_artifacts.clone());
+                if active.is_none()
+                    && current
+                        .as_ref()
+                        .is_some_and(|head| Self::terminal_aborts_inventory(head, expected))
+                {
+                    Ok(CheckpointArtifactInventoryUpdateResult::Unchanged)
+                } else {
+                    Ok(CheckpointArtifactInventoryUpdateResult::Conflict { current: active })
+                }
+            }
+        }
+    }
+
+    /// Clear an exact local artifact inventory after its durable Abort paths are sealed.
+    ///
+    /// # Errors
+    /// Object-store I/O or a malformed, cluster, or foreign-deployment inventory.
+    pub async fn complete_checkpoint_artifact_cleanup(
+        &self,
+        expected: &CheckpointArtifactInventory,
+    ) -> Result<CheckpointArtifactInventoryUpdateResult, DecisionError> {
+        if self.update_mode == DecisionStoreUpdateMode::LocalSingleWriter {
+            let lock = self.local_metadata_rmw_lock.as_ref().ok_or_else(|| {
+                DecisionError::Conflict(
+                    "local decision store is missing its namespace write lock".into(),
+                )
+            })?;
+            let _guard = lock.lock().await;
+            self.complete_checkpoint_artifact_cleanup_inner(expected)
+                .await
+        } else {
+            self.complete_checkpoint_artifact_cleanup_inner(expected)
+                .await
+        }
+    }
+
     pub(crate) async fn canonical_outcome_with_index(
         &self,
         epoch: u64,
@@ -2280,27 +2776,55 @@ impl CheckpointDecisionStore {
         committed_index: Option<CommittedCheckpointIndex>,
     ) -> Result<RecordOutcomeResult, DecisionError> {
         let observed = self.read_decision_head(&candidate.deployment_id).await?;
-        if let Some(current) = observed.as_ref() {
-            if current.head.latest_terminal.epoch == candidate.epoch {
-                return if current.head.latest_terminal == candidate {
+        if let Some(terminal) = observed
+            .as_ref()
+            .and_then(|current| current.head.latest_terminal.as_ref())
+        {
+            if terminal.epoch == candidate.epoch {
+                return if terminal == &candidate {
                     Ok(RecordOutcomeResult::Unchanged(candidate))
                 } else {
                     Ok(RecordOutcomeResult::Conflict {
-                        winner: current.head.latest_terminal.clone(),
+                        winner: terminal.clone(),
                     })
                 };
             }
-            if current.head.latest_terminal.epoch > candidate.epoch {
+            if terminal.epoch > candidate.epoch {
                 return Ok(RecordOutcomeResult::Conflict {
-                    winner: current.head.latest_terminal.clone(),
+                    winner: terminal.clone(),
                 });
             }
         }
 
+        let active = observed
+            .as_ref()
+            .and_then(|current| current.head.active_artifacts.as_ref());
+        let candidate_attempt = CheckpointAttempt::new(candidate.epoch, candidate.checkpoint_id);
+        if active.is_some_and(|active| active.attempt != candidate_attempt) {
+            return Err(DecisionError::Conflict(format!(
+                "checkpoint outcome attempt {} does not match the active artifact inventory",
+                candidate.checkpoint_id
+            )));
+        }
+
         if candidate.is_commit() {
+            let active = active.ok_or_else(|| {
+                DecisionError::Conflict(format!(
+                    "checkpoint Commit {} has no durable artifact inventory",
+                    candidate.checkpoint_id
+                ))
+            })?;
             let index = committed_index.as_ref().ok_or_else(|| {
                 DecisionError::Conflict("Commit has no validated committed checkpoint".into())
             })?;
+            if index.pipeline_identity != active.pipeline_identity
+                || index.assignment_fence != active.assignment_fence
+            {
+                return Err(DecisionError::Conflict(
+                    "Commit metadata does not match the active checkpoint artifact inventory"
+                        .into(),
+                ));
+            }
             let expected_predecessor = observed.as_ref().and_then(|current| {
                 current
                     .head
@@ -2332,61 +2856,31 @@ impl CheckpointDecisionStore {
                     .as_ref()
                     .and_then(|current| current.head.latest_commit.clone())
             },
-            latest_terminal: candidate.clone(),
+            latest_terminal: Some(candidate.clone()),
+            active_artifacts: if candidate.is_commit() {
+                None
+            } else {
+                active.cloned()
+            },
         };
-        Self::validate_decision_head_shape(&head, &candidate.deployment_id)?;
-        let expected = observed.map(|current| current.update_version);
-        let payload = Self::encode_control_record(
-            "checkpoint decision head",
-            &head,
-            CHECKPOINT_DECISION_HEAD_MAX_BYTES,
-        )?;
-        let mode = match (self.update_mode, expected) {
-            (_, None) => PutMode::Create,
-            (DecisionStoreUpdateMode::NativeCas, Some(version)) => PutMode::Update(version),
-            (DecisionStoreUpdateMode::LocalSingleWriter, Some(_)) => PutMode::Overwrite,
-        };
-        let result = self
-            .store
-            .put_opts(
-                &Self::decision_head_path(&head.deployment_id),
-                PutPayload::from(payload),
-                PutOptions {
-                    mode,
-                    ..PutOptions::default()
-                },
-            )
-            .await
-            .map(|_| ());
-        if result.is_ok() {
-            return Ok(RecordOutcomeResult::Created(candidate));
-        }
-
-        let winner = self.read_decision_head(&head.deployment_id).await?;
-        if let Some(winner) = winner {
-            if winner.head == head {
-                return Ok(RecordOutcomeResult::Unchanged(candidate));
+        match self.put_decision_head(observed, head).await? {
+            DecisionHeadCasResult::Applied => Ok(RecordOutcomeResult::Created(candidate)),
+            DecisionHeadCasResult::Unchanged => Ok(RecordOutcomeResult::Unchanged(candidate)),
+            DecisionHeadCasResult::Conflict(winner) => {
+                if let Some(terminal) = winner.and_then(|head| head.latest_terminal) {
+                    if terminal.epoch >= candidate.epoch {
+                        return if terminal == candidate {
+                            Ok(RecordOutcomeResult::Unchanged(candidate))
+                        } else {
+                            Ok(RecordOutcomeResult::Conflict { winner: terminal })
+                        };
+                    }
+                }
+                Err(DecisionError::Conflict(format!(
+                    "checkpoint decision head contention did not publish epoch {}",
+                    candidate.epoch
+                )))
             }
-            if winner.head.latest_terminal.epoch >= candidate.epoch {
-                return if winner.head.latest_terminal == candidate {
-                    Ok(RecordOutcomeResult::Unchanged(candidate))
-                } else {
-                    Ok(RecordOutcomeResult::Conflict {
-                        winner: winner.head.latest_terminal,
-                    })
-                };
-            }
-        }
-
-        let error = result.expect_err("failed decision-head write has an error");
-        match error {
-            object_store::Error::Precondition { .. }
-            | object_store::Error::AlreadyExists { .. }
-            | object_store::Error::NotFound { .. } => Err(DecisionError::Conflict(format!(
-                "checkpoint decision head contention did not publish epoch {}",
-                candidate.epoch
-            ))),
-            error => Err(DecisionError::Io(error.to_string())),
         }
     }
 
@@ -2451,6 +2945,7 @@ impl CheckpointDecisionStore {
             .map(|versioned| CheckpointDecisionHead {
                 latest_terminal: versioned.head.latest_terminal,
                 latest_commit: versioned.head.latest_commit,
+                active_artifacts: versioned.head.active_artifacts,
             }))
     }
 
@@ -2464,7 +2959,7 @@ impl CheckpointDecisionStore {
         Ok(self
             .checkpoint_decision_head()
             .await?
-            .map(|head| head.latest_terminal))
+            .and_then(|head| head.latest_terminal))
     }
 
     /// Read the latest authoritative local Commit without listing storage.

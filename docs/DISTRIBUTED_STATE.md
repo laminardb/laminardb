@@ -1,6 +1,6 @@
 # Distributed state
 
-- **Status date:** 2026-08-04
+- **Status date:** 2026-08-10
 - **Checkpoint core:** implemented
 - **Cluster state matrix:** incomplete and fail-closed
 - **Production validation:** pending the final soak matrix
@@ -27,6 +27,11 @@ participant frames for an unchanged assignment, and restores target-owned ranges
 committed donors for a direct successor. Successor recovery requires the authority's exact pinned
 handoff cut; skipped generations fail closed. Sources then replay from the committed offsets. It
 never scans checkpoint objects to infer state references.
+
+Before any artifact or Prepare publication, the authority records one exact active attempt. Abort
+recovery permanently seals the exact manifest paths, retaining any original manifests needed to
+reconstruct and seal the candidate index, then seals node data and clears the inventory. These
+same-path seals block late conditional creates; restart and takeover resume without LIST.
 
 Retention keeps only the authoritative latest recovery cut because its manifests are a complete
 logical inventory and directly reference every older live chunk. A bounded two-phase cursor
@@ -61,8 +66,6 @@ ownership and restore.
 
 The following remain production gaps, not alternate state implementations:
 
-- Durable Aborts reclaim exact prepared objects, including after restart. An attempt that crashes
-  before publishing a terminal decision can still leave unreferenced checkpoint metadata.
 - Checkpoint capture still performs state-sized snapshot work synchronously; its tail latency is
   not certified.
 - Temporal ASOF has vnode-keyed final-only execution, compact per-source-partition replay

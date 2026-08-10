@@ -1348,6 +1348,43 @@ impl RecoveryMonitor {
             return;
         }
 
+        let artifact_cleanup = {
+            let deadline = tokio::time::Instant::now() + DECISION_IO_TIMEOUT;
+            let mut coordinator = db.coordinator.lock().await;
+            match coordinator.as_mut() {
+                Some(coordinator) => coordinator
+                    .settle_cluster_checkpoint_artifacts_until(&round.leader_proof, deadline)
+                    .await
+                    .map_err(|error| error.to_string()),
+                None => Err("checkpoint coordinator is not configured".to_string()),
+            }
+        };
+        match artifact_cleanup {
+            Ok(true) => tracing::warn!(
+                gen = gen_id,
+                "cleaned unresolved checkpoint artifacts after stop quorum"
+            ),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(
+                    gen = gen_id,
+                    %error,
+                    "could not reconcile unresolved checkpoint artifacts"
+                );
+                self.abandon_round(db, controller, &round).await;
+                return;
+            }
+        }
+        if !driver_owns_prepare(db, controller, &round).await {
+            tracing::warn!(
+                gen = gen_id,
+                "recovery driver lost ownership during checkpoint artifact cleanup; yielding"
+            );
+            let _ = controller.clear_recover(&round).await;
+            hold_intake_and_request_retry(db, controller, gen_id, false).await;
+            return;
+        }
+
         // The world is stopped, so the greatest Commit and its immutable global index form the
         // exact recovery cut. No committed checkpoint means a fresh start.
         let selected = match read_committed_target_bounded(db).await {

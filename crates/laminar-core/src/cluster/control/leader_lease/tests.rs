@@ -441,6 +441,27 @@ async fn committed_checkpoint_with_predecessor(
     decisions.create_committed_checkpoint(&index).await.unwrap()
 }
 
+async fn begin_checkpoint_artifacts(
+    store: &LeaderLeaseStore,
+    proof: &LeaderProof,
+    fence: &CheckpointAssignmentFence,
+    checkpoint_id: u64,
+) -> CheckpointArtifactInventory {
+    let inventory = CheckpointArtifactInventory {
+        deployment_id: CheckpointDecisionStore::new(Arc::clone(&store.store))
+            .load_or_create_deployment_id()
+            .await
+            .unwrap(),
+        pipeline_identity: crate::checkpoint::PipelineIdentity::empty(),
+        attempt: crate::checkpoint::CheckpointAttempt::canonical(checkpoint_id),
+        assignment_fence: Some(fence.clone()),
+    };
+    store
+        .begin_cluster_checkpoint_artifacts(proof, inventory)
+        .await
+        .unwrap()
+}
+
 async fn record_commit(
     store: &LeaderLeaseStore,
     proof: &LeaderProof,
@@ -466,6 +487,7 @@ async fn try_record_commit(
         .await
         .unwrap()
         .and_then(|outcome| outcome.committed_checkpoint);
+    begin_checkpoint_artifacts(store, proof, fence, checkpoint_id).await;
     let committed_checkpoint =
         committed_checkpoint_with_predecessor(store, fence, checkpoint_id, 9, predecessor).await;
     store
@@ -4221,6 +4243,192 @@ async fn delayed_cluster_decision_is_fenced_when_takeover_wins_next_sequence() {
 }
 
 #[tokio::test]
+async fn cluster_checkpoint_artifacts_block_successors_and_survive_abort_until_cleanup() {
+    let store = store(1_000);
+    let incumbent = owner(1, 1, 1);
+    let LeaseOutcome::Acquired(first) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+        unreachable!()
+    };
+    let proof = first.proof();
+    let fence = assignment_fence(&incumbent);
+    let inventory = begin_checkpoint_artifacts(&store, &proof, &fence, 1).await;
+    assert_eq!(
+        store.cluster_checkpoint_artifacts().await.unwrap(),
+        Some(inventory.clone())
+    );
+
+    let mut successor = inventory.clone();
+    successor.attempt = crate::checkpoint::CheckpointAttempt::canonical(2);
+    assert!(matches!(
+        store
+            .begin_cluster_checkpoint_artifacts(&proof, successor)
+            .await,
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(_)
+        ))
+    ));
+
+    store
+        .record_cluster_outcome(&proof, 1, 1, fence.clone(), CheckpointVerdict::Abort, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.cluster_checkpoint_artifacts().await.unwrap(),
+        Some(inventory.clone())
+    );
+    assert!(matches!(
+        store
+            .begin_cluster_checkpoint_artifacts(&proof, inventory.clone())
+            .await,
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(message)
+        )) if message.contains("unresolved or inherited")
+    ));
+    store
+        .finish_cluster_checkpoint_artifact_cleanup(&proof, &inventory)
+        .await
+        .unwrap();
+    store
+        .finish_cluster_checkpoint_artifact_cleanup(&proof, &inventory)
+        .await
+        .unwrap();
+    assert!(store
+        .cluster_checkpoint_artifacts()
+        .await
+        .unwrap()
+        .is_none());
+
+    record_commit(&store, &proof, &fence, 2, 2).await;
+    assert!(store
+        .cluster_checkpoint_artifacts()
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn delayed_artifact_admission_cannot_reopen_a_durable_abort() {
+    let (raw, store) = blocking_once_at(1_000, lease_path(2));
+    let incumbent = owner(1, 1, 1);
+    let LeaseOutcome::Acquired(first) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+        unreachable!()
+    };
+    let proof = first.proof();
+    let fence = assignment_fence(&incumbent);
+    let inventory = CheckpointArtifactInventory {
+        deployment_id: CheckpointDecisionStore::new(Arc::clone(&store.store))
+            .load_or_create_deployment_id()
+            .await
+            .unwrap(),
+        pipeline_identity: crate::checkpoint::PipelineIdentity::empty(),
+        attempt: crate::checkpoint::CheckpointAttempt::canonical(1),
+        assignment_fence: Some(fence.clone()),
+    };
+
+    let delayed_store = Arc::clone(&store);
+    let delayed_proof = proof.clone();
+    let delayed_inventory = inventory.clone();
+    let delayed = tokio::spawn(async move {
+        delayed_store
+            .begin_cluster_checkpoint_artifacts(&delayed_proof, delayed_inventory)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+
+    assert_eq!(
+        store
+            .begin_cluster_checkpoint_artifacts(&proof, inventory.clone())
+            .await
+            .unwrap(),
+        inventory
+    );
+    store
+        .record_cluster_outcome(&proof, 1, 1, fence, CheckpointVerdict::Abort, None)
+        .await
+        .unwrap();
+    raw.release.add_permits(1);
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), delayed)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(_)
+        ))
+    ));
+    assert_eq!(
+        store.cluster_checkpoint_artifacts().await.unwrap(),
+        Some(inventory)
+    );
+}
+
+#[tokio::test]
+async fn takeover_can_only_abort_the_exact_active_checkpoint_inventory() {
+    let store = store(10);
+    let incumbent = owner(1, 1, 1);
+    let successor = owner(2, 2, 1);
+    let LeaseOutcome::Acquired(first) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+        unreachable!()
+    };
+    let proof = first.proof();
+    let fence = assignment_fence(&incumbent);
+    let inventory = begin_checkpoint_artifacts(&store, &proof, &fence, 1).await;
+    let observation = store.observe_rival(&successor, &first).unwrap();
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    let LeaseOutcome::Acquired(takeover) = store
+        .try_takeover(&successor, &observation, 20)
+        .await
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let takeover_proof = takeover.proof();
+    assert!(matches!(
+        store
+            .begin_cluster_checkpoint_artifacts(&takeover_proof, inventory.clone())
+            .await,
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(message)
+        )) if message.contains("outside the assignment fence")
+    ));
+    let committed = committed_checkpoint(&store, &fence, 1, 1).await;
+    assert!(matches!(
+        store
+            .record_cluster_outcome(
+                &takeover_proof,
+                1,
+                1,
+                fence.clone(),
+                CheckpointVerdict::Commit,
+                Some(committed),
+            )
+            .await,
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(message)
+        )) if message.contains("requires its leader proof in the assignment fence")
+    ));
+    store
+        .record_cluster_outcome(&takeover_proof, 1, 1, fence, CheckpointVerdict::Abort, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .finish_cluster_checkpoint_artifact_cleanup(&proof, &inventory)
+            .await,
+        Err(ClusterCheckpointAuthorityError::Fenced)
+    ));
+    store
+        .finish_cluster_checkpoint_artifact_cleanup(&takeover_proof, &inventory)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn delayed_cluster_decision_retries_after_renewal_wins_next_sequence() {
     let (raw, store) = blocking_once_at(1_000, lease_path(2));
     let incumbent = owner(1, 1, 1);
@@ -5115,6 +5323,7 @@ async fn next_commit_is_rejected_at_the_live_commit_capacity_before_sequence_cre
     disable_history_pruning_for_test(&store).await;
     let proof = first.proof();
     let fence = assignment_fence(&incumbent);
+    begin_checkpoint_artifacts(&store, &proof, &fence, 1).await;
     let first_checkpoint = committed_checkpoint(&store, &fence, 1, 1).await;
     store
         .record_cluster_outcome(
@@ -5213,9 +5422,11 @@ async fn next_commit_is_rejected_at_the_live_commit_capacity_before_sequence_cre
         .checkpoint_outcome
         .as_ref()
         .and_then(|outcome| outcome.committed_checkpoint.clone());
+    begin_checkpoint_artifacts(&store, &proof, &fence, next_checkpoint_id).await;
     let next_checkpoint =
         committed_checkpoint_with_predecessor(&store, &fence, next_checkpoint_id, 9, predecessor)
             .await;
+    let before = store.load_record().await.unwrap().unwrap();
     let error = store
         .record_cluster_outcome(
             &proof,
@@ -5233,12 +5444,12 @@ async fn next_commit_is_rejected_at_the_live_commit_capacity_before_sequence_cre
             if message.contains("live Commit retention reached")
     ));
     assert!(
-        read_authority_record(store.store.as_ref(), floor_sequence + 1)
+        read_authority_record(store.store.as_ref(), before.lease.seq + 1)
             .await
             .unwrap()
             .is_none()
     );
-    assert_eq!(store.load_record().await.unwrap().unwrap(), floor_head);
+    assert_eq!(store.load_record().await.unwrap().unwrap(), before);
 }
 
 #[tokio::test]
@@ -5492,6 +5703,7 @@ async fn cluster_commit_rejects_a_fork_from_the_authoritative_commit_head() {
     let proof = first.proof();
     let fence = assignment_fence(&incumbent);
     record_commit(&store, &proof, &fence, 1, 1).await;
+    begin_checkpoint_artifacts(&store, &proof, &fence, 2).await;
     let fork = committed_checkpoint(&store, &fence, 2, 2).await;
     let before = store.load_record().await.unwrap().unwrap();
 
@@ -5526,6 +5738,7 @@ async fn cluster_commit_extends_the_same_head_after_an_intervening_abort() {
     };
     let proof = first.proof();
     let fence = assignment_fence(&incumbent);
+    begin_checkpoint_artifacts(&store, &proof, &fence, 1).await;
     let first_checkpoint = committed_checkpoint(&store, &fence, 1, 1).await;
     store
         .record_cluster_outcome(
@@ -5542,6 +5755,7 @@ async fn cluster_commit_extends_the_same_head_after_an_intervening_abort() {
         .record_cluster_outcome(&proof, 2, 2, fence.clone(), CheckpointVerdict::Abort, None)
         .await
         .unwrap();
+    begin_checkpoint_artifacts(&store, &proof, &fence, 3).await;
     let next_checkpoint =
         committed_checkpoint_with_predecessor(&store, &fence, 3, 9, Some(first_checkpoint)).await;
 

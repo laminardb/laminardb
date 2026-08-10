@@ -792,6 +792,36 @@ async fn source_less_leader_holds_rotation_fence_through_whole_and_vnode_capture
 }
 
 #[cfg(feature = "cluster")]
+#[tokio::test]
+async fn checkpoint_tail_settlement_waits_for_terminal_task() {
+    let mut callback = empty_callback_fixture();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    callback.spawn_checkpoint_tail(async move {
+        started_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+    });
+    started_rx.await.unwrap();
+
+    {
+        let settlement =
+            crate::pipeline::PipelineCallback::settle_checkpoint_tail_tasks(&mut callback);
+        tokio::pin!(settlement);
+        tokio::select! {
+            biased;
+            result = &mut settlement => {
+                panic!("unfinished checkpoint tail detached during settlement: {result:?}");
+            }
+            () = tokio::task::yield_now() => {}
+        }
+        release_tx.send(()).unwrap();
+        settlement.await.unwrap();
+    }
+
+    assert!(callback.checkpoint_tail_tasks.is_empty());
+}
+
+#[cfg(feature = "cluster")]
 fn local_follower_prepare(
     controller: &laminar_core::cluster::control::ClusterController,
     attempt: CheckpointAttempt,
@@ -1593,10 +1623,15 @@ async fn callback_publishes_prepare_directly_before_checkpoint_work() {
         .await
         .unwrap();
 
-    let authority = Arc::new(LeaderLeaseStore::new(
-        Arc::new(object_store::memory::InMemory::new()),
-        1_000,
-    ));
+    let checkpoint_objects: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let decision_store = Arc::new(
+        laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::clone(
+            &checkpoint_objects,
+        )),
+    );
+    let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
+    let authority = Arc::new(LeaderLeaseStore::new(checkpoint_objects, 1_000));
     let owner = LeaderLeaseOwner {
         node: leader_id,
         boot: leader.recovery_incarnation(),
@@ -1611,7 +1646,7 @@ async fn callback_publishes_prepare_directly_before_checkpoint_work() {
         .unwrap();
     leader.set_leader_lease_store(Arc::clone(&authority));
     leader.install_local_leader_proof_provider();
-    follower.set_leader_lease_store(authority);
+    follower.set_leader_lease_store(Arc::clone(&authority));
 
     follower
         .start_barrier_server("127.0.0.1:0".parse().unwrap(), None)
@@ -1651,6 +1686,20 @@ async fn callback_publishes_prepare_directly_before_checkpoint_work() {
     callback.vnode_registry = Some(registry);
     callback.checkpoint_timeout = Duration::from_secs(1);
     callback.quorum_timeout = Duration::from_millis(200);
+    let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
+        crate::checkpoint_coordinator::CheckpointConfig::default(),
+        memory_checkpoint_store(),
+    )
+    .unwrap();
+    coordinator
+        .bind_durable_decision_store(Arc::clone(&decision_store))
+        .await
+        .unwrap();
+    coordinator
+        .bind_pipeline_identity(laminar_core::checkpoint::PipelineIdentity::empty())
+        .unwrap();
+    coordinator.set_cluster_controller(Arc::clone(&leader));
+    callback.coordinator = Arc::new(tokio::sync::Mutex::new(Some(coordinator)));
 
     let expired = CheckpointAttempt::new(1, 1);
     let error = crate::pipeline::PipelineCallback::publish_checkpoint_prepare(
@@ -1669,7 +1718,58 @@ async fn callback_publishes_prepare_directly_before_checkpoint_work() {
         .await
         .is_none());
 
-    let attempt = CheckpointAttempt::new(2, 2);
+    let blocked_attempt = CheckpointAttempt::new(1, 1);
+    let blocked_inventory = laminar_core::checkpoint_decision::CheckpointArtifactInventory {
+        deployment_id,
+        pipeline_identity: laminar_core::checkpoint::PipelineIdentity::empty(),
+        attempt: blocked_attempt,
+        assignment_fence: Some(fence.clone()),
+    };
+    let blocking_proof = leader.capture_leader_proof().unwrap();
+    authority
+        .begin_cluster_checkpoint_artifacts(&blocking_proof, blocked_inventory)
+        .await
+        .unwrap();
+    let rejected = CheckpointAttempt::new(2, 2);
+    let error = crate::pipeline::PipelineCallback::publish_checkpoint_prepare(
+        &mut callback,
+        rejected,
+        std::time::Instant::now(),
+        laminar_core::checkpoint::flags::NONE,
+        Some(fence.clone()),
+    )
+    .await
+    .expect_err("conflicting artifact inventory must prevent Prepare publication");
+    assert!(error.contains("artifact admission"), "{error}");
+    assert!(leader_kv
+        .read_from(leader_id, ANNOUNCEMENT_KEY)
+        .await
+        .is_none());
+    authority
+        .record_cluster_outcome(
+            &blocking_proof,
+            blocked_attempt.epoch,
+            blocked_attempt.checkpoint_id,
+            fence.clone(),
+            laminar_core::checkpoint_decision::CheckpointVerdict::Abort,
+            None,
+        )
+        .await
+        .unwrap();
+    {
+        let mut coordinator = callback.coordinator.lock().await;
+        assert!(coordinator
+            .as_mut()
+            .unwrap()
+            .settle_cluster_checkpoint_artifacts_until(
+                &blocking_proof,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap());
+    }
+
+    let attempt = CheckpointAttempt::new(3, 3);
     let expected = certified_barrier(
         attempt,
         fence.clone(),
@@ -1685,6 +1785,14 @@ async fn callback_publishes_prepare_directly_before_checkpoint_work() {
     )
     .await
     .unwrap();
+    assert_eq!(
+        authority
+            .cluster_checkpoint_artifacts()
+            .await
+            .unwrap()
+            .map(|inventory| inventory.attempt),
+        Some(attempt)
+    );
     tokio::time::timeout(Duration::from_secs(2), async {
         while follower.checkpoint_prepare_received_at(&expected).is_none() {
             tokio::task::yield_now().await;

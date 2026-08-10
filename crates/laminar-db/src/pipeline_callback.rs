@@ -1080,8 +1080,8 @@ pub(crate) struct ConnectorPipelineCallback {
         crossfire::MAsyncTx<crossfire::mpsc::Array<CheckpointCompletion>>,
     /// Existing database-owned I/O runtime used by asynchronous ALO checkpoint tails.
     pub(crate) checkpoint_tail_runtime: tokio::runtime::Handle,
-    /// Every asynchronous ALO checkpoint tail. `JoinSet` provides structured cancellation and
-    /// prevents shutdown from racing detached state/sink work.
+    /// Every asynchronous ALO checkpoint tail. `JoinSet` keeps shutdown from racing state/sink
+    /// work that has not reached a terminal result.
     pub(crate) checkpoint_tail_tasks: tokio::task::JoinSet<()>,
     /// In-flight epoch count; the coordinator serializes durable checkpoint tails.
     pub(crate) checkpoint_in_flight: Arc<std::sync::atomic::AtomicU64>,
@@ -1923,34 +1923,30 @@ impl ConnectorPipelineCallback {
     ) -> Result<(), DbError> {
         let request = std::mem::take(&mut tail.request);
         let attempt = tail.attempt;
-        let result = tokio::time::timeout_at(deadline, async {
-            let mut guard = tail.coordinator.lock().await;
-            let coordinator = guard.as_mut().ok_or_else(|| {
-                DbError::Checkpoint(
-                    "[LDB-6045] checkpoint coordinator disappeared before follower prepare".into(),
-                )
+        let mut guard = tokio::time::timeout_at(deadline, tail.coordinator.lock())
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6046] follower checkpoint {} epoch {} exceeded its {:?} end-to-end \
+                     deadline while waiting for checkpoint coordinator ownership",
+                    attempt.checkpoint_id, attempt.epoch, tail.checkpoint_timeout
+                ))
             })?;
-            coordinator.set_local_watermark(tail.local_watermark);
-            coordinator
-                .follower_prepare_acked_until(
-                    request,
-                    tail.identity.leader_proof.clone(),
-                    attempt.epoch,
-                    attempt.checkpoint_id,
-                    deadline,
-                )
-                .await?;
-            Ok::<_, DbError>(())
-        })
-        .await;
-
-        result.unwrap_or_else(|_| {
-            Err(DbError::Checkpoint(format!(
-                "[LDB-6046] follower checkpoint {} epoch {} exceeded its {:?} end-to-end \
-                 deadline during prepare",
-                attempt.checkpoint_id, attempt.epoch, tail.checkpoint_timeout
-            )))
-        })
+        let coordinator = guard.as_mut().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6045] checkpoint coordinator disappeared before follower prepare".into(),
+            )
+        })?;
+        coordinator.set_local_watermark(tail.local_watermark);
+        coordinator
+            .follower_prepare_acked_until(
+                request,
+                tail.identity.leader_proof.clone(),
+                attempt.epoch,
+                attempt.checkpoint_id,
+                deadline,
+            )
+            .await
     }
 
     #[cfg(feature = "cluster")]
@@ -5258,16 +5254,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .or_else(|| self.graph.execution_poison_reason().map(str::to_owned))
     }
 
-    async fn settle_checkpoint_tail_tasks(&mut self, abort: bool) -> Result<(), String> {
-        if abort {
-            self.checkpoint_tail_tasks.abort_all();
-            // Cancellation is cooperative and a tail may be inside blocking storage code. Drop
-            // the JoinSet after requesting abort instead of defeating the shutdown deadline by
-            // awaiting it. Exact attempt IDs make any detached ambiguous write unusable unless
-            // its matching durable decision exists.
-            self.checkpoint_tail_tasks = tokio::task::JoinSet::new();
-            return Ok(());
-        }
+    async fn settle_checkpoint_tail_tasks(&mut self) -> Result<(), String> {
         let mut failures = Vec::new();
         while let Some(result) = self.checkpoint_tail_tasks.join_next().await {
             match result {
@@ -5363,7 +5350,19 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     "checkpoint flags {flags:#x} no longer match admission {expected_flags:#x}"
                 ));
             }
+            let deadline =
+                tokio::time::Instant::from_std(attempt_started) + self.checkpoint_timeout;
             let Some(controller) = self.cluster_controller.as_ref() else {
+                let mut guard = tokio::time::timeout_at(deadline, self.coordinator.lock())
+                    .await
+                    .map_err(|_| "local checkpoint artifact admission timed out".to_string())?;
+                let coordinator = guard.as_mut().ok_or_else(|| {
+                    "local checkpoint artifact admission has no coordinator".to_string()
+                })?;
+                coordinator
+                    .begin_checkpoint_artifacts_until(attempt, None, None, deadline)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 return Ok(());
             };
             if !controller.is_leader() {
@@ -5385,8 +5384,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 "[LDB-6055] clustered checkpoint lost its assignment certificate before Prepare"
                     .to_string()
             })?;
-            let deadline =
-                tokio::time::Instant::from_std(attempt_started) + self.checkpoint_timeout;
             let quorum_window = self.quorum_timeout.min(
                 self.checkpoint_timeout
                     .saturating_sub(attempt_started.elapsed()),
@@ -5398,6 +5395,23 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             // can resolve this exact attempt instead of assuming Prepare was absent.
             self.checkpoint_leader_proofs
                 .insert(attempt, leader_proof.clone());
+            {
+                let mut guard = tokio::time::timeout_at(deadline, self.coordinator.lock())
+                    .await
+                    .map_err(|_| "cluster checkpoint artifact admission timed out".to_string())?;
+                let coordinator = guard.as_mut().ok_or_else(|| {
+                    "cluster checkpoint artifact admission has no coordinator".to_string()
+                })?;
+                coordinator
+                    .begin_checkpoint_artifacts_until(
+                        attempt,
+                        Some(assignment_fence.clone()),
+                        Some(&leader_proof),
+                        deadline,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
             tokio::time::timeout_at(
                 deadline,
                 controller.announce_prepare_barrier(
@@ -5425,12 +5439,24 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
         #[cfg(not(feature = "cluster"))]
         {
-            let _ = (attempt, attempt_started, flags);
+            let _ = flags;
             if admitted_assignment_fence.is_some() {
                 return Err(
                     "cluster assignment certificate supplied to a local checkpoint runtime".into(),
                 );
             }
+            let deadline =
+                tokio::time::Instant::from_std(attempt_started) + self.checkpoint_timeout;
+            let mut guard = tokio::time::timeout_at(deadline, self.coordinator.lock())
+                .await
+                .map_err(|_| "local checkpoint artifact admission timed out".to_string())?;
+            let coordinator = guard.as_mut().ok_or_else(|| {
+                "local checkpoint artifact admission has no coordinator".to_string()
+            })?;
+            coordinator
+                .begin_checkpoint_artifacts_until(attempt, None, None, deadline)
+                .await
+                .map_err(|error| error.to_string())?;
             Ok(())
         }
     }

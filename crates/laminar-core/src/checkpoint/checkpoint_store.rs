@@ -10,14 +10,18 @@ use bytes::Bytes;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use sha2::{Digest, Sha256};
 
-use crate::checkpoint::canonical_json_bytes;
 use crate::checkpoint::checkpoint_manifest::{
     checkpoint_descriptor_sha256, ByteRange, CheckpointManifest, NodeDataObject,
     PreparedSinkDescriptor, StateChunkId,
 };
+use crate::checkpoint::{canonical_json_bytes, canonical_json_sha256};
+use crate::checkpoint_decision::CheckpointArtifactInventory;
 use crate::state::{KeyGroupCount, DEFAULT_KEY_GROUP_COUNT, LOCAL_NODE_ID};
 
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ABORT_SEAL_BYTES: u64 = MAX_MANIFEST_BYTES + 64 * 1024;
+const CHECKPOINT_ARTIFACT_IDENTITY_VERSION: u32 = 1;
+const CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION: u32 = 1;
 
 /// Default maximum size of one participant's checkpoint data object.
 pub const DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES: u64 = 512 * 1024 * 1024;
@@ -67,6 +71,66 @@ pub fn checkpoint_manifest_bytes(
     canonical_json_bytes(manifest)
 }
 
+#[derive(serde::Serialize)]
+struct CheckpointArtifactIdentityPayload<'a> {
+    version: u32,
+    inventory: &'a CheckpointArtifactInventory,
+    chunk: StateChunkId,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct CheckpointArtifactAbortSeal {
+    version: u32,
+    artifact_identity_sha256: String,
+    chunk: StateChunkId,
+    original_manifest: Option<CheckpointManifest>,
+}
+
+enum ManifestAbortState {
+    Sealed(Option<(CheckpointManifest, Bytes)>),
+    Manifest(CheckpointManifest, Bytes),
+}
+
+/// SHA-256 binding one active artifact inventory to one exact participant object namespace.
+///
+/// # Errors
+/// Returns an error when the inventory or object identity is not canonical.
+pub fn checkpoint_artifact_identity_sha256(
+    inventory: &CheckpointArtifactInventory,
+    chunk: StateChunkId,
+) -> Result<String, CheckpointStoreError> {
+    inventory.validate().map_err(|error| {
+        CheckpointStoreError::Invalid(format!("checkpoint artifact inventory: {error}"))
+    })?;
+    if chunk.participant_id == 0 || chunk.checkpoint_id != inventory.attempt.checkpoint_id {
+        return Err(CheckpointStoreError::Invalid(
+            "checkpoint artifact chunk does not match its active inventory".into(),
+        ));
+    }
+    match inventory.assignment_fence.as_ref() {
+        Some(fence) if !fence.contains(chunk.participant_id) => {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint artifact participant {} is outside its assignment fence",
+                chunk.participant_id
+            )));
+        }
+        None if chunk.participant_id != LOCAL_NODE_ID.0 => {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "local checkpoint artifact participant must be {}",
+                LOCAL_NODE_ID.0
+            )));
+        }
+        Some(_) | None => {}
+    }
+    canonical_json_sha256(&CheckpointArtifactIdentityPayload {
+        version: CHECKPOINT_ARTIFACT_IDENTITY_VERSION,
+        inventory,
+        chunk,
+    })
+    .map_err(CheckpointStoreError::Serde)
+}
+
 /// Immutable checkpoint storage contract.
 #[async_trait]
 pub trait CheckpointStore: Send + Sync {
@@ -83,12 +147,28 @@ pub trait CheckpointStore: Send + Sync {
         LOCAL_NODE_ID.0
     }
 
-    /// Validate and conditional-create the immutable node data object, then its manifest.
+    /// Validate and conditional-create the immutable node data object, then its manifest. Active
+    /// inventory and exact Abort seals reconcile creates left ambiguous by caller cancellation.
     async fn save_checkpoint(
         &self,
         manifest: &CheckpointManifest,
         node_data: &[Bytes],
     ) -> Result<Bytes, CheckpointStoreError>;
+
+    /// Replace this exact aborted manifest path with a monotone seal. If a valid manifest was
+    /// already durable, preserve it inside the seal and return it with its canonical bytes.
+    async fn seal_aborted_manifest(
+        &self,
+        chunk: StateChunkId,
+        expected_artifact_identity_sha256: &str,
+    ) -> Result<Option<(CheckpointManifest, Bytes)>, CheckpointStoreError>;
+
+    /// Replace this exact aborted node-data path with a monotone seal without reading its body.
+    async fn seal_aborted_node_data(
+        &self,
+        chunk: StateChunkId,
+        expected_artifact_identity_sha256: &str,
+    ) -> Result<(), CheckpointStoreError>;
 
     /// Load this node's exact manifest.
     async fn load_manifest(
@@ -292,6 +372,164 @@ impl ObjectStoreCheckpointStore {
             return Ok(None);
         };
         self.decode_manifest(chunk, &bytes).map(Some)
+    }
+
+    async fn load_manifest_or_abort_seal_bytes(
+        &self,
+        chunk: StateChunkId,
+    ) -> Result<Option<Bytes>, CheckpointStoreError> {
+        let path = self.manifest_path(chunk);
+        let result = match self.store.get(&path).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if result.meta.size > MAX_ABORT_SEAL_BYTES {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "manifest or abort seal is {} bytes, exceeding the {MAX_ABORT_SEAL_BYTES}-byte limit",
+                result.meta.size
+            )));
+        }
+        let expected_size = result.meta.size;
+        let bytes = result.bytes().await?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != expected_size {
+            return Err(CheckpointStoreError::Invalid(
+                "manifest or abort seal length changed while being read".into(),
+            ));
+        }
+        Ok(Some(bytes))
+    }
+
+    fn validate_abort_seal_manifest(
+        &self,
+        chunk: StateChunkId,
+        expected_artifact_identity_sha256: &str,
+        manifest: &CheckpointManifest,
+    ) -> Result<Bytes, CheckpointStoreError> {
+        ensure_manifest_valid(
+            manifest,
+            chunk.participant_id,
+            self.key_group_count,
+            self.max_node_data_bytes,
+        )?;
+        if manifest.checkpoint_id != chunk.checkpoint_id || manifest.node_data.chunk != chunk {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "manifest does not match aborted artifact path for participant {} checkpoint {}",
+                chunk.participant_id, chunk.checkpoint_id
+            )));
+        }
+        let inventory = CheckpointArtifactInventory {
+            deployment_id: manifest.deployment_id.clone(),
+            pipeline_identity: manifest.pipeline_identity.clone(),
+            attempt: crate::checkpoint::CheckpointAttempt::new(
+                manifest.epoch,
+                manifest.checkpoint_id,
+            ),
+            assignment_fence: manifest.assignment_fence.clone(),
+        };
+        let actual = checkpoint_artifact_identity_sha256(&inventory, chunk)?;
+        if actual != expected_artifact_identity_sha256 {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "manifest for participant {} checkpoint {} has a different artifact identity",
+                chunk.participant_id, chunk.checkpoint_id
+            )));
+        }
+        let canonical = Bytes::from(checkpoint_manifest_bytes(manifest)?);
+        if u64::try_from(canonical.len()).unwrap_or(u64::MAX) > MAX_MANIFEST_BYTES {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "manifest exceeds the {MAX_MANIFEST_BYTES}-byte limit"
+            )));
+        }
+        Ok(canonical)
+    }
+
+    fn decode_manifest_abort_state(
+        &self,
+        chunk: StateChunkId,
+        expected_artifact_identity_sha256: &str,
+        bytes: &Bytes,
+    ) -> Result<ManifestAbortState, CheckpointStoreError> {
+        if let Ok(seal) = serde_json::from_slice::<CheckpointArtifactAbortSeal>(bytes) {
+            validate_abort_seal(&seal, chunk, expected_artifact_identity_sha256)?;
+            let canonical_seal = checkpoint_artifact_abort_seal_bytes(&seal)?;
+            if canonical_seal != *bytes {
+                return Err(CheckpointStoreError::Invalid(format!(
+                    "participant {} checkpoint {} abort seal is not canonical",
+                    chunk.participant_id, chunk.checkpoint_id
+                )));
+            }
+            let original = seal
+                .original_manifest
+                .map(|manifest| {
+                    let canonical = self.validate_abort_seal_manifest(
+                        chunk,
+                        expected_artifact_identity_sha256,
+                        &manifest,
+                    )?;
+                    Ok::<_, CheckpointStoreError>((manifest, canonical))
+                })
+                .transpose()?;
+            return Ok(ManifestAbortState::Sealed(original));
+        }
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_MANIFEST_BYTES {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "manifest exceeds the {MAX_MANIFEST_BYTES}-byte limit"
+            )));
+        }
+        let manifest = self.decode_manifest(chunk, bytes)?;
+        let canonical =
+            self.validate_abort_seal_manifest(chunk, expected_artifact_identity_sha256, &manifest)?;
+        if canonical != *bytes {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "participant {} checkpoint {} manifest is not canonical",
+                chunk.participant_id, chunk.checkpoint_id
+            )));
+        }
+        Ok(ManifestAbortState::Manifest(manifest, canonical))
+    }
+
+    async fn node_data_is_exact_abort_seal(
+        &self,
+        chunk: StateChunkId,
+        expected: &Bytes,
+    ) -> Result<bool, CheckpointStoreError> {
+        let path = self.node_data_path(chunk);
+        let expected_len = u64::try_from(expected.len()).unwrap_or(u64::MAX);
+        let meta = match self.store.head(&path).await {
+            Ok(meta) => meta,
+            Err(object_store::Error::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if meta.size != expected_len {
+            return Ok(false);
+        }
+        let result = match self.store.get(&path).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if result.meta.size != expected_len {
+            return Ok(false);
+        }
+        Ok(result.bytes().await? == *expected)
+    }
+
+    async fn overwrite(
+        &self,
+        path: &object_store::path::Path,
+        bytes: Bytes,
+    ) -> Result<(), CheckpointStoreError> {
+        self.store
+            .put_opts(
+                path,
+                PutPayload::from_bytes(bytes),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..PutOptions::default()
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     async fn create_immutable(
@@ -517,6 +755,80 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         Ok(encoded)
     }
 
+    async fn seal_aborted_manifest(
+        &self,
+        chunk: StateChunkId,
+        expected_artifact_identity_sha256: &str,
+    ) -> Result<Option<(CheckpointManifest, Bytes)>, CheckpointStoreError> {
+        validate_abort_seal_request(chunk, expected_artifact_identity_sha256)?;
+        let empty_seal = CheckpointArtifactAbortSeal {
+            version: CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION,
+            artifact_identity_sha256: expected_artifact_identity_sha256.to_owned(),
+            chunk,
+            original_manifest: None,
+        };
+        let empty_seal_bytes = checkpoint_artifact_abort_seal_bytes(&empty_seal)?;
+        let path = self.manifest_path(chunk);
+        if self
+            .create_immutable(&path, PutPayload::from_bytes(empty_seal_bytes.clone()))
+            .await?
+        {
+            return Ok(None);
+        }
+
+        let current = self
+            .load_manifest_or_abort_seal_bytes(chunk)
+            .await?
+            .ok_or_else(|| {
+                CheckpointStoreError::Invalid(format!(
+                    "participant {} checkpoint {} manifest seal create conflicted but no object exists",
+                    chunk.participant_id, chunk.checkpoint_id
+                ))
+            })?;
+        match self.decode_manifest_abort_state(
+            chunk,
+            expected_artifact_identity_sha256,
+            &current,
+        )? {
+            ManifestAbortState::Sealed(original) => Ok(original),
+            ManifestAbortState::Manifest(manifest, canonical) => {
+                let seal = CheckpointArtifactAbortSeal {
+                    version: CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION,
+                    artifact_identity_sha256: expected_artifact_identity_sha256.to_owned(),
+                    chunk,
+                    original_manifest: Some(manifest.clone()),
+                };
+                self.overwrite(&path, checkpoint_artifact_abort_seal_bytes(&seal)?)
+                    .await?;
+                Ok(Some((manifest, canonical)))
+            }
+        }
+    }
+
+    async fn seal_aborted_node_data(
+        &self,
+        chunk: StateChunkId,
+        expected_artifact_identity_sha256: &str,
+    ) -> Result<(), CheckpointStoreError> {
+        validate_abort_seal_request(chunk, expected_artifact_identity_sha256)?;
+        let seal = CheckpointArtifactAbortSeal {
+            version: CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION,
+            artifact_identity_sha256: expected_artifact_identity_sha256.to_owned(),
+            chunk,
+            original_manifest: None,
+        };
+        let encoded = checkpoint_artifact_abort_seal_bytes(&seal)?;
+        let path = self.node_data_path(chunk);
+        if self
+            .create_immutable(&path, PutPayload::from_bytes(encoded.clone()))
+            .await?
+            || self.node_data_is_exact_abort_seal(chunk, &encoded).await?
+        {
+            return Ok(());
+        }
+        self.overwrite(&path, encoded).await
+    }
+
     async fn load_manifest_for_participant(
         &self,
         participant_id: u64,
@@ -730,6 +1042,51 @@ async fn run_conditional_probe(
     }
 }
 
+fn validate_abort_seal_request(
+    chunk: StateChunkId,
+    expected_artifact_identity_sha256: &str,
+) -> Result<(), CheckpointStoreError> {
+    if chunk.participant_id == 0
+        || chunk.checkpoint_id == 0
+        || !is_canonical_sha256(expected_artifact_identity_sha256)
+    {
+        return Err(CheckpointStoreError::Invalid(
+            "checkpoint artifact abort seal identity is not canonical".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_abort_seal(
+    seal: &CheckpointArtifactAbortSeal,
+    expected_chunk: StateChunkId,
+    expected_artifact_identity_sha256: &str,
+) -> Result<(), CheckpointStoreError> {
+    validate_abort_seal_request(expected_chunk, expected_artifact_identity_sha256)?;
+    if seal.version != CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION
+        || seal.chunk != expected_chunk
+        || seal.artifact_identity_sha256 != expected_artifact_identity_sha256
+    {
+        return Err(CheckpointStoreError::Invalid(format!(
+            "participant {} checkpoint {} has a different abort seal",
+            expected_chunk.participant_id, expected_chunk.checkpoint_id
+        )));
+    }
+    Ok(())
+}
+
+fn checkpoint_artifact_abort_seal_bytes(
+    seal: &CheckpointArtifactAbortSeal,
+) -> Result<Bytes, CheckpointStoreError> {
+    let encoded = Bytes::from(canonical_json_bytes(seal)?);
+    if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_ABORT_SEAL_BYTES {
+        return Err(CheckpointStoreError::Invalid(format!(
+            "checkpoint artifact abort seal exceeds the {MAX_ABORT_SEAL_BYTES}-byte limit"
+        )));
+    }
+    Ok(encoded)
+}
+
 fn ensure_manifest_valid(
     manifest: &CheckpointManifest,
     participant_id: u64,
@@ -793,6 +1150,13 @@ fn checked_chunks_len(chunks: &[Bytes]) -> Result<u64, CheckpointStoreError> {
 
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn missing_node_data(chunk: StateChunkId) -> CheckpointStoreError {

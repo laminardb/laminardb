@@ -1457,13 +1457,9 @@ const SHUTDOWN_DRAIN_BUDGET: Duration = Duration::from_secs(2);
 const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Shutdown-only poll cadence. It closes the atomic/channel race when a tail drops its in-flight
-/// guard without producing another wakeup (for example an aborted cluster follower tail).
+/// guard without producing another wakeup (for example a cluster follower tail with no
+/// completion).
 const SHUTDOWN_COMPLETION_TICK: Duration = Duration::from_millis(10);
-
-/// Grace period for already-captured asynchronous checkpoint tails. On expiry their tracked
-/// tasks are cancelled before sources or sinks are torn down; exact attempt namespaces leave any
-/// ambiguous remote write safe for recovery.
-const SHUTDOWN_CHECKPOINT_TAIL_TIMEOUT: Duration = Duration::from_secs(8);
 
 fn try_source_checkpoint(
     connector: &dyn SourceConnector,
@@ -4639,8 +4635,6 @@ impl StreamingCoordinator {
         callback: &mut impl PipelineCallback,
     ) -> Option<String> {
         let mut continuation_fault = None;
-        let deadline = Instant::now() + SHUTDOWN_CHECKPOINT_TAIL_TIMEOUT;
-        let mut tails_aborted = false;
         loop {
             self.drain_manual_requests();
             self.fail_waiting_manual("pipeline is stopping; no new checkpoint can be admitted");
@@ -4659,25 +4653,8 @@ impl StreamingCoordinator {
                 break;
             }
 
-            if Instant::now() >= deadline {
-                let pending = self.checkpoint_in_flight.load(Ordering::Acquire);
-                let reason = format!(
-                    "checkpoint durable-tail shutdown drain timed out after \
-                     {SHUTDOWN_CHECKPOINT_TAIL_TIMEOUT:?} with {pending} attempt(s) still in \
-                     flight; cancelling tails for recovery"
-                );
-                continuation_fault.get_or_insert(reason);
-                if let Err(error) = callback.settle_checkpoint_tail_tasks(true).await {
-                    continuation_fault.get_or_insert(error);
-                }
-                tails_aborted = true;
-                break;
-            }
-
             let completion = if let Some(rx) = self.checkpoint_complete_rx.as_mut() {
-                let tick = SHUTDOWN_COMPLETION_TICK
-                    .min(deadline.saturating_duration_since(Instant::now()));
-                match tokio::time::timeout(tick, rx.recv()).await {
+                match tokio::time::timeout(SHUTDOWN_COMPLETION_TICK, rx.recv()).await {
                     Ok(Ok(completion)) => Some(completion),
                     Ok(Err(_)) => {
                         tokio::time::sleep(SHUTDOWN_COMPLETION_TICK).await;
@@ -4696,10 +4673,8 @@ impl StreamingCoordinator {
             }
         }
 
-        if !tails_aborted {
-            if let Err(error) = callback.settle_checkpoint_tail_tasks(false).await {
-                continuation_fault.get_or_insert(error);
-            }
+        if let Err(error) = callback.settle_checkpoint_tail_tasks().await {
+            continuation_fault.get_or_insert(error);
         }
 
         // A sender enqueues its completion before dropping the in-flight guard. Once the counter

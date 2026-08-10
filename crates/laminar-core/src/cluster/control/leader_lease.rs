@@ -21,8 +21,8 @@ use crate::checkpoint::{
     CommittedCheckpointRef, LeaderProof, LeaderProofOwner, MAX_CHECKPOINT_PARTICIPANTS,
 };
 use crate::checkpoint_decision::{
-    CheckpointDecisionStore, CheckpointOutcome, CheckpointScope, CheckpointVerdict, DecisionError,
-    RecordOutcomeResult,
+    CheckpointArtifactInventory, CheckpointDecisionStore, CheckpointOutcome, CheckpointScope,
+    CheckpointVerdict, DecisionError, RecordOutcomeResult,
 };
 use crate::cluster::discovery::NodeId;
 
@@ -44,7 +44,7 @@ const LEASE_PREFIX: &str = "control/leader-lease/";
 const AUTHORITY_HEAD_PATH: &str = "control/leader-lease-head/v1.json";
 const STORE_CONTRACT_PROBE_PREFIX: &str = "control/object-store-contract-probes/v1/";
 const RECOVERY_RELEASE_TERMINAL_PREFIX: &str = "control/recovery-release-terminals/v2/";
-const AUTHORITY_RECORD_VERSION: u32 = 11;
+const AUTHORITY_RECORD_VERSION: u32 = 12;
 const AUTHORITY_HEAD_VERSION: u32 = 1;
 const MAX_AUTHORITY_RECORD_BYTES: u64 = 256 * 1024;
 const MAX_AUTHORITY_HEAD_BYTES: u64 = 128;
@@ -980,6 +980,10 @@ struct LeaderAuthorityRecord {
     outcome_floor: Option<AuthorityOutcomeFloor>,
     /// Exact leader-fenced artifact cleanup position, preserved across leadership terms.
     artifact_cleanup: Option<ClusterArtifactCleanupCursor>,
+    /// Exact unresolved checkpoint attempt whose artifacts require a terminal decision or cleanup.
+    active_checkpoint_artifacts: Option<CheckpointArtifactInventory>,
+    /// Leader term that admitted `active_checkpoint_artifacts` before any artifact write.
+    active_checkpoint_artifact_leader_proof: Option<LeaderProof>,
     /// Present only on the sequence that admitted an assignment decision.
     assignment_decision: Option<AuthorityAssignmentDecision>,
     /// Link to the preceding assignment decision, present only on a decision-bearing record.
@@ -1189,6 +1193,8 @@ impl LeaderAuthorityRecord {
             commit_head: None,
             outcome_floor: None,
             artifact_cleanup: None,
+            active_checkpoint_artifacts: None,
+            active_checkpoint_artifact_leader_proof: None,
             assignment_decision: None,
             previous_assignment_decision: None,
             assignment_decision_head: None,
@@ -1212,6 +1218,10 @@ impl LeaderAuthorityRecord {
             commit_head: self.commit_head,
             outcome_floor: self.outcome_floor.clone(),
             artifact_cleanup: self.artifact_cleanup.clone(),
+            active_checkpoint_artifacts: self.active_checkpoint_artifacts.clone(),
+            active_checkpoint_artifact_leader_proof: self
+                .active_checkpoint_artifact_leader_proof
+                .clone(),
             assignment_decision: None,
             previous_assignment_decision: None,
             assignment_decision_head: self.assignment_decision_head,
@@ -1253,6 +1263,7 @@ impl LeaderAuthorityRecord {
         self.validate_checkpoint_outcome_chain()?;
         self.validate_outcome_floor()?;
         self.validate_artifact_cleanup()?;
+        self.validate_checkpoint_artifact_inventory()?;
         self.validate_assignment_decision_chain()?;
         self.validate_assignment_decision_floor()?;
         self.validate_assignment_handoff_pin()?;
@@ -1500,6 +1511,74 @@ impl LeaderAuthorityRecord {
             return Err(LeaseError::Invalid(
                 "cluster artifact cleanup is not bound to its protected retention cut".into(),
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_checkpoint_artifact_inventory(&self) -> Result<(), LeaseError> {
+        let (Some(inventory), Some(admitting_proof)) = (
+            self.active_checkpoint_artifacts.as_ref(),
+            self.active_checkpoint_artifact_leader_proof.as_ref(),
+        ) else {
+            if self.active_checkpoint_artifacts.is_some()
+                || self.active_checkpoint_artifact_leader_proof.is_some()
+            {
+                return Err(LeaseError::Invalid(
+                    "cluster checkpoint artifact inventory has incomplete leader authority".into(),
+                ));
+            }
+            return Ok(());
+        };
+
+        inventory.validate().map_err(|error| {
+            LeaseError::Invalid(format!("cluster checkpoint artifact inventory: {error}"))
+        })?;
+        let assignment_fence = inventory.assignment_fence.as_ref().ok_or_else(|| {
+            LeaseError::Invalid(
+                "cluster checkpoint artifact inventory has no assignment fence".into(),
+            )
+        })?;
+        if !admitting_proof.is_canonical()
+            || assignment_fence.participant_incarnation(admitting_proof.owner.node_id)
+                != Some(admitting_proof.owner.boot_id)
+        {
+            return Err(LeaseError::Invalid(
+                "cluster checkpoint artifact inventory has no canonical admitting leader".into(),
+            ));
+        }
+        if self
+            .outcome_floor
+            .as_ref()
+            .is_some_and(|floor| floor.deployment_id != inventory.deployment_id)
+        {
+            return Err(LeaseError::Invalid(
+                "cluster checkpoint artifact inventory belongs to a foreign deployment".into(),
+            ));
+        }
+        if let Some(head) = self.outcome_head {
+            let attempt = crate::checkpoint::CheckpointAttempt::new(head.epoch, head.checkpoint_id);
+            if matches!(
+                inventory.attempt.relation_to(attempt),
+                crate::checkpoint::CheckpointAttemptRelation::Older
+                    | crate::checkpoint::CheckpointAttemptRelation::Conflict
+            ) {
+                return Err(LeaseError::Invalid(
+                    "cluster checkpoint artifact inventory is behind the terminal outcome head"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(outcome) = self.checkpoint_outcome.as_ref() {
+            let exact = outcome.deployment_id == inventory.deployment_id
+                && outcome.epoch == inventory.attempt.epoch
+                && outcome.checkpoint_id == inventory.attempt.checkpoint_id
+                && outcome.assignment_fence.as_ref() == inventory.assignment_fence.as_ref();
+            if outcome.is_commit() || !exact {
+                return Err(LeaseError::Invalid(
+                    "terminal cluster outcome has inconsistent checkpoint artifact inventory"
+                        .into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -4102,6 +4181,233 @@ impl LeaderLeaseStore {
         .into())
     }
 
+    /// Read the unresolved cluster checkpoint artifact inventory, if any.
+    ///
+    /// # Errors
+    /// Fails when the durable authority head is unavailable or invalid.
+    pub async fn cluster_checkpoint_artifacts(
+        &self,
+    ) -> Result<Option<CheckpointArtifactInventory>, ClusterCheckpointAuthorityError> {
+        Ok(self
+            .load_record()
+            .await?
+            .and_then(|head| head.active_checkpoint_artifacts))
+    }
+
+    /// Admit one exact cluster checkpoint attempt before any participant writes artifacts.
+    ///
+    /// An identical retry returns the durable inventory. A later attempt cannot begin until the
+    /// current attempt commits or its aborted artifacts are cleaned exactly.
+    ///
+    /// # Errors
+    /// Fails for a stale proof, foreign deployment, malformed inventory, another active attempt,
+    /// or object-store failure.
+    pub async fn begin_cluster_checkpoint_artifacts(
+        &self,
+        proof: &LeaderProof,
+        inventory: CheckpointArtifactInventory,
+    ) -> Result<CheckpointArtifactInventory, ClusterCheckpointAuthorityError> {
+        if !proof.is_canonical() {
+            return Err(ClusterCheckpointAuthorityError::Fenced);
+        }
+        inventory.validate().map_err(DecisionError::Conflict)?;
+        let assignment_fence = inventory.assignment_fence.as_ref().ok_or_else(|| {
+            DecisionError::Conflict(
+                "cluster checkpoint artifact inventory requires an assignment fence".into(),
+            )
+        })?;
+        if assignment_fence.participant_incarnation(proof.owner.node_id)
+            != Some(proof.owner.boot_id)
+        {
+            return Err(DecisionError::Conflict(
+                "checkpoint artifact admitting leader is outside the assignment fence".into(),
+            )
+            .into());
+        }
+        let initial = self
+            .load_record()
+            .await?
+            .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+        if !initial.lease.matches_proof(proof) {
+            return Err(ClusterCheckpointAuthorityError::Fenced);
+        }
+        let deployment_id = CheckpointDecisionStore::new(Arc::clone(&self.store))
+            .load_or_create_deployment_id()
+            .await?;
+        if inventory.deployment_id != deployment_id {
+            return Err(DecisionError::Conflict(format!(
+                "checkpoint artifact inventory deployment {} does not match authority deployment {deployment_id}",
+                inventory.deployment_id
+            ))
+            .into());
+        }
+
+        loop {
+            let published = self
+                .load_published_authority_head()
+                .await?
+                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            let current = &published.record;
+            if !current.lease.matches_proof(proof) {
+                return Err(ClusterCheckpointAuthorityError::Fenced);
+            }
+            if let Some(active) = current.active_checkpoint_artifacts.as_ref() {
+                if active == &inventory
+                    && current.active_checkpoint_artifact_leader_proof.as_ref() == Some(proof)
+                    && current.outcome_head.is_none_or(|head| {
+                        head.epoch != inventory.attempt.epoch
+                            || head.checkpoint_id != inventory.attempt.checkpoint_id
+                    })
+                {
+                    return Ok(active.clone());
+                }
+                return Err(DecisionError::Conflict(format!(
+                    "checkpoint {} still has unresolved or inherited cluster artifacts",
+                    active.attempt.checkpoint_id
+                ))
+                .into());
+            }
+            if let Some(head) = current.outcome_head {
+                let terminal =
+                    crate::checkpoint::CheckpointAttempt::new(head.epoch, head.checkpoint_id);
+                if inventory.attempt.relation_to(terminal)
+                    != crate::checkpoint::CheckpointAttemptRelation::Newer
+                {
+                    return Err(DecisionError::Conflict(format!(
+                        "checkpoint {} does not advance terminal checkpoint {}",
+                        inventory.attempt.checkpoint_id, head.checkpoint_id
+                    ))
+                    .into());
+                }
+            }
+
+            let sequence =
+                current.lease.seq.checked_add(1).ok_or_else(|| {
+                    LeaseError::Invalid("leader authority sequence exhausted".into())
+                })?;
+            let mut lease = current.lease.clone();
+            lease.seq = sequence;
+            let mut next = current.preserve_with_lease(lease);
+            next.active_checkpoint_artifacts = Some(inventory.clone());
+            next.active_checkpoint_artifact_leader_proof = Some(proof.clone());
+            next.validate()?;
+            match self
+                .create_authority_record(Some(&published), &next)
+                .await?
+            {
+                AuthorityCreateOutcome::Created | AuthorityCreateOutcome::ExistingIdentical => {
+                    return Ok(inventory);
+                }
+                AuthorityCreateOutcome::Contended(winner) => {
+                    if !winner.lease.matches_proof(proof) {
+                        return Err(ClusterCheckpointAuthorityError::Fenced);
+                    }
+                    if winner.active_checkpoint_artifacts.as_ref() == Some(&inventory)
+                        && winner.active_checkpoint_artifact_leader_proof.as_ref() == Some(proof)
+                        && winner.outcome_head.is_none_or(|head| {
+                            head.epoch != inventory.attempt.epoch
+                                || head.checkpoint_id != inventory.attempt.checkpoint_id
+                        })
+                    {
+                        return Ok(inventory);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+
+    /// Clear one exact retained inventory after its durable Abort artifact paths are sealed.
+    ///
+    /// # Errors
+    /// Fails for a stale proof, a different active attempt, a missing matching Abort, malformed
+    /// inventory, or object-store failure.
+    pub async fn finish_cluster_checkpoint_artifact_cleanup(
+        &self,
+        proof: &LeaderProof,
+        expected: &CheckpointArtifactInventory,
+    ) -> Result<(), ClusterCheckpointAuthorityError> {
+        if !proof.is_canonical() {
+            return Err(ClusterCheckpointAuthorityError::Fenced);
+        }
+        expected.validate().map_err(DecisionError::Conflict)?;
+        if expected.assignment_fence.is_none() {
+            return Err(DecisionError::Conflict(
+                "cluster checkpoint artifact inventory requires an assignment fence".into(),
+            )
+            .into());
+        }
+
+        loop {
+            let published = self
+                .load_published_authority_head()
+                .await?
+                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            let current = &published.record;
+            if !current.lease.matches_proof(proof) {
+                return Err(ClusterCheckpointAuthorityError::Fenced);
+            }
+            let snapshot = self.cached_audited_cluster_outcomes_from(current).await?;
+            let matching_abort = snapshot.outcomes.iter().any(|outcome| {
+                matches!(outcome.verdict, CheckpointVerdict::Abort)
+                    && outcome.deployment_id == expected.deployment_id
+                    && outcome.epoch == expected.attempt.epoch
+                    && outcome.checkpoint_id == expected.attempt.checkpoint_id
+                    && outcome.assignment_fence.as_ref() == expected.assignment_fence.as_ref()
+            });
+            match current.active_checkpoint_artifacts.as_ref() {
+                None if matching_abort => return Ok(()),
+                None => {
+                    return Err(DecisionError::Conflict(format!(
+                        "checkpoint {} has no retained cluster artifact inventory",
+                        expected.attempt.checkpoint_id
+                    ))
+                    .into());
+                }
+                Some(active) if active != expected => {
+                    return Err(DecisionError::Conflict(format!(
+                        "checkpoint {} still has unresolved cluster artifacts",
+                        active.attempt.checkpoint_id
+                    ))
+                    .into());
+                }
+                Some(_) if !matching_abort => {
+                    return Err(DecisionError::Conflict(format!(
+                        "checkpoint {} has no matching durable Abort",
+                        expected.attempt.checkpoint_id
+                    ))
+                    .into());
+                }
+                Some(_) => {}
+            }
+
+            let sequence =
+                current.lease.seq.checked_add(1).ok_or_else(|| {
+                    LeaseError::Invalid("leader authority sequence exhausted".into())
+                })?;
+            let mut lease = current.lease.clone();
+            lease.seq = sequence;
+            let mut next = current.preserve_with_lease(lease);
+            next.active_checkpoint_artifacts = None;
+            next.active_checkpoint_artifact_leader_proof = None;
+            next.validate()?;
+            match self
+                .create_authority_record(Some(&published), &next)
+                .await?
+            {
+                AuthorityCreateOutcome::Created | AuthorityCreateOutcome::ExistingIdentical => {
+                    return Ok(());
+                }
+                AuthorityCreateOutcome::Contended(winner) => {
+                    if !winner.lease.matches_proof(proof) {
+                        return Err(ClusterCheckpointAuthorityError::Fenced);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+
     /// Admit one cluster terminal outcome through the exact next leader-authority sequence.
     ///
     /// Renewals, takeovers, catalog seals, floor advances, and other decisions all contend on the
@@ -4172,6 +4478,41 @@ impl LeaderLeaseStore {
                     })
                 };
             }
+            let active = match current.active_checkpoint_artifacts.as_ref() {
+                Some(active)
+                    if active.deployment_id == candidate.deployment_id
+                        && active.attempt.epoch == candidate.epoch
+                        && active.attempt.checkpoint_id == candidate.checkpoint_id
+                        && active.assignment_fence.as_ref()
+                            == candidate.assignment_fence.as_ref() =>
+                {
+                    Some(active)
+                }
+                Some(_) => {
+                    return Err(DecisionError::Conflict(format!(
+                        "cluster checkpoint {} does not match the active artifact inventory",
+                        candidate.checkpoint_id
+                    ))
+                    .into());
+                }
+                None if candidate.is_commit() => {
+                    return Err(DecisionError::Conflict(format!(
+                        "cluster Commit checkpoint {} has no admitted artifact inventory",
+                        candidate.checkpoint_id
+                    ))
+                    .into());
+                }
+                None => None,
+            };
+            if candidate.is_commit()
+                && current.active_checkpoint_artifact_leader_proof.as_ref() != Some(proof)
+            {
+                return Err(DecisionError::Conflict(format!(
+                    "takeover leader cannot Commit checkpoint {} admitted by an older leader term",
+                    candidate.checkpoint_id
+                ))
+                .into());
+            }
             if let Some(last) = outcomes.last() {
                 if candidate.checkpoint_id <= last.checkpoint_id {
                     return Err(DecisionError::Conflict(format!(
@@ -4206,6 +4547,13 @@ impl LeaderLeaseStore {
                 if index.predecessor != expected_predecessor {
                     return Err(DecisionError::Conflict(format!(
                         "cluster Commit checkpoint {} does not extend the authoritative Commit head",
+                        candidate.checkpoint_id
+                    ))
+                    .into());
+                }
+                if active.is_none_or(|active| index.pipeline_identity != active.pipeline_identity) {
+                    return Err(DecisionError::Conflict(format!(
+                        "cluster Commit checkpoint {} does not match its admitted pipeline identity",
                         candidate.checkpoint_id
                     ))
                     .into());
@@ -4271,6 +4619,8 @@ impl LeaderLeaseStore {
             if candidate.is_commit() {
                 next.previous_commit = current.commit_head;
                 next.commit_head = Some(new_link);
+                next.active_checkpoint_artifacts = None;
+                next.active_checkpoint_artifact_leader_proof = None;
                 if next
                     .assignment_handoff_pin
                     .as_ref()

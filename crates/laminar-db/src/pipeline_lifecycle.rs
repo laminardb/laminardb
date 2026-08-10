@@ -1969,6 +1969,40 @@ impl LaminarDB {
             }
             None => true,
         };
+        let checkpoint_authority = controller.checkpoint_authority().map_err(|error| {
+            DbError::Checkpoint(format!(
+                "cluster startup checkpoint authority is unavailable: {error}"
+            ))
+        })?;
+        let unresolved_artifacts = tokio::time::timeout_at(
+            deadline,
+            checkpoint_authority.cluster_checkpoint_artifacts(),
+        )
+        .await
+        .map_err(|_| {
+            DbError::Checkpoint("cluster startup artifact inventory read timed out".into())
+        })?
+        .map_err(|error| {
+            DbError::Checkpoint(format!(
+                "cluster startup artifact inventory read failed: {error}"
+            ))
+        })?;
+        if unresolved_artifacts.is_some() {
+            controller.set_recovering(true);
+            tokio::time::timeout_at(
+                deadline,
+                crate::coordinated_recovery::request_local_fault(
+                    &controller,
+                    &self.pending_recovery_fault,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint("startup artifact recovery fault publication timed out".into())
+            })?
+            .map_err(DbError::Checkpoint)?;
+            return Ok(ClusterStartupDisposition::RecoveryFenced);
+        }
         if idle {
             controller.set_recovering(false);
             let drain_transition = controller

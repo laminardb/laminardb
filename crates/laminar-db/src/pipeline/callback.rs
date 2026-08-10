@@ -592,12 +592,9 @@ pub trait PipelineCallback: Send + 'static {
     /// Record a failure before an exact checkpoint attempt could be reserved.
     fn record_checkpoint_admission_failure(&mut self, _reason: &str) {}
 
-    /// Join tracked asynchronous checkpoint tails before connector teardown. When `abort` is
-    /// true, request cancellation and detach them because the bounded graceful-drain budget has
-    /// expired and cancellation may be cooperative.
+    /// Join tracked asynchronous checkpoint tails before connector teardown.
     fn settle_checkpoint_tail_tasks(
         &mut self,
-        _abort: bool,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send {
         std::future::ready(Ok(()))
     }
@@ -615,8 +612,8 @@ pub trait PipelineCallback: Send + 'static {
         ))
     }
 
-    /// Publish the certified cluster `Prepare` for an exact reserved attempt before any source or
-    /// shuffle barrier is injected. Local runtimes have no cluster control record.
+    /// Durably admit exact checkpoint artifacts, then publish the certified cluster `Prepare`,
+    /// before any source or shuffle barrier is injected.
     fn publish_checkpoint_prepare(
         &mut self,
         _attempt: CheckpointAttempt,
