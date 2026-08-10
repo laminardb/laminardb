@@ -40,11 +40,18 @@ use crate::operator::sql_query::ClusterShuffleConfig;
 #[cfg(feature = "cluster")]
 use crate::operator_graph::{ManagedVnodeTransition, ManagedVnodeTransitionMode};
 
-const OPERATOR_CHECKPOINT_VERSION: u8 = 2;
+const OPERATOR_CHECKPOINT_VERSION: u8 = 3;
 const ABSENT_VNODE: u8 = 0;
 const PRESENT_VNODE: u8 = 1;
+const VNODE_FRAME_VERSION: u8 = 1;
 const VNODE_FRAME_HEADER_LEN: usize = std::mem::align_of::<ArchivedJoinStateCheckpoint>();
-const ABSENT_VNODE_FRAME: [u8; VNODE_FRAME_HEADER_LEN] = [ABSENT_VNODE; VNODE_FRAME_HEADER_LEN];
+const fn vnode_frame_header(tag: u8) -> [u8; VNODE_FRAME_HEADER_LEN] {
+    let mut header = [0_u8; VNODE_FRAME_HEADER_LEN];
+    header[0] = tag;
+    header[1] = VNODE_FRAME_VERSION;
+    header
+}
+const ABSENT_VNODE_FRAME: [u8; VNODE_FRAME_HEADER_LEN] = vnode_frame_header(ABSENT_VNODE);
 #[cfg(feature = "cluster")]
 const REMOTE_EVENT_CHARGE: usize = std::mem::size_of::<IntervalRemoteEvent>();
 #[cfg(feature = "cluster")]
@@ -516,7 +523,9 @@ impl IntervalJoinOperatorCheckpointCapture {
 struct IntervalHandoffCut {
     left_watermark: i64,
     right_watermark: i64,
+    #[cfg(feature = "cluster")]
     left_idle: bool,
+    #[cfg(feature = "cluster")]
     right_idle: bool,
 }
 
@@ -1412,14 +1421,14 @@ impl IntervalJoinOperator {
         let retained_checkpoint_bytes = checkpoint.retained_ipc_bytes()?;
         let archive_budget = max_encoded_bytes
             .checked_sub(retained_checkpoint_bytes)
+            .and_then(|bytes| bytes.checked_sub(HEAP_ALLOCATION_CHARGE))
             .ok_or_else(|| {
                 DbError::Checkpoint(format!(
-                    "{context}: encoded checkpoint retains {retained_checkpoint_bytes} bytes; state-frame budget is {max_encoded_bytes} bytes"
+                    "{context}: encoded checkpoint retains {retained_checkpoint_bytes} bytes plus its archive allocation; state-frame budget is {max_encoded_bytes} bytes"
                 ))
             })?;
         let mut bounded = laminar_core::serialization::BoundedBytesWriter::new(archive_budget);
-        let mut header = [0_u8; VNODE_FRAME_HEADER_LEN];
-        header[0] = PRESENT_VNODE;
+        let header = vnode_frame_header(PRESENT_VNODE);
         std::io::Write::write_all(&mut bounded, &header).map_err(|error| {
             DbError::Checkpoint(format!("{context}: vnode frame header: {error}"))
         })?;
@@ -1485,7 +1494,13 @@ impl IntervalJoinOperator {
             )));
         }
         let (header, payload) = bytes.split_at(VNODE_FRAME_HEADER_LEN);
-        if header[1..].iter().any(|byte| *byte != 0) {
+        if header[1] != VNODE_FRAME_VERSION {
+            return Err(DbError::Checkpoint(format!(
+                "{context}: vnode frame version {} is unsupported",
+                header[1]
+            )));
+        }
+        if header[2..].iter().any(|byte| *byte != 0) {
             return Err(DbError::Checkpoint(format!(
                 "{context}: vnode frame header is malformed"
             )));
@@ -5605,7 +5620,10 @@ mod tests {
         )
         .unwrap()
         .len();
-        let limit = ipc_bytes.checked_add(archive_bytes).unwrap();
+        let limit = ipc_bytes
+            .checked_add(archive_bytes)
+            .and_then(|bytes| bytes.checked_add(HEAP_ALLOCATION_CHARGE))
+            .unwrap();
         assert!(op.accounted_state_bytes() <= limit);
         op.set_managed_state_budget(limit);
 
@@ -5647,12 +5665,23 @@ mod tests {
             .next()
             .and_then(|captured| captured.state)
             .unwrap();
+        let retained_bytes = sizing.vnode_states[0]
+            .as_mut()
+            .unwrap()
+            .snapshot_checkpoint(&sizing.config, usize::MAX)
+            .unwrap()
+            .retained_ipc_bytes()
+            .unwrap();
         let frame_bytes = materialize_capture(capture).unwrap().len();
-        let limit = frame_bytes.checked_mul(2).unwrap() - 1;
+        let single_frame_peak = retained_bytes
+            .checked_add(HEAP_ALLOCATION_CHARGE)
+            .and_then(|bytes| bytes.checked_add(frame_bytes))
+            .unwrap();
+        let limit = single_frame_peak.checked_add(frame_bytes).unwrap() - 1;
 
         let mut peak_operator = make_operator();
         peak_operator.vnode_states[1] = None;
-        peak_operator.set_managed_state_budget(frame_bytes);
+        peak_operator.set_managed_state_budget(single_frame_peak - 1);
         let peak_capture = peak_operator
             .checkpoint_vnodes(&[0], 2, u64::MAX)
             .unwrap()
@@ -5853,7 +5882,7 @@ mod tests {
         assert_eq!(target.applied_left_watermark, i64::MIN);
         assert!(target.vnode_states.iter().all(Option::is_none));
 
-        let donor3 = encode_whole(3, 250, false);
+        let donor3 = encode_whole(3, 250, true);
         let whole_restores = [
             ManagedWholeRestore {
                 participant_id: 2,
@@ -5925,7 +5954,7 @@ mod tests {
         target.publish_vnode_transition();
         assert_eq!(target.applied_left_watermark, 300);
         assert_eq!(target.applied_right_watermark, 250);
-        assert!(!target.applied_left_idle);
+        assert!(target.applied_left_idle);
         assert!(!target.applied_right_idle);
         target.finish_vnode_transition();
 
@@ -6252,12 +6281,98 @@ mod tests {
             .expect("state admitted before projection failure remains checkpointable");
         let state = materialize_capture(capture).unwrap();
         assert_eq!(state.first(), Some(&PRESENT_VNODE));
+        assert_eq!(state.get(1), Some(&VNODE_FRAME_VERSION));
         let decoded = rkyv::from_bytes::<JoinStateCheckpoint, rkyv::rancor::Error>(
             &state[VNODE_FRAME_HEADER_LEN..],
         )
         .unwrap();
         assert_eq!(decoded.left_buffer_rows, 1);
         assert_eq!(decoded.right_buffer_rows, 1);
+    }
+
+    #[test]
+    fn current_vnode_frame_version_rejects_legacy_present_and_absent_frames() {
+        let config = test_config();
+        let mut state = IntervalJoinState::new();
+        let encoded = IntervalJoinOperator::serialize_state(
+            &mut state,
+            &config,
+            "versioned vnode",
+            crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
+        )
+        .unwrap();
+        assert_eq!(encoded[0], PRESENT_VNODE);
+        assert_eq!(encoded[1], VNODE_FRAME_VERSION);
+        assert!(IntervalJoinOperator::decode_vnode_frame(
+            &ABSENT_VNODE_FRAME,
+            &config,
+            "current absent",
+            crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
+            None,
+        )
+        .unwrap()
+        .is_none());
+
+        let mut legacy_present = encoded.clone();
+        legacy_present[1] = 0;
+        let error = IntervalJoinOperator::decode_vnode_frame(
+            &legacy_present,
+            &config,
+            "legacy present",
+            crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
+            None,
+        )
+        .err()
+        .expect("legacy present vnode frame must fail");
+        assert!(error.to_string().contains("version 0 is unsupported"));
+
+        let legacy_absent = vec![0_u8; VNODE_FRAME_HEADER_LEN];
+        let error = IntervalJoinOperator::decode_vnode_frame(
+            &legacy_absent,
+            &config,
+            "legacy absent",
+            crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
+            None,
+        )
+        .err()
+        .expect("legacy absent vnode frame must fail");
+        assert!(error.to_string().contains("version 0 is unsupported"));
+
+        let mut malformed = ABSENT_VNODE_FRAME;
+        malformed[2] = 1;
+        let error = IntervalJoinOperator::decode_vnode_frame(
+            &malformed,
+            &config,
+            "malformed current",
+            crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
+            None,
+        )
+        .err()
+        .expect("malformed current vnode frame must fail");
+        assert!(error.to_string().contains("header is malformed"));
+    }
+
+    #[test]
+    fn whole_checkpoint_rejects_previous_operator_version() {
+        let config = test_config();
+        let mut source =
+            IntervalJoinOperator::new("stale-whole", config.clone(), None, SessionContext::new());
+        source.applied_left_watermark = 0;
+        let mut checkpoint = source
+            .capture_operator_checkpoint(u64::MAX)
+            .unwrap()
+            .unwrap()
+            .checkpoint;
+        checkpoint.version = OPERATOR_CHECKPOINT_VERSION - 1;
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&checkpoint)
+            .unwrap()
+            .to_vec();
+        let mut target =
+            IntervalJoinOperator::new("stale-whole", config, None, SessionContext::new());
+        let error = target.restore(OperatorCheckpoint { data }).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("version or configuration does not match"));
     }
 
     #[test]

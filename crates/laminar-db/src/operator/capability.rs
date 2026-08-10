@@ -31,8 +31,8 @@ pub(crate) enum ManagedStateContract {
     SqlAggregateV1,
     /// Vnode-local event-time windows, sessions, accumulators, and implicit timers.
     CoreWindowV1,
-    /// Whole-image state for the bounded, append-only vnode-keyed interval join.
-    BoundedIntervalJoinV1,
+    /// Vnode-local retained rows, relation weights, match support, and event-time join state.
+    BoundedIntervalJoinV2,
     /// Vnode-local version history, probes, frontiers, and timers for temporal joins.
     TemporalJoinV1,
     #[cfg(test)]
@@ -227,7 +227,7 @@ impl OperatorCapability {
             OperatorImplementation::IntervalJoin,
             OperatorStateClass::VnodeKeyed,
         )
-        .with_managed_state(ManagedStateContract::BoundedIntervalJoinV1)
+        .with_managed_state(ManagedStateContract::BoundedIntervalJoinV2)
     }
 
     /// Descriptor for the managed temporal operator.
@@ -391,6 +391,15 @@ mod tests {
                 state_class: State::VnodeKeyed,
                 cluster_status: DdlGuarded,
                 managed_state: Some(ManagedStateContract::CoreWindowV1),
+            }
+        );
+        assert_eq!(
+            OperatorCapability::bounded_interval_join(),
+            OperatorCapability {
+                implementation: Implementation::IntervalJoin,
+                state_class: State::VnodeKeyed,
+                cluster_status: DdlGuarded,
+                managed_state: Some(ManagedStateContract::BoundedIntervalJoinV2),
             }
         );
     }

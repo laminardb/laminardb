@@ -1453,7 +1453,7 @@ impl IncrementalAggState {
         }
     }
 
-    #[cfg(any(not(feature = "cluster"), test))]
+    #[cfg(test)]
     pub fn process_batch(&mut self, batch: &RecordBatch, watermark_ms: i64) -> Result<(), DbError> {
         self.process_batch_for_vnode(batch, watermark_ms, None)
     }

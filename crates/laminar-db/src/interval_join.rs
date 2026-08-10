@@ -3,6 +3,7 @@
 //! Stream-stream interval join for
 //! `right_ts BETWEEN left_ts AND left_ts + time_bound`. Evicts expired rows on watermark advance.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use arrow::array::{
     LargeStringArray, RecordBatch, StringArray, StringViewArray,
 };
 use arrow::compute::concat_batches;
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use rustc_hash::{FxHashMap, FxHasher};
 
 use laminar_sql::parser::join_parser::JoinType;
@@ -28,8 +29,6 @@ const MAX_RETAINED_BATCHES: usize = 256;
 const EMIT_THRESHOLD: usize = 8_192;
 const MAX_CYCLE_OUTPUT_ROWS: usize = 262_144;
 const MAX_CYCLE_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
-const ROW_MATCHED: u8 = 1;
-const ROW_EMITTED: u8 = 2;
 // Null tuples never probe. Keeping them in a regular bucket lets eviction and compaction retain
 // one state path for every row; a real hash collision remains safe because tuple equality follows.
 const NULL_TUPLE_HASH: u64 = u64::MAX;
@@ -53,12 +52,31 @@ const ARRAY_METADATA_CHARGE: usize = 128;
 // `Vec::push` currently reserves four position slots for the first element. This intentionally
 // rejects a checkpoint unless its worst supported index shape fits before index construction.
 const WORST_CASE_ROW_NON_HASH_CHARGE: usize = std::mem::size_of::<usize>()
-    + std::mem::size_of::<u8>()
     + BTREE_TIMESTAMP_CHARGE
     + HEAP_ALLOCATION_CHARGE
     + 4 * std::mem::size_of::<(usize, usize)>();
 const RESTORE_WORST_CASE_ROW_CHARGE: usize =
     WORST_CASE_ROW_NON_HASH_CHARGE + 3 * HASH_BUCKET_CHARGE;
+
+const fn charged_allocation(bytes: usize) -> usize {
+    bytes.saturating_add(if bytes == 0 {
+        0
+    } else {
+        HEAP_ALLOCATION_CHARGE
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JoinExecutionMode {
+    AppendOnly,
+    Weighted,
+}
+
+impl JoinExecutionMode {
+    const fn is_weighted(self) -> bool {
+        matches!(self, Self::Weighted)
+    }
+}
 
 type SideIndex = FxHashMap<u64, BTreeMap<i64, Vec<(usize, usize)>>>;
 
@@ -77,8 +95,18 @@ fn position_vector_charge(capacity: usize) -> usize {
         .saturating_add(capacity.saturating_mul(std::mem::size_of::<(usize, usize)>()))
 }
 
-fn mark_row_flag(row_flags: &mut [Arc<[u8]>], batch: usize, row: usize, flag: u8) {
-    Arc::make_mut(&mut row_flags[batch])[row] |= flag;
+fn tracks_left_matches(join_type: JoinType) -> bool {
+    matches!(
+        join_type,
+        JoinType::Left | JoinType::Full | JoinType::LeftSemi | JoinType::LeftAnti
+    )
+}
+
+fn tracks_right_matches(join_type: JoinType) -> bool {
+    matches!(
+        join_type,
+        JoinType::Right | JoinType::Full | JoinType::RightSemi | JoinType::RightAnti
+    )
 }
 
 fn insert_index_position(
@@ -254,6 +282,7 @@ fn tuples_equal(
 
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct JoinStateCheckpoint {
+    pub weighted: bool,
     pub join_type: u8,
     pub left_keys: Vec<String>,
     pub right_keys: Vec<String>,
@@ -268,8 +297,12 @@ pub(crate) struct JoinStateCheckpoint {
     pub right_batches: Vec<Vec<u8>>,
     pub left_evicted_cutoff: i64,
     pub right_evicted_cutoff: i64,
-    pub left_row_flags: Vec<Vec<u8>>,
-    pub right_row_flags: Vec<Vec<u8>>,
+    pub left_row_weights: Vec<Vec<i64>>,
+    pub right_row_weights: Vec<Vec<i64>>,
+    pub left_match_flags: Vec<Vec<u8>>,
+    pub right_match_flags: Vec<Vec<u8>>,
+    pub left_match_weights: Vec<Vec<i64>>,
+    pub right_match_weights: Vec<Vec<i64>>,
 }
 
 impl JoinStateCheckpoint {
@@ -281,10 +314,22 @@ impl JoinStateCheckpoint {
             self.right_batches
                 .capacity()
                 .checked_mul(std::mem::size_of::<Vec<u8>>()),
-            self.left_row_flags
+            self.left_row_weights
+                .capacity()
+                .checked_mul(std::mem::size_of::<Vec<i64>>()),
+            self.right_row_weights
+                .capacity()
+                .checked_mul(std::mem::size_of::<Vec<i64>>()),
+            self.left_match_weights
+                .capacity()
+                .checked_mul(std::mem::size_of::<Vec<i64>>()),
+            self.right_match_weights
+                .capacity()
+                .checked_mul(std::mem::size_of::<Vec<i64>>()),
+            self.left_match_flags
                 .capacity()
                 .checked_mul(std::mem::size_of::<Vec<u8>>()),
-            self.right_row_flags
+            self.right_match_flags
                 .capacity()
                 .checked_mul(std::mem::size_of::<Vec<u8>>()),
             self.left_keys
@@ -296,28 +341,58 @@ impl JoinStateCheckpoint {
         ]
         .into_iter()
         .try_fold(0usize, |total, bytes| {
-            total
-                .checked_add(bytes.ok_or_else(|| {
-                    DbError::Checkpoint(
-                        "interval join checkpoint roster accounting overflow".into(),
-                    )
-                })?)
-                .ok_or_else(|| {
-                    DbError::Checkpoint(
-                        "interval join checkpoint roster accounting overflow".into(),
-                    )
-                })
+            let bytes = bytes.ok_or_else(|| {
+                DbError::Checkpoint("interval join checkpoint roster accounting overflow".into())
+            })?;
+            total.checked_add(charged_allocation(bytes)).ok_or_else(|| {
+                DbError::Checkpoint("interval join checkpoint roster accounting overflow".into())
+            })
         })?;
         let payload = self
             .left_batches
             .iter()
             .chain(&self.right_batches)
-            .chain(&self.left_row_flags)
-            .chain(&self.right_row_flags)
             .try_fold(roster_bytes, |total, batch| {
-                total.checked_add(batch.capacity()).ok_or_else(|| {
+                total
+                    .checked_add(charged_allocation(batch.capacity()))
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "interval join checkpoint retained IPC accounting overflow".into(),
+                        )
+                    })
+            })?;
+        let payload = self
+            .left_match_flags
+            .iter()
+            .chain(&self.right_match_flags)
+            .try_fold(payload, |total, flags| {
+                total
+                    .checked_add(charged_allocation(flags.capacity()))
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "interval join checkpoint retained match-flag accounting overflow"
+                                .into(),
+                        )
+                    })
+            })?;
+        let payload = self
+            .left_row_weights
+            .iter()
+            .chain(&self.right_row_weights)
+            .chain(&self.left_match_weights)
+            .chain(&self.right_match_weights)
+            .try_fold(payload, |total, batch| {
+                let bytes = batch
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<i64>())
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "interval join checkpoint retained weight accounting overflow".into(),
+                        )
+                    })?;
+                total.checked_add(charged_allocation(bytes)).ok_or_else(|| {
                     DbError::Checkpoint(
-                        "interval join checkpoint retained IPC accounting overflow".into(),
+                        "interval join checkpoint retained weight accounting overflow".into(),
                     )
                 })
             })?;
@@ -332,7 +407,7 @@ impl JoinStateCheckpoint {
                 self.right_table.capacity(),
             ])
             .try_fold(payload, |total, bytes| {
-                total.checked_add(bytes).ok_or_else(|| {
+                total.checked_add(charged_allocation(bytes)).ok_or_else(|| {
                     DbError::Checkpoint(
                         "interval join checkpoint configuration accounting overflow".into(),
                     )
@@ -342,6 +417,7 @@ impl JoinStateCheckpoint {
 }
 
 pub(crate) struct IntervalJoinCheckpointCapture {
+    execution_mode: JoinExecutionMode,
     config: StreamJoinConfig,
     bound_ms: i64,
     left_buffer_rows: u64,
@@ -350,8 +426,12 @@ pub(crate) struct IntervalJoinCheckpointCapture {
     right_batches: Vec<RecordBatch>,
     left_evicted_cutoff: i64,
     right_evicted_cutoff: i64,
-    left_row_flags: Vec<Arc<[u8]>>,
-    right_row_flags: Vec<Arc<[u8]>>,
+    left_row_weights: Vec<Arc<[i64]>>,
+    right_row_weights: Vec<Arc<[i64]>>,
+    left_match_flags: Vec<Arc<[u8]>>,
+    right_match_flags: Vec<Arc<[u8]>>,
+    left_match_weights: Vec<Arc<[i64]>>,
+    right_match_weights: Vec<Arc<[i64]>>,
     left_needs_compaction: bool,
     right_needs_compaction: bool,
     retained_bytes: usize,
@@ -363,23 +443,19 @@ impl IntervalJoinCheckpointCapture {
     }
 
     fn calculate_retained_bytes(&self) -> usize {
-        fn allocation(bytes: usize) -> usize {
-            bytes.saturating_add(if bytes == 0 {
-                0
-            } else {
-                HEAP_ALLOCATION_CHARGE
-            })
-        }
-
         fn roster<T>(capacity: usize) -> usize {
-            allocation(capacity.saturating_mul(std::mem::size_of::<T>()))
+            charged_allocation(capacity.saturating_mul(std::mem::size_of::<T>()))
         }
 
         fn batch_side(
             batches: &[RecordBatch],
             batch_capacity: usize,
-            row_flags: &[Arc<[u8]>],
-            flag_capacity: usize,
+            row_weights: &[Arc<[i64]>],
+            row_weight_capacity: usize,
+            match_flags: &[Arc<[u8]>],
+            match_flag_capacity: usize,
+            match_weights: &[Arc<[i64]>],
+            match_weight_capacity: usize,
         ) -> usize {
             batches
                 .iter()
@@ -388,9 +464,21 @@ impl IntervalJoinCheckpointCapture {
                         .saturating_add(batch.get_array_memory_size())
                         .saturating_add(batch_metadata_charge(batch))
                 })
-                .saturating_add(roster::<Arc<[u8]>>(flag_capacity))
-                .saturating_add(row_flags.iter().fold(0usize, |bytes, flags| {
-                    bytes.saturating_add(allocation(flags.len()))
+                .saturating_add(roster::<Arc<[i64]>>(row_weight_capacity))
+                .saturating_add(row_weights.iter().fold(0usize, |bytes, weights| {
+                    bytes.saturating_add(charged_allocation(
+                        weights.len().saturating_mul(std::mem::size_of::<i64>()),
+                    ))
+                }))
+                .saturating_add(roster::<Arc<[i64]>>(match_weight_capacity))
+                .saturating_add(match_weights.iter().fold(0usize, |bytes, weights| {
+                    bytes.saturating_add(charged_allocation(
+                        weights.len().saturating_mul(std::mem::size_of::<i64>()),
+                    ))
+                }))
+                .saturating_add(roster::<Arc<[u8]>>(match_flag_capacity))
+                .saturating_add(match_flags.iter().fold(0usize, |bytes, flags| {
+                    bytes.saturating_add(charged_allocation(flags.len()))
                 }))
         }
 
@@ -398,7 +486,7 @@ impl IntervalJoinCheckpointCapture {
             values
                 .iter()
                 .fold(roster::<String>(capacity), |bytes, value| {
-                    bytes.saturating_add(allocation(value.capacity()))
+                    bytes.saturating_add(charged_allocation(value.capacity()))
                 })
         }
 
@@ -418,41 +506,99 @@ impl IntervalJoinCheckpointCapture {
             &self.config.left_table,
             &self.config.right_table,
         ] {
-            bytes = bytes.saturating_add(allocation(value.capacity()));
+            bytes = bytes.saturating_add(charged_allocation(value.capacity()));
         }
         bytes
             .saturating_add(batch_side(
                 &self.left_batches,
                 self.left_batches.capacity(),
-                &self.left_row_flags,
-                self.left_row_flags.capacity(),
+                &self.left_row_weights,
+                self.left_row_weights.capacity(),
+                &self.left_match_flags,
+                self.left_match_flags.capacity(),
+                &self.left_match_weights,
+                self.left_match_weights.capacity(),
             ))
             .saturating_add(batch_side(
                 &self.right_batches,
                 self.right_batches.capacity(),
-                &self.right_row_flags,
-                self.right_row_flags.capacity(),
+                &self.right_row_weights,
+                self.right_row_weights.capacity(),
+                &self.right_match_flags,
+                self.right_match_flags.capacity(),
+                &self.right_match_weights,
+                self.right_match_weights.capacity(),
             ))
     }
 
     pub(crate) fn encode(self, max_encoded_bytes: usize) -> Result<JoinStateCheckpoint, DbError> {
-        type EncodedSide = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+        type EncodedSide = (Vec<Vec<u8>>, Vec<Vec<i64>>, Vec<Vec<u8>>, Vec<Vec<i64>>);
+
+        #[derive(Clone, Copy)]
+        struct EncodeSideOptions {
+            track_matches: bool,
+            execution_mode: JoinExecutionMode,
+            needs_compaction: bool,
+            retain_null_tuples: bool,
+        }
 
         fn encode_side(
             side: &str,
             batches: &[RecordBatch],
-            captured_flags: &[Arc<[u8]>],
-            needs_compaction: bool,
+            captured_row_weights: &[Arc<[i64]>],
+            captured_match_flags: &[Arc<[u8]>],
+            captured_match_weights: &[Arc<[i64]>],
+            options: EncodeSideOptions,
             key_columns: &[String],
             time_column: &str,
             evicted_cutoff: i64,
-            retain_null_tuples: bool,
             expected_rows: u64,
             remaining: &mut usize,
         ) -> Result<EncodedSide, DbError> {
-            if batches.len() != captured_flags.len() {
+            fn weight_allocation_bytes(
+                rows: &Vec<i64>,
+                flags: &Vec<u8>,
+                matches: &Vec<i64>,
+            ) -> Result<usize, DbError> {
+                [
+                    rows.capacity().checked_mul(std::mem::size_of::<i64>()),
+                    Some(flags.capacity()),
+                    matches.capacity().checked_mul(std::mem::size_of::<i64>()),
+                ]
+                .into_iter()
+                .try_fold(0usize, |total, bytes| {
+                    let bytes = bytes.ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "interval join checkpoint weight accounting overflow".into(),
+                        )
+                    })?;
+                    total.checked_add(charged_allocation(bytes)).ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "interval join checkpoint weight accounting overflow".into(),
+                        )
+                    })
+                })
+            }
+
+            let EncodeSideOptions {
+                track_matches,
+                execution_mode,
+                needs_compaction,
+                retain_null_tuples,
+            } = options;
+            let weighted = execution_mode.is_weighted();
+
+            if (weighted && batches.len() != captured_row_weights.len())
+                || (!weighted && !captured_row_weights.is_empty())
+                || (track_matches && !weighted && batches.len() != captured_match_flags.len())
+                || (track_matches && weighted && batches.len() != captured_match_weights.len())
+                || (!track_matches
+                    && (!captured_match_flags.is_empty() || !captured_match_weights.is_empty()))
+                || (weighted && !captured_match_flags.is_empty())
+                || (!weighted && !captured_match_weights.is_empty())
+            {
                 return Err(DbError::Checkpoint(format!(
-                    "interval join {side} checkpoint flag roster does not match its batch roster"
+                    "interval join {side} checkpoint weight rosters do not match its batch roster"
                 )));
             }
             let mut encoded = Vec::new();
@@ -461,29 +607,57 @@ impl IntervalJoinCheckpointCapture {
                     "interval join {side} checkpoint batch roster cannot be reserved"
                 ))
             })?;
-            let mut row_flags = Vec::new();
-            row_flags
-                .try_reserve_exact(captured_flags.len())
+            let mut row_weights = Vec::new();
+            row_weights
+                .try_reserve_exact(captured_row_weights.len())
                 .map_err(|_| {
                     DbError::Checkpoint(format!(
-                        "interval join {side} checkpoint flag roster cannot be reserved"
+                        "interval join {side} checkpoint row-weight roster cannot be reserved"
                     ))
                 })?;
-            let roster_bytes = encoded
-                .capacity()
-                .checked_mul(std::mem::size_of::<Vec<u8>>())
-                .and_then(|bytes| {
-                    bytes.checked_add(
-                        row_flags
-                            .capacity()
-                            .checked_mul(std::mem::size_of::<Vec<u8>>())?,
-                    )
-                })
-                .ok_or_else(|| {
+            let mut match_weights = Vec::new();
+            match_weights
+                .try_reserve_exact(captured_match_weights.len())
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint match-weight roster cannot be reserved"
+                    ))
+                })?;
+            let mut match_flags = Vec::new();
+            match_flags
+                .try_reserve_exact(captured_match_flags.len())
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint match-flag roster cannot be reserved"
+                    ))
+                })?;
+            let roster_bytes = [
+                encoded
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<Vec<u8>>()),
+                row_weights
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<Vec<i64>>()),
+                match_flags
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<Vec<u8>>()),
+                match_weights
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<Vec<i64>>()),
+            ]
+            .into_iter()
+            .try_fold(0usize, |total, bytes| {
+                let bytes = bytes.ok_or_else(|| {
                     DbError::Checkpoint(format!(
                         "interval join {side} checkpoint roster accounting overflow"
                     ))
                 })?;
+                total.checked_add(charged_allocation(bytes)).ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint roster accounting overflow"
+                    ))
+                })
+            })?;
             *remaining = remaining.checked_sub(roster_bytes).ok_or_else(|| {
                 DbError::Checkpoint(format!(
                     "interval join {side} checkpoint roster exceeded its cumulative checkpoint byte limit"
@@ -491,13 +665,34 @@ impl IntervalJoinCheckpointCapture {
             })?;
 
             let mut encoded_rows = 0_u64;
-            for (batch, captured_flags) in batches.iter().zip(captured_flags) {
-                if batch.num_rows() == 0 || captured_flags.len() != batch.num_rows() {
+            for (batch_index, batch) in batches.iter().enumerate() {
+                let captured_row_weights =
+                    weighted.then(|| captured_row_weights[batch_index].as_ref());
+                let captured_match_flags = (track_matches && !weighted)
+                    .then(|| captured_match_flags[batch_index].as_ref());
+                let captured_match_weights = (track_matches && weighted)
+                    .then(|| &captured_match_weights[batch_index])
+                    .map(AsRef::as_ref);
+                if batch.num_rows() == 0
+                    || captured_row_weights.is_some_and(|weights| weights.len() != batch.num_rows())
+                    || captured_match_weights
+                        .is_some_and(|weights| weights.len() != batch.num_rows())
+                    || captured_match_flags.is_some_and(|flags| flags.len() != batch.num_rows())
+                {
                     return Err(DbError::Checkpoint(format!(
                         "interval join {side} checkpoint batch shape is invalid"
                     )));
                 }
-                let (compacted, flags) = if needs_compaction {
+                if captured_row_weights.is_some_and(|weights| weights.contains(&0))
+                    || captured_match_weights
+                        .is_some_and(|weights| weights.iter().any(|weight| *weight < 0))
+                    || captured_match_flags.is_some_and(|flags| flags.iter().any(|flag| *flag > 1))
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint has invalid row or match weights"
+                    )));
+                }
+                let (compacted, rows, flags, matches) = if needs_compaction {
                     let scan_bytes = batch
                         .num_rows()
                         .checked_mul(2 * std::mem::size_of::<i64>() + std::mem::size_of::<u32>())
@@ -537,14 +732,7 @@ impl IntervalJoinCheckpointCapture {
                             "interval join {side} checkpoint selection cannot be reserved"
                         ))
                     })?;
-                    for (row, (&timestamp, &flag)) in
-                        timestamps.iter().zip(captured_flags.iter()).enumerate()
-                    {
-                        if flag & !(ROW_MATCHED | ROW_EMITTED) != 0 {
-                            return Err(DbError::Checkpoint(format!(
-                                "interval join {side} checkpoint has invalid per-row match state"
-                            )));
-                        }
+                    for (row, &timestamp) in timestamps.iter().enumerate() {
                         if timestamp >= evicted_cutoff
                             && (retain_null_tuples || keys.iter().all(|key| !key.is_null(row)))
                         {
@@ -580,31 +768,79 @@ impl IntervalJoinCheckpointCapture {
                                 "interval join {side} checkpoint scan accounting overflow"
                             ))
                         })?;
-                    let flag_headroom = remaining.checked_sub(scan_retained).ok_or_else(|| {
-                        DbError::Checkpoint(format!(
+                    let weight_headroom =
+                        remaining.checked_sub(scan_retained).ok_or_else(|| {
+                            DbError::Checkpoint(format!(
                             "interval join {side} checkpoint scan exceeded its remaining byte limit"
                         ))
-                    })?;
-                    if selected.len() > flag_headroom {
-                        return Err(DbError::Checkpoint(format!(
-                            "interval join {side} checkpoint flags exceed the remaining byte limit"
-                        )));
-                    }
-                    let mut flags = Vec::new();
-                    flags.try_reserve_exact(selected.len()).map_err(|_| {
+                        })?;
+                    let selected_i64_bytes = selected
+                        .len()
+                        .checked_mul(std::mem::size_of::<i64>())
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "interval join {side} checkpoint weight accounting overflow"
+                            ))
+                        })?;
+                    let selected_weight_bytes = [
+                        weighted.then(|| charged_allocation(selected_i64_bytes)),
+                        (track_matches && weighted).then(|| charged_allocation(selected_i64_bytes)),
+                        (track_matches && !weighted).then(|| charged_allocation(selected.len())),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .try_fold(0usize, usize::checked_add)
+                    .ok_or_else(|| {
                         DbError::Checkpoint(format!(
-                            "interval join {side} checkpoint flags cannot be reserved"
+                            "interval join {side} checkpoint weight accounting overflow"
                         ))
                     })?;
+                    if selected_weight_bytes > weight_headroom {
+                        return Err(DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint weights exceed the remaining byte limit"
+                        )));
+                    }
+                    let mut rows = Vec::new();
+                    if weighted {
+                        rows.try_reserve_exact(selected.len()).map_err(|_| {
+                            DbError::Checkpoint(format!(
+                                "interval join {side} checkpoint row weights cannot be reserved"
+                            ))
+                        })?;
+                    }
+                    let mut matches = Vec::new();
+                    if track_matches && weighted {
+                        matches.try_reserve_exact(selected.len()).map_err(|_| {
+                            DbError::Checkpoint(format!(
+                                "interval join {side} checkpoint match weights cannot be reserved"
+                            ))
+                        })?;
+                    }
+                    let mut flags = Vec::new();
+                    if track_matches && !weighted {
+                        flags.try_reserve_exact(selected.len()).map_err(|_| {
+                            DbError::Checkpoint(format!(
+                                "interval join {side} checkpoint match flags cannot be reserved"
+                            ))
+                        })?;
+                    }
                     let scratch_headroom = remaining
-                        .checked_sub(flags.capacity())
+                        .checked_sub(weight_allocation_bytes(&rows, &flags, &matches)?)
                         .and_then(|bytes| bytes.checked_sub(scan_retained))
                         .ok_or_else(|| {
                             DbError::Checkpoint(format!(
                                 "interval join {side} checkpoint scan exceeded its remaining byte limit"
                             ))
                         })?;
-                    flags.extend(selected.iter().map(|row| captured_flags[*row as usize]));
+                    if let Some(captured) = captured_row_weights {
+                        rows.extend(selected.iter().map(|row| captured[*row as usize]));
+                    }
+                    if let Some(captured) = captured_match_weights {
+                        matches.extend(selected.iter().map(|row| captured[*row as usize]));
+                    }
+                    if let Some(captured) = captured_match_flags {
+                        flags.extend(selected.iter().map(|row| captured[*row as usize]));
+                    }
                     let compacted = if selected.len() == batch.num_rows() {
                         None
                     } else {
@@ -642,37 +878,75 @@ impl IntervalJoinCheckpointCapture {
                             })?,
                         )
                     };
-                    (compacted, flags)
+                    (compacted, rows, flags, matches)
                 } else {
-                    if captured_flags
-                        .iter()
-                        .any(|flag| flag & !(ROW_MATCHED | ROW_EMITTED) != 0)
-                    {
-                        return Err(DbError::Checkpoint(format!(
-                            "interval join {side} checkpoint has invalid per-row match state"
-                        )));
-                    }
-                    if captured_flags.len() > *remaining {
-                        return Err(DbError::Checkpoint(format!(
-                            "interval join {side} checkpoint flags exceed the remaining byte limit"
-                        )));
-                    }
-                    let mut flags = Vec::new();
-                    flags.try_reserve_exact(captured_flags.len()).map_err(|_| {
+                    let weight_bytes = [
+                        captured_row_weights.map(|weights| {
+                            charged_allocation(
+                                weights.len().saturating_mul(std::mem::size_of::<i64>()),
+                            )
+                        }),
+                        captured_match_weights.map(|weights| {
+                            charged_allocation(
+                                weights.len().saturating_mul(std::mem::size_of::<i64>()),
+                            )
+                        }),
+                        captured_match_flags.map(|flags| charged_allocation(flags.len())),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .try_fold(0usize, usize::checked_add)
+                    .ok_or_else(|| {
                         DbError::Checkpoint(format!(
-                            "interval join {side} checkpoint flags cannot be reserved"
+                            "interval join {side} checkpoint weight accounting overflow"
                         ))
                     })?;
-                    flags.extend_from_slice(captured_flags);
-                    (None, flags)
+                    if weight_bytes > *remaining {
+                        return Err(DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint weights exceed the remaining byte limit"
+                        )));
+                    }
+                    let mut rows = Vec::new();
+                    rows.try_reserve_exact(captured_row_weights.map_or(0, <[i64]>::len))
+                        .map_err(|_| {
+                            DbError::Checkpoint(format!(
+                                "interval join {side} checkpoint row weights cannot be reserved"
+                            ))
+                        })?;
+                    if let Some(captured) = captured_row_weights {
+                        rows.extend_from_slice(captured);
+                    }
+                    let mut matches = Vec::new();
+                    if let Some(captured) = captured_match_weights {
+                        matches.try_reserve_exact(captured.len()).map_err(|_| {
+                            DbError::Checkpoint(format!(
+                                "interval join {side} checkpoint match weights cannot be reserved"
+                            ))
+                        })?;
+                        matches.extend_from_slice(captured);
+                    }
+                    let mut flags = Vec::new();
+                    if let Some(captured) = captured_match_flags {
+                        flags.try_reserve_exact(captured.len()).map_err(|_| {
+                            DbError::Checkpoint(format!(
+                                "interval join {side} checkpoint match flags cannot be reserved"
+                            ))
+                        })?;
+                        flags.extend_from_slice(captured);
+                    }
+                    (None, rows, flags, matches)
                 };
-                *remaining = remaining.checked_sub(flags.capacity()).ok_or_else(|| {
+                let weight_bytes = weight_allocation_bytes(&rows, &flags, &matches)?;
+                *remaining = remaining.checked_sub(weight_bytes).ok_or_else(|| {
                     DbError::Checkpoint(format!(
-                        "interval join {side} checkpoint flag accounting overflow"
+                        "interval join {side} checkpoint weight accounting overflow"
                     ))
                 })?;
+                let encoded_batch_rows = compacted
+                    .as_ref()
+                    .map_or(batch.num_rows(), RecordBatch::num_rows);
                 encoded_rows = encoded_rows
-                    .checked_add(u64::try_from(flags.len()).map_err(|_| {
+                    .checked_add(u64::try_from(encoded_batch_rows).map_err(|_| {
                         DbError::Checkpoint(format!(
                             "interval join {side} checkpoint row count exceeds u64"
                         ))
@@ -688,11 +962,14 @@ impl IntervalJoinCheckpointCapture {
                         .get_array_memory_size()
                         .saturating_add(batch_metadata_charge(batch))
                 });
-                let serialization_limit = remaining.checked_sub(scratch_bytes).ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "interval join {side} checkpoint compacted batch exceeds its remaining byte limit"
-                    ))
-                })?;
+                let serialization_limit = remaining
+                    .checked_sub(scratch_bytes)
+                    .and_then(|bytes| bytes.checked_sub(HEAP_ALLOCATION_CHARGE))
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint compacted batch exceeds its remaining byte limit"
+                        ))
+                    })?;
                 let ipc = laminar_core::serialization::serialize_batches_stream_bounded(
                     batch.schema().as_ref(),
                     std::iter::once(batch),
@@ -703,20 +980,30 @@ impl IntervalJoinCheckpointCapture {
                         "interval join {side} batch serialization within the cumulative checkpoint limit: {error}"
                     ))
                 })?;
-                *remaining = remaining.checked_sub(ipc.capacity()).ok_or_else(|| {
-                    DbError::Checkpoint(
-                        "interval join checkpoint encoded byte accounting overflow".into(),
-                    )
-                })?;
+                *remaining = remaining
+                    .checked_sub(charged_allocation(ipc.capacity()))
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "interval join checkpoint encoded byte accounting overflow".into(),
+                        )
+                    })?;
                 encoded.push(ipc);
-                row_flags.push(flags);
+                if weighted {
+                    row_weights.push(rows);
+                }
+                if track_matches && weighted {
+                    match_weights.push(matches);
+                }
+                if track_matches && !weighted {
+                    match_flags.push(flags);
+                }
             }
             if encoded_rows != expected_rows {
                 return Err(DbError::Checkpoint(format!(
                     "interval join {side} checkpoint row-count mismatch: expected {expected_rows}, encoded {encoded_rows}"
                 )));
             }
-            Ok((encoded, row_flags))
+            Ok((encoded, row_weights, match_flags, match_weights))
         }
 
         let config_bytes = self
@@ -724,29 +1011,29 @@ impl IntervalJoinCheckpointCapture {
             .left_keys
             .iter()
             .chain(&self.config.right_keys)
-            .map(String::capacity)
+            .map(|value| charged_allocation(value.capacity()))
             .chain([
-                self.config.left_time_column.capacity(),
-                self.config.right_time_column.capacity(),
-                self.config.left_table.capacity(),
-                self.config.right_table.capacity(),
+                charged_allocation(self.config.left_time_column.capacity()),
+                charged_allocation(self.config.right_time_column.capacity()),
+                charged_allocation(self.config.left_table.capacity()),
+                charged_allocation(self.config.right_table.capacity()),
             ])
             .try_fold(0usize, usize::checked_add)
             .and_then(|total| {
-                total.checked_add(
+                total.checked_add(charged_allocation(
                     self.config
                         .left_keys
                         .capacity()
                         .checked_mul(std::mem::size_of::<String>())?,
-                )
+                ))
             })
             .and_then(|total| {
-                total.checked_add(
+                total.checked_add(charged_allocation(
                     self.config
                         .right_keys
                         .capacity()
                         .checked_mul(std::mem::size_of::<String>())?,
-                )
+                ))
             })
             .ok_or_else(|| {
                 DbError::Checkpoint(
@@ -758,32 +1045,46 @@ impl IntervalJoinCheckpointCapture {
                 "interval join retained configuration exceeds its {max_encoded_bytes}-byte checkpoint limit"
             ))
         })?;
-        let (left_batches, left_row_flags) = encode_side(
+        let (left_batches, left_row_weights, left_match_flags, left_match_weights) = encode_side(
             "left",
             &self.left_batches,
-            &self.left_row_flags,
-            self.left_needs_compaction,
+            &self.left_row_weights,
+            &self.left_match_flags,
+            &self.left_match_weights,
+            EncodeSideOptions {
+                track_matches: tracks_left_matches(self.config.join_type),
+                execution_mode: self.execution_mode,
+                needs_compaction: self.left_needs_compaction,
+                retain_null_tuples: retain_left_null_tuples(self.config.join_type),
+            },
             &self.config.left_keys,
             &self.config.left_time_column,
             self.left_evicted_cutoff,
-            retain_left_null_tuples(self.config.join_type),
             self.left_buffer_rows,
             &mut remaining,
         )?;
-        let (right_batches, right_row_flags) = encode_side(
-            "right",
-            &self.right_batches,
-            &self.right_row_flags,
-            self.right_needs_compaction,
-            &self.config.right_keys,
-            &self.config.right_time_column,
-            self.right_evicted_cutoff,
-            retain_right_null_tuples(self.config.join_type),
-            self.right_buffer_rows,
-            &mut remaining,
-        )?;
+        let (right_batches, right_row_weights, right_match_flags, right_match_weights) =
+            encode_side(
+                "right",
+                &self.right_batches,
+                &self.right_row_weights,
+                &self.right_match_flags,
+                &self.right_match_weights,
+                EncodeSideOptions {
+                    track_matches: tracks_right_matches(self.config.join_type),
+                    execution_mode: self.execution_mode,
+                    needs_compaction: self.right_needs_compaction,
+                    retain_null_tuples: retain_right_null_tuples(self.config.join_type),
+                },
+                &self.config.right_keys,
+                &self.config.right_time_column,
+                self.right_evicted_cutoff,
+                self.right_buffer_rows,
+                &mut remaining,
+            )?;
 
         Ok(JoinStateCheckpoint {
+            weighted: self.execution_mode.is_weighted(),
             join_type: join_type_tag(self.config.join_type),
             left_keys: self.config.left_keys,
             right_keys: self.config.right_keys,
@@ -798,8 +1099,12 @@ impl IntervalJoinCheckpointCapture {
             right_batches,
             left_evicted_cutoff: self.left_evicted_cutoff,
             right_evicted_cutoff: self.right_evicted_cutoff,
-            left_row_flags,
-            right_row_flags,
+            left_row_weights,
+            right_row_weights,
+            left_match_flags,
+            right_match_flags,
+            left_match_weights,
+            right_match_weights,
         })
     }
 }
@@ -826,7 +1131,9 @@ pub(crate) struct SideState {
     retained_batch_bytes: usize,
     retained_batch_metadata_bytes: usize,
     row_bytes: Vec<Vec<usize>>,
-    row_flags: Vec<Arc<[u8]>>,
+    row_weights: Vec<Arc<[i64]>>,
+    match_flags: Vec<Arc<[u8]>>,
+    match_weights: Vec<Arc<[i64]>>,
     row_size_vector_bytes: usize,
     index_entry_bytes: usize,
 }
@@ -841,18 +1148,23 @@ impl SideState {
             retained_batch_bytes: 0,
             retained_batch_metadata_bytes: 0,
             row_bytes: Vec::new(),
-            row_flags: Vec::new(),
+            row_weights: Vec::new(),
+            match_flags: Vec::new(),
+            match_weights: Vec::new(),
             row_size_vector_bytes: 0,
             index_entry_bytes: 0,
         }
     }
 
-    pub(crate) fn add_batch(
+    fn add_batch(
         &mut self,
         batch: &RecordBatch,
+        row_weights: Option<Arc<[i64]>>,
         key_col_names: &[String],
         time_col_name: &str,
         retain_null_tuples: bool,
+        track_matches: bool,
+        execution_mode: JoinExecutionMode,
     ) -> Result<bool, DbError> {
         if let Some(retained) = self.batches.first() {
             if retained.schema().as_ref() != batch.schema().as_ref() {
@@ -861,12 +1173,25 @@ impl SideState {
                 ));
             }
         }
+        let valid_weight_roster = match (execution_mode, row_weights.as_deref()) {
+            (JoinExecutionMode::AppendOnly, None) => true,
+            (JoinExecutionMode::Weighted, Some(weights)) => {
+                weights.len() == batch.num_rows() && weights.iter().all(|weight| *weight != 0)
+            }
+            _ => false,
+        };
+        if !valid_weight_roster {
+            return Err(DbError::PipelineTerminal(
+                "interval join admitted an invalid row-weight roster".into(),
+            ));
+        }
         if batch.num_rows() == 0 {
             return Ok(false);
         }
         let batch_idx = self.batches.len();
         let keys = extract_key_columns(batch, key_col_names)?;
         let timestamps = extract_column_as_timestamps(batch, time_col_name)?;
+        let row_bytes = logical_row_bytes(batch)?;
         let mut indexed_rows = 0usize;
         for (row_idx, &ts) in timestamps.iter().enumerate() {
             let key_hash = match tuple_hash_at(&keys, row_idx) {
@@ -886,7 +1211,6 @@ impl SideState {
         if indexed_rows == 0 {
             return Ok(false);
         }
-        let row_bytes = logical_row_bytes(batch)?;
         self.row_count += indexed_rows;
         self.retained_rows = self.retained_rows.saturating_add(batch.num_rows());
         self.retained_batch_bytes = self
@@ -900,8 +1224,98 @@ impl SideState {
             .saturating_add(position_vector_charge(row_bytes.capacity()));
         self.batches.push(batch.clone());
         self.row_bytes.push(row_bytes);
-        self.row_flags.push(Arc::from(vec![0; batch.num_rows()]));
+        if let Some(row_weights) = row_weights {
+            self.row_weights.push(row_weights);
+        }
+        if track_matches {
+            if execution_mode == JoinExecutionMode::AppendOnly {
+                self.match_flags
+                    .push(Arc::from(vec![0_u8; batch.num_rows()]));
+            } else {
+                self.match_weights
+                    .push(Arc::from(vec![0_i64; batch.num_rows()]));
+            }
+        }
         Ok(true)
+    }
+
+    fn row_weight(&self, batch: usize, row: usize) -> Result<i64, DbError> {
+        if self.row_weights.is_empty() {
+            return self
+                .batches
+                .get(batch)
+                .filter(|batch| row < batch.num_rows())
+                .map(|_| 1)
+                .ok_or_else(|| {
+                    DbError::PipelineTerminal("interval join row position is invalid".into())
+                });
+        }
+        self.row_weights
+            .get(batch)
+            .and_then(|weights| weights.get(row))
+            .copied()
+            .ok_or_else(|| {
+                DbError::PipelineTerminal("interval join row-weight position is invalid".into())
+            })
+    }
+
+    fn match_weight(
+        &self,
+        batch: usize,
+        row: usize,
+        execution_mode: JoinExecutionMode,
+    ) -> Result<i64, DbError> {
+        if execution_mode == JoinExecutionMode::AppendOnly {
+            self.match_flags
+                .get(batch)
+                .and_then(|flags| flags.get(row))
+                .copied()
+                .map(i64::from)
+                .ok_or_else(|| {
+                    DbError::PipelineTerminal("interval join match-flag position is invalid".into())
+                })
+        } else {
+            self.match_weights
+                .get(batch)
+                .and_then(|weights| weights.get(row))
+                .copied()
+                .ok_or_else(|| {
+                    DbError::PipelineTerminal(
+                        "interval join match-weight position is invalid".into(),
+                    )
+                })
+        }
+    }
+
+    fn set_match_weight(
+        match_flags: &mut [Arc<[u8]>],
+        match_weights: &mut [Arc<[i64]>],
+        batch: usize,
+        row: usize,
+        weight: i64,
+        execution_mode: JoinExecutionMode,
+    ) -> Result<(), DbError> {
+        if execution_mode == JoinExecutionMode::AppendOnly {
+            let weight = u8::try_from(weight).map_err(|_| {
+                DbError::PipelineTerminal("interval join match flag exceeds u8".into())
+            })?;
+            let flags = match_flags.get_mut(batch).ok_or_else(|| {
+                DbError::PipelineTerminal("interval join match-flag batch is missing".into())
+            })?;
+            let current = Arc::make_mut(flags).get_mut(row).ok_or_else(|| {
+                DbError::PipelineTerminal("interval join match-flag row is missing".into())
+            })?;
+            *current = weight;
+        } else {
+            let weights = match_weights.get_mut(batch).ok_or_else(|| {
+                DbError::PipelineTerminal("interval join match-weight batch is missing".into())
+            })?;
+            let current = Arc::make_mut(weights).get_mut(row).ok_or_else(|| {
+                DbError::PipelineTerminal("interval join match-weight row is missing".into())
+            })?;
+            *current = weight;
+        }
+        Ok(())
     }
 
     fn evict_before(
@@ -929,7 +1343,9 @@ impl SideState {
             self.retained_batch_bytes = 0;
             self.retained_batch_metadata_bytes = 0;
             self.row_bytes.clear();
-            self.row_flags.clear();
+            self.row_weights.clear();
+            self.match_flags.clear();
+            self.match_weights.clear();
             self.row_size_vector_bytes = 0;
             self.index_entry_bytes = 0;
             return Ok(());
@@ -947,6 +1363,7 @@ impl SideState {
         &self,
         cutoff: i64,
         limit: usize,
+        execution_mode: JoinExecutionMode,
     ) -> Result<Vec<(usize, usize)>, DbError> {
         let mut positions = Vec::new();
         for position in self
@@ -955,8 +1372,7 @@ impl SideState {
             .flat_map(|timestamps| timestamps.range(..cutoff))
             .flat_map(|(_, positions)| positions.iter().copied())
         {
-            let flags = self.row_flags[position.0][position.1];
-            if flags & (ROW_MATCHED | ROW_EMITTED) != 0 {
+            if self.match_weight(position.0, position.1, execution_mode)? != 0 {
                 continue;
             }
             if positions.len() == limit {
@@ -986,17 +1402,39 @@ impl SideState {
             self.retained_batch_bytes = 0;
             self.retained_batch_metadata_bytes = 0;
             self.row_bytes.clear();
-            self.row_flags.clear();
+            self.row_weights.clear();
+            self.match_flags.clear();
+            self.match_weights.clear();
             self.row_size_vector_bytes = 0;
             self.index_entry_bytes = 0;
             return Ok(());
         }
 
         live_rows.sort_unstable();
-        let replacement_flags: Vec<u8> = live_rows
-            .iter()
-            .map(|&(batch, row)| self.row_flags[batch][row])
-            .collect();
+        let replacement_row_weights: Vec<i64> = if self.row_weights.is_empty() {
+            Vec::new()
+        } else {
+            live_rows
+                .iter()
+                .map(|&(batch, row)| self.row_weights[batch][row])
+                .collect()
+        };
+        let replacement_match_weights: Vec<i64> = if self.match_weights.is_empty() {
+            Vec::new()
+        } else {
+            live_rows
+                .iter()
+                .map(|&(batch, row)| self.match_weights[batch][row])
+                .collect()
+        };
+        let replacement_match_flags: Vec<u8> = if self.match_flags.is_empty() {
+            Vec::new()
+        } else {
+            live_rows
+                .iter()
+                .map(|&(batch, row)| self.match_flags[batch][row])
+                .collect()
+        };
 
         let mut taken: Vec<RecordBatch> = Vec::new();
         let mut i = 0;
@@ -1061,7 +1499,21 @@ impl SideState {
         self.row_size_vector_bytes = position_vector_charge(row_bytes.capacity());
         self.batches = vec![compacted];
         self.row_bytes = vec![row_bytes];
-        self.row_flags = vec![Arc::from(replacement_flags)];
+        self.row_weights = if replacement_row_weights.is_empty() {
+            Vec::new()
+        } else {
+            vec![Arc::from(replacement_row_weights)]
+        };
+        self.match_weights = if replacement_match_weights.is_empty() {
+            Vec::new()
+        } else {
+            vec![Arc::from(replacement_match_weights)]
+        };
+        self.match_flags = if replacement_match_flags.is_empty() {
+            Vec::new()
+        } else {
+            vec![Arc::from(replacement_match_flags)]
+        };
         self.index = replacement_index;
         self.index_entry_bytes = replacement_index_entry_bytes;
         self.row_count = replacement_rows;
@@ -1089,18 +1541,43 @@ impl SideState {
             )
             .saturating_add(self.row_size_vector_bytes)
             .saturating_add(
-                self.row_flags
+                self.row_weights
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Arc<[i64]>>()),
+            )
+            .saturating_add(
+                usize::from(self.row_weights.capacity() > 0).saturating_mul(HEAP_ALLOCATION_CHARGE),
+            )
+            .saturating_add(self.row_weights.iter().fold(0usize, |bytes, weights| {
+                bytes.saturating_add(charged_allocation(
+                    weights.len().saturating_mul(std::mem::size_of::<i64>()),
+                ))
+            }))
+            .saturating_add(
+                self.match_flags
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Arc<[u8]>>()),
             )
             .saturating_add(
-                usize::from(self.row_flags.capacity() > 0).saturating_mul(HEAP_ALLOCATION_CHARGE),
+                usize::from(self.match_flags.capacity() > 0).saturating_mul(HEAP_ALLOCATION_CHARGE),
+            )
+            .saturating_add(self.match_flags.iter().fold(0usize, |bytes, flags| {
+                bytes.saturating_add(charged_allocation(flags.len()))
+            }))
+            .saturating_add(
+                self.match_weights
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Arc<[i64]>>()),
             )
             .saturating_add(
-                self.row_flags
-                    .iter()
-                    .fold(0usize, |bytes, flags| bytes.saturating_add(flags.len())),
+                usize::from(self.match_weights.capacity() > 0)
+                    .saturating_mul(HEAP_ALLOCATION_CHARGE),
             )
+            .saturating_add(self.match_weights.iter().fold(0usize, |bytes, weights| {
+                bytes.saturating_add(charged_allocation(
+                    weights.len().saturating_mul(std::mem::size_of::<i64>()),
+                ))
+            }))
             .saturating_add(self.index.capacity().saturating_mul(HASH_BUCKET_CHARGE))
             .saturating_add(
                 usize::from(self.index.capacity() > 0).saturating_mul(HEAP_ALLOCATION_CHARGE),
@@ -1108,7 +1585,12 @@ impl SideState {
             .saturating_add(self.index_entry_bytes)
     }
 
-    fn worst_case_input_growth(&self, batches: &[RecordBatch]) -> Result<usize, DbError> {
+    fn worst_case_input_growth(
+        &self,
+        batches: &[RecordBatch],
+        track_matches: bool,
+        execution_mode: JoinExecutionMode,
+    ) -> Result<usize, DbError> {
         let (rows, batch_bytes) = batches.iter().try_fold(
             (0usize, 0usize),
             |(rows, bytes), batch| -> Result<_, DbError> {
@@ -1118,8 +1600,37 @@ impl SideState {
                 let bytes = bytes
                     .checked_add(batch.get_array_memory_size())
                     .and_then(|total| total.checked_add(batch_metadata_charge(batch)))
-                    .and_then(|total| total.checked_add(batch.num_rows()))
-                    .and_then(|total| total.checked_add(std::mem::size_of::<Arc<[u8]>>()))
+                    .and_then(|total| {
+                        if execution_mode == JoinExecutionMode::Weighted {
+                            total
+                                .checked_add(charged_allocation(
+                                    batch.num_rows().checked_mul(std::mem::size_of::<i64>())?,
+                                ))?
+                                .checked_add(std::mem::size_of::<Arc<[i64]>>())
+                        } else {
+                            Some(total)
+                        }
+                    })
+                    .and_then(|total| {
+                        if track_matches {
+                            let support_bytes = if execution_mode == JoinExecutionMode::AppendOnly {
+                                batch.num_rows()
+                            } else {
+                                batch.num_rows().checked_mul(std::mem::size_of::<i64>())?
+                            };
+                            let roster_entry_bytes =
+                                if execution_mode == JoinExecutionMode::AppendOnly {
+                                    std::mem::size_of::<Arc<[u8]>>()
+                                } else {
+                                    std::mem::size_of::<Arc<[i64]>>()
+                                };
+                            total
+                                .checked_add(charged_allocation(support_bytes))?
+                                .checked_add(roster_entry_bytes)
+                        } else {
+                            Some(total)
+                        }
+                    })
                     .and_then(|total| total.checked_add(HEAP_ALLOCATION_CHARGE))
                     .ok_or_else(|| {
                         DbError::BackpressureFail(
@@ -1170,10 +1681,20 @@ pub(crate) struct IntervalJoinState {
     left_schema: Option<SchemaRef>,
     right_schema: Option<SchemaRef>,
     output_schema: Option<SchemaRef>,
+    execution_mode: JoinExecutionMode,
 }
 
 impl IntervalJoinState {
     pub(crate) fn new() -> Self {
+        Self::new_with_mode(JoinExecutionMode::AppendOnly)
+    }
+
+    #[cfg(test)]
+    fn new_weighted() -> Self {
+        Self::new_with_mode(JoinExecutionMode::Weighted)
+    }
+
+    fn new_with_mode(execution_mode: JoinExecutionMode) -> Self {
         Self {
             left: SideState::new(),
             right: SideState::new(),
@@ -1182,6 +1703,7 @@ impl IntervalJoinState {
             left_schema: None,
             right_schema: None,
             output_schema: None,
+            execution_mode,
         }
     }
 
@@ -1205,16 +1727,22 @@ impl IntervalJoinState {
             .saturating_add(self.output_schema.as_ref().map_or(0, schema_bytes))
     }
 
-    pub(crate) fn preflight_input_growth(
+    fn preflight_input_growth(
         &self,
         left_batches: &[RecordBatch],
         right_batches: &[RecordBatch],
+        join_type: JoinType,
+        execution_mode: JoinExecutionMode,
         max_state_bytes: usize,
     ) -> Result<(), DbError> {
         let growth = self
             .left
-            .worst_case_input_growth(left_batches)?
-            .checked_add(self.right.worst_case_input_growth(right_batches)?)
+            .worst_case_input_growth(left_batches, tracks_left_matches(join_type), execution_mode)?
+            .checked_add(self.right.worst_case_input_growth(
+                right_batches,
+                tracks_right_matches(join_type),
+                execution_mode,
+            )?)
             .ok_or_else(|| {
                 DbError::BackpressureFail("interval join state growth accounting overflow".into())
             })?;
@@ -1259,7 +1787,7 @@ impl IntervalJoinState {
         }
         self.left_schema = Some(left);
         self.right_schema = Some(right);
-        self.cache_input_schemas(None, None, config)
+        self.cache_input_schemas(None, None, config, self.execution_mode)
     }
 
     fn cache_input_schemas(
@@ -1267,7 +1795,13 @@ impl IntervalJoinState {
         left: Option<SchemaRef>,
         right: Option<SchemaRef>,
         config: &StreamJoinConfig,
+        execution_mode: JoinExecutionMode,
     ) -> Result<(), DbError> {
+        if self.execution_mode != execution_mode {
+            return Err(DbError::InvalidOperation(
+                "interval join execution mode changed while state was retained".into(),
+            ));
+        }
         if let Some(left) = left {
             if self
                 .left_schema
@@ -1318,7 +1852,12 @@ impl IntervalJoinState {
                     )));
                 }
             }
-            self.output_schema = Some(build_output_schema(left, right, config));
+            self.output_schema = Some(build_output_schema_for_mode(
+                left,
+                right,
+                config,
+                execution_mode,
+            ));
         }
         Ok(())
     }
@@ -1329,6 +1868,7 @@ impl IntervalJoinState {
         left_watermark: i64,
         right_watermark: i64,
         force: bool,
+        execution_mode: JoinExecutionMode,
         output_budget: &mut IntervalJoinOutputBudget,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let bound_ms = i64::try_from(config.time_bound.as_millis()).map_err(|_| {
@@ -1354,42 +1894,39 @@ impl IntervalJoinState {
         let mut remaining_rows = MAX_CYCLE_OUTPUT_ROWS.saturating_sub(output_budget.emitted_rows);
         let left_positions = if close_left && emit_left {
             self.left
-                .unmatched_positions_before(left_cutoff, remaining_rows)?
+                .unmatched_positions_before(left_cutoff, remaining_rows, execution_mode)?
         } else {
             Vec::new()
         };
         remaining_rows = remaining_rows.saturating_sub(left_positions.len());
         let right_positions = if close_right && emit_right {
             self.right
-                .unmatched_positions_before(right_cutoff, remaining_rows)?
+                .unmatched_positions_before(right_cutoff, remaining_rows, execution_mode)?
         } else {
             Vec::new()
         };
 
         let mut rows = Vec::new();
-        let mut emitted_left = Vec::new();
-        let mut emitted_right = Vec::new();
+        let mut weights = Vec::new();
         if emit_left {
             for &(batch, row) in &left_positions {
-                let flags = self.left.row_flags[batch][row];
-                if flags & (ROW_MATCHED | ROW_EMITTED) == 0 {
-                    rows.push(JoinOutputRow {
-                        left: Some((batch, row)),
-                        right: None,
-                    });
-                    emitted_left.push((batch, row));
+                rows.push(JoinOutputRow {
+                    left: Some((batch, row)),
+                    right: None,
+                });
+                if execution_mode.is_weighted() {
+                    weights.push(self.left.row_weight(batch, row)?);
                 }
             }
         }
         if emit_right {
             for &(batch, row) in &right_positions {
-                let flags = self.right.row_flags[batch][row];
-                if flags & (ROW_MATCHED | ROW_EMITTED) == 0 {
-                    rows.push(JoinOutputRow {
-                        left: None,
-                        right: Some((batch, row)),
-                    });
-                    emitted_right.push((batch, row));
+                rows.push(JoinOutputRow {
+                    left: None,
+                    right: Some((batch, row)),
+                });
+                if execution_mode.is_weighted() {
+                    weights.push(self.right.row_weight(batch, row)?);
                 }
             }
         }
@@ -1413,6 +1950,7 @@ impl IntervalJoinState {
             })?;
             flush_output_rows(
                 &mut rows,
+                &mut weights,
                 output_schema,
                 left_schema,
                 right_schema,
@@ -1421,15 +1959,10 @@ impl IntervalJoinState {
                 &self.right.batches,
                 &self.left.row_bytes,
                 &self.right.row_bytes,
+                execution_mode,
                 &mut output,
                 output_budget,
             )?;
-            for (batch, row) in emitted_left {
-                mark_row_flag(&mut self.left.row_flags, batch, row, ROW_EMITTED);
-            }
-            for (batch, row) in emitted_right {
-                mark_row_flag(&mut self.right.row_flags, batch, row, ROW_EMITTED);
-            }
         }
 
         self.evict_closed_rows(config, left_watermark, right_watermark, force)?;
@@ -1506,24 +2039,65 @@ impl IntervalJoinState {
         &self,
         config: &StreamJoinConfig,
     ) -> Result<IntervalJoinCheckpointCapture, DbError> {
-        type CapturedSide = (Vec<RecordBatch>, Vec<Arc<[u8]>>, u64);
+        type CapturedSide = (
+            Vec<RecordBatch>,
+            Vec<Arc<[i64]>>,
+            Vec<Arc<[u8]>>,
+            Vec<Arc<[i64]>>,
+            u64,
+        );
 
-        fn capture_side(side: &str, state: &SideState) -> Result<CapturedSide, DbError> {
-            if state.batches.len() != state.row_flags.len() {
+        fn capture_side(
+            side: &str,
+            state: &SideState,
+            track_matches: bool,
+            execution_mode: JoinExecutionMode,
+        ) -> Result<CapturedSide, DbError> {
+            if (execution_mode == JoinExecutionMode::Weighted
+                && state.batches.len() != state.row_weights.len())
+                || (execution_mode == JoinExecutionMode::AppendOnly
+                    && !state.row_weights.is_empty())
+                || (track_matches
+                    && execution_mode == JoinExecutionMode::AppendOnly
+                    && state.batches.len() != state.match_flags.len())
+                || (track_matches
+                    && execution_mode == JoinExecutionMode::Weighted
+                    && state.batches.len() != state.match_weights.len())
+                || (!track_matches
+                    && (!state.match_flags.is_empty() || !state.match_weights.is_empty()))
+                || (execution_mode == JoinExecutionMode::AppendOnly
+                    && !state.match_weights.is_empty())
+                || (execution_mode == JoinExecutionMode::Weighted && !state.match_flags.is_empty())
+            {
                 return Err(DbError::Checkpoint(format!(
-                    "interval join {side} checkpoint flag roster does not match its batch roster"
+                    "interval join {side} checkpoint weight rosters do not match its batch roster"
                 )));
             }
             let mut retained_rows = 0usize;
-            for (batch, flags) in state.batches.iter().zip(&state.row_flags) {
+            for (batch_index, batch) in state.batches.iter().enumerate() {
+                let row_weights = execution_mode
+                    .is_weighted()
+                    .then(|| &state.row_weights[batch_index]);
                 if batch.num_rows() == 0 {
                     return Err(DbError::Checkpoint(format!(
                         "interval join {side} checkpoint contains an empty batch"
                     )));
                 }
-                if flags.len() != batch.num_rows() {
+                if row_weights.is_some_and(|weights| {
+                    weights.len() != batch.num_rows() || weights.contains(&0)
+                }) || (track_matches
+                    && execution_mode == JoinExecutionMode::AppendOnly
+                    && (state.match_flags[batch_index].len() != batch.num_rows()
+                        || state.match_flags[batch_index].iter().any(|flag| *flag > 1)))
+                    || (track_matches
+                        && execution_mode == JoinExecutionMode::Weighted
+                        && (state.match_weights[batch_index].len() != batch.num_rows()
+                            || state.match_weights[batch_index]
+                                .iter()
+                                .any(|weight| *weight < 0)))
+                {
                     return Err(DbError::Checkpoint(format!(
-                        "interval join {side} checkpoint flag length does not match its batch"
+                        "interval join {side} checkpoint contains invalid row or match weights"
                     )));
                 }
                 retained_rows = retained_rows.checked_add(batch.num_rows()).ok_or_else(|| {
@@ -1549,16 +2123,34 @@ impl IntervalJoinState {
                     ))
                 })?;
             batches.extend(state.batches.iter().cloned());
-            let mut row_flags = Vec::new();
-            row_flags
-                .try_reserve_exact(state.row_flags.len())
+            let mut row_weights = Vec::new();
+            row_weights
+                .try_reserve_exact(state.row_weights.len())
                 .map_err(|_| {
                     DbError::Checkpoint(format!(
-                        "interval join {side} checkpoint flag roster cannot be reserved"
+                        "interval join {side} checkpoint row-weight roster cannot be reserved"
                     ))
                 })?;
-            row_flags.extend(state.row_flags.iter().cloned());
-            Ok((batches, row_flags, rows))
+            row_weights.extend(state.row_weights.iter().cloned());
+            let mut match_flags = Vec::new();
+            match_flags
+                .try_reserve_exact(state.match_flags.len())
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint match-flag roster cannot be reserved"
+                    ))
+                })?;
+            match_flags.extend(state.match_flags.iter().cloned());
+            let mut match_weights = Vec::new();
+            match_weights
+                .try_reserve_exact(state.match_weights.len())
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint match-weight roster cannot be reserved"
+                    ))
+                })?;
+            match_weights.extend(state.match_weights.iter().cloned());
+            Ok((batches, row_weights, match_flags, match_weights, rows))
         }
 
         let bound_ms = i64::try_from(config.time_bound.as_millis()).map_err(|_| {
@@ -1566,10 +2158,33 @@ impl IntervalJoinState {
                 "interval join time bound exceeds the supported millisecond range".into(),
             )
         })?;
-        let (left_batches, left_row_flags, left_buffer_rows) = capture_side("left", &self.left)?;
-        let (right_batches, right_row_flags, right_buffer_rows) =
-            capture_side("right", &self.right)?;
+        let execution_mode = self.execution_mode;
+        let (
+            left_batches,
+            left_row_weights,
+            left_match_flags,
+            left_match_weights,
+            left_buffer_rows,
+        ) = capture_side(
+            "left",
+            &self.left,
+            tracks_left_matches(config.join_type),
+            execution_mode,
+        )?;
+        let (
+            right_batches,
+            right_row_weights,
+            right_match_flags,
+            right_match_weights,
+            right_buffer_rows,
+        ) = capture_side(
+            "right",
+            &self.right,
+            tracks_right_matches(config.join_type),
+            execution_mode,
+        )?;
         let mut capture = IntervalJoinCheckpointCapture {
+            execution_mode,
             config: config.clone(),
             bound_ms,
             left_buffer_rows,
@@ -1578,8 +2193,12 @@ impl IntervalJoinState {
             right_batches,
             left_evicted_cutoff: self.left_evicted_cutoff,
             right_evicted_cutoff: self.right_evicted_cutoff,
-            left_row_flags,
-            right_row_flags,
+            left_row_weights,
+            right_row_weights,
+            left_match_flags,
+            right_match_flags,
+            left_match_weights,
+            right_match_weights,
             left_needs_compaction: !self.left.is_compact(),
             right_needs_compaction: !self.right.is_compact(),
             retained_bytes: 0,
@@ -1603,28 +2222,146 @@ impl IntervalJoinState {
         config: &StreamJoinConfig,
         max_state_bytes: usize,
     ) -> Result<Self, DbError> {
+        Self::from_checkpoint_with_mode(cp, config, max_state_bytes, JoinExecutionMode::AppendOnly)
+    }
+
+    fn from_checkpoint_with_mode(
+        cp: &JoinStateCheckpoint,
+        config: &StreamJoinConfig,
+        max_state_bytes: usize,
+        execution_mode: JoinExecutionMode,
+    ) -> Result<Self, DbError> {
+        fn preflight_side_metadata(
+            side: &str,
+            batch_count: usize,
+            expected_rows: usize,
+            row_weights: &[Vec<i64>],
+            match_flags: &[Vec<u8>],
+            match_weights: &[Vec<i64>],
+            track_matches: bool,
+            weighted: bool,
+        ) -> Result<(), DbError> {
+            if batch_count > expected_rows
+                || (weighted && row_weights.len() != batch_count)
+                || (!weighted && !row_weights.is_empty())
+                || (track_matches && weighted && match_weights.len() != batch_count)
+                || (track_matches && !weighted && match_flags.len() != batch_count)
+                || (!track_matches && (!match_flags.is_empty() || !match_weights.is_empty()))
+                || (weighted && !match_flags.is_empty())
+                || (!weighted && !match_weights.is_empty())
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join {side} checkpoint has invalid weight rosters"
+                )));
+            }
+            let mut metadata_rows = None;
+            if weighted {
+                let mut rows = 0usize;
+                for weights in row_weights {
+                    if weights.is_empty() || weights.contains(&0) {
+                        return Err(DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint has invalid row weights"
+                        )));
+                    }
+                    rows = rows.checked_add(weights.len()).ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint row-count overflow"
+                        ))
+                    })?;
+                }
+                metadata_rows = Some(rows);
+            }
+            if track_matches && weighted {
+                let mut rows = 0usize;
+                for (batch_index, weights) in match_weights.iter().enumerate() {
+                    if weights.is_empty()
+                        || weights.iter().any(|weight| *weight < 0)
+                        || weights.len() != row_weights[batch_index].len()
+                    {
+                        return Err(DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint has invalid match weights"
+                        )));
+                    }
+                    rows = rows.checked_add(weights.len()).ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint row-count overflow"
+                        ))
+                    })?;
+                }
+                if metadata_rows.is_some_and(|expected| expected != rows) {
+                    return Err(DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint weight row counts differ"
+                    )));
+                }
+                metadata_rows = Some(rows);
+            }
+            if track_matches && !weighted {
+                let mut rows = 0usize;
+                for flags in match_flags {
+                    if flags.is_empty() || flags.iter().any(|flag| *flag > 1) {
+                        return Err(DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint has invalid match flags"
+                        )));
+                    }
+                    rows = rows.checked_add(flags.len()).ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint row-count overflow"
+                        ))
+                    })?;
+                }
+                metadata_rows = Some(rows);
+            }
+            if metadata_rows.is_some_and(|rows| rows != expected_rows) {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join {side} checkpoint row-count metadata is inconsistent"
+                )));
+            }
+            Ok(())
+        }
+
         fn decode_side(
             side: &str,
             ipc_batches: &[Vec<u8>],
-            row_flags: &[Vec<u8>],
+            row_weights: &[Vec<i64>],
+            match_flags: &[Vec<u8>],
+            match_weights: &[Vec<i64>],
+            track_matches: bool,
+            weighted: bool,
             expected_rows: usize,
             decoded_charge: &mut usize,
             max_state_bytes: usize,
         ) -> Result<Vec<RecordBatch>, DbError> {
-            if row_flags.len() != ipc_batches.len() {
-                return Err(DbError::Checkpoint(format!(
-                    "interval join {side} checkpoint flag roster does not match its batch roster"
-                )));
-            }
             let mut decoded = Vec::new();
             decoded.try_reserve_exact(ipc_batches.len()).map_err(|_| {
                 DbError::Checkpoint(format!(
                     "interval join {side} checkpoint batch roster cannot be reserved"
                 ))
             })?;
+            *decoded_charge = decoded_charge
+                .checked_add(charged_allocation(
+                    decoded
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<RecordBatch>())
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "interval join {side} decoded roster accounting overflow"
+                            ))
+                        })?,
+                ))
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "interval join {side} decoded roster accounting overflow"
+                    ))
+                })?;
+            if *decoded_charge > max_state_bytes {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join cumulative decoded state exceeds the {max_state_bytes}-byte restore limit before batch decode"
+                )));
+            }
             let mut rows = 0usize;
             let mut schema: Option<SchemaRef> = None;
-            for (ipc_bytes, flags) in ipc_batches.iter().zip(row_flags) {
+            for (batch_index, ipc_bytes) in ipc_batches.iter().enumerate() {
+                let row_weights = weighted.then(|| &row_weights[batch_index]);
                 let batch = laminar_core::serialization::deserialize_batch_stream(ipc_bytes)
                     .map_err(|error| {
                         DbError::Checkpoint(format!(
@@ -1636,9 +2373,15 @@ impl IntervalJoinState {
                         "interval join {side} checkpoint contains an empty batch"
                     )));
                 }
-                if flags.len() != batch.num_rows() || flags.iter().any(|flag| flag & !3 != 0) {
+                let match_flags = (track_matches && !weighted).then(|| &match_flags[batch_index]);
+                let match_weights =
+                    (track_matches && weighted).then(|| &match_weights[batch_index]);
+                if row_weights.is_some_and(|weights| weights.len() != batch.num_rows())
+                    || match_weights.is_some_and(|weights| weights.len() != batch.num_rows())
+                    || match_flags.is_some_and(|flags| flags.len() != batch.num_rows())
+                {
                     return Err(DbError::Checkpoint(format!(
-                        "interval join {side} checkpoint has invalid per-row match state"
+                        "interval join {side} checkpoint row and weight shapes differ"
                     )));
                 }
                 if let Some(expected_schema) = schema.as_ref() {
@@ -1670,6 +2413,23 @@ impl IntervalJoinState {
                     .checked_add(batch.get_array_memory_size())
                     .and_then(|bytes| bytes.checked_add(batch_metadata_charge(&batch)))
                     .and_then(|bytes| bytes.checked_add(row_charge))
+                    .and_then(|bytes| {
+                        bytes.checked_add(charged_allocation(
+                            row_weights
+                                .map_or(0, Vec::len)
+                                .checked_mul(std::mem::size_of::<i64>())?,
+                        ))
+                    })
+                    .and_then(|bytes| {
+                        bytes.checked_add(charged_allocation(
+                            match_weights
+                                .map_or(0, Vec::len)
+                                .checked_mul(std::mem::size_of::<i64>())?,
+                        ))
+                    })
+                    .and_then(|bytes| {
+                        bytes.checked_add(charged_allocation(match_flags.map_or(0, Vec::len)))
+                    })
                     .ok_or_else(|| {
                         DbError::Checkpoint(
                             "interval join cumulative decoded byte accounting overflow".into(),
@@ -1693,6 +2453,12 @@ impl IntervalJoinState {
         if max_state_bytes == 0 {
             return Err(DbError::Checkpoint(
                 "interval join restore state limit must be greater than zero".into(),
+            ));
+        }
+        if cp.weighted != execution_mode.is_weighted() {
+            return Err(DbError::Checkpoint(
+                "interval join checkpoint execution mode does not match the restored operator"
+                    .into(),
             ));
         }
         let bound_ms = i64::try_from(config.time_bound.as_millis()).map_err(|_| {
@@ -1724,6 +2490,32 @@ impl IntervalJoinState {
         let expected_rows = expected_left.checked_add(expected_right).ok_or_else(|| {
             DbError::Checkpoint("interval join checkpoint row-count overflow".into())
         })?;
+        preflight_side_metadata(
+            "left",
+            cp.left_batches.len(),
+            expected_left,
+            &cp.left_row_weights,
+            &cp.left_match_flags,
+            &cp.left_match_weights,
+            tracks_left_matches(config.join_type),
+            execution_mode.is_weighted(),
+        )?;
+        preflight_side_metadata(
+            "right",
+            cp.right_batches.len(),
+            expected_right,
+            &cp.right_row_weights,
+            &cp.right_match_flags,
+            &cp.right_match_weights,
+            tracks_right_matches(config.join_type),
+            execution_mode.is_weighted(),
+        )?;
+        let retained_checkpoint_bytes = cp.retained_ipc_bytes()?;
+        if retained_checkpoint_bytes > max_state_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "interval join checkpoint retains {retained_checkpoint_bytes} bytes before decode; restore limit is {max_state_bytes} bytes"
+            )));
+        }
         let worst_case_row_bytes = expected_rows
             .checked_mul(RESTORE_WORST_CASE_ROW_CHARGE)
             .ok_or_else(|| {
@@ -1731,22 +2523,17 @@ impl IntervalJoinState {
                     "interval join checkpoint worst-case row accounting overflow".into(),
                 )
             })?;
-        if worst_case_row_bytes > max_state_bytes {
+        let predecode_projection = std::mem::size_of::<Self>()
+            .checked_add(retained_checkpoint_bytes)
+            .and_then(|bytes| bytes.checked_add(worst_case_row_bytes))
+            .ok_or_else(|| {
+                DbError::Checkpoint("interval join checkpoint restore projection overflow".into())
+            })?;
+        if predecode_projection > max_state_bytes {
             return Err(DbError::Checkpoint(format!(
-                "interval join checkpoint declares {expected_rows} rows whose worst-case decoded index charge exceeds the {max_state_bytes}-byte restore limit"
+                "interval join checkpoint declares {expected_rows} rows whose retained checkpoint plus worst-case decoded index charge is {predecode_projection} bytes; restore limit is {max_state_bytes} bytes"
             )));
         }
-        for (side, batch_count, expected) in [
-            ("left", cp.left_batches.len(), expected_left),
-            ("right", cp.right_batches.len(), expected_right),
-        ] {
-            if batch_count > expected {
-                return Err(DbError::Checkpoint(format!(
-                    "interval join {side} checkpoint has {batch_count} non-empty batches for {expected} rows"
-                )));
-            }
-        }
-
         let mut decoded_charge = std::mem::size_of::<Self>();
         if decoded_charge > max_state_bytes {
             return Err(DbError::Checkpoint(format!(
@@ -1756,7 +2543,11 @@ impl IntervalJoinState {
         let left_batches = decode_side(
             "left",
             &cp.left_batches,
-            &cp.left_row_flags,
+            &cp.left_row_weights,
+            &cp.left_match_flags,
+            &cp.left_match_weights,
+            tracks_left_matches(config.join_type),
+            execution_mode.is_weighted(),
             expected_left,
             &mut decoded_charge,
             max_state_bytes,
@@ -1764,33 +2555,57 @@ impl IntervalJoinState {
         let right_batches = decode_side(
             "right",
             &cp.right_batches,
-            &cp.right_row_flags,
+            &cp.right_row_weights,
+            &cp.right_match_flags,
+            &cp.right_match_weights,
+            tracks_right_matches(config.join_type),
+            execution_mode.is_weighted(),
             expected_right,
             &mut decoded_charge,
             max_state_bytes,
         )?;
 
-        let mut state = Self::new();
+        let mut state = Self::new_with_mode(execution_mode);
         state.left_evicted_cutoff = cp.left_evicted_cutoff;
         state.right_evicted_cutoff = cp.right_evicted_cutoff;
 
-        for (batch, flags) in left_batches.into_iter().zip(cp.left_row_flags.iter()) {
+        for (batch_index, batch) in left_batches.into_iter().enumerate() {
+            let row_weights = if execution_mode.is_weighted() {
+                Some(Arc::from(cp.left_row_weights[batch_index].clone()))
+            } else {
+                None
+            };
             let _ = state
                 .left
                 .add_batch(
                     &batch,
+                    row_weights,
                     &config.left_keys,
                     &config.left_time_column,
                     retain_left_null_tuples(config.join_type),
+                    tracks_left_matches(config.join_type),
+                    execution_mode,
                 )
                 .map_err(|error| {
                     DbError::Checkpoint(format!(
                         "interval join left checkpoint index rebuild: {error}"
                     ))
                 })?;
-            *state.left.row_flags.last_mut().ok_or_else(|| {
-                DbError::Checkpoint("interval join left row flags lost during restore".into())
-            })? = Arc::from(flags.clone());
+            if tracks_left_matches(config.join_type) {
+                if execution_mode == JoinExecutionMode::AppendOnly {
+                    *state.left.match_flags.last_mut().ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "interval join left match flags lost during restore".into(),
+                        )
+                    })? = Arc::from(cp.left_match_flags[batch_index].clone());
+                } else {
+                    *state.left.match_weights.last_mut().ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "interval join left match weights lost during restore".into(),
+                        )
+                    })? = Arc::from(cp.left_match_weights[batch_index].clone());
+                }
+            }
             state.left_schema = Some(batch.schema());
             if state.accounted_state_bytes() > max_state_bytes {
                 return Err(DbError::Checkpoint(format!(
@@ -1799,23 +2614,43 @@ impl IntervalJoinState {
             }
         }
 
-        for (batch, flags) in right_batches.into_iter().zip(cp.right_row_flags.iter()) {
+        for (batch_index, batch) in right_batches.into_iter().enumerate() {
+            let row_weights = if execution_mode.is_weighted() {
+                Some(Arc::from(cp.right_row_weights[batch_index].clone()))
+            } else {
+                None
+            };
             let _ = state
                 .right
                 .add_batch(
                     &batch,
+                    row_weights,
                     &config.right_keys,
                     &config.right_time_column,
                     retain_right_null_tuples(config.join_type),
+                    tracks_right_matches(config.join_type),
+                    execution_mode,
                 )
                 .map_err(|error| {
                     DbError::Checkpoint(format!(
                         "interval join right checkpoint index rebuild: {error}"
                     ))
                 })?;
-            *state.right.row_flags.last_mut().ok_or_else(|| {
-                DbError::Checkpoint("interval join right row flags lost during restore".into())
-            })? = Arc::from(flags.clone());
+            if tracks_right_matches(config.join_type) {
+                if execution_mode == JoinExecutionMode::AppendOnly {
+                    *state.right.match_flags.last_mut().ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "interval join right match flags lost during restore".into(),
+                        )
+                    })? = Arc::from(cp.right_match_flags[batch_index].clone());
+                } else {
+                    *state.right.match_weights.last_mut().ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "interval join right match weights lost during restore".into(),
+                        )
+                    })? = Arc::from(cp.right_match_weights[batch_index].clone());
+                }
+            }
             state.right_schema = Some(batch.schema());
             if state.accounted_state_bytes() > max_state_bytes {
                 return Err(DbError::Checkpoint(format!(
@@ -1905,6 +2740,25 @@ pub(crate) fn build_output_schema(
     Arc::new(Schema::new(fields))
 }
 
+fn build_output_schema_for_mode(
+    left_schema: &SchemaRef,
+    right_schema: &SchemaRef,
+    config: &StreamJoinConfig,
+    execution_mode: JoinExecutionMode,
+) -> SchemaRef {
+    let plain = build_output_schema(left_schema, right_schema, config);
+    if execution_mode == JoinExecutionMode::AppendOnly {
+        return plain;
+    }
+    let mut fields = plain.fields().iter().cloned().collect::<Vec<_>>();
+    fields.push(Arc::new(Field::new(
+        laminar_core::changelog::WEIGHT_COLUMN,
+        DataType::Int64,
+        false,
+    )));
+    Arc::new(Schema::new_with_metadata(fields, plain.metadata().clone()))
+}
+
 #[derive(Clone, Copy)]
 struct JoinOutputRow {
     left: Option<(usize, usize)>,
@@ -1914,6 +2768,7 @@ struct JoinOutputRow {
 #[allow(clippy::too_many_arguments)]
 fn flush_output_rows(
     rows: &mut Vec<JoinOutputRow>,
+    weights: &mut Vec<i64>,
     output_schema: &SchemaRef,
     left_schema: &SchemaRef,
     right_schema: &SchemaRef,
@@ -1922,9 +2777,17 @@ fn flush_output_rows(
     right_batches: &[RecordBatch],
     left_row_bytes: &[Vec<usize>],
     right_row_bytes: &[Vec<usize>],
+    execution_mode: JoinExecutionMode,
     out: &mut Vec<RecordBatch>,
     output_budget: &mut IntervalJoinOutputBudget,
 ) -> Result<(), DbError> {
+    if (execution_mode.is_weighted() && weights.len() != rows.len())
+        || (!execution_mode.is_weighted() && !weights.is_empty())
+    {
+        return Err(DbError::PipelineTerminal(
+            "interval join output weight roster is inconsistent with its execution mode".into(),
+        ));
+    }
     if rows.is_empty() {
         return Ok(());
     }
@@ -1935,7 +2798,7 @@ fn flush_output_rows(
             "interval join cycle exceeded {MAX_CYCLE_OUTPUT_ROWS} output rows; narrow the event-time bound or reduce hot-key fanout"
         )));
     }
-    let logical_bytes = rows.iter().try_fold(0usize, |total, row| {
+    let payload_bytes = rows.iter().try_fold(0usize, |total, row| {
         let left = row.left.map_or(Ok(0), |(batch, index)| {
             left_row_bytes
                 .get(batch)
@@ -1955,6 +2818,21 @@ fn flush_output_rows(
                 })
         })?;
         Ok::<_, DbError>(total.saturating_add(left).saturating_add(right))
+    })?;
+    let weight_bytes = if execution_mode == JoinExecutionMode::Weighted {
+        rows.len()
+            .checked_mul(std::mem::size_of::<i64>())
+            .and_then(|bytes| bytes.checked_add(rows.len().saturating_add(7) / 8))
+            .ok_or_else(|| {
+                DbError::BackpressureFail(
+                    "interval join weighted output byte accounting overflow".into(),
+                )
+            })?
+    } else {
+        0
+    };
+    let logical_bytes = payload_bytes.checked_add(weight_bytes).ok_or_else(|| {
+        DbError::BackpressureFail("interval join output byte accounting overflow".into())
     })?;
     let allocation_charge = logical_bytes.saturating_mul(2).saturating_add(
         rows.len()
@@ -2009,6 +2887,11 @@ fn flush_output_rows(
             .collect::<Vec<_>>();
         append_side("right", right_schema, right_batches, &indices)?;
     }
+    if execution_mode == JoinExecutionMode::Weighted {
+        columns.push(Arc::new(Int64Array::from_iter_values(
+            weights.iter().copied(),
+        )));
+    }
 
     let batch = RecordBatch::try_new(output_schema.clone(), columns)
         .map_err(|e| DbError::query_pipeline_arrow("interval join (result)", &e))?;
@@ -2026,17 +2909,24 @@ fn flush_output_rows(
         out.push(batch);
     }
     rows.clear();
+    weights.clear();
     Ok(())
 }
 
-fn validate_append_only_input(
+struct NormalizedJoinInput<'a> {
+    batches: Cow<'a, [RecordBatch]>,
+    row_weights: Vec<Arc<[i64]>>,
+}
+
+fn validate_normalized_join_batch(
     side: &str,
-    batches: &[RecordBatch],
+    batch: &RecordBatch,
     key_columns: &[String],
     time_column: &str,
     closed_cutoff: i64,
+    execution_mode: JoinExecutionMode,
 ) -> Result<(), DbError> {
-    for batch in batches {
+    if execution_mode == JoinExecutionMode::AppendOnly {
         if let Ok(index) = batch.schema().index_of("_op") {
             let operations = batch
                 .column(index)
@@ -2058,48 +2948,167 @@ fn validate_append_only_input(
                 )));
             }
         }
+    }
 
-        if let Ok(index) = batch
-            .schema()
-            .index_of(laminar_core::changelog::WEIGHT_COLUMN)
-        {
-            let weights = batch
-                .column(index)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    DbError::Pipeline(format!(
-                        "interval join ({side}): {} must be Int64 for append-only validation",
-                        laminar_core::changelog::WEIGHT_COLUMN
-                    ))
-                })?;
-            if let Some((row, weight)) = weights
-                .iter()
-                .enumerate()
-                .find(|(_, weight)| *weight != Some(1))
-            {
-                return Err(DbError::InvalidOperation(format!(
-                    "interval join ({side}) accepts only +1 weights; row {row} has weight {}",
-                    weight.map_or_else(|| "NULL".to_string(), |value| value.to_string())
-                )));
-            }
-        }
-
-        // Preflight key/time extraction for every batch before either side mutates state.
-        let _ = extract_key_columns(batch, key_columns)?;
-        let timestamps = extract_column_as_timestamps(batch, time_column)?;
-        if let Some((row, timestamp)) = timestamps
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, timestamp)| *timestamp < closed_cutoff)
-        {
-            return Err(DbError::InvalidOperation(format!(
-                "interval join ({side}) received late row {row} at {timestamp} below closed cutoff {closed_cutoff}"
-            )));
-        }
+    let _ = extract_key_columns(batch, key_columns)?;
+    let timestamps = extract_column_as_timestamps(batch, time_column)?;
+    if let Some((row, timestamp)) = timestamps
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, timestamp)| *timestamp < closed_cutoff)
+    {
+        return Err(DbError::InvalidOperation(format!(
+            "interval join ({side}) received late row {row} at {timestamp} below closed cutoff {closed_cutoff}"
+        )));
     }
     Ok(())
+}
+
+fn normalize_join_input<'a>(
+    side: &str,
+    batches: &'a [RecordBatch],
+    key_columns: &[String],
+    time_column: &str,
+    closed_cutoff: i64,
+    execution_mode: JoinExecutionMode,
+) -> Result<NormalizedJoinInput<'a>, DbError> {
+    if execution_mode == JoinExecutionMode::AppendOnly
+        && batches.iter().all(|batch| {
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .all(|field| field.name() != laminar_core::changelog::WEIGHT_COLUMN)
+        })
+    {
+        for batch in batches {
+            validate_normalized_join_batch(
+                side,
+                batch,
+                key_columns,
+                time_column,
+                closed_cutoff,
+                execution_mode,
+            )?;
+        }
+        return Ok(NormalizedJoinInput {
+            batches: Cow::Borrowed(batches),
+            row_weights: Vec::new(),
+        });
+    }
+
+    let mut normalized = Vec::new();
+    let mut row_weights = Vec::new();
+    normalized.try_reserve_exact(batches.len()).map_err(|_| {
+        DbError::BackpressureFail(format!(
+            "interval join ({side}) input roster cannot be reserved"
+        ))
+    })?;
+    if execution_mode.is_weighted() {
+        row_weights.try_reserve_exact(batches.len()).map_err(|_| {
+            DbError::BackpressureFail(format!(
+                "interval join ({side}) weight roster cannot be reserved"
+            ))
+        })?;
+    }
+
+    for batch in batches {
+        let schema = batch.schema();
+        let weight_indices = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, field)| {
+                (field.name() == laminar_core::changelog::WEIGHT_COLUMN).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let (plain, weights): (RecordBatch, Option<Arc<[i64]>>) = match weight_indices.as_slice() {
+            [] if execution_mode == JoinExecutionMode::AppendOnly => (batch.clone(), None),
+            [] => {
+                return Err(DbError::InvalidOperation(format!(
+                    "interval join ({side}) weighted input is missing trailing {}",
+                    laminar_core::changelog::WEIGHT_COLUMN
+                )));
+            }
+            [index] if *index == batch.num_columns().saturating_sub(1) => {
+                let field = schema.field(*index);
+                if field.data_type() != &DataType::Int64 || field.is_nullable() {
+                    return Err(DbError::SchemaMismatch(format!(
+                        "interval join ({side}) {} must be non-null Int64",
+                        laminar_core::changelog::WEIGHT_COLUMN
+                    )));
+                }
+                let weights = batch
+                    .column(*index)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        DbError::Pipeline(format!(
+                            "interval join ({side}) {} has an invalid Arrow representation",
+                            laminar_core::changelog::WEIGHT_COLUMN
+                        ))
+                    })?;
+                if let Some((row, weight)) = weights.iter().enumerate().find(|(_, weight)| {
+                    execution_mode == JoinExecutionMode::AppendOnly && *weight != Some(1)
+                        || execution_mode == JoinExecutionMode::Weighted
+                            && weight.is_none_or(|weight| weight == 0)
+                }) {
+                    let requirement = if execution_mode == JoinExecutionMode::AppendOnly {
+                        "+1"
+                    } else {
+                        "nonzero"
+                    };
+                    return Err(DbError::InvalidOperation(format!(
+                        "interval join ({side}) requires {requirement} weights; row {row} has weight {}",
+                        weight.map_or_else(|| "NULL".to_string(), |value| value.to_string())
+                    )));
+                }
+                let plain_schema = Arc::new(Schema::new_with_metadata(
+                    schema.fields()[..*index].to_vec(),
+                    schema.metadata().clone(),
+                ));
+                let plain = RecordBatch::try_new(plain_schema, batch.columns()[..*index].to_vec())
+                    .map_err(|error| {
+                        DbError::query_pipeline_arrow(
+                            format!("interval join ({side}) strip weight"),
+                            &error,
+                        )
+                    })?;
+                let retained_weights = if execution_mode.is_weighted() {
+                    Some(Arc::from(
+                        weights.iter().map(Option::unwrap).collect::<Vec<_>>(),
+                    ))
+                } else {
+                    None
+                };
+                (plain, retained_weights)
+            }
+            _ => {
+                return Err(DbError::SchemaMismatch(format!(
+                    "interval join ({side}) requires a sole trailing {} column",
+                    laminar_core::changelog::WEIGHT_COLUMN
+                )));
+            }
+        };
+
+        validate_normalized_join_batch(
+            side,
+            &plain,
+            key_columns,
+            time_column,
+            closed_cutoff,
+            execution_mode,
+        )?;
+        normalized.push(plain);
+        if let Some(weights) = weights {
+            row_weights.push(weights);
+        }
+    }
+    Ok(NormalizedJoinInput {
+        batches: Cow::Owned(normalized),
+        row_weights,
+    })
 }
 
 fn validate_input_schemas(
@@ -2136,8 +3145,47 @@ fn partial_apply(error: DbError) -> DbError {
     }
 }
 
-/// One cycle: new left rows probe all right; new right rows probe only old left.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn next_match_support(
+    current: i64,
+    delta: i64,
+    execution_mode: JoinExecutionMode,
+) -> Result<i64, DbError> {
+    let next = if execution_mode == JoinExecutionMode::AppendOnly {
+        if delta != 1 || !(0..=1).contains(&current) {
+            return Err(DbError::PipelineTerminal(
+                "interval join append-only match support is corrupt".into(),
+            ));
+        }
+        1
+    } else {
+        current.checked_add(delta).ok_or_else(|| {
+            DbError::PipelineTerminal("interval join match-support overflow".into())
+        })?
+    };
+    if next < 0 {
+        return Err(DbError::PipelineTerminal(format!(
+            "interval join match support became negative ({current} + {delta})"
+        )));
+    }
+    Ok(next)
+}
+
+fn semi_transition_weight(
+    row_weight: i64,
+    previous_support: i64,
+    next_support: i64,
+) -> Result<Option<i64>, DbError> {
+    match (previous_support > 0, next_support > 0) {
+        (false, true) => Ok(Some(row_weight)),
+        (true, false) => row_weight.checked_neg().map(Some).ok_or_else(|| {
+            DbError::PipelineTerminal("interval join semi-join retraction overflow".into())
+        }),
+        _ => Ok(None),
+    }
+}
+
+/// Append-only cycle: new left rows probe all right, then new right rows probe old left.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_interval_join_cycle(
     state: &mut IntervalJoinState,
     left_batches: &[RecordBatch],
@@ -2149,6 +3197,35 @@ pub(crate) fn execute_interval_join_cycle(
     right_watermark: i64,
     max_state_bytes: usize,
     output_budget: &mut IntervalJoinOutputBudget,
+) -> Result<Vec<RecordBatch>, DbError> {
+    execute_interval_join_cycle_with_mode(
+        state,
+        left_batches,
+        right_batches,
+        config,
+        left_admission_watermark,
+        right_admission_watermark,
+        left_watermark,
+        right_watermark,
+        max_state_bytes,
+        output_budget,
+        JoinExecutionMode::AppendOnly,
+    )
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn execute_interval_join_cycle_with_mode(
+    state: &mut IntervalJoinState,
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    config: &StreamJoinConfig,
+    left_admission_watermark: i64,
+    right_admission_watermark: i64,
+    left_watermark: i64,
+    right_watermark: i64,
+    max_state_bytes: usize,
+    output_budget: &mut IntervalJoinOutputBudget,
+    execution_mode: JoinExecutionMode,
 ) -> Result<Vec<RecordBatch>, DbError> {
     if config.left_keys.is_empty()
         || config.left_keys.len() != config.right_keys.len()
@@ -2171,37 +3248,38 @@ pub(crate) fn execute_interval_join_cycle(
         ));
     }
 
-    let left_schema = validate_input_schemas(
-        "left",
-        &state.left,
-        state.left_schema.as_ref(),
-        left_batches,
-    )?;
-    let right_schema = validate_input_schemas(
-        "right",
-        &state.right,
-        state.right_schema.as_ref(),
-        right_batches,
-    )?;
-
-    validate_append_only_input(
+    let left_input = normalize_join_input(
         "left",
         left_batches,
         &config.left_keys,
         &config.left_time_column,
         left_admission_watermark,
+        execution_mode,
     )?;
-    validate_append_only_input(
+    let right_input = normalize_join_input(
         "right",
         right_batches,
         &config.right_keys,
         &config.right_time_column,
         right_admission_watermark,
+        execution_mode,
     )?;
-    state.cache_input_schemas(left_schema, right_schema, config)?;
+    let left_schema = validate_input_schemas(
+        "left",
+        &state.left,
+        state.left_schema.as_ref(),
+        left_input.batches.as_ref(),
+    )?;
+    let right_schema = validate_input_schemas(
+        "right",
+        &state.right,
+        state.right_schema.as_ref(),
+        right_input.batches.as_ref(),
+    )?;
+    state.cache_input_schemas(left_schema, right_schema, config, execution_mode)?;
 
-    let has_left_input = left_batches.iter().any(|batch| batch.num_rows() > 0);
-    let has_right_input = right_batches.iter().any(|batch| batch.num_rows() > 0);
+    let has_left_input = left_input.batches.iter().any(|batch| batch.num_rows() > 0);
+    let has_right_input = right_input.batches.iter().any(|batch| batch.num_rows() > 0);
     if !has_left_input && !has_right_input {
         return state
             .finalize_closed_rows(
@@ -2209,13 +3287,20 @@ pub(crate) fn execute_interval_join_cycle(
                 left_watermark,
                 right_watermark,
                 false,
+                execution_mode,
                 output_budget,
             )
             .map_err(partial_apply);
     }
 
     state
-        .preflight_input_growth(left_batches, right_batches, max_state_bytes)
+        .preflight_input_growth(
+            left_input.batches.as_ref(),
+            right_input.batches.as_ref(),
+            config.join_type,
+            execution_mode,
+            max_state_bytes,
+        )
         .map_err(partial_apply)?;
 
     let mut result = Vec::new();
@@ -2230,8 +3315,36 @@ pub(crate) fn execute_interval_join_cycle(
                     .map_err(|e| DbError::query_pipeline_arrow(side, &e))?;
                 Ok((batch.num_rows() > 0).then_some(batch))
             };
-        let new_left = concat_nonempty(left_batches, "interval join (left concat)")?;
-        let new_right = concat_nonempty(right_batches, "interval join (right concat)")?;
+        let new_left = concat_nonempty(left_input.batches.as_ref(), "interval join (left concat)")?;
+        let new_right =
+            concat_nonempty(right_input.batches.as_ref(), "interval join (right concat)")?;
+        let concat_weights = |weights: &[Arc<[i64]>], side: &str| -> Result<Arc<[i64]>, DbError> {
+            let row_count = weights.iter().try_fold(0usize, |rows, weights| {
+                rows.checked_add(weights.len()).ok_or_else(|| {
+                    DbError::BackpressureFail(format!(
+                        "interval join ({side}) weight row-count overflow"
+                    ))
+                })
+            })?;
+            let mut concatenated = Vec::new();
+            concatenated.try_reserve_exact(row_count).map_err(|_| {
+                DbError::BackpressureFail(format!(
+                    "interval join ({side}) weights cannot be reserved"
+                ))
+            })?;
+            for weights in weights {
+                concatenated.extend_from_slice(weights);
+            }
+            Ok(Arc::from(concatenated))
+        };
+        let (new_left_weights, new_right_weights) = if execution_mode.is_weighted() {
+            (
+                Some(concat_weights(&left_input.row_weights, "left")?),
+                Some(concat_weights(&right_input.row_weights, "right")?),
+            )
+        } else {
+            (None, None)
+        };
 
         // Buffer first so every output position points into retained state.
         let left_old_count = state.left.batches.len();
@@ -2239,9 +3352,12 @@ pub(crate) fn execute_interval_join_cycle(
         let has_new_right = if let Some(rb) = new_right {
             state.right.add_batch(
                 &rb,
+                new_right_weights,
                 &config.right_keys,
                 &config.right_time_column,
                 retain_right_null_tuples(config.join_type),
+                tracks_right_matches(config.join_type),
+                execution_mode,
             )?
         } else {
             false
@@ -2249,9 +3365,12 @@ pub(crate) fn execute_interval_join_cycle(
         let has_new_left = if let Some(lb) = new_left {
             state.left.add_batch(
                 &lb,
+                new_left_weights,
                 &config.left_keys,
                 &config.left_time_column,
                 retain_left_null_tuples(config.join_type),
+                tracks_left_matches(config.join_type),
+                execution_mode,
             )?
         } else {
             false
@@ -2275,71 +3394,23 @@ pub(crate) fn execute_interval_join_cycle(
         let empty_right = Arc::new(Schema::empty());
         let left_schema = state.left_schema.as_ref().unwrap_or(&empty_left);
         let right_schema = state.right_schema.as_ref().unwrap_or(&empty_right);
-        let fallback_output = state
-            .output_schema
-            .is_none()
-            .then(|| build_output_schema(left_schema, right_schema, config));
+        let fallback_output = state.output_schema.is_none().then(|| {
+            build_output_schema_for_mode(left_schema, right_schema, config, execution_mode)
+        });
         let output_schema = state
             .output_schema
             .as_ref()
             .or(fallback_output.as_ref())
             .expect("interval join fallback output schema constructed");
         let mut output_rows = Vec::new();
+        let mut output_weights = Vec::new();
 
-        macro_rules! admit_match {
-            ($left_batch:expr, $left_row:expr, $right_batch:expr, $right_row:expr) => {{
-                mark_row_flag(
-                    &mut state.left.row_flags,
-                    $left_batch,
-                    $left_row,
-                    ROW_MATCHED,
-                );
-                mark_row_flag(
-                    &mut state.right.row_flags,
-                    $right_batch,
-                    $right_row,
-                    ROW_MATCHED,
-                );
-                match config.join_type {
-                    JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
-                        output_rows.push(JoinOutputRow {
-                            left: Some(($left_batch, $left_row)),
-                            right: Some(($right_batch, $right_row)),
-                        });
-                    }
-                    JoinType::LeftSemi => {
-                        if state.left.row_flags[$left_batch][$left_row] & ROW_EMITTED == 0 {
-                            mark_row_flag(
-                                &mut state.left.row_flags,
-                                $left_batch,
-                                $left_row,
-                                ROW_EMITTED,
-                            );
-                            output_rows.push(JoinOutputRow {
-                                left: Some(($left_batch, $left_row)),
-                                right: None,
-                            });
-                        }
-                    }
-                    JoinType::RightSemi => {
-                        if state.right.row_flags[$right_batch][$right_row] & ROW_EMITTED == 0 {
-                            mark_row_flag(
-                                &mut state.right.row_flags,
-                                $right_batch,
-                                $right_row,
-                                ROW_EMITTED,
-                            );
-                            output_rows.push(JoinOutputRow {
-                                left: None,
-                                right: Some(($right_batch, $right_row)),
-                            });
-                        }
-                    }
-                    JoinType::LeftAnti | JoinType::RightAnti => {}
-                }
+        macro_rules! flush_if_needed {
+            () => {{
                 if output_rows.len() >= EMIT_THRESHOLD {
                     flush_output_rows(
                         &mut output_rows,
+                        &mut output_weights,
                         output_schema,
                         left_schema,
                         right_schema,
@@ -2348,6 +3419,7 @@ pub(crate) fn execute_interval_join_cycle(
                         &state.right.batches,
                         &state.left.row_bytes,
                         &state.right.row_bytes,
+                        execution_mode,
                         &mut result,
                         output_budget,
                     )?;
@@ -2355,83 +3427,302 @@ pub(crate) fn execute_interval_join_cycle(
             }};
         }
 
-        if has_new_left {
-            let lb_kc = &left_key_cols[new_left_batch_idx];
-            let lb_ts = extract_column_as_timestamps(
-                &state.left.batches[new_left_batch_idx],
-                &config.left_time_column,
-            )?;
-            for (row_idx, &left_ts) in lb_ts.iter().enumerate() {
-                let Some(key_hash) = tuple_hash_at(lb_kc, row_idx) else {
-                    continue;
-                };
-                let low = left_ts;
-                let high = left_ts.saturating_add(bound_ms);
-                if let Some(times) = state.right.index.get(&key_hash) {
-                    'left_row_matches: for entries in
-                        times.range(low..=high).map(|(_, entries)| entries)
-                    {
-                        for &(r_batch, r_row) in entries {
-                            if matches!(config.join_type, JoinType::RightSemi | JoinType::RightAnti)
-                                && state.right.row_flags[r_batch][r_row] & ROW_MATCHED != 0
-                            {
-                                continue;
-                            }
-                            if !tuples_equal(lb_kc, row_idx, &right_key_cols[r_batch], r_row) {
-                                continue;
-                            }
-                            admit_match!(new_left_batch_idx, row_idx, r_batch, r_row);
-                            if matches!(config.join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
-                                break 'left_row_matches;
-                            }
-                        }
-                    }
+        macro_rules! push_output {
+            ($row:expr, $weight:expr) => {{
+                output_rows.push($row);
+                if execution_mode.is_weighted() {
+                    output_weights.push($weight);
                 }
-            }
+            }};
         }
 
-        // Probe new right against OLD left only — new_left × new_right already covered above.
-        if has_new_right {
-            let rb_kc = &right_key_cols[new_right_batch_idx];
-            let rb_ts = extract_column_as_timestamps(
-                &state.right.batches[new_right_batch_idx],
-                &config.right_time_column,
-            )?;
-            for (row_idx, &right_ts) in rb_ts.iter().enumerate() {
-                let Some(key_hash) = tuple_hash_at(rb_kc, row_idx) else {
-                    continue;
+        macro_rules! admit_match {
+            ($left_batch:expr, $left_row:expr, $right_batch:expr, $right_row:expr,
+             $left_initial:expr, $right_initial:expr) => {{
+                let emits_pair = matches!(
+                    config.join_type,
+                    JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
+                );
+                let (left_weight, right_weight) = if execution_mode == JoinExecutionMode::AppendOnly
+                {
+                    (1, 1)
+                } else {
+                    (
+                        state.left.row_weight($left_batch, $left_row)?,
+                        state.right.row_weight($right_batch, $right_row)?,
+                    )
                 };
-                let low = right_ts.saturating_sub(bound_ms);
-                let high = right_ts;
-                if let Some(times) = state.left.index.get(&key_hash) {
-                    'right_row_matches: for entries in
-                        times.range(low..=high).map(|(_, entries)| entries)
-                    {
-                        for &(l_batch, l_row) in entries {
-                            if l_batch >= left_old_count {
-                                continue;
+                let pair_weight = if emits_pair {
+                    if execution_mode == JoinExecutionMode::AppendOnly {
+                        Some(1)
+                    } else {
+                        Some(left_weight.checked_mul(right_weight).ok_or_else(|| {
+                            DbError::PipelineTerminal(
+                                "interval join pair-weight multiplication overflow".into(),
+                            )
+                        })?)
+                    }
+                } else {
+                    None
+                };
+                let left_support = if tracks_left_matches(config.join_type) {
+                    let previous =
+                        state
+                            .left
+                            .match_weight($left_batch, $left_row, execution_mode)?;
+                    let next = next_match_support(previous, right_weight, execution_mode)?;
+                    let transition = if config.join_type == JoinType::LeftSemi && !$left_initial {
+                        semi_transition_weight(left_weight, previous, next)?
+                    } else {
+                        None
+                    };
+                    Some((next, transition))
+                } else {
+                    None
+                };
+                let right_support = if tracks_right_matches(config.join_type) {
+                    let previous =
+                        state
+                            .right
+                            .match_weight($right_batch, $right_row, execution_mode)?;
+                    let next = next_match_support(previous, left_weight, execution_mode)?;
+                    let transition = if config.join_type == JoinType::RightSemi && !$right_initial {
+                        semi_transition_weight(right_weight, previous, next)?
+                    } else {
+                        None
+                    };
+                    Some((next, transition))
+                } else {
+                    None
+                };
+
+                if let Some((next, _)) = left_support {
+                    SideState::set_match_weight(
+                        &mut state.left.match_flags,
+                        &mut state.left.match_weights,
+                        $left_batch,
+                        $left_row,
+                        next,
+                        execution_mode,
+                    )?;
+                }
+                if let Some((next, _)) = right_support {
+                    SideState::set_match_weight(
+                        &mut state.right.match_flags,
+                        &mut state.right.match_weights,
+                        $right_batch,
+                        $right_row,
+                        next,
+                        execution_mode,
+                    )?;
+                }
+                if let Some(weight) = pair_weight {
+                    push_output!(
+                        JoinOutputRow {
+                            left: Some(($left_batch, $left_row)),
+                            right: Some(($right_batch, $right_row)),
+                        },
+                        weight
+                    );
+                }
+                if let Some(weight) = left_support.and_then(|(_, transition)| transition) {
+                    push_output!(
+                        JoinOutputRow {
+                            left: Some(($left_batch, $left_row)),
+                            right: None,
+                        },
+                        weight
+                    );
+                }
+                if let Some(weight) = right_support.and_then(|(_, transition)| transition) {
+                    push_output!(
+                        JoinOutputRow {
+                            left: None,
+                            right: Some(($right_batch, $right_row)),
+                        },
+                        weight
+                    );
+                }
+                flush_if_needed!();
+            }};
+        }
+
+        macro_rules! probe_new_right {
+            ($initial:expr) => {{
+                if has_new_right {
+                    let rb_kc = &right_key_cols[new_right_batch_idx];
+                    let rb_ts = extract_column_as_timestamps(
+                        &state.right.batches[new_right_batch_idx],
+                        &config.right_time_column,
+                    )?;
+                    for (row_idx, &right_ts) in rb_ts.iter().enumerate() {
+                        if let Some(key_hash) = tuple_hash_at(rb_kc, row_idx) {
+                            let low = right_ts.saturating_sub(bound_ms);
+                            let high = right_ts;
+                            if let Some(times) = state.left.index.get(&key_hash) {
+                                'right_row_matches: for entries in
+                                    times.range(low..=high).map(|(_, entries)| entries)
+                                {
+                                    for &(l_batch, l_row) in entries {
+                                        if l_batch >= left_old_count {
+                                            continue;
+                                        }
+                                        if execution_mode == JoinExecutionMode::AppendOnly
+                                            && matches!(
+                                                config.join_type,
+                                                JoinType::LeftSemi | JoinType::LeftAnti
+                                            )
+                                            && state.left.match_weight(
+                                                l_batch,
+                                                l_row,
+                                                execution_mode,
+                                            )? != 0
+                                        {
+                                            continue;
+                                        }
+                                        if !tuples_equal(
+                                            &left_key_cols[l_batch],
+                                            l_row,
+                                            rb_kc,
+                                            row_idx,
+                                        ) {
+                                            continue;
+                                        }
+                                        admit_match!(
+                                            l_batch,
+                                            l_row,
+                                            new_right_batch_idx,
+                                            row_idx,
+                                            false,
+                                            $initial
+                                        );
+                                        if execution_mode == JoinExecutionMode::AppendOnly
+                                            && matches!(
+                                                config.join_type,
+                                                JoinType::RightSemi | JoinType::RightAnti
+                                            )
+                                        {
+                                            break 'right_row_matches;
+                                        }
+                                    }
+                                }
                             }
-                            if matches!(config.join_type, JoinType::LeftSemi | JoinType::LeftAnti)
-                                && state.left.row_flags[l_batch][l_row] & ROW_MATCHED != 0
-                            {
-                                continue;
-                            }
-                            if !tuples_equal(&left_key_cols[l_batch], l_row, rb_kc, row_idx) {
-                                continue;
-                            }
-                            admit_match!(l_batch, l_row, new_right_batch_idx, row_idx);
-                            if matches!(config.join_type, JoinType::RightSemi | JoinType::RightAnti)
-                            {
-                                break 'right_row_matches;
-                            }
+                        }
+                        if execution_mode == JoinExecutionMode::Weighted
+                            && config.join_type == JoinType::RightSemi
+                            && state.right.match_weight(
+                                new_right_batch_idx,
+                                row_idx,
+                                execution_mode,
+                            )? > 0
+                        {
+                            push_output!(
+                                JoinOutputRow {
+                                    left: None,
+                                    right: Some((new_right_batch_idx, row_idx)),
+                                },
+                                state.right.row_weight(new_right_batch_idx, row_idx)?
+                            );
+                            flush_if_needed!();
                         }
                     }
                 }
-            }
+            }};
+        }
+
+        macro_rules! probe_new_left {
+            ($initial:expr) => {{
+                if has_new_left {
+                    let lb_kc = &left_key_cols[new_left_batch_idx];
+                    let lb_ts = extract_column_as_timestamps(
+                        &state.left.batches[new_left_batch_idx],
+                        &config.left_time_column,
+                    )?;
+                    for (row_idx, &left_ts) in lb_ts.iter().enumerate() {
+                        if let Some(key_hash) = tuple_hash_at(lb_kc, row_idx) {
+                            let low = left_ts;
+                            let high = left_ts.saturating_add(bound_ms);
+                            if let Some(times) = state.right.index.get(&key_hash) {
+                                'left_row_matches: for entries in
+                                    times.range(low..=high).map(|(_, entries)| entries)
+                                {
+                                    for &(r_batch, r_row) in entries {
+                                        if execution_mode == JoinExecutionMode::AppendOnly
+                                            && matches!(
+                                                config.join_type,
+                                                JoinType::RightSemi | JoinType::RightAnti
+                                            )
+                                            && state.right.match_weight(
+                                                r_batch,
+                                                r_row,
+                                                execution_mode,
+                                            )? != 0
+                                        {
+                                            continue;
+                                        }
+                                        if !tuples_equal(
+                                            lb_kc,
+                                            row_idx,
+                                            &right_key_cols[r_batch],
+                                            r_row,
+                                        ) {
+                                            continue;
+                                        }
+                                        admit_match!(
+                                            new_left_batch_idx,
+                                            row_idx,
+                                            r_batch,
+                                            r_row,
+                                            $initial,
+                                            false
+                                        );
+                                        if execution_mode == JoinExecutionMode::AppendOnly
+                                            && matches!(
+                                                config.join_type,
+                                                JoinType::LeftSemi | JoinType::LeftAnti
+                                            )
+                                        {
+                                            break 'left_row_matches;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if execution_mode == JoinExecutionMode::Weighted
+                            && config.join_type == JoinType::LeftSemi
+                            && state.left.match_weight(
+                                new_left_batch_idx,
+                                row_idx,
+                                execution_mode,
+                            )? > 0
+                        {
+                            push_output!(
+                                JoinOutputRow {
+                                    left: Some((new_left_batch_idx, row_idx)),
+                                    right: None,
+                                },
+                                state.left.row_weight(new_left_batch_idx, row_idx)?
+                            );
+                            flush_if_needed!();
+                        }
+                    }
+                }
+            }};
+        }
+
+        if execution_mode == JoinExecutionMode::AppendOnly {
+            // Preserve the production kernel's established output order and saturated support path.
+            probe_new_left!(false);
+            probe_new_right!(false);
+        } else {
+            // Canonical differential fold: dR probes L_old before dL sees R_old + dR.
+            probe_new_right!(true);
+            probe_new_left!(true);
         }
 
         flush_output_rows(
             &mut output_rows,
+            &mut output_weights,
             output_schema,
             left_schema,
             right_schema,
@@ -2440,6 +3731,7 @@ pub(crate) fn execute_interval_join_cycle(
             &state.right.batches,
             &state.left.row_bytes,
             &state.right.row_bytes,
+            execution_mode,
             &mut result,
             output_budget,
         )?;
@@ -2447,7 +3739,14 @@ pub(crate) fn execute_interval_join_cycle(
     })();
     admitted.map_err(partial_apply)?;
     let closed = state
-        .finalize_closed_rows(config, left_watermark, right_watermark, true, output_budget)
+        .finalize_closed_rows(
+            config,
+            left_watermark,
+            right_watermark,
+            true,
+            execution_mode,
+            output_budget,
+        )
         .map_err(partial_apply)?;
     result.extend(closed);
     Ok(result)
@@ -2481,6 +3780,84 @@ mod tests {
             usize::MAX,
             &mut output_budget,
         )
+    }
+
+    fn execute_weighted_cycle(
+        state: &mut IntervalJoinState,
+        left_batches: &[RecordBatch],
+        right_batches: &[RecordBatch],
+        config: &StreamJoinConfig,
+        left_watermark: i64,
+        right_watermark: i64,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let mut output_budget = IntervalJoinOutputBudget::default();
+        execute_interval_join_cycle_with_mode(
+            state,
+            left_batches,
+            right_batches,
+            config,
+            left_watermark,
+            right_watermark,
+            left_watermark,
+            right_watermark,
+            usize::MAX,
+            &mut output_budget,
+            JoinExecutionMode::Weighted,
+        )
+    }
+
+    fn weighted_batch(batch: RecordBatch, weights: &[i64]) -> RecordBatch {
+        assert_eq!(batch.num_rows(), weights.len());
+        let input_schema = batch.schema();
+        let mut fields = input_schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        fields.push(Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            DataType::Int64,
+            false,
+        ));
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            input_schema.metadata().clone(),
+        ));
+        let mut columns = batch.columns().to_vec();
+        columns.push(Arc::new(Int64Array::from(weights.to_vec())));
+        RecordBatch::try_new(schema, columns).unwrap()
+    }
+
+    fn emitted_weights(output: &[RecordBatch]) -> Vec<i64> {
+        output
+            .iter()
+            .flat_map(|batch| {
+                let weight_index = batch.num_columns() - 1;
+                assert_eq!(
+                    batch.schema().field(weight_index).name(),
+                    laminar_core::changelog::WEIGHT_COLUMN
+                );
+                assert!(!batch.schema().field(weight_index).is_nullable());
+                assert_eq!(
+                    batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .filter(|field| { field.name() == laminar_core::changelog::WEIGHT_COLUMN })
+                        .count(),
+                    1
+                );
+                batch
+                    .column(weight_index)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     fn make_config() -> StreamJoinConfig {
@@ -2756,6 +4133,9 @@ mod tests {
         let checkpoint = state
             .snapshot_checkpoint(&config, crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES)
             .unwrap();
+        assert!(!checkpoint.weighted);
+        assert!(checkpoint.left_row_weights.is_empty());
+        assert_eq!(checkpoint.left_match_flags, vec![vec![1]]);
         let mut incompatible = config.clone();
         incompatible.join_type = JoinType::RightSemi;
         let error = IntervalJoinState::from_checkpoint(
@@ -2996,18 +4376,24 @@ mod tests {
         shared_timestamp
             .add_batch(
                 &left_batch(&["A", "A"], &[100, 100], &[1.0, 2.0]),
+                None,
                 &["id".to_string()],
                 "ts",
                 false,
+                false,
+                JoinExecutionMode::AppendOnly,
             )
             .unwrap();
         let mut distinct_topology = SideState::new();
         distinct_topology
             .add_batch(
                 &left_batch(&["A", "B"], &[100, 200], &[1.0, 2.0]),
+                None,
                 &["id".to_string()],
                 "ts",
                 false,
+                false,
+                JoinExecutionMode::AppendOnly,
             )
             .unwrap();
 
@@ -3035,7 +4421,6 @@ mod tests {
         .unwrap();
         assert!(!state.left.is_compact());
         let first_column = state.left.batches[0].column(0).clone();
-        let first_flags = Arc::clone(&state.left.row_flags[0]);
 
         let error = state
             .capture_checkpoint(&config)
@@ -3049,7 +4434,6 @@ mod tests {
         assert!(Arc::ptr_eq(&first_column, state.left.batches[0].column(0)));
 
         let capture = state.capture_checkpoint(&config).unwrap();
-        assert!(Arc::ptr_eq(&first_flags, &capture.left_row_flags[0]));
         assert!(Arc::ptr_eq(
             &first_column,
             capture.left_batches[0].column(0)
@@ -3058,14 +4442,16 @@ mod tests {
             .encode(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES)
             .unwrap();
         assert_eq!(checkpoint.left_buffer_rows, 1);
-        assert_eq!(checkpoint.left_row_flags, vec![vec![0]]);
+        assert!(checkpoint.left_row_weights.is_empty());
+        assert!(checkpoint.left_match_flags.is_empty());
         assert!(Arc::ptr_eq(&first_column, state.left.batches[0].column(0)));
         assert!(!state.left.is_compact());
     }
 
     #[test]
-    fn post_cut_flag_mutation_preserves_captured_flags() {
-        let config = make_config();
+    fn post_cut_support_mutation_preserves_captured_support() {
+        let mut config = make_config();
+        config.join_type = JoinType::LeftSemi;
         let mut state = IntervalJoinState::new();
         execute_interval_join_cycle(
             &mut state,
@@ -3087,21 +4473,22 @@ mod tests {
             0,
         )
         .unwrap();
-        assert_eq!(state.left.row_flags[0][0], ROW_MATCHED);
+        assert_eq!(state.left.match_flags[0][0], 1);
         assert!(!Arc::ptr_eq(
-            &capture.left_row_flags[0],
-            &state.left.row_flags[0]
+            &capture.left_match_flags[0],
+            &state.left.match_flags[0]
         ));
 
         let checkpoint = capture
             .encode(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES)
             .unwrap();
-        assert_eq!(checkpoint.left_row_flags, vec![vec![0]]);
+        assert_eq!(checkpoint.left_match_flags, vec![vec![0]]);
     }
 
     #[test]
     fn restore_cardinality_preflight_precedes_ipc_decode() {
         let checkpoint = JoinStateCheckpoint {
+            weighted: false,
             join_type: join_type_tag(JoinType::Inner),
             left_keys: vec!["id".into()],
             right_keys: vec!["id".into()],
@@ -3116,8 +4503,12 @@ mod tests {
             right_batches: Vec::new(),
             left_evicted_cutoff: i64::MIN,
             right_evicted_cutoff: i64::MIN,
-            left_row_flags: vec![vec![0, 0]],
-            right_row_flags: Vec::new(),
+            left_row_weights: Vec::new(),
+            right_row_weights: Vec::new(),
+            left_match_flags: Vec::new(),
+            right_match_flags: Vec::new(),
+            left_match_weights: Vec::new(),
+            right_match_weights: Vec::new(),
         };
         let error = IntervalJoinState::from_checkpoint(
             &checkpoint,
@@ -3139,6 +4530,8 @@ mod tests {
             .preflight_input_growth(
                 &[left_batch(&["A"], &[100], &[1.0])],
                 &[],
+                JoinType::Inner,
+                JoinExecutionMode::AppendOnly,
                 state.accounted_state_bytes(),
             )
             .unwrap_err();
@@ -3167,7 +4560,11 @@ mod tests {
             .checked_add(
                 state
                     .left
-                    .worst_case_input_growth(std::slice::from_ref(&incoming))
+                    .worst_case_input_growth(
+                        std::slice::from_ref(&incoming),
+                        false,
+                        JoinExecutionMode::AppendOnly,
+                    )
                     .unwrap(),
             )
             .unwrap();
@@ -3216,9 +4613,12 @@ mod tests {
             .left
             .add_batch(
                 &left_batch(&keys, &timestamps, &values),
+                None,
                 &["id".to_string()],
                 "ts",
                 false,
+                false,
+                JoinExecutionMode::AppendOnly,
             )
             .unwrap();
 
@@ -3226,6 +4626,8 @@ mod tests {
             .preflight_input_growth(
                 &[left_batch(&["hot"], &[100], &[1.0])],
                 &[],
+                JoinType::Inner,
+                JoinExecutionMode::AppendOnly,
                 state.accounted_state_bytes().saturating_add(64 * 1024),
             )
             .unwrap();
@@ -3236,9 +4638,12 @@ mod tests {
         let mut side = SideState::new();
         side.add_batch(
             &left_batch(&["A"], &[100], &[1.0]),
+            None,
             &["id".to_string()],
             "ts",
             false,
+            false,
+            JoinExecutionMode::AppendOnly,
         )
         .unwrap();
         let before_index = side.index.clone();
@@ -3466,6 +4871,87 @@ mod tests {
     }
 
     #[test]
+    fn append_normalization_borrows_plain_batches_and_owns_only_weight_strips() {
+        let config = make_config();
+        let plain_input = [left_batch(&["A"], &[100], &[1.0])];
+        let plain = normalize_join_input(
+            "left",
+            &plain_input,
+            &config.left_keys,
+            &config.left_time_column,
+            0,
+            JoinExecutionMode::AppendOnly,
+        )
+        .unwrap();
+        assert!(plain.row_weights.is_empty());
+        assert!(matches!(&plain.batches, Cow::Borrowed(_)));
+
+        let weighted_input = [weighted_batch(left_batch(&["A"], &[100], &[1.0]), &[1])];
+        let stripped = normalize_join_input(
+            "left",
+            &weighted_input,
+            &config.left_keys,
+            &config.left_time_column,
+            0,
+            JoinExecutionMode::AppendOnly,
+        )
+        .unwrap();
+        assert!(stripped.row_weights.is_empty());
+        assert!(matches!(&stripped.batches, Cow::Owned(_)));
+        assert_eq!(stripped.batches[0].num_columns(), 3);
+        assert_eq!(
+            std::mem::size_of::<JoinOutputRow>(),
+            std::mem::size_of::<(Option<(usize, usize)>, Option<(usize, usize)>,)>()
+        );
+    }
+
+    #[test]
+    fn side_admission_requires_mode_exact_weight_rosters() {
+        let batch = left_batch(&["A"], &[100], &[1.0]);
+        let keys = ["id".to_string()];
+
+        let mut append = SideState::new();
+        append
+            .add_batch(
+                &batch,
+                None,
+                &keys,
+                "ts",
+                false,
+                false,
+                JoinExecutionMode::AppendOnly,
+            )
+            .unwrap();
+        assert!(append.row_weights.is_empty());
+
+        let append_error = SideState::new()
+            .add_batch(
+                &batch,
+                Some(Arc::<[i64]>::from([1_i64])),
+                &keys,
+                "ts",
+                false,
+                false,
+                JoinExecutionMode::AppendOnly,
+            )
+            .unwrap_err();
+        assert!(append_error.to_string().contains("row-weight roster"));
+
+        let weighted_error = SideState::new()
+            .add_batch(
+                &batch,
+                None,
+                &keys,
+                "ts",
+                false,
+                false,
+                JoinExecutionMode::Weighted,
+            )
+            .unwrap_err();
+        assert!(weighted_error.to_string().contains("row-weight roster"));
+    }
+
+    #[test]
     fn negative_weight_fails_before_state_mutation() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
@@ -3495,7 +4981,7 @@ mod tests {
         let error =
             execute_interval_join_cycle(&mut state, &[retraction], &[], &make_config(), 0, 0)
                 .unwrap_err();
-        assert!(error.to_string().contains("only +1 weights"));
+        assert!(error.to_string().contains("requires +1 weights"));
         assert_eq!(state.left.row_count, 0);
     }
 
@@ -3637,5 +5123,500 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, DbError::BackpressureFail(_)));
+    }
+
+    #[test]
+    fn weighted_deltas_cover_all_interval_join_kinds() {
+        let cases = [
+            (JoinType::Inner, vec![6, -6]),
+            (JoinType::Left, vec![6, -6, 2]),
+            (JoinType::Right, vec![6, -6]),
+            (JoinType::Full, vec![6, -6, 2]),
+            (JoinType::LeftSemi, vec![2, -2]),
+            (JoinType::LeftAnti, vec![2]),
+            (JoinType::RightSemi, vec![3, -3]),
+            (JoinType::RightAnti, Vec::new()),
+        ];
+
+        for (join_type, expected) in cases {
+            let mut config = make_config();
+            config.join_type = join_type;
+            let mut state = IntervalJoinState::new_weighted();
+            let mut output = execute_weighted_cycle(
+                &mut state,
+                &[weighted_batch(left_batch(&["A"], &[100], &[1.0]), &[2])],
+                &[weighted_batch(right_batch(&["A"], &[110], &[10.0]), &[3])],
+                &config,
+                0,
+                0,
+            )
+            .unwrap();
+            output.extend(
+                execute_weighted_cycle(
+                    &mut state,
+                    &[],
+                    &[weighted_batch(right_batch(&["A"], &[110], &[10.0]), &[-3])],
+                    &config,
+                    0,
+                    0,
+                )
+                .unwrap(),
+            );
+            output.extend(
+                execute_weighted_cycle(&mut state, &[], &[], &config, 1_000, 1_000).unwrap(),
+            );
+            assert_eq!(emitted_weights(&output), expected, "{join_type:?}");
+        }
+    }
+
+    #[test]
+    fn execution_mode_is_bound_even_while_state_is_empty() {
+        let config = make_config();
+        let mut append_only = IntervalJoinState::new();
+        let error = execute_weighted_cycle(&mut append_only, &[], &[], &config, 0, 0)
+            .expect_err("append-only state must reject weighted execution");
+        assert!(error.to_string().contains("execution mode changed"));
+        assert_eq!(append_only.buffered_rows(), (0, 0));
+
+        let mut weighted = IntervalJoinState::new_weighted();
+        let error = execute_interval_join_cycle(&mut weighted, &[], &[], &config, 0, 0)
+            .expect_err("weighted state must reject append-only execution");
+        assert!(error.to_string().contains("execution mode changed"));
+        assert_eq!(weighted.buffered_rows(), (0, 0));
+    }
+
+    #[test]
+    fn weighted_semi_tracks_full_support_and_canonical_right_delta_order() {
+        let mut left_semi = make_config();
+        left_semi.join_type = JoinType::LeftSemi;
+        let mut state = IntervalJoinState::new_weighted();
+        let first = execute_weighted_cycle(
+            &mut state,
+            &[weighted_batch(left_batch(&["A"], &[100], &[1.0]), &[5])],
+            &[weighted_batch(
+                right_batch(&["A", "A"], &[110, 110], &[10.0, 20.0]),
+                &[2, 3],
+            )],
+            &left_semi,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(emitted_weights(&first), vec![5]);
+        let still_matched = execute_weighted_cycle(
+            &mut state,
+            &[],
+            &[weighted_batch(right_batch(&["A"], &[110], &[10.0]), &[-2])],
+            &left_semi,
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(still_matched.is_empty());
+        let becomes_unmatched = execute_weighted_cycle(
+            &mut state,
+            &[],
+            &[weighted_batch(right_batch(&["A"], &[110], &[20.0]), &[-3])],
+            &left_semi,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(emitted_weights(&becomes_unmatched), vec![-5]);
+
+        let mut right_semi = make_config();
+        right_semi.join_type = JoinType::RightSemi;
+        let mut ordered = IntervalJoinState::new_weighted();
+        execute_weighted_cycle(
+            &mut ordered,
+            &[weighted_batch(left_batch(&["A"], &[100], &[1.0]), &[1])],
+            &[],
+            &right_semi,
+            0,
+            0,
+        )
+        .unwrap();
+        let output = execute_weighted_cycle(
+            &mut ordered,
+            &[weighted_batch(left_batch(&["A"], &[100], &[1.0]), &[-1])],
+            &[weighted_batch(right_batch(&["A"], &[110], &[10.0]), &[1])],
+            &right_semi,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(emitted_weights(&output), vec![1, -1]);
+    }
+
+    #[test]
+    fn weighted_cross_term_is_emitted_once() {
+        let config = make_config();
+        let mut state = IntervalJoinState::new_weighted();
+        execute_weighted_cycle(
+            &mut state,
+            &[weighted_batch(left_batch(&["A"], &[100], &[1.0]), &[2])],
+            &[weighted_batch(right_batch(&["A"], &[110], &[10.0]), &[3])],
+            &config,
+            0,
+            0,
+        )
+        .unwrap();
+        let output = execute_weighted_cycle(
+            &mut state,
+            &[weighted_batch(left_batch(&["A"], &[100], &[2.0]), &[5])],
+            &[weighted_batch(right_batch(&["A"], &[110], &[20.0]), &[7])],
+            &config,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(emitted_weights(&output), vec![14, 15, 35]);
+    }
+
+    #[test]
+    fn weighted_checkpoint_is_shallow_and_restores_exact_support() {
+        let mut config = make_config();
+        config.join_type = JoinType::LeftSemi;
+        let mut state = IntervalJoinState::new_weighted();
+        execute_weighted_cycle(
+            &mut state,
+            &[weighted_batch(left_batch(&["A"], &[100], &[1.0]), &[4])],
+            &[weighted_batch(right_batch(&["A"], &[110], &[10.0]), &[2])],
+            &config,
+            0,
+            0,
+        )
+        .unwrap();
+        let row_weights = Arc::clone(&state.left.row_weights[0]);
+        let match_weights = Arc::clone(&state.left.match_weights[0]);
+        let capture = state.capture_checkpoint(&config).unwrap();
+        assert!(Arc::ptr_eq(&row_weights, &capture.left_row_weights[0]));
+        assert!(Arc::ptr_eq(&match_weights, &capture.left_match_weights[0]));
+
+        let checkpoint = capture
+            .encode(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES)
+            .unwrap();
+        assert!(checkpoint.weighted);
+        let mode_error = IntervalJoinState::from_checkpoint(
+            &checkpoint,
+            &config,
+            crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
+        )
+        .err()
+        .expect("weighted checkpoint must not restore into append-only state");
+        assert!(mode_error.to_string().contains("execution mode"));
+        let mut restored = IntervalJoinState::from_checkpoint_with_mode(
+            &checkpoint,
+            &config,
+            crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
+            JoinExecutionMode::Weighted,
+        )
+        .unwrap();
+        let output = execute_weighted_cycle(
+            &mut restored,
+            &[],
+            &[weighted_batch(right_batch(&["A"], &[110], &[10.0]), &[-2])],
+            &config,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(emitted_weights(&output), vec![-4]);
+
+        execute_weighted_cycle(
+            &mut state,
+            &[],
+            &[weighted_batch(right_batch(&["A"], &[110], &[10.0]), &[-2])],
+            &config,
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&match_weights, &state.left.match_weights[0]));
+        assert!(Arc::ptr_eq(&row_weights, &state.left.row_weights[0]));
+    }
+
+    #[test]
+    fn weighted_checkpoint_compaction_keeps_payload_and_weight_rosters_aligned() {
+        let mut config = make_config();
+        config.join_type = JoinType::LeftSemi;
+        let mut state = IntervalJoinState::new_weighted();
+        execute_weighted_cycle(
+            &mut state,
+            &[weighted_batch(
+                left_batch_nullable(&[Some("A"), None], &[100, 200], &[1.0, 2.0]),
+                &[7, -2],
+            )],
+            &[],
+            &config,
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(!state.left.is_compact());
+
+        let checkpoint = state
+            .capture_checkpoint(&config)
+            .unwrap()
+            .encode(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES)
+            .unwrap();
+        assert_eq!(checkpoint.left_row_weights, vec![vec![7]]);
+        assert_eq!(checkpoint.left_match_weights, vec![vec![0]]);
+        let decoded =
+            laminar_core::serialization::deserialize_batch_stream(&checkpoint.left_batches[0])
+                .unwrap();
+        assert_eq!(decoded.num_rows(), 1);
+        assert_eq!(
+            decoded
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "A"
+        );
+    }
+
+    #[test]
+    fn weighted_checkpoint_keeps_support_after_opposite_eviction() {
+        let mut config = make_config();
+        config.join_type = JoinType::Left;
+        let mut state = IntervalJoinState::new_weighted();
+        execute_weighted_cycle(
+            &mut state,
+            &[weighted_batch(left_batch(&["A"], &[100], &[1.0]), &[1])],
+            &[weighted_batch(right_batch(&["A"], &[110], &[10.0]), &[1])],
+            &config,
+            0,
+            0,
+        )
+        .unwrap();
+        execute_weighted_cycle(&mut state, &[], &[], &config, 200, 150).unwrap();
+        assert_eq!(state.buffered_rows(), (1, 0));
+
+        let checkpoint = state
+            .capture_checkpoint(&config)
+            .unwrap()
+            .encode(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES)
+            .unwrap();
+        let mut restored = IntervalJoinState::from_checkpoint_with_mode(
+            &checkpoint,
+            &config,
+            crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
+            JoinExecutionMode::Weighted,
+        )
+        .unwrap();
+        let output = execute_weighted_cycle(&mut restored, &[], &[], &config, 200, 300).unwrap();
+        assert!(
+            output.is_empty(),
+            "matched left row became falsely unmatched"
+        );
+    }
+
+    #[test]
+    fn weighted_arithmetic_and_late_deltas_fail_closed() {
+        let config = make_config();
+        let mut overflow = IntervalJoinState::new_weighted();
+        let error = execute_weighted_cycle(
+            &mut overflow,
+            &[weighted_batch(
+                left_batch(&["A"], &[100], &[1.0]),
+                &[i64::MAX],
+            )],
+            &[weighted_batch(right_batch(&["A"], &[110], &[10.0]), &[2])],
+            &config,
+            0,
+            0,
+        )
+        .unwrap_err();
+        assert!(error.requires_pipeline_halt());
+        assert!(error.to_string().contains("multiplication overflow"));
+
+        let mut left_semi = make_config();
+        left_semi.join_type = JoinType::LeftSemi;
+        let mut underflow = IntervalJoinState::new_weighted();
+        execute_weighted_cycle(
+            &mut underflow,
+            &[weighted_batch(left_batch(&["A"], &[100], &[1.0]), &[1])],
+            &[],
+            &left_semi,
+            0,
+            0,
+        )
+        .unwrap();
+        let error = execute_weighted_cycle(
+            &mut underflow,
+            &[],
+            &[weighted_batch(right_batch(&["A"], &[110], &[10.0]), &[-1])],
+            &left_semi,
+            0,
+            0,
+        )
+        .unwrap_err();
+        assert!(error.requires_pipeline_halt());
+        assert!(error.to_string().contains("became negative"));
+        assert_eq!(underflow.left.match_weights[0][0], 0);
+
+        let mut support_overflow = IntervalJoinState::new_weighted();
+        execute_weighted_cycle(
+            &mut support_overflow,
+            &[weighted_batch(left_batch(&["A"], &[100], &[1.0]), &[1])],
+            &[weighted_batch(
+                right_batch(&["A"], &[110], &[10.0]),
+                &[i64::MAX],
+            )],
+            &left_semi,
+            0,
+            0,
+        )
+        .unwrap();
+        let error = execute_weighted_cycle(
+            &mut support_overflow,
+            &[],
+            &[weighted_batch(right_batch(&["A"], &[110], &[10.0]), &[1])],
+            &left_semi,
+            0,
+            0,
+        )
+        .unwrap_err();
+        assert!(error.requires_pipeline_halt());
+        assert!(error.to_string().contains("match-support overflow"));
+        assert_eq!(support_overflow.left.match_weights[0][0], i64::MAX);
+
+        let mut negate_overflow = IntervalJoinState::new_weighted();
+        execute_weighted_cycle(
+            &mut negate_overflow,
+            &[weighted_batch(
+                left_batch(&["A"], &[100], &[1.0]),
+                &[i64::MIN],
+            )],
+            &[weighted_batch(right_batch(&["A"], &[110], &[10.0]), &[1])],
+            &left_semi,
+            0,
+            0,
+        )
+        .unwrap();
+        let error = execute_weighted_cycle(
+            &mut negate_overflow,
+            &[],
+            &[weighted_batch(right_batch(&["A"], &[110], &[10.0]), &[-1])],
+            &left_semi,
+            0,
+            0,
+        )
+        .unwrap_err();
+        assert!(error.requires_pipeline_halt());
+        assert!(error.to_string().contains("semi-join retraction overflow"));
+        assert_eq!(negate_overflow.left.match_weights[0][0], 1);
+
+        let mut late = IntervalJoinState::new_weighted();
+        let error = execute_interval_join_cycle_with_mode(
+            &mut late,
+            &[weighted_batch(left_batch(&["A"], &[99], &[1.0]), &[-1])],
+            &[],
+            &config,
+            100,
+            0,
+            100,
+            0,
+            usize::MAX,
+            &mut IntervalJoinOutputBudget::default(),
+            JoinExecutionMode::Weighted,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("late row"));
+        assert_eq!(late.buffered_rows(), (0, 0));
+    }
+
+    #[test]
+    fn weighted_output_budget_accounts_for_the_trailing_weight_before_build() {
+        let config = make_config();
+        let initial_bytes = MAX_CYCLE_OUTPUT_BYTES - 225;
+        let mut append_only = IntervalJoinState::new();
+        let mut append_budget = IntervalJoinOutputBudget {
+            emitted_rows: 0,
+            emitted_bytes: initial_bytes,
+        };
+        let append_result = super::execute_interval_join_cycle(
+            &mut append_only,
+            &[left_batch(&["A"], &[100], &[1.0])],
+            &[right_batch(&["A"], &[110], &[10.0])],
+            &config,
+            0,
+            0,
+            0,
+            0,
+            usize::MAX,
+            &mut append_budget,
+        );
+        match append_result {
+            Ok(output) => assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 1),
+            Err(error) => {
+                assert!(error.to_string().contains("exceeded"));
+                assert!(!error.to_string().contains("would exceed"));
+            }
+        }
+
+        let mut state = IntervalJoinState::new_weighted();
+        let mut output_budget = IntervalJoinOutputBudget {
+            emitted_rows: 0,
+            emitted_bytes: initial_bytes,
+        };
+        let error = execute_interval_join_cycle_with_mode(
+            &mut state,
+            &[weighted_batch(left_batch(&["A"], &[100], &[1.0]), &[1])],
+            &[weighted_batch(right_batch(&["A"], &[110], &[10.0]), &[1])],
+            &config,
+            0,
+            0,
+            0,
+            0,
+            usize::MAX,
+            &mut output_budget,
+            JoinExecutionMode::Weighted,
+        )
+        .unwrap_err();
+        assert!(matches!(error, DbError::BackpressureFail(_)));
+        assert!(error.to_string().contains("would exceed"));
+        assert_eq!(output_budget.emitted_bytes, initial_bytes);
+    }
+
+    #[test]
+    fn weighted_restore_rejects_corrupt_support_before_ipc_decode() {
+        let mut config = make_config();
+        config.join_type = JoinType::LeftSemi;
+        let checkpoint = JoinStateCheckpoint {
+            weighted: true,
+            join_type: join_type_tag(config.join_type),
+            left_keys: config.left_keys.clone(),
+            right_keys: config.right_keys.clone(),
+            left_time_column: config.left_time_column.clone(),
+            right_time_column: config.right_time_column.clone(),
+            left_table: config.left_table.clone(),
+            right_table: config.right_table.clone(),
+            bound_ms: 100,
+            left_buffer_rows: 1,
+            right_buffer_rows: 0,
+            left_batches: vec![vec![0xff]],
+            right_batches: Vec::new(),
+            left_evicted_cutoff: i64::MIN,
+            right_evicted_cutoff: i64::MIN,
+            left_row_weights: vec![vec![1]],
+            right_row_weights: Vec::new(),
+            left_match_flags: Vec::new(),
+            right_match_flags: Vec::new(),
+            left_match_weights: vec![vec![-1]],
+            right_match_weights: Vec::new(),
+        };
+        let error = IntervalJoinState::from_checkpoint_with_mode(
+            &checkpoint,
+            &config,
+            crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
+            JoinExecutionMode::Weighted,
+        )
+        .err()
+        .expect("corrupt weighted support must fail before IPC decode");
+        assert!(error.to_string().contains("invalid match weights"));
+        assert!(!error.to_string().contains("deserialization"));
     }
 }
