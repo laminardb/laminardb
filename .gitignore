@@ -51,7 +51,6 @@ wal/
 /tools/*
 !/tools/independent-soak-contract/
 !/tools/kafka-transaction-probe/
-!/tools/state-backend-zipf-oracle/
 
 # Private configs (symlinked from private repo)
 CLAUDE.md

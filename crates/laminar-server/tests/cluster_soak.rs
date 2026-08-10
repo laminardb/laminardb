@@ -17,8 +17,9 @@
 //! duplicates. The exact legs use checkpoint-replayable Kafka inputs and coordinated Delta append;
 //! an independent snapshot oracle requires the main frozen output exactly once. All four join legs
 //! phase the matrix across faults and require connector-visible keyed aggregate results that combine
-//! pre-fault retained state with post-fault input. The local exact leg separately validates
-//! finite-source and retained-state recovery.
+//! pre-fault retained state with post-fault input. That phased source also closes direct TUMBLE,
+//! HOP, and SESSION state after recovery. The local exact leg separately validates finite-source
+//! and retained-state recovery.
 //!
 //! Ignored by default — spawns processes and runs for minutes:
 //!
@@ -277,6 +278,37 @@ const MATRIX_OUTPUT_PIPELINES: [&str; 8] = [
 ];
 
 #[cfg(feature = "kafka")]
+#[derive(Clone, Copy)]
+struct CoreWindowCanary {
+    kind: &'static str,
+    pipeline: &'static str,
+    expression: &'static str,
+    emit: &'static str,
+}
+
+#[cfg(feature = "kafka")]
+const CORE_WINDOW_CANARIES: [CoreWindowCanary; 3] = [
+    CoreWindowCanary {
+        kind: "tumble",
+        pipeline: "soak_window_tumble",
+        expression: "TUMBLE(event_time, INTERVAL '1' SECOND)",
+        emit: "EMIT ON WINDOW CLOSE",
+    },
+    CoreWindowCanary {
+        kind: "hop",
+        pipeline: "soak_window_hop",
+        expression: "HOP(event_time, INTERVAL '500' MILLISECOND, INTERVAL '1' SECOND)",
+        emit: "EMIT FINAL",
+    },
+    CoreWindowCanary {
+        kind: "session",
+        pipeline: "soak_window_session",
+        expression: "SESSION(event_time, INTERVAL '1' SECOND)",
+        emit: "EMIT ON WINDOW CLOSE",
+    },
+];
+
+#[cfg(feature = "kafka")]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct MatrixOutput {
     join_case: String,
@@ -292,6 +324,15 @@ struct MatrixAggregateOutput {
     right_count: u64,
     left_sum: Option<i64>,
     right_sum: Option<i64>,
+}
+
+#[cfg(feature = "kafka")]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CoreWindowOutput {
+    kind: String,
+    window_start_ms: i64,
+    row_count: u64,
+    id_sum: i64,
 }
 
 #[cfg(feature = "kafka")]
@@ -4078,6 +4119,280 @@ fn record_consumed_offset(consumed: &mut [i64], partition: i32, offset: i64) {
 }
 
 #[cfg(feature = "kafka")]
+fn expected_core_window_outputs(event_time_ms: u64) -> BTreeMap<CoreWindowOutput, u64> {
+    let event_time_ms = i64::try_from(event_time_ms).expect("window event time fits i64");
+    let tumble_start = event_time_ms.div_euclid(1_000) * 1_000;
+    let latest_hop_start = event_time_ms.div_euclid(500) * 500;
+    [
+        CoreWindowOutput {
+            kind: "tumble".to_owned(),
+            window_start_ms: tumble_start,
+            row_count: 4,
+            id_sum: -412,
+        },
+        CoreWindowOutput {
+            kind: "hop".to_owned(),
+            window_start_ms: latest_hop_start - 500,
+            row_count: 4,
+            id_sum: -412,
+        },
+        CoreWindowOutput {
+            kind: "hop".to_owned(),
+            window_start_ms: latest_hop_start,
+            row_count: 4,
+            id_sum: -412,
+        },
+        CoreWindowOutput {
+            kind: "session".to_owned(),
+            window_start_ms: event_time_ms,
+            row_count: 4,
+            id_sum: -412,
+        },
+    ]
+    .into_iter()
+    .fold(BTreeMap::new(), |mut expected, row| {
+        *expected.entry(row).or_default() += 1;
+        expected
+    })
+}
+
+#[cfg(feature = "kafka")]
+fn json_timestamp_ms(value: &serde_json::Value, field: &str, context: &str) -> Result<i64, String> {
+    let value = value
+        .get(field)
+        .ok_or_else(|| format!("{context} has no {field}: {value}"))?;
+    if let Some(timestamp) = value.as_i64() {
+        return Ok(timestamp);
+    }
+    let timestamp = value
+        .as_str()
+        .ok_or_else(|| format!("{context} {field} is not a timestamp string: {value}"))?;
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|parsed| parsed.timestamp_millis())
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S%.f")
+                .map(|parsed| parsed.and_utc().timestamp_millis())
+        })
+        .map_err(|error| format!("{context} {field} {timestamp:?} is invalid: {error}"))
+}
+
+#[cfg(feature = "kafka")]
+fn decode_core_window_output(value: &serde_json::Value) -> Result<CoreWindowOutput, String> {
+    let kind = value
+        .get("window_kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("window output has no string window_kind: {value}"))?;
+    let row_count = value
+        .get("row_count")
+        .and_then(json_u64)
+        .ok_or_else(|| format!("window output has no non-negative row_count: {value}"))?;
+    let id_sum = value
+        .get("id_sum")
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
+        .ok_or_else(|| format!("window output has no signed id_sum: {value}"))?;
+    Ok(CoreWindowOutput {
+        kind: kind.to_owned(),
+        window_start_ms: json_timestamp_ms(value, "window_start", "window output")?,
+        row_count,
+        id_sum,
+    })
+}
+
+#[cfg(feature = "kafka")]
+struct KafkaCoreWindowOracle {
+    consumer: rdkafka::consumer::BaseConsumer,
+    topic: String,
+    consumed_offsets: Vec<i64>,
+    observed: BTreeMap<CoreWindowOutput, u64>,
+}
+
+#[cfg(feature = "kafka")]
+impl KafkaCoreWindowOracle {
+    fn new(brokers: &str, topic: &str) -> Self {
+        use rdkafka::consumer::Consumer;
+        use rdkafka::{Offset, TopicPartitionList};
+
+        let consumer: rdkafka::consumer::BaseConsumer = rdkafka::ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .set(
+                "group.id",
+                format!("laminardb-soak-window-oracle-{}", std::process::id()),
+            )
+            .set("enable.auto.commit", "false")
+            .create()
+            .expect("Kafka CoreWindow oracle consumer");
+        let mut assignment = TopicPartitionList::with_capacity(
+            usize::try_from(OUTPUT_TOPIC_PARTITIONS).expect("window partition count fits usize"),
+        );
+        for partition in 0..OUTPUT_TOPIC_PARTITIONS {
+            assignment
+                .add_partition_offset(topic, partition, Offset::Beginning)
+                .expect("build CoreWindow oracle assignment");
+        }
+        consumer
+            .assign(&assignment)
+            .expect("assign CoreWindow oracle from beginning");
+        Self {
+            consumer,
+            topic: topic.to_owned(),
+            consumed_offsets: vec![
+                0;
+                usize::try_from(OUTPUT_TOPIC_PARTITIONS)
+                    .expect("window partition count fits usize")
+            ],
+            observed: BTreeMap::new(),
+        }
+    }
+
+    fn high_watermarks(&self) -> Option<Vec<i64>> {
+        kafka_high_watermarks(&self.consumer, &self.topic, OUTPUT_TOPIC_PARTITIONS)
+    }
+
+    fn consumed_through(&self, boundary: &[i64]) -> bool {
+        self.consumed_offsets.len() == boundary.len()
+            && self
+                .consumed_offsets
+                .iter()
+                .zip(boundary)
+                .all(|(consumed, boundary)| consumed >= boundary)
+    }
+
+    fn drain(&mut self) -> Result<usize, String> {
+        use rdkafka::message::Message;
+
+        let mut drained = 0;
+        while let Some(result) = self.consumer.poll(Duration::ZERO) {
+            let message = result.map_err(|error| format!("Kafka window read failed: {error}"))?;
+            record_consumed_offset(
+                &mut self.consumed_offsets,
+                message.partition(),
+                message.offset(),
+            );
+            let payload = message
+                .payload()
+                .ok_or_else(|| "Kafka window output had a null payload".to_owned())?;
+            let value: serde_json::Value = serde_json::from_slice(payload)
+                .map_err(|error| format!("invalid Kafka window JSON: {error}"))?;
+            let output = decode_core_window_output(&value)?;
+            *self.observed.entry(output).or_default() += 1;
+            drained += 1;
+        }
+        Ok(drained)
+    }
+}
+
+#[cfg(feature = "kafka")]
+fn validate_core_window_outputs(
+    observed: &BTreeMap<CoreWindowOutput, u64>,
+    expected: &BTreeMap<CoreWindowOutput, u64>,
+    exactly_once: bool,
+) -> Result<u64, String> {
+    for (row, count) in observed {
+        let Some(expected_count) = expected.get(row) else {
+            return Err(format!("unexpected CoreWindow output {row:?}"));
+        };
+        if exactly_once && count != expected_count {
+            return Err(format!(
+                "CoreWindow output {row:?} occurred {count} times; expected {expected_count}"
+            ));
+        }
+    }
+    for (row, expected_count) in expected {
+        let observed_count = observed.get(row).copied().unwrap_or(0);
+        if observed_count < *expected_count {
+            return Err(format!(
+                "CoreWindow output {row:?} occurred {observed_count} times; expected at least {expected_count}"
+            ));
+        }
+    }
+    Ok(observed.values().copied().sum())
+}
+
+#[cfg(feature = "kafka")]
+fn assert_kafka_core_window_outputs(
+    nodes: &mut [Node],
+    output: &mut KafkaCoreWindowOracle,
+    expected: &BTreeMap<CoreWindowOutput, u64>,
+    frozen_input_at: Instant,
+    window: Duration,
+    label: &str,
+) {
+    let deadline = Instant::now() + window;
+    let visibility_slo = Duration::from_millis(env_u64(
+        "LAMINAR_SOAK_ALO_VISIBILITY_MS",
+        DEFAULT_ALO_VISIBILITY_MS,
+    ));
+    let mut last_boundary = None;
+    let mut quiet_since = None;
+    let mut visibility_checked = false;
+    loop {
+        assert_running_nodes(nodes);
+        let drained = output
+            .drain()
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+        if let Some((row, count)) = output
+            .observed
+            .iter()
+            .find(|(row, _)| !expected.contains_key(*row))
+        {
+            panic!("{label}: unexpected CoreWindow output {row:?} occurred {count} times");
+        }
+        let complete = validate_core_window_outputs(&output.observed, expected, false).is_ok();
+        if complete && !visibility_checked {
+            let visibility = frozen_input_at.elapsed();
+            assert!(
+                visibility <= visibility_slo,
+                "{label}: CoreWindow output visibility {visibility:?} exceeded {visibility_slo:?}"
+            );
+            eprintln!(
+                "soak: PROFILE {label} CoreWindow visibility_ms={:.3}",
+                visibility.as_secs_f64() * 1_000.0
+            );
+            visibility_checked = true;
+        }
+        let boundary = output.high_watermarks();
+        let consumed_boundary = boundary
+            .as_ref()
+            .is_some_and(|boundary| output.consumed_through(boundary));
+        if complete
+            && consumed_boundary
+            && drained == 0
+            && boundary.is_some()
+            && boundary == last_boundary
+        {
+            let quiet_since = quiet_since.get_or_insert_with(Instant::now);
+            if quiet_since.elapsed() >= OUTPUT_BOUNDARY_STABILITY {
+                let records = validate_core_window_outputs(&output.observed, expected, false)
+                    .expect("CoreWindow output was validated above");
+                eprintln!(
+                    "soak: {label} validated {} window rows across {records} ALO records",
+                    expected.len()
+                );
+                return;
+            }
+        } else {
+            quiet_since = None;
+        }
+        last_boundary = boundary;
+        assert!(
+            Instant::now() < deadline,
+            "{label}: CoreWindow output incomplete: {}",
+            match validate_core_window_outputs(&output.observed, expected, false) {
+                Ok(records) => format!(
+                    "observed {records} valid records but the output boundary did not stabilize"
+                ),
+                Err(error) => error,
+            }
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(feature = "kafka")]
 struct KafkaOutputOracle {
     consumer: rdkafka::consumer::BaseConsumer,
     topic: String,
@@ -4231,30 +4546,11 @@ fn parse_temporal_output(
                 .ok_or_else(|| {
                     format!("temporal probe output has no integer offset_ms: {value}")
                 })?;
-            let probe_time = value
-                .get("probe_time")
-                .ok_or_else(|| format!("temporal probe output has no probe_time: {value}"))?;
-            let probe_time_ms = if let Some(timestamp) = probe_time.as_i64() {
-                timestamp
-            } else {
-                let timestamp = probe_time.as_str().ok_or_else(|| {
-                    format!("temporal probe_time is not a timestamp string: {value}")
-                })?;
-                chrono::DateTime::parse_from_rfc3339(timestamp)
-                    .map(|parsed| parsed.timestamp_millis())
-                    .or_else(|_| {
-                        chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S%.f")
-                            .map(|parsed| parsed.and_utc().timestamp_millis())
-                    })
-                    .map_err(|error| {
-                        format!("temporal probe_time {timestamp:?} is invalid: {error}")
-                    })?
-            };
             Ok(TemporalOutput::InnerProbe {
                 left_id,
                 right_id: unsigned("right_id")?,
                 offset_ms,
-                probe_time_ms,
+                probe_time_ms: json_timestamp_ms(value, "probe_time", "temporal probe output")?,
             })
         }
     }
@@ -4891,6 +5187,13 @@ struct DeltaTemporalSnapshot {
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+#[derive(Clone, Debug)]
+struct DeltaCoreWindowSnapshot {
+    version: i64,
+    outputs: BTreeMap<CoreWindowOutput, u64>,
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 struct DeltaOutputOracle {
     table_uri: String,
     storage_options: HashMap<String, String>,
@@ -5348,6 +5651,201 @@ impl DeltaOutputOracle {
             Ok(rows)
         })
     }
+
+    fn core_window_snapshot(&self) -> Result<DeltaCoreWindowSnapshot, String> {
+        self.runtime.block_on(async {
+            let uri = deltalake::ensure_table_uri(&self.table_uri)
+                .map_err(|error| format!("invalid Delta CoreWindow table URI: {error}"))?;
+            let table =
+                deltalake::open_table_with_storage_options(uri, self.storage_options.clone())
+                    .await
+                    .map_err(|error| format!("open Delta CoreWindow output: {error}"))?;
+            let version = table
+                .version()
+                .ok_or_else(|| "Delta CoreWindow output has no committed version".to_owned())?;
+            let context = deltalake::datafusion::prelude::SessionContext::new();
+            table
+                .update_datafusion_session(&context.state())
+                .map_err(|error| format!("register Delta CoreWindow object store: {error}"))?;
+            let provider = table
+                .table_provider()
+                .build()
+                .await
+                .map_err(|error| format!("build Delta CoreWindow table provider: {error}"))?;
+            context
+                .register_table("soak_delta_window", Arc::new(provider))
+                .map_err(|error| format!("register Delta CoreWindow table: {error}"))?;
+            let batches = context
+                .sql(
+                    "SELECT window_kind, window_start, row_count, id_sum \
+                     FROM soak_delta_window",
+                )
+                .await
+                .map_err(|error| format!("plan Delta CoreWindow scan: {error}"))?
+                .collect()
+                .await
+                .map_err(|error| format!("scan Delta CoreWindow output: {error}"))?;
+
+            let mut outputs = BTreeMap::new();
+            for batch in batches {
+                let column = |name: &str| {
+                    batch
+                        .schema()
+                        .index_of(name)
+                        .map(|index| batch.column(index))
+                        .map_err(|error| format!("Delta CoreWindow {name} column: {error}"))
+                };
+                let kind = arrow_cast::cast(column("window_kind")?, &DataType::Utf8)
+                    .map_err(|error| format!("cast Delta CoreWindow window_kind: {error}"))?;
+                let start = arrow_cast::cast(
+                    column("window_start")?,
+                    &DataType::Timestamp(TimeUnit::Millisecond, None),
+                )
+                .map_err(|error| format!("cast Delta CoreWindow window_start: {error}"))?;
+                let count = arrow_cast::cast(column("row_count")?, &DataType::Int64)
+                    .map_err(|error| format!("cast Delta CoreWindow row_count: {error}"))?;
+                let sum = arrow_cast::cast(column("id_sum")?, &DataType::Int64)
+                    .map_err(|error| format!("cast Delta CoreWindow id_sum: {error}"))?;
+                let kind = kind
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .ok_or_else(|| "Delta CoreWindow kind did not cast to Utf8".to_owned())?;
+                let start = start
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .ok_or_else(|| {
+                        "Delta CoreWindow start did not cast to Timestamp(ms)".to_owned()
+                    })?;
+                let count = count
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| "Delta CoreWindow count did not cast to Int64".to_owned())?;
+                let sum = sum
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| "Delta CoreWindow sum did not cast to Int64".to_owned())?;
+                for row in 0..batch.num_rows() {
+                    if kind.is_null(row)
+                        || start.is_null(row)
+                        || count.is_null(row)
+                        || sum.is_null(row)
+                    {
+                        return Err("Delta CoreWindow output contains a null field".to_owned());
+                    }
+                    let output = CoreWindowOutput {
+                        kind: kind.value(row).to_owned(),
+                        window_start_ms: start.value(row),
+                        row_count: u64::try_from(count.value(row)).map_err(|_| {
+                            "Delta CoreWindow output has a negative row_count".to_owned()
+                        })?,
+                        id_sum: sum.value(row),
+                    };
+                    *outputs.entry(output).or_default() += 1;
+                }
+            }
+            Ok(DeltaCoreWindowSnapshot { version, outputs })
+        })
+    }
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn assert_delta_core_window_outputs(
+    nodes: &mut [Node],
+    outputs: &BTreeMap<String, DeltaOutputOracle>,
+    expected: &BTreeMap<CoreWindowOutput, u64>,
+    frozen_input_at: Instant,
+    window: Duration,
+    label: &str,
+) {
+    let deadline = Instant::now() + window;
+    let visibility_slo = Duration::from_millis(env_u64(
+        "LAMINAR_SOAK_EO_VISIBILITY_MS",
+        DEFAULT_EO_VISIBILITY_MS,
+    ));
+    let completed = loop {
+        assert_running_nodes(nodes);
+        let mut snapshots = BTreeMap::new();
+        let mut observed = BTreeMap::new();
+        let mut pending = None;
+        for (kind, output) in outputs {
+            match output.core_window_snapshot() {
+                Ok(snapshot) => {
+                    for (row, count) in &snapshot.outputs {
+                        assert_eq!(
+                            row.kind, *kind,
+                            "{label}: {kind} table contains a {} row",
+                            row.kind
+                        );
+                        let Some(expected_count) = expected.get(row) else {
+                            panic!("{label}: unexpected Delta CoreWindow output {row:?}");
+                        };
+                        assert!(
+                            count <= expected_count,
+                            "{label}: Delta CoreWindow output {row:?} occurred {count} times; expected {expected_count}"
+                        );
+                        *observed.entry(row.clone()).or_default() += count;
+                    }
+                    snapshots.insert(kind.clone(), snapshot);
+                }
+                Err(error) => {
+                    pending = Some(format!("{kind}: {error}"));
+                    break;
+                }
+            }
+        }
+        if pending.is_none()
+            && snapshots.len() == outputs.len()
+            && validate_core_window_outputs(&observed, expected, true).is_ok()
+        {
+            let visibility = frozen_input_at.elapsed();
+            assert!(
+                visibility <= visibility_slo,
+                "{label}: CoreWindow output visibility {visibility:?} exceeded {visibility_slo:?}"
+            );
+            eprintln!(
+                "soak: PROFILE {label} CoreWindow visibility_ms={:.3}",
+                visibility.as_secs_f64() * 1_000.0
+            );
+            break snapshots;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label}: Delta CoreWindow output incomplete: {}",
+            pending.unwrap_or_else(|| {
+                validate_core_window_outputs(&observed, expected, true)
+                    .expect_err("incomplete CoreWindow output must explain its gap")
+            })
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    let quiet_deadline = Instant::now() + OUTPUT_BOUNDARY_STABILITY;
+    while Instant::now() < quiet_deadline {
+        assert_running_nodes(nodes);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for (kind, output) in outputs {
+        let previous = completed
+            .get(kind)
+            .expect("every Delta CoreWindow canary completed");
+        let stable = output
+            .core_window_snapshot()
+            .unwrap_or_else(|error| panic!("{label}: {kind} Delta quiet re-read failed: {error}"));
+        assert!(
+            stable.version >= previous.version,
+            "{label}: {kind} Delta version regressed from {} to {}",
+            previous.version,
+            stable.version
+        );
+        assert_eq!(
+            stable.outputs, previous.outputs,
+            "{label}: {kind} Delta output changed during the quiet re-read"
+        );
+    }
+    eprintln!(
+        "soak: {label} validated {} exact CoreWindow rows and a stable EO reread",
+        expected.len()
+    );
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
@@ -6668,6 +7166,29 @@ topic = "{output_topic}"
         .collect()
 }
 
+#[cfg(feature = "kafka")]
+fn kafka_core_window_sink_config(brokers: &str, output_topic: &str) -> String {
+    CORE_WINDOW_CANARIES
+        .iter()
+        .map(|canary| {
+            format!(
+                r#"
+[[sink]]
+name = "{pipeline}_output"
+pipeline = "{pipeline}"
+connector = "kafka"
+format = "json"
+[sink.properties]
+"bootstrap.servers" = "{brokers}"
+topic = "{output_topic}"
+"key.column" = "window_kind"
+"#,
+                pipeline = canary.pipeline,
+            )
+        })
+        .collect()
+}
+
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 fn delta_append_sink_config(
     name: &str,
@@ -6781,6 +7302,66 @@ fn delta_matrix_aggregate_sink_config(
         .collect()
 }
 
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn delta_core_window_table_uris(run_id: &str, topology: &str) -> BTreeMap<String, String> {
+    CORE_WINDOW_CANARIES
+        .iter()
+        .map(|canary| {
+            (
+                canary.kind.to_owned(),
+                delta_soak_table_uri(run_id, &format!("{topology}-window-{}", canary.kind)),
+            )
+        })
+        .collect()
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn delta_core_window_sink_config(
+    table_uris: &BTreeMap<String, String>,
+    storage: &DeltaSoakStorage,
+) -> String {
+    CORE_WINDOW_CANARIES
+        .iter()
+        .map(|canary| {
+            delta_append_sink_config(
+                &format!("{}_output", canary.pipeline),
+                canary.pipeline,
+                table_uris
+                    .get(canary.kind)
+                    .expect("every CoreWindow canary has a Delta URI"),
+                storage,
+            )
+        })
+        .collect()
+}
+
+#[cfg(feature = "kafka")]
+fn core_window_canary_pipeline_config() -> String {
+    CORE_WINDOW_CANARIES
+        .iter()
+        .map(|canary| {
+            format!(
+                r#"
+[[pipeline]]
+name = "{pipeline}"
+sql = """
+SELECT '{kind}' AS window_kind, {expression} AS window_start,
+       COUNT(*) AS row_count, SUM(id) AS id_sum
+FROM soak_matrix_lhs
+WHERE id IN (-101, -102, -104, -105)
+GROUP BY {expression}
+{emit}
+"""
+"#,
+                kind = canary.kind,
+                pipeline = canary.pipeline,
+                expression = canary.expression,
+                emit = canary.emit,
+            )
+        })
+        .collect()
+}
+
 #[cfg(feature = "kafka")]
 fn bounded_join_matrix_workload_config(
     brokers: &str,
@@ -6876,6 +7457,7 @@ WHERE {filter}
         ));
     }
     config.push_str(&bounded_join_matrix_aggregate_pipeline_config());
+    config.push_str(&core_window_canary_pipeline_config());
     config.push_str(sinks);
     config
 }
@@ -7822,6 +8404,33 @@ fn observe_live_join_state(
 }
 
 #[cfg(feature = "kafka")]
+fn observe_live_core_window_state(
+    nodes: &[Node],
+    high_water: &mut [Option<f64>; CORE_WINDOW_CANARIES.len()],
+) {
+    for (canary, observed) in CORE_WINDOW_CANARIES.iter().zip(high_water) {
+        let current = live_operator_state_bytes(nodes, canary.pipeline);
+        *observed = Some(observed.map_or(current, |previous| previous.max(current)));
+    }
+}
+
+#[cfg(feature = "kafka")]
+fn assert_core_window_state_bounds(
+    observed: &[Option<f64>; CORE_WINDOW_CANARIES.len()],
+    nodes: usize,
+    label: &str,
+) {
+    for (canary, observed) in CORE_WINDOW_CANARIES.iter().zip(observed) {
+        assert_live_join_state_bytes(
+            *observed,
+            1,
+            nodes,
+            &format!("{label} {} CoreWindow", canary.kind),
+        );
+    }
+}
+
+#[cfg(feature = "kafka")]
 fn live_operator_state_bytes(nodes: &[Node], operator: &str) -> f64 {
     let operator_label = format!("operator=\"{operator}\"");
     let mut current = 0.0;
@@ -8575,6 +9184,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     let temporal_probe_output_topic = format!("soak-single-temporal-probe-{run_id}");
     let matrix_output_topic = format!("soak-single-matrix-{run_id}");
     let matrix_aggregate_topic = format!("soak-single-matrix-aggregate-{run_id}");
+    let window_output_topic = format!("soak-single-window-{run_id}");
     let consumer_group = format!("soak-single-{run_id}");
     let matrix_consumer_group = format!("soak-single-matrix-{run_id}");
     kafka_create_topic(&brokers, &left_topic, kafka_partitions);
@@ -8598,6 +9208,12 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     let mut delta_matrix_output_oracles = None;
     #[cfg(feature = "delta-lake-s3")]
     let mut delta_matrix_aggregate_oracles = None;
+    #[cfg(feature = "delta-lake-s3")]
+    let mut window_output_oracle = None;
+    #[cfg(not(feature = "delta-lake-s3"))]
+    let mut window_output_oracle;
+    #[cfg(feature = "delta-lake-s3")]
+    let mut delta_window_output_oracles = None;
     let (sink_config, matrix_sink_config) = match delivery {
         JoinDelivery::AtLeastOnce => {
             let (configured_oracles, sink_config) = JoinOutputOracles::kafka(
@@ -8610,17 +9226,20 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
             output_oracles = configured_oracles;
             kafka_create_topic(&brokers, &matrix_output_topic, OUTPUT_TOPIC_PARTITIONS);
             kafka_create_topic(&brokers, &matrix_aggregate_topic, OUTPUT_TOPIC_PARTITIONS);
+            kafka_create_topic(&brokers, &window_output_topic, OUTPUT_TOPIC_PARTITIONS);
             matrix_output_oracle = Some(KafkaMatrixOracle::new(&brokers, &matrix_output_topic));
             matrix_aggregate_oracle = Some(KafkaMatrixAggregateOracle::new(
                 &brokers,
                 &matrix_aggregate_topic,
             ));
+            window_output_oracle = Some(KafkaCoreWindowOracle::new(&brokers, &window_output_topic));
             (
                 sink_config,
                 format!(
-                    "{}{}",
+                    "{}{}{}",
                     kafka_matrix_sink_config(&brokers, &matrix_output_topic),
-                    kafka_matrix_aggregate_sink_config(&brokers, &matrix_aggregate_topic)
+                    kafka_matrix_aggregate_sink_config(&brokers, &matrix_aggregate_topic),
+                    kafka_core_window_sink_config(&brokers, &window_output_topic),
                 ),
             )
         }
@@ -8647,7 +9266,18 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
                         .map(|(join_case, uri)| (join_case, DeltaOutputOracle::new(uri, &storage)))
                         .collect::<BTreeMap<_, _>>(),
                 );
-                (sink_config, format!("{matrix_sinks}{aggregate_sinks}"))
+                let window_uris = delta_core_window_table_uris(&run_id, "single");
+                let window_sinks = delta_core_window_sink_config(&window_uris, &storage);
+                delta_window_output_oracles = Some(
+                    window_uris
+                        .into_iter()
+                        .map(|(kind, uri)| (kind, DeltaOutputOracle::new(uri, &storage)))
+                        .collect::<BTreeMap<_, _>>(),
+                );
+                (
+                    sink_config,
+                    format!("{matrix_sinks}{aggregate_sinks}{window_sinks}"),
+                )
             }
             #[cfg(not(feature = "delta-lake-s3"))]
             panic!("EO join soak requires the delta-lake-s3 feature");
@@ -8748,6 +9378,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         CheckpointBarrierTimingEvidence::with_artifact_directory(log_dir.clone());
     let mut live_state_high_water = None;
     let mut temporal_state_high_water = None;
+    let mut window_state_high_water = [None; CORE_WINDOW_CANARIES.len()];
     let initial_spawn = nodes[0].verify_executable_for_spawn();
     nodes[0].spawn(initial_spawn);
     wait_for(
@@ -8790,6 +9421,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         recovery_ceiling,
         latest_checkpoint,
     );
+    observe_live_core_window_state(&nodes, &mut window_state_high_water);
     if let Some(output) = matrix_aggregate_oracle.as_mut() {
         assert_matrix_aggregate_gate_closed(
             output,
@@ -8895,12 +9527,40 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         "soak: single {delivery_label} completed {round} steady rounds and {kills} hard restarts"
     );
 
-    let matrix_final_boundary = produce_matrix_post_fault_inputs(
+    let (matrix_final_boundary, window_frozen_input_at) = produce_matrix_post_fault_inputs(
         &brokers,
         &matrix_left_topic,
         &matrix_right_topic,
         matrix_pre_fault_event_time,
     );
+    let expected_windows = expected_core_window_outputs(matrix_pre_fault_event_time);
+    match delivery {
+        JoinDelivery::AtLeastOnce => assert_kafka_core_window_outputs(
+            &mut nodes,
+            window_output_oracle
+                .as_mut()
+                .expect("single ALO Kafka CoreWindow oracle"),
+            &expected_windows,
+            window_frozen_input_at,
+            recovery_ceiling,
+            "single-node ALO CoreWindow canaries",
+        ),
+        JoinDelivery::ExactlyOnce => {
+            #[cfg(feature = "delta-lake-s3")]
+            assert_delta_core_window_outputs(
+                &mut nodes,
+                delta_window_output_oracles
+                    .as_ref()
+                    .expect("single EO Delta CoreWindow oracles"),
+                &expected_windows,
+                window_frozen_input_at,
+                recovery_ceiling,
+                "single-node EO CoreWindow canaries",
+            );
+            #[cfg(not(feature = "delta-lake-s3"))]
+            unreachable!("EO runner is unavailable without delta-lake-s3");
+        }
+    }
     latest_checkpoint = assert_final_input_cut(
         &mut nodes,
         &matrix_commit_oracle,
@@ -9152,7 +9812,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
 
     assert_hot_path_latency(
         &nodes,
-        &format!("single-node {delivery_label} stateful joins"),
+        &format!("single-node {delivery_label} stateful workload"),
     );
     assert_live_join_state_bytes(
         live_state_high_water,
@@ -9165,6 +9825,11 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         minimum_live_state_bytes.max(1),
         nodes.len(),
         &format!("single-node {delivery_label} temporal ASOF load"),
+    );
+    assert_core_window_state_bounds(
+        &window_state_high_water,
+        nodes.len(),
+        &format!("single-node {delivery_label}"),
     );
 }
 
@@ -9239,6 +9904,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     let temporal_probe_output_topic = format!("soak-cluster-temporal-probe-{run_id}");
     let matrix_output_topic = format!("soak-cluster-matrix-{run_id}");
     let matrix_aggregate_topic = format!("soak-cluster-matrix-aggregate-{run_id}");
+    let window_output_topic = format!("soak-cluster-window-{run_id}");
     let consumer_group = format!("soak-cluster-{run_id}");
     let matrix_consumer_group = format!("soak-cluster-matrix-{run_id}");
     // Kafka partitioning is independent from engine key-group cardinality. The provider hashes
@@ -9265,6 +9931,12 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     let mut delta_matrix_output_oracles = None;
     #[cfg(feature = "delta-lake-s3")]
     let mut delta_matrix_aggregate_oracles = None;
+    #[cfg(feature = "delta-lake-s3")]
+    let mut window_output_oracle = None;
+    #[cfg(not(feature = "delta-lake-s3"))]
+    let mut window_output_oracle;
+    #[cfg(feature = "delta-lake-s3")]
+    let mut delta_window_output_oracles = None;
     let (sink_config, matrix_sink_config) = match delivery {
         JoinDelivery::AtLeastOnce => {
             let (configured_oracles, sink_config) = JoinOutputOracles::kafka(
@@ -9277,17 +9949,20 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
             output_oracles = configured_oracles;
             kafka_create_topic(&brokers, &matrix_output_topic, OUTPUT_TOPIC_PARTITIONS);
             kafka_create_topic(&brokers, &matrix_aggregate_topic, OUTPUT_TOPIC_PARTITIONS);
+            kafka_create_topic(&brokers, &window_output_topic, OUTPUT_TOPIC_PARTITIONS);
             matrix_output_oracle = Some(KafkaMatrixOracle::new(&brokers, &matrix_output_topic));
             matrix_aggregate_oracle = Some(KafkaMatrixAggregateOracle::new(
                 &brokers,
                 &matrix_aggregate_topic,
             ));
+            window_output_oracle = Some(KafkaCoreWindowOracle::new(&brokers, &window_output_topic));
             (
                 sink_config,
                 format!(
-                    "{}{}",
+                    "{}{}{}",
                     kafka_matrix_sink_config(&brokers, &matrix_output_topic),
-                    kafka_matrix_aggregate_sink_config(&brokers, &matrix_aggregate_topic)
+                    kafka_matrix_aggregate_sink_config(&brokers, &matrix_aggregate_topic),
+                    kafka_core_window_sink_config(&brokers, &window_output_topic),
                 ),
             )
         }
@@ -9314,7 +9989,18 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
                         .map(|(join_case, uri)| (join_case, DeltaOutputOracle::new(uri, &storage)))
                         .collect::<BTreeMap<_, _>>(),
                 );
-                (sink_config, format!("{matrix_sinks}{aggregate_sinks}"))
+                let window_uris = delta_core_window_table_uris(&run_id, "cluster");
+                let window_sinks = delta_core_window_sink_config(&window_uris, &storage);
+                delta_window_output_oracles = Some(
+                    window_uris
+                        .into_iter()
+                        .map(|(kind, uri)| (kind, DeltaOutputOracle::new(uri, &storage)))
+                        .collect::<BTreeMap<_, _>>(),
+                );
+                (
+                    sink_config,
+                    format!("{matrix_sinks}{aggregate_sinks}{window_sinks}"),
+                )
             }
             #[cfg(not(feature = "delta-lake-s3"))]
             panic!("EO join soak requires the delta-lake-s3 feature");
@@ -9421,6 +10107,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         CheckpointBarrierTimingEvidence::with_artifact_directory(log_dir.clone());
     let mut live_state_high_water = None;
     let mut temporal_state_high_water = None;
+    let mut window_state_high_water = [None; CORE_WINDOW_CANARIES.len()];
     for n in &mut nodes {
         let initial_spawn = n.verify_executable_for_spawn();
         n.spawn(initial_spawn);
@@ -9525,6 +10212,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         recovery_ceiling,
         latest_checkpoint,
     );
+    observe_live_core_window_state(&nodes, &mut window_state_high_water);
     if let Some(output) = matrix_aggregate_oracle.as_mut() {
         assert_matrix_aggregate_gate_closed(
             output,
@@ -9976,12 +10664,40 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         latest_checkpoint.checkpoint_id, latest_checkpoint.epoch
     );
 
-    let matrix_final_boundary = produce_matrix_post_fault_inputs(
+    let (matrix_final_boundary, window_frozen_input_at) = produce_matrix_post_fault_inputs(
         &brokers,
         &matrix_left_topic,
         &matrix_right_topic,
         matrix_pre_fault_event_time,
     );
+    let expected_windows = expected_core_window_outputs(matrix_pre_fault_event_time);
+    match delivery {
+        JoinDelivery::AtLeastOnce => assert_kafka_core_window_outputs(
+            &mut nodes,
+            window_output_oracle
+                .as_mut()
+                .expect("cluster ALO Kafka CoreWindow oracle"),
+            &expected_windows,
+            window_frozen_input_at,
+            recovery_ceiling,
+            "three-node ALO CoreWindow canaries",
+        ),
+        JoinDelivery::ExactlyOnce => {
+            #[cfg(feature = "delta-lake-s3")]
+            assert_delta_core_window_outputs(
+                &mut nodes,
+                delta_window_output_oracles
+                    .as_ref()
+                    .expect("cluster EO Delta CoreWindow oracles"),
+                &expected_windows,
+                window_frozen_input_at,
+                recovery_ceiling,
+                "three-node EO CoreWindow canaries",
+            );
+            #[cfg(not(feature = "delta-lake-s3"))]
+            unreachable!("EO runner is unavailable without delta-lake-s3");
+        }
+    }
     latest_checkpoint = assert_final_input_cut(
         &mut nodes,
         &matrix_commit_oracle,
@@ -10271,7 +10987,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     }
     assert_hot_path_latency(
         &nodes,
-        &format!("three-node {delivery_label} stateful joins"),
+        &format!("three-node {delivery_label} stateful workload"),
     );
     assert_live_join_state_bytes(
         live_state_high_water,
@@ -10284,6 +11000,11 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         minimum_live_state_bytes.max(1),
         nodes.len(),
         &format!("three-node {delivery_label} temporal ASOF load"),
+    );
+    assert_core_window_state_bounds(
+        &window_state_high_water,
+        nodes.len(),
+        &format!("three-node {delivery_label}"),
     );
 }
 
@@ -10425,7 +11146,7 @@ fn produce_matrix_post_fault_inputs(
     left_topic: &str,
     right_topic: &str,
     pre_fault_event_time: u64,
-) -> Vec<i64> {
+) -> (Vec<i64>, Instant) {
     let event_time = matrix_event_time_ms();
     let sentinel_time = event_time
         .max(pre_fault_event_time)
@@ -10442,7 +11163,8 @@ fn produce_matrix_post_fault_inputs(
         (-203_i64, -24_i64, -13_i64, event_time),
         (-902, 2, 1, sentinel_time),
     ];
-    produce_matrix_phase(brokers, left_topic, right_topic, &left, &right)
+    let boundary = produce_matrix_phase(brokers, left_topic, right_topic, &left, &right);
+    (boundary, Instant::now())
 }
 
 #[cfg(feature = "kafka")]

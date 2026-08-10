@@ -318,9 +318,10 @@ while let Some(rows) = sub.poll() {
 ### Cluster SQL boundary
 
 Cluster `CREATE STREAM` admits projection/filter pipelines, supported non-windowed keyed aggregates,
-and the eight bounded join kinds described above. The named output of any kind may feed a separate
-keyed aggregate stream. Fused join-and-aggregate statements and cluster windowed aggregates remain
-rejected.
+the eight bounded join kinds described above, and managed direct-source `TUMBLE`, `HOP`, and
+`SESSION` aggregates. Cluster windows require a watermark on the event-time column and `EMIT ON
+WINDOW CLOSE` or `EMIT FINAL`. A named join output may feed a separate keyed aggregate stream;
+fused join-and-aggregate and windowed-join statements remain rejected.
 
 Cluster materialized-view creation is rejected with `[LDB-4007]` regardless of query shape because
 retained output and reads do not yet have a planner-certified distributed lifecycle. Consequently,
