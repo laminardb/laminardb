@@ -24,19 +24,11 @@ pub(crate) struct RetainedBatch {
     peer: Option<u64>,
     recovery_gen: Option<u64>,
     routed_vnodes: Arc<[u32]>,
-    uniform_vnode: Option<u32>,
-}
-
-#[cfg(feature = "cluster")]
-pub(crate) fn uniform_vnode_hint(routed_vnodes: &[u32]) -> Option<u32> {
-    match routed_vnodes {
-        [vnode] => Some(*vnode),
-        _ => None,
-    }
 }
 
 #[cfg(feature = "cluster")]
 impl RetainedBatch {
+    #[cfg(test)]
     pub(crate) fn local(batch: RecordBatch) -> Self {
         Self {
             batch,
@@ -45,7 +37,6 @@ impl RetainedBatch {
             peer: None,
             recovery_gen: None,
             routed_vnodes: Arc::from([]),
-            uniform_vnode: None,
         }
     }
 
@@ -54,7 +45,6 @@ impl RetainedBatch {
         let peer = received.peer();
         let recovery_gen = received.recovery_gen();
         let routed_vnodes = received.routed_vnodes_arc();
-        let uniform_vnode = uniform_vnode_hint(&routed_vnodes);
         let (batch, admission) = received.into_parts();
         Self {
             batch,
@@ -63,7 +53,6 @@ impl RetainedBatch {
             peer: Some(peer),
             recovery_gen: Some(recovery_gen),
             routed_vnodes,
-            uniform_vnode,
         }
     }
 
@@ -75,7 +64,6 @@ impl RetainedBatch {
         recovery_gen: u64,
         routed_vnodes: Arc<[u32]>,
     ) -> Self {
-        let uniform_vnode = uniform_vnode_hint(&routed_vnodes);
         Self {
             batch,
             admissions: Arc::from([admission]),
@@ -83,7 +71,6 @@ impl RetainedBatch {
             peer: Some(peer),
             recovery_gen: Some(recovery_gen),
             routed_vnodes,
-            uniform_vnode,
         }
     }
 
@@ -94,7 +81,6 @@ impl RetainedBatch {
         recovery_gen: u64,
         routed_vnodes: Arc<[u32]>,
     ) -> Self {
-        let uniform_vnode = uniform_vnode_hint(&routed_vnodes);
         Self {
             batch,
             admissions: Arc::from([]),
@@ -102,7 +88,6 @@ impl RetainedBatch {
             peer: Some(peer),
             recovery_gen: Some(recovery_gen),
             routed_vnodes,
-            uniform_vnode,
         }
     }
 
@@ -124,10 +109,6 @@ impl RetainedBatch {
 
     pub(crate) fn routed_vnodes(&self) -> &[u32] {
         &self.routed_vnodes
-    }
-
-    pub(crate) const fn uniform_vnode(&self) -> Option<u32> {
-        self.uniform_vnode
     }
 
     pub(crate) fn heap_bytes(&self) -> Option<usize> {
@@ -190,18 +171,6 @@ pub(crate) fn shuffle_send_error(
     } else {
         DbError::ShuffleNotReady(format!("{context}: send to peer {peer}: {error}"))
     }
-}
-
-#[cfg(feature = "cluster")]
-pub(crate) async fn send_shuffle_plan(
-    sender: &laminar_core::shuffle::ShuffleSender,
-    assignment_version: u64,
-    outbound: Vec<(u64, laminar_core::shuffle::ShuffleMessage)>,
-    context: &str,
-) -> Result<(), DbError> {
-    send_shuffle_plan_retaining(sender, assignment_version, outbound, context)
-        .await
-        .0
 }
 
 #[cfg(feature = "cluster")]
@@ -562,13 +531,6 @@ mod shuffle_tests {
         (sender, receiver)
     }
 
-    #[test]
-    fn uniform_vnode_hint_requires_exactly_one_route() {
-        assert_eq!(uniform_vnode_hint(&[7]), Some(7));
-        assert_eq!(uniform_vnode_hint(&[]), None);
-        assert_eq!(uniform_vnode_hint(&[3, 7]), None);
-    }
-
     #[tokio::test]
     async fn send_plan_classifies_first_unreachable_peer_as_not_ready() {
         let (sender, _receiver) = sender_with_reachable_peer_two().await;
@@ -587,7 +549,7 @@ mod shuffle_tests {
     #[tokio::test]
     async fn send_plan_prioritizes_terminal_error_without_admission() {
         let (sender, _receiver) = sender_with_reachable_peer_two().await;
-        let error = send_shuffle_plan(
+        let (result, retry_plan) = send_shuffle_plan_retaining(
             &sender,
             1,
             vec![
@@ -596,16 +558,17 @@ mod shuffle_tests {
             ],
             "test shuffle",
         )
-        .await
-        .unwrap_err();
+        .await;
+        let error = result.unwrap_err();
 
         assert!(matches!(error, DbError::ShuffleTerminal(_)));
+        assert!(retry_plan.is_none());
     }
 
     #[tokio::test]
     async fn send_plan_completes_peer_groups_and_preserves_peer_order() {
         let (sender, receiver) = sender_with_reachable_peer_two().await;
-        let error = send_shuffle_plan(
+        let (result, retry_plan) = send_shuffle_plan_retaining(
             &sender,
             1,
             vec![
@@ -622,11 +585,12 @@ mod shuffle_tests {
             ],
             "join shuffle",
         )
-        .await
-        .unwrap_err();
+        .await;
+        let error = result.unwrap_err();
 
         assert!(matches!(error, DbError::ShufflePartialSend(_)));
         assert!(error.requires_pipeline_recovery());
+        assert!(retry_plan.is_none());
         let first = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
             .await
             .expect("admitted data frame was not delivered")
@@ -642,17 +606,18 @@ mod shuffle_tests {
     #[tokio::test]
     async fn send_plan_classifies_invalid_route_as_terminal() {
         let (sender, _receiver) = sender_with_reachable_peer_two().await;
-        let error = send_shuffle_plan(
+        let (result, retry_plan) = send_shuffle_plan_retaining(
             &sender,
             1,
             vec![(1, ShuffleMessage::checkpointed("stage".into(), 0, batch(1)))],
             "test shuffle",
         )
-        .await
-        .unwrap_err();
+        .await;
+        let error = result.unwrap_err();
 
         assert!(matches!(error, DbError::ShuffleTerminal(_)));
         assert!(error.requires_pipeline_halt());
+        assert!(retry_plan.is_none());
     }
 }
 

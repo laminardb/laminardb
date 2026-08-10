@@ -767,6 +767,8 @@ async fn audited_final_owner_exit_preserves_predecessor_binding_until_graph_publ
 struct VnodeAcquisitionProbe {
     live: Arc<parking_lot::Mutex<std::collections::BTreeMap<u32, Vec<u8>>>>,
     prepared: Option<std::collections::BTreeMap<u32, Vec<u8>>>,
+    prepare_count: Arc<std::sync::atomic::AtomicUsize>,
+    publish_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[cfg(feature = "cluster")]
@@ -805,6 +807,8 @@ impl crate::operator_graph::GraphOperator for VnodeAcquisitionProbe {
             prepared.insert(restore.vnode, restore.state.to_vec());
         }
         self.prepared = Some(prepared);
+        self.prepare_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -817,6 +821,8 @@ impl crate::operator_graph::GraphOperator for VnodeAcquisitionProbe {
             .prepared
             .take()
             .expect("acquisition probe transition must be prepared");
+        self.publish_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -829,16 +835,30 @@ async fn record_two_vnode_acquisition_checkpoint(
     pipeline_identity: &laminar_core::checkpoint::PipelineIdentity,
 ) -> laminar_core::checkpoint::CommittedCheckpointRef {
     use laminar_core::checkpoint::{
-        checkpoint_sha256, ByteRange, CheckpointManifest, CheckpointScope, CheckpointStore,
-        CommittedCheckpointIndex, CommittedParticipantRef, ObjectStoreCheckpointStore, StateFrame,
-        StateFrameKey, COMMITTED_CHECKPOINT_INDEX_VERSION,
+        checkpoint_sha256, ByteRange, CheckpointAttempt, CheckpointManifest, CheckpointScope,
+        CheckpointStore, CommittedCheckpointIndex, CommittedParticipantRef,
+        ObjectStoreCheckpointStore, StateFrame, StateFrameKey, COMMITTED_CHECKPOINT_INDEX_VERSION,
     };
-    use laminar_core::checkpoint_decision::{CheckpointDecisionStore, CheckpointVerdict};
+    use laminar_core::checkpoint_decision::{
+        CheckpointArtifactInventory, CheckpointDecisionStore, CheckpointVerdict,
+    };
     use laminar_core::state::KeyGroupCount;
 
     let key_groups = KeyGroupCount::try_from(fence.vnode_count).unwrap();
     let deployment_id = CheckpointDecisionStore::new(Arc::clone(objects))
         .load_or_create_deployment_id()
+        .await
+        .unwrap();
+    authority
+        .begin_cluster_checkpoint_artifacts(
+            proof,
+            CheckpointArtifactInventory {
+                deployment_id: deployment_id.clone(),
+                pipeline_identity: pipeline_identity.clone(),
+                attempt: CheckpointAttempt::canonical(1),
+                assignment_fence: Some(fence.clone()),
+            },
+        )
         .await
         .unwrap();
     let mut participants = Vec::new();
@@ -1091,6 +1111,8 @@ async fn assignment_acquisition_stages_committed_vnode_for_graph_publication() {
             .into_iter()
             .collect::<std::collections::BTreeMap<_, _>>(),
     ));
+    let prepare_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let publish_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut graph =
         crate::operator_graph::OperatorGraph::new(laminar_sql::create_session_context());
     graph.set_key_group_count(key_groups);
@@ -1099,12 +1121,14 @@ async fn assignment_acquisition_stages_committed_vnode_for_graph_publication() {
         Box::new(VnodeAcquisitionProbe {
             live: Arc::clone(&live),
             prepared: None,
+            prepare_count: Arc::clone(&prepare_count),
+            publish_count: Arc::clone(&publish_count),
         }),
     );
     graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
-        registry,
-        sender,
-        receiver,
+        registry: Arc::clone(&registry),
+        sender: Arc::clone(&sender),
+        receiver: Arc::clone(&receiver),
         self_id,
     });
     graph.set_pipeline_identity(identity.clone());
@@ -1128,6 +1152,48 @@ async fn assignment_acquisition_stages_committed_vnode_for_graph_publication() {
         .lock()
         .as_ref()
         .is_some_and(|binding| binding.matches(&target_fence, &identity)));
+    assert_eq!(prepare_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(publish_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let owners = [self_id, self_id];
+    let owner_ids = [self_id.0, self_id.0];
+    let topology_target = laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
+        target_fence.assignment_version + 1,
+        &owner_ids,
+        vec![local],
+    )
+    .unwrap();
+    let topology_only = crate::vnode_transition_staging::PendingVnodeTransition::assignment_change(
+        target_fence,
+        &owners,
+        topology_target.clone(),
+        &owners,
+        local,
+        identity.clone(),
+        Vec::new(),
+        None,
+    )
+    .unwrap();
+    assert!(topology_only.revoked_vnodes().is_empty());
+    assert!(topology_only.acquired_vnodes().is_empty());
+    *db.pending_vnode_transition.lock() = Some(Arc::new(topology_only));
+    registry.set_assignment_and_version(Arc::from(owners), topology_target.assignment_version);
+    sender
+        .install_assignment_fence(&topology_target, &owner_ids)
+        .unwrap();
+    receiver
+        .install_assignment_fence(&topology_target, &owner_ids)
+        .unwrap();
+
+    assert!(graph.complete_pending_vnode_transition().await.unwrap());
+    assert_eq!(prepare_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(publish_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db
+        .installed_vnode_state
+        .lock()
+        .as_ref()
+        .is_some_and(|binding| binding.matches(&topology_target, &identity)));
 }
 
 #[cfg(feature = "cluster")]

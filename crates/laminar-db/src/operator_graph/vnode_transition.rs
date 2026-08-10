@@ -980,7 +980,8 @@ impl OperatorGraph {
                 || relevant_acquired
                 || matches!(
                     contract,
-                    ManagedStateContract::BoundedIntervalJoinV1
+                    ManagedStateContract::SqlAggregateV1
+                        | ManagedStateContract::BoundedIntervalJoinV1
                         | ManagedStateContract::CoreWindowV1
                         | ManagedStateContract::TemporalJoinV1
                 );

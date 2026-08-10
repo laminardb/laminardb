@@ -85,13 +85,16 @@ impl GraphOperator for BatchProbe {
 }
 
 #[cfg(feature = "cluster")]
-struct CoreWindowFrontierProbe(Arc<parking_lot::Mutex<Vec<InputFrontier>>>);
+struct ManagedFrontierProbe {
+    capability: OperatorCapability,
+    seen: Arc<parking_lot::Mutex<Vec<InputFrontier>>>,
+}
 
 #[cfg(feature = "cluster")]
 #[async_trait]
-impl GraphOperator for CoreWindowFrontierProbe {
+impl GraphOperator for ManagedFrontierProbe {
     fn cluster_capability(&self) -> OperatorCapability {
-        OperatorCapability::managed_core_window()
+        self.capability
     }
 
     async fn process(
@@ -107,7 +110,7 @@ impl GraphOperator for CoreWindowFrontierProbe {
         _inputs: &[Vec<RecordBatch>],
         frontiers: &[InputFrontier],
     ) -> Result<Vec<RecordBatch>, DbError> {
-        *self.0.lock() = frontiers.to_vec();
+        *self.seen.lock() = frontiers.to_vec();
         Ok(Vec::new())
     }
 
@@ -1022,19 +1025,46 @@ async fn alignment_harness() -> AlignmentHarness {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn only_core_window_receives_the_node_local_source_frontier() {
+async fn ordered_shuffle_operators_receive_the_node_local_source_frontier() {
     let mut harness = alignment_harness().await;
     let source = harness.graph.ensure_source_node("events");
-    let core_seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let ordinary_seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let core = harness
-        .graph
-        .place_operator_node(
+    let managed = [
+        (
             "core_window",
-            Box::new(CoreWindowFrontierProbe(Arc::clone(&core_seen))),
-            1,
-        )
-        .unwrap();
+            OperatorCapability::managed_core_window(),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+        ),
+        (
+            "sql_aggregate",
+            OperatorCapability::keyed_sql_aggregate(),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+        ),
+        (
+            "interval_join",
+            OperatorCapability::bounded_interval_join(),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+        ),
+        (
+            "temporal_join",
+            OperatorCapability::managed_temporal_join(),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+        ),
+    ];
+    for (name, capability, seen) in &managed {
+        let node = harness
+            .graph
+            .place_operator_node(
+                name,
+                Box::new(ManagedFrontierProbe {
+                    capability: *capability,
+                    seen: Arc::clone(seen),
+                }),
+                1,
+            )
+            .unwrap();
+        harness.graph.add_edge(source, node, 0);
+    }
     let ordinary = harness
         .graph
         .place_operator_node(
@@ -1043,7 +1073,6 @@ async fn only_core_window_receives_the_node_local_source_frontier() {
             1,
         )
         .unwrap();
-    harness.graph.add_edge(source, core, 0);
     harness.graph.add_edge(source, ordinary, 0);
     let committed = FxHashMap::from_iter([(
         Arc::from("events"),
@@ -1066,7 +1095,9 @@ async fn only_core_window_receives_the_node_local_source_frontier() {
         .await
         .unwrap();
 
-    assert_eq!(*core_seen.lock(), [local["events"]]);
+    for (_, _, seen) in managed {
+        assert_eq!(*seen.lock(), [local["events"]]);
+    }
     assert_eq!(*ordinary_seen.lock(), [committed["events"]]);
 }
 
@@ -1659,7 +1690,6 @@ async fn align_shuffle_barriers_retains_peer_rows_then_aligns_exact_attempt() {
     );
     assert_eq!(got[0].num_rows(), batch.num_rows());
     assert_eq!(got[0].routed_vnodes(), &[0]);
-    assert_eq!(got[0].uniform_vnode(), Some(0));
     assert_eq!(got[0].peer(), Some(2));
     assert_eq!(
         got[0].assignment_version(),

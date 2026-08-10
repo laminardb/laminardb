@@ -16,6 +16,8 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
 
+#[cfg(feature = "cluster")]
+use laminar_core::state::NodeId;
 use laminar_core::state::{KeyGroupCount, VnodeAssignmentSnapshot, VnodeRegistry, LOCAL_NODE_ID};
 use laminar_sql::translator::StreamJoinConfig;
 
@@ -26,6 +28,8 @@ use crate::interval_join::{
     JoinStateCheckpoint, HEAP_ALLOCATION_CHARGE,
 };
 use crate::operator::ProjectingJoinState;
+#[cfg(feature = "cluster")]
+use crate::operator_graph::merge_input_frontier_iter;
 use crate::operator_graph::{
     CapturedVnodeState, EncodedStateFrame, InputFrontier, StateFrameCapture,
 };
@@ -36,16 +40,101 @@ use crate::operator::sql_query::ClusterShuffleConfig;
 #[cfg(feature = "cluster")]
 use crate::operator_graph::{ManagedVnodeTransition, ManagedVnodeTransitionMode};
 
-const OPERATOR_CHECKPOINT_VERSION: u8 = 1;
+const OPERATOR_CHECKPOINT_VERSION: u8 = 2;
 const ABSENT_VNODE: u8 = 0;
 const PRESENT_VNODE: u8 = 1;
 const VNODE_FRAME_HEADER_LEN: usize = std::mem::align_of::<ArchivedJoinStateCheckpoint>();
 const ABSENT_VNODE_FRAME: [u8; VNODE_FRAME_HEADER_LEN] = [ABSENT_VNODE; VNODE_FRAME_HEADER_LEN];
+#[cfg(feature = "cluster")]
+const REMOTE_EVENT_CHARGE: usize = std::mem::size_of::<IntervalRemoteEvent>();
+#[cfg(feature = "cluster")]
+const PEER_CHANNEL_ENTRY_CHARGE: usize = 64;
+#[cfg(feature = "cluster")]
+const PENDING_ROUTE_ENTRY_CHARGE: usize = 64;
+#[cfg(feature = "cluster")]
+const RETAINED_BATCH_ARC_CHARGE: usize =
+    std::mem::size_of::<crate::operator::RetainedBatch>() + 2 * std::mem::size_of::<usize>();
+#[cfg(feature = "cluster")]
+const ROW_VNODE_ARC_CHARGE: usize = 2 * std::mem::size_of::<usize>();
 
 #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 enum JoinInputSide {
     Left,
     Right,
+}
+
+impl JoinInputSide {
+    #[cfg(feature = "cluster")]
+    const fn port(self) -> usize {
+        match self {
+            Self::Left => 0,
+            Self::Right => 1,
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
+#[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct IntervalCheckpointFrontier {
+    watermark: Option<i64>,
+    idle: bool,
+}
+
+impl From<InputFrontier> for IntervalCheckpointFrontier {
+    fn from(frontier: InputFrontier) -> Self {
+        Self {
+            watermark: frontier.watermark,
+            idle: frontier.idle,
+        }
+    }
+}
+
+impl From<IntervalCheckpointFrontier> for InputFrontier {
+    fn from(frontier: IntervalCheckpointFrontier) -> Self {
+        Self {
+            watermark: frontier.watermark,
+            idle: frontier.idle,
+        }
+    }
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+enum IntervalCheckpointEvent {
+    Data {
+        recovery_gen: u64,
+        routed_vnodes: Vec<u32>,
+        ipc: Vec<u8>,
+    },
+    Frontier {
+        recovery_gen: u64,
+        frontier: IntervalCheckpointFrontier,
+    },
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct IntervalCheckpointChannel {
+    peer: u64,
+    applied: IntervalCheckpointFrontier,
+    events: Vec<IntervalCheckpointEvent>,
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct IntervalClusterCheckpoint {
+    assignment_version: u64,
+    owner_map_digest: [u8; 32],
+    self_id: u64,
+    recovery_gen: u64,
+    local_frontiers: [IntervalCheckpointFrontier; 2],
+    remote_side_cursor: u8,
+    remote_peer_cursors: [Option<u64>; 2],
+    channels: [Vec<IntervalCheckpointChannel>; 2],
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -59,23 +148,48 @@ struct IntervalJoinOperatorCheckpoint {
     left_table: String,
     right_table: String,
     bound_ms: i64,
-    aligned_replay: Vec<(u64, JoinInputSide, i64, Vec<u8>)>,
     applied_left_watermark: i64,
     applied_right_watermark: i64,
     applied_left_idle: bool,
     applied_right_idle: bool,
-    assignment_version: Option<u64>,
-    owner_map_digest: Option<[u8; 32]>,
-    participant_id: Option<u64>,
+    cluster: Option<IntervalClusterCheckpoint>,
 }
 
 #[cfg(feature = "cluster")]
-type CapturedAlignedReplay = (u64, JoinInputSide, i64, crate::operator::RetainedBatch);
+enum CapturedIntervalEvent {
+    Data {
+        recovery_gen: u64,
+        retained: Arc<crate::operator::RetainedBatch>,
+    },
+    Frontier {
+        recovery_gen: u64,
+        frontier: InputFrontier,
+    },
+}
+
+#[cfg(feature = "cluster")]
+struct CapturedIntervalChannel {
+    peer: u64,
+    applied: InputFrontier,
+    events: Vec<CapturedIntervalEvent>,
+}
+
+#[cfg(feature = "cluster")]
+struct CapturedIntervalCluster {
+    assignment_version: u64,
+    owner_map_digest: [u8; 32],
+    self_id: u64,
+    recovery_gen: u64,
+    local_frontiers: [InputFrontier; 2],
+    remote_side_cursor: u8,
+    remote_peer_cursors: [Option<u64>; 2],
+    channels: [Vec<CapturedIntervalChannel>; 2],
+}
 
 struct IntervalJoinOperatorCheckpointCapture {
     checkpoint: IntervalJoinOperatorCheckpoint,
     #[cfg(feature = "cluster")]
-    aligned_replay: VecDeque<CapturedAlignedReplay>,
+    cluster: Option<CapturedIntervalCluster>,
     retained_bytes: u64,
 }
 
@@ -88,8 +202,6 @@ impl IntervalJoinOperatorCheckpointCapture {
         left_keys_capacity: usize,
         right_keys_capacity: usize,
         string_capacities: impl IntoIterator<Item = usize>,
-        #[cfg(feature = "cluster")] aligned_replay_capacity: usize,
-        #[cfg(feature = "cluster")] aligned_replay_batch_bytes: impl IntoIterator<Item = Option<usize>>,
     ) -> Result<u64, DbError> {
         fn allocation(bytes: usize) -> Result<usize, DbError> {
             bytes
@@ -131,24 +243,6 @@ impl IntervalJoinOperatorCheckpointCapture {
             add(&mut bytes, allocation(capacity)?)?;
         }
 
-        #[cfg(feature = "cluster")]
-        {
-            add(
-                &mut bytes,
-                roster::<CapturedAlignedReplay>(aligned_replay_capacity)?,
-            )?;
-            for batch_bytes in aligned_replay_batch_bytes {
-                add(
-                    &mut bytes,
-                    batch_bytes.ok_or_else(|| {
-                        DbError::Checkpoint(
-                            "interval join aligned replay capture accounting overflow".into(),
-                        )
-                    })?,
-                )?;
-            }
-        }
-
         u64::try_from(bytes).map_err(|_| {
             DbError::Checkpoint("interval join whole-state capture exceeds u64".into())
         })
@@ -169,13 +263,102 @@ impl IntervalJoinOperatorCheckpointCapture {
                     &self.checkpoint.right_table,
                 ])
                 .map(String::capacity),
-            #[cfg(feature = "cluster")]
-            self.aligned_replay.capacity(),
-            #[cfg(feature = "cluster")]
-            self.aligned_replay
-                .iter()
-                .map(|(_, _, _, batch)| batch.heap_bytes()),
         )
+        .and_then(|base| {
+            #[cfg(feature = "cluster")]
+            let extra: Result<usize, DbError> =
+                self.cluster.as_ref().map_or(Ok(0usize), |cluster| {
+                    let allocation = |bytes: usize| {
+                        bytes.checked_add(usize::from(bytes != 0) * HEAP_ALLOCATION_CHARGE)
+                    };
+                    let mut bytes = 0usize;
+                    for channels in &cluster.channels {
+                        bytes = bytes
+                            .checked_add(
+                                allocation(
+                                    channels
+                                        .capacity()
+                                        .checked_mul(std::mem::size_of::<CapturedIntervalChannel>())
+                                        .ok_or_else(|| {
+                                            DbError::Checkpoint(
+                                                "interval join channel capture accounting overflow"
+                                                    .into(),
+                                            )
+                                        })?,
+                                )
+                                .ok_or_else(|| {
+                                    DbError::Checkpoint(
+                                        "interval join channel capture accounting overflow".into(),
+                                    )
+                                })?,
+                            )
+                            .ok_or_else(|| {
+                                DbError::Checkpoint(
+                                    "interval join channel capture accounting overflow".into(),
+                                )
+                            })?;
+                        for channel in channels {
+                            bytes = bytes
+                                .checked_add(
+                                    allocation(
+                                        channel
+                                            .events
+                                            .capacity()
+                                            .checked_mul(
+                                                std::mem::size_of::<CapturedIntervalEvent>(),
+                                            )
+                                            .ok_or_else(|| {
+                                                DbError::Checkpoint(
+                                                "interval join event capture accounting overflow"
+                                                    .into(),
+                                            )
+                                            })?,
+                                    )
+                                    .ok_or_else(|| {
+                                        DbError::Checkpoint(
+                                            "interval join event capture accounting overflow"
+                                                .into(),
+                                        )
+                                    })?,
+                                )
+                                .ok_or_else(|| {
+                                    DbError::Checkpoint(
+                                        "interval join event capture accounting overflow".into(),
+                                    )
+                                })?;
+                            for event in &channel.events {
+                                if let CapturedIntervalEvent::Data { retained, .. } = event {
+                                    bytes = bytes
+                                        .checked_add(retained.heap_bytes().ok_or_else(|| {
+                                            DbError::Checkpoint(
+                                            "interval join retained shuffle accounting overflow"
+                                                .into(),
+                                        )
+                                        })?)
+                                        .and_then(|bytes| {
+                                            bytes.checked_add(RETAINED_BATCH_ARC_CHARGE)
+                                        })
+                                        .ok_or_else(|| {
+                                            DbError::Checkpoint(
+                                            "interval join retained shuffle accounting overflow"
+                                                .into(),
+                                        )
+                                        })?;
+                                }
+                            }
+                        }
+                    }
+                    Ok(bytes)
+                });
+            #[cfg(not(feature = "cluster"))]
+            let extra: Result<usize, DbError> = Ok(0);
+            let extra = u64::try_from(extra?).map_err(|_| {
+                DbError::Checkpoint("interval join channel capture exceeds u64".into())
+            })?;
+            base.checked_add(extra).ok_or_else(|| {
+                DbError::Checkpoint("interval join whole-state capture accounting overflow".into())
+            })
+        })
     }
 
     fn encode(self, max_working_bytes: usize, context: &str) -> Result<Vec<u8>, DbError> {
@@ -188,50 +371,132 @@ impl IntervalJoinOperatorCheckpointCapture {
         #[cfg(not(feature = "cluster"))]
         let remaining = max_working_bytes;
         #[cfg(feature = "cluster")]
-        {
-            let mut aligned_replay = Vec::new();
-            aligned_replay
-                .try_reserve_exact(capture.aligned_replay.len())
-                .map_err(|_| {
+        if let Some(cluster) = capture.cluster.take() {
+            let allocation = |capacity: usize, item_bytes: usize| {
+                capacity
+                    .checked_mul(item_bytes)
+                    .and_then(|bytes| {
+                        bytes.checked_add(usize::from(bytes != 0) * HEAP_ALLOCATION_CHARGE)
+                    })
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!("{context}: channel scratch overflow"))
+                    })
+            };
+            let mut encoded_channels = [Vec::new(), Vec::new()];
+            for (port, encoded_port) in encoded_channels.iter_mut().enumerate() {
+                encoded_port
+                    .try_reserve_exact(cluster.channels[port].len())
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "{context}: channel roster cannot be reserved: {error}"
+                        ))
+                    })?;
+                let channel_bytes = allocation(
+                    encoded_port.capacity(),
+                    std::mem::size_of::<IntervalCheckpointChannel>(),
+                )?;
+                remaining = remaining.checked_sub(channel_bytes).ok_or_else(|| {
                     DbError::Checkpoint(format!(
-                        "{context}: aligned replay roster cannot be reserved"
+                        "{context}: encoded channel roster requires {channel_bytes} bytes"
                     ))
                 })?;
-            let roster_bytes = aligned_replay
-                .capacity()
-                .checked_mul(std::mem::size_of::<(u64, JoinInputSide, i64, Vec<u8>)>())
-                .ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "{context}: aligned replay roster accounting overflow"
-                    ))
-                })?;
-            remaining = remaining.checked_sub(roster_bytes).ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "{context}: aligned replay roster exceeded its cumulative serialization budget"
-                ))
-            })?;
-
-            while let Some((assignment, side, watermark, batch)) =
-                capture.aligned_replay.pop_front()
-            {
-                let bytes = laminar_core::serialization::serialize_batches_stream_bounded(
-                    batch.batch().schema().as_ref(),
-                    std::iter::once(batch.batch()),
-                    remaining,
-                )
-                .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "{context}: aligned replay serialization within the cumulative budget: {error}"
-                    ))
-                })?;
-                remaining = remaining.checked_sub(bytes.capacity()).ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "{context}: aligned replay byte accounting overflow"
-                    ))
-                })?;
-                aligned_replay.push((assignment, side, watermark, bytes));
+                for channel in &cluster.channels[port] {
+                    let mut events = Vec::new();
+                    events
+                        .try_reserve_exact(channel.events.len())
+                        .map_err(|error| {
+                            DbError::Checkpoint(format!(
+                                "{context}: peer {} event roster cannot be reserved: {error}",
+                                channel.peer
+                            ))
+                        })?;
+                    let event_bytes = allocation(
+                        events.capacity(),
+                        std::mem::size_of::<IntervalCheckpointEvent>(),
+                    )?;
+                    remaining = remaining.checked_sub(event_bytes).ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "{context}: peer {} encoded event roster requires {event_bytes} bytes",
+                            channel.peer
+                        ))
+                    })?;
+                    for event in &channel.events {
+                        let encoded = match event {
+                            CapturedIntervalEvent::Data {
+                                recovery_gen,
+                                retained,
+                            } => {
+                                let mut routed_vnodes = Vec::new();
+                                routed_vnodes
+                                    .try_reserve_exact(retained.routed_vnodes().len())
+                                    .map_err(|error| {
+                                        DbError::Checkpoint(format!(
+                                            "{context}: peer {} route roster cannot be reserved: {error}",
+                                            channel.peer
+                                        ))
+                                    })?;
+                                let route_bytes = allocation(
+                                    routed_vnodes.capacity(),
+                                    std::mem::size_of::<u32>(),
+                                )?;
+                                remaining = remaining.checked_sub(route_bytes).ok_or_else(|| {
+                                    DbError::Checkpoint(format!(
+                                        "{context}: peer {} route roster requires {route_bytes} bytes",
+                                        channel.peer
+                                    ))
+                                })?;
+                                routed_vnodes.extend_from_slice(retained.routed_vnodes());
+                                let ipc =
+                                    laminar_core::serialization::serialize_batches_stream_bounded(
+                                        retained.batch().schema().as_ref(),
+                                        std::iter::once(retained.batch()),
+                                        remaining,
+                                    )
+                                    .map_err(|error| {
+                                        DbError::Checkpoint(format!(
+                                            "{context}: peer {} queued data serialization: {error}",
+                                            channel.peer
+                                        ))
+                                    })?;
+                                remaining =
+                                    remaining.checked_sub(ipc.capacity()).ok_or_else(|| {
+                                        DbError::Checkpoint(format!(
+                                            "{context}: queued data byte accounting overflow"
+                                        ))
+                                    })?;
+                                IntervalCheckpointEvent::Data {
+                                    recovery_gen: *recovery_gen,
+                                    routed_vnodes,
+                                    ipc,
+                                }
+                            }
+                            CapturedIntervalEvent::Frontier {
+                                recovery_gen,
+                                frontier,
+                            } => IntervalCheckpointEvent::Frontier {
+                                recovery_gen: *recovery_gen,
+                                frontier: (*frontier).into(),
+                            },
+                        };
+                        events.push(encoded);
+                    }
+                    encoded_port.push(IntervalCheckpointChannel {
+                        peer: channel.peer,
+                        applied: channel.applied.into(),
+                        events,
+                    });
+                }
             }
-            capture.checkpoint.aligned_replay = aligned_replay;
+            capture.checkpoint.cluster = Some(IntervalClusterCheckpoint {
+                assignment_version: cluster.assignment_version,
+                owner_map_digest: cluster.owner_map_digest,
+                self_id: cluster.self_id,
+                recovery_gen: cluster.recovery_gen,
+                local_frontiers: cluster.local_frontiers.map(Into::into),
+                remote_side_cursor: cluster.remote_side_cursor,
+                remote_peer_cursors: cluster.remote_peer_cursors,
+                channels: encoded_channels,
+            });
         }
 
         let writer = rkyv::ser::writer::IoWriter::new(
@@ -251,6 +516,8 @@ impl IntervalJoinOperatorCheckpointCapture {
 struct IntervalHandoffCut {
     left_watermark: i64,
     right_watermark: i64,
+    left_idle: bool,
+    right_idle: bool,
 }
 
 #[cfg(feature = "cluster")]
@@ -258,6 +525,9 @@ struct PreparedIntervalJoinTransition {
     replacements: Vec<(u32, Option<Box<IntervalJoinState>>)>,
     local_assignment: VnodeAssignmentSnapshot,
     resident_vnodes: Vec<u32>,
+    cluster_peers: Arc<[u64]>,
+    peer_channels: [BTreeMap<u64, IntervalPeerChannel>; 2],
+    bootstrap_broadcast: bool,
     handoff_cut: Option<IntervalHandoffCut>,
 }
 
@@ -265,6 +535,87 @@ struct PreparedIntervalJoinTransition {
 enum IntervalJoinTransitionCleanup {
     Aborted(PreparedIntervalJoinTransition),
     Published(PreparedIntervalJoinTransition),
+}
+
+#[cfg(feature = "cluster")]
+struct QueuedIntervalBatch {
+    retained: Arc<crate::operator::RetainedBatch>,
+    row_vnodes: Arc<[u32]>,
+    charged_bytes: usize,
+}
+
+#[cfg(feature = "cluster")]
+struct IntervalRemoteEvent {
+    assignment_version: u64,
+    recovery_gen: u64,
+    payload: IntervalRemoteEventPayload,
+}
+
+#[cfg(feature = "cluster")]
+enum IntervalRemoteEventPayload {
+    Data(QueuedIntervalBatch),
+    Frontier(InputFrontier),
+}
+
+#[cfg(feature = "cluster")]
+impl IntervalRemoteEvent {
+    fn payload_bytes(&self) -> usize {
+        match &self.payload {
+            IntervalRemoteEventPayload::Data(batch) => batch.charged_bytes,
+            IntervalRemoteEventPayload::Frontier(_) => 0,
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Default)]
+struct IntervalPeerChannel {
+    applied: InputFrontier,
+    accepted: InputFrontier,
+    events: VecDeque<IntervalRemoteEvent>,
+}
+
+#[cfg(feature = "cluster")]
+struct IntervalClusterInputPlan {
+    routed: BTreeMap<u32, [Vec<RecordBatch>; 2]>,
+    outbound: Vec<(u64, laminar_core::shuffle::ShuffleMessage)>,
+    local_frontiers: [InputFrontier; 2],
+    effective_frontiers: [InputFrontier; 2],
+}
+
+#[cfg(feature = "cluster")]
+type IntervalSendOutcome = (
+    Result<(), DbError>,
+    Option<Vec<(u64, laminar_core::shuffle::ShuffleMessage)>>,
+);
+
+#[cfg(feature = "cluster")]
+type IntervalSendTask = tokio::task::JoinHandle<()>;
+
+#[cfg(feature = "cluster")]
+struct PendingIntervalClusterInput {
+    routed: BTreeMap<u32, [Vec<RecordBatch>; 2]>,
+    outbound: Option<Vec<(u64, laminar_core::shuffle::ShuffleMessage)>>,
+    local_frontiers: [InputFrontier; 2],
+    send: Option<IntervalSendTask>,
+    outcome: Option<tokio::sync::oneshot::Receiver<IntervalSendOutcome>>,
+    accounted_bytes: usize,
+}
+
+#[cfg(feature = "cluster")]
+impl Drop for PendingIntervalClusterInput {
+    fn drop(&mut self) {
+        if let Some(send) = &self.send {
+            send.abort();
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+enum PendingIntervalCompletion {
+    Waiting,
+    RetryLater,
+    Applied(Vec<RecordBatch>),
 }
 
 pub(crate) struct IntervalJoinOperator {
@@ -282,7 +633,25 @@ pub(crate) struct IntervalJoinOperator {
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<ClusterShuffleConfig>,
     #[cfg(feature = "cluster")]
-    aligned_replay: VecDeque<(u64, JoinInputSide, i64, crate::operator::RetainedBatch)>,
+    cluster_peers: Arc<[u64]>,
+    #[cfg(feature = "cluster")]
+    local_frontiers: [InputFrontier; 2],
+    #[cfg(feature = "cluster")]
+    peer_channels: [BTreeMap<u64, IntervalPeerChannel>; 2],
+    #[cfg(feature = "cluster")]
+    last_broadcasts: [InputFrontier; 2],
+    #[cfg(feature = "cluster")]
+    remote_side_cursor: u8,
+    #[cfg(feature = "cluster")]
+    remote_peer_cursors: [Option<u64>; 2],
+    #[cfg(feature = "cluster")]
+    queued_shuffle_bytes: usize,
+    #[cfg(feature = "cluster")]
+    queued_remote_events: usize,
+    #[cfg(feature = "cluster")]
+    queued_event_capacity_bytes: usize,
+    #[cfg(feature = "cluster")]
+    pending_cluster_input: Option<PendingIntervalClusterInput>,
     #[cfg(feature = "cluster")]
     prepared_vnode_transition: Option<PreparedIntervalJoinTransition>,
     #[cfg(feature = "cluster")]
@@ -337,7 +706,25 @@ impl IntervalJoinOperator {
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
             #[cfg(feature = "cluster")]
-            aligned_replay: VecDeque::new(),
+            cluster_peers: Arc::from([]),
+            #[cfg(feature = "cluster")]
+            local_frontiers: [InputFrontier::default(); 2],
+            #[cfg(feature = "cluster")]
+            peer_channels: [BTreeMap::new(), BTreeMap::new()],
+            #[cfg(feature = "cluster")]
+            last_broadcasts: [InputFrontier::default(); 2],
+            #[cfg(feature = "cluster")]
+            remote_side_cursor: 0,
+            #[cfg(feature = "cluster")]
+            remote_peer_cursors: [None; 2],
+            #[cfg(feature = "cluster")]
+            queued_shuffle_bytes: 0,
+            #[cfg(feature = "cluster")]
+            queued_remote_events: 0,
+            #[cfg(feature = "cluster")]
+            queued_event_capacity_bytes: 0,
+            #[cfg(feature = "cluster")]
+            pending_cluster_input: None,
             #[cfg(feature = "cluster")]
             prepared_vnode_transition: None,
             #[cfg(feature = "cluster")]
@@ -369,12 +756,121 @@ impl IntervalJoinOperator {
         self.resident_vnodes.reserve_exact(vnode_count);
         self.dirty_vnode_roster.reserve_exact(vnode_count);
         self.full_vnode_capture_required = true;
-        self.local_assignment = config.registry.versioned_snapshot();
+        let assignment = config.registry.versioned_snapshot();
+        self.local_assignment = assignment.clone();
+        let peers = Self::remote_owner_peers(&assignment, config.self_id);
+        for &peer in &peers {
+            self.peer_channels[0].entry(peer).or_default();
+            self.peer_channels[1].entry(peer).or_default();
+        }
+        self.cluster_peers = peers.into();
         self.cluster_shuffle = Some(config);
     }
 
+    #[cfg(feature = "cluster")]
+    fn remote_owner_peers(assignment: &VnodeAssignmentSnapshot, self_id: NodeId) -> Vec<u64> {
+        assignment
+            .owners()
+            .iter()
+            .copied()
+            .filter(|owner| !owner.is_unassigned() && *owner != self_id)
+            .map(|owner| owner.0)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn active_cluster_scope(
+        &self,
+    ) -> Result<(ClusterShuffleConfig, VnodeAssignmentSnapshot, Arc<[u64]>), DbError> {
+        let config = self.cluster_shuffle.clone().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "interval join [{}] has no cluster shuffle scope",
+                self.projection.op_name
+            ))
+        })?;
+        let assignment = config.registry.versioned_snapshot();
+        let sender_digest = config.sender.active_assignment_digest();
+        let receiver_digest = config.receiver.active_assignment_digest();
+        if assignment.version() != self.local_assignment.version()
+            || !std::ptr::eq(assignment.owners(), self.local_assignment.owners())
+            || config.sender.local_id() != config.self_id.0
+            || config.receiver.local_id() != config.self_id.0
+            || config.sender.incarnation() != config.receiver.incarnation()
+            || config.sender.assignment_version() != assignment.version()
+            || config.receiver.assignment_version() != assignment.version()
+            || config.sender.recovery_gen() != config.receiver.recovery_gen()
+            || sender_digest.is_none()
+            || sender_digest != receiver_digest
+        {
+            return Err(DbError::ShuffleNotReady(format!(
+                "interval join [{}] cluster ownership is outside its attached assignment",
+                self.projection.op_name
+            )));
+        }
+        Ok((config, assignment, Arc::clone(&self.cluster_peers)))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn validate_frontier(
+        &self,
+        previous: InputFrontier,
+        next: InputFrontier,
+        side: JoinInputSide,
+    ) -> Result<(), DbError> {
+        if next.watermark == Some(i64::MIN)
+            || (previous.watermark.is_some() && next.watermark.is_none())
+        {
+            return Err(DbError::Pipeline(format!(
+                "interval join [{}] {} frontier became uninitialized",
+                self.projection.op_name,
+                side.name()
+            )));
+        }
+        if let (Some(previous), Some(next)) = (previous.watermark, next.watermark) {
+            if next < previous {
+                return Err(DbError::Pipeline(format!(
+                    "interval join [{}] {} frontier regressed from {previous} to {next}",
+                    self.projection.op_name,
+                    side.name()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn max_watermark(current: Option<i64>, floor: Option<i64>) -> Option<i64> {
+        match (current, floor) {
+            (Some(current), Some(floor)) => Some(current.max(floor)),
+            (None, floor) => floor,
+            (current, None) => current,
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn watermark_option(watermark: i64) -> Option<i64> {
+        (watermark != i64::MIN).then_some(watermark)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn applied_frontiers(&self) -> [InputFrontier; 2] {
+        [
+            InputFrontier {
+                watermark: Self::watermark_option(self.applied_left_watermark),
+                idle: self.applied_left_idle,
+            },
+            InputFrontier {
+                watermark: Self::watermark_option(self.applied_right_watermark),
+                idle: self.applied_right_idle,
+            },
+        ]
+    }
+
     fn accounted_state_bytes(&self) -> usize {
-        self.vnode_states
+        let bytes = self
+            .vnode_states
             .capacity()
             .saturating_mul(std::mem::size_of::<Option<Box<IntervalJoinState>>>())
             .saturating_add(
@@ -395,12 +891,39 @@ impl IntervalJoinOperator {
                     .as_ref()
                     .expect("resident interval vnode must contain state");
                 total.saturating_add(state.accounted_state_bytes())
-            }))
+            }));
+        #[cfg(feature = "cluster")]
+        let bytes = bytes.saturating_add(self.cluster_accounted_bytes());
+        bytes
+    }
+
+    #[cfg(feature = "cluster")]
+    fn cluster_accounted_bytes(&self) -> usize {
+        let channels = self
+            .peer_channels
+            .iter()
+            .map(BTreeMap::len)
+            .sum::<usize>()
+            .saturating_mul(
+                std::mem::size_of::<(u64, IntervalPeerChannel)>()
+                    .saturating_add(PEER_CHANNEL_ENTRY_CHARGE),
+            );
+        self.cluster_peers
+            .len()
+            .saturating_mul(std::mem::size_of::<u64>())
+            .saturating_add(channels)
+            .saturating_add(self.queued_event_capacity_bytes)
+            .saturating_add(self.queued_shuffle_bytes)
+            .saturating_add(
+                self.pending_cluster_input
+                    .as_ref()
+                    .map_or(0, |pending| pending.accounted_bytes),
+            )
     }
 
     #[cfg(feature = "cluster")]
     fn transition_accounted_bytes(transition: &PreparedIntervalJoinTransition) -> usize {
-        transition
+        let bytes = transition
             .replacements
             .capacity()
             .saturating_mul(std::mem::size_of::<(u32, Option<Box<IntervalJoinState>>)>())
@@ -420,7 +943,37 @@ impl IntervalJoinOperator {
                     .fold(0usize, |total, state| {
                         total.saturating_add(state.accounted_state_bytes())
                     }),
+            );
+        let channels = transition
+            .peer_channels
+            .iter()
+            .map(BTreeMap::len)
+            .sum::<usize>()
+            .saturating_mul(
+                std::mem::size_of::<(u64, IntervalPeerChannel)>()
+                    .saturating_add(PEER_CHANNEL_ENTRY_CHARGE),
             )
+            .saturating_add(
+                transition
+                    .peer_channels
+                    .iter()
+                    .flat_map(BTreeMap::values)
+                    .map(|channel| {
+                        channel
+                            .events
+                            .capacity()
+                            .saturating_mul(REMOTE_EVENT_CHARGE)
+                    })
+                    .sum::<usize>(),
+            );
+        bytes
+            .saturating_add(
+                transition
+                    .cluster_peers
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
+            .saturating_add(channels)
     }
 
     fn add_resident_vnode(&mut self, vnode: u32) {
@@ -452,23 +1005,331 @@ impl IntervalJoinOperator {
         }
     }
 
+    #[cfg(feature = "cluster")]
+    fn capture_cluster_checkpoint(
+        &self,
+        max_capture_bytes: usize,
+    ) -> Result<Option<CapturedIntervalCluster>, DbError> {
+        let Some(config) = self.cluster_shuffle.as_ref() else {
+            if self.queued_remote_events != 0
+                || self.queued_shuffle_bytes != 0
+                || self.pending_cluster_input.is_some()
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join [{}] has cluster state without an attached scope",
+                    self.projection.op_name
+                )));
+            }
+            return Ok(None);
+        };
+        let (_, assignment, peers) = self.active_cluster_scope()?;
+        if self.pending_cluster_input.is_some()
+            || self.last_broadcasts != self.local_frontiers
+            || peers.as_ref() != Self::remote_owner_peers(&assignment, config.self_id).as_slice()
+            || self.remote_side_cursor > 1
+        {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] cluster channels are not at a checkpoint boundary",
+                self.projection.op_name
+            )));
+        }
+        let effective = self.effective_cluster_frontiers(self.local_frontiers, None)?;
+        if effective[0].watermark.unwrap_or(i64::MIN) != self.applied_left_watermark
+            || effective[1].watermark.unwrap_or(i64::MIN) != self.applied_right_watermark
+            || (self.queued_remote_events == 0
+                && (effective[0].idle != self.applied_left_idle
+                    || effective[1].idle != self.applied_right_idle))
+        {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] applied cluster frontier is inconsistent",
+                self.projection.op_name
+            )));
+        }
+
+        let allocation =
+            |bytes: usize| bytes.checked_add(usize::from(bytes != 0) * HEAP_ALLOCATION_CHARGE);
+        let mut requested_retained = 0usize;
+        for peer_channels in &self.peer_channels {
+            requested_retained = requested_retained
+                .checked_add(
+                    allocation(
+                        peer_channels
+                            .len()
+                            .checked_mul(std::mem::size_of::<CapturedIntervalChannel>())
+                            .ok_or_else(|| self.accounting_error())?,
+                    )
+                    .ok_or_else(|| self.accounting_error())?,
+                )
+                .ok_or_else(|| self.accounting_error())?;
+            for channel in peer_channels.values() {
+                requested_retained = requested_retained
+                    .checked_add(
+                        allocation(
+                            channel
+                                .events
+                                .len()
+                                .checked_mul(std::mem::size_of::<CapturedIntervalEvent>())
+                                .ok_or_else(|| self.accounting_error())?,
+                        )
+                        .ok_or_else(|| self.accounting_error())?,
+                    )
+                    .ok_or_else(|| self.accounting_error())?;
+                for event in &channel.events {
+                    if let IntervalRemoteEventPayload::Data(batch) = &event.payload {
+                        requested_retained = requested_retained
+                            .checked_add(
+                                batch
+                                    .retained
+                                    .heap_bytes()
+                                    .and_then(|bytes| bytes.checked_add(RETAINED_BATCH_ARC_CHARGE))
+                                    .ok_or_else(|| self.accounting_error())?,
+                            )
+                            .ok_or_else(|| self.accounting_error())?;
+                    }
+                }
+            }
+        }
+        if requested_retained > max_capture_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] channel capture requires {requested_retained} bytes; headroom is {max_capture_bytes} bytes",
+                self.projection.op_name
+            )));
+        }
+
+        let mut queued_bytes = 0usize;
+        let mut queued_events = 0usize;
+        let mut capacity_bytes = 0usize;
+        let mut channels = [Vec::new(), Vec::new()];
+        for side in [JoinInputSide::Left, JoinInputSide::Right] {
+            let port = side.port();
+            if self.peer_channels[port].len() != peers.len()
+                || !self.peer_channels[port]
+                    .keys()
+                    .copied()
+                    .eq(peers.iter().copied())
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join [{}] {} channel roster is incomplete",
+                    self.projection.op_name,
+                    side.name()
+                )));
+            }
+            channels[port]
+                .try_reserve_exact(peers.len())
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "interval join [{}] {} checkpoint channel reservation: {error}",
+                        self.projection.op_name,
+                        side.name()
+                    ))
+                })?;
+            for (&peer, channel) in &self.peer_channels[port] {
+                capacity_bytes = capacity_bytes
+                    .checked_add(
+                        channel
+                            .events
+                            .capacity()
+                            .checked_mul(REMOTE_EVENT_CHARGE)
+                            .ok_or_else(|| self.accounting_error())?,
+                    )
+                    .ok_or_else(|| self.accounting_error())?;
+                let mut accepted = channel.applied;
+                let mut previous_recovery = None;
+                let mut captured = Vec::new();
+                captured
+                    .try_reserve_exact(channel.events.len())
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "interval join [{}] peer {peer} event capture reservation: {error}",
+                            self.projection.op_name
+                        ))
+                    })?;
+                for event in &channel.events {
+                    if event.assignment_version != assignment.version()
+                        || event.recovery_gen > config.receiver.recovery_gen()
+                        || previous_recovery.is_some_and(|previous| event.recovery_gen < previous)
+                    {
+                        return Err(DbError::Checkpoint(format!(
+                            "interval join [{}] peer {peer} queue crossed assignment or recovery",
+                            self.projection.op_name
+                        )));
+                    }
+                    previous_recovery = Some(event.recovery_gen);
+                    queued_bytes = queued_bytes
+                        .checked_add(event.payload_bytes())
+                        .ok_or_else(|| self.accounting_error())?;
+                    queued_events = queued_events
+                        .checked_add(1)
+                        .ok_or_else(|| self.accounting_error())?;
+                    let event = match &event.payload {
+                        IntervalRemoteEventPayload::Data(batch) => {
+                            let declared = batch.retained.routed_vnodes();
+                            let mut seen = vec![false; declared.len()];
+                            let coverage_valid = batch.row_vnodes.iter().all(|vnode| {
+                                declared.binary_search(vnode).is_ok_and(|index| {
+                                    seen[index] = true;
+                                    true
+                                })
+                            }) && seen.iter().all(|seen| *seen);
+                            let expected_bytes = batch
+                                .retained
+                                .heap_bytes()
+                                .and_then(|bytes| bytes.checked_add(RETAINED_BATCH_ARC_CHARGE))
+                                .and_then(|bytes| {
+                                    batch
+                                        .row_vnodes
+                                        .len()
+                                        .checked_mul(std::mem::size_of::<u32>())
+                                        .and_then(|vnodes| vnodes.checked_add(ROW_VNODE_ARC_CHARGE))
+                                        .and_then(|vnodes| bytes.checked_add(vnodes))
+                                });
+                            if accepted.idle
+                                || declared.is_empty()
+                                || declared.windows(2).any(|pair| pair[0] >= pair[1])
+                                || declared.iter().any(|vnode| {
+                                    assignment
+                                        .owners()
+                                        .get(*vnode as usize)
+                                        .is_none_or(|owner| *owner != config.self_id)
+                                })
+                                || batch.row_vnodes.len() != batch.retained.batch().num_rows()
+                                || !coverage_valid
+                                || expected_bytes != Some(batch.charged_bytes)
+                                || batch.retained.peer() != Some(peer)
+                                || batch.retained.assignment_version() != Some(assignment.version())
+                                || batch.retained.recovery_gen() != Some(event.recovery_gen)
+                            {
+                                return Err(DbError::Checkpoint(format!(
+                                    "interval join [{}] peer {peer} has data behind an idle or invalid channel",
+                                    self.projection.op_name
+                                )));
+                            }
+                            CapturedIntervalEvent::Data {
+                                recovery_gen: event.recovery_gen,
+                                retained: Arc::clone(&batch.retained),
+                            }
+                        }
+                        IntervalRemoteEventPayload::Frontier(frontier) => {
+                            let floor = if port == 0 {
+                                self.applied_left_watermark
+                            } else {
+                                self.applied_right_watermark
+                            };
+                            if accepted.idle
+                                && !frontier.idle
+                                && Self::watermark_option(floor).is_some_and(|floor| {
+                                    frontier.watermark.is_none_or(|watermark| watermark < floor)
+                                })
+                            {
+                                return Err(DbError::Checkpoint(format!(
+                                    "interval join [{}] peer {peer} {} revival frontier is below its checkpoint floor",
+                                    self.projection.op_name,
+                                    side.name()
+                                )));
+                            }
+                            self.validate_frontier(accepted, *frontier, side)?;
+                            accepted = *frontier;
+                            CapturedIntervalEvent::Frontier {
+                                recovery_gen: event.recovery_gen,
+                                frontier: *frontier,
+                            }
+                        }
+                    };
+                    captured.push(event);
+                }
+                if accepted != channel.accepted {
+                    return Err(DbError::Checkpoint(format!(
+                        "interval join [{}] peer {peer} accepted frontier is not derivable",
+                        self.projection.op_name
+                    )));
+                }
+                channels[port].push(CapturedIntervalChannel {
+                    peer,
+                    applied: channel.applied,
+                    events: captured,
+                });
+            }
+        }
+        if queued_bytes != self.queued_shuffle_bytes
+            || queued_events != self.queued_remote_events
+            || capacity_bytes != self.queued_event_capacity_bytes
+        {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] channel accounting is inconsistent",
+                self.projection.op_name
+            )));
+        }
+        let capture = CapturedIntervalCluster {
+            assignment_version: assignment.version(),
+            owner_map_digest: self.checkpoint_assignment_identity()?.1,
+            self_id: config.self_id.0,
+            recovery_gen: config.receiver.recovery_gen(),
+            local_frontiers: self.local_frontiers,
+            remote_side_cursor: self.remote_side_cursor,
+            remote_peer_cursors: self.remote_peer_cursors,
+            channels,
+        };
+        let mut retained = 0usize;
+        for channels in &capture.channels {
+            retained = retained
+                .checked_add(
+                    allocation(
+                        channels
+                            .capacity()
+                            .checked_mul(std::mem::size_of::<CapturedIntervalChannel>())
+                            .ok_or_else(|| self.accounting_error())?,
+                    )
+                    .ok_or_else(|| self.accounting_error())?,
+                )
+                .ok_or_else(|| self.accounting_error())?;
+            for channel in channels {
+                retained = retained
+                    .checked_add(
+                        allocation(
+                            channel
+                                .events
+                                .capacity()
+                                .checked_mul(std::mem::size_of::<CapturedIntervalEvent>())
+                                .ok_or_else(|| self.accounting_error())?,
+                        )
+                        .ok_or_else(|| self.accounting_error())?,
+                    )
+                    .ok_or_else(|| self.accounting_error())?;
+                for event in &channel.events {
+                    if let CapturedIntervalEvent::Data {
+                        retained: batch, ..
+                    } = event
+                    {
+                        retained = retained
+                            .checked_add(
+                                batch
+                                    .heap_bytes()
+                                    .and_then(|bytes| bytes.checked_add(RETAINED_BATCH_ARC_CHARGE))
+                                    .ok_or_else(|| self.accounting_error())?,
+                            )
+                            .ok_or_else(|| self.accounting_error())?;
+                    }
+                }
+            }
+        }
+        if retained > max_capture_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] channel capture retains {retained} bytes; headroom is {max_capture_bytes} bytes",
+                self.projection.op_name
+            )));
+        }
+        Ok(Some(capture))
+    }
+
     fn capture_operator_checkpoint(
         &self,
         max_capture_bytes: u64,
     ) -> Result<Option<IntervalJoinOperatorCheckpointCapture>, DbError> {
         #[cfg(feature = "cluster")]
-        if self.cluster_shuffle.is_none() && !self.aligned_replay.is_empty() {
-            return Err(DbError::Checkpoint(format!(
-                "interval join [{}] has cluster replay without an attached cluster scope",
-                self.projection.op_name
-            )));
-        }
-        #[cfg(feature = "cluster")]
-        let aligned_replay_is_empty = self.aligned_replay.is_empty();
+        let cluster_attached = self.cluster_shuffle.is_some();
         #[cfg(not(feature = "cluster"))]
-        let aligned_replay_is_empty = true;
-
-        if aligned_replay_is_empty
+        let cluster_attached = false;
+        if !cluster_attached
             && self.applied_left_watermark == i64::MIN
             && self.applied_right_watermark == i64::MIN
             && !self.applied_left_idle
@@ -496,12 +1357,6 @@ impl IntervalJoinOperator {
                     &self.config.right_table,
                 ])
                 .map(String::len),
-            #[cfg(feature = "cluster")]
-            self.aligned_replay.len(),
-            #[cfg(feature = "cluster")]
-            self.aligned_replay
-                .iter()
-                .map(|(_, _, _, batch)| batch.heap_bytes()),
         )?;
         if preflight_bytes > max_capture_bytes {
             return Err(DbError::Checkpoint(format!(
@@ -510,13 +1365,10 @@ impl IntervalJoinOperator {
             )));
         }
         #[cfg(feature = "cluster")]
-        let assignment_identity = self
-            .cluster_shuffle
-            .as_ref()
-            .map(|_| self.checkpoint_assignment_identity())
-            .transpose()?;
-        #[cfg(not(feature = "cluster"))]
-        let assignment_identity: Option<(u64, [u8; 32], u64)> = None;
+        let cluster = self.capture_cluster_checkpoint(
+            usize::try_from(max_capture_bytes.saturating_sub(preflight_bytes))
+                .unwrap_or(usize::MAX),
+        )?;
         let checkpoint = IntervalJoinOperatorCheckpoint {
             version: OPERATOR_CHECKPOINT_VERSION,
             join_type: join_type_tag(self.config.join_type),
@@ -527,63 +1379,26 @@ impl IntervalJoinOperator {
             left_table: self.config.left_table.clone(),
             right_table: self.config.right_table.clone(),
             bound_ms,
-            aligned_replay: Vec::new(),
             applied_left_watermark: self.applied_left_watermark,
             applied_right_watermark: self.applied_right_watermark,
             applied_left_idle: self.applied_left_idle,
             applied_right_idle: self.applied_right_idle,
-            assignment_version: assignment_identity.map(|identity| identity.0),
-            owner_map_digest: assignment_identity.map(|identity| identity.1),
-            participant_id: assignment_identity.map(|identity| identity.2),
+            cluster: None,
         };
-        #[cfg(feature = "cluster")]
-        let mut aligned_replay = VecDeque::new();
-        #[cfg(feature = "cluster")]
-        aligned_replay
-            .try_reserve_exact(self.aligned_replay.len())
-            .map_err(|_| {
-                DbError::Checkpoint(format!(
-                    "interval join [{}] aligned replay capture roster cannot be reserved",
-                    self.projection.op_name
-                ))
-            })?;
-        let retained_bytes = IntervalJoinOperatorCheckpointCapture::calculate_retained_bytes_for(
-            checkpoint.left_keys.capacity(),
-            checkpoint.right_keys.capacity(),
-            checkpoint
-                .left_keys
-                .iter()
-                .chain(&checkpoint.right_keys)
-                .chain([
-                    &checkpoint.left_time_column,
-                    &checkpoint.right_time_column,
-                    &checkpoint.left_table,
-                    &checkpoint.right_table,
-                ])
-                .map(String::capacity),
+        let mut capture = IntervalJoinOperatorCheckpointCapture {
+            checkpoint,
             #[cfg(feature = "cluster")]
-            aligned_replay.capacity(),
-            #[cfg(feature = "cluster")]
-            self.aligned_replay
-                .iter()
-                .map(|(_, _, _, batch)| batch.heap_bytes()),
-        )?;
+            cluster,
+            retained_bytes: 0,
+        };
+        let retained_bytes = capture.calculate_retained_bytes()?;
+        capture.retained_bytes = retained_bytes;
         if retained_bytes > max_capture_bytes {
             return Err(DbError::Checkpoint(format!(
                 "interval join [{}] whole checkpoint capture retains {retained_bytes} bytes; capture headroom is {max_capture_bytes} bytes",
                 self.projection.op_name
             )));
         }
-        #[cfg(feature = "cluster")]
-        aligned_replay.extend(self.aligned_replay.iter().map(
-            |(assignment, side, watermark, batch)| (*assignment, *side, *watermark, batch.clone()),
-        ));
-        let capture = IntervalJoinOperatorCheckpointCapture {
-            checkpoint,
-            #[cfg(feature = "cluster")]
-            aligned_replay,
-            retained_bytes,
-        };
         debug_assert_eq!(capture.calculate_retained_bytes()?, retained_bytes);
         Ok(Some(capture))
     }
@@ -851,10 +1666,20 @@ impl IntervalJoinOperator {
                     ))
                 })?;
             self.validate_checkpoint_config(&checkpoint)?;
-            if !checkpoint.aligned_replay.is_empty()
-                || checkpoint.assignment_version != Some(transition.predecessor.assignment_version)
-                || checkpoint.owner_map_digest != Some(transition.predecessor.assignment_digest)
-                || checkpoint.participant_id != Some(restore.participant_id)
+            let Some(cluster) = checkpoint.cluster.as_ref() else {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join [{}] donor {} whole checkpoint has no cluster identity",
+                    self.projection.op_name, restore.participant_id
+                )));
+            };
+            if cluster.assignment_version != transition.predecessor.assignment_version
+                || cluster.owner_map_digest != transition.predecessor.assignment_digest
+                || cluster.self_id != restore.participant_id
+                || cluster
+                    .channels
+                    .iter()
+                    .flatten()
+                    .any(|channel| !channel.events.is_empty())
             {
                 return Err(DbError::Checkpoint(format!(
                     "interval join [{}] donor {} whole checkpoint is not a portable predecessor cut",
@@ -864,10 +1689,14 @@ impl IntervalJoinOperator {
             let cut = IntervalHandoffCut {
                 left_watermark: checkpoint.applied_left_watermark,
                 right_watermark: checkpoint.applied_right_watermark,
+                left_idle: checkpoint.applied_left_idle,
+                right_idle: checkpoint.applied_right_idle,
             };
             if let Some(expected) = &mut common {
                 if expected.left_watermark != cut.left_watermark
                     || expected.right_watermark != cut.right_watermark
+                    || expected.left_idle != cut.left_idle
+                    || expected.right_idle != cut.right_idle
                 {
                     return Err(DbError::Checkpoint(format!(
                         "interval join [{}] donor whole checkpoints disagree on the handoff watermarks",
@@ -919,6 +1748,8 @@ impl IntervalJoinOperator {
         Ok(Some(IntervalHandoffCut {
             left_watermark: right_evicted_cutoff,
             right_watermark,
+            left_idle: false,
+            right_idle: false,
         }))
     }
 
@@ -1087,17 +1918,6 @@ impl IntervalJoinOperator {
         }
     }
 
-    #[cfg(feature = "cluster")]
-    fn post_shuffle_admission_error(&self, outbound_admitted: bool, error: DbError) -> DbError {
-        if !outbound_admitted || error.requires_pipeline_recovery() {
-            return error;
-        }
-        DbError::ShufflePartialSend(format!(
-            "interval join [{}] failed after outbound shuffle data was admitted: {error}",
-            self.projection.op_name
-        ))
-    }
-
     fn prevalidate_inputs(&self, inputs: &[Vec<RecordBatch>]) -> Result<(), DbError> {
         if self.config.left_keys.is_empty()
             || self.config.left_keys.len() != self.config.right_keys.len()
@@ -1252,15 +2072,12 @@ impl IntervalJoinOperator {
     }
 
     #[cfg(feature = "cluster")]
-    fn route_owned_batch(
+    fn row_vnodes_for_side(
         &self,
-        config: &ClusterShuffleConfig,
-        assignment: &laminar_core::state::VnodeAssignmentSnapshot,
         side: JoinInputSide,
         batch: &RecordBatch,
-        declared_vnodes: Option<&[u32]>,
-        routed: &mut BTreeMap<u32, [Vec<RecordBatch>; 2]>,
-    ) -> Result<(), DbError> {
+        vnode_count: u32,
+    ) -> Result<Vec<u32>, DbError> {
         let (side_name, key_names) = match side {
             JoinInputSide::Left => ("left", self.config.left_keys.as_slice()),
             JoinInputSide::Right => ("right", self.config.right_keys.as_slice()),
@@ -1276,20 +2093,118 @@ impl IntervalJoinOperator {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let row_vnodes =
-            laminar_core::shuffle::row_vnodes(batch, &key_indices, config.registry.vnode_count())
-                .map_err(|error| {
-                crate::operator::shuffle_routing_error(
-                    &format!(
-                        "interval join [{}] {side_name} routing",
-                        self.projection.op_name
-                    ),
-                    &error,
-                )
-            })?;
+        laminar_core::shuffle::row_vnodes(batch, &key_indices, vnode_count).map_err(|error| {
+            crate::operator::shuffle_routing_error(
+                &format!(
+                    "interval join [{}] {side_name} routing",
+                    self.projection.op_name
+                ),
+                &error,
+            )
+        })
+    }
+
+    #[cfg(feature = "cluster")]
+    fn build_queued_batch(
+        &self,
+        retained: crate::operator::RetainedBatch,
+        accepted: InputFrontier,
+        config: &ClusterShuffleConfig,
+        assignment: &laminar_core::state::VnodeAssignmentSnapshot,
+        side: JoinInputSide,
+    ) -> Result<QueuedIntervalBatch, DbError> {
+        if accepted.idle {
+            return Err(DbError::ShuffleTerminal(format!(
+                "interval join [{}] received {} data behind an idle peer frontier",
+                self.projection.op_name,
+                side.name()
+            )));
+        }
+        let batch = retained.batch();
+        let declared = retained.routed_vnodes();
+        if batch.num_rows() == 0
+            || batch.num_rows() > laminar_core::shuffle::ROUTE_MAX_BATCH_ROWS
+            || declared.is_empty()
+            || declared.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(DbError::ShuffleTerminal(format!(
+                "interval join [{}] rejected non-canonical {} shuffle data",
+                self.projection.op_name,
+                side.name()
+            )));
+        }
+        let logical_bytes = laminar_core::shuffle::logical_batch_bytes(batch).map_err(|error| {
+            DbError::ShuffleTerminal(format!(
+                "interval join [{}] rejected {} shuffle batch size: {error}",
+                self.projection.op_name,
+                side.name()
+            ))
+        })?;
+        if logical_bytes > laminar_core::shuffle::ROUTE_MAX_BATCH_BYTES
+            || declared.iter().any(|vnode| {
+                assignment
+                    .owners()
+                    .get(*vnode as usize)
+                    .is_none_or(|owner| *owner != config.self_id)
+            })
+        {
+            return Err(DbError::ShuffleTerminal(format!(
+                "interval join [{}] received {} data outside local vnode ownership",
+                self.projection.op_name,
+                side.name()
+            )));
+        }
+        let row_vnodes = self.row_vnodes_for_side(side, batch, config.registry.vnode_count())?;
+        let mut seen = vec![false; declared.len()];
+        for vnode in &row_vnodes {
+            let Ok(index) = declared.binary_search(vnode) else {
+                return Err(DbError::ShuffleTerminal(format!(
+                    "interval join [{}] {} shuffle vnode metadata omits a decoded row",
+                    self.projection.op_name,
+                    side.name()
+                )));
+            };
+            seen[index] = true;
+        }
+        if seen.iter().any(|seen| !seen) {
+            return Err(DbError::ShuffleTerminal(format!(
+                "interval join [{}] {} shuffle vnode metadata names an absent row",
+                self.projection.op_name,
+                side.name()
+            )));
+        }
+        let charged_bytes = retained
+            .heap_bytes()
+            .and_then(|bytes| bytes.checked_add(RETAINED_BATCH_ARC_CHARGE))
+            .and_then(|bytes| {
+                row_vnodes
+                    .len()
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .and_then(|vnodes| vnodes.checked_add(ROW_VNODE_ARC_CHARGE))
+                    .and_then(|vnodes| bytes.checked_add(vnodes))
+            })
+            .ok_or_else(|| self.accounting_error())?;
+        Ok(QueuedIntervalBatch {
+            retained: Arc::new(retained),
+            row_vnodes: row_vnodes.into(),
+            charged_bytes,
+        })
+    }
+
+    #[cfg(feature = "cluster")]
+    fn route_owned_batch(
+        &self,
+        config: &ClusterShuffleConfig,
+        assignment: &laminar_core::state::VnodeAssignmentSnapshot,
+        side: JoinInputSide,
+        batch: &RecordBatch,
+        row_vnodes: &[u32],
+        routed: &mut BTreeMap<u32, [Vec<RecordBatch>; 2]>,
+    ) -> Result<(), DbError> {
+        let side_name = side.name();
         let plan = laminar_core::shuffle::route_checkpointed_batch(
             batch,
-            &row_vnodes,
+            row_vnodes,
             assignment,
             config.self_id,
         )
@@ -1308,15 +2223,6 @@ impl IntervalJoinOperator {
                 self.projection.op_name
             )));
         }
-        if let Some(declared) = declared_vnodes {
-            let actual: Vec<u32> = plan.local.iter().map(|route| route.vnode).collect();
-            if actual.as_slice() != declared {
-                return Err(DbError::Checkpoint(format!(
-                    "interval join [{}] {side_name} shuffle vnode metadata {declared:?} does not match decoded rows {actual:?}",
-                    self.projection.op_name
-                )));
-            }
-        }
         for route in plan.local {
             Self::push_routed_batch(routed, route.vnode, side, route.batch);
         }
@@ -1324,58 +2230,121 @@ impl IntervalJoinOperator {
     }
 
     #[cfg(feature = "cluster")]
-    async fn route_cluster_inputs(
+    fn effective_cluster_frontiers(
+        &self,
+        local: [InputFrontier; 2],
+        override_event: Option<(usize, u64, InputFrontier, usize)>,
+    ) -> Result<[InputFrontier; 2], DbError> {
+        let merge = |port: usize| -> Result<InputFrontier, DbError> {
+            let peers = self.peer_channels[port].iter().map(|(&peer, channel)| {
+                let mut applied = override_event
+                    .filter(|(event_port, event_peer, _, _)| {
+                        *event_port == port && *event_peer == peer
+                    })
+                    .map_or(channel.applied, |(_, _, frontier, _)| frontier);
+                let consumed = override_event
+                    .filter(|(event_port, event_peer, _, _)| {
+                        *event_port == port && *event_peer == peer
+                    })
+                    .map_or(0, |(_, _, _, consumed)| consumed);
+                if channel.events.len() > consumed {
+                    applied.idle = false;
+                    let floor = if port == 0 {
+                        self.applied_left_watermark
+                    } else {
+                        self.applied_right_watermark
+                    };
+                    applied.watermark =
+                        Self::max_watermark(applied.watermark, Self::watermark_option(floor));
+                }
+                applied
+            });
+            let merged =
+                merge_input_frontier_iter(std::iter::once(local[port]).chain(peers), i64::MIN);
+            let previous = self.applied_frontiers()[port];
+            self.validate_frontier(
+                previous,
+                merged,
+                if port == 0 {
+                    JoinInputSide::Left
+                } else {
+                    JoinInputSide::Right
+                },
+            )?;
+            if self.pending_cluster_input.is_some() {
+                return Ok(InputFrontier {
+                    watermark: previous.watermark,
+                    idle: false,
+                });
+            }
+            Ok(merged)
+        };
+        Ok([merge(0)?, merge(1)?])
+    }
+
+    #[cfg(feature = "cluster")]
+    fn plan_cluster_inputs(
         &self,
         inputs: &[Vec<RecordBatch>],
-    ) -> Result<
-        (
-            BTreeMap<u32, [Vec<RecordBatch>; 2]>,
-            Vec<laminar_core::shuffle::ReceivedBatch>,
-            bool,
-        ),
-        DbError,
-    > {
+        frontiers: [InputFrontier; 2],
+        config: &ClusterShuffleConfig,
+        assignment: &VnodeAssignmentSnapshot,
+        peers: &[u64],
+    ) -> Result<IntervalClusterInputPlan, DbError> {
         self.prevalidate_inputs(inputs)?;
-        let config = self.cluster_shuffle.as_ref().ok_or_else(|| {
-            DbError::Checkpoint(format!(
-                "interval join [{}] has no cluster shuffle scope",
-                self.projection.op_name
-            ))
-        })?;
-        let assignment = config.registry.versioned_snapshot();
-        let mut routed = BTreeMap::new();
-        let mut outbound = Vec::new();
+        let mut local_frontiers = frontiers;
+        for side in [JoinInputSide::Left, JoinInputSide::Right] {
+            let port = side.port();
+            self.validate_frontier(self.local_frontiers[port], frontiers[port], side)?;
+            let has_data = inputs
+                .get(port)
+                .is_some_and(|batches| batches.iter().any(|batch| batch.num_rows() != 0));
+            if frontiers[port].idle && has_data {
+                return Err(DbError::InvalidOperation(format!(
+                    "interval join [{}] received {} data from an idle local channel",
+                    self.projection.op_name,
+                    side.name()
+                )));
+            }
+            if self.local_frontiers[port].idle && !local_frontiers[port].idle {
+                let floor = if port == 0 {
+                    self.applied_left_watermark
+                } else {
+                    self.applied_right_watermark
+                };
+                local_frontiers[port].watermark = Self::max_watermark(
+                    local_frontiers[port].watermark,
+                    Self::watermark_option(floor),
+                );
+            }
+        }
 
-        for (side, batches) in [
-            (
-                JoinInputSide::Left,
-                inputs.first().map_or(&[] as &[RecordBatch], Vec::as_slice),
-            ),
-            (
-                JoinInputSide::Right,
-                inputs.get(1).map_or(&[] as &[RecordBatch], Vec::as_slice),
-            ),
-        ] {
-            let (side_name, key_names) = match side {
-                JoinInputSide::Left => ("left", self.config.left_keys.as_slice()),
-                JoinInputSide::Right => ("right", self.config.right_keys.as_slice()),
+        let mut routed = BTreeMap::new();
+        let mut remote_data: [BTreeMap<u64, Vec<laminar_core::shuffle::ShuffleMessage>>; 2] =
+            [BTreeMap::new(), BTreeMap::new()];
+        for side in [JoinInputSide::Right, JoinInputSide::Left] {
+            let port = side.port();
+            let key_names = if port == 0 {
+                self.config.left_keys.as_slice()
+            } else {
+                self.config.right_keys.as_slice()
             };
-            let stage = format!("{}::{side_name}", self.projection.op_name);
-            for batch in batches {
+            let stage = format!("{}::{}", self.projection.op_name, side.name());
+            for batch in inputs.get(port).into_iter().flatten() {
                 if batch.num_rows() == 0 {
                     continue;
                 }
                 let key_indices = key_names
                     .iter()
-                    .map(|key_name| {
-                        batch.schema().index_of(key_name).map_err(|error| {
-                            DbError::SchemaMismatch(format!(
-                                "interval join [{}] {side_name} routing key '{key_name}': {error}",
-                                self.projection.op_name
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .map(|key| batch.schema().index_of(key))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        DbError::SchemaMismatch(format!(
+                            "interval join [{}] {} routing key: {error}",
+                            self.projection.op_name,
+                            side.name()
+                        ))
+                    })?;
                 let row_vnodes = laminar_core::shuffle::row_vnodes(
                     batch,
                     &key_indices,
@@ -1384,8 +2353,9 @@ impl IntervalJoinOperator {
                 .map_err(|error| {
                     crate::operator::shuffle_routing_error(
                         &format!(
-                            "interval join [{}] {side_name} routing",
-                            self.projection.op_name
+                            "interval join [{}] {} routing",
+                            self.projection.op_name,
+                            side.name()
                         ),
                         &error,
                     )
@@ -1393,14 +2363,15 @@ impl IntervalJoinOperator {
                 let plan = laminar_core::shuffle::route_checkpointed_batch(
                     batch,
                     &row_vnodes,
-                    &assignment,
+                    assignment,
                     config.self_id,
                 )
                 .map_err(|error| {
                     crate::operator::shuffle_routing_error(
                         &format!(
-                            "interval join [{}] {side_name} routing",
-                            self.projection.op_name
+                            "interval join [{}] {} routing",
+                            self.projection.op_name,
+                            side.name()
                         ),
                         &error,
                     )
@@ -1409,49 +2380,401 @@ impl IntervalJoinOperator {
                     Self::push_routed_batch(&mut routed, route.vnode, side, route.batch);
                 }
                 for route in plan.remote {
-                    outbound.push((
-                        route.owner.0,
+                    remote_data[port].entry(route.owner.0).or_default().push(
                         laminar_core::shuffle::ShuffleMessage::checkpointed_routed(
                             stage.clone(),
                             route.routed_vnodes,
                             route.batch,
                         ),
-                    ));
+                    );
                 }
             }
         }
 
-        let outbound_admitted = !outbound.is_empty();
-        crate::operator::send_shuffle_plan(
-            &config.sender,
-            assignment.version(),
+        let mut outbound = Vec::new();
+        for &peer in peers {
+            for side in [JoinInputSide::Right, JoinInputSide::Left] {
+                let port = side.port();
+                let current = local_frontiers[port];
+                let data = remote_data[port].remove(&peer);
+                let has_data = data.as_ref().is_some_and(|data| !data.is_empty());
+                let stage = format!("{}::{}", self.projection.op_name, side.name());
+                if has_data && self.last_broadcasts[port].idle && !current.idle {
+                    outbound.push((
+                        peer,
+                        laminar_core::shuffle::ShuffleMessage::Frontier {
+                            stage: stage.clone(),
+                            watermark: self.last_broadcasts[port].watermark,
+                            idle: false,
+                        },
+                    ));
+                }
+                if let Some(data) = data {
+                    outbound.extend(data.into_iter().map(|message| (peer, message)));
+                }
+                if has_data || self.last_broadcasts[port] != current {
+                    outbound.push((
+                        peer,
+                        laminar_core::shuffle::ShuffleMessage::Frontier {
+                            stage,
+                            watermark: current.watermark,
+                            idle: current.idle,
+                        },
+                    ));
+                }
+            }
+        }
+        if remote_data.iter().any(|by_peer| !by_peer.is_empty()) {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] routed data outside its owner frontier roster",
+                self.projection.op_name
+            )));
+        }
+        let effective_frontiers = self.effective_cluster_frontiers(local_frontiers, None)?;
+        Ok(IntervalClusterInputPlan {
+            routed,
             outbound,
-            &format!("interval join [{}] shuffle", self.projection.op_name),
-        )
-        .await?;
+            local_frontiers,
+            effective_frontiers,
+        })
+    }
 
-        let mut admitted = Vec::new();
-        for side in [JoinInputSide::Left, JoinInputSide::Right] {
-            let side_name = match side {
-                JoinInputSide::Left => "left",
-                JoinInputSide::Right => "right",
+    #[cfg(feature = "cluster")]
+    fn batch_plan_bytes(&self, batch: &RecordBatch) -> Result<usize, DbError> {
+        batch
+            .num_columns()
+            .checked_mul(std::mem::size_of::<Arc<dyn arrow::array::Array>>())
+            .and_then(|bytes| bytes.checked_add(batch.get_array_memory_size()))
+            .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
+            .ok_or_else(|| self.accounting_error())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn cluster_input_plan_bytes(&self, plan: &IntervalClusterInputPlan) -> Result<usize, DbError> {
+        let mut bytes = plan
+            .routed
+            .len()
+            .checked_mul(
+                std::mem::size_of::<(u32, [Vec<RecordBatch>; 2])>() + PENDING_ROUTE_ENTRY_CHARGE,
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(plan.outbound.capacity().checked_mul(std::mem::size_of::<(
+                    u64,
+                    laminar_core::shuffle::ShuffleMessage,
+                )>())?)
+            })
+            .and_then(|bytes| {
+                plan.outbound
+                    .len()
+                    .checked_mul(
+                        std::mem::size_of::<usize>()
+                            + std::mem::size_of::<(u64, usize)>()
+                            + std::mem::size_of::<(u64, Vec<usize>)>(),
+                    )
+                    .and_then(|grouping| bytes.checked_add(grouping))
+            })
+            .ok_or_else(|| self.accounting_error())?;
+        for batches in plan.routed.values().flat_map(|sides| sides.iter()) {
+            bytes = bytes
+                .checked_add(
+                    batches
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<RecordBatch>())
+                        .ok_or_else(|| self.accounting_error())?,
+                )
+                .ok_or_else(|| self.accounting_error())?;
+            for batch in batches {
+                bytes = bytes
+                    .checked_add(self.batch_plan_bytes(batch)?)
+                    .ok_or_else(|| self.accounting_error())?;
+            }
+        }
+        for (_, message) in &plan.outbound {
+            let message_bytes = match message {
+                laminar_core::shuffle::ShuffleMessage::Barrier(_) => 0,
+                laminar_core::shuffle::ShuffleMessage::Frontier { stage, .. } => stage.capacity(),
+                laminar_core::shuffle::ShuffleMessage::Data {
+                    stage,
+                    routed_vnodes,
+                    batch,
+                } => self
+                    .batch_plan_bytes(batch)?
+                    .checked_add(stage.capacity())
+                    .and_then(|bytes| {
+                        bytes.checked_add(
+                            routed_vnodes
+                                .len()
+                                .checked_mul(std::mem::size_of::<u32>())?,
+                        )
+                    })
+                    .ok_or_else(|| self.accounting_error())?,
             };
-            let stage = format!("{}::{side_name}", self.projection.op_name);
-            let received = config.receiver.drain_checkpointed_data_for(&stage);
-            for batch in &received {
+            bytes = bytes
+                .checked_add(message_bytes)
+                .ok_or_else(|| self.accounting_error())?;
+        }
+        Ok(bytes)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn accounting_error(&self) -> DbError {
+        DbError::Pipeline(format!(
+            "interval join [{}] managed-state accounting overflow",
+            self.projection.op_name
+        ))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn outbound_finalize_error(&self, error: DbError) -> DbError {
+        if error.requires_pipeline_recovery() {
+            error
+        } else {
+            DbError::ShufflePartialSend(format!(
+                "interval join [{}] failed after outbound shuffle admission: {error}",
+                self.projection.op_name
+            ))
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn remote_replay_error(&self, error: DbError) -> DbError {
+        if error.requires_pipeline_recovery() {
+            error
+        } else {
+            DbError::Checkpoint(format!(
+                "interval join [{}] ordered shuffle replay requires recovery: {error}",
+                self.projection.op_name
+            ))
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn start_pending_cluster_send(
+        &mut self,
+        config: &ClusterShuffleConfig,
+        assignment_version: u64,
+    ) {
+        let pending = self
+            .pending_cluster_input
+            .as_mut()
+            .expect("interval send plan must be installed before it starts");
+        debug_assert!(pending.send.is_none());
+        debug_assert!(pending.outcome.is_none());
+        let outbound = pending
+            .outbound
+            .take()
+            .expect("idle interval send plan must retain its outbound cut");
+        let sender = Arc::clone(&config.sender);
+        let wake = config.receiver.work_ready_notify();
+        let context = format!("interval join [{}] shuffle", self.projection.op_name);
+        let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+        pending.outcome = Some(outcome_rx);
+        pending.send = Some(tokio::spawn(async move {
+            let outcome = crate::operator::send_shuffle_plan_retaining(
+                &sender,
+                assignment_version,
+                outbound,
+                &context,
+            )
+            .await;
+            let should_wake = !matches!(&outcome.0, Err(error) if error.is_shuffle_not_ready());
+            if outcome_tx.send(outcome).is_ok() && should_wake {
+                wake.notify_one();
+            }
+        }));
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn finish_pending_cluster_input(&mut self) -> Result<PendingIntervalCompletion, DbError> {
+        let received = {
+            let Some(pending) = self.pending_cluster_input.as_mut() else {
+                return Ok(PendingIntervalCompletion::Waiting);
+            };
+            match (pending.send.as_ref(), pending.outcome.as_mut()) {
+                (None, None) => return Ok(PendingIntervalCompletion::Waiting),
+                (Some(_), Some(outcome)) => outcome.try_recv().map_err(|error| match error {
+                    tokio::sync::oneshot::error::TryRecvError::Empty => None,
+                    tokio::sync::oneshot::error::TryRecvError::Closed => {
+                        Some("send task ended without a delivery outcome")
+                    }
+                }),
+                _ => Err(Some("send task lost its completion channel")),
+            }
+        };
+        let outcome = match received {
+            Ok(outcome) => outcome,
+            Err(None) => {
+                return Ok(PendingIntervalCompletion::Waiting);
+            }
+            Err(Some(reason)) => {
+                drop(self.pending_cluster_input.take());
+                return Err(DbError::ShufflePartialSend(format!(
+                    "interval join [{}] {reason}",
+                    self.projection.op_name
+                )));
+            }
+        };
+        let mut pending = self
+            .pending_cluster_input
+            .take()
+            .expect("finished interval send plan");
+        pending.send.take().expect("completed interval send task");
+        pending
+            .outcome
+            .take()
+            .expect("completed interval send outcome");
+        let (result, outbound) = outcome;
+        if let Err(error) = result {
+            if error.is_shuffle_not_ready() {
+                pending.outbound = Some(outbound.ok_or_else(|| {
+                    DbError::ShufflePartialSend(format!(
+                        "interval join [{}] safe send failure lost its retry plan",
+                        self.projection.op_name
+                    ))
+                })?);
+                self.pending_cluster_input = Some(pending);
+                return Ok(PendingIntervalCompletion::RetryLater);
+            }
+            return Err(error);
+        }
+        debug_assert!(outbound.is_none());
+        let effective = self
+            .effective_cluster_frontiers(pending.local_frontiers, None)
+            .map_err(|error| self.outbound_finalize_error(error))?;
+        let routed = std::mem::take(&mut pending.routed);
+        let local_frontiers = pending.local_frontiers;
+        drop(pending);
+        let output = self
+            .apply_routed_cluster(routed, effective)
+            .map_err(|error| self.outbound_finalize_error(error))?;
+        let output = self
+            .project_output(output)
+            .await
+            .map_err(|error| self.outbound_finalize_error(error))?;
+        self.local_frontiers = local_frontiers;
+        self.last_broadcasts = local_frontiers;
+        Ok(PendingIntervalCompletion::Applied(output))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn apply_routed_cluster(
+        &mut self,
+        mut routed: BTreeMap<u32, [Vec<RecordBatch>; 2]>,
+        frontiers: [InputFrontier; 2],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let left = frontiers[0].watermark.unwrap_or(i64::MIN);
+        let right = frontiers[1].watermark.unwrap_or(i64::MIN);
+        if left > self.applied_left_watermark || right > self.applied_right_watermark {
+            self.add_resident_vnodes(&mut routed);
+        }
+        let output = self.execute_routed_shards(routed, left, right)?;
+        self.applied_left_watermark = self.applied_left_watermark.max(left);
+        self.applied_right_watermark = self.applied_right_watermark.max(right);
+        self.applied_left_idle = frontiers[0].idle;
+        self.applied_right_idle = frontiers[1].idle;
+        Ok(output)
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn drain_remote_event(
+        &mut self,
+        config: &ClusterShuffleConfig,
+        assignment: &VnodeAssignmentSnapshot,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let mut selected = None;
+        for side_offset in 0..2 {
+            let port = (usize::from(self.remote_side_cursor) + side_offset) % 2;
+            let side = if port == 0 {
+                JoinInputSide::Left
+            } else {
+                JoinInputSide::Right
+            };
+            let peers = self.cluster_peers.as_ref();
+            if peers.is_empty() {
+                continue;
+            }
+            let start = self.remote_peer_cursors[port].map_or(0, |cursor| {
+                let next = peers.partition_point(|peer| *peer <= cursor);
+                if next == peers.len() {
+                    0
+                } else {
+                    next
+                }
+            });
+            for offset in 0..peers.len() {
+                let peer = peers[(start + offset) % peers.len()];
+                if !self.peer_channels[port][&peer].events.is_empty() {
+                    selected = Some((side, peer));
+                    break;
+                }
+            }
+            if selected.is_some() {
+                break;
+            }
+        }
+        let (side, peer) = selected.ok_or_else(|| {
+            DbError::Checkpoint("interval join remote-event count is inconsistent".into())
+        })?;
+        let port = side.port();
+        let channel = &self.peer_channels[port][&peer];
+        let event = channel.events.front().expect("selected interval event");
+        if event.assignment_version != assignment.version()
+            || event.recovery_gen > config.receiver.recovery_gen()
+        {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] queued {} event crossed assignment or recovery",
+                self.projection.op_name,
+                side.name()
+            )));
+        }
+        let mut routed = BTreeMap::new();
+        let next_applied = match &event.payload {
+            IntervalRemoteEventPayload::Data(batch) => {
                 self.route_owned_batch(
                     config,
-                    &assignment,
+                    assignment,
                     side,
-                    batch.batch(),
-                    Some(batch.routed_vnodes()),
+                    batch.retained.batch(),
+                    &batch.row_vnodes,
                     &mut routed,
                 )
-                .map_err(|error| self.post_shuffle_admission_error(outbound_admitted, error))?;
+                .map_err(|error| self.remote_replay_error(error))?;
+                channel.applied
             }
-            admitted.extend(received);
+            IntervalRemoteEventPayload::Frontier(frontier) => {
+                self.validate_frontier(channel.applied, *frontier, side)
+                    .map_err(|error| self.remote_replay_error(error))?;
+                *frontier
+            }
+        };
+        let effective = self
+            .effective_cluster_frontiers(self.local_frontiers, Some((port, peer, next_applied, 1)))
+            .map_err(|error| self.remote_replay_error(error))?;
+        let released = event.payload_bytes();
+        let was_frontier = matches!(event.payload, IntervalRemoteEventPayload::Frontier(_));
+        let channel = self.peer_channels[port]
+            .get_mut(&peer)
+            .expect("selected interval channel");
+        channel.events.pop_front().expect("selected interval event");
+        if was_frontier {
+            channel.applied = next_applied;
         }
-        Ok((routed, admitted, outbound_admitted))
+        self.remote_peer_cursors[port] = Some(peer);
+        self.remote_side_cursor = u8::try_from((port + 1) % 2).expect("interval side cursor");
+        self.queued_shuffle_bytes = self
+            .queued_shuffle_bytes
+            .checked_sub(released)
+            .expect("validated interval queue accounting");
+        self.queued_remote_events = self
+            .queued_remote_events
+            .checked_sub(1)
+            .expect("validated interval event accounting");
+        let output = self
+            .apply_routed_cluster(routed, effective)
+            .map_err(|error| self.remote_replay_error(error))?;
+        self.project_output(output)
+            .await
+            .map_err(|error| self.remote_replay_error(error))
     }
 
     #[cfg(feature = "cluster")]
@@ -1461,91 +2784,193 @@ impl IntervalJoinOperator {
         left_frontier: InputFrontier,
         right_frontier: InputFrontier,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        if !self.aligned_replay.is_empty() {
-            return self.execute_aligned_replay().await;
+        let scope = self.active_cluster_scope();
+        let (config, assignment, peers) = match scope {
+            Ok(scope) => scope,
+            Err(error) if self.pending_cluster_input.is_some() => {
+                return Err(self.outbound_finalize_error(error));
+            }
+            Err(error) => return Err(error),
+        };
+        let mut deferred_output = Vec::new();
+        let mut drained_remote = false;
+        if self.queued_remote_events != 0 {
+            if inputs.iter().any(|batches| !batches.is_empty()) {
+                let error = DbError::InvalidOperation(format!(
+                    "interval join [{}] received local input while ordered shuffle replay was pending",
+                    self.projection.op_name
+                ));
+                return Err(if self.pending_cluster_input.is_some() {
+                    self.outbound_finalize_error(error)
+                } else {
+                    error
+                });
+            }
+            deferred_output = self.drain_remote_event(&config, &assignment).await?;
+            drained_remote = true;
         }
-        let left_watermark = left_frontier.watermark.unwrap_or(i64::MIN);
-        let right_watermark = right_frontier.watermark.unwrap_or(i64::MIN);
-        let (mut routed, _admitted, outbound_admitted) = self.route_cluster_inputs(inputs).await?;
-        let frontier_advanced = left_watermark > self.applied_left_watermark
-            || right_watermark > self.applied_right_watermark;
-        if frontier_advanced {
-            self.add_resident_vnodes(&mut routed);
+        let completion = self.finish_pending_cluster_input().await.map_err(|error| {
+            if drained_remote {
+                self.remote_replay_error(error)
+            } else {
+                error
+            }
+        })?;
+        match completion {
+            PendingIntervalCompletion::Applied(output) => {
+                deferred_output.extend(output);
+                return Ok(deferred_output);
+            }
+            PendingIntervalCompletion::Waiting | PendingIntervalCompletion::RetryLater => {}
         }
-        let output = self
-            .execute_routed_shards(routed, left_watermark, right_watermark)
-            .map_err(|error| self.post_shuffle_admission_error(outbound_admitted, error))?;
-        let output = self
-            .project_output(output)
-            .await
-            .map_err(|error| self.post_shuffle_admission_error(outbound_admitted, error))?;
-        self.applied_left_watermark = self.applied_left_watermark.max(left_watermark);
-        self.applied_right_watermark = self.applied_right_watermark.max(right_watermark);
-        self.applied_left_idle = left_frontier.idle;
-        self.applied_right_idle = right_frontier.idle;
+        if self.pending_cluster_input.is_some() {
+            if inputs.iter().any(|batches| !batches.is_empty()) {
+                return Err(
+                    self.outbound_finalize_error(DbError::InvalidOperation(format!(
+                        "interval join [{}] received local input while a shuffle send was pending",
+                        self.projection.op_name
+                    ))),
+                );
+            }
+            if self
+                .pending_cluster_input
+                .as_ref()
+                .is_some_and(|pending| pending.send.is_none())
+            {
+                self.start_pending_cluster_send(&config, assignment.version());
+            }
+            return Ok(deferred_output);
+        }
+        if drained_remote {
+            return Ok(deferred_output);
+        }
+        let plan = self.plan_cluster_inputs(
+            inputs,
+            [left_frontier, right_frontier],
+            &config,
+            &assignment,
+            &peers,
+        )?;
+        if !plan.outbound.is_empty() {
+            let accounted_bytes = self.cluster_input_plan_bytes(&plan)?;
+            let total = self
+                .accounted_state_bytes()
+                .checked_add(accounted_bytes)
+                .ok_or_else(|| self.accounting_error())?;
+            if total > self.max_managed_state_bytes {
+                return Err(DbError::ManagedStateBudgetExceeded {
+                    context: format!(
+                        "interval join [{}] pending shuffle send",
+                        self.projection.op_name
+                    ),
+                    accounted_bytes: total,
+                    limit_bytes: self.max_managed_state_bytes,
+                });
+            }
+            let IntervalClusterInputPlan {
+                routed,
+                outbound,
+                local_frontiers,
+                effective_frontiers: _,
+            } = plan;
+            self.pending_cluster_input = Some(PendingIntervalClusterInput {
+                routed,
+                outbound: Some(outbound),
+                local_frontiers,
+                send: None,
+                outcome: None,
+                accounted_bytes,
+            });
+            self.start_pending_cluster_send(&config, assignment.version());
+            return Ok(Vec::new());
+        }
+        let output = self.apply_routed_cluster(plan.routed, plan.effective_frontiers)?;
+        let output = self.project_output(output).await?;
+        self.local_frontiers = plan.local_frontiers;
+        self.last_broadcasts = plan.local_frontiers;
         Ok(output)
     }
 
     #[cfg(feature = "cluster")]
-    async fn execute_aligned_replay(&mut self) -> Result<Vec<RecordBatch>, DbError> {
-        let config = self.cluster_shuffle.as_ref().ok_or_else(|| {
-            DbError::Checkpoint(format!(
-                "interval join [{}] has aligned replay without cluster ownership",
+    fn side_for_stage(&self, stage: &str) -> Result<JoinInputSide, DbError> {
+        match stage.strip_prefix(self.projection.op_name.as_ref()) {
+            Some("::left") => Ok(JoinInputSide::Left),
+            Some("::right") => Ok(JoinInputSide::Right),
+            _ => Err(DbError::ShuffleTerminal(format!(
+                "interval join [{}] rejected unknown shuffle stage '{stage}'",
                 self.projection.op_name
-            ))
-        })?;
-        let assignment = config.registry.versioned_snapshot();
-        if config.sender.assignment_version() != assignment.version()
-            || config.receiver.assignment_version() != assignment.version()
-            || self
-                .aligned_replay
-                .iter()
-                .any(|(version, _, _, _)| *version != assignment.version())
-        {
-            return Err(DbError::Checkpoint(format!(
-                "interval join [{}] aligned replay crossed its assignment boundary",
-                self.projection.op_name
-            )));
+            ))),
         }
-        let (_, side, watermark, batch) =
-            self.aligned_replay.front().cloned().ok_or_else(|| {
-                DbError::Checkpoint("interval join replay queue became empty".into())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn reserve_remote_event_slot(
+        &mut self,
+        side: JoinInputSide,
+        peer: u64,
+        payload_bytes: usize,
+    ) -> Result<(usize, usize), DbError> {
+        let current_accounted = self.accounted_state_bytes();
+        let next_bytes = self
+            .queued_shuffle_bytes
+            .checked_add(payload_bytes)
+            .ok_or_else(|| self.accounting_error())?;
+        let next_events = self
+            .queued_remote_events
+            .checked_add(1)
+            .ok_or_else(|| self.accounting_error())?;
+        let port = side.port();
+        let previous_capacity = self.peer_channels[port][&peer].events.capacity();
+        self.peer_channels[port]
+            .get_mut(&peer)
+            .expect("validated interval peer channel")
+            .events
+            .try_reserve_exact(1)
+            .map_err(|error| {
+                DbError::Pipeline(format!(
+                    "interval join [{}] could not reserve ordered shuffle event: {error}",
+                    self.projection.op_name
+                ))
             })?;
-        let mut routed = BTreeMap::new();
-        self.route_owned_batch(config, &assignment, side, batch.batch(), None, &mut routed)?;
-        let (left_watermark, right_watermark) = match side {
-            JoinInputSide::Left => (watermark, self.applied_right_watermark),
-            JoinInputSide::Right => (self.applied_left_watermark, watermark),
-        };
-        if left_watermark > self.applied_left_watermark
-            || right_watermark > self.applied_right_watermark
-        {
-            self.add_resident_vnodes(&mut routed);
+        let reserved_capacity = self.peer_channels[port][&peer].events.capacity();
+        let added_capacity_bytes = reserved_capacity
+            .checked_sub(previous_capacity)
+            .and_then(|slots| slots.checked_mul(REMOTE_EVENT_CHARGE))
+            .ok_or_else(|| self.accounting_error())?;
+        let next_accounted = current_accounted
+            .checked_add(added_capacity_bytes)
+            .and_then(|bytes| bytes.checked_add(payload_bytes))
+            .ok_or_else(|| self.accounting_error())?;
+        if next_accounted > self.max_managed_state_bytes {
+            self.peer_channels[port]
+                .get_mut(&peer)
+                .expect("reserved interval peer channel")
+                .events
+                .shrink_to(previous_capacity);
+            let retained_capacity = self.peer_channels[port][&peer].events.capacity();
+            self.queued_event_capacity_bytes = self
+                .queued_event_capacity_bytes
+                .checked_add(
+                    retained_capacity
+                        .checked_sub(previous_capacity)
+                        .and_then(|slots| slots.checked_mul(REMOTE_EVENT_CHARGE))
+                        .ok_or_else(|| self.accounting_error())?,
+                )
+                .ok_or_else(|| self.accounting_error())?;
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!(
+                    "interval join [{}] ordered shuffle queue",
+                    self.projection.op_name
+                ),
+                accounted_bytes: next_accounted,
+                limit_bytes: self.max_managed_state_bytes,
+            });
         }
-        let output = self.execute_routed_shards(routed, left_watermark, right_watermark)?;
-        let output = self.project_output(output).await.map_err(|error| {
-            DbError::Checkpoint(format!(
-                "interval join [{}] aligned replay requires recovery: {error}",
-                self.projection.op_name
-            ))
-        })?;
-        self.aligned_replay.pop_front().ok_or_else(|| {
-            DbError::Checkpoint(format!(
-                "interval join [{}] aligned replay disappeared after emission",
-                self.projection.op_name
-            ))
-        })?;
-        match side {
-            JoinInputSide::Left => {
-                self.applied_left_watermark = self.applied_left_watermark.max(watermark);
-                self.applied_left_idle = false;
-            }
-            JoinInputSide::Right => {
-                self.applied_right_watermark = self.applied_right_watermark.max(watermark);
-                self.applied_right_idle = false;
-            }
-        }
-        Ok(output)
+        self.queued_event_capacity_bytes = self
+            .queued_event_capacity_bytes
+            .checked_add(added_capacity_bytes)
+            .ok_or_else(|| self.accounting_error())?;
+        Ok((next_bytes, next_events))
     }
 }
 
@@ -1557,7 +2982,26 @@ impl GraphOperator for IntervalJoinOperator {
 
     #[cfg(feature = "cluster")]
     fn checkpoint_aligned_replay_pending(&self) -> bool {
-        !self.aligned_replay.is_empty()
+        self.pending_cluster_input.is_some() || self.queued_remote_events != 0
+    }
+
+    fn checkpoint_drain_pending(&self) -> bool {
+        #[cfg(feature = "cluster")]
+        if self.pending_cluster_input.is_some() || self.last_broadcasts != self.local_frontiers {
+            return true;
+        }
+        false
+    }
+
+    #[cfg(feature = "cluster")]
+    fn deferred_work_is_runnable(&self) -> bool {
+        self.queued_remote_events != 0
+            || (self.pending_cluster_input.is_none()
+                && self.last_broadcasts != self.local_frontiers)
+    }
+
+    fn advances_frontier_without_input(&self) -> bool {
+        true
     }
 
     fn managed_state_accounting(&self) -> Option<ManagedStateAccountingSnapshot> {
@@ -1692,6 +3136,19 @@ impl GraphOperator for IntervalJoinOperator {
             || self.applied_right_watermark != i64::MIN
             || self.applied_left_idle
             || self.applied_right_idle
+            || {
+                #[cfg(feature = "cluster")]
+                {
+                    self.pending_cluster_input.is_some()
+                        || self.queued_remote_events != 0
+                        || self.local_frontiers != [InputFrontier::default(); 2]
+                        || self.last_broadcasts != [InputFrontier::default(); 2]
+                }
+                #[cfg(not(feature = "cluster"))]
+                {
+                    false
+                }
+            }
         {
             return Err(DbError::Checkpoint(format!(
                 "interval join [{}] checkpoint restore was applied more than once",
@@ -1717,62 +3174,292 @@ impl GraphOperator for IntervalJoinOperator {
         })?;
         self.validate_checkpoint_config(&checkpoint)?;
         #[cfg(feature = "cluster")]
-        let expected_identity = self
-            .cluster_shuffle
-            .as_ref()
-            .map(|_| self.checkpoint_assignment_identity())
-            .transpose()?;
-        #[cfg(not(feature = "cluster"))]
-        let expected_identity: Option<(u64, [u8; 32], u64)> = None;
-        if let Some(expected) = expected_identity {
-            if checkpoint.assignment_version != Some(expected.0)
-                || checkpoint.owner_map_digest != Some(expected.1)
-                || checkpoint.participant_id != Some(expected.2)
-            {
+        let decoded_cluster = match (self.cluster_shuffle.clone(), checkpoint.cluster) {
+            (Some(config), Some(cluster)) => {
+                let (_, assignment, peers) = self.active_cluster_scope()?;
+                let expected = self.checkpoint_assignment_identity()?;
+                if cluster.assignment_version != expected.0
+                    || cluster.owner_map_digest != expected.1
+                    || cluster.self_id != expected.2
+                    || cluster.recovery_gen > config.receiver.recovery_gen()
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "interval join [{}] checkpoint assignment or recovery does not match the restored operator",
+                        self.projection.op_name
+                    )));
+                }
+                let local_frontiers = cluster.local_frontiers.map(Into::into);
+                for side in [JoinInputSide::Left, JoinInputSide::Right] {
+                    self.validate_frontier(
+                        InputFrontier::default(),
+                        local_frontiers[side.port()],
+                        side,
+                    )?;
+                }
+                if cluster.remote_side_cursor > 1 {
+                    return Err(DbError::Checkpoint(format!(
+                        "interval join [{}] checkpoint side cursor is invalid",
+                        self.projection.op_name
+                    )));
+                }
+                let mut peer_channels = [BTreeMap::new(), BTreeMap::new()];
+                let mut queued_bytes = 0usize;
+                let mut queued_events = 0usize;
+                let mut capacity_bytes = 0usize;
+                for side in [JoinInputSide::Left, JoinInputSide::Right] {
+                    let port = side.port();
+                    if cluster.channels[port].len() != peers.len()
+                        || !cluster.channels[port]
+                            .iter()
+                            .map(|channel| channel.peer)
+                            .eq(peers.iter().copied())
+                    {
+                        return Err(DbError::Checkpoint(format!(
+                            "interval join [{}] {} checkpoint channel roster is invalid",
+                            self.projection.op_name,
+                            side.name()
+                        )));
+                    }
+                    for channel in &cluster.channels[port] {
+                        let applied: InputFrontier = channel.applied.into();
+                        self.validate_frontier(InputFrontier::default(), applied, side)?;
+                        let mut runtime = IntervalPeerChannel {
+                            applied,
+                            accepted: applied,
+                            events: VecDeque::new(),
+                        };
+                        runtime
+                            .events
+                            .try_reserve_exact(channel.events.len())
+                            .map_err(|error| {
+                                DbError::Checkpoint(format!(
+                                    "interval join [{}] peer {} restore queue reservation: {error}",
+                                    self.projection.op_name, channel.peer
+                                ))
+                            })?;
+                        capacity_bytes = capacity_bytes
+                            .checked_add(
+                                runtime
+                                    .events
+                                    .capacity()
+                                    .checked_mul(REMOTE_EVENT_CHARGE)
+                                    .ok_or_else(|| self.accounting_error())?,
+                            )
+                            .ok_or_else(|| self.accounting_error())?;
+                        let mut previous_recovery = None;
+                        for event in &channel.events {
+                            let payload = match event {
+                                IntervalCheckpointEvent::Data {
+                                    recovery_gen,
+                                    routed_vnodes,
+                                    ipc,
+                                } => {
+                                    if runtime.accepted.idle
+                                        || *recovery_gen > cluster.recovery_gen
+                                        || previous_recovery
+                                            .is_some_and(|previous| *recovery_gen < previous)
+                                        || routed_vnodes.is_empty()
+                                    {
+                                        return Err(DbError::Checkpoint(format!(
+                                            "interval join [{}] peer {} restored data is behind an idle or invalid channel",
+                                            self.projection.op_name, channel.peer
+                                        )));
+                                    }
+                                    let batch = laminar_core::serialization::deserialize_batch_stream(ipc)
+                                        .map_err(|error| DbError::Checkpoint(format!(
+                                            "interval join [{}] peer {} queued data restore: {error}",
+                                            self.projection.op_name, channel.peer
+                                        )))?;
+                                    let retained = crate::operator::RetainedBatch::restored_channel(
+                                        batch,
+                                        channel.peer,
+                                        cluster.assignment_version,
+                                        *recovery_gen,
+                                        Arc::from(routed_vnodes.clone()),
+                                    );
+                                    let batch = self.build_queued_batch(
+                                        retained,
+                                        runtime.accepted,
+                                        &config,
+                                        &assignment,
+                                        side,
+                                    )?;
+                                    queued_bytes = queued_bytes
+                                        .checked_add(batch.charged_bytes)
+                                        .ok_or_else(|| self.accounting_error())?;
+                                    IntervalRemoteEventPayload::Data(batch)
+                                }
+                                IntervalCheckpointEvent::Frontier {
+                                    recovery_gen,
+                                    frontier,
+                                } => {
+                                    if *recovery_gen > cluster.recovery_gen
+                                        || previous_recovery
+                                            .is_some_and(|previous| *recovery_gen < previous)
+                                    {
+                                        return Err(DbError::Checkpoint(format!(
+                                            "interval join [{}] peer {} frontier recovery is invalid",
+                                            self.projection.op_name, channel.peer
+                                        )));
+                                    }
+                                    let frontier: InputFrontier = (*frontier).into();
+                                    let floor = if port == 0 {
+                                        checkpoint.applied_left_watermark
+                                    } else {
+                                        checkpoint.applied_right_watermark
+                                    };
+                                    if runtime.accepted.idle
+                                        && !frontier.idle
+                                        && Self::watermark_option(floor).is_some_and(|floor| {
+                                            frontier
+                                                .watermark
+                                                .is_none_or(|watermark| watermark < floor)
+                                        })
+                                    {
+                                        return Err(DbError::Checkpoint(format!(
+                                            "interval join [{}] peer {} {} revival frontier is below its checkpoint floor",
+                                            self.projection.op_name,
+                                            channel.peer,
+                                            side.name()
+                                        )));
+                                    }
+                                    self.validate_frontier(runtime.accepted, frontier, side)?;
+                                    runtime.accepted = frontier;
+                                    IntervalRemoteEventPayload::Frontier(frontier)
+                                }
+                            };
+                            let recovery_gen = match event {
+                                IntervalCheckpointEvent::Data { recovery_gen, .. }
+                                | IntervalCheckpointEvent::Frontier { recovery_gen, .. } => {
+                                    *recovery_gen
+                                }
+                            };
+                            previous_recovery = Some(recovery_gen);
+                            runtime.events.push_back(IntervalRemoteEvent {
+                                assignment_version: cluster.assignment_version,
+                                recovery_gen,
+                                payload,
+                            });
+                            queued_events = queued_events
+                                .checked_add(1)
+                                .ok_or_else(|| self.accounting_error())?;
+                        }
+                        peer_channels[port].insert(channel.peer, runtime);
+                    }
+                }
+                for port in 0..2 {
+                    if cluster.remote_peer_cursors[port]
+                        .is_some_and(|peer| peers.binary_search(&peer).is_err())
+                    {
+                        return Err(DbError::Checkpoint(format!(
+                            "interval join [{}] checkpoint remote cursor is invalid",
+                            self.projection.op_name
+                        )));
+                    }
+                    let merged = merge_input_frontier_iter(
+                        std::iter::once(local_frontiers[port]).chain(
+                            peer_channels[port].values().map(|channel| {
+                                let mut applied = channel.applied;
+                                if !channel.events.is_empty() {
+                                    applied.idle = false;
+                                    let floor = if port == 0 {
+                                        checkpoint.applied_left_watermark
+                                    } else {
+                                        checkpoint.applied_right_watermark
+                                    };
+                                    applied.watermark = Self::max_watermark(
+                                        applied.watermark,
+                                        Self::watermark_option(floor),
+                                    );
+                                }
+                                applied
+                            }),
+                        ),
+                        i64::MIN,
+                    );
+                    let expected_watermark = if port == 0 {
+                        checkpoint.applied_left_watermark
+                    } else {
+                        checkpoint.applied_right_watermark
+                    };
+                    let expected_idle = if port == 0 {
+                        checkpoint.applied_left_idle
+                    } else {
+                        checkpoint.applied_right_idle
+                    };
+                    let queue_empty = peer_channels[port]
+                        .values()
+                        .all(|channel| channel.events.is_empty());
+                    if merged.watermark.unwrap_or(i64::MIN) != expected_watermark
+                        || (queue_empty && merged.idle != expected_idle)
+                    {
+                        return Err(DbError::Checkpoint(format!(
+                            "interval join [{}] restored cluster frontier is inconsistent",
+                            self.projection.op_name
+                        )));
+                    }
+                }
+                Some((
+                    local_frontiers,
+                    peer_channels,
+                    cluster.remote_side_cursor,
+                    cluster.remote_peer_cursors,
+                    queued_bytes,
+                    queued_events,
+                    capacity_bytes,
+                ))
+            }
+            (None, None) => None,
+            _ => {
                 return Err(DbError::Checkpoint(format!(
-                    "interval join [{}] checkpoint assignment does not match the restored operator",
+                    "interval join [{}] checkpoint deployment mode does not match the operator",
                     self.projection.op_name
                 )));
             }
-        } else if checkpoint.assignment_version.is_some()
-            || checkpoint.owner_map_digest.is_some()
-            || checkpoint.participant_id.is_some()
-            || !checkpoint.aligned_replay.is_empty()
-        {
+        };
+        #[cfg(not(feature = "cluster"))]
+        if checkpoint.cluster.is_some() {
             return Err(DbError::Checkpoint(format!(
-                "interval join [{}] checkpoint contains cluster state without an attached cluster scope",
+                "interval join [{}] checkpoint contains cluster channel state",
                 self.projection.op_name
             )));
         }
 
         #[cfg(feature = "cluster")]
-        let decoded_replay = checkpoint
-            .aligned_replay
-            .into_iter()
-            .map(|(assignment, side, watermark, bytes)| {
-                laminar_core::serialization::deserialize_batch_stream(&bytes)
-                    .map(|batch| {
-                        (
-                            assignment,
-                            side,
-                            watermark,
-                            crate::operator::RetainedBatch::local(batch),
-                        )
-                    })
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "interval join [{}] aligned replay restore: {error}",
-                            self.projection.op_name
-                        ))
-                    })
-            })
-            .collect::<Result<VecDeque<_>, DbError>>()?;
-        #[cfg(feature = "cluster")]
-        if !self.aligned_replay.is_empty() && !decoded_replay.is_empty() {
-            return Err(DbError::Checkpoint(format!(
-                "interval join [{}] aligned replay was applied more than once",
-                self.projection.op_name
-            )));
+        if let Some((_, channels, _, _, queued_bytes, _, capacity_bytes)) = decoded_cluster.as_ref()
+        {
+            let restored_channels = channels
+                .iter()
+                .map(BTreeMap::len)
+                .sum::<usize>()
+                .checked_mul(
+                    std::mem::size_of::<(u64, IntervalPeerChannel)>()
+                        .saturating_add(PEER_CHANNEL_ENTRY_CHARGE),
+                )
+                .ok_or_else(|| self.accounting_error())?;
+            let restored_cluster = self
+                .cluster_peers
+                .len()
+                .checked_mul(std::mem::size_of::<u64>())
+                .and_then(|bytes| bytes.checked_add(restored_channels))
+                .and_then(|bytes| bytes.checked_add(*capacity_bytes))
+                .and_then(|bytes| bytes.checked_add(*queued_bytes))
+                .ok_or_else(|| self.accounting_error())?;
+            let projected_accounted = self
+                .accounted_state_bytes()
+                .checked_sub(self.cluster_accounted_bytes())
+                .and_then(|bytes| bytes.checked_add(restored_cluster))
+                .ok_or_else(|| self.accounting_error())?;
+            if projected_accounted > self.max_managed_state_bytes {
+                return Err(DbError::ManagedStateBudgetExceeded {
+                    context: format!(
+                        "interval join [{}] cluster checkpoint restore",
+                        self.projection.op_name
+                    ),
+                    accounted_bytes: projected_accounted,
+                    limit_bytes: self.max_managed_state_bytes,
+                });
+            }
         }
 
         self.applied_left_watermark = checkpoint.applied_left_watermark;
@@ -1780,7 +3467,18 @@ impl GraphOperator for IntervalJoinOperator {
         self.applied_left_idle = checkpoint.applied_left_idle;
         self.applied_right_idle = checkpoint.applied_right_idle;
         #[cfg(feature = "cluster")]
-        self.aligned_replay.extend(decoded_replay);
+        if let Some((local, channels, side_cursor, cursors, bytes, events, capacity)) =
+            decoded_cluster
+        {
+            self.local_frontiers = local;
+            self.last_broadcasts = local;
+            self.peer_channels = channels;
+            self.remote_side_cursor = side_cursor;
+            self.remote_peer_cursors = cursors;
+            self.queued_shuffle_bytes = bytes;
+            self.queued_remote_events = events;
+            self.queued_event_capacity_bytes = capacity;
+        }
 
         Ok(())
     }
@@ -1802,19 +3500,9 @@ impl GraphOperator for IntervalJoinOperator {
         let mut output = input.with_watermark_ceiling(Some(safe));
         output.idle = self.applied_left_idle && self.applied_right_idle;
         #[cfg(feature = "cluster")]
-        let replay_hold = self
-            .aligned_replay
-            .iter()
-            .map(|(_, side, watermark, _)| {
-                if right_only || matches!(side, JoinInputSide::Left) {
-                    *watermark
-                } else {
-                    watermark.saturating_sub(bound_ms)
-                }
-            })
-            .min();
-        #[cfg(feature = "cluster")]
-        let output = output.held_at(replay_hold);
+        if self.pending_cluster_input.is_some() || self.queued_remote_events != 0 {
+            output.idle = false;
+        }
         output
     }
 
@@ -1828,7 +3516,9 @@ impl GraphOperator for IntervalJoinOperator {
 
     #[cfg(feature = "cluster")]
     fn wants_input(&self) -> bool {
-        self.aligned_replay.is_empty()
+        self.pending_cluster_input.is_none()
+            && self.queued_remote_events == 0
+            && self.last_broadcasts == self.local_frontiers
     }
 
     #[cfg(feature = "cluster")]
@@ -1836,32 +3526,111 @@ impl GraphOperator for IntervalJoinOperator {
         &mut self,
         stage: &str,
         batch: crate::operator::RetainedBatch,
-        watermark: i64,
+        _watermark: i64,
     ) -> Result<(), DbError> {
-        if self.cluster_shuffle.is_none() {
-            return Err(DbError::Checkpoint(format!(
-                "interval join [{}] received shuffle data without cluster ownership",
-                self.projection.op_name
-            )));
-        }
-        let side = if stage == format!("{}::left", self.projection.op_name) {
-            JoinInputSide::Left
-        } else if stage == format!("{}::right", self.projection.op_name) {
-            JoinInputSide::Right
-        } else {
-            return Err(DbError::Checkpoint(format!(
-                "interval join [{}] rejected unknown shuffle stage '{stage}'",
-                self.projection.op_name
-            )));
-        };
-        let assignment = batch.assignment_version().ok_or_else(|| {
-            DbError::Checkpoint(format!(
+        let side = self.side_for_stage(stage)?;
+        let (config, assignment, peers) = self.active_cluster_scope()?;
+        let peer = batch.peer().ok_or_else(|| {
+            DbError::ShuffleTerminal(format!(
                 "interval join [{}] received unscoped shuffle data",
                 self.projection.op_name
             ))
         })?;
-        self.aligned_replay
-            .push_back((assignment, side, watermark, batch));
+        if peers.binary_search(&peer).is_err()
+            || batch.assignment_version() != Some(assignment.version())
+            || batch.recovery_gen() != Some(config.receiver.recovery_gen())
+        {
+            return Err(DbError::ShuffleTerminal(format!(
+                "interval join [{}] received {} data outside assignment {} recovery {}",
+                self.projection.op_name,
+                side.name(),
+                assignment.version(),
+                config.receiver.recovery_gen()
+            )));
+        }
+        let accepted = self.peer_channels[side.port()]
+            .get(&peer)
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] has no {} channel for peer {peer}",
+                    self.projection.op_name,
+                    side.name()
+                ))
+            })?
+            .accepted;
+        let batch = self.build_queued_batch(batch, accepted, &config, &assignment, side)?;
+        let charged_bytes = batch.charged_bytes;
+        let (next_bytes, next_events) =
+            self.reserve_remote_event_slot(side, peer, charged_bytes)?;
+        let assignment_version = batch
+            .retained
+            .assignment_version()
+            .expect("validated interval assignment");
+        let recovery_gen = batch
+            .retained
+            .recovery_gen()
+            .expect("validated interval recovery");
+        self.queued_shuffle_bytes = next_bytes;
+        self.queued_remote_events = next_events;
+        self.peer_channels[side.port()]
+            .get_mut(&peer)
+            .expect("reserved interval peer channel")
+            .events
+            .push_back(IntervalRemoteEvent {
+                assignment_version,
+                recovery_gen,
+                payload: IntervalRemoteEventPayload::Data(batch),
+            });
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn stage_checkpointed_shuffle_frontier(
+        &mut self,
+        stage: &str,
+        peer: u64,
+        mut frontier: InputFrontier,
+        assignment_version: u64,
+        recovery_gen: u64,
+    ) -> Result<(), DbError> {
+        let side = self.side_for_stage(stage)?;
+        let (config, assignment, peers) = self.active_cluster_scope()?;
+        if peers.binary_search(&peer).is_err()
+            || assignment_version != assignment.version()
+            || recovery_gen != config.receiver.recovery_gen()
+            || frontier.watermark == Some(i64::MIN)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] received {} frontier from peer {peer} outside assignment {} recovery {}",
+                self.projection.op_name,
+                side.name(),
+                assignment.version(),
+                config.receiver.recovery_gen()
+            )));
+        }
+        let previous = self.peer_channels[side.port()][&peer].accepted;
+        self.validate_frontier(previous, frontier, side)?;
+        if previous.idle && !frontier.idle {
+            let floor = if side.port() == 0 {
+                self.applied_left_watermark
+            } else {
+                self.applied_right_watermark
+            };
+            frontier.watermark =
+                Self::max_watermark(frontier.watermark, Self::watermark_option(floor));
+        }
+        let (next_bytes, next_events) = self.reserve_remote_event_slot(side, peer, 0)?;
+        self.queued_shuffle_bytes = next_bytes;
+        self.queued_remote_events = next_events;
+        let channel = self.peer_channels[side.port()]
+            .get_mut(&peer)
+            .expect("reserved interval peer channel");
+        channel.events.push_back(IntervalRemoteEvent {
+            assignment_version,
+            recovery_gen,
+            payload: IntervalRemoteEventPayload::Frontier(frontier),
+        });
+        channel.accepted = frontier;
         Ok(())
     }
 
@@ -1871,6 +3640,13 @@ impl GraphOperator for IntervalJoinOperator {
         vnode_count: u32,
         max_capture_bytes: u64,
     ) -> Result<Option<Vec<CapturedVnodeState>>, DbError> {
+        #[cfg(feature = "cluster")]
+        if self.pending_cluster_input.is_some() || self.last_broadcasts != self.local_frontiers {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] vnode capture requires a drained channel cut",
+                self.projection.op_name
+            )));
+        }
         if u32::from(self.key_group_count) != vnode_count
             || required_vnodes.windows(2).any(|pair| pair[0] >= pair[1])
             || required_vnodes.iter().any(|vnode| *vnode >= vnode_count)
@@ -2007,6 +3783,13 @@ impl GraphOperator for IntervalJoinOperator {
     }
 
     fn restore_vnode(&mut self, vnode: u32, vnode_count: u32, state: &[u8]) -> Result<(), DbError> {
+        #[cfg(feature = "cluster")]
+        if self.pending_cluster_input.is_some() || self.last_broadcasts != self.local_frontiers {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] vnode restore requires a pristine channel cut",
+                self.projection.op_name
+            )));
+        }
         if u32::from(self.key_group_count) != vnode_count || vnode >= vnode_count {
             return Err(DbError::Checkpoint(format!(
                 "interval join [{}] vnode {vnode} restore does not match its {vnode_count}-vnode topology",
@@ -2066,6 +3849,16 @@ impl GraphOperator for IntervalJoinOperator {
         if self.prepared_vnode_transition.is_some() || self.vnode_transition_cleanup.is_some() {
             return Err(DbError::Checkpoint(format!(
                 "interval join [{}] already owns vnode transition state",
+                self.projection.op_name
+            )));
+        }
+        if self.pending_cluster_input.is_some()
+            || self.queued_remote_events != 0
+            || self.queued_shuffle_bytes != 0
+            || self.last_broadcasts != self.local_frontiers
+        {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] transition requires a drained channel cut",
                 self.projection.op_name
             )));
         }
@@ -2136,7 +3929,8 @@ impl GraphOperator for IntervalJoinOperator {
                     || self.applied_right_watermark != i64::MIN
                     || self.applied_left_idle
                     || self.applied_right_idle
-                    || !self.aligned_replay.is_empty()
+                    || self.local_frontiers != [InputFrontier::default(); 2]
+                    || self.last_broadcasts != [InputFrontier::default(); 2]
             } else {
                 transition.predecessor.assignment_version != self.local_assignment.version()
                     || !transition.predecessor.matches_owner_map(&installed_owners)
@@ -2148,13 +3942,32 @@ impl GraphOperator for IntervalJoinOperator {
                 assignment.version()
             )));
         }
-
         let fresh_acquirer = target_contains_self
             && (checkpoint_bootstrap
                 || transition
                     .predecessor
                     .participant_incarnation(config.self_id.0)
                     != Some(config.sender.incarnation()));
+        let predecessor_peers = Self::remote_owner_peers(&self.local_assignment, config.self_id);
+        if !fresh_acquirer
+            && (self.cluster_peers.as_ref() != predecessor_peers.as_slice()
+                || self.peer_channels.iter().any(|channels| {
+                    channels.len() != predecessor_peers.len()
+                        || !channels
+                            .keys()
+                            .copied()
+                            .eq(predecessor_peers.iter().copied())
+                        || channels.values().any(|channel| {
+                            !channel.events.is_empty() || channel.accepted != channel.applied
+                        })
+                }))
+        {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] transition found stale predecessor channels",
+                self.projection.op_name
+            )));
+        }
+
         if fresh_acquirer {
             let target_owned = assignment
                 .owners()
@@ -2184,7 +3997,10 @@ impl GraphOperator for IntervalJoinOperator {
             && self.applied_right_watermark == i64::MIN
             && !self.applied_left_idle
             && !self.applied_right_idle
-            && self.aligned_replay.is_empty();
+            && self.local_frontiers == [InputFrontier::default(); 2]
+            && self.last_broadcasts == [InputFrontier::default(); 2]
+            && self.queued_remote_events == 0
+            && self.pending_cluster_input.is_none();
         let requires_handoff_cut = fresh_acquirer || pristine_restore_target;
         let mut handoff_cut = self.portable_handoff_cut(&transition, requires_handoff_cut)?;
         let derive_handoff_cut = requires_handoff_cut && handoff_cut.is_none();
@@ -2194,6 +4010,8 @@ impl GraphOperator for IntervalJoinOperator {
             Some(handoff_cut.unwrap_or(IntervalHandoffCut {
                 left_watermark: self.applied_left_watermark,
                 right_watermark: self.applied_right_watermark,
+                left_idle: self.applied_left_idle,
+                right_idle: self.applied_right_idle,
             }))
         };
 
@@ -2312,6 +4130,8 @@ impl GraphOperator for IntervalJoinOperator {
             let cut = recovered_cut.unwrap_or(IntervalHandoffCut {
                 left_watermark: i64::MIN,
                 right_watermark: i64::MIN,
+                left_idle: false,
+                right_idle: false,
             });
             for (vnode, state) in replacements
                 .iter()
@@ -2383,10 +4203,56 @@ impl GraphOperator for IntervalJoinOperator {
             }
         }
         resident_vnodes.extend_from_slice(&self.resident_vnodes[resident_index..]);
+        let target_peers = Self::remote_owner_peers(&assignment, config.self_id);
+        let transition_frontiers = handoff_cut.map_or(self.applied_frontiers(), |cut| {
+            [
+                InputFrontier {
+                    watermark: Self::watermark_option(cut.left_watermark),
+                    idle: cut.left_idle,
+                },
+                InputFrontier {
+                    watermark: Self::watermark_option(cut.right_watermark),
+                    idle: cut.right_idle,
+                },
+            ]
+        });
+        let peer_incarnation_changed = target_peers.iter().copied().any(|peer| {
+            transition.predecessor.participant_incarnation(peer)
+                != transition.target.participant_incarnation(peer)
+        });
+        let mut peer_channels = [BTreeMap::new(), BTreeMap::new()];
+        for port in 0..2 {
+            for &peer in &target_peers {
+                let same_incarnation = transition.predecessor.participant_incarnation(peer)
+                    == transition.target.participant_incarnation(peer);
+                let applied = if fresh_acquirer || !same_incarnation {
+                    transition_frontiers[port]
+                } else {
+                    self.peer_channels[port]
+                        .get(&peer)
+                        .map_or(transition_frontiers[port], |channel| channel.applied)
+                };
+                peer_channels[port].insert(
+                    peer,
+                    IntervalPeerChannel {
+                        applied,
+                        accepted: applied,
+                        events: VecDeque::new(),
+                    },
+                );
+            }
+        }
+        let bootstrap_broadcast = !target_peers.is_empty()
+            && (fresh_acquirer
+                || peer_incarnation_changed
+                || target_peers.as_slice() != self.cluster_peers.as_ref());
         let prepared = PreparedIntervalJoinTransition {
             replacements: replacements.into_iter().collect(),
             local_assignment: assignment,
             resident_vnodes,
+            cluster_peers: target_peers.into(),
+            peer_channels,
+            bootstrap_broadcast,
             handoff_cut,
         };
         let total_bytes = live_bytes
@@ -2429,13 +4295,34 @@ impl GraphOperator for IntervalJoinOperator {
         }
         std::mem::swap(&mut self.local_assignment, &mut prepared.local_assignment);
         std::mem::swap(&mut self.resident_vnodes, &mut prepared.resident_vnodes);
+        std::mem::swap(&mut self.cluster_peers, &mut prepared.cluster_peers);
+        std::mem::swap(&mut self.peer_channels, &mut prepared.peer_channels);
+        self.remote_side_cursor = 0;
+        self.remote_peer_cursors = [None; 2];
+        self.queued_event_capacity_bytes = self
+            .peer_channels
+            .iter()
+            .flat_map(BTreeMap::values)
+            .map(|channel| {
+                channel
+                    .events
+                    .capacity()
+                    .saturating_mul(REMOTE_EVENT_CHARGE)
+            })
+            .sum();
         if let Some(mut cut) = prepared.handoff_cut {
             std::mem::swap(&mut self.applied_left_watermark, &mut cut.left_watermark);
             std::mem::swap(&mut self.applied_right_watermark, &mut cut.right_watermark);
-            self.applied_left_idle = false;
-            self.applied_right_idle = false;
+            std::mem::swap(&mut self.applied_left_idle, &mut cut.left_idle);
+            std::mem::swap(&mut self.applied_right_idle, &mut cut.right_idle);
+            self.local_frontiers = self.applied_frontiers();
             prepared.handoff_cut = Some(cut);
         }
+        self.last_broadcasts = if prepared.bootstrap_broadcast {
+            [InputFrontier::default(); 2]
+        } else {
+            self.local_frontiers
+        };
         self.vnode_transition_cleanup = Some(IntervalJoinTransitionCleanup::Published(prepared));
     }
 
@@ -2709,100 +4596,6 @@ mod tests {
         assert_eq!(restored.restored_output_frontier(), Some(output));
     }
 
-    #[cfg(feature = "cluster")]
-    #[tokio::test]
-    async fn whole_checkpoint_capture_defers_and_preserves_its_replay_cut() {
-        let (scope, fence) = single_owner_shuffle(1).await;
-        let mut operator = IntervalJoinOperator::new(
-            "replay-checkpoint",
-            test_config(),
-            None,
-            SessionContext::new(),
-        );
-        operator.attach_cluster_shuffle(scope.clone());
-        operator.applied_left_watermark = 7_000;
-        operator.applied_right_watermark = 6_000;
-        operator.applied_left_idle = true;
-        operator.aligned_replay.push_back((
-            fence.assignment_version,
-            JoinInputSide::Right,
-            5_000,
-            crate::operator::RetainedBatch::restored_channel(
-                right_batch(&["A"], &[5_000], &[1.0]),
-                1,
-                fence.assignment_version,
-                1,
-                Arc::from([0_u32]),
-            ),
-        ));
-
-        let retained_bytes = operator
-            .capture_operator_checkpoint(u64::MAX)
-            .unwrap()
-            .unwrap()
-            .retained_bytes();
-        assert!(retained_bytes > 0);
-        assert!(operator.checkpoint_capture(retained_bytes - 1).is_err());
-        let capture = operator
-            .checkpoint_capture(retained_bytes)
-            .unwrap()
-            .unwrap();
-        assert!(matches!(&capture, StateFrameCapture::Deferred { .. }));
-
-        operator.applied_left_watermark = 9_000;
-        operator.applied_right_watermark = 9_000;
-        operator.applied_left_idle = false;
-        operator.applied_right_idle = true;
-        operator.aligned_replay.clear();
-
-        let checkpoint = OperatorCheckpoint {
-            data: materialize_capture(capture).unwrap().to_vec(),
-        };
-        let mut restored = IntervalJoinOperator::new(
-            "replay-checkpoint",
-            test_config(),
-            None,
-            SessionContext::new(),
-        );
-        restored.attach_cluster_shuffle(scope);
-        restored.restore(checkpoint).unwrap();
-
-        assert_eq!(restored.applied_left_watermark, 7_000);
-        assert_eq!(restored.applied_right_watermark, 6_000);
-        assert!(restored.applied_left_idle);
-        assert!(!restored.applied_right_idle);
-        let (assignment, side, watermark, batch) = restored.aligned_replay.front().unwrap();
-        assert_eq!(*assignment, fence.assignment_version);
-        assert!(matches!(side, JoinInputSide::Right));
-        assert_eq!(*watermark, 5_000);
-        assert_eq!(batch.num_rows(), 1);
-        assert_eq!(restored.aligned_replay.len(), 1);
-    }
-
-    #[cfg(feature = "cluster")]
-    #[test]
-    fn pending_right_replay_holds_left_oriented_output_by_the_join_bound() {
-        use laminar_sql::parser::join_parser::JoinType;
-
-        for (join_type, expected) in [(JoinType::Inner, 4_900), (JoinType::RightSemi, 5_000)] {
-            let mut config = test_config();
-            config.join_type = join_type;
-            let mut operator =
-                IntervalJoinOperator::new("replay-frontier", config, None, SessionContext::new());
-            operator.applied_left_watermark = 10_000;
-            operator.applied_right_watermark = 10_000;
-            operator.aligned_replay.push_back((
-                1,
-                JoinInputSide::Right,
-                5_000,
-                crate::operator::RetainedBatch::local(right_batch(&["A"], &[5_000], &[1.0])),
-            ));
-            let output = operator.output_frontier(unconstrained_frontier());
-            assert_eq!(output.watermark, Some(expected), "{join_type:?}");
-            assert!(!output.idle, "{join_type:?}");
-        }
-    }
-
     fn left_batch(ids: &[&str], timestamps: &[i64], values: &[f64]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
@@ -2989,52 +4782,497 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn aligned_replay_reactivates_input_and_sweeps_resident_vnodes() {
-        use laminar_sql::parser::join_parser::JoinType;
-
-        let (shuffle, _) = single_owner_shuffle(2).await;
-        let assignment_version = shuffle.registry.assignment_version();
-        let resident_key = key_for_vnode(0, 2);
-        let replay_key = key_for_vnode(1, 2);
-        let left = left_batch(&[resident_key.as_str()], &[100], &[1.0]);
-        let right = right_batch(&[replay_key.as_str()], &[250], &[2.0]);
-        let mut config = test_config();
-        config.join_type = JoinType::LeftAnti;
-        let mut op = IntervalJoinOperator::new(
-            "replay_sweep",
-            config,
+    async fn zero_admission_send_retries_without_becoming_runnable() {
+        let (scope, _) = two_owner_shuffle().await;
+        let mut operator = IntervalJoinOperator::new(
+            "retry_interval",
+            test_config(),
             None,
             laminar_sql::create_session_context(),
         );
-        op.set_input_schemas(left.schema(), right.schema());
-        op.attach_cluster_shuffle(shuffle);
+        operator.attach_cluster_shuffle(scope);
+        let retry_plan = vec![(
+            2,
+            laminar_core::shuffle::ShuffleMessage::Frontier {
+                stage: "retry_interval::left".to_string(),
+                watermark: None,
+                idle: false,
+            },
+        )];
+        let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+        let (visible_tx, visible_rx) = tokio::sync::oneshot::channel();
+        let send = tokio::spawn(async move {
+            let _ = outcome_tx.send((
+                Err(DbError::ShuffleNotReady("injected zero admission".into())),
+                Some(retry_plan),
+            ));
+            let _ = visible_tx.send(());
+        });
+        operator.pending_cluster_input = Some(PendingIntervalClusterInput {
+            routed: BTreeMap::new(),
+            outbound: None,
+            local_frontiers: [InputFrontier::default(); 2],
+            send: Some(send),
+            outcome: Some(outcome_rx),
+            accounted_bytes: 0,
+        });
+        visible_rx.await.unwrap();
 
-        let initial = op.process(&[vec![left], vec![]], &[0, 0]).await.unwrap();
-        assert!(initial.is_empty());
-        assert!(op.vnode_states[0].is_some());
-        op.applied_left_idle = true;
-        op.applied_right_idle = true;
-        op.aligned_replay.push_back((
-            assignment_version,
-            JoinInputSide::Right,
-            300,
-            crate::operator::RetainedBatch::local(right),
-        ));
-
-        let output = op.execute_aligned_replay().await.unwrap();
-
-        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
-        assert_eq!(op.applied_right_watermark, 300);
-        assert!(op.applied_left_idle);
-        assert!(!op.applied_right_idle);
-        assert!(op.aligned_replay.is_empty());
-        assert!(!op.output_frontier(unconstrained_frontier()).idle);
-        assert_eq!(op.vnode_states[0].as_ref().unwrap().buffered_rows(), (0, 0));
+        let output = operator
+            .process_cluster(
+                &[Vec::new(), Vec::new()],
+                InputFrontier::default(),
+                InputFrontier::default(),
+            )
+            .await
+            .unwrap();
+        assert!(output.is_empty());
+        assert!(operator
+            .pending_cluster_input
+            .as_ref()
+            .unwrap()
+            .send
+            .is_some());
+        assert!(operator
+            .pending_cluster_input
+            .as_ref()
+            .unwrap()
+            .outcome
+            .is_some());
+        assert!(!operator.deferred_work_is_runnable());
+        assert!(operator.checkpoint_capture(u64::MAX).is_err());
+        assert!(operator.checkpoint_vnodes(&[0], 2, u64::MAX).is_err());
     }
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn outbound_admission_turns_later_local_halt_into_recovery() {
+    async fn pending_send_applies_remote_match_before_local_finalize() {
+        use laminar_sql::parser::join_parser::JoinType;
+
+        let (scope, _) = two_owner_shuffle().await;
+        let mut config = test_config();
+        config.join_type = JoinType::Left;
+        let mut operator = IntervalJoinOperator::new(
+            "pending_interval",
+            config,
+            None,
+            laminar_sql::create_session_context(),
+        );
+        operator.attach_cluster_shuffle(scope.clone());
+        let local_key = key_for_vnode(0, 2);
+        let remote_key = key_for_vnode(1, 2);
+        let local = left_batch(&[local_key.as_str()], &[100], &[8.0]);
+        let outbound = left_batch(&[remote_key.as_str()], &[100], &[1.0]);
+        let close = InputFrontier {
+            watermark: Some(300),
+            idle: false,
+        };
+        let assignment = scope.registry.versioned_snapshot();
+        let plan = operator
+            .plan_cluster_inputs(
+                &[vec![local, outbound], Vec::new()],
+                [close; 2],
+                &scope,
+                &assignment,
+                &[2],
+            )
+            .unwrap();
+        let accounted_bytes = operator.cluster_input_plan_bytes(&plan).unwrap();
+        let IntervalClusterInputPlan {
+            routed,
+            outbound,
+            local_frontiers,
+            effective_frontiers: _,
+        } = plan;
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+        let (visible_tx, visible_rx) = tokio::sync::oneshot::channel();
+        let send = tokio::spawn(async move {
+            let _ = wait.await;
+            drop(outbound);
+            let _ = outcome_tx.send((Ok(()), None));
+            let _ = visible_tx.send(());
+        });
+        operator.pending_cluster_input = Some(PendingIntervalClusterInput {
+            routed,
+            outbound: None,
+            local_frontiers,
+            send: Some(send),
+            outcome: Some(outcome_rx),
+            accounted_bytes,
+        });
+        let assignment_version = scope.registry.assignment_version();
+        let recovery_gen = scope.receiver.recovery_gen();
+        operator
+            .stage_checkpointed_shuffle(
+                "pending_interval::right",
+                crate::operator::RetainedBatch::restored_channel(
+                    right_batch(&[local_key.as_str()], &[110], &[34.0]),
+                    2,
+                    assignment_version,
+                    recovery_gen,
+                    Arc::from([0_u32]),
+                ),
+                i64::MIN,
+            )
+            .unwrap();
+        operator
+            .stage_checkpointed_shuffle_frontier(
+                "pending_interval::right",
+                2,
+                close,
+                assignment_version,
+                recovery_gen,
+            )
+            .unwrap();
+
+        let output = tokio::time::timeout(
+            Duration::from_millis(50),
+            operator.process_cluster(
+                &[Vec::new(), Vec::new()],
+                InputFrontier::default(),
+                InputFrontier::default(),
+            ),
+        )
+        .await
+        .expect("pending interval send blocked the graph task")
+        .unwrap();
+        assert!(output.is_empty());
+        assert_eq!(operator.queued_remote_events, 1);
+        assert!(operator.pending_cluster_input.is_some());
+
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), visible_rx)
+            .await
+            .expect("pending interval send outcome was not published")
+            .unwrap();
+        let output = operator
+            .process_cluster(
+                &[Vec::new(), Vec::new()],
+                InputFrontier::default(),
+                InputFrontier::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let amount = output[0]
+            .column_by_name("amount_right_stream")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(amount.value(0), 34.0);
+        assert!(operator.pending_cluster_input.is_none());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn ordered_channel_checkpoint_restores_scope_and_rejects_idle_data() {
+        let (scope, _) = two_owner_shuffle().await;
+        let mut operator = IntervalJoinOperator::new(
+            "channel_interval",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+        );
+        operator.attach_cluster_shuffle(scope.clone());
+        let key = key_for_vnode(0, 2);
+        let assignment_version = scope.registry.assignment_version();
+        let recovery_gen = scope.receiver.recovery_gen();
+        let close = InputFrontier {
+            watermark: Some(300),
+            idle: false,
+        };
+        operator
+            .stage_checkpointed_shuffle(
+                "channel_interval::right",
+                crate::operator::RetainedBatch::restored_channel(
+                    right_batch(&[key.as_str()], &[110], &[2.0]),
+                    2,
+                    assignment_version,
+                    recovery_gen,
+                    Arc::from([0_u32]),
+                ),
+                i64::MIN,
+            )
+            .unwrap();
+        operator
+            .stage_checkpointed_shuffle_frontier(
+                "channel_interval::right",
+                2,
+                close,
+                assignment_version,
+                recovery_gen,
+            )
+            .unwrap();
+        operator
+            .stage_checkpointed_shuffle_frontier(
+                "channel_interval::left",
+                2,
+                close,
+                assignment_version,
+                recovery_gen,
+            )
+            .unwrap();
+        let IntervalRemoteEventPayload::Data(queued) = &operator.peer_channels
+            [JoinInputSide::Right.port()][&2]
+            .events
+            .front()
+            .unwrap()
+            .payload
+        else {
+            panic!("right channel did not retain its staged data first");
+        };
+        assert_eq!(queued.row_vnodes.as_ref(), &[0]);
+        operator.remote_side_cursor = 1;
+        let checkpoint = operator.checkpoint().unwrap().unwrap();
+        let checkpoint_data = checkpoint.data.clone();
+        let active_recovery = recovery_gen + 1;
+        scope.sender.set_recovery_gen(active_recovery);
+        scope.receiver.set_recovery_gen(active_recovery);
+
+        let mut malformed =
+            rkyv::from_bytes::<IntervalJoinOperatorCheckpoint, rkyv::rancor::Error>(
+                &checkpoint_data,
+            )
+            .unwrap();
+        malformed.applied_right_watermark = 200;
+        let right_channel =
+            &mut malformed.cluster.as_mut().unwrap().channels[JoinInputSide::Right.port()][0];
+        right_channel.applied = IntervalCheckpointFrontier {
+            watermark: Some(100),
+            idle: true,
+        };
+        right_channel.events.insert(
+            0,
+            IntervalCheckpointEvent::Frontier {
+                recovery_gen,
+                frontier: IntervalCheckpointFrontier {
+                    watermark: Some(150),
+                    idle: false,
+                },
+            },
+        );
+        let mut malformed_target = IntervalJoinOperator::new(
+            "channel_interval",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+        );
+        malformed_target.attach_cluster_shuffle(scope.clone());
+        let error = malformed_target
+            .restore(OperatorCheckpoint {
+                data: rkyv::to_bytes::<rkyv::rancor::Error>(&malformed)
+                    .unwrap()
+                    .to_vec(),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("revival frontier is below"));
+
+        let mut rejected = IntervalJoinOperator::new(
+            "channel_interval",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+        );
+        rejected.attach_cluster_shuffle(scope.clone());
+        let prior_key = "p".repeat(checkpoint_data.len().saturating_mul(2).max(1));
+        let mut prior_state = IntervalJoinState::new();
+        execute_interval_join_cycle(
+            &mut prior_state,
+            &[left_batch(&[prior_key.as_str()], &[90], &[1.0])],
+            &[],
+            &rejected.config,
+            i64::MIN,
+            i64::MIN,
+            i64::MIN,
+            i64::MIN,
+            usize::MAX,
+            &mut IntervalJoinOutputBudget::default(),
+        )
+        .unwrap();
+        rejected.vnode_states[0] = Some(Box::new(prior_state));
+        rejected.add_resident_vnode(0);
+        let prior_channel_frontiers = [
+            InputFrontier {
+                watermark: Some(17),
+                idle: false,
+            },
+            InputFrontier {
+                watermark: Some(19),
+                idle: false,
+            },
+        ];
+        for (port, frontier) in prior_channel_frontiers.into_iter().enumerate() {
+            let channel = rejected.peer_channels[port].get_mut(&2).unwrap();
+            channel.applied = frontier;
+            channel.accepted = frontier;
+        }
+        rejected.remote_side_cursor = 0;
+        rejected.remote_peer_cursors = [Some(2), Some(2)];
+        let prior_state_ptr = std::ptr::from_ref(rejected.vnode_states[0].as_deref().unwrap());
+        let baseline = rejected.accounted_state_bytes();
+        assert!(checkpoint_data.len() <= baseline);
+        rejected.set_managed_state_budget(baseline);
+        let error = rejected
+            .restore(OperatorCheckpoint {
+                data: checkpoint_data.clone(),
+            })
+            .unwrap_err();
+        let DbError::ManagedStateBudgetExceeded {
+            context,
+            accounted_bytes,
+            limit_bytes,
+        } = error
+        else {
+            panic!("cluster restore did not reject its projected state budget");
+        };
+        assert!(context.contains("cluster checkpoint restore"));
+        assert_eq!(limit_bytes, baseline);
+        assert!(accounted_bytes > baseline);
+        assert_eq!(
+            std::ptr::from_ref(rejected.vnode_states[0].as_deref().unwrap()),
+            prior_state_ptr
+        );
+        assert_eq!(
+            rejected.vnode_states[0].as_deref().unwrap().buffered_rows(),
+            (1, 0)
+        );
+        assert_eq!(rejected.resident_vnodes, [0]);
+        assert_eq!(rejected.applied_left_watermark, i64::MIN);
+        assert_eq!(rejected.applied_right_watermark, i64::MIN);
+        assert!(!rejected.applied_left_idle);
+        assert!(!rejected.applied_right_idle);
+        assert_eq!(rejected.local_frontiers, [InputFrontier::default(); 2]);
+        assert_eq!(rejected.last_broadcasts, [InputFrontier::default(); 2]);
+        assert_eq!(rejected.remote_side_cursor, 0);
+        assert_eq!(rejected.remote_peer_cursors, [Some(2), Some(2)]);
+        assert_eq!(rejected.queued_remote_events, 0);
+        assert_eq!(rejected.queued_shuffle_bytes, 0);
+        assert_eq!(rejected.queued_event_capacity_bytes, 0);
+        assert!(rejected.pending_cluster_input.is_none());
+        for (port, frontier) in prior_channel_frontiers.into_iter().enumerate() {
+            let channel = &rejected.peer_channels[port][&2];
+            assert_eq!(channel.applied, frontier);
+            assert_eq!(channel.accepted, frontier);
+            assert!(channel.events.is_empty());
+        }
+
+        let mut restored = IntervalJoinOperator::new(
+            "channel_interval",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+        );
+        restored.attach_cluster_shuffle(scope);
+        restored.restore(checkpoint).unwrap();
+        assert_eq!(restored.queued_remote_events, 3);
+        let IntervalRemoteEventPayload::Data(queued) = &restored.peer_channels
+            [JoinInputSide::Right.port()][&2]
+            .events
+            .front()
+            .unwrap()
+            .payload
+        else {
+            panic!("restored right channel lost its staged data order");
+        };
+        assert_eq!(queued.row_vnodes.as_ref(), &[0]);
+        assert!(!restored.wants_input());
+        assert!(restored
+            .checkpoint_vnodes(&[0], 2, u64::MAX)
+            .unwrap()
+            .is_some());
+
+        let first = restored
+            .process_cluster(
+                &[Vec::new(), Vec::new()],
+                InputFrontier::default(),
+                InputFrontier::default(),
+            )
+            .await
+            .unwrap();
+        assert!(first.is_empty());
+        assert_eq!(restored.queued_remote_events, 2);
+        assert_eq!(
+            restored.vnode_states[0].as_ref().unwrap().buffered_rows(),
+            (0, 1)
+        );
+        assert_eq!(
+            restored.peer_channels[JoinInputSide::Right.port()][&2].applied,
+            InputFrontier::default()
+        );
+        let second = restored
+            .process_cluster(
+                &[Vec::new(), Vec::new()],
+                InputFrontier::default(),
+                InputFrontier::default(),
+            )
+            .await
+            .unwrap();
+        assert!(second.is_empty());
+        assert_eq!(restored.queued_remote_events, 1);
+        assert_eq!(
+            restored.peer_channels[JoinInputSide::Left.port()][&2].applied,
+            close
+        );
+        assert_eq!(
+            restored.peer_channels[JoinInputSide::Right.port()][&2].applied,
+            InputFrontier::default()
+        );
+        assert_eq!(
+            restored.vnode_states[0].as_ref().unwrap().buffered_rows(),
+            (0, 1)
+        );
+        let third = restored
+            .process_cluster(
+                &[Vec::new(), Vec::new()],
+                InputFrontier::default(),
+                InputFrontier::default(),
+            )
+            .await
+            .unwrap();
+        assert!(third.is_empty());
+        assert_eq!(restored.queued_remote_events, 0);
+        assert_eq!(
+            restored.peer_channels[JoinInputSide::Right.port()][&2].applied,
+            close
+        );
+        assert_eq!(
+            restored.vnode_states[0].as_ref().unwrap().buffered_rows(),
+            (0, 1)
+        );
+
+        restored
+            .stage_checkpointed_shuffle_frontier(
+                "channel_interval::left",
+                2,
+                InputFrontier {
+                    watermark: close.watermark,
+                    idle: true,
+                },
+                assignment_version,
+                active_recovery,
+            )
+            .unwrap();
+        let error = restored
+            .stage_checkpointed_shuffle(
+                "channel_interval::left",
+                crate::operator::RetainedBatch::restored_channel(
+                    left_batch(&[key.as_str()], &[100], &[1.0]),
+                    2,
+                    assignment_version,
+                    active_recovery,
+                    Arc::from([0_u32]),
+                ),
+                i64::MIN,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("behind an idle peer frontier"));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn pending_plan_budget_rejects_before_shuffle_admission() {
         let (shuffle, remote_receiver) = two_owner_shuffle().await;
         let local_key = key_for_vnode(0, 2);
         let remote_key = key_for_vnode(1, 2);
@@ -3045,7 +5283,8 @@ mod tests {
             laminar_sql::create_session_context(),
         );
         op.attach_cluster_shuffle(shuffle);
-        op.max_managed_state_bytes = 1;
+        let baseline = op.accounted_state_bytes();
+        op.max_managed_state_bytes = baseline;
 
         let error = op
             .process(
@@ -3062,16 +5301,23 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(error, DbError::ShufflePartialSend(_)));
-        assert!(error.requires_pipeline_recovery());
-        let received = tokio::time::timeout(Duration::from_secs(2), remote_receiver.recv())
-            .await
-            .expect("remote frame was not delivered")
-            .expect("shuffle receiver closed");
-        assert!(matches!(
-            received.message(),
-            laminar_core::shuffle::ShuffleMessage::Data { .. }
-        ));
+        let DbError::ManagedStateBudgetExceeded {
+            context,
+            accounted_bytes,
+            limit_bytes,
+        } = error
+        else {
+            panic!("pending interval plan did not fail its managed-state budget");
+        };
+        assert!(context.contains("pending shuffle send"));
+        assert_eq!(limit_bytes, baseline);
+        assert!(accounted_bytes > baseline);
+        assert!(op.pending_cluster_input.is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), remote_receiver.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -3554,14 +5800,29 @@ mod tests {
                 left_table: donor_config.left_table.clone(),
                 right_table: donor_config.right_table.clone(),
                 bound_ms: i64::try_from(donor_config.time_bound.as_millis()).unwrap(),
-                aligned_replay: Vec::new(),
                 applied_left_watermark: 300,
                 applied_right_watermark: right_watermark,
                 applied_left_idle: left_idle,
                 applied_right_idle: false,
-                assignment_version: Some(predecessor.assignment_version),
-                owner_map_digest: Some(predecessor.assignment_digest),
-                participant_id: Some(participant_id),
+                cluster: Some(IntervalClusterCheckpoint {
+                    assignment_version: predecessor.assignment_version,
+                    owner_map_digest: predecessor.assignment_digest,
+                    self_id: participant_id,
+                    recovery_gen: 1,
+                    local_frontiers: [
+                        IntervalCheckpointFrontier {
+                            watermark: Some(300),
+                            idle: left_idle,
+                        },
+                        IntervalCheckpointFrontier {
+                            watermark: Some(right_watermark),
+                            idle: false,
+                        },
+                    ],
+                    remote_side_cursor: 0,
+                    remote_peer_cursors: [None; 2],
+                    channels: [Vec::new(), Vec::new()],
+                }),
             };
             rkyv::to_bytes::<rkyv::rancor::Error>(&checkpoint)
                 .unwrap()
@@ -3715,16 +5976,16 @@ mod tests {
         .unwrap();
         let target = CheckpointAssignmentFence::from_owner_map(
             target_version,
-            &[3],
+            &[2],
             vec![CheckpointParticipant {
-                node_id: 3,
-                boot_incarnation: uuid::Uuid::from_u128(3),
+                node_id: 2,
+                boot_incarnation: uuid::Uuid::from_u128(22),
             }],
         )
         .unwrap();
         scope
             .registry
-            .set_assignment_and_version(Arc::from([NodeId(3)]), target_version);
+            .set_assignment_and_version(Arc::from([NodeId(2)]), target_version);
         scope.sender.invalidate_assignment_fence();
         scope.receiver.invalidate_assignment_fence();
 
@@ -3739,6 +6000,19 @@ mod tests {
         predecessor_registry
             .set_assignment_and_version(Arc::from([NodeId(2)]), predecessor_version);
         operator.local_assignment = predecessor_registry.versioned_snapshot();
+        operator.applied_left_watermark = 100;
+        operator.applied_right_watermark = 200;
+        operator.local_frontiers = operator.applied_frontiers();
+        operator.last_broadcasts = operator.local_frontiers;
+        for port in 0..2 {
+            let stale = InputFrontier {
+                watermark: Some(900 + i64::try_from(port).unwrap()),
+                idle: false,
+            };
+            let channel = operator.peer_channels[port].get_mut(&2).unwrap();
+            channel.applied = stale;
+            channel.accepted = stale;
+        }
 
         operator
             .prepare_vnode_transition(ManagedVnodeTransition {
@@ -3750,10 +6024,19 @@ mod tests {
                 mode: ManagedVnodeTransitionMode::Live,
             })
             .unwrap();
+        let prepared = operator.prepared_vnode_transition.as_ref().unwrap();
+        assert!(prepared.bootstrap_broadcast);
+        for port in 0..2 {
+            let channel = &prepared.peer_channels[port][&2];
+            assert_eq!(channel.applied, operator.local_frontiers[port]);
+            assert_eq!(channel.accepted, operator.local_frontiers[port]);
+            assert!(channel.events.is_empty());
+        }
         operator.publish_vnode_transition();
 
         assert_eq!(operator.local_assignment.version(), target_version);
-        assert_eq!(operator.local_assignment.owners(), &[NodeId(3)]);
+        assert_eq!(operator.local_assignment.owners(), &[NodeId(2)]);
+        assert_eq!(operator.last_broadcasts, [InputFrontier::default(); 2]);
     }
 
     #[cfg(feature = "cluster")]

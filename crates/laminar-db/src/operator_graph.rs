@@ -1346,7 +1346,7 @@ impl OperatorGraph {
         self.owned_vnodes_cache = None;
     }
 
-    /// Install the cluster shuffle config for streaming aggregates.
+    /// Install the cluster shuffle config for managed stateful operators.
     #[cfg(feature = "cluster")]
     pub fn set_cluster_shuffle(
         &mut self,
@@ -1372,7 +1372,7 @@ impl OperatorGraph {
         self.cluster_shuffle.as_ref()
     }
 
-    /// Install node-local source progress used only by `CoreWindow`'s ordered peer frontier.
+    /// Install node-local source progress for managed ordered peer-frontier channels.
     #[cfg(feature = "cluster")]
     pub(crate) fn set_local_source_frontiers(
         &mut self,
@@ -2863,8 +2863,15 @@ impl OperatorGraph {
         let port_count = self.nodes[node_id].input_port_count;
         #[cfg(feature = "cluster")]
         let use_local_source_frontier = self.cluster_shuffle.is_some()
-            && self.nodes[node_id].capability.managed_state
-                == Some(ManagedStateContract::CoreWindowV1);
+            && matches!(
+                self.nodes[node_id].capability.managed_state,
+                Some(
+                    ManagedStateContract::CoreWindowV1
+                        | ManagedStateContract::SqlAggregateV1
+                        | ManagedStateContract::BoundedIntervalJoinV1
+                        | ManagedStateContract::TemporalJoinV1
+                )
+            );
         let frontiers: smallvec::SmallVec<[InputFrontier; 2]> = (0..port_count)
             .map(|port| {
                 let upstream = self.input_sources[node_id][port];
