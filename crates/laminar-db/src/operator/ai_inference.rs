@@ -14,6 +14,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
+use crossfire::AsyncTxTrait as _;
 use datafusion::prelude::SessionContext;
 use rustc_hash::FxHashMap;
 use tokio::runtime::Handle;
@@ -385,6 +386,12 @@ impl GraphOperator for AiInferenceOperator {
     fn wants_input(&self) -> bool {
         self.in_flight_rows() < self.max_in_flight
     }
+
+    fn deferred_work_is_runnable(&self) -> bool {
+        (!self.unsubmitted.is_empty() && !self.submit_tx.is_full())
+            || !self.replay.is_empty()
+            || !self.result_rx.is_empty()
+    }
 }
 
 fn embedding_type() -> DataType {
@@ -696,6 +703,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!op.wants_input(), "over the in-flight cap → refuses input");
+        assert!(!op.deferred_work_is_runnable());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

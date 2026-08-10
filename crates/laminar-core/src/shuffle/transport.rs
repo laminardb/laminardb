@@ -3185,6 +3185,7 @@ mod grpc {
         // restores it on drop so a cancelled `recv` can't strand it.
         rx: Mutex<Option<InboundRx>>,
         rx_returned: Arc<tokio::sync::Notify>,
+        work_ready: Arc<tokio::sync::Notify>,
         deferred_recv: Mutex<Option<Inbound>>,
         deferred_recv_ready: AtomicBool,
         #[cfg(test)]
@@ -3250,6 +3251,7 @@ mod grpc {
             let listener = tokio::net::TcpListener::bind(addr).await?;
             let local_addr = listener.local_addr()?;
             let (tx, rx) = mpsc::bounded_async::<Inbound>(SHUFFLE_RECV_QUEUE);
+            let work_ready = Arc::new(tokio::sync::Notify::new());
 
             let recovery_gen = Arc::new(AtomicU64::new(0));
             let assignment = Arc::new(RwLock::new(None));
@@ -3272,6 +3274,7 @@ mod grpc {
                 process_lease: Arc::clone(&process_lease),
                 pending_handshakes: Arc::clone(&pending_handshakes),
                 tx,
+                work_ready: Arc::clone(&work_ready),
                 recovery_gen: Arc::clone(&recovery_gen),
                 delivery: Arc::clone(&delivery),
                 barrier_arrivals: Arc::clone(&barrier_arrivals),
@@ -3313,6 +3316,7 @@ mod grpc {
                 receiver_incarnation,
                 rx: Mutex::new(Some(rx)),
                 rx_returned: Arc::new(tokio::sync::Notify::new()),
+                work_ready,
                 deferred_recv: Mutex::new(None),
                 deferred_recv_ready: AtomicBool::new(false),
                 #[cfg(test)]
@@ -3675,6 +3679,24 @@ mod grpc {
         #[must_use]
         pub fn local_addr(&self) -> SocketAddr {
             self.local_addr
+        }
+
+        /// Notification fired when shuffle work is ready for an execution cycle.
+        #[must_use]
+        pub fn work_ready_notify(&self) -> Arc<tokio::sync::Notify> {
+            Arc::clone(&self.work_ready)
+        }
+
+        /// Whether admitted work is still waiting in the receive queue.
+        #[must_use]
+        pub fn queued_work_ready(&self) -> bool {
+            if self.deferred_recv_ready.load(Ordering::Acquire) {
+                return true;
+            }
+            self.rx
+                .lock()
+                .as_ref()
+                .is_some_and(|receiver| !receiver.is_empty())
         }
 
         /// Revalidate a queued envelope at the consumer boundary. A stream can pass its final
@@ -4623,6 +4645,7 @@ mod grpc {
         process_lease: Arc<ProcessLeaseGate>,
         pending_handshakes: Arc<PendingHandshakes>,
         tx: InboundTx,
+        work_ready: Arc<tokio::sync::Notify>,
         recovery_gen: Arc<AtomicU64>,
         delivery: Arc<DeliveryTracker>,
         barrier_arrivals: Arc<AtomicU64>,
@@ -4899,6 +4922,7 @@ mod grpc {
     /// would let the consumer observe the barrier before its loss fence.
     async fn publish_barrier(
         tx: &InboundTx,
+        work_ready: &tokio::sync::Notify,
         barrier_arrivals: &AtomicU64,
         holdover: &Holdover,
         assignment_version: &AtomicU64,
@@ -4949,6 +4973,7 @@ mod grpc {
                 let enqueued = result.is_ok();
                 if enqueued {
                     barrier_arrivals.fetch_add(1, Ordering::Release);
+                    work_ready.notify_one();
                 }
                 Ok(enqueued)
             },
@@ -4968,6 +4993,7 @@ mod grpc {
             process_lease,
             pending_handshakes,
             tx,
+            work_ready,
             barrier_arrivals,
             holdover,
             recovery_gen,
@@ -5082,6 +5108,7 @@ mod grpc {
                     };
                     if !publish_barrier(
                         tx,
+                        work_ready,
                         barrier_arrivals,
                         holdover,
                         assignment_version,
@@ -5138,6 +5165,7 @@ mod grpc {
                         Some(DataAdmission::new(delivery, reservation, stream_cancel));
                     let forwarded = forward_frontier(
                         tx,
+                        work_ready,
                         fence,
                         v.stage,
                         v.watermark,
@@ -5259,6 +5287,7 @@ mod grpc {
                         Some(DataAdmission::new(delivery, reservation, stream_cancel));
                     let forwarded = forward_routed_batch(
                         tx,
+                        work_ready,
                         fence,
                         service.local_id,
                         &scope.assignment,
@@ -5312,6 +5341,7 @@ mod grpc {
 
     async fn forward_frontier(
         tx: &InboundTx,
+        work_ready: &tokio::sync::Notify,
         fence: StreamFence,
         stage: String,
         watermark: Option<i64>,
@@ -5333,7 +5363,13 @@ mod grpc {
                 fence,
                 assignment_digest: None,
                 checkpoint_sequence,
-            }) => Ok(result.is_ok()),
+            }) => {
+                let enqueued = result.is_ok();
+                if enqueued {
+                    work_ready.notify_one();
+                }
+                Ok(enqueued)
+            },
         }
     }
 
@@ -5341,6 +5377,7 @@ mod grpc {
     /// queue has closed.
     async fn forward_routed_batch(
         tx: &InboundTx,
+        work_ready: &tokio::sync::Notify,
         fence: StreamFence,
         receiver_node_id: ShufflePeerId,
         assignment: &InstalledAssignment,
@@ -5395,7 +5432,13 @@ mod grpc {
                 fence,
                 assignment_digest: None,
                 checkpoint_sequence,
-            }) => Ok(result.is_ok()),
+            }) => {
+                let enqueued = result.is_ok();
+                if enqueued {
+                    work_ready.notify_one();
+                }
+                Ok(enqueued)
+            },
         }
     }
 

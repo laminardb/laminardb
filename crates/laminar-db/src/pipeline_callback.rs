@@ -4082,18 +4082,19 @@ impl ConnectorPipelineCallback {
         self.source_frontiers_buf.clear();
         if let Some(ref tracker) = self.tracker {
             for (&sid, name) in &self.source_name_arcs {
-                self.source_frontiers_buf.insert(
-                    Arc::clone(name),
-                    InputFrontier {
-                        watermark: tracker
-                            .source_watermark(sid)
-                            .filter(|watermark| *watermark != i64::MIN),
-                        idle: tracker.is_idle(sid),
-                    },
-                );
+                let frontier = InputFrontier {
+                    watermark: tracker
+                        .source_watermark(sid)
+                        .filter(|watermark| *watermark != i64::MIN),
+                    idle: tracker.is_idle(sid),
+                };
+                self.source_frontiers_buf.insert(Arc::clone(name), frontier);
             }
         }
 
+        #[cfg(feature = "cluster")]
+        self.graph
+            .set_local_source_frontiers(&self.source_frontiers_buf);
         #[cfg(feature = "cluster")]
         if let Some(controller) = self.cluster_controller.as_ref() {
             Self::cap_source_frontiers_by_cluster_min(
@@ -4111,6 +4112,14 @@ impl ConnectorPipelineCallback {
         self.require_process_authority("checkpoint graph drain")?;
         self.refresh_source_frontiers();
         let watermark = self.effective_pipeline_watermark();
+        #[cfg(feature = "cluster")]
+        let shuffle_work_wake = self
+            .graph
+            .cluster_shuffle_config()
+            .map(|shuffle| shuffle.receiver.work_ready_notify());
+        #[cfg(not(feature = "cluster"))]
+        let shuffle_work_wake: Option<Arc<tokio::sync::Notify>> = None;
+        let mut completed_pass = false;
         while !self.graph.checkpoint_is_quiescent() {
             #[cfg(feature = "cluster")]
             self.require_process_authority("checkpoint graph execution")?;
@@ -4121,6 +4130,30 @@ impl ConnectorPipelineCallback {
                 );
                 set_checkpoint_fault(&self.checkpoint_fault, error.clone());
                 return Err(crate::pipeline::CycleError::Recovery(error));
+            }
+
+            #[cfg(feature = "cluster")]
+            let shuffle_work_ready = self
+                .graph
+                .cluster_shuffle_config()
+                .is_some_and(|shuffle| shuffle.receiver.queued_work_ready());
+            #[cfg(not(feature = "cluster"))]
+            let shuffle_work_ready = false;
+            if completed_pass && !shuffle_work_ready && !self.graph.has_runnable_deferred_work() {
+                tokio::select! {
+                    biased;
+                    () = tokio::time::sleep_until(deadline) => {}
+                    () = async {
+                        match shuffle_work_wake.as_ref() {
+                            Some(wake) => wake.notified().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {}
+                    () = tokio::time::sleep(
+                        crate::pipeline::streaming_coordinator::IDLE_TIMEOUT,
+                    ) => {}
+                }
+                continue;
             }
 
             let source_frontiers = if self.source_frontiers_buf.is_empty() {
@@ -4201,6 +4234,7 @@ impl ConnectorPipelineCallback {
                 0,
                 u64::try_from(pass_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             );
+            completed_pass = true;
 
             if tokio::time::Instant::now() >= deadline {
                 let error = format!(
@@ -5472,6 +5506,19 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
     }
 
+    fn shuffle_work_wake(&self) -> Option<Arc<tokio::sync::Notify>> {
+        #[cfg(feature = "cluster")]
+        {
+            self.graph
+                .cluster_shuffle_config()
+                .map(|shuffle| shuffle.receiver.work_ready_notify())
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            None
+        }
+    }
+
     fn tick_idle_watermark(&mut self) {
         let Some(ref mut trk) = self.tracker else {
             return;
@@ -5882,15 +5929,26 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn has_deferred_input(&self) -> bool {
-        // In cluster mode, always return true so the coordinator runs `execute_cycle` each idle
-        // tick; without this a follower with no local sources never drains the shuffle receiver.
+        // A shuffle wake schedules the cycle; this gate lets that cycle drain the receiver.
         #[cfg(feature = "cluster")]
         {
-            if self.cluster_controller.is_some() {
+            if self.graph.cluster_shuffle_config().is_some() {
                 return true;
             }
         }
         self.graph.has_deferred_work()
+    }
+
+    fn has_runnable_deferred_input(&self) -> bool {
+        #[cfg(feature = "cluster")]
+        if self
+            .graph
+            .cluster_shuffle_config()
+            .is_some_and(|shuffle| shuffle.receiver.queued_work_ready())
+        {
+            return true;
+        }
+        self.graph.has_runnable_deferred_work()
     }
 
     async fn cancel_source_barrier_attempt(

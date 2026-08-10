@@ -404,6 +404,62 @@ async fn wait_until(mut ready: impl FnMut() -> bool) {
     .expect("shuffle state did not settle");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiver_wakes_for_admitted_data_frontier_and_barrier() {
+    let receiver = bind_on_loopback(2).await;
+    let sender = sender(1);
+    sender.register_peer(2, receiver.local_addr());
+    let wake = receiver.work_ready_notify();
+
+    sender
+        .send_to(
+            2,
+            &ShuffleMessage::checkpointed("stage".into(), 0, one_row(1)),
+        )
+        .await
+        .unwrap();
+    wait_until(|| receiver.committed_sequence_for_test(1) == Some(1)).await;
+    assert!(receiver.queued_work_ready());
+    tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+        .await
+        .expect("an enqueue before the waiter did not retain a wake permit");
+    assert_eq!(receiver.drain_available().len(), 1);
+    assert!(!receiver.queued_work_ready());
+
+    for watermark in [1, 2] {
+        sender
+            .send_to(
+                2,
+                &ShuffleMessage::Frontier {
+                    stage: "stage".into(),
+                    watermark: Some(watermark),
+                    idle: false,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    wait_until(|| receiver.committed_sequence_for_test(1) == Some(3)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+        .await
+        .expect("frontier enqueue did not retain a wake permit");
+    assert!(receiver.queued_work_ready());
+    let _ = receiver.drain_checkpointed_staged();
+    assert_eq!(receiver.drain_staged_frontiers().len(), 1);
+    assert!(receiver.queued_work_ready());
+    let _ = receiver.drain_checkpointed_staged();
+    assert_eq!(receiver.drain_staged_frontiers().len(), 1);
+    assert!(!receiver.queued_work_ready());
+
+    send_barrier(&sender, &[2], CheckpointBarrier::new(1, 1))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+        .await
+        .expect("barrier enqueue did not retain a wake permit");
+    assert!(receiver.queued_work_ready());
+}
+
 #[test]
 fn shuffle_assignment_admission_rejects_oversized_roster() {
     let maximum = u64::try_from(crate::checkpoint::MAX_CHECKPOINT_PARTICIPANTS).unwrap();

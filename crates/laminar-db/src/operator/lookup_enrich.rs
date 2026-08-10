@@ -12,6 +12,7 @@ use arrow::compute::{concat, take};
 use arrow::row::RowConverter;
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
+use crossfire::AsyncTxTrait as _;
 use datafusion::prelude::SessionContext;
 use rustc_hash::FxHashMap;
 use tokio::runtime::Handle;
@@ -682,6 +683,20 @@ impl GraphOperator for LookupEnrichOperator {
 
     fn wants_input(&self) -> bool {
         self.in_flight_rows() < self.max_in_flight
+    }
+
+    fn deferred_work_is_runnable(&self) -> bool {
+        let resolved = self.resolved.as_ref();
+        let submit_ready = !self.unsubmitted.is_empty()
+            && resolved
+                .and_then(|resolved| resolved.submit_tx.as_ref())
+                .is_some_and(|sender| !sender.is_full());
+        let result_ready = resolved
+            .and_then(|resolved| resolved.result_rx.as_ref())
+            .is_some_and(|receiver| !receiver.is_empty());
+        let replay_ready =
+            !self.replay.is_empty() && self.retained_pending_rows() < self.max_in_flight;
+        submit_ready || result_ready || replay_ready
     }
 }
 

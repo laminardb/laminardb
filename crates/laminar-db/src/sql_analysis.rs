@@ -7,7 +7,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use datafusion_expr::LogicalPlan;
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_expr::{LogicalPlan, Volatility};
 use sqlparser::ast::{
     visit_expressions, CastKind, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
     GroupByExpr, Ident, ObjectName, ObjectNamePart, SelectFlavor, SelectItem, SetExpr, Statement,
@@ -21,9 +22,12 @@ use laminar_sql::parser::join_parser::{analyze_join, analyze_joins, JoinType};
 
 use crate::error::DbError;
 use crate::operator::window_frame::MomentFn;
+use laminar_sql::parser::WindowRewriter;
 #[cfg(test)]
 use laminar_sql::parser::{EmitClause, EmitStrategy as SqlEmitStrategy};
-use laminar_sql::translator::{JoinOperatorConfig, StreamJoinConfig, TemporalJoinTranslatorConfig};
+use laminar_sql::translator::{
+    JoinOperatorConfig, StreamJoinConfig, TemporalJoinTranslatorConfig, WindowOperatorConfig,
+};
 
 #[cfg(test)]
 pub(crate) fn sql_emit_to_core(
@@ -229,19 +233,335 @@ fn collect_referenced_columns(sql: &str) -> Option<FxHashSet<String>> {
 ///
 /// A self-join (`events e1 JOIN events e2`) returns `None` even though the base name repeats.
 pub(crate) fn single_source_table(sql: &str) -> Option<String> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql).ok()?;
-    let mut tables = Vec::new();
-    for stmt in &statements {
-        if let Statement::Query(query) = stmt {
-            collect_tables_counting(query.body.as_ref(), &mut tables);
-        }
+    let query = parse_standard_query(sql)?;
+    let mut visitor = QueryHazardVisitor::new(None);
+    let _ = query.visit(&mut visitor);
+    if visitor.hazards.unnest || visitor.hazards.nested_query {
+        return None;
     }
+    let mut tables = Vec::new();
+    collect_tables_counting(query.body.as_ref(), &mut tables);
     if tables.len() == 1 {
         tables.into_iter().next()
     } else {
         None
     }
+}
+
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Default)]
+pub(crate) struct ClusterQueryHazards {
+    pub(crate) runtime_function: bool,
+    pub(crate) ai_function: bool,
+    pub(crate) unnest: bool,
+    pub(crate) nested_query: bool,
+}
+
+fn parse_standard_query(sql: &str) -> Option<Box<sqlparser::ast::Query>> {
+    let mut statements = laminar_sql::parse_streaming_sql(sql).ok()?.into_iter();
+    let laminar_sql::parser::StreamingStatement::Standard(statement) = statements.next()? else {
+        return None;
+    };
+    if statements.next().is_some() {
+        return None;
+    }
+    let Statement::Query(query) = *statement else {
+        return None;
+    };
+    Some(query)
+}
+
+fn single_function_ident(name: &ObjectName) -> Option<&Ident> {
+    match name.0.as_slice() {
+        [ObjectNamePart::Identifier(ident)] => Some(ident),
+        _ => None,
+    }
+}
+
+fn is_cluster_runtime_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "now"
+            | "current_timestamp"
+            | "current_date"
+            | "today"
+            | "current_time"
+            | "proctime"
+            | "watermark"
+    )
+}
+
+fn supported_window_marker(name: &str) -> Option<(&'static str, bool)> {
+    match name.to_ascii_lowercase().as_str() {
+        "tumble" => Some(("tumble", true)),
+        "tumble_end" => Some(("tumble", false)),
+        "hop" => Some(("hop", true)),
+        "hop_end" => Some(("hop", false)),
+        "session" => Some(("session", true)),
+        _ => None,
+    }
+}
+
+fn is_unsupported_window_marker(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "cumulate" | "cumulate_end" | "slide"
+    )
+}
+
+fn window_time_arg_matches(function: &sqlparser::ast::Function, expected: &str) -> bool {
+    let FunctionArguments::List(arguments) = &function.args else {
+        return false;
+    };
+    matches!(
+        arguments.args.first(),
+        Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))))
+            if ident.value == expected
+    )
+}
+
+fn window_marker_matches(
+    function: &sqlparser::ast::Function,
+    base_name: &str,
+    expected: &WindowOperatorConfig,
+) -> bool {
+    let FunctionArguments::List(arguments) = &function.args else {
+        return false;
+    };
+    if function.uses_odbc_syntax
+        || !matches!(function.parameters, FunctionArguments::None)
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+        || arguments.duplicate_treatment.is_some()
+        || !arguments.clauses.is_empty()
+        || !window_time_arg_matches(function, &expected.time_column)
+    {
+        return false;
+    }
+
+    let mut canonical = function.clone();
+    canonical.name = ObjectName::from(vec![Ident::new(base_name)]);
+    let Ok(Some(window)) = WindowRewriter::extract_window_function(&Expr::Function(canonical))
+    else {
+        return false;
+    };
+    let Ok(actual) = WindowOperatorConfig::from_window_function(&window) else {
+        return false;
+    };
+    actual.window_type == expected.window_type
+        && actual.time_column == expected.time_column
+        && actual.size == expected.size
+        && actual.slide == expected.slide
+        && actual.gap == expected.gap
+        && actual.offset_ms == expected.offset_ms
+}
+
+struct QueryHazardVisitor<'a> {
+    hazards: ClusterQueryHazards,
+    query_count: usize,
+    expected_window: Option<&'a WindowOperatorConfig>,
+    saw_window_start: bool,
+    invalid_window: bool,
+}
+
+impl<'a> QueryHazardVisitor<'a> {
+    fn new(expected_window: Option<&'a WindowOperatorConfig>) -> Self {
+        Self {
+            hazards: ClusterQueryHazards::default(),
+            query_count: 0,
+            expected_window,
+            saw_window_start: false,
+            invalid_window: false,
+        }
+    }
+}
+
+impl Visitor for QueryHazardVisitor<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &sqlparser::ast::Query) -> ControlFlow<Self::Break> {
+        self.query_count += 1;
+        self.hazards.nested_query |= self.query_count > 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        self.hazards.unnest |= match factor {
+            TableFactor::UNNEST { .. } => true,
+            TableFactor::Table {
+                name,
+                args: Some(_),
+                ..
+            }
+            | TableFactor::Function { name, .. } => single_function_ident(name)
+                .is_some_and(|ident| ident.value.eq_ignore_ascii_case("unnest")),
+            _ => false,
+        };
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        if let Expr::Identifier(ident) = expr {
+            self.hazards.runtime_function |=
+                ident.quote_style.is_none() && ident_is_wallclock(&ident.value);
+            return ControlFlow::Continue(());
+        }
+        let Expr::Function(function) = expr else {
+            return ControlFlow::Continue(());
+        };
+        let Some(ident) = single_function_ident(&function.name) else {
+            return ControlFlow::Continue(());
+        };
+        let name = ident.value.as_str();
+        self.hazards.runtime_function |= is_cluster_runtime_function(name);
+        self.hazards.ai_function |= ai::is_ai_function_name(name);
+        self.hazards.unnest |= name.eq_ignore_ascii_case("unnest");
+        if let Some((base_name, is_start)) = supported_window_marker(name) {
+            self.saw_window_start |= is_start;
+            if let Some(expected) = self.expected_window {
+                self.invalid_window |= !window_marker_matches(function, base_name, expected);
+            }
+        } else if is_unsupported_window_marker(name) {
+            self.invalid_window = true;
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+pub(crate) fn cluster_query_hazards(sql: &str) -> Option<ClusterQueryHazards> {
+    let query = parse_standard_query(sql)?;
+    let mut visitor = QueryHazardVisitor::new(None);
+    let _ = query.visit(&mut visitor);
+    Some(visitor.hazards)
+}
+
+pub(crate) fn planned_functions_are_immutable(plan: &LogicalPlan) -> bool {
+    let mut immutable = true;
+    let _ = plan.apply(|node| {
+        for expression in node.expressions() {
+            let _ = expression.apply(|expression| {
+                let volatility = match expression {
+                    datafusion_expr::Expr::ScalarFunction(function) => {
+                        Some(function.func.signature().volatility)
+                    }
+                    datafusion_expr::Expr::AggregateFunction(function) => {
+                        Some(function.func.signature().volatility)
+                    }
+                    datafusion_expr::Expr::WindowFunction(function) => {
+                        Some(function.fun.signature().volatility)
+                    }
+                    _ => None,
+                };
+                if volatility.is_some_and(|volatility| volatility != Volatility::Immutable) {
+                    immutable = false;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            });
+            if !immutable {
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    immutable
+}
+
+pub(crate) fn managed_core_window_source(
+    sql: &str,
+    window: &WindowOperatorConfig,
+) -> Option<String> {
+    let query = parse_standard_query(sql)?;
+    let mut visitor = QueryHazardVisitor::new(Some(window));
+    let _ = query.visit(&mut visitor);
+    if visitor.hazards.runtime_function
+        || visitor.hazards.ai_function
+        || visitor.hazards.unnest
+        || visitor.hazards.nested_query
+        || !visitor.saw_window_start
+        || visitor.invalid_window
+    {
+        return None;
+    }
+    if query.with.is_some()
+        || query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+    {
+        return None;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let GroupByExpr::Expressions(group_exprs, group_modifiers) = &select.group_by else {
+        return None;
+    };
+    if !group_modifiers.is_empty()
+        || !group_exprs.iter().any(|expression| {
+            matches!(expression, Expr::Function(function)
+            if single_function_ident(&function.name).is_some_and(|ident| {
+                supported_window_marker(&ident.value).is_some_and(|(_, is_start)| is_start)
+            }))
+        })
+    {
+        return None;
+    }
+    if select.distinct.is_some()
+        || select.top.is_some()
+        || select.exclude.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || select.prewhere.is_some()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+        || select.value_table_mode.is_some()
+        || select.connect_by.is_some()
+        || !matches!(select.flavor, SelectFlavor::Standard)
+    {
+        return None;
+    }
+    let [from] = select.from.as_slice() else {
+        return None;
+    };
+    if !from.joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table {
+        name,
+        alias,
+        args: None,
+        with_hints,
+        version: None,
+        with_ordinality: false,
+        partitions,
+        json_path: None,
+        sample: None,
+        index_hints,
+        ..
+    } = &from.relation
+    else {
+        return None;
+    };
+    if alias
+        .as_ref()
+        .is_some_and(|alias| !alias.columns.is_empty())
+        || !with_hints.is_empty()
+        || !partitions.is_empty()
+        || !index_hints.is_empty()
+    {
+        return None;
+    }
+    Some(resolve_tvf_source(name, None))
 }
 
 fn collect_tables_counting(set_expr: &SetExpr, tables: &mut Vec<String>) {
@@ -253,10 +573,6 @@ fn collect_tables_counting(set_expr: &SetExpr, tables: &mut Vec<String>) {
                     collect_factor_counting(&join.relation, tables);
                 }
             }
-            // UNNEST in the projection expands rows; the single-source path can't handle it.
-            if projection_has_unnest(&select.projection) {
-                tables.push("\u{0}non_table_factor".to_string());
-            }
         }
         SetExpr::SetOperation { left, right, .. } => {
             collect_tables_counting(left.as_ref(), tables);
@@ -267,13 +583,6 @@ fn collect_tables_counting(set_expr: &SetExpr, tables: &mut Vec<String>) {
         }
         _ => {}
     }
-}
-
-// Checked on the serialized item; a false positive only forces the safe full-plan path.
-fn projection_has_unnest(items: &[SelectItem]) -> bool {
-    items
-        .iter()
-        .any(|item| item.to_string().to_ascii_lowercase().contains("unnest("))
 }
 
 fn collect_factor_counting(factor: &TableFactor, tables: &mut Vec<String>) {
@@ -930,7 +1239,10 @@ mod ai {
         let Expr::Function(func) = expr else {
             return None;
         };
-        let task = task_from_ai_function(&func.name.to_string().to_ascii_lowercase())?;
+        let [ObjectNamePart::Identifier(name)] = func.name.0.as_slice() else {
+            return None;
+        };
+        let task = task_from_ai_function(&name.value.to_ascii_lowercase())?;
         let FunctionArguments::List(list) = &func.args else {
             return None;
         };
@@ -1007,6 +1319,10 @@ mod ai {
     }
 
     // Must stay in step with the marker list in laminar-sql's ai_udf.
+    pub(crate) fn is_ai_function_name(name: &str) -> bool {
+        task_from_ai_function(&name.to_ascii_lowercase()).is_some()
+    }
+
     fn task_from_ai_function(name: &str) -> Option<Task> {
         match name {
             "ai_classify" => Some(Task::Classify),
@@ -2409,89 +2725,33 @@ fn expr_is_wallclock(expr: &Expr) -> bool {
         i.quote_style.is_none() && ident_is_wallclock(&i.value)
     }
     match strip_nested(expr) {
-        Expr::Function(f) => ident_is_wallclock(&f.name.to_string()),
+        Expr::Function(function) => single_function_ident(&function.name)
+            .is_some_and(|ident| ident_is_wallclock(&ident.value)),
         Expr::Identifier(id) => ident(id),
         _ => false,
     }
 }
 
-fn expr_uses_wallclock(expr: &Expr) -> bool {
-    if expr_is_wallclock(expr) {
-        return true;
-    }
-    match expr {
-        Expr::BinaryOp { left, right, .. } => {
-            expr_uses_wallclock(left) || expr_uses_wallclock(right)
+fn query_ast_uses(query: &sqlparser::ast::Query, predicate: fn(&Expr) -> bool) -> bool {
+    let mut found = false;
+    let _ = visit_expressions(query, |expr| {
+        if predicate(expr) {
+            found = true;
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
-        Expr::UnaryOp { expr: e, .. }
-        | Expr::Cast { expr: e, .. }
-        | Expr::Nested(e)
-        | Expr::IsNull(e)
-        | Expr::IsNotNull(e)
-        | Expr::Collate { expr: e, .. } => expr_uses_wallclock(e),
-        Expr::Between {
-            expr: e, low, high, ..
-        } => expr_uses_wallclock(e) || expr_uses_wallclock(low) || expr_uses_wallclock(high),
-        Expr::InList { expr: e, list, .. } => {
-            expr_uses_wallclock(e) || list.iter().any(expr_uses_wallclock)
-        }
-        Expr::Function(f) => {
-            if let sqlparser::ast::FunctionArguments::List(al) = &f.args {
-                al.args.iter().any(|a| match a {
-                    sqlparser::ast::FunctionArg::Unnamed(
-                        sqlparser::ast::FunctionArgExpr::Expr(e),
-                    )
-                    | sqlparser::ast::FunctionArg::Named {
-                        arg: sqlparser::ast::FunctionArgExpr::Expr(e),
-                        ..
-                    } => expr_uses_wallclock(e),
-                    _ => false,
-                })
-            } else {
-                false
-            }
-        }
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            operand.as_deref().is_some_and(expr_uses_wallclock)
-                || conditions
-                    .iter()
-                    .any(|w| expr_uses_wallclock(&w.condition) || expr_uses_wallclock(&w.result))
-                || else_result.as_deref().is_some_and(expr_uses_wallclock)
-        }
-        Expr::Tuple(items) => items.iter().any(expr_uses_wallclock),
-        Expr::Array(arr) => arr.elem.iter().any(expr_uses_wallclock),
-        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => set_expr_uses_wallclock(&q.body),
-        Expr::InSubquery {
-            expr: e, subquery, ..
-        } => expr_uses_wallclock(e) || set_expr_uses_wallclock(&subquery.body),
-        _ => false,
-    }
+    });
+    found
 }
 
-fn set_expr_uses_wallclock(set: &SetExpr) -> bool {
-    match set {
-        SetExpr::Select(sel) => {
-            sel.selection.as_ref().is_some_and(expr_uses_wallclock)
-                || sel.having.as_ref().is_some_and(expr_uses_wallclock)
-                || sel.qualify.as_ref().is_some_and(expr_uses_wallclock)
-                || sel.projection.iter().any(|p| match p {
-                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                        expr_uses_wallclock(e)
-                    }
-                    _ => false,
-                })
-        }
-        SetExpr::Query(q) => set_expr_uses_wallclock(&q.body),
-        SetExpr::SetOperation { left, right, .. } => {
-            set_expr_uses_wallclock(left) || set_expr_uses_wallclock(right)
-        }
-        _ => false,
-    }
+fn query_ast_uses_wallclock(query: &sqlparser::ast::Query) -> bool {
+    query_ast_uses(query, expr_is_wallclock)
+}
+
+#[cfg(test)]
+pub(crate) fn query_uses_runtime_clock(sql: &str) -> bool {
+    cluster_query_hazards(sql).is_none_or(|hazards| hazards.runtime_function)
 }
 
 fn strip_nested(expr: &Expr) -> &Expr {
@@ -2657,15 +2917,7 @@ pub(crate) fn analyze_temporal_filter(sql: &str) -> TemporalFilterAnalysis {
         return TemporalFilterAnalysis::NotPresent;
     };
 
-    let uses_now = select.selection.as_ref().is_some_and(expr_uses_wallclock)
-        || select.having.as_ref().is_some_and(expr_uses_wallclock)
-        || select.qualify.as_ref().is_some_and(expr_uses_wallclock)
-        || select.projection.iter().any(|item| match item {
-            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                expr_uses_wallclock(e)
-            }
-            _ => false,
-        });
+    let uses_now = query_ast_uses_wallclock(query);
     if !uses_now {
         return TemporalFilterAnalysis::NotPresent;
     }

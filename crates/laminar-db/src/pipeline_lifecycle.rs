@@ -3572,6 +3572,7 @@ impl LaminarDB {
             context
         };
         laminar_sql::register_streaming_functions(&ctx);
+        self.register_custom_functions_into(&ctx);
 
         let lookup_tables: Vec<(String, arrow::datatypes::SchemaRef)> = {
             let ts = self.table_store.read();

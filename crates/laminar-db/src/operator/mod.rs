@@ -199,6 +199,21 @@ pub(crate) async fn send_shuffle_plan(
     outbound: Vec<(u64, laminar_core::shuffle::ShuffleMessage)>,
     context: &str,
 ) -> Result<(), DbError> {
+    send_shuffle_plan_retaining(sender, assignment_version, outbound, context)
+        .await
+        .0
+}
+
+#[cfg(feature = "cluster")]
+pub(crate) async fn send_shuffle_plan_retaining(
+    sender: &laminar_core::shuffle::ShuffleSender,
+    assignment_version: u64,
+    outbound: Vec<(u64, laminar_core::shuffle::ShuffleMessage)>,
+    context: &str,
+) -> (
+    Result<(), DbError>,
+    Option<Vec<(u64, laminar_core::shuffle::ShuffleMessage)>>,
+) {
     let mut group_indices = rustc_hash::FxHashMap::default();
     let mut peer_groups = Vec::<(u64, Vec<(usize, laminar_core::shuffle::ShuffleMessage)>)>::new();
     for (index, (peer, message)) in outbound.into_iter().enumerate() {
@@ -216,7 +231,8 @@ pub(crate) async fn send_shuffle_plan(
     let outcomes =
         futures::future::join_all(peer_groups.into_iter().map(|(peer, messages)| async move {
             let mut admitted_any = false;
-            for (index, message) in messages {
+            let mut messages = messages.into_iter();
+            while let Some((index, message)) = messages.next() {
                 match sender
                     .send_to_for_assignment(peer, assignment_version, &message)
                     .await
@@ -225,21 +241,29 @@ pub(crate) async fn send_shuffle_plan(
                     Err(error) => {
                         admitted_any |=
                             laminar_core::shuffle::shuffle_send_may_have_been_admitted(&error);
-                        return (admitted_any, Some((index, peer, error)));
+                        let mut retained = Vec::new();
+                        if !admitted_any {
+                            retained.push((index, peer, message));
+                            retained
+                                .extend(messages.map(|(index, message)| (index, peer, message)));
+                        }
+                        return (admitted_any, Some((index, peer, error)), retained);
                     }
                 }
             }
-            (admitted_any, None)
+            (admitted_any, None, Vec::new())
         }))
         .await;
 
     let mut sent_any = false;
     let mut errors = Vec::new();
-    for (admitted, error) in outcomes {
+    let mut retained = Vec::new();
+    for (admitted, error, peer_retained) in outcomes {
         sent_any |= admitted;
         if let Some(error) = error {
             errors.push(error);
         }
+        retained.extend(peer_retained);
     }
 
     let first_error = if sent_any {
@@ -256,10 +280,22 @@ pub(crate) async fn send_shuffle_plan(
         })
     };
 
-    match first_error {
+    let result = match first_error {
         Some((_, peer, error)) => Err(shuffle_send_error(context, peer, &error, sent_any)),
         None => Ok(()),
-    }
+    };
+    let retry_plan = if matches!(&result, Err(error) if error.is_shuffle_not_ready()) {
+        retained.sort_unstable_by_key(|(index, _, _)| *index);
+        Some(
+            retained
+                .into_iter()
+                .map(|(_, peer, message)| (peer, message))
+                .collect(),
+        )
+    } else {
+        None
+    };
+    (result, retry_plan)
 }
 
 /// Re-execute a cached physical plan without re-planning; source leaves are swapped per cycle.
@@ -536,16 +572,16 @@ mod shuffle_tests {
     #[tokio::test]
     async fn send_plan_classifies_first_unreachable_peer_as_not_ready() {
         let (sender, _receiver) = sender_with_reachable_peer_two().await;
-        let error = send_shuffle_plan(
-            &sender,
-            1,
-            vec![(3, ShuffleMessage::checkpointed("stage".into(), 2, batch(1)))],
-            "test shuffle",
-        )
-        .await
-        .unwrap_err();
+        let outbound = vec![
+            (3, ShuffleMessage::checkpointed("stage".into(), 2, batch(1))),
+            (3, ShuffleMessage::checkpointed("stage".into(), 2, batch(2))),
+        ];
+        let (result, retry_plan) =
+            send_shuffle_plan_retaining(&sender, 1, outbound.clone(), "test shuffle").await;
+        let error = result.unwrap_err();
 
         assert!(matches!(error, DbError::ShuffleNotReady(_)));
+        assert_eq!(retry_plan, Some(outbound));
     }
 
     #[tokio::test]

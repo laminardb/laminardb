@@ -215,6 +215,27 @@ pub(crate) fn exact_table_reference(name: &str) -> datafusion::common::TableRefe
     datafusion::common::TableReference::bare(name)
 }
 
+fn validate_custom_function_name(
+    kind: &str,
+    name: &str,
+    aliases: &[String],
+) -> Result<(), DbError> {
+    const CORE_WINDOW_MARKERS: [&str; 5] = ["tumble", "tumble_end", "hop", "hop_end", "session"];
+    let collision = std::iter::once(name)
+        .chain(aliases.iter().map(String::as_str))
+        .find(|candidate| {
+            CORE_WINDOW_MARKERS
+                .iter()
+                .any(|marker| candidate.eq_ignore_ascii_case(marker))
+        });
+    if let Some(collision) = collision {
+        return Err(DbError::Config(format!(
+            "custom {kind} '{name}' uses reserved CoreWindow marker name or alias '{collision}'"
+        )));
+    }
+    Ok(())
+}
+
 /// The main `LaminarDB` database handle.
 ///
 /// Unified interface for SQL execution, data ingestion, and result consumption.
@@ -223,6 +244,8 @@ pub struct LaminarDB {
     pub(crate) catalog: Arc<SourceCatalog>,
     pub(crate) planner: parking_lot::Mutex<StreamingPlanner>,
     pub(crate) ctx: SessionContext,
+    custom_udfs: Vec<datafusion_expr::ScalarUDF>,
+    custom_udafs: Vec<datafusion_expr::AggregateUDF>,
     pub(crate) config: LaminarConfig,
     pub(crate) config_vars: Arc<HashMap<String, String>>,
     pub(crate) shutdown: std::sync::atomic::AtomicBool,
@@ -1492,6 +1515,8 @@ impl LaminarDB {
             catalog,
             planner: parking_lot::Mutex::new(StreamingPlanner::new()),
             ctx,
+            custom_udfs: Vec::new(),
+            custom_udafs: Vec::new(),
             config,
             config_vars: Arc::new(config_vars),
             shutdown: std::sync::atomic::AtomicBool::new(false),
@@ -3521,13 +3546,34 @@ impl LaminarDB {
     }
 
     /// Register a custom scalar UDF. Called by the builder after construction.
-    pub(crate) fn register_custom_udf(&self, udf: datafusion_expr::ScalarUDF) {
-        self.ctx.register_udf(udf);
+    pub(crate) fn register_custom_udf(
+        &mut self,
+        udf: datafusion_expr::ScalarUDF,
+    ) -> Result<(), DbError> {
+        validate_custom_function_name("scalar UDF", udf.name(), udf.aliases())?;
+        self.ctx.register_udf(udf.clone());
+        self.custom_udfs.push(udf);
+        Ok(())
     }
 
     /// Register a custom aggregate UDF. Called by the builder after construction.
-    pub(crate) fn register_custom_udaf(&self, udaf: datafusion_expr::AggregateUDF) {
-        self.ctx.register_udaf(udaf);
+    pub(crate) fn register_custom_udaf(
+        &mut self,
+        udaf: datafusion_expr::AggregateUDF,
+    ) -> Result<(), DbError> {
+        validate_custom_function_name("aggregate UDF", udaf.name(), udaf.aliases())?;
+        self.ctx.register_udaf(udaf.clone());
+        self.custom_udafs.push(udaf);
+        Ok(())
+    }
+
+    pub(crate) fn register_custom_functions_into(&self, ctx: &SessionContext) {
+        for udf in &self.custom_udfs {
+            ctx.register_udf(udf.clone());
+        }
+        for udaf in &self.custom_udafs {
+            ctx.register_udaf(udaf.clone());
+        }
     }
 
     /// Execute a SQL statement.

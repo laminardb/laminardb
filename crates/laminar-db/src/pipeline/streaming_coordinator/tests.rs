@@ -506,6 +506,8 @@ struct MockCallback {
     checkpoint_control_watch: Option<
         tokio::sync::watch::Receiver<Option<laminar_core::cluster::control::BarrierAnnouncement>>,
     >,
+    shuffle_work_wake: Option<Arc<tokio::sync::Notify>>,
+    runnable_deferred_input: bool,
     barrier_captures: Vec<(CheckpointAttempt, usize)>,
     runtime: MockRuntimeState,
     assignment_fault: Option<String>,
@@ -590,6 +592,8 @@ impl MockCallback {
             checkpoint_control_enabled: false,
             #[cfg(feature = "cluster")]
             checkpoint_control_watch: None,
+            shuffle_work_wake: None,
+            runnable_deferred_input: false,
             barrier_captures: Vec::new(),
             runtime: MockRuntimeState {
                 leader: true,
@@ -691,6 +695,18 @@ impl PipelineCallback for MockCallback {
         {
             None
         }
+    }
+
+    fn shuffle_work_wake(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.shuffle_work_wake.clone()
+    }
+
+    fn has_deferred_input(&self) -> bool {
+        self.shuffle_work_wake.is_some()
+    }
+
+    fn has_runnable_deferred_input(&self) -> bool {
+        self.runnable_deferred_input
     }
 
     async fn execute_cycle(
@@ -1147,6 +1163,110 @@ async fn checkpoint_control_watch_wakes_a_quiet_follower() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test(start_paused = true)]
+async fn shuffle_work_wakes_a_quiet_coordinator_before_idle_fallback() {
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+    let coordinator = test_coordinator(
+        rx,
+        control_rx,
+        shutdown,
+        DeliveryGuarantee::AtLeastOnce,
+        None,
+    );
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let mut callback = MockCallback::new();
+    callback.shuffle_work_wake = Some(Arc::clone(&wake));
+    callback.runnable_deferred_input = false;
+    callback.halt_at_cycle = Some(1);
+
+    let task = tokio::spawn(coordinator.run(callback));
+    tokio::task::yield_now().await;
+    assert!(!task.is_finished());
+
+    wake.notify_one();
+    let exit = tokio::time::timeout(Duration::from_millis(10), task)
+        .await
+        .expect("shuffle input did not wake before the idle fallback")
+        .unwrap();
+    assert!(matches!(exit, ExitReason::Shutdown));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn runnable_deferred_replay_does_not_wait_for_notify() {
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+    let mut coordinator = test_coordinator(
+        rx,
+        control_rx,
+        shutdown,
+        DeliveryGuarantee::AtLeastOnce,
+        None,
+    );
+    coordinator.replay_pending = true;
+    let mut callback = MockCallback::new();
+    callback.shuffle_work_wake = Some(Arc::new(tokio::sync::Notify::new()));
+    callback.runnable_deferred_input = true;
+    callback.halt_at_cycle = Some(1);
+
+    let exit = tokio::time::timeout(Duration::from_millis(10), coordinator.run(callback))
+        .await
+        .expect("runnable deferred replay waited for a shuffle notification");
+    assert!(matches!(exit, ExitReason::Shutdown));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn blocked_deferred_replay_waits_for_the_idle_fallback() {
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+    let mut coordinator = test_coordinator(
+        rx,
+        control_rx,
+        Arc::clone(&shutdown),
+        DeliveryGuarantee::AtLeastOnce,
+        None,
+    );
+    coordinator.replay_pending = true;
+
+    let mut callback = MockCallback::new();
+    callback.runnable_deferred_input = false;
+    let cycles = Arc::clone(&callback.cycle_input_rows);
+
+    let task = tokio::spawn(coordinator.run(callback));
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(cycles.lock().is_empty());
+    assert!(!task.is_finished());
+
+    tokio::time::advance(IDLE_TIMEOUT - Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(cycles.lock().is_empty());
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    for _ in 0..16 {
+        if cycles.lock().len() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(cycles.lock().len(), 1);
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(cycles.lock().len(), 1);
+
+    shutdown.notify_one();
+    let exit = task.await.unwrap();
+    assert!(matches!(exit, ExitReason::Shutdown));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
 async fn pending_checkpoint_control_rechecks_when_completion_precedes_claim_drop() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
@@ -1588,18 +1708,21 @@ async fn recovery_intake_gate_allows_control_only_vnode_transition_completion() 
     callback.runtime.recovering = true;
     callback.intake_gate.store(true, Ordering::Release);
     callback.pending_vnode_transition = true;
+    let wake = Arc::new(tokio::sync::Notify::new());
+    callback.shuffle_work_wake = Some(Arc::clone(&wake));
     let completions = Arc::clone(&callback.vnode_transition_completions);
     let written_rows = Arc::clone(&callback.written_rows);
 
     let run = tokio::spawn(async move { coordinator.run(callback).await });
     tokio::task::yield_now().await;
-    tokio::time::advance(IDLE_TIMEOUT).await;
-    for _ in 0..64 {
-        if completions.load(Ordering::Acquire) != 0 {
-            break;
+    wake.notify_one();
+    tokio::time::timeout(Duration::from_millis(10), async {
+        while completions.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
-    }
+    })
+    .await
+    .expect("shuffle completion did not wake the fenced transition");
 
     assert_eq!(
         completions.load(Ordering::Acquire),
@@ -2461,6 +2584,7 @@ async fn deferred_operator_work_does_not_cancel_due_checkpoint() {
     let mut state = CoordinatorRunState {
         batch_window: Duration::ZERO,
         checkpoint_control_wake: None,
+        shuffle_work_wake: None,
         checkpoint_control_poll_at: tokio::time::Instant::now(),
         checkpoint_control_pending: false,
         barriers: Vec::new(),

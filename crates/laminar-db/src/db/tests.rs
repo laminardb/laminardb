@@ -9033,6 +9033,12 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
             )
             .await
             .unwrap();
+            db.execute(
+                "CREATE SOURCE unwatermarked_events (id BIGINT, value DOUBLE, ts TIMESTAMP NOT NULL) \
+                 FROM GENERATOR ('max.rows' = '1')",
+            )
+            .await
+            .unwrap();
             let temporal_connector = crate::temporal_test_source::CONNECTOR_NAME;
             db.execute(&format!(
                 "CREATE SOURCE temporal_left (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, value BIGINT NOT NULL, \
@@ -9049,15 +9055,117 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
             .await
             .unwrap();
 
-            assert_cluster_rejection(
-                &db,
-                "rejected_eowc_stream",
-                "CREATE STREAM rejected_eowc_stream AS \
+            db.execute(
+                "CREATE STREAM managed_eowc_stream AS \
                  SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n \
                  FROM left_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
                  EMIT ON WINDOW CLOSE",
             )
+            .await
+            .expect("static event-time CoreWindow state is cluster-safe");
+            assert!(db.catalog.get_stream_entry("managed_eowc_stream").is_some());
+            let managed_window =
+                db.connector_manager.lock().streams()["managed_eowc_stream"].clone();
+            assert!(db
+                .revalidate_persisted_cluster_query_shapes(&std::collections::HashMap::from([(
+                    managed_window.name.clone(),
+                    managed_window,
+                )]))
+                .await
+                .expect("persisted CoreWindow plans must retain managed-vnode admission"));
+            for (name, ddl) in [
+                (
+                    "managed_hop_stream",
+                    "CREATE STREAM managed_hop_stream AS \
+                     SELECT id, HOP(ts, INTERVAL '10' SECOND, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n \
+                     FROM left_events GROUP BY id, HOP(ts, INTERVAL '10' SECOND, INTERVAL '1' MINUTE) \
+                     EMIT ON WINDOW CLOSE",
+                ),
+                (
+                    "managed_session_stream",
+                    "CREATE STREAM managed_session_stream AS \
+                     SELECT id, SESSION(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n \
+                     FROM left_events GROUP BY id, SESSION(ts, INTERVAL '1' MINUTE) \
+                     EMIT ON WINDOW CLOSE",
+                ),
+                (
+                    "managed_global_tumble",
+                    "CREATE STREAM managed_global_tumble AS \
+                     SELECT TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n \
+                     FROM left_events GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE) \
+                     EMIT ON WINDOW CLOSE",
+                ),
+            ] {
+                db.execute(ddl)
+                    .await
+                    .unwrap_or_else(|error| panic!("{name} should use managed CoreWindow: {error}"));
+                assert!(db.catalog.get_stream_entry(name).is_some());
+            }
+            assert_cluster_rejection(
+                &db,
+                "rejected_dynamic_eowc",
+                "CREATE STREAM rejected_dynamic_eowc AS \
+                 SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n \
+                 FROM left_events WHERE ts > now() - INTERVAL '10' MINUTE \
+                 GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) EMIT ON WINDOW CLOSE",
+            )
             .await;
+            for (name, ddl) in [
+                (
+                    "rejected_ordered_eowc",
+                    "CREATE STREAM rejected_ordered_eowc AS \
+                     SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n \
+                     FROM left_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
+                     ORDER BY COUNT(*) + 0 EMIT ON WINDOW CLOSE",
+                ),
+                (
+                    "rejected_limited_eowc",
+                    "CREATE STREAM rejected_limited_eowc AS \
+                     SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n \
+                     FROM left_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
+                     LIMIT 1 EMIT ON WINDOW CLOSE",
+                ),
+                (
+                    "rejected_indirect_eowc",
+                    "CREATE STREAM rejected_indirect_eowc AS \
+                     SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, \
+                            (SELECT MAX(value) FROM right_events) AS other, COUNT(*) AS n \
+                     FROM left_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
+                     EMIT ON WINDOW CLOSE",
+                ),
+                (
+                    "rejected_unwatermarked_eowc",
+                    "CREATE STREAM rejected_unwatermarked_eowc AS \
+                     SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n \
+                     FROM unwatermarked_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
+                     EMIT ON WINDOW CLOSE",
+                ),
+                (
+                    "rejected_nested_ai_eowc",
+                    "CREATE STREAM rejected_nested_ai_eowc AS \
+                     SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, \
+                            COUNT(ai_sentiment(CAST(id AS VARCHAR))) AS n \
+                     FROM left_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
+                     EMIT ON WINDOW CLOSE",
+                ),
+                (
+                    "rejected_random_eowc",
+                    "CREATE STREAM rejected_random_eowc AS \
+                     SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, \
+                            SUM(value + random()) AS total \
+                     FROM left_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
+                     EMIT ON WINDOW CLOSE",
+                ),
+                (
+                    "rejected_uuid_eowc",
+                    "CREATE STREAM rejected_uuid_eowc AS \
+                     SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(uuid()) AS n \
+                     FROM left_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
+                     EMIT ON WINDOW CLOSE",
+                ),
+            ] {
+                assert_cluster_rejection(&db, name, ddl).await;
+            }
             db.execute(
                 "CREATE STREAM interval_ok AS \
                  SELECT l.id AS id, l.value AS left_value, r.value AS right_value \

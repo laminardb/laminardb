@@ -1821,7 +1821,7 @@ impl LaminarDB {
             }));
         };
 
-        self.validate_cluster_query_shape_before_plan("stream", &name_str, query_sql, emit_clause)?;
+        self.validate_cluster_query_shape_before_plan("stream", &name_str, query_sql)?;
         let planned =
             self.plan_streaming_query(name, query, emit_clause.cloned(), query_sql, false)?;
         if !self.is_cluster_runtime()
@@ -2592,10 +2592,7 @@ impl LaminarDB {
         object_kind: &str,
         name: &str,
         query_sql: &str,
-        emit_clause: Option<&laminar_sql::parser::EmitClause>,
     ) -> Result<(), DbError> {
-        use laminar_sql::parser::EmitClause;
-
         if !self.is_cluster_runtime() {
             return Ok(());
         }
@@ -2607,32 +2604,28 @@ impl LaminarDB {
             ))
         };
 
-        if emit_clause
-            .is_some_and(|emit| matches!(emit, EmitClause::OnWindowClose | EmitClause::Final))
-        {
-            return reject(
-                "window-close/final emission has whole-operator window state without a vnode lifecycle",
-            );
-        }
         if crate::sql_analysis::plan_frame_query(query_sql).is_some() {
             return reject(
                 "analytic/window-frame state has no vnode-keyed checkpoint and rebalance lifecycle",
             );
         }
-        if !crate::sql_analysis::detect_ai_functions(query_sql).is_empty() {
+        let hazards = crate::sql_analysis::cluster_query_hazards(query_sql).ok_or_else(|| {
+            Self::cluster_state_lifecycle_error(
+                object_kind,
+                name,
+                "query SQL could not be certified by the cluster admission parser",
+            )
+        })?;
+        if hazards.runtime_function {
+            return reject(
+                "runtime clock/watermark functions require a cluster-wide evaluation frontier",
+            );
+        }
+        if hazards.ai_function {
             return reject(
                 "AI inference has checkpointed in-flight rows but no vnode-keyed rebalance lifecycle",
             );
         }
-        if !matches!(
-            crate::sql_analysis::analyze_temporal_filter(query_sql),
-            crate::sql_analysis::TemporalFilterAnalysis::NotPresent
-        ) {
-            return reject(
-                "retracting temporal-filter state has no vnode-keyed checkpoint and rebalance lifecycle",
-            );
-        }
-
         if crate::sql_analysis::has_join_clause(query_sql)
             && self.first_incremental_ref(query_sql).is_some()
         {
@@ -2658,12 +2651,7 @@ impl LaminarDB {
         if !self.is_cluster_runtime() {
             return Ok(false);
         }
-        self.validate_cluster_query_shape_before_plan(
-            object_kind,
-            name,
-            query_sql,
-            plan.emit_clause.as_ref(),
-        )?;
+        self.validate_cluster_query_shape_before_plan(object_kind, name, query_sql)?;
         let reject = |reason: &str| {
             Err(Self::cluster_state_lifecycle_error(
                 object_kind,
@@ -2677,9 +2665,96 @@ impl LaminarDB {
                 "analytic/window-frame state has no vnode-keyed checkpoint and rebalance lifecycle",
             );
         }
-        if plan.window_config.is_some() {
+        let managed_window_emit = plan.emit_clause.as_ref().is_some_and(|emit| {
+            matches!(
+                emit,
+                laminar_sql::parser::EmitClause::OnWindowClose
+                    | laminar_sql::parser::EmitClause::Final
+            )
+        });
+        if let Some(window) = plan.window_config.as_ref() {
+            if !managed_window_emit {
+                return reject(
+                    "cluster windows require EMIT ON WINDOW CLOSE or EMIT FINAL on the managed CoreWindow path",
+                );
+            }
+            if plan.join_config.is_some() || crate::sql_analysis::has_join_clause(query_sql) {
+                return reject(
+                    "a windowed join requires a planner-certified combined join/window vnode lifecycle",
+                );
+            }
+            let source_name = crate::sql_analysis::managed_core_window_source(
+                query_sql,
+                window,
+            )
+            .ok_or_else(|| {
+                    Self::cluster_state_lifecycle_error(
+                        object_kind,
+                        name,
+                        "managed CoreWindow execution requires one direct source, an unqualified event-time column, and no nested or row-expanding query shape",
+                    )
+                })?;
+            let source = self.catalog.get_source(&source_name).ok_or_else(|| {
+                Self::cluster_state_lifecycle_error(
+                    object_kind,
+                    name,
+                    "managed CoreWindow execution requires exactly one direct source",
+                )
+            })?;
+            if source
+                .is_processing_time
+                .load(std::sync::atomic::Ordering::Acquire)
+                || source.watermark_column.as_deref() != Some(window.time_column.as_str())
+                || source.max_out_of_orderness.is_none()
+            {
+                return reject(
+                    "managed CoreWindow execution requires an event-time watermark on its window time column",
+                );
+            }
+            let managed = crate::core_window_state::CoreWindowState::try_from_sql(
+                &self.ctx,
+                query_sql,
+                window,
+                plan.emit_clause.as_ref(),
+                self.checkpoint_key_groups(),
+            )
+            .await
+            .map_err(|error| {
+                Self::cluster_state_lifecycle_error(
+                    object_kind,
+                    name,
+                    &format!("managed CoreWindow validation failed: {error}"),
+                )
+            })?
+            .ok_or_else(|| {
+                Self::cluster_state_lifecycle_error(
+                    object_kind,
+                    name,
+                    "window aggregate cannot be constructed on the managed CoreWindow path",
+                )
+            })?;
+            if !managed.planned_functions_are_immutable() {
+                return reject(
+                    "managed CoreWindow execution requires replay-immutable planned functions",
+                );
+            }
+            if managed.compiled_projection().is_none() {
+                return reject(
+                    "managed CoreWindow execution requires compiled pre-aggregation over its direct source",
+                );
+            }
+            #[cfg(feature = "cluster")]
+            if self.shuffle_sender.lock().is_none()
+                || self.shuffle_receiver.lock().is_none()
+                || self.vnode_registry.lock().is_none()
+            {
+                return reject("CoreWindow has no complete shuffle and vnode ownership scope");
+            }
+            return Ok(true);
+        }
+        if managed_window_emit {
             return reject(
-                "windowed aggregate state has no certified watermark eviction lifecycle",
+                "window-close/final emission requires a managed TUMBLE, HOP, or SESSION aggregate",
             );
         }
         if plan

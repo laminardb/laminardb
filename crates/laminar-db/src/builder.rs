@@ -587,6 +587,12 @@ impl LaminarDbBuilder {
             self.target_partitions,
             runtime_mode,
         )?;
+        for udf in self.custom_udfs {
+            db.register_custom_udf(udf)?;
+        }
+        for udaf in self.custom_udafs {
+            db.register_custom_udaf(udaf)?;
+        }
         if let Some(runtime) = self.ai_runtime {
             let handle = tokio::runtime::Handle::try_current().map_err(|_| {
                 DbError::InvalidOperation(
@@ -600,12 +606,6 @@ impl LaminarDbBuilder {
             callback(db.connector_registry())?;
         }
         db.connector_registry().freeze();
-        for udf in self.custom_udfs {
-            db.register_custom_udf(udf);
-        }
-        for udaf in self.custom_udafs {
-            db.register_custom_udaf(udaf);
-        }
         #[cfg(feature = "cluster")]
         if let Some(controller) = self.cluster_controller {
             db.set_cluster_controller(controller)?;
@@ -1576,7 +1576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_register_udf() {
+    async fn builder_preserves_custom_function_registry_for_graph_contexts() {
         use std::any::Any;
         use std::hash::{Hash, Hasher};
 
@@ -1636,9 +1636,12 @@ mod tests {
             }
         }
 
-        let udf = ScalarUDF::new_from_impl(FortyTwo::new());
+        let udf = ScalarUDF::new_from_impl(FortyTwo::new()).with_aliases(["abs"]);
+        let udaf = AggregateUDF::new_from_impl(laminar_sql::datafusion::JsonAgg::new())
+            .with_aliases(["custom_json_agg"]);
         let db = LaminarDB::builder()
             .register_udf(udf)
+            .register_udaf(udaf)
             .build()
             .await
             .unwrap();
@@ -1646,5 +1649,38 @@ mod tests {
         // Verify the UDF is queryable
         let result = db.execute("SELECT forty_two()").await;
         assert!(result.is_ok(), "UDF should be callable: {result:?}");
+
+        let graph_ctx = laminar_sql::create_session_context();
+        laminar_sql::register_streaming_functions(&graph_ctx);
+        db.register_custom_functions_into(&graph_ctx);
+        let graph_state = graph_ctx.state();
+        assert_eq!(graph_state.scalar_functions()["abs"].name(), "forty_two");
+        assert!(graph_state
+            .aggregate_functions()
+            .contains_key("custom_json_agg"));
+    }
+
+    #[tokio::test]
+    async fn builder_rejects_reserved_core_window_function_names_and_aliases() {
+        let canonical = ScalarUDF::new_from_impl(laminar_sql::datafusion::TumbleWindowStart::new());
+        let canonical_error = LaminarDB::builder()
+            .register_udf(canonical)
+            .build()
+            .await
+            .unwrap_err();
+        assert!(canonical_error
+            .to_string()
+            .contains("reserved CoreWindow marker name or alias 'tumble'"));
+
+        let alias = AggregateUDF::new_from_impl(laminar_sql::datafusion::JsonAgg::new())
+            .with_aliases(["SeSsIoN"]);
+        let alias_error = LaminarDB::builder()
+            .register_udaf(alias)
+            .build()
+            .await
+            .unwrap_err();
+        assert!(alias_error
+            .to_string()
+            .contains("reserved CoreWindow marker name or alias 'SeSsIoN'"));
     }
 }

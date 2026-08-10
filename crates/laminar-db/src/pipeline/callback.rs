@@ -678,6 +678,11 @@ pub trait PipelineCallback: Send + 'static {
         None
     }
 
+    /// Wake the coordinator when inbound data or deferred shuffle work becomes ready.
+    fn shuffle_work_wake(&self) -> Option<Arc<tokio::sync::Notify>> {
+        None
+    }
+
     /// Demote sources idle past their timeout so a quiet input doesn't pin the combined watermark.
     fn tick_idle_watermark(&mut self) {}
 
@@ -724,6 +729,11 @@ pub trait PipelineCallback: Send + 'static {
     /// `true` when deferred operators have pending input to drain.
     fn has_deferred_input(&self) -> bool {
         false
+    }
+
+    /// `true` when retained work can run now without waiting for an external wake.
+    fn has_runnable_deferred_input(&self) -> bool {
+        self.has_deferred_input()
     }
 
     /// Reserve each subscription log's cursor at the aligned checkpoint cut.

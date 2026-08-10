@@ -166,6 +166,45 @@ impl crate::operator_graph::GraphOperator for PendingGraphPassOperator {
     }
 }
 
+struct ExternallyRunnableDrainOperator {
+    pending: Arc<std::sync::atomic::AtomicBool>,
+    runnable: Arc<std::sync::atomic::AtomicBool>,
+    process_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::operator_graph::GraphOperator for ExternallyRunnableDrainOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        self.process_calls
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if self.runnable.load(std::sync::atomic::Ordering::Acquire) {
+            self.pending
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        Ok(Vec::new())
+    }
+
+    fn checkpoint_drain_pending(&self) -> bool {
+        self.pending.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<crate::operator_graph::OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn deferred_work_is_runnable(&self) -> bool {
+        self.runnable.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 #[cfg(feature = "cluster")]
 struct FollowerCheckpointEvidenceOperator;
 
@@ -1327,6 +1366,53 @@ async fn expired_checkpoint_deadline_rejects_an_already_quiescent_graph() {
         .lock()
         .as_deref()
         .is_some_and(|reason| reason.contains("end-to-end deadline")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn checkpoint_graph_drain_waits_for_externally_blocked_work() {
+    let mut callback = empty_callback_fixture();
+    let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let runnable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let process_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    callback.graph.push_test_node(
+        "externally-runnable-drain",
+        Box::new(ExternallyRunnableDrainOperator {
+            pending,
+            runnable: Arc::clone(&runnable),
+            process_calls: Arc::clone(&process_calls),
+        }),
+    );
+
+    let drain = tokio::spawn(async move {
+        callback
+            .drain_checkpoint_edges_until_inner(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+    });
+    for _ in 0..16 {
+        if process_calls.load(std::sync::atomic::Ordering::Acquire) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(process_calls.load(std::sync::atomic::Ordering::Acquire), 1);
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(process_calls.load(std::sync::atomic::Ordering::Acquire), 1);
+
+    tokio::time::advance(
+        crate::pipeline::streaming_coordinator::IDLE_TIMEOUT - Duration::from_millis(1),
+    )
+    .await;
+    tokio::task::yield_now().await;
+    assert_eq!(process_calls.load(std::sync::atomic::Ordering::Acquire), 1);
+
+    runnable.store(true, std::sync::atomic::Ordering::Release);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    drain.await.unwrap().unwrap();
+    assert_eq!(process_calls.load(std::sync::atomic::Ordering::Acquire), 2);
 }
 
 #[tokio::test]

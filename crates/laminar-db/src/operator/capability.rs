@@ -213,13 +213,10 @@ impl OperatorCapability {
     }
 
     /// Managed vnode state for TUMBLE, HOP, and SESSION aggregates.
-    ///
-    /// Cluster admission remains closed until the ordered data/frontier shuffle is installed.
     pub(crate) const fn managed_core_window() -> Self {
-        Self::rejected(
+        Self::ddl_guarded(
             OperatorImplementation::EowcQuery,
             OperatorStateClass::VnodeKeyed,
-            "window state is vnode-scoped, but distributed input routing and global watermark authority are not certified",
         )
         .with_managed_state(ManagedStateContract::CoreWindowV1)
     }
@@ -387,5 +384,14 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(
+            OperatorCapability::managed_core_window(),
+            OperatorCapability {
+                implementation: Implementation::EowcQuery,
+                state_class: State::VnodeKeyed,
+                cluster_status: DdlGuarded,
+                managed_state: Some(ManagedStateContract::CoreWindowV1),
+            }
+        );
     }
 }

@@ -1234,6 +1234,7 @@ pub struct StreamingCoordinator {
 struct CoordinatorRunState {
     batch_window: Duration,
     checkpoint_control_wake: Option<CheckpointControlWake>,
+    shuffle_work_wake: Option<Arc<tokio::sync::Notify>>,
     checkpoint_control_poll_at: tokio::time::Instant,
     checkpoint_control_pending: bool,
     barriers: Vec<(usize, CheckpointBarrier, SourceCheckpoint)>,
@@ -1443,7 +1444,7 @@ impl PendingBarrier {
 }
 
 /// Fallback timeout for idle wake.
-const IDLE_TIMEOUT: Duration = Duration::from_millis(100);
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Internal topology-retry floor and cap. Assignment admission remains the authoritative gate.
 const CHECKPOINT_RETRY_BASE: Duration = Duration::from_millis(100);
@@ -4842,7 +4843,9 @@ impl StreamingCoordinator {
         if intake_paused || self.replay_pending {
             let _ = callback.is_recovering();
         }
-        let replay_ready = self.replay_pending && !intake_paused;
+        let replay_ready = self.replay_pending
+            && !intake_paused
+            && (self.manual_handoff_required || callback.has_runnable_deferred_input());
         let parked_ready =
             !self.replay_pending && !intake_paused && self.parked_source_msg.is_some();
         let mut retrying_replay = false;
@@ -4943,6 +4946,12 @@ impl StreamingCoordinator {
                     return CoordinatorWait::stop();
                 }
             }
+            () = async {
+                match state.shuffle_work_wake.as_ref() {
+                    Some(wake) => wake.notified().await,
+                    None => std::future::pending().await,
+                }
+            } => None,
             authority_lost = wait_coordinator_delay(
                 IDLE_TIMEOUT,
                 #[cfg(feature = "cluster")]
@@ -5129,6 +5138,7 @@ impl StreamingCoordinator {
         let mut state = CoordinatorRunState {
             batch_window: self.config.batch_window,
             checkpoint_control_wake: callback.checkpoint_control_wake(),
+            shuffle_work_wake: callback.shuffle_work_wake(),
             checkpoint_control_poll_at: tokio::time::Instant::now(),
             checkpoint_control_pending: false,
             barriers: Vec::new(),

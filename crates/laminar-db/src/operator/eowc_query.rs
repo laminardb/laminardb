@@ -12,6 +12,8 @@ use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
 #[cfg(feature = "cluster")]
 use laminar_core::checkpoint::CheckpointAssignmentFence;
+#[cfg(feature = "cluster")]
+use laminar_core::shuffle::ShuffleMessage;
 use laminar_core::state::KeyGroupCount;
 #[cfg(feature = "cluster")]
 use laminar_core::state::{NodeId, VnodeAssignmentSnapshot};
@@ -182,9 +184,38 @@ struct EowcPeerChannel {
 #[cfg(feature = "cluster")]
 struct EowcClusterInputPlan {
     local_batches: Vec<(RecordBatch, Option<u32>)>,
-    outbound: Vec<(u64, laminar_core::shuffle::ShuffleMessage)>,
+    outbound: Vec<(u64, ShuffleMessage)>,
     local_frontier: InputFrontier,
     effective_frontier: InputFrontier,
+}
+
+#[cfg(feature = "cluster")]
+type EowcSendTask =
+    tokio::task::JoinHandle<(Result<(), DbError>, Option<Vec<(u64, ShuffleMessage)>>)>;
+
+#[cfg(feature = "cluster")]
+struct PendingEowcClusterInput {
+    local_batches: Vec<(RecordBatch, Option<u32>)>,
+    outbound: Option<Vec<(u64, ShuffleMessage)>>,
+    local_frontier: InputFrontier,
+    send: Option<EowcSendTask>,
+    accounted_bytes: usize,
+}
+
+#[cfg(feature = "cluster")]
+enum PendingEowcCompletion {
+    Waiting,
+    RetryLater,
+    Applied(Vec<RecordBatch>),
+}
+
+#[cfg(feature = "cluster")]
+impl Drop for PendingEowcClusterInput {
+    fn drop(&mut self) {
+        if let Some(send) = &self.send {
+            send.abort();
+        }
+    }
 }
 
 #[cfg(feature = "cluster")]
@@ -512,6 +543,8 @@ pub(crate) struct EowcQueryOperator {
     #[cfg(feature = "cluster")]
     queued_remote_events: usize,
     #[cfg(feature = "cluster")]
+    pending_cluster_input: Option<PendingEowcClusterInput>,
+    #[cfg(feature = "cluster")]
     prepared_vnode_transition: Option<PreparedEowcTransition>,
     #[cfg(feature = "cluster")]
     vnode_transition_cleanup: Option<CoreWindowTransitionCleanup>,
@@ -566,6 +599,8 @@ impl EowcQueryOperator {
             #[cfg(feature = "cluster")]
             queued_remote_events: 0,
             #[cfg(feature = "cluster")]
+            pending_cluster_input: None,
+            #[cfg(feature = "cluster")]
             prepared_vnode_transition: None,
             #[cfg(feature = "cluster")]
             vnode_transition_cleanup: None,
@@ -579,6 +614,16 @@ impl EowcQueryOperator {
                 self.op_name
             ))
         })?;
+        #[cfg(feature = "cluster")]
+        if self.cluster_scope.is_some()
+            && crate::sql_analysis::managed_core_window_source(&self.sql, cfg).is_none()
+        {
+            return Err(DbError::Unsupported(format!(
+                "[{}] EOWC query '{}' is outside the certified direct-source CoreWindow shape",
+                laminar_core::error_codes::CLUSTER_STATE_LIFECYCLE_UNSUPPORTED,
+                self.op_name
+            )));
+        }
         let Some(mut window) = CoreWindowState::try_from_sql(
             &self.ctx,
             &self.sql,
@@ -593,6 +638,23 @@ impl EowcQueryOperator {
                 self.op_name
             )));
         };
+
+        #[cfg(feature = "cluster")]
+        if self.cluster_scope.is_some() && !window.planned_functions_are_immutable() {
+            return Err(DbError::Unsupported(format!(
+                "[{}] EOWC query '{}' contains a planned function that is not replay-immutable",
+                laminar_core::error_codes::CLUSTER_STATE_LIFECYCLE_UNSUPPORTED,
+                self.op_name
+            )));
+        }
+        #[cfg(feature = "cluster")]
+        if self.cluster_scope.is_some() && window.compiled_projection().is_none() {
+            return Err(DbError::Unsupported(format!(
+                "[{}] EOWC query '{}' has no compiled pre-aggregation path",
+                laminar_core::error_codes::CLUSTER_STATE_LIFECYCLE_UNSUPPORTED,
+                self.op_name
+            )));
+        }
 
         window.attach_metrics(self.prom.clone());
         tracing::info!(
@@ -625,7 +687,7 @@ impl EowcQueryOperator {
     }
 
     fn core_window_apply_error(op_name: &str, phase: &str, error: DbError) -> DbError {
-        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
+        if error.requires_pipeline_recovery() {
             return error;
         }
         DbError::StatefulOperatorPartialApply(format!(
@@ -640,6 +702,7 @@ impl EowcQueryOperator {
         op_name: &str,
         ctx: &SessionContext,
         task_ctx: &Arc<TaskContext>,
+        require_compiled: bool,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let now_filtered = cw.apply_dynamic_now_filter(ctx, inputs, watermark)?;
         let inputs: &[RecordBatch] = now_filtered.as_deref().unwrap_or(inputs);
@@ -647,6 +710,11 @@ impl EowcQueryOperator {
         let batches = if let Some(proj) = cw.compiled_projection() {
             match try_evaluate_compiled(proj, inputs) {
                 Ok(result) => result,
+                Err(error) if require_compiled => {
+                    return Err(DbError::PipelineTerminal(format!(
+                        "managed CoreWindow '{op_name}' compiled pre-aggregation failed: {error}"
+                    )));
+                }
                 Err(e) => {
                     tracing::debug!(
                         query = %op_name,
@@ -662,6 +730,10 @@ impl EowcQueryOperator {
                     }
                 }
             }
+        } else if require_compiled {
+            return Err(DbError::PipelineTerminal(format!(
+                "managed CoreWindow '{op_name}' has no compiled pre-aggregation"
+            )));
         } else if let Some(physical) = cw.cached_pre_agg_physical() {
             super::execute_cached_physical(task_ctx.clone(), op_name, physical).await?
         } else {
@@ -837,7 +909,78 @@ impl EowcQueryOperator {
         window
             .checked_add(self.cluster_topology_bytes()?)
             .and_then(|bytes| bytes.checked_add(self.queued_payload_bytes))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.pending_cluster_input
+                        .as_ref()
+                        .map_or(0, |pending| pending.accounted_bytes),
+                )
+            })
             .ok_or_else(|| self.accounting_error())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn batch_plan_bytes(&self, batch: &RecordBatch) -> Result<usize, DbError> {
+        batch
+            .num_columns()
+            .checked_mul(std::mem::size_of::<Arc<dyn arrow::array::Array>>())
+            .and_then(|bytes| bytes.checked_add(batch.get_array_memory_size()))
+            .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
+            .ok_or_else(|| self.accounting_error())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn cluster_input_plan_bytes(&self, plan: &EowcClusterInputPlan) -> Result<usize, DbError> {
+        let mut bytes = plan
+            .local_batches
+            .capacity()
+            .checked_mul(std::mem::size_of::<(RecordBatch, Option<u32>)>())
+            .and_then(|local| {
+                plan.outbound
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<(u64, ShuffleMessage)>())
+                    .and_then(|outbound| local.checked_add(outbound))
+            })
+            .and_then(|bytes| {
+                plan.outbound
+                    .len()
+                    .checked_mul(
+                        std::mem::size_of::<usize>()
+                            + std::mem::size_of::<(u64, usize)>()
+                            + std::mem::size_of::<(u64, Vec<usize>)>(),
+                    )
+                    .and_then(|grouping| bytes.checked_add(grouping))
+            })
+            .ok_or_else(|| self.accounting_error())?;
+        for (batch, _) in &plan.local_batches {
+            bytes = bytes
+                .checked_add(self.batch_plan_bytes(batch)?)
+                .ok_or_else(|| self.accounting_error())?;
+        }
+        for (_, message) in &plan.outbound {
+            let message_bytes = match message {
+                ShuffleMessage::Barrier(_) => 0,
+                ShuffleMessage::Frontier { stage, .. } => stage.capacity(),
+                ShuffleMessage::Data {
+                    stage,
+                    routed_vnodes,
+                    batch,
+                } => self
+                    .batch_plan_bytes(batch)?
+                    .checked_add(stage.capacity())
+                    .and_then(|bytes| {
+                        routed_vnodes
+                            .len()
+                            .checked_mul(std::mem::size_of::<u32>())
+                            .and_then(|routes| bytes.checked_add(routes))
+                    })
+                    .ok_or_else(|| self.accounting_error())?,
+            };
+            bytes = bytes
+                .checked_add(message_bytes)
+                .ok_or_else(|| self.accounting_error())?;
+        }
+        Ok(bytes)
     }
 
     #[cfg(feature = "cluster")]
@@ -1131,7 +1274,7 @@ impl EowcQueryOperator {
             ))
         })?;
         let mut local_batches = Vec::new();
-        let mut remote_data = BTreeMap::<u64, Vec<laminar_core::shuffle::ShuffleMessage>>::new();
+        let mut remote_data = BTreeMap::<u64, Vec<ShuffleMessage>>::new();
         for batch in batches.into_iter().filter(|batch| batch.num_rows() != 0) {
             let row_vnodes = crate::operator::sql_query::hash_rows_to_vnodes(
                 &batch,
@@ -1163,7 +1306,7 @@ impl EowcQueryOperator {
             );
             for route in plan.remote {
                 remote_data.entry(route.owner.0).or_default().push(
-                    laminar_core::shuffle::ShuffleMessage::checkpointed_routed(
+                    ShuffleMessage::checkpointed_routed(
                         self.op_name.to_string(),
                         route.routed_vnodes,
                         route.batch,
@@ -1179,7 +1322,7 @@ impl EowcQueryOperator {
             if has_data && self.last_broadcast.idle && !local_frontier.idle {
                 outbound.push((
                     peer,
-                    laminar_core::shuffle::ShuffleMessage::Frontier {
+                    ShuffleMessage::Frontier {
                         stage: self.op_name.to_string(),
                         watermark: self.last_broadcast.watermark,
                         idle: false,
@@ -1192,7 +1335,7 @@ impl EowcQueryOperator {
             if has_data || self.last_broadcast != local_frontier {
                 outbound.push((
                     peer,
-                    laminar_core::shuffle::ShuffleMessage::Frontier {
+                    ShuffleMessage::Frontier {
                         stage: self.op_name.to_string(),
                         watermark: local_frontier.watermark,
                         idle: local_frontier.idle,
@@ -1217,7 +1360,7 @@ impl EowcQueryOperator {
 
     #[cfg(feature = "cluster")]
     fn remote_replay_error(&self, error: DbError) -> DbError {
-        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
+        if error.requires_pipeline_recovery() {
             error
         } else {
             DbError::Checkpoint(format!(
@@ -1357,12 +1500,121 @@ impl EowcQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
+    fn start_pending_cluster_send(
+        &mut self,
+        config: &ClusterShuffleConfig,
+        assignment_version: u64,
+    ) {
+        let pending = self
+            .pending_cluster_input
+            .as_mut()
+            .expect("CoreWindow send plan must be installed before it starts");
+        debug_assert!(pending.send.is_none());
+        let outbound = pending
+            .outbound
+            .take()
+            .expect("idle CoreWindow send plan must retain its outbound cut");
+        let sender = Arc::clone(&config.sender);
+        let wake = config.receiver.work_ready_notify();
+        let context = format!("managed CoreWindow '{}' shuffle", self.op_name);
+        pending.send = Some(tokio::spawn(async move {
+            let result = crate::operator::send_shuffle_plan_retaining(
+                &sender,
+                assignment_version,
+                outbound,
+                &context,
+            )
+            .await;
+            if !matches!(&result.0, Err(error) if error.is_shuffle_not_ready()) {
+                wake.notify_one();
+            }
+            result
+        }));
+    }
+
+    #[cfg(feature = "cluster")]
+    fn outbound_finalize_error(&self, error: DbError) -> DbError {
+        if error.requires_pipeline_recovery() {
+            error
+        } else {
+            DbError::ShufflePartialSend(format!(
+                "managed CoreWindow '{}' failed after outbound shuffle admission: {error}",
+                self.op_name
+            ))
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn finish_pending_cluster_input(&mut self) -> Result<PendingEowcCompletion, DbError> {
+        let finished = self
+            .pending_cluster_input
+            .as_ref()
+            .and_then(|pending| pending.send.as_ref())
+            .is_some_and(tokio::task::JoinHandle::is_finished);
+        if !finished {
+            return Ok(PendingEowcCompletion::Waiting);
+        }
+        let mut pending = self
+            .pending_cluster_input
+            .take()
+            .expect("finished CoreWindow send plan");
+        let send = pending.send.take().expect("pending CoreWindow send task");
+        let (result, outbound) = send.await.map_err(|error| {
+            DbError::ShufflePartialSend(format!(
+                "managed CoreWindow '{}' send task ended without a delivery outcome: {error}",
+                self.op_name
+            ))
+        })?;
+        if let Err(error) = result {
+            if error.is_shuffle_not_ready() {
+                pending.outbound = Some(outbound.ok_or_else(|| {
+                    DbError::ShufflePartialSend(format!(
+                        "managed CoreWindow '{}' safe send failure lost its retry plan",
+                        self.op_name
+                    ))
+                })?);
+                self.pending_cluster_input = Some(pending);
+                return Ok(PendingEowcCompletion::RetryLater);
+            }
+            return Err(error);
+        }
+        debug_assert!(outbound.is_none());
+
+        let effective = self
+            .effective_cluster_frontier(pending.local_frontier, None)
+            .map_err(|error| self.outbound_finalize_error(error))?;
+        let output = {
+            let window = self.state.as_mut().ok_or_else(|| {
+                DbError::ShufflePartialSend(format!(
+                    "managed CoreWindow '{}' is not initialized",
+                    self.op_name
+                ))
+            })?;
+            Self::apply_routed_and_close(
+                window,
+                &pending.local_batches,
+                Self::frontier_watermark(effective),
+                &self.op_name,
+            )
+        }
+        .map_err(|error| self.outbound_finalize_error(error))?;
+        self.local_frontier = pending.local_frontier;
+        self.last_broadcast = pending.local_frontier;
+        self.effective_frontier = effective;
+        Ok(PendingEowcCompletion::Applied(output))
+    }
+
+    #[cfg(feature = "cluster")]
     async fn process_cluster(
         &mut self,
         inputs: &[Vec<RecordBatch>],
         frontier: InputFrontier,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let (config, assignment, peers) = self.active_cluster_scope()?;
+        match self.finish_pending_cluster_input().await? {
+            PendingEowcCompletion::Applied(output) => return Ok(output),
+            PendingEowcCompletion::Waiting | PendingEowcCompletion::RetryLater => {}
+        }
         if self.queued_remote_events != 0 {
             if inputs.iter().any(|batches| !batches.is_empty()) {
                 return Err(DbError::InvalidOperation(format!(
@@ -1371,6 +1623,22 @@ impl EowcQueryOperator {
                 )));
             }
             return self.drain_remote_event(&assignment, config.self_id);
+        }
+        if self.pending_cluster_input.is_some() {
+            if inputs.iter().any(|batches| !batches.is_empty()) {
+                return Err(DbError::InvalidOperation(format!(
+                    "managed CoreWindow '{}' received local input while a shuffle send was pending",
+                    self.op_name
+                )));
+            }
+            if self
+                .pending_cluster_input
+                .as_ref()
+                .is_some_and(|pending| pending.send.is_none())
+            {
+                self.start_pending_cluster_send(&config, assignment.version());
+            }
+            return Ok(Vec::new());
         }
         let input_batches = inputs.first().map_or(&[][..], Vec::as_slice);
         let has_data = input_batches.iter().any(|batch| batch.num_rows() != 0);
@@ -1390,20 +1658,40 @@ impl EowcQueryOperator {
                 &self.op_name,
                 &self.ctx,
                 &self.task_ctx,
+                true,
             )
             .await?
         };
         let plan =
             self.plan_cluster_batches(pre_aggregate, local_frontier, &config, &assignment, &peers)?;
-        let outbound_admitted = !plan.outbound.is_empty();
-        if outbound_admitted {
-            crate::operator::send_shuffle_plan(
-                &config.sender,
-                assignment.version(),
-                plan.outbound,
-                &format!("managed CoreWindow '{}' shuffle", self.op_name),
-            )
-            .await?;
+        if !plan.outbound.is_empty() {
+            let accounted_bytes = self.cluster_input_plan_bytes(&plan)?;
+            let total = self
+                .checked_live_state_bytes()?
+                .checked_add(accounted_bytes)
+                .ok_or_else(|| self.accounting_error())?;
+            if total > self.max_managed_state_bytes {
+                return Err(DbError::ManagedStateBudgetExceeded {
+                    context: format!("managed CoreWindow '{}' pending shuffle send", self.op_name),
+                    accounted_bytes: total,
+                    limit_bytes: self.max_managed_state_bytes,
+                });
+            }
+            let EowcClusterInputPlan {
+                local_batches,
+                outbound,
+                local_frontier,
+                effective_frontier: _,
+            } = plan;
+            self.pending_cluster_input = Some(PendingEowcClusterInput {
+                local_batches,
+                outbound: Some(outbound),
+                local_frontier,
+                send: None,
+                accounted_bytes,
+            });
+            self.start_pending_cluster_send(&config, assignment.version());
+            return Ok(Vec::new());
         }
         let output = {
             let window = self.state.as_mut().expect("initialized CoreWindow state");
@@ -1413,20 +1701,7 @@ impl EowcQueryOperator {
                 Self::frontier_watermark(plan.effective_frontier),
                 &self.op_name,
             )
-        }
-        .map_err(|error| {
-            if !outbound_admitted
-                || error.requires_pipeline_recovery()
-                || error.requires_pipeline_halt()
-            {
-                error
-            } else {
-                DbError::ShufflePartialSend(format!(
-                    "managed CoreWindow '{}' failed after outbound shuffle admission: {error}",
-                    self.op_name
-                ))
-            }
-        })?;
+        }?;
         self.local_frontier = plan.local_frontier;
         self.last_broadcast = plan.local_frontier;
         self.effective_frontier = plan.effective_frontier;
@@ -1442,7 +1717,8 @@ impl EowcQueryOperator {
             return Ok(None);
         };
         let (_, assignment, peers) = self.active_cluster_scope()?;
-        if self.last_broadcast != self.local_frontier
+        if self.pending_cluster_input.is_some()
+            || self.last_broadcast != self.local_frontier
             || self.peer_channels.len() != peers.len()
             || self
                 .remote_peer_cursor
@@ -2056,6 +2332,7 @@ impl EowcQueryOperator {
             || self
                 .remote_peer_cursor
                 .is_some_and(|peer| expected_peers.binary_search(&peer).is_err())
+            || self.pending_cluster_input.is_some()
             || self.last_broadcast != self.local_frontier
             || self.queued_payload_bytes != 0
             || self.queued_remote_events != 0
@@ -2312,6 +2589,7 @@ impl EowcQueryOperator {
             .collect::<Vec<_>>();
         let bootstrap_pristine = window.is_pristine_for_restore()
             && !self.whole_restore_applied
+            && self.pending_cluster_input.is_none()
             && self.local_frontier == InputFrontier::default()
             && self.last_broadcast == InputFrontier::default()
             && self.effective_frontier == InputFrontier::default()
@@ -2684,6 +2962,7 @@ impl GraphOperator for EowcQueryOperator {
                 &self.op_name,
                 &self.ctx,
                 &self.task_ctx,
+                false,
             )
             .await?
         };
@@ -2691,8 +2970,11 @@ impl GraphOperator for EowcQueryOperator {
             .into_iter()
             .map(|batch| (batch, None))
             .collect::<Vec<_>>();
-        let window = self.state.as_mut().expect("initialized CoreWindow state");
-        Self::apply_routed_and_close(window, &routed, watermark, &self.op_name)
+        let output = {
+            let window = self.state.as_mut().expect("initialized CoreWindow state");
+            Self::apply_routed_and_close(window, &routed, watermark, &self.op_name)?
+        };
+        Ok(output)
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
@@ -2733,6 +3015,7 @@ impl GraphOperator for EowcQueryOperator {
         })?;
         #[cfg(feature = "cluster")]
         let cluster_pristine = self.local_frontier == InputFrontier::default()
+            && self.pending_cluster_input.is_none()
             && self.last_broadcast == InputFrontier::default()
             && self.effective_frontier == InputFrontier::default()
             && self.remote_peer_cursor.is_none()
@@ -2819,17 +3102,29 @@ impl GraphOperator for EowcQueryOperator {
 
     #[cfg(feature = "cluster")]
     fn wants_input(&self) -> bool {
-        self.queued_remote_events == 0 && self.last_broadcast == self.local_frontier
+        self.pending_cluster_input.is_none()
+            && self.queued_remote_events == 0
+            && self.last_broadcast == self.local_frontier
     }
 
     #[cfg(feature = "cluster")]
     fn checkpoint_aligned_replay_pending(&self) -> bool {
-        self.queued_remote_events != 0
+        self.pending_cluster_input.is_some() || self.queued_remote_events != 0
     }
 
     #[cfg(feature = "cluster")]
     fn checkpoint_drain_pending(&self) -> bool {
-        self.last_broadcast != self.local_frontier
+        self.pending_cluster_input.is_some() || self.last_broadcast != self.local_frontier
+    }
+
+    #[cfg(feature = "cluster")]
+    fn deferred_work_is_runnable(&self) -> bool {
+        self.queued_remote_events != 0 || self.last_broadcast != self.local_frontier
+    }
+
+    #[cfg(feature = "cluster")]
+    fn advances_frontier_without_input(&self) -> bool {
+        self.cluster_scope.is_some()
     }
 
     #[cfg(feature = "cluster")]
@@ -2838,7 +3133,7 @@ impl GraphOperator for EowcQueryOperator {
             return input;
         }
         let mut output = self.effective_frontier;
-        if self.queued_remote_events != 0 {
+        if self.pending_cluster_input.is_some() || self.queued_remote_events != 0 {
             output.idle = false;
         }
         output
@@ -2848,7 +3143,7 @@ impl GraphOperator for EowcQueryOperator {
     fn restored_output_frontier(&self) -> Option<InputFrontier> {
         self.cluster_scope.as_ref()?;
         let mut frontier = self.effective_frontier;
-        if self.queued_remote_events != 0 {
+        if self.pending_cluster_input.is_some() || self.queued_remote_events != 0 {
             frontier.idle = false;
         }
         Some(frontier)
@@ -3539,6 +3834,229 @@ mod core_tests {
                 }
             )
         ));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn zero_admission_send_restarts_once_without_becoming_runnable() {
+        let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
+        let mut operator = EowcQueryOperator::new(
+            "managed_window",
+            AGG_SQL,
+            Some(EmitClause::OnWindowClose),
+            Some(test_window_config()),
+            aggregate_context(),
+            key_groups(),
+            None,
+        );
+        operator.initialize_managed_state().await.unwrap();
+        operator.attach_cluster_scope(scope);
+
+        let retry_plan = vec![(
+            2,
+            ShuffleMessage::Frontier {
+                stage: "managed_window".to_string(),
+                watermark: None,
+                idle: false,
+            },
+        )];
+        let send = tokio::spawn(async move {
+            (
+                Err(DbError::ShuffleNotReady("injected zero admission".into())),
+                Some(retry_plan),
+            )
+        });
+        operator.pending_cluster_input = Some(PendingEowcClusterInput {
+            local_batches: Vec::new(),
+            outbound: None,
+            local_frontier: InputFrontier::default(),
+            send: Some(send),
+            accounted_bytes: 0,
+        });
+
+        while !operator
+            .pending_cluster_input
+            .as_ref()
+            .unwrap()
+            .send
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            tokio::task::yield_now().await;
+        }
+        assert!(!operator.deferred_work_is_runnable());
+
+        let output = operator
+            .process_cluster(&[Vec::new()], InputFrontier::default())
+            .await
+            .unwrap();
+        assert!(output.is_empty());
+        let pending = operator.pending_cluster_input.as_ref().unwrap();
+        assert!(pending.send.is_some());
+        assert!(pending.outbound.is_none());
+        assert!(!operator.deferred_work_is_runnable());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn pending_cluster_send_drains_remote_data_before_committing_local_cut() {
+        let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
+        let mut operator = EowcQueryOperator::new(
+            "managed_window",
+            AGG_SQL,
+            Some(EmitClause::OnWindowClose),
+            Some(test_window_config()),
+            aggregate_context(),
+            key_groups(),
+            None,
+        );
+        operator.initialize_managed_state().await.unwrap();
+        let (local_symbol, local) = projected_batch_for_vnode(&operator, 0, 8.0);
+        let (remote_symbol, remote) = projected_batch_for_vnode(&operator, 0, 34.0);
+        let (_, outbound_batch) = projected_batch_for_vnode(&operator, 1, 1.0);
+        assert_eq!(local_symbol, remote_symbol);
+        operator.attach_cluster_scope(scope.clone());
+        let close = InputFrontier {
+            watermark: Some(60_000),
+            idle: false,
+        };
+        let assignment = scope.registry.versioned_snapshot();
+        let plan = operator
+            .plan_cluster_batches(
+                vec![local, outbound_batch],
+                close,
+                &scope,
+                &assignment,
+                &[2],
+            )
+            .unwrap();
+        assert_eq!(plan.local_batches.len(), 1);
+        assert!(plan
+            .outbound
+            .iter()
+            .any(|(_, message)| matches!(message, ShuffleMessage::Data { .. })));
+        let accounted_bytes = operator.cluster_input_plan_bytes(&plan).unwrap();
+        let EowcClusterInputPlan {
+            local_batches,
+            outbound,
+            local_frontier,
+            effective_frontier: _,
+        } = plan;
+        let baseline = operator.managed_state_accounting().unwrap().live;
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let send = tokio::spawn(async move {
+            let _ = wait.await;
+            drop(outbound);
+            (Ok(()), None)
+        });
+        operator.pending_cluster_input = Some(PendingEowcClusterInput {
+            local_batches,
+            outbound: None,
+            local_frontier,
+            send: Some(send),
+            accounted_bytes,
+        });
+        let assignment_version = scope.registry.assignment_version();
+        let recovery_gen = scope.receiver.recovery_gen();
+        operator
+            .stage_checkpointed_shuffle(
+                "managed_window",
+                crate::operator::RetainedBatch::restored_channel(
+                    remote,
+                    2,
+                    assignment_version,
+                    recovery_gen,
+                    Arc::from([0_u32]),
+                ),
+                i64::MIN,
+            )
+            .unwrap();
+        operator
+            .stage_checkpointed_shuffle_frontier(
+                "managed_window",
+                2,
+                close,
+                assignment_version,
+                recovery_gen,
+            )
+            .unwrap();
+        assert_eq!(operator.queued_remote_events, 2);
+        assert_ne!(operator.queued_payload_bytes, 0);
+        assert!(operator.deferred_work_is_runnable());
+
+        let output = tokio::time::timeout(
+            Duration::from_millis(50),
+            operator.process_cluster(&[Vec::new()], InputFrontier::default()),
+        )
+        .await
+        .expect("pending send blocked the graph task")
+        .unwrap();
+        assert!(output.is_empty());
+        assert!(!operator.wants_input());
+        assert!(operator.checkpoint_drain_pending());
+        assert!(operator.capture_operator_checkpoint(usize::MAX).is_err());
+        assert_eq!(operator.local_frontier, InputFrontier::default());
+        assert_eq!(operator.queued_remote_events, 1);
+        assert_eq!(operator.queued_payload_bytes, 0);
+        assert!(!operator
+            .pending_cluster_input
+            .as_ref()
+            .unwrap()
+            .send
+            .as_ref()
+            .unwrap()
+            .is_finished());
+        assert!(operator.managed_state_accounting().unwrap().live >= baseline + accounted_bytes);
+
+        let output = tokio::time::timeout(
+            Duration::from_millis(50),
+            operator.process_cluster(&[Vec::new()], InputFrontier::default()),
+        )
+        .await
+        .expect("remote frontier waited for the blocked send")
+        .unwrap();
+        assert!(output.is_empty());
+        assert_eq!(operator.queued_remote_events, 0);
+        assert_eq!(operator.peer_channels[&2].applied, close);
+        assert_eq!(operator.local_frontier, InputFrontier::default());
+        assert!(operator.pending_cluster_input.is_some());
+        assert!(!operator.deferred_work_is_runnable());
+
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !operator
+                .pending_cluster_input
+                .as_ref()
+                .unwrap()
+                .send
+                .as_ref()
+                .unwrap()
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending send task did not finish");
+        assert!(!operator.deferred_work_is_runnable());
+        let output = operator
+            .process_cluster(&[Vec::new()], InputFrontier::default())
+            .await
+            .unwrap();
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let total = output[0]
+            .column_by_name("total")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(total.value(0), 42.0);
+        assert!(operator.pending_cluster_input.is_none());
+        assert_eq!(operator.local_frontier, close);
+        assert_eq!(operator.effective_frontier, close);
+        assert!(operator.wants_input());
+        assert!(!operator.checkpoint_drain_pending());
     }
 
     #[cfg(feature = "cluster")]

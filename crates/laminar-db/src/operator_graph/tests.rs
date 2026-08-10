@@ -84,6 +84,38 @@ impl GraphOperator for BatchProbe {
     }
 }
 
+#[cfg(feature = "cluster")]
+struct CoreWindowFrontierProbe(Arc<parking_lot::Mutex<Vec<InputFrontier>>>);
+
+#[cfg(feature = "cluster")]
+#[async_trait]
+impl GraphOperator for CoreWindowFrontierProbe {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::managed_core_window()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        unreachable!("rich frontier dispatch is required")
+    }
+
+    async fn process_with_frontiers(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        frontiers: &[InputFrontier],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        *self.0.lock() = frontiers.to_vec();
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+}
+
 #[async_trait]
 impl GraphOperator for RichFrontierProbe {
     fn cluster_capability(&self) -> OperatorCapability {
@@ -396,10 +428,12 @@ async fn snapshotable_operator_work_keeps_idle_cycles_live() {
 
     let remaining = Arc::new(std::sync::atomic::AtomicUsize::new(2));
     let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+    graph.push_test_node("head", Box::new(SourcePassthrough));
     graph.push_test_node(
         "bounded-drain",
         Box::new(BoundedDrainProbe(Arc::clone(&remaining))),
     );
+    graph.set_query_budget_ns(0);
     graph.compute_topo_order();
 
     assert!(graph.has_deferred_work());
@@ -984,6 +1018,56 @@ async fn alignment_harness() -> AlignmentHarness {
         fence,
         recorded,
     }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn only_core_window_receives_the_node_local_source_frontier() {
+    let mut harness = alignment_harness().await;
+    let source = harness.graph.ensure_source_node("events");
+    let core_seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let ordinary_seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let core = harness
+        .graph
+        .place_operator_node(
+            "core_window",
+            Box::new(CoreWindowFrontierProbe(Arc::clone(&core_seen))),
+            1,
+        )
+        .unwrap();
+    let ordinary = harness
+        .graph
+        .place_operator_node(
+            "ordinary",
+            Box::new(RichFrontierProbe(Arc::clone(&ordinary_seen))),
+            1,
+        )
+        .unwrap();
+    harness.graph.add_edge(source, core, 0);
+    harness.graph.add_edge(source, ordinary, 0);
+    let committed = FxHashMap::from_iter([(
+        Arc::from("events"),
+        InputFrontier {
+            watermark: Some(100),
+            idle: false,
+        },
+    )]);
+    let local = FxHashMap::from_iter([(
+        Arc::from("events"),
+        InputFrontier {
+            watermark: Some(900),
+            idle: false,
+        },
+    )]);
+    harness.graph.set_local_source_frontiers(&local);
+    harness
+        .graph
+        .execute_cycle(&FxHashMap::default(), 100, Some(&committed))
+        .await
+        .unwrap();
+
+    assert_eq!(*core_seen.lock(), [local["events"]]);
+    assert_eq!(*ordinary_seen.lock(), [committed["events"]]);
 }
 
 #[cfg(feature = "cluster")]
@@ -4753,6 +4837,10 @@ async fn checkpoint_drain_failure_or_no_progress_preserves_pending_edges() {
         fn wants_input(&self) -> bool {
             false
         }
+
+        fn deferred_work_is_runnable(&self) -> bool {
+            false
+        }
     }
 
     let mut graph = test_graph();
@@ -4801,6 +4889,10 @@ async fn checkpoint_drain_failure_or_no_progress_preserves_pending_edges() {
         graph.output_watermarks[paused],
         i64::MIN,
         "an operator that declined buffered input must not advance its output watermark"
+    );
+    assert!(
+        !graph.has_runnable_deferred_work(),
+        "backpressure-gated input is retained, not runnable"
     );
     assert!(!graph.checkpoint_is_quiescent());
 }
@@ -5643,7 +5735,7 @@ async fn managed_state_initialization_rejects_a_budget_below_the_empty_topology(
 }
 
 #[tokio::test]
-async fn aggregate_record_growth_is_rejected_before_output_routing() {
+async fn aggregate_record_growth_requires_recovery_before_output_routing() {
     let mut graph = test_graph();
     graph.register_source_schema("trades".to_string(), test_schema());
     graph.add_query(
@@ -5674,19 +5766,17 @@ async fn aggregate_record_growth_is_rejected_before_output_routing() {
     let error = graph
         .execute_cycle(&source, i64::MAX, None)
         .await
-        .expect_err("record growth above the baseline must halt the pipeline");
+        .expect_err("record growth above the baseline must require recovery");
 
-    assert!(matches!(
-        &error,
-        DbError::ManagedStateBudgetExceeded {
-            context,
-            accounted_bytes,
-            limit_bytes,
-        } if context == "operator 'agg' record processing"
-            && *accounted_bytes > baseline
-            && *limit_bytes == baseline
-    ));
-    assert!(error.requires_pipeline_halt());
+    let DbError::StatefulOperatorPartialApply(reason) = &error else {
+        panic!("expected partial-apply recovery error, got {error}");
+    };
+    assert!(
+        reason.contains("operator 'agg' record processing"),
+        "{reason}"
+    );
+    assert!(reason.contains(&format!("limit={baseline}")), "{reason}");
+    assert!(error.requires_pipeline_recovery());
     assert!(
         graph.input_bufs[downstream][0].is_empty(),
         "the rejected aggregate output crossed the downstream routing boundary"

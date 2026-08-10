@@ -407,6 +407,7 @@ pub(crate) struct CoreWindowState {
     state_output_schema: SchemaRef,
     group_output_sources: Vec<GroupOutputSource>,
     compiled_projection: Option<CompiledProjection>,
+    planned_functions_immutable: bool,
     // Built once; LiveSourceExec leaves carry fresh data per execute.
     cached_pre_agg_physical: Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
     // Set when WHERE references `now()`; resolved per cycle.
@@ -532,6 +533,8 @@ impl CoreWindowState {
             .map_err(|e| DbError::Pipeline(format!("plan error: {e}")))?;
 
         let plan = df.logical_plan();
+        let planned_functions_immutable =
+            crate::sql_analysis::planned_functions_are_immutable(plan);
         let top_schema = Arc::new(plan.schema().as_arrow().clone());
 
         let Some(agg_info) = find_aggregate(plan) else {
@@ -888,6 +891,7 @@ impl CoreWindowState {
             group_output_sources,
             time_col_index,
             compiled_projection,
+            planned_functions_immutable,
             cached_pre_agg_physical,
             now_where,
             now_filter_cache: None,
@@ -2485,6 +2489,10 @@ impl CoreWindowState {
 
     pub fn compiled_projection(&self) -> Option<&CompiledProjection> {
         self.compiled_projection.as_ref()
+    }
+
+    pub(crate) const fn planned_functions_are_immutable(&self) -> bool {
+        self.planned_functions_immutable
     }
 
     #[cfg(feature = "cluster")]
@@ -4313,6 +4321,7 @@ mod tests {
             output_schema,
             time_col_index: 2,
             compiled_projection: None,
+            planned_functions_immutable: true,
             cached_pre_agg_physical: None,
             now_where: None,
             now_filter_cache: None,
@@ -4391,6 +4400,7 @@ mod tests {
             output_schema,
             time_col_index: 2,
             compiled_projection: None,
+            planned_functions_immutable: true,
             cached_pre_agg_physical: None,
             now_where: None,
             now_filter_cache: None,
@@ -4458,6 +4468,7 @@ mod tests {
             output_schema,
             time_col_index: 2,
             compiled_projection: None,
+            planned_functions_immutable: true,
             cached_pre_agg_physical: None,
             now_where: None,
             now_filter_cache: None,
@@ -4523,6 +4534,7 @@ mod tests {
             output_schema,
             time_col_index: 2,
             compiled_projection: None,
+            planned_functions_immutable: true,
             cached_pre_agg_physical: None,
             now_where: None,
             now_filter_cache: None,
