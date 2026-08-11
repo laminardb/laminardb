@@ -1725,13 +1725,16 @@ async fn recovery_target_is_the_exact_commit_and_global_index() {
         checkpoint_watermark: None,
     };
     let authority = controller.checkpoint_authority().unwrap();
+    let proof = controller.capture_leader_proof().unwrap();
+    crate::rebalance::admit_cluster_checkpoint_artifacts_for_test(&authority, &proof, &committed)
+        .await;
     let reference = authority
         .create_committed_checkpoint(&committed)
         .await
         .unwrap();
     let durable = authority
         .record_cluster_outcome(
-            &controller.capture_leader_proof().unwrap(),
+            &proof,
             1,
             1,
             fence,

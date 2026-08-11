@@ -3351,8 +3351,30 @@ async fn shuffle_follower_rejection_accepts_exact_abort_or_newer_terminal() {
 }
 
 #[cfg(feature = "cluster")]
-#[tokio::test]
-async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement() {
+#[test]
+fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement() {
+    const TEST_THREAD_STACK_BYTES: usize = 4 * 1024 * 1024;
+
+    let test = std::thread::Builder::new()
+        .name("live-leader-shuffle-nack-test".into())
+        .stack_size(TEST_THREAD_STACK_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("live-leader shuffle NACK test runtime must build");
+            runtime.block_on(
+                live_leader_durably_aborts_shuffle_follower_nack_before_retirement_body(),
+            );
+        })
+        .expect("live-leader shuffle NACK test thread must spawn");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement_body() {
     use laminar_core::checkpoint_decision::CheckpointVerdict;
     use laminar_core::cluster::control::barrier::BARRIER_ADDR_KEY;
     use laminar_core::cluster::control::{
@@ -3890,7 +3912,7 @@ async fn gate_committed_checkpoint(
     decision_store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
     attempt: CheckpointAttempt,
     fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
-) -> laminar_core::checkpoint::CommittedCheckpointRef {
+) -> laminar_core::checkpoint::CommittedCheckpointIndex {
     use laminar_core::checkpoint::{
         ChannelProgress, CheckpointScope, CommittedCheckpointIndex, CommittedParticipantRef,
         ConnectorCheckpoint, PipelineIdentity, COMMITTED_CHECKPOINT_INDEX_VERSION,
@@ -3918,7 +3940,7 @@ async fn gate_committed_checkpoint(
             idle: false,
         })
         .collect();
-    let index = CommittedCheckpointIndex {
+    CommittedCheckpointIndex {
         version: COMMITTED_CHECKPOINT_INDEX_VERSION,
         deployment_id: decision_store.load_or_create_deployment_id().await.unwrap(),
         pipeline_identity: PipelineIdentity::empty(),
@@ -3936,11 +3958,7 @@ async fn gate_committed_checkpoint(
         )]),
         channel_progress,
         checkpoint_watermark: Some(42),
-    };
-    decision_store
-        .create_committed_checkpoint(&index)
-        .await
-        .unwrap()
+    }
 }
 
 #[cfg(feature = "cluster")]
@@ -3950,9 +3968,14 @@ async fn record_gate_commit(
     attempt: CheckpointAttempt,
     fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
 ) {
-    let committed_checkpoint = gate_committed_checkpoint(decision_store, attempt, fence).await;
+    let index = gate_committed_checkpoint(decision_store, attempt, fence).await;
     let authority = controller.checkpoint_authority().unwrap();
     let proof = authority.load().await.unwrap().unwrap().proof();
+    crate::rebalance::admit_cluster_checkpoint_artifacts_for_test(&authority, &proof, &index).await;
+    let committed_checkpoint = decision_store
+        .create_committed_checkpoint(&index)
+        .await
+        .unwrap();
     authority
         .record_cluster_outcome(
             &proof,

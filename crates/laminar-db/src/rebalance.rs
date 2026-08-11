@@ -3107,6 +3107,30 @@ fn retain_recovery_predecessors(
 }
 
 #[cfg(test)]
+pub(crate) async fn admit_cluster_checkpoint_artifacts_for_test(
+    authority: &LeaderLeaseStore,
+    proof: &laminar_core::checkpoint::LeaderProof,
+    index: &laminar_core::checkpoint::CommittedCheckpointIndex,
+) {
+    use laminar_core::checkpoint::CheckpointAttempt;
+    use laminar_core::checkpoint_decision::CheckpointArtifactInventory;
+
+    let inventory = CheckpointArtifactInventory {
+        deployment_id: index.deployment_id.clone(),
+        pipeline_identity: index.pipeline_identity.clone(),
+        attempt: CheckpointAttempt::new(index.epoch, index.checkpoint_id),
+        assignment_fence: index.assignment_fence.clone(),
+    };
+    assert_eq!(
+        authority
+            .begin_cluster_checkpoint_artifacts(proof, inventory.clone())
+            .await
+            .unwrap(),
+        inventory
+    );
+}
+
+#[cfg(test)]
 pub(crate) async fn record_assignment_checkpoint_for_test(
     authority: &LeaderLeaseStore,
     authority_store: &Arc<dyn object_store::ObjectStore>,
@@ -3159,6 +3183,7 @@ pub(crate) async fn record_assignment_checkpoint_for_test(
         channel_progress: Vec::new(),
         checkpoint_watermark: None,
     };
+    admit_cluster_checkpoint_artifacts_for_test(authority, proof, &index).await;
     let reference = authority.create_committed_checkpoint(&index).await.unwrap();
     authority
         .record_cluster_outcome(

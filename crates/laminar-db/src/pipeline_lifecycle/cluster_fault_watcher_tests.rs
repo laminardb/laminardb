@@ -388,6 +388,10 @@ async fn zero_vnode_worker_finishes_startup_idle_and_data_plane_fenced() {
         Some(Arc::clone(&assignment_store)),
         members_rx,
     ));
+    controller.set_leader_lease_store(Arc::new(LeaderLeaseStore::new(
+        Arc::clone(&objects),
+        10_000,
+    )));
     controller
         .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
         .unwrap();
