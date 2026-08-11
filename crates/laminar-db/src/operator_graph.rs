@@ -642,7 +642,7 @@ impl Drop for GraphExecutionAttemptGuard {
 const STATS_SAMPLE_INTERVAL: u64 = 32;
 
 /// Logical ABI for independently checksummed operator and vnode frames.
-pub(crate) const STATE_FRAME_ABI_VERSION: u32 = 4;
+pub(crate) const STATE_FRAME_ABI_VERSION: u32 = 5;
 
 #[derive(Debug)]
 pub(crate) struct CapturedWholeState {
@@ -2875,7 +2875,7 @@ impl OperatorGraph {
                 Some(
                     ManagedStateContract::CoreWindowV1
                         | ManagedStateContract::SqlAggregateV1
-                        | ManagedStateContract::BoundedIntervalJoinV2
+                        | ManagedStateContract::BoundedIntervalJoinV3
                         | ManagedStateContract::TemporalJoinV1
                 )
             );

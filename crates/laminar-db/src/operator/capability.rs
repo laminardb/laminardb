@@ -32,7 +32,7 @@ pub(crate) enum ManagedStateContract {
     /// Vnode-local event-time windows, sessions, accumulators, and implicit timers.
     CoreWindowV1,
     /// Vnode-local retained rows, relation weights, match support, and event-time join state.
-    BoundedIntervalJoinV2,
+    BoundedIntervalJoinV3,
     /// Vnode-local version history, probes, frontiers, and timers for temporal joins.
     TemporalJoinV1,
     #[cfg(test)]
@@ -227,7 +227,7 @@ impl OperatorCapability {
             OperatorImplementation::IntervalJoin,
             OperatorStateClass::VnodeKeyed,
         )
-        .with_managed_state(ManagedStateContract::BoundedIntervalJoinV2)
+        .with_managed_state(ManagedStateContract::BoundedIntervalJoinV3)
     }
 
     /// Descriptor for the managed temporal operator.
@@ -399,7 +399,7 @@ mod tests {
                 implementation: Implementation::IntervalJoin,
                 state_class: State::VnodeKeyed,
                 cluster_status: DdlGuarded,
-                managed_state: Some(ManagedStateContract::BoundedIntervalJoinV2),
+                managed_state: Some(ManagedStateContract::BoundedIntervalJoinV3),
             }
         );
     }

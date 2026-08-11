@@ -23,9 +23,15 @@ use laminar_sql::translator::StreamJoinConfig;
 
 use crate::error::DbError;
 use crate::interval_join::{
-    execute_interval_join_cycle, join_type_tag, ArchivedJoinStateCheckpoint,
+    execute_interval_join_cycle, execute_weighted_interval_join_cycle, join_type_tag,
     IntervalJoinCheckpointCapture, IntervalJoinOutputBudget, IntervalJoinState,
     JoinStateCheckpoint, HEAP_ALLOCATION_CHARGE,
+};
+#[cfg(feature = "cluster")]
+use crate::operator::interval_join_input::preflight_queued_batch_ipc_restore;
+use crate::operator::interval_join_input::{
+    normalizer_config_fingerprint, BoundedJoinInputCheckpoint, BoundedJoinInputCheckpointCapture,
+    BoundedJoinInputConfig, BoundedJoinInputMode, BoundedJoinInputNormalizer,
 };
 use crate::operator::ProjectingJoinState;
 #[cfg(feature = "cluster")]
@@ -40,11 +46,13 @@ use crate::operator::sql_query::ClusterShuffleConfig;
 #[cfg(feature = "cluster")]
 use crate::operator_graph::{ManagedVnodeTransition, ManagedVnodeTransitionMode};
 
-const OPERATOR_CHECKPOINT_VERSION: u8 = 3;
+const OPERATOR_CHECKPOINT_VERSION: u8 = 4;
 const ABSENT_VNODE: u8 = 0;
 const PRESENT_VNODE: u8 = 1;
-const VNODE_FRAME_VERSION: u8 = 1;
-const VNODE_FRAME_HEADER_LEN: usize = std::mem::align_of::<ArchivedJoinStateCheckpoint>();
+const VNODE_FRAME_VERSION: u8 = 2;
+const VNODE_FRAME_HEADER_LEN: usize = std::mem::align_of::<ArchivedIntervalVnodeCheckpoint>();
+#[cfg(feature = "cluster")]
+const WHOLE_RESTORE_ROW_SCRATCH_CHARGE: usize = 2_048;
 const fn vnode_frame_header(tag: u8) -> [u8; VNODE_FRAME_HEADER_LEN] {
     let mut header = [0_u8; VNODE_FRAME_HEADER_LEN];
     header[0] = tag;
@@ -147,6 +155,7 @@ struct IntervalClusterCheckpoint {
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct IntervalJoinOperatorCheckpoint {
     version: u8,
+    ordered_input_fingerprints: Option<[[u8; 32]; 2]>,
     join_type: u8,
     left_keys: Vec<String>,
     right_keys: Vec<String>,
@@ -160,6 +169,26 @@ struct IntervalJoinOperatorCheckpoint {
     applied_left_idle: bool,
     applied_right_idle: bool,
     cluster: Option<IntervalClusterCheckpoint>,
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct IntervalVnodeCheckpoint {
+    core: JoinStateCheckpoint,
+    left_normalizer: Option<BoundedJoinInputCheckpoint>,
+    right_normalizer: Option<BoundedJoinInputCheckpoint>,
+}
+
+struct IntervalVnodeCheckpointCapture {
+    core: IntervalJoinCheckpointCapture,
+    left_normalizer: Option<BoundedJoinInputCheckpointCapture>,
+    right_normalizer: Option<BoundedJoinInputCheckpointCapture>,
+    retained_bytes: usize,
+}
+
+impl IntervalVnodeCheckpointCapture {
+    const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
 }
 
 #[cfg(feature = "cluster")]
@@ -193,11 +222,83 @@ struct CapturedIntervalCluster {
     channels: [Vec<CapturedIntervalChannel>; 2],
 }
 
+#[cfg(feature = "cluster")]
+impl CapturedIntervalCluster {
+    fn retained_bytes(&self) -> Result<usize, DbError> {
+        let allocation = |bytes: usize| {
+            bytes
+                .checked_add(usize::from(bytes != 0) * HEAP_ALLOCATION_CHARGE)
+                .ok_or_else(|| {
+                    DbError::Checkpoint("interval join channel capture accounting overflow".into())
+                })
+        };
+        let mut bytes = 0usize;
+        for channels in &self.channels {
+            bytes = bytes
+                .checked_add(allocation(
+                    channels
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<CapturedIntervalChannel>())
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(
+                                "interval join channel capture accounting overflow".into(),
+                            )
+                        })?,
+                )?)
+                .ok_or_else(|| {
+                    DbError::Checkpoint("interval join channel capture accounting overflow".into())
+                })?;
+            for channel in channels {
+                bytes = bytes
+                    .checked_add(allocation(
+                        channel
+                            .events
+                            .capacity()
+                            .checked_mul(std::mem::size_of::<CapturedIntervalEvent>())
+                            .ok_or_else(|| {
+                                DbError::Checkpoint(
+                                    "interval join event capture accounting overflow".into(),
+                                )
+                            })?,
+                    )?)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "interval join event capture accounting overflow".into(),
+                        )
+                    })?;
+                for event in &channel.events {
+                    if let CapturedIntervalEvent::Data { retained, .. } = event {
+                        bytes = bytes
+                            .checked_add(retained.heap_bytes().ok_or_else(|| {
+                                DbError::Checkpoint(
+                                    "interval join retained shuffle accounting overflow".into(),
+                                )
+                            })?)
+                            .and_then(|bytes| bytes.checked_add(RETAINED_BATCH_ARC_CHARGE))
+                            .ok_or_else(|| {
+                                DbError::Checkpoint(
+                                    "interval join retained shuffle accounting overflow".into(),
+                                )
+                            })?;
+                    }
+                }
+            }
+        }
+        Ok(bytes)
+    }
+}
+
 struct IntervalJoinOperatorCheckpointCapture {
     checkpoint: IntervalJoinOperatorCheckpoint,
     #[cfg(feature = "cluster")]
     cluster: Option<CapturedIntervalCluster>,
     retained_bytes: u64,
+}
+
+struct IntervalWholeRestorePreflight {
+    decoded_checkpoint: usize,
+    runtime_scratch: usize,
+    encoded_frame: usize,
 }
 
 impl IntervalJoinOperatorCheckpointCapture {
@@ -273,90 +374,10 @@ impl IntervalJoinOperatorCheckpointCapture {
         )
         .and_then(|base| {
             #[cfg(feature = "cluster")]
-            let extra: Result<usize, DbError> =
-                self.cluster.as_ref().map_or(Ok(0usize), |cluster| {
-                    let allocation = |bytes: usize| {
-                        bytes.checked_add(usize::from(bytes != 0) * HEAP_ALLOCATION_CHARGE)
-                    };
-                    let mut bytes = 0usize;
-                    for channels in &cluster.channels {
-                        bytes = bytes
-                            .checked_add(
-                                allocation(
-                                    channels
-                                        .capacity()
-                                        .checked_mul(std::mem::size_of::<CapturedIntervalChannel>())
-                                        .ok_or_else(|| {
-                                            DbError::Checkpoint(
-                                                "interval join channel capture accounting overflow"
-                                                    .into(),
-                                            )
-                                        })?,
-                                )
-                                .ok_or_else(|| {
-                                    DbError::Checkpoint(
-                                        "interval join channel capture accounting overflow".into(),
-                                    )
-                                })?,
-                            )
-                            .ok_or_else(|| {
-                                DbError::Checkpoint(
-                                    "interval join channel capture accounting overflow".into(),
-                                )
-                            })?;
-                        for channel in channels {
-                            bytes = bytes
-                                .checked_add(
-                                    allocation(
-                                        channel
-                                            .events
-                                            .capacity()
-                                            .checked_mul(
-                                                std::mem::size_of::<CapturedIntervalEvent>(),
-                                            )
-                                            .ok_or_else(|| {
-                                                DbError::Checkpoint(
-                                                "interval join event capture accounting overflow"
-                                                    .into(),
-                                            )
-                                            })?,
-                                    )
-                                    .ok_or_else(|| {
-                                        DbError::Checkpoint(
-                                            "interval join event capture accounting overflow"
-                                                .into(),
-                                        )
-                                    })?,
-                                )
-                                .ok_or_else(|| {
-                                    DbError::Checkpoint(
-                                        "interval join event capture accounting overflow".into(),
-                                    )
-                                })?;
-                            for event in &channel.events {
-                                if let CapturedIntervalEvent::Data { retained, .. } = event {
-                                    bytes = bytes
-                                        .checked_add(retained.heap_bytes().ok_or_else(|| {
-                                            DbError::Checkpoint(
-                                            "interval join retained shuffle accounting overflow"
-                                                .into(),
-                                        )
-                                        })?)
-                                        .and_then(|bytes| {
-                                            bytes.checked_add(RETAINED_BATCH_ARC_CHARGE)
-                                        })
-                                        .ok_or_else(|| {
-                                            DbError::Checkpoint(
-                                            "interval join retained shuffle accounting overflow"
-                                                .into(),
-                                        )
-                                        })?;
-                                }
-                            }
-                        }
-                    }
-                    Ok(bytes)
-                });
+            let extra: Result<usize, DbError> = self
+                .cluster
+                .as_ref()
+                .map_or(Ok(0usize), CapturedIntervalCluster::retained_bytes);
             #[cfg(not(feature = "cluster"))]
             let extra: Result<usize, DbError> = Ok(0);
             let extra = u64::try_from(extra?).map_err(|_| {
@@ -391,6 +412,17 @@ impl IntervalJoinOperatorCheckpointCapture {
             };
             let mut encoded_channels = [Vec::new(), Vec::new()];
             for (port, encoded_port) in encoded_channels.iter_mut().enumerate() {
+                let requested_channel_bytes = allocation(
+                    cluster.channels[port].len(),
+                    std::mem::size_of::<IntervalCheckpointChannel>(),
+                )?;
+                remaining = remaining
+                    .checked_sub(requested_channel_bytes)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "{context}: encoded channel roster requires {requested_channel_bytes} bytes"
+                        ))
+                    })?;
                 encoded_port
                     .try_reserve_exact(cluster.channels[port].len())
                     .map_err(|error| {
@@ -402,13 +434,27 @@ impl IntervalJoinOperatorCheckpointCapture {
                     encoded_port.capacity(),
                     std::mem::size_of::<IntervalCheckpointChannel>(),
                 )?;
-                remaining = remaining.checked_sub(channel_bytes).ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "{context}: encoded channel roster requires {channel_bytes} bytes"
-                    ))
-                })?;
+                remaining = remaining
+                    .checked_sub(channel_bytes.saturating_sub(requested_channel_bytes))
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "{context}: encoded channel roster allocation requires {channel_bytes} bytes"
+                        ))
+                    })?;
                 for channel in &cluster.channels[port] {
                     let mut events = Vec::new();
+                    let requested_event_bytes = allocation(
+                        channel.events.len(),
+                        std::mem::size_of::<IntervalCheckpointEvent>(),
+                    )?;
+                    remaining = remaining
+                        .checked_sub(requested_event_bytes)
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "{context}: peer {} encoded event roster requires {requested_event_bytes} bytes",
+                                channel.peer
+                            ))
+                        })?;
                     events
                         .try_reserve_exact(channel.events.len())
                         .map_err(|error| {
@@ -421,12 +467,14 @@ impl IntervalJoinOperatorCheckpointCapture {
                         events.capacity(),
                         std::mem::size_of::<IntervalCheckpointEvent>(),
                     )?;
-                    remaining = remaining.checked_sub(event_bytes).ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "{context}: peer {} encoded event roster requires {event_bytes} bytes",
-                            channel.peer
-                        ))
-                    })?;
+                    remaining = remaining
+                        .checked_sub(event_bytes.saturating_sub(requested_event_bytes))
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "{context}: peer {} encoded event allocation requires {event_bytes} bytes",
+                                channel.peer
+                            ))
+                        })?;
                     for event in &channel.events {
                         let encoded = match event {
                             CapturedIntervalEvent::Data {
@@ -434,6 +482,18 @@ impl IntervalJoinOperatorCheckpointCapture {
                                 retained,
                             } => {
                                 let mut routed_vnodes = Vec::new();
+                                let requested_route_bytes = allocation(
+                                    retained.routed_vnodes().len(),
+                                    std::mem::size_of::<u32>(),
+                                )?;
+                                remaining = remaining
+                                    .checked_sub(requested_route_bytes)
+                                    .ok_or_else(|| {
+                                        DbError::Checkpoint(format!(
+                                            "{context}: peer {} route roster requires {requested_route_bytes} bytes",
+                                            channel.peer
+                                        ))
+                                    })?;
                                 routed_vnodes
                                     .try_reserve_exact(retained.routed_vnodes().len())
                                     .map_err(|error| {
@@ -446,18 +506,28 @@ impl IntervalJoinOperatorCheckpointCapture {
                                     routed_vnodes.capacity(),
                                     std::mem::size_of::<u32>(),
                                 )?;
-                                remaining = remaining.checked_sub(route_bytes).ok_or_else(|| {
-                                    DbError::Checkpoint(format!(
-                                        "{context}: peer {} route roster requires {route_bytes} bytes",
-                                        channel.peer
-                                    ))
-                                })?;
+                                remaining = remaining
+                                    .checked_sub(route_bytes.saturating_sub(requested_route_bytes))
+                                    .ok_or_else(|| {
+                                        DbError::Checkpoint(format!(
+                                            "{context}: peer {} route allocation requires {route_bytes} bytes",
+                                            channel.peer
+                                        ))
+                                    })?;
                                 routed_vnodes.extend_from_slice(retained.routed_vnodes());
+                                let ipc_budget = remaining
+                                    .checked_sub(HEAP_ALLOCATION_CHARGE)
+                                    .ok_or_else(|| {
+                                        DbError::Checkpoint(format!(
+                                            "{context}: peer {} queued data has no IPC allocation headroom",
+                                            channel.peer
+                                        ))
+                                    })?;
                                 let ipc =
                                     laminar_core::serialization::serialize_batches_stream_bounded(
                                         retained.batch().schema().as_ref(),
                                         std::iter::once(retained.batch()),
-                                        remaining,
+                                        ipc_budget,
                                     )
                                     .map_err(|error| {
                                         DbError::Checkpoint(format!(
@@ -465,12 +535,21 @@ impl IntervalJoinOperatorCheckpointCapture {
                                             channel.peer
                                         ))
                                     })?;
-                                remaining =
-                                    remaining.checked_sub(ipc.capacity()).ok_or_else(|| {
+                                let ipc_bytes = ipc
+                                    .capacity()
+                                    .checked_add(
+                                        usize::from(ipc.capacity() != 0) * HEAP_ALLOCATION_CHARGE,
+                                    )
+                                    .ok_or_else(|| {
                                         DbError::Checkpoint(format!(
                                             "{context}: queued data byte accounting overflow"
                                         ))
                                     })?;
+                                remaining = remaining.checked_sub(ipc_bytes).ok_or_else(|| {
+                                    DbError::Checkpoint(format!(
+                                        "{context}: queued data byte accounting overflow"
+                                    ))
+                                })?;
                                 IntervalCheckpointEvent::Data {
                                     recovery_gen: *recovery_gen,
                                     routed_vnodes,
@@ -506,14 +585,21 @@ impl IntervalJoinOperatorCheckpointCapture {
             });
         }
 
+        let archive_budget = remaining
+            .checked_sub(HEAP_ALLOCATION_CHARGE)
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "{context}: whole checkpoint has no archive-allocation headroom"
+                ))
+            })?;
         let writer = rkyv::ser::writer::IoWriter::new(
-            laminar_core::serialization::BoundedBytesWriter::new(remaining),
+            laminar_core::serialization::BoundedBytesWriter::new(archive_budget),
         );
         rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(&capture.checkpoint, writer)
             .map(|bytes| bytes.into_inner().into_vec())
             .map_err(|error| {
                 DbError::Checkpoint(format!(
-                    "{context}: archive serialization exceeded the remaining {remaining}-byte cumulative budget: {error}"
+                    "{context}: archive serialization exceeded its {archive_budget}-byte payload headroom: {error}"
                 ))
             })
     }
@@ -531,7 +617,7 @@ struct IntervalHandoffCut {
 
 #[cfg(feature = "cluster")]
 struct PreparedIntervalJoinTransition {
-    replacements: Vec<(u32, Option<Box<IntervalJoinState>>)>,
+    replacements: Vec<(u32, Option<Box<IntervalJoinVnodeState>>)>,
     local_assignment: VnodeAssignmentSnapshot,
     resident_vnodes: Vec<u32>,
     cluster_peers: Arc<[u64]>,
@@ -627,17 +713,239 @@ enum PendingIntervalCompletion {
     Applied(Vec<RecordBatch>),
 }
 
+#[derive(Clone)]
+struct OrderedIntervalInputSpec {
+    input_schema: SchemaRef,
+    event_time_index: usize,
+    mode: BoundedJoinInputMode,
+    fingerprint: [u8; 32],
+}
+
+#[derive(Clone)]
+struct OrderedIntervalJoinSpec {
+    left: OrderedIntervalInputSpec,
+    right: OrderedIntervalInputSpec,
+}
+
+struct OrderedIntervalJoinInputs {
+    left: BoundedJoinInputNormalizer,
+    right: BoundedJoinInputNormalizer,
+}
+
+struct IntervalJoinVnodeState {
+    core: IntervalJoinState,
+    ordered: Option<OrderedIntervalJoinInputs>,
+}
+
+impl std::ops::Deref for IntervalJoinVnodeState {
+    type Target = IntervalJoinState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+impl std::ops::DerefMut for IntervalJoinVnodeState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.core
+    }
+}
+
+impl IntervalJoinVnodeState {
+    fn new_append() -> Self {
+        Self {
+            core: IntervalJoinState::new(),
+            ordered: None,
+        }
+    }
+
+    fn try_new_ordered(
+        vnode: u32,
+        spec: &OrderedIntervalJoinSpec,
+        absolute_state_cap: usize,
+        dynamic_state_limit: usize,
+        join_config: &StreamJoinConfig,
+        left_prior_cutoff: i64,
+        right_prior_cutoff: i64,
+    ) -> Result<Self, DbError> {
+        let bound_ms = i64::try_from(join_config.time_bound.as_millis()).map_err(|_| {
+            DbError::InvalidOperation(
+                "interval join time bound exceeds the supported millisecond range".into(),
+            )
+        })?;
+        let left_preflight = BoundedJoinInputNormalizer::construction_preflight_bytes(
+            spec.left.input_schema.as_ref(),
+            spec.left.event_time_index,
+            &spec.left.mode,
+        )?;
+        let right_preflight = BoundedJoinInputNormalizer::construction_preflight_bytes(
+            spec.right.input_schema.as_ref(),
+            spec.right.event_time_index,
+            &spec.right.mode,
+        )?;
+        let core_preflight = IntervalJoinState::weighted_empty_state_preflight(
+            spec.left.input_schema.as_ref(),
+            spec.right.input_schema.as_ref(),
+        )?;
+        let projected = HEAP_ALLOCATION_CHARGE
+            .checked_add(left_preflight)
+            .and_then(|bytes| bytes.checked_add(right_preflight))
+            .and_then(|bytes| bytes.checked_add(core_preflight))
+            .ok_or_else(|| {
+                DbError::BackpressureFail(
+                    "ordered interval vnode construction accounting overflow".into(),
+                )
+            })?;
+        if projected > dynamic_state_limit {
+            return Err(DbError::BackpressureFail(format!(
+                "ordered interval vnode {vnode} construction requires {projected} bytes; dynamic shard limit is {dynamic_state_limit} bytes"
+            )));
+        }
+        let left_limit = dynamic_state_limit
+            .checked_sub(HEAP_ALLOCATION_CHARGE)
+            .and_then(|bytes| bytes.checked_sub(core_preflight))
+            .and_then(|bytes| bytes.checked_sub(right_preflight))
+            .expect("construction preflight validated left headroom");
+        let left = BoundedJoinInputNormalizer::try_new_at_cutoff(
+            Arc::clone(&spec.left.input_schema),
+            BoundedJoinInputConfig {
+                vnode,
+                event_time_index: spec.left.event_time_index,
+                mode: spec.left.mode.clone(),
+                max_retained_bytes: absolute_state_cap,
+            },
+            left_prior_cutoff,
+            left_limit,
+        )?;
+        let right_limit = dynamic_state_limit
+            .checked_sub(HEAP_ALLOCATION_CHARGE)
+            .and_then(|bytes| bytes.checked_sub(core_preflight))
+            .and_then(|bytes| bytes.checked_sub(left.accounted_state_bytes()))
+            .expect("construction preflight validated right headroom");
+        let right = BoundedJoinInputNormalizer::try_new_at_cutoff(
+            Arc::clone(&spec.right.input_schema),
+            BoundedJoinInputConfig {
+                vnode,
+                event_time_index: spec.right.event_time_index,
+                mode: spec.right.mode.clone(),
+                max_retained_bytes: absolute_state_cap,
+            },
+            right_prior_cutoff,
+            right_limit,
+        )?;
+        let core_limit = dynamic_state_limit
+            .checked_sub(HEAP_ALLOCATION_CHARGE)
+            .and_then(|bytes| bytes.checked_sub(left.accounted_state_bytes()))
+            .and_then(|bytes| bytes.checked_sub(right.accounted_state_bytes()))
+            .expect("construction preflight validated core headroom");
+        let mut core = IntervalJoinState::new_weighted_at_frontiers(
+            left_prior_cutoff,
+            right_prior_cutoff,
+            bound_ms,
+        );
+        core.seed_input_schemas(
+            Arc::clone(left.visible_schema()),
+            Arc::clone(right.visible_schema()),
+            join_config,
+        )?;
+        if core.accounted_state_bytes() > core_limit {
+            return Err(DbError::BackpressureFail(format!(
+                "ordered interval vnode {vnode} core construction exceeds its {core_limit}-byte cumulative headroom"
+            )));
+        }
+        let state = Self {
+            core,
+            ordered: Some(OrderedIntervalJoinInputs { left, right }),
+        };
+        debug_assert!(state.accounted_state_bytes() <= dynamic_state_limit);
+        Ok(state)
+    }
+
+    fn accounted_state_bytes(&self) -> usize {
+        self.core
+            .accounted_state_bytes()
+            .saturating_add(self.ordered.as_ref().map_or(0, |ordered| {
+                HEAP_ALLOCATION_CHARGE
+                    .saturating_add(ordered.left.accounted_state_bytes())
+                    .saturating_add(ordered.right.accounted_state_bytes())
+            }))
+    }
+
+    #[cfg(test)]
+    fn ordered_fingerprints(&self) -> Option<[[u8; 32]; 2]> {
+        self.ordered.as_ref().map(|ordered| {
+            [
+                ordered.left.config_fingerprint(),
+                ordered.right.config_fingerprint(),
+            ]
+        })
+    }
+
+    fn capture_checkpoint(
+        &self,
+        config: &StreamJoinConfig,
+        max_capture_bytes: usize,
+    ) -> Result<IntervalVnodeCheckpointCapture, DbError> {
+        let core = self.core.capture_checkpoint(config, max_capture_bytes)?;
+        let mut remaining = max_capture_bytes
+            .checked_sub(core.retained_bytes())
+            .ok_or_else(|| {
+                DbError::Checkpoint(
+                    "interval join core capture exhausted vnode capture headroom".into(),
+                )
+            })?;
+        let (left_normalizer, right_normalizer) = if let Some(ordered) = &self.ordered {
+            let left = ordered.left.capture_checkpoint(remaining)?;
+            remaining = remaining
+                .checked_sub(left.retained_bytes())
+                .ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "interval join left normalizer capture exhausted vnode headroom".into(),
+                    )
+                })?;
+            let right = ordered.right.capture_checkpoint(remaining)?;
+            (Some(left), Some(right))
+        } else {
+            (None, None)
+        };
+        let retained_bytes = core
+            .retained_bytes()
+            .checked_add(
+                left_normalizer
+                    .as_ref()
+                    .map_or(0, BoundedJoinInputCheckpointCapture::retained_bytes),
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    right_normalizer
+                        .as_ref()
+                        .map_or(0, BoundedJoinInputCheckpointCapture::retained_bytes),
+                )
+            })
+            .ok_or_else(|| {
+                DbError::Checkpoint("interval join vnode capture accounting overflow".into())
+            })?;
+        Ok(IntervalVnodeCheckpointCapture {
+            core,
+            left_normalizer,
+            right_normalizer,
+            retained_bytes,
+        })
+    }
+}
+
 pub(crate) struct IntervalJoinOperator {
     config: StreamJoinConfig,
     key_group_count: KeyGroupCount,
     local_assignment: VnodeAssignmentSnapshot,
-    vnode_states: Vec<Option<Box<IntervalJoinState>>>,
+    vnode_states: Vec<Option<Box<IntervalJoinVnodeState>>>,
     resident_vnodes: Vec<u32>,
     dirty_vnodes: Vec<bool>,
     dirty_vnode_roster: Vec<u32>,
     full_vnode_capture_required: bool,
     max_managed_state_bytes: usize,
     input_schemas: Option<(SchemaRef, SchemaRef)>,
+    ordered_input_spec: Option<OrderedIntervalJoinSpec>,
     projection: ProjectingJoinState,
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<ClusterShuffleConfig>,
@@ -711,6 +1019,7 @@ impl IntervalJoinOperator {
             full_vnode_capture_required: true,
             max_managed_state_bytes: crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
             input_schemas: None,
+            ordered_input_spec: None,
             projection: ProjectingJoinState::new(name, ctx, projection_sql, "__interval_tmp"),
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
@@ -750,6 +1059,96 @@ impl IntervalJoinOperator {
         self.input_schemas = Some((left, right));
     }
 
+    /// Configure the private ordered-input contract. Planner/DDL admission intentionally does not
+    /// call this until its checkpoint and source-capability contract is admitted separately.
+    #[allow(
+        dead_code,
+        reason = "planner admission is intentionally closed while the ordered-input contract is staged"
+    )]
+    pub(crate) fn configure_ordered_inputs(
+        &mut self,
+        left_mode: BoundedJoinInputMode,
+        right_mode: BoundedJoinInputMode,
+    ) -> Result<(), DbError> {
+        if self.vnode_states.iter().any(Option::is_some) || self.ordered_input_spec.is_some() {
+            return Err(DbError::InvalidOperation(
+                "ordered interval input must be configured before vnode state exists".into(),
+            ));
+        }
+        let (left_schema, right_schema) = self.input_schemas.as_ref().ok_or_else(|| {
+            DbError::Config("ordered interval input requires both declared source schemas".into())
+        })?;
+
+        let build = |side: &str,
+                     schema: &SchemaRef,
+                     time_column: &str,
+                     join_keys: &[String],
+                     mode: BoundedJoinInputMode|
+         -> Result<OrderedIntervalInputSpec, DbError> {
+            let event_time_index = schema.index_of(time_column).map_err(|error| {
+                DbError::Config(format!(
+                    "ordered interval {side} event-time column '{time_column}': {error}"
+                ))
+            })?;
+            if let BoundedJoinInputMode::KeyedUpsert {
+                primary_key_indices,
+            } = &mode
+            {
+                for key in join_keys {
+                    let index = schema.index_of(key).map_err(|error| {
+                        DbError::Config(format!(
+                            "ordered interval {side} join key '{key}': {error}"
+                        ))
+                    })?;
+                    if !primary_key_indices.contains(&index) {
+                        return Err(DbError::Config(format!(
+                            "ordered interval {side} keyed primary key must include join key '{key}'"
+                        )));
+                    }
+                }
+                if !primary_key_indices.contains(&event_time_index) {
+                    return Err(DbError::Config(format!(
+                        "ordered interval {side} keyed primary key must include event time"
+                    )));
+                }
+            }
+            let fingerprint =
+                normalizer_config_fingerprint(schema.as_ref(), event_time_index, &mode);
+            BoundedJoinInputNormalizer::try_new(
+                Arc::clone(schema),
+                BoundedJoinInputConfig {
+                    vnode: 0,
+                    event_time_index,
+                    mode: mode.clone(),
+                    max_retained_bytes: self.max_managed_state_bytes,
+                },
+            )?;
+            Ok(OrderedIntervalInputSpec {
+                input_schema: Arc::clone(schema),
+                event_time_index,
+                mode,
+                fingerprint,
+            })
+        };
+        self.ordered_input_spec = Some(OrderedIntervalJoinSpec {
+            left: build(
+                "left",
+                left_schema,
+                &self.config.left_time_column,
+                &self.config.left_keys,
+                left_mode,
+            )?,
+            right: build(
+                "right",
+                right_schema,
+                &self.config.right_time_column,
+                &self.config.right_keys,
+                right_mode,
+            )?,
+        });
+        Ok(())
+    }
+
     #[cfg(feature = "cluster")]
     pub(crate) fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
         debug_assert!(self.vnode_states.iter().all(Option::is_none));
@@ -787,6 +1186,30 @@ impl IntervalJoinOperator {
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn try_remote_owner_peers(
+        assignment: &VnodeAssignmentSnapshot,
+        self_id: NodeId,
+        context: &str,
+    ) -> Result<Vec<u64>, DbError> {
+        let mut peers = Vec::new();
+        peers
+            .try_reserve_exact(assignment.owners().len())
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "{context}: peer-roster reservation failed: {error}"
+                ))
+            })?;
+        for owner in assignment.owners() {
+            if !owner.is_unassigned() && *owner != self_id {
+                peers.push(owner.0);
+            }
+        }
+        peers.sort_unstable();
+        peers.dedup();
+        Ok(peers)
     }
 
     #[cfg(feature = "cluster")]
@@ -881,7 +1304,7 @@ impl IntervalJoinOperator {
         let bytes = self
             .vnode_states
             .capacity()
-            .saturating_mul(std::mem::size_of::<Option<Box<IntervalJoinState>>>())
+            .saturating_mul(std::mem::size_of::<Option<Box<IntervalJoinVnodeState>>>())
             .saturating_add(
                 self.resident_vnodes
                     .capacity()
@@ -935,7 +1358,10 @@ impl IntervalJoinOperator {
         let bytes = transition
             .replacements
             .capacity()
-            .saturating_mul(std::mem::size_of::<(u32, Option<Box<IntervalJoinState>>)>())
+            .saturating_mul(std::mem::size_of::<(
+                u32,
+                Option<Box<IntervalJoinVnodeState>>,
+            )>())
             .saturating_add(
                 transition
                     .resident_vnodes
@@ -1032,9 +1458,19 @@ impl IntervalJoinOperator {
             return Ok(None);
         };
         let (_, assignment, peers) = self.active_cluster_scope()?;
+        let assignment_identity = self.checkpoint_assignment_identity(max_capture_bytes)?;
+        let peer_roster_is_canonical = peers.windows(2).all(|pair| pair[0] < pair[1])
+            && peers
+                .iter()
+                .all(|peer| *peer != 0 && *peer != config.self_id.0)
+            && assignment.owners().iter().all(|owner| {
+                owner.is_unassigned()
+                    || *owner == config.self_id
+                    || peers.binary_search(&owner.0).is_ok()
+            });
         if self.pending_cluster_input.is_some()
             || self.last_broadcasts != self.local_frontiers
-            || peers.as_ref() != Self::remote_owner_peers(&assignment, config.self_id).as_slice()
+            || !peer_roster_is_canonical
             || self.remote_side_cursor > 1
         {
             return Err(DbError::Checkpoint(format!(
@@ -1058,6 +1494,7 @@ impl IntervalJoinOperator {
         let allocation =
             |bytes: usize| bytes.checked_add(usize::from(bytes != 0) * HEAP_ALLOCATION_CHARGE);
         let mut requested_retained = 0usize;
+        let mut max_declared_vnodes = 0usize;
         for peer_channels in &self.peer_channels {
             requested_retained = requested_retained
                 .checked_add(
@@ -1085,6 +1522,8 @@ impl IntervalJoinOperator {
                     .ok_or_else(|| self.accounting_error())?;
                 for event in &channel.events {
                     if let IntervalRemoteEventPayload::Data(batch) = &event.payload {
+                        max_declared_vnodes =
+                            max_declared_vnodes.max(batch.retained.routed_vnodes().len());
                         requested_retained = requested_retained
                             .checked_add(
                                 batch
@@ -1098,9 +1537,36 @@ impl IntervalJoinOperator {
                 }
             }
         }
-        if requested_retained > max_capture_bytes {
+        let requested_coverage_scratch =
+            allocation(max_declared_vnodes).ok_or_else(|| self.accounting_error())?;
+        let requested_peak = requested_retained
+            .checked_add(requested_coverage_scratch)
+            .ok_or_else(|| self.accounting_error())?;
+        if requested_peak > max_capture_bytes {
             return Err(DbError::Checkpoint(format!(
-                "interval join [{}] channel capture requires {requested_retained} bytes; headroom is {max_capture_bytes} bytes",
+                "interval join [{}] channel capture requires {requested_peak} bytes; headroom is {max_capture_bytes} bytes",
+                self.projection.op_name
+            )));
+        }
+
+        let mut coverage_marks = Vec::<u8>::new();
+        coverage_marks
+            .try_reserve_exact(max_declared_vnodes)
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] channel coverage scratch reservation: {error}",
+                    self.projection.op_name
+                ))
+            })?;
+        coverage_marks.resize(max_declared_vnodes, 0);
+        let coverage_scratch_bytes =
+            allocation(coverage_marks.capacity()).ok_or_else(|| self.accounting_error())?;
+        let actual_peak = requested_retained
+            .checked_add(coverage_scratch_bytes)
+            .ok_or_else(|| self.accounting_error())?;
+        if actual_peak > max_capture_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] channel capture allocation requires {actual_peak} bytes; headroom is {max_capture_bytes} bytes",
                 self.projection.op_name
             )));
         }
@@ -1173,13 +1639,14 @@ impl IntervalJoinOperator {
                     let event = match &event.payload {
                         IntervalRemoteEventPayload::Data(batch) => {
                             let declared = batch.retained.routed_vnodes();
-                            let mut seen = vec![false; declared.len()];
+                            let seen = &mut coverage_marks[..declared.len()];
+                            seen.fill(0);
                             let coverage_valid = batch.row_vnodes.iter().all(|vnode| {
                                 declared.binary_search(vnode).is_ok_and(|index| {
-                                    seen[index] = true;
+                                    seen[index] = 1;
                                     true
                                 })
-                            }) && seen.iter().all(|seen| *seen);
+                            }) && seen.iter().all(|seen| *seen != 0);
                             let expected_bytes = batch
                                 .retained
                                 .heap_bytes()
@@ -1270,7 +1737,7 @@ impl IntervalJoinOperator {
         }
         let capture = CapturedIntervalCluster {
             assignment_version: assignment.version(),
-            owner_map_digest: self.checkpoint_assignment_identity()?.1,
+            owner_map_digest: assignment_identity.1,
             self_id: config.self_id.0,
             recovery_gen: config.receiver.recovery_gen(),
             local_frontiers: self.local_frontiers,
@@ -1278,52 +1745,13 @@ impl IntervalJoinOperator {
             remote_peer_cursors: self.remote_peer_cursors,
             channels,
         };
-        let mut retained = 0usize;
-        for channels in &capture.channels {
-            retained = retained
-                .checked_add(
-                    allocation(
-                        channels
-                            .capacity()
-                            .checked_mul(std::mem::size_of::<CapturedIntervalChannel>())
-                            .ok_or_else(|| self.accounting_error())?,
-                    )
-                    .ok_or_else(|| self.accounting_error())?,
-                )
-                .ok_or_else(|| self.accounting_error())?;
-            for channel in channels {
-                retained = retained
-                    .checked_add(
-                        allocation(
-                            channel
-                                .events
-                                .capacity()
-                                .checked_mul(std::mem::size_of::<CapturedIntervalEvent>())
-                                .ok_or_else(|| self.accounting_error())?,
-                        )
-                        .ok_or_else(|| self.accounting_error())?,
-                    )
-                    .ok_or_else(|| self.accounting_error())?;
-                for event in &channel.events {
-                    if let CapturedIntervalEvent::Data {
-                        retained: batch, ..
-                    } = event
-                    {
-                        retained = retained
-                            .checked_add(
-                                batch
-                                    .heap_bytes()
-                                    .and_then(|bytes| bytes.checked_add(RETAINED_BATCH_ARC_CHARGE))
-                                    .ok_or_else(|| self.accounting_error())?,
-                            )
-                            .ok_or_else(|| self.accounting_error())?;
-                    }
-                }
-            }
-        }
-        if retained > max_capture_bytes {
+        let retained = capture.retained_bytes()?;
+        let retained_peak = retained
+            .checked_add(coverage_scratch_bytes)
+            .ok_or_else(|| self.accounting_error())?;
+        if retained_peak > max_capture_bytes {
             return Err(DbError::Checkpoint(format!(
-                "interval join [{}] channel capture retains {retained} bytes; headroom is {max_capture_bytes} bytes",
+                "interval join [{}] channel capture peak retains {retained_peak} bytes; headroom is {max_capture_bytes} bytes",
                 self.projection.op_name
             )));
         }
@@ -1339,6 +1767,7 @@ impl IntervalJoinOperator {
         #[cfg(not(feature = "cluster"))]
         let cluster_attached = false;
         if !cluster_attached
+            && self.ordered_input_spec.is_none()
             && self.applied_left_watermark == i64::MIN
             && self.applied_right_watermark == i64::MIN
             && !self.applied_left_idle
@@ -1380,6 +1809,10 @@ impl IntervalJoinOperator {
         )?;
         let checkpoint = IntervalJoinOperatorCheckpoint {
             version: OPERATOR_CHECKPOINT_VERSION,
+            ordered_input_fingerprints: self
+                .ordered_input_spec
+                .as_ref()
+                .map(|spec| [spec.left.fingerprint, spec.right.fingerprint]),
             join_type: join_type_tag(self.config.join_type),
             left_keys: self.config.left_keys.clone(),
             right_keys: self.config.right_keys.clone(),
@@ -1413,12 +1846,53 @@ impl IntervalJoinOperator {
     }
 
     fn encode_state_capture(
-        capture: IntervalJoinCheckpointCapture,
+        capture: IntervalVnodeCheckpointCapture,
         context: &str,
         max_encoded_bytes: usize,
     ) -> Result<EncodedStateFrame, DbError> {
-        let checkpoint = capture.encode(max_encoded_bytes)?;
-        let retained_checkpoint_bytes = checkpoint.retained_ipc_bytes()?;
+        let core = capture.core.encode(max_encoded_bytes)?;
+        let mut retained_checkpoint_bytes = core.retained_ipc_bytes()?;
+        let left_normalizer = if let Some(capture) = capture.left_normalizer {
+            let remaining = max_encoded_bytes
+                .checked_sub(retained_checkpoint_bytes)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "{context}: core checkpoint exhausted the vnode frame budget"
+                    ))
+                })?;
+            let checkpoint = capture.encode(remaining)?;
+            retained_checkpoint_bytes = retained_checkpoint_bytes
+                .checked_add(checkpoint.retained_bytes()?)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!("{context}: checkpoint accounting overflow"))
+                })?;
+            Some(checkpoint)
+        } else {
+            None
+        };
+        let right_normalizer = if let Some(capture) = capture.right_normalizer {
+            let remaining = max_encoded_bytes
+                .checked_sub(retained_checkpoint_bytes)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "{context}: left checkpoint exhausted the vnode frame budget"
+                    ))
+                })?;
+            let checkpoint = capture.encode(remaining)?;
+            retained_checkpoint_bytes = retained_checkpoint_bytes
+                .checked_add(checkpoint.retained_bytes()?)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!("{context}: checkpoint accounting overflow"))
+                })?;
+            Some(checkpoint)
+        } else {
+            None
+        };
+        let checkpoint = IntervalVnodeCheckpoint {
+            core,
+            left_normalizer,
+            right_normalizer,
+        };
         let archive_budget = max_encoded_bytes
             .checked_sub(retained_checkpoint_bytes)
             .and_then(|bytes| bytes.checked_sub(HEAP_ALLOCATION_CHARGE))
@@ -1449,8 +1923,14 @@ impl IntervalJoinOperator {
         context: &str,
         max_encoded_bytes: usize,
     ) -> Result<Vec<u8>, DbError> {
+        let core = state.capture_checkpoint(config, max_encoded_bytes)?;
         Self::encode_state_capture(
-            state.capture_checkpoint(config)?,
+            IntervalVnodeCheckpointCapture {
+                retained_bytes: core.retained_bytes(),
+                core,
+                left_normalizer: None,
+                right_normalizer: None,
+            },
             context,
             max_encoded_bytes,
         )
@@ -1459,35 +1939,173 @@ impl IntervalJoinOperator {
 
     fn deserialize_state(
         bytes: &[u8],
+        vnode: u32,
         config: &StreamJoinConfig,
+        ordered_spec: Option<&OrderedIntervalJoinSpec>,
         context: &str,
         max_state_bytes: usize,
+        absolute_state_cap: usize,
         cut: Option<IntervalHandoffCut>,
-    ) -> Result<IntervalJoinState, DbError> {
-        let checkpoint = rkyv::from_bytes::<JoinStateCheckpoint, rkyv::rancor::Error>(bytes)
+    ) -> Result<IntervalJoinVnodeState, DbError> {
+        let archived = rkyv::access::<ArchivedIntervalVnodeCheckpoint, rkyv::rancor::Error>(bytes)
             .map_err(|error| DbError::Checkpoint(format!("{context}: {error}")))?;
-        if let Some(cut) = cut {
+        if archived.left_normalizer.is_some() != ordered_spec.is_some()
+            || archived.right_normalizer.is_some() != ordered_spec.is_some()
+            || archived.core.weighted != ordered_spec.is_some()
+        {
+            return Err(DbError::Checkpoint(format!(
+                "{context}: archived vnode execution contract changed"
+            )));
+        }
+        let deep_decode_preflight = bytes
+            .len()
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(4 * HEAP_ALLOCATION_CHARGE))
+            .ok_or_else(|| DbError::Checkpoint(format!("{context}: decode accounting overflow")))?;
+        if deep_decode_preflight > max_state_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "{context}: archived vnode needs {deep_decode_preflight} bytes of deep-decode headroom; remaining limit is {max_state_bytes} bytes"
+            )));
+        }
+        let checkpoint = rkyv::from_bytes::<IntervalVnodeCheckpoint, rkyv::rancor::Error>(bytes)
+            .map_err(|error| DbError::Checkpoint(format!("{context}: {error}")))?;
+        let core_checkpoint_bytes = checkpoint.core.retained_ipc_bytes()?;
+        let left_checkpoint_bytes = checkpoint
+            .left_normalizer
+            .as_ref()
+            .map_or(Ok(0), BoundedJoinInputCheckpoint::retained_bytes)?;
+        let right_checkpoint_bytes = checkpoint
+            .right_normalizer
+            .as_ref()
+            .map_or(Ok(0), BoundedJoinInputCheckpoint::retained_bytes)?;
+        let decoded_checkpoint_bytes = core_checkpoint_bytes
+            .checked_add(left_checkpoint_bytes)
+            .and_then(|bytes| bytes.checked_add(right_checkpoint_bytes))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<IntervalVnodeCheckpoint>()))
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!("{context}: decoded checkpoint accounting overflow"))
+            })?;
+        if decoded_checkpoint_bytes > deep_decode_preflight
+            || decoded_checkpoint_bytes > max_state_bytes
+        {
+            return Err(DbError::Checkpoint(format!(
+                "{context}: decoded vnode checkpoint exceeds its preflighted restore headroom"
+            )));
+        }
+        let wrapper_charge = usize::from(ordered_spec.is_some()) * HEAP_ALLOCATION_CHARGE;
+        let mut remaining = max_state_bytes
+            .checked_sub(decoded_checkpoint_bytes)
+            .and_then(|bytes| bytes.checked_sub(wrapper_charge))
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "{context}: decoded checkpoint and vnode wrapper exceed the restore limit"
+                ))
+            })?;
+        let mut core = if ordered_spec.is_some() {
+            IntervalJoinState::from_weighted_checkpoint(&checkpoint.core, config, remaining)
+        } else {
+            IntervalJoinState::from_checkpoint(&checkpoint.core, config, remaining)
+        }
+        .map_err(|error| DbError::Checkpoint(format!("{context}: {error}")))?;
+        remaining = remaining
+            .checked_sub(core.accounted_state_bytes())
+            .ok_or_else(|| DbError::Checkpoint(format!("{context}: core restore overflow")))?;
+
+        let ordered = match (
+            ordered_spec,
+            checkpoint.left_normalizer.as_ref(),
+            checkpoint.right_normalizer.as_ref(),
+        ) {
+            (None, None, None) => None,
+            (Some(spec), Some(left_checkpoint), Some(right_checkpoint)) => {
+                let left = BoundedJoinInputNormalizer::from_checkpoint(
+                    left_checkpoint,
+                    Arc::clone(&spec.left.input_schema),
+                    BoundedJoinInputConfig {
+                        vnode,
+                        event_time_index: spec.left.event_time_index,
+                        mode: spec.left.mode.clone(),
+                        max_retained_bytes: absolute_state_cap,
+                    },
+                    remaining,
+                )?;
+                remaining = remaining
+                    .checked_sub(left.accounted_state_bytes())
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!("{context}: left normalizer restore overflow"))
+                    })?;
+                let right = BoundedJoinInputNormalizer::from_checkpoint(
+                    right_checkpoint,
+                    Arc::clone(&spec.right.input_schema),
+                    BoundedJoinInputConfig {
+                        vnode,
+                        event_time_index: spec.right.event_time_index,
+                        mode: spec.right.mode.clone(),
+                        max_retained_bytes: absolute_state_cap,
+                    },
+                    remaining,
+                )?;
+                core.seed_input_schemas(
+                    Arc::clone(left.visible_schema()),
+                    Arc::clone(right.visible_schema()),
+                    config,
+                )?;
+                Some(OrderedIntervalJoinInputs { left, right })
+            }
+            _ => {
+                return Err(DbError::Checkpoint(format!(
+                    "{context}: vnode execution contract does not match its normalizer frames"
+                )));
+            }
+        };
+        let state = IntervalJoinVnodeState { core, ordered };
+        if let Some(ordered) = &state.ordered {
+            let normalizer_cut = IntervalHandoffCut {
+                left_watermark: ordered.left.closed_cutoff(),
+                right_watermark: ordered.right.closed_cutoff(),
+                #[cfg(feature = "cluster")]
+                left_idle: false,
+                #[cfg(feature = "cluster")]
+                right_idle: false,
+            };
+            if cut.is_some_and(|cut| {
+                cut.left_watermark != normalizer_cut.left_watermark
+                    || cut.right_watermark != normalizer_cut.right_watermark
+            }) {
+                return Err(DbError::Checkpoint(format!(
+                    "{context}: ordered normalizer cutoffs disagree with the whole handoff cut"
+                )));
+            }
+            Self::validate_ordered_core_cutoffs(&state, config, context, normalizer_cut)?;
+        } else if let Some(cut) = cut {
             Self::validate_handoff_cutoffs(
-                checkpoint.left_evicted_cutoff,
-                checkpoint.right_evicted_cutoff,
-                checkpoint.left_buffer_rows != 0,
-                checkpoint.right_buffer_rows != 0,
+                checkpoint.core.left_evicted_cutoff,
+                checkpoint.core.right_evicted_cutoff,
+                checkpoint.core.left_buffer_rows != 0,
+                checkpoint.core.right_buffer_rows != 0,
                 config,
                 context,
                 cut,
             )?;
         }
-        IntervalJoinState::from_checkpoint(&checkpoint, config, max_state_bytes)
-            .map_err(|error| DbError::Checkpoint(format!("{context}: {error}")))
+        if state.accounted_state_bytes() > max_state_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "{context}: combined vnode state exceeds its {max_state_bytes}-byte restore limit"
+            )));
+        }
+        Ok(state)
     }
 
     fn decode_vnode_frame(
         bytes: &[u8],
+        vnode: u32,
         config: &StreamJoinConfig,
+        ordered_spec: Option<&OrderedIntervalJoinSpec>,
         context: &str,
         max_state_bytes: usize,
+        absolute_state_cap: usize,
         cut: Option<IntervalHandoffCut>,
-    ) -> Result<Option<IntervalJoinState>, DbError> {
+    ) -> Result<Option<IntervalJoinVnodeState>, DbError> {
         if bytes.len() < VNODE_FRAME_HEADER_LEN {
             return Err(DbError::Checkpoint(format!(
                 "{context}: vnode frame header is truncated"
@@ -1514,9 +2132,17 @@ impl IntervalJoinOperator {
             PRESENT_VNODE if payload.is_empty() => Err(DbError::Checkpoint(format!(
                 "{context}: present vnode frame has no payload"
             ))),
-            PRESENT_VNODE => {
-                Self::deserialize_state(payload, config, context, max_state_bytes, cut).map(Some)
-            }
+            PRESENT_VNODE => Self::deserialize_state(
+                payload,
+                vnode,
+                config,
+                ordered_spec,
+                context,
+                max_state_bytes,
+                absolute_state_cap,
+                cut,
+            )
+            .map(Some),
             _ => Err(DbError::Checkpoint(format!(
                 "{context}: vnode frame has unknown tag {tag}"
             ))),
@@ -1551,6 +2177,29 @@ impl IntervalJoinOperator {
         Ok(())
     }
 
+    fn validate_ordered_core_cutoffs(
+        state: &IntervalJoinVnodeState,
+        config: &StreamJoinConfig,
+        context: &str,
+        cut: IntervalHandoffCut,
+    ) -> Result<(), DbError> {
+        let bound_ms = i64::try_from(config.time_bound.as_millis()).map_err(|_| {
+            DbError::Checkpoint(format!(
+                "{context}: configured time bound exceeds the supported millisecond range"
+            ))
+        })?;
+        let expected = (
+            cut.right_watermark.saturating_sub(bound_ms),
+            cut.left_watermark,
+        );
+        if state.evicted_cutoffs() != expected {
+            return Err(DbError::Checkpoint(format!(
+                "{context}: weighted core cutoffs disagree with authoritative normalizer cutoffs"
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_checkpoint_config(
         &self,
         checkpoint: &IntervalJoinOperatorCheckpoint,
@@ -1562,6 +2211,11 @@ impl IntervalJoinOperator {
             ))
         })?;
         if checkpoint.version != OPERATOR_CHECKPOINT_VERSION
+            || checkpoint.ordered_input_fingerprints
+                != self
+                    .ordered_input_spec
+                    .as_ref()
+                    .map(|spec| [spec.left.fingerprint, spec.right.fingerprint])
             || checkpoint.join_type != join_type_tag(self.config.join_type)
             || checkpoint.left_keys != self.config.left_keys
             || checkpoint.right_keys != self.config.right_keys
@@ -1579,8 +2233,413 @@ impl IntervalJoinOperator {
         Ok(())
     }
 
+    fn validate_archived_checkpoint_config(
+        &self,
+        checkpoint: &ArchivedIntervalJoinOperatorCheckpoint,
+    ) -> Result<(), DbError> {
+        let bound_ms = i64::try_from(self.config.time_bound.as_millis()).map_err(|_| {
+            DbError::Checkpoint(format!(
+                "interval join [{}] configured bound is not checkpointable",
+                self.projection.op_name
+            ))
+        })?;
+        let expected_fingerprints = self
+            .ordered_input_spec
+            .as_ref()
+            .map(|spec| [spec.left.fingerprint, spec.right.fingerprint]);
+        let fingerprints_match = match (
+            checkpoint.ordered_input_fingerprints.as_ref(),
+            expected_fingerprints.as_ref(),
+        ) {
+            (None, None) => true,
+            (Some(archived), Some(expected)) => archived.as_slice() == expected.as_slice(),
+            _ => false,
+        };
+        let left_keys_match = checkpoint.left_keys.len() == self.config.left_keys.len()
+            && checkpoint
+                .left_keys
+                .iter()
+                .zip(&self.config.left_keys)
+                .all(|(archived, expected)| archived.as_str() == expected.as_str());
+        let right_keys_match = checkpoint.right_keys.len() == self.config.right_keys.len()
+            && checkpoint
+                .right_keys
+                .iter()
+                .zip(&self.config.right_keys)
+                .all(|(archived, expected)| archived.as_str() == expected.as_str());
+        if checkpoint.version != OPERATOR_CHECKPOINT_VERSION
+            || !fingerprints_match
+            || checkpoint.join_type != join_type_tag(self.config.join_type)
+            || !left_keys_match
+            || !right_keys_match
+            || checkpoint.left_time_column.as_str() != self.config.left_time_column.as_str()
+            || checkpoint.right_time_column.as_str() != self.config.right_time_column.as_str()
+            || checkpoint.left_table.as_str() != self.config.left_table.as_str()
+            || checkpoint.right_table.as_str() != self.config.right_table.as_str()
+            || checkpoint.bound_ms != bound_ms
+        {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] archived checkpoint version or configuration does not match the operator",
+                self.projection.op_name
+            )));
+        }
+        Ok(())
+    }
+
+    fn preflight_whole_restore_archive(
+        &self,
+        bytes: &Vec<u8>,
+    ) -> Result<IntervalWholeRestorePreflight, DbError> {
+        let archived =
+            rkyv::access::<ArchivedIntervalJoinOperatorCheckpoint, rkyv::rancor::Error>(bytes)
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "interval join [{}] checkpoint archive validation: {error}",
+                        self.projection.op_name
+                    ))
+                })?;
+        self.validate_archived_checkpoint_config(archived)?;
+
+        let allocation = |payload: usize| {
+            payload
+                .checked_add(usize::from(payload != 0) * HEAP_ALLOCATION_CHARGE)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "interval join [{}] whole restore accounting overflow",
+                        self.projection.op_name
+                    ))
+                })
+        };
+        let roster = |count: usize, item_bytes: usize| {
+            count
+                .checked_mul(item_bytes)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "interval join [{}] whole restore roster overflow",
+                        self.projection.op_name
+                    ))
+                })
+                .and_then(allocation)
+        };
+        let add = |total: &mut usize, charge: usize| {
+            *total = total.checked_add(charge).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] whole restore accounting overflow",
+                    self.projection.op_name
+                ))
+            })?;
+            Ok::<(), DbError>(())
+        };
+
+        let encoded_bytes = allocation(bytes.capacity())?;
+        let mut decoded_checkpoint_bytes = std::mem::size_of::<IntervalJoinOperatorCheckpoint>();
+        add(
+            &mut decoded_checkpoint_bytes,
+            roster(archived.left_keys.len(), std::mem::size_of::<String>())?,
+        )?;
+        add(
+            &mut decoded_checkpoint_bytes,
+            roster(archived.right_keys.len(), std::mem::size_of::<String>())?,
+        )?;
+        for key in archived.left_keys.iter().chain(archived.right_keys.iter()) {
+            add(&mut decoded_checkpoint_bytes, allocation(key.len())?)?;
+        }
+        for value in [
+            &archived.left_time_column,
+            &archived.right_time_column,
+            &archived.left_table,
+            &archived.right_table,
+        ] {
+            add(&mut decoded_checkpoint_bytes, allocation(value.len())?)?;
+        }
+
+        #[cfg(feature = "cluster")]
+        let mut runtime_bytes = 0usize;
+        #[cfg(not(feature = "cluster"))]
+        let runtime_bytes = 0usize;
+        #[cfg(feature = "cluster")]
+        match (self.cluster_shuffle.as_ref(), archived.cluster.as_ref()) {
+            (Some(config), Some(cluster)) => {
+                let (_, assignment, peers) = self.active_cluster_scope()?;
+                let owner_map_digest =
+                    laminar_core::checkpoint::CheckpointAssignmentFence::owner_map_digest_iter(
+                        u32::from(self.key_group_count),
+                        assignment.owners().iter().map(|owner| owner.0),
+                    );
+                if cluster.assignment_version != assignment.version()
+                    || cluster.owner_map_digest != owner_map_digest
+                    || cluster.self_id != config.self_id.0
+                    || cluster.recovery_gen > config.receiver.recovery_gen()
+                    || cluster.remote_side_cursor > 1
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "interval join [{}] archived cluster checkpoint identity is invalid",
+                        self.projection.op_name
+                    )));
+                }
+                for port in 0..2 {
+                    let channels = &cluster.channels[port];
+                    if channels.len() != peers.len()
+                        || !channels
+                            .iter()
+                            .map(|channel| channel.peer)
+                            .eq(peers.iter().copied())
+                    {
+                        return Err(DbError::Checkpoint(format!(
+                            "interval join [{}] archived cluster channel roster is invalid",
+                            self.projection.op_name
+                        )));
+                    }
+                    add(
+                        &mut decoded_checkpoint_bytes,
+                        roster(
+                            channels.len(),
+                            std::mem::size_of::<IntervalCheckpointChannel>(),
+                        )?,
+                    )?;
+                    add(
+                        &mut runtime_bytes,
+                        roster(
+                            channels.len(),
+                            std::mem::size_of::<(u64, IntervalPeerChannel)>()
+                                .saturating_add(PEER_CHANNEL_ENTRY_CHARGE),
+                        )?,
+                    )?;
+                    for channel in channels.iter() {
+                        add(
+                            &mut decoded_checkpoint_bytes,
+                            roster(
+                                channel.events.len(),
+                                std::mem::size_of::<IntervalCheckpointEvent>(),
+                            )?,
+                        )?;
+                        add(
+                            &mut runtime_bytes,
+                            roster(channel.events.len(), REMOTE_EVENT_CHARGE)?,
+                        )?;
+                        for event in channel.events.iter() {
+                            if let ArchivedIntervalCheckpointEvent::Data {
+                                routed_vnodes,
+                                ipc,
+                                ..
+                            } = event
+                            {
+                                let routes = routed_vnodes.as_slice();
+                                if routes.is_empty()
+                                    || routes
+                                        .windows(2)
+                                        .any(|pair| pair[0].to_native() >= pair[1].to_native())
+                                    || routes.iter().any(|vnode| {
+                                        let vnode = vnode.to_native();
+                                        vnode >= u32::from(self.key_group_count)
+                                            || assignment
+                                                .owners()
+                                                .get(vnode as usize)
+                                                .is_none_or(|owner| *owner != config.self_id)
+                                    })
+                                {
+                                    return Err(DbError::Checkpoint(format!(
+                                        "interval join [{}] archived queued-data vnode roster is invalid",
+                                        self.projection.op_name
+                                    )));
+                                }
+                                let ipc_preflight =
+                                    preflight_queued_batch_ipc_restore(ipc.as_slice())?;
+                                if ipc_preflight.rows == 0
+                                    || routes.len() > ipc_preflight.rows
+                                    || ipc_preflight.body_bytes > ipc.len()
+                                {
+                                    return Err(DbError::Checkpoint(format!(
+                                        "interval join [{}] archived queued-data IPC shape is invalid",
+                                        self.projection.op_name
+                                    )));
+                                }
+                                add(
+                                    &mut decoded_checkpoint_bytes,
+                                    roster(routes.len(), std::mem::size_of::<u32>())?,
+                                )?;
+                                add(&mut decoded_checkpoint_bytes, allocation(ipc.len())?)?;
+
+                                let decoded_payload = ipc
+                                    .len()
+                                    .checked_mul(8)
+                                    .ok_or_else(|| self.accounting_error())?;
+                                let row_scratch = ipc_preflight
+                                    .rows
+                                    .checked_mul(WHOLE_RESTORE_ROW_SCRATCH_CHARGE)
+                                    .ok_or_else(|| self.accounting_error())?;
+                                let route_scratch = routes
+                                    .len()
+                                    .checked_add(ipc_preflight.rows)
+                                    .and_then(|count| count.checked_mul(std::mem::size_of::<u32>()))
+                                    .and_then(|bytes| bytes.checked_add(2 * ROW_VNODE_ARC_CHARGE))
+                                    .ok_or_else(|| self.accounting_error())?;
+                                let event_runtime = decoded_payload
+                                    .checked_add(row_scratch)
+                                    .and_then(|bytes| bytes.checked_add(route_scratch))
+                                    .and_then(|bytes| bytes.checked_add(4 * HEAP_ALLOCATION_CHARGE))
+                                    .ok_or_else(|| self.accounting_error())?;
+                                add(&mut runtime_bytes, event_runtime)?;
+                            }
+                        }
+                    }
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join [{}] archived checkpoint deployment mode does not match the operator",
+                    self.projection.op_name
+                )));
+            }
+        }
+        #[cfg(not(feature = "cluster"))]
+        if archived.cluster.is_some() {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] archived checkpoint contains cluster channel state",
+                self.projection.op_name
+            )));
+        }
+
+        let generic_decode_bound = bytes
+            .len()
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(8 * HEAP_ALLOCATION_CHARGE))
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] whole restore decode accounting overflow",
+                    self.projection.op_name
+                ))
+            })?;
+        decoded_checkpoint_bytes = decoded_checkpoint_bytes.max(generic_decode_bound);
+        let restore_peak = self
+            .accounted_state_bytes()
+            .checked_add(encoded_bytes)
+            .and_then(|bytes| bytes.checked_add(decoded_checkpoint_bytes))
+            .and_then(|bytes| bytes.checked_add(runtime_bytes))
+            .ok_or_else(|| self.accounting_error())?;
+        if restore_peak > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!(
+                    "interval join [{}] whole checkpoint restore preflight",
+                    self.projection.op_name
+                ),
+                accounted_bytes: restore_peak,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+        Ok(IntervalWholeRestorePreflight {
+            decoded_checkpoint: decoded_checkpoint_bytes,
+            runtime_scratch: runtime_bytes,
+            encoded_frame: encoded_bytes,
+        })
+    }
+
+    fn decoded_whole_checkpoint_bytes(
+        checkpoint: &IntervalJoinOperatorCheckpoint,
+    ) -> Result<usize, DbError> {
+        let allocation = |bytes: usize| {
+            bytes
+                .checked_add(usize::from(bytes != 0) * HEAP_ALLOCATION_CHARGE)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "interval join decoded whole-checkpoint accounting overflow".into(),
+                    )
+                })
+        };
+        let roster = |capacity: usize, item_bytes: usize| {
+            capacity
+                .checked_mul(item_bytes)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "interval join decoded whole-checkpoint roster overflow".into(),
+                    )
+                })
+                .and_then(allocation)
+        };
+        let mut bytes = std::mem::size_of::<IntervalJoinOperatorCheckpoint>();
+        for charge in [
+            roster(
+                checkpoint.left_keys.capacity(),
+                std::mem::size_of::<String>(),
+            )?,
+            roster(
+                checkpoint.right_keys.capacity(),
+                std::mem::size_of::<String>(),
+            )?,
+            allocation(checkpoint.left_time_column.capacity())?,
+            allocation(checkpoint.right_time_column.capacity())?,
+            allocation(checkpoint.left_table.capacity())?,
+            allocation(checkpoint.right_table.capacity())?,
+        ] {
+            bytes = bytes.checked_add(charge).ok_or_else(|| {
+                DbError::Checkpoint(
+                    "interval join decoded whole-checkpoint accounting overflow".into(),
+                )
+            })?;
+        }
+        for key in checkpoint.left_keys.iter().chain(&checkpoint.right_keys) {
+            bytes = bytes
+                .checked_add(allocation(key.capacity())?)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "interval join decoded whole-checkpoint accounting overflow".into(),
+                    )
+                })?;
+        }
+        if let Some(cluster) = &checkpoint.cluster {
+            for channels in &cluster.channels {
+                bytes = bytes
+                    .checked_add(roster(
+                        channels.capacity(),
+                        std::mem::size_of::<IntervalCheckpointChannel>(),
+                    )?)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "interval join decoded whole-checkpoint accounting overflow".into(),
+                        )
+                    })?;
+                for channel in channels {
+                    bytes = bytes
+                        .checked_add(roster(
+                            channel.events.capacity(),
+                            std::mem::size_of::<IntervalCheckpointEvent>(),
+                        )?)
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(
+                                "interval join decoded whole-checkpoint accounting overflow".into(),
+                            )
+                        })?;
+                    for event in &channel.events {
+                        if let IntervalCheckpointEvent::Data {
+                            routed_vnodes, ipc, ..
+                        } = event
+                        {
+                            let route_charge =
+                                roster(routed_vnodes.capacity(), std::mem::size_of::<u32>())?;
+                            let ipc_charge = allocation(ipc.capacity())?;
+                            bytes = bytes
+                                .checked_add(route_charge)
+                                .and_then(|bytes| bytes.checked_add(ipc_charge))
+                                .ok_or_else(|| {
+                                    DbError::Checkpoint(
+                                        "interval join decoded whole-checkpoint accounting overflow"
+                                            .into(),
+                                    )
+                                })?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
     #[cfg(feature = "cluster")]
-    fn checkpoint_assignment_identity(&self) -> Result<(u64, [u8; 32], u64), DbError> {
+    fn checkpoint_assignment_identity(
+        &self,
+        max_scratch_bytes: usize,
+    ) -> Result<(u64, [u8; 32], u64), DbError> {
         let config = self.cluster_shuffle.as_ref().ok_or_else(|| {
             DbError::Checkpoint(format!(
                 "interval join [{}] has no cluster assignment",
@@ -1588,11 +2647,49 @@ impl IntervalJoinOperator {
             ))
         })?;
         let assignment = config.registry.versioned_snapshot();
-        let owners = assignment
+        let requested_owner_bytes = assignment
             .owners()
-            .iter()
-            .map(|owner| owner.0)
-            .collect::<Vec<_>>();
+            .len()
+            .checked_mul(std::mem::size_of::<u64>())
+            .and_then(|bytes| bytes.checked_add(usize::from(bytes != 0) * HEAP_ALLOCATION_CHARGE))
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] checkpoint owner-roster accounting overflow",
+                    self.projection.op_name
+                ))
+            })?;
+        if requested_owner_bytes > max_scratch_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] checkpoint owner roster needs {requested_owner_bytes} bytes; scratch headroom is {max_scratch_bytes} bytes",
+                self.projection.op_name
+            )));
+        }
+        let mut owners = Vec::new();
+        owners
+            .try_reserve_exact(assignment.owners().len())
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] checkpoint owner-roster reservation failed: {error}",
+                    self.projection.op_name
+                ))
+            })?;
+        let actual_owner_bytes = owners
+            .capacity()
+            .checked_mul(std::mem::size_of::<u64>())
+            .and_then(|bytes| bytes.checked_add(usize::from(bytes != 0) * HEAP_ALLOCATION_CHARGE))
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] checkpoint owner-roster accounting overflow",
+                    self.projection.op_name
+                ))
+            })?;
+        if actual_owner_bytes > max_scratch_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] checkpoint owner allocation needs {actual_owner_bytes} bytes; scratch headroom is {max_scratch_bytes} bytes",
+                self.projection.op_name
+            )));
+        }
+        owners.extend(assignment.owners().iter().map(|owner| owner.0));
         let owner_map_digest =
             laminar_core::checkpoint::CheckpointAssignmentFence::owner_map_digest(
                 u32::from(self.key_group_count),
@@ -1623,6 +2720,7 @@ impl IntervalJoinOperator {
         &self,
         transition: &ManagedVnodeTransition<'_>,
         requires_handoff_cut: bool,
+        max_decode_bytes: usize,
     ) -> Result<Option<IntervalHandoffCut>, DbError> {
         if !requires_handoff_cut {
             return Ok(None);
@@ -1658,6 +2756,12 @@ impl IntervalJoinOperator {
         if transition.whole_restores.is_empty() {
             return Ok(None);
         }
+        let predecessor_owners: &[NodeId] = match transition.mode {
+            ManagedVnodeTransitionMode::Live => self.local_assignment.owners(),
+            ManagedVnodeTransitionMode::CheckpointBootstrap { predecessor_owners } => {
+                predecessor_owners
+            }
+        };
 
         let mut whole_donors = std::collections::BTreeSet::new();
         let mut common: Option<IntervalHandoffCut> = None;
@@ -1667,6 +2771,32 @@ impl IntervalJoinOperator {
             {
                 return Err(DbError::Checkpoint(format!(
                     "interval join [{}] has an invalid whole frame for donor {}",
+                    self.projection.op_name, restore.participant_id
+                )));
+            }
+            rkyv::access::<ArchivedIntervalJoinOperatorCheckpoint, rkyv::rancor::Error>(
+                restore.state,
+            )
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] donor {} whole checkpoint archive: {error}",
+                    self.projection.op_name, restore.participant_id
+                ))
+            })?;
+            let decode_preflight = restore
+                .state
+                .len()
+                .checked_mul(4)
+                .and_then(|bytes| bytes.checked_add(8 * HEAP_ALLOCATION_CHARGE))
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "interval join [{}] donor {} whole decode accounting overflow",
+                        self.projection.op_name, restore.participant_id
+                    ))
+                })?;
+            if decode_preflight > max_decode_bytes {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join [{}] donor {} whole checkpoint needs {decode_preflight} bytes of decode headroom; remaining transition headroom is {max_decode_bytes} bytes",
                     self.projection.op_name, restore.participant_id
                 )));
             }
@@ -1680,6 +2810,13 @@ impl IntervalJoinOperator {
                         self.projection.op_name, restore.participant_id
                     ))
                 })?;
+            let decoded_bytes = Self::decoded_whole_checkpoint_bytes(&checkpoint)?;
+            if decoded_bytes > decode_preflight || decoded_bytes > max_decode_bytes {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join [{}] donor {} decoded whole checkpoint exceeds its preflighted transition headroom",
+                    self.projection.op_name, restore.participant_id
+                )));
+            }
             self.validate_checkpoint_config(&checkpoint)?;
             let Some(cluster) = checkpoint.cluster.as_ref() else {
                 return Err(DbError::Checkpoint(format!(
@@ -1690,16 +2827,100 @@ impl IntervalJoinOperator {
             if cluster.assignment_version != transition.predecessor.assignment_version
                 || cluster.owner_map_digest != transition.predecessor.assignment_digest
                 || cluster.self_id != restore.participant_id
-                || cluster
-                    .channels
-                    .iter()
-                    .flatten()
-                    .any(|channel| !channel.events.is_empty())
             {
                 return Err(DbError::Checkpoint(format!(
                     "interval join [{}] donor {} whole checkpoint is not a portable predecessor cut",
                     self.projection.op_name, restore.participant_id
                 )));
+            }
+            let mut expected_peers = Vec::new();
+            expected_peers
+                .try_reserve_exact(predecessor_owners.len())
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "interval join [{}] donor {} peer-roster reservation failed: {error}",
+                        self.projection.op_name, restore.participant_id
+                    ))
+                })?;
+            expected_peers.extend(
+                predecessor_owners
+                    .iter()
+                    .filter(|owner| !owner.is_unassigned() && owner.0 != restore.participant_id)
+                    .map(|owner| owner.0),
+            );
+            expected_peers.sort_unstable();
+            expected_peers.dedup();
+            let local_frontiers = cluster.local_frontiers.map(Into::into);
+            for side in [JoinInputSide::Left, JoinInputSide::Right] {
+                self.validate_frontier(
+                    InputFrontier::default(),
+                    local_frontiers[side.port()],
+                    side,
+                )?;
+            }
+            if cluster.remote_side_cursor > 1 {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join [{}] donor {} whole checkpoint has an invalid side cursor",
+                    self.projection.op_name, restore.participant_id
+                )));
+            }
+            for side in [JoinInputSide::Left, JoinInputSide::Right] {
+                let port = side.port();
+                if cluster.channels[port].len() != expected_peers.len()
+                    || !cluster.channels[port]
+                        .iter()
+                        .map(|channel| channel.peer)
+                        .eq(expected_peers.iter().copied())
+                    || cluster.channels[port]
+                        .iter()
+                        .any(|channel| !channel.events.is_empty())
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "interval join [{}] donor {} {} portable channel roster is invalid",
+                        self.projection.op_name,
+                        restore.participant_id,
+                        side.name()
+                    )));
+                }
+                for channel in &cluster.channels[port] {
+                    let frontier: InputFrontier = channel.applied.into();
+                    self.validate_frontier(InputFrontier::default(), frontier, side)?;
+                }
+                if cluster.remote_peer_cursors[port]
+                    .is_some_and(|peer| expected_peers.binary_search(&peer).is_err())
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "interval join [{}] donor {} portable remote cursor is invalid",
+                        self.projection.op_name, restore.participant_id
+                    )));
+                }
+                let merged = merge_input_frontier_iter(
+                    std::iter::once(local_frontiers[port]).chain(
+                        cluster.channels[port]
+                            .iter()
+                            .map(|channel| InputFrontier::from(channel.applied)),
+                    ),
+                    i64::MIN,
+                );
+                let (expected_watermark, expected_idle) = if port == 0 {
+                    (
+                        checkpoint.applied_left_watermark,
+                        checkpoint.applied_left_idle,
+                    )
+                } else {
+                    (
+                        checkpoint.applied_right_watermark,
+                        checkpoint.applied_right_idle,
+                    )
+                };
+                if merged.watermark.unwrap_or(i64::MIN) != expected_watermark
+                    || merged.idle != expected_idle
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "interval join [{}] donor {} portable applied frontier has no exact drained-cut evidence",
+                        self.projection.op_name, restore.participant_id
+                    )));
+                }
             }
             let cut = IntervalHandoffCut {
                 left_watermark: checkpoint.applied_left_watermark,
@@ -1734,9 +2955,19 @@ impl IntervalJoinOperator {
     #[cfg(feature = "cluster")]
     fn restored_handoff_cut_evidence(
         &self,
-        state: &IntervalJoinState,
+        state: &IntervalJoinVnodeState,
         context: &str,
     ) -> Result<Option<IntervalHandoffCut>, DbError> {
+        if let Some(ordered) = &state.ordered {
+            let cut = IntervalHandoffCut {
+                left_watermark: ordered.left.closed_cutoff(),
+                right_watermark: ordered.right.closed_cutoff(),
+                left_idle: false,
+                right_idle: false,
+            };
+            Self::validate_ordered_core_cutoffs(state, &self.config, context, cut)?;
+            return Ok(Some(cut));
+        }
         let (left_rows, right_rows) = state.buffered_rows();
         let (left_evicted_cutoff, right_evicted_cutoff) = state.evicted_cutoffs();
         if left_rows == 0
@@ -1813,20 +3044,34 @@ impl IntervalJoinOperator {
         if slot.is_none() && !has_input {
             return Ok(Vec::new());
         }
-        if slot.is_none() && IntervalJoinState::new().accounted_state_bytes() > shard_limit {
-            return Err(DbError::BackpressureFail(format!(
-                "interval join [{}] cannot allocate vnode {vnode} state within its {shard_limit}-byte remaining limit",
-                self.projection.op_name
-            )));
-        }
-        if slot.is_none() {
-            let mut state = IntervalJoinState::new();
-            if let Some((left_schema, right_schema)) = &self.input_schemas {
-                state.seed_input_schemas(
-                    left_schema.clone(),
-                    right_schema.clone(),
+        let initialized_new = slot.is_none();
+        if initialized_new {
+            let state = if let Some(spec) = &self.ordered_input_spec {
+                IntervalJoinVnodeState::try_new_ordered(
+                    vnode,
+                    spec,
+                    self.max_managed_state_bytes,
+                    shard_limit,
                     &self.config,
-                )?;
+                    left_admission_watermark,
+                    right_admission_watermark,
+                )?
+            } else {
+                let mut state = IntervalJoinVnodeState::new_append();
+                if let Some((left_schema, right_schema)) = &self.input_schemas {
+                    state.seed_input_schemas(
+                        left_schema.clone(),
+                        right_schema.clone(),
+                        &self.config,
+                    )?;
+                }
+                state
+            };
+            if state.accounted_state_bytes() > shard_limit {
+                return Err(DbError::BackpressureFail(format!(
+                    "interval join [{}] cannot allocate vnode {vnode} state within its {shard_limit}-byte remaining limit",
+                    self.projection.op_name
+                )));
             }
             self.vnode_states[vnode_index] = Some(Box::new(state));
             self.add_resident_vnode(vnode);
@@ -1835,22 +3080,121 @@ impl IntervalJoinOperator {
             .as_mut()
             .expect("interval join state initialized");
         let cutoffs_before = state.evicted_cutoffs();
-        let result = execute_interval_join_cycle(
-            state,
-            left,
-            right,
-            &self.config,
-            left_admission_watermark,
-            right_admission_watermark,
-            left_watermark,
-            right_watermark,
-            shard_limit,
-            output_budget,
-        );
+        let ordered_cutoffs_before = state
+            .ordered
+            .as_ref()
+            .map(|ordered| (ordered.left.closed_cutoff(), ordered.right.closed_cutoff()));
+        let result = (|| {
+            if state.ordered.is_none() {
+                execute_interval_join_cycle(
+                    &mut state.core,
+                    left,
+                    right,
+                    &self.config,
+                    left_admission_watermark,
+                    right_admission_watermark,
+                    left_watermark,
+                    right_watermark,
+                    shard_limit,
+                    output_budget,
+                )
+            } else {
+                let IntervalJoinVnodeState { core, ordered } = state.as_mut();
+                let ordered = ordered
+                    .as_mut()
+                    .expect("ordered vnode checked before differential execution");
+                if ordered.left.closed_cutoff() != left_admission_watermark
+                    || ordered.right.closed_cutoff() != right_admission_watermark
+                {
+                    return Err(DbError::PipelineTerminal(format!(
+                        "interval join [{}] vnode {vnode} ordered cutoffs disagree with applied input frontiers",
+                        self.projection.op_name
+                    )));
+                }
+                let wrapper_charge = HEAP_ALLOCATION_CHARGE;
+                let core_current = core.accounted_state_bytes();
+                let right_current = ordered.right.accounted_state_bytes();
+                let left_limit = shard_limit
+                    .checked_sub(wrapper_charge)
+                    .and_then(|bytes| bytes.checked_sub(core_current))
+                    .and_then(|bytes| bytes.checked_sub(right_current))
+                    .ok_or_else(|| {
+                        DbError::BackpressureFail(format!(
+                            "interval join [{}] vnode {vnode} ordered state exceeds its shard budget",
+                            self.projection.op_name
+                        ))
+                    })?;
+                let left_prepared = ordered.left.prepare_batches(
+                    left,
+                    left_admission_watermark,
+                    left_watermark,
+                    left_limit,
+                )?;
+                let left_projected = left_prepared.projected_state_bytes();
+                let left_reserved = left_prepared.transient_state_bytes().max(left_projected);
+                let right_limit = shard_limit
+                    .checked_sub(wrapper_charge)
+                    .and_then(|bytes| bytes.checked_sub(core_current))
+                    .and_then(|bytes| bytes.checked_sub(left_reserved))
+                    .ok_or_else(|| {
+                        DbError::BackpressureFail(format!(
+                            "interval join [{}] vnode {vnode} left normalization exhausted its shard budget",
+                            self.projection.op_name
+                        ))
+                    })?;
+                let right_prepared = ordered.right.prepare_batches(
+                    right,
+                    right_admission_watermark,
+                    right_watermark,
+                    right_limit,
+                )?;
+                let right_projected = right_prepared.projected_state_bytes();
+                let right_reserved = right_prepared.transient_state_bytes().max(right_projected);
+                let core_limit = shard_limit
+                    .checked_sub(wrapper_charge)
+                    .and_then(|bytes| bytes.checked_sub(left_reserved))
+                    .and_then(|bytes| bytes.checked_sub(right_reserved))
+                    .ok_or_else(|| {
+                        DbError::BackpressureFail(format!(
+                            "interval join [{}] vnode {vnode} normalization exhausted its shard budget",
+                            self.projection.op_name
+                        ))
+                    })?;
+                let result = execute_weighted_interval_join_cycle(
+                    core,
+                    left_prepared.output_batches(),
+                    right_prepared.output_batches(),
+                    &self.config,
+                    left_watermark,
+                    right_watermark,
+                    core_limit,
+                    output_budget,
+                );
+                match result {
+                    Ok(output) => {
+                        left_prepared.commit();
+                        right_prepared.commit();
+                        Ok(output)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        })();
         *accounted_total = other_state_bytes.saturating_add(state.accounted_state_bytes());
-        let checkpoint_state_changed = has_input || state.evicted_cutoffs() != cutoffs_before;
+        let checkpoint_state_changed = has_input
+            || state.evicted_cutoffs() != cutoffs_before
+            || state
+                .ordered
+                .as_ref()
+                .map(|ordered| (ordered.left.closed_cutoff(), ordered.right.closed_cutoff()))
+                != ordered_cutoffs_before;
         if result.is_ok() && checkpoint_state_changed {
             self.mark_vnode_dirty(vnode);
+        }
+        if result.is_err() && initialized_new {
+            self.vnode_states[vnode_index] = None;
+            self.remove_resident_vnode(vnode);
+            *accounted_total = other_state_bytes;
         }
         result
     }
@@ -1965,7 +3309,58 @@ impl IntervalJoinOperator {
                 self.input_schemas
                     .as_ref()
                     .map(|schemas| if port == 0 { &schemas.0 } else { &schemas.1 });
-            for (batch_index, batch) in inputs.get(port).into_iter().flatten().enumerate() {
+            let ordered_spec = self.ordered_input_spec.as_ref().map(|spec| {
+                if port == 0 {
+                    &spec.left
+                } else {
+                    &spec.right
+                }
+            });
+            for (batch_index, routed_batch) in inputs.get(port).into_iter().flatten().enumerate() {
+                let stripped;
+                let batch = if ordered_spec.is_some() {
+                    laminar_connectors::connector::source_row_positions(routed_batch)
+                        .map_err(|error| {
+                            DbError::SchemaMismatch(format!(
+                                "interval join [{}] {side} batch {batch_index} source positions: {error}",
+                                self.projection.op_name
+                            ))
+                        })?
+                        .ok_or_else(|| {
+                            DbError::SchemaMismatch(format!(
+                                "interval join [{}] {side} batch {batch_index} requires deterministic source positions",
+                                self.projection.op_name
+                            ))
+                        })?;
+                    laminar_connectors::connector::source_mutations_routed(routed_batch).map_err(
+                        |error| {
+                            DbError::SchemaMismatch(format!(
+                                "interval join [{}] {side} batch {batch_index} source mutations: {error}",
+                                self.projection.op_name
+                            ))
+                        },
+                    )?;
+                    let positioned =
+                        laminar_connectors::connector::strip_source_mutations_routed(routed_batch)
+                            .map_err(|error| {
+                                DbError::SchemaMismatch(format!(
+                                    "interval join [{}] {side} batch {batch_index} source mutations: {error}",
+                                    self.projection.op_name
+                                ))
+                            })?;
+                    stripped = laminar_connectors::connector::strip_source_row_positions(
+                        &positioned,
+                    )
+                    .map_err(|error| {
+                        DbError::SchemaMismatch(format!(
+                            "interval join [{}] {side} batch {batch_index} source positions: {error}",
+                            self.projection.op_name
+                        ))
+                    })?;
+                    &stripped
+                } else {
+                    routed_batch
+                };
                 if let Some(expected) = expected_schema {
                     if batch.schema().as_ref() != expected.as_ref() {
                         return Err(DbError::SchemaMismatch(format!(
@@ -2531,7 +3926,6 @@ impl IntervalJoinOperator {
         Ok(bytes)
     }
 
-    #[cfg(feature = "cluster")]
     fn accounting_error(&self) -> DbError {
         DbError::Pipeline(format!(
             "interval join [{}] managed-state accounting overflow",
@@ -3178,6 +4572,7 @@ impl GraphOperator for IntervalJoinOperator {
                 self.max_managed_state_bytes
             )));
         }
+        let restore_preflight = self.preflight_whole_restore_archive(&checkpoint.data)?;
         let checkpoint = rkyv::from_bytes::<IntervalJoinOperatorCheckpoint, rkyv::rancor::Error>(
             &checkpoint.data,
         )
@@ -3187,12 +4582,40 @@ impl GraphOperator for IntervalJoinOperator {
                 self.projection.op_name
             ))
         })?;
+        let decoded_checkpoint_bytes = Self::decoded_whole_checkpoint_bytes(&checkpoint)?;
+        if decoded_checkpoint_bytes > restore_preflight.decoded_checkpoint {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] decoded whole checkpoint exceeds its preflighted bound",
+                self.projection.op_name
+            )));
+        }
+        let decoded_peak = self
+            .accounted_state_bytes()
+            .checked_add(restore_preflight.encoded_frame)
+            .and_then(|bytes| bytes.checked_add(decoded_checkpoint_bytes))
+            .and_then(|bytes| bytes.checked_add(restore_preflight.runtime_scratch))
+            .ok_or_else(|| self.accounting_error())?;
+        if decoded_peak > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!(
+                    "interval join [{}] decoded whole checkpoint restore",
+                    self.projection.op_name
+                ),
+                accounted_bytes: decoded_peak,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
         self.validate_checkpoint_config(&checkpoint)?;
         #[cfg(feature = "cluster")]
         let decoded_cluster = match (self.cluster_shuffle.clone(), checkpoint.cluster) {
             (Some(config), Some(cluster)) => {
                 let (_, assignment, peers) = self.active_cluster_scope()?;
-                let expected = self.checkpoint_assignment_identity()?;
+                let owner_map_digest =
+                    laminar_core::checkpoint::CheckpointAssignmentFence::owner_map_digest_iter(
+                        u32::from(self.key_group_count),
+                        assignment.owners().iter().map(|owner| owner.0),
+                    );
+                let expected = (assignment.version(), owner_map_digest, config.self_id.0);
                 if cluster.assignment_version != expected.0
                     || cluster.owner_map_digest != expected.1
                     || cluster.self_id != expected.2
@@ -3460,6 +4883,28 @@ impl GraphOperator for IntervalJoinOperator {
                 .and_then(|bytes| bytes.checked_add(*capacity_bytes))
                 .and_then(|bytes| bytes.checked_add(*queued_bytes))
                 .ok_or_else(|| self.accounting_error())?;
+            if restored_cluster > restore_preflight.runtime_scratch {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join [{}] restored cluster state exceeds its preflighted bound",
+                    self.projection.op_name
+                )));
+            }
+            let restore_peak = self
+                .accounted_state_bytes()
+                .checked_add(restore_preflight.encoded_frame)
+                .and_then(|bytes| bytes.checked_add(decoded_checkpoint_bytes))
+                .and_then(|bytes| bytes.checked_add(restored_cluster))
+                .ok_or_else(|| self.accounting_error())?;
+            if restore_peak > self.max_managed_state_bytes {
+                return Err(DbError::ManagedStateBudgetExceeded {
+                    context: format!(
+                        "interval join [{}] cluster checkpoint restore peak",
+                        self.projection.op_name
+                    ),
+                    accounted_bytes: restore_peak,
+                    limit_bytes: self.max_managed_state_bytes,
+                });
+            }
             let projected_accounted = self
                 .accounted_state_bytes()
                 .checked_sub(self.cluster_accounted_bytes())
@@ -3743,7 +5188,10 @@ impl GraphOperator for IntervalJoinOperator {
                         self.projection.op_name
                     )));
                 }
-                let state_capture = state.capture_checkpoint(&self.config)?;
+                let state_capture = state.capture_checkpoint(
+                    &self.config,
+                    usize::try_from(remaining_capture_bytes).unwrap_or(usize::MAX),
+                )?;
                 let retained_bytes =
                     u64::try_from(state_capture.retained_bytes()).unwrap_or(u64::MAX);
                 retained_capture_bytes = retained_capture_bytes
@@ -3818,30 +5266,47 @@ impl GraphOperator for IntervalJoinOperator {
         let remaining = self
             .max_managed_state_bytes
             .checked_sub(other_bytes)
+            .and_then(|bytes| bytes.checked_sub(state.len()))
             .ok_or_else(|| {
                 DbError::Checkpoint(format!(
-                    "interval join [{}] restored state exceeds its {}-byte limit",
+                    "interval join [{}] live state plus encoded vnode exceeds its {}-byte restore limit",
                     self.projection.op_name, self.max_managed_state_bytes
                 ))
             })?;
+        let ordered_cut = self
+            .ordered_input_spec
+            .as_ref()
+            .map(|_| IntervalHandoffCut {
+                left_watermark: self.applied_left_watermark,
+                right_watermark: self.applied_right_watermark,
+                #[cfg(feature = "cluster")]
+                left_idle: self.applied_left_idle,
+                #[cfg(feature = "cluster")]
+                right_idle: self.applied_right_idle,
+            });
         let replacement = Self::decode_vnode_frame(
             state,
+            vnode,
             &self.config,
+            self.ordered_input_spec.as_ref(),
             &format!(
                 "interval join [{}] vnode {vnode} restore",
                 self.projection.op_name
             ),
             remaining,
-            None,
+            self.max_managed_state_bytes,
+            ordered_cut,
         )?;
         self.vnode_states[vnode as usize] = if let Some(mut replacement) = replacement {
             replacement.validate_vnode(vnode, vnode_count, &self.config)?;
-            if let Some((left_schema, right_schema)) = &self.input_schemas {
-                replacement.seed_input_schemas(
-                    left_schema.clone(),
-                    right_schema.clone(),
-                    &self.config,
-                )?;
+            if replacement.ordered.is_none() {
+                if let Some((left_schema, right_schema)) = &self.input_schemas {
+                    replacement.seed_input_schemas(
+                        left_schema.clone(),
+                        right_schema.clone(),
+                        &self.config,
+                    )?;
+                }
             }
             Some(Box::new(replacement))
         } else {
@@ -3884,20 +5349,261 @@ impl GraphOperator for IntervalJoinOperator {
             ))
         })?;
         let assignment = config.registry.versioned_snapshot();
-        let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
-        let installed_owners: Vec<u64> = self
-            .local_assignment
-            .owners()
+        let allocation = |bytes: usize| {
+            bytes
+                .checked_add(usize::from(bytes != 0) * HEAP_ALLOCATION_CHARGE)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "interval join [{}] transition allocation accounting overflow",
+                        self.projection.op_name
+                    ))
+                })
+        };
+        let roster = |capacity: usize, item_bytes: usize| {
+            capacity
+                .checked_mul(item_bytes)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "interval join [{}] transition roster accounting overflow",
+                        self.projection.op_name
+                    ))
+                })
+                .and_then(allocation)
+        };
+        let live_bytes = self.accounted_state_bytes();
+        let transition_payload_bytes = transition
+            .restores
             .iter()
-            .map(|owner| owner.0)
-            .collect();
+            .map(|restore| restore.state.len())
+            .chain(
+                transition
+                    .whole_restores
+                    .iter()
+                    .map(|restore| restore.state.len()),
+            )
+            .try_fold(0usize, usize::checked_add)
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] transition payload accounting overflow",
+                    self.projection.op_name
+                ))
+            })?;
+        let replacement_capacity = transition
+            .revoked
+            .len()
+            .checked_add(transition.restores.len())
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] transition replacement accounting overflow",
+                    self.projection.op_name
+                ))
+            })?;
+        let target_resident_capacity = self
+            .resident_vnodes
+            .len()
+            .checked_add(transition.restores.len())
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] transition resident-roster accounting overflow",
+                    self.projection.op_name
+                ))
+            })?;
+        let target_peer_capacity = assignment.owners().len();
+        let owner_roster_capacity = assignment
+            .owners()
+            .len()
+            .max(self.local_assignment.owners().len());
+        let owner_roster_charge = roster(owner_roster_capacity, std::mem::size_of::<u64>())?;
+        let replacement_item_bytes =
+            std::mem::size_of::<(u32, Option<Box<IntervalJoinVnodeState>>)>();
+        let replacement_tree_payload = replacement_capacity
+            .checked_mul(
+                replacement_item_bytes
+                    .checked_add(PEER_CHANNEL_ENTRY_CHARGE)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "interval join [{}] transition replacement accounting overflow",
+                            self.projection.op_name
+                        ))
+                    })?,
+            )
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] transition replacement accounting overflow",
+                    self.projection.op_name
+                ))
+            })?;
+        let replacement_tree_charge = allocation(replacement_tree_payload)?;
+        let peer_channel_payload = target_peer_capacity
+            .checked_mul(2)
+            .and_then(|entries| {
+                entries.checked_mul(
+                    std::mem::size_of::<(u64, IntervalPeerChannel)>()
+                        .checked_add(PEER_CHANNEL_ENTRY_CHARGE)?,
+                )
+            })
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] transition channel accounting overflow",
+                    self.projection.op_name
+                ))
+            })?;
+        let peer_channel_charge = allocation(peer_channel_payload)?;
+        let owner_peer_roster_charge = roster(owner_roster_capacity, std::mem::size_of::<u64>())?;
+        let target_peer_roster_charge = roster(target_peer_capacity, std::mem::size_of::<u64>())?;
+        let replacement_roster_charge = roster(replacement_capacity, replacement_item_bytes)?;
+        let resident_roster_charge = roster(target_resident_capacity, std::mem::size_of::<u32>())?;
+        let owner_tree_charge = allocation(
+            owner_roster_capacity
+                .checked_mul(
+                    std::mem::size_of::<u64>()
+                        .checked_add(PEER_CHANNEL_ENTRY_CHARGE)
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "interval join [{}] owner-tree accounting overflow",
+                                self.projection.op_name
+                            ))
+                        })?,
+                )
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "interval join [{}] owner-tree accounting overflow",
+                        self.projection.op_name
+                    ))
+                })?,
+        )?;
+        let donor_tree_charge = allocation(
+            transition
+                .restores
+                .len()
+                .checked_add(transition.whole_restores.len())
+                .and_then(|entries| {
+                    entries.checked_mul(
+                        std::mem::size_of::<u64>().checked_add(PEER_CHANNEL_ENTRY_CHARGE)?,
+                    )
+                })
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "interval join [{}] donor-tree accounting overflow",
+                        self.projection.op_name
+                    ))
+                })?,
+        )?;
+        let mut scaffold_bytes = std::mem::size_of::<PreparedIntervalJoinTransition>();
+        for charge in [
+            std::mem::size_of::<VnodeAssignmentSnapshot>(),
+            32,
+            // Target, installed, optional bootstrap, and one internal owner-map roster may
+            // overlap while assignment fences are validated.
+            owner_roster_charge.checked_mul(4).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] transition scaffold accounting overflow",
+                    self.projection.op_name
+                ))
+            })?,
+            owner_tree_charge,
+            donor_tree_charge,
+            // Predecessor/target peer scratch and the final Arc allocation may overlap.
+            owner_peer_roster_charge.checked_mul(2).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] transition scaffold accounting overflow",
+                    self.projection.op_name
+                ))
+            })?,
+            target_peer_roster_charge.checked_mul(2).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] transition scaffold accounting overflow",
+                    self.projection.op_name
+                ))
+            })?,
+            replacement_tree_charge,
+            replacement_roster_charge,
+            resident_roster_charge,
+            peer_channel_charge,
+            512,
+        ] {
+            scaffold_bytes = scaffold_bytes.checked_add(charge).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] transition scaffold accounting overflow",
+                    self.projection.op_name
+                ))
+            })?;
+        }
+        let largest_whole_decode = transition
+            .whole_restores
+            .iter()
+            .try_fold(0usize, |largest, restore| {
+                restore
+                    .state
+                    .len()
+                    .checked_mul(4)
+                    .and_then(|bytes| bytes.checked_add(8 * HEAP_ALLOCATION_CHARGE))
+                    .map(|bytes| largest.max(bytes))
+            })
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] whole-checkpoint decode accounting overflow",
+                    self.projection.op_name
+                ))
+            })?;
+        let fixed_transition_bytes = live_bytes
+            .checked_add(transition_payload_bytes)
+            .and_then(|bytes| bytes.checked_add(scaffold_bytes))
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] transition accounting overflow",
+                    self.projection.op_name
+                ))
+            })?;
+        let whole_decode_headroom = self
+            .max_managed_state_bytes
+            .checked_sub(fixed_transition_bytes)
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] transition live state, payload, and scaffolding exceed its {}-byte limit",
+                    self.projection.op_name, self.max_managed_state_bytes
+                ))
+            })?;
+        if largest_whole_decode > whole_decode_headroom {
+            return Err(DbError::Checkpoint(format!(
+                "interval join [{}] transition whole decode needs {largest_whole_decode} bytes; remaining headroom is {whole_decode_headroom} bytes",
+                self.projection.op_name
+            )));
+        }
+
+        let mut owners = Vec::new();
+        owners
+            .try_reserve_exact(assignment.owners().len())
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] target owner-roster reservation failed: {error}",
+                    self.projection.op_name
+                ))
+            })?;
+        owners.extend(assignment.owners().iter().map(|owner| owner.0));
+        let mut installed_owners = Vec::new();
+        installed_owners
+            .try_reserve_exact(self.local_assignment.owners().len())
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] installed owner-roster reservation failed: {error}",
+                    self.projection.op_name
+                ))
+            })?;
+        installed_owners.extend(self.local_assignment.owners().iter().map(|owner| owner.0));
         let checkpoint_bootstrap = match transition.mode {
             ManagedVnodeTransitionMode::Live => false,
             ManagedVnodeTransitionMode::CheckpointBootstrap { predecessor_owners } => {
-                let predecessor_owner_ids = predecessor_owners
-                    .iter()
-                    .map(|owner| owner.0)
-                    .collect::<Vec<_>>();
+                let mut predecessor_owner_ids = Vec::new();
+                predecessor_owner_ids
+                    .try_reserve_exact(predecessor_owners.len())
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "interval join [{}] predecessor owner-roster reservation failed: {error}",
+                            self.projection.op_name
+                        ))
+                    })?;
+                predecessor_owner_ids.extend(predecessor_owners.iter().map(|owner| owner.0));
                 if !transition
                     .predecessor
                     .matches_owner_map(&predecessor_owner_ids)
@@ -3963,7 +5669,11 @@ impl GraphOperator for IntervalJoinOperator {
                     .predecessor
                     .participant_incarnation(config.self_id.0)
                     != Some(config.sender.incarnation()));
-        let predecessor_peers = Self::remote_owner_peers(&self.local_assignment, config.self_id);
+        let predecessor_peers = Self::try_remote_owner_peers(
+            &self.local_assignment,
+            config.self_id,
+            "interval join transition predecessor",
+        )?;
         if !fresh_acquirer
             && (self.cluster_peers.as_ref() != predecessor_peers.as_slice()
                 || self.peer_channels.iter().any(|channels| {
@@ -3988,18 +5698,14 @@ impl GraphOperator for IntervalJoinOperator {
                 .owners()
                 .iter()
                 .zip(0_u32..)
-                .filter_map(|(owner, vnode)| (*owner == config.self_id).then_some(vnode))
-                .collect::<Vec<_>>();
-            let restored = transition
+                .filter_map(|(owner, vnode)| (*owner == config.self_id).then_some(vnode));
+            let target_owned_count = target_owned.clone().count();
+            let exact_restore_roster = transition
                 .restores
                 .iter()
                 .map(|restore| restore.vnode)
-                .collect::<Vec<_>>();
-            if !transition.revoked.is_empty()
-                || target_owned.is_empty()
-                || restored != target_owned
-                || restored.windows(2).any(|pair| pair[0] >= pair[1])
-            {
+                .eq(target_owned);
+            if !transition.revoked.is_empty() || target_owned_count == 0 || !exact_restore_roster {
                 return Err(DbError::Checkpoint(format!(
                     "interval join [{}] fresh-owner transition does not contain every acquired vnode frame",
                     self.projection.op_name
@@ -4017,7 +5723,8 @@ impl GraphOperator for IntervalJoinOperator {
             && self.queued_remote_events == 0
             && self.pending_cluster_input.is_none();
         let requires_handoff_cut = fresh_acquirer || pristine_restore_target;
-        let mut handoff_cut = self.portable_handoff_cut(&transition, requires_handoff_cut)?;
+        let mut handoff_cut =
+            self.portable_handoff_cut(&transition, requires_handoff_cut, whole_decode_headroom)?;
         let derive_handoff_cut = requires_handoff_cut && handoff_cut.is_none();
         let restore_cut = if transition.restores.is_empty() || derive_handoff_cut {
             None
@@ -4049,12 +5756,10 @@ impl GraphOperator for IntervalJoinOperator {
             }
             replacements.insert(*vnode, None);
         }
-        let mut restore_vnodes = rustc_hash::FxHashSet::default();
-        let mut restore_payload_bytes = 0usize;
-        for restore in transition.restores {
-            if !restore_vnodes.insert(restore.vnode) {
+        for (restore_index, restore) in transition.restores.iter().enumerate() {
+            if restore_index != 0 && transition.restores[restore_index - 1].vnode >= restore.vnode {
                 return Err(DbError::Checkpoint(format!(
-                    "interval join [{}] transition repeats restored vnode {}",
+                    "interval join [{}] transition restore roster is not strictly ordered at vnode {}",
                     self.projection.op_name, restore.vnode
                 )));
             }
@@ -4068,33 +5773,15 @@ impl GraphOperator for IntervalJoinOperator {
                     self.projection.op_name, restore.vnode
                 )));
             }
-            restore_payload_bytes = restore_payload_bytes
-                .checked_add(restore.state.len())
-                .ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "interval join [{}] transition restore payload accounting overflow",
-                        self.projection.op_name
-                    ))
-                })?;
-            if restore_payload_bytes > self.max_managed_state_bytes {
-                return Err(DbError::Checkpoint(format!(
-                    "interval join [{}] transition restore payload exceeds its {}-byte limit",
-                    self.projection.op_name, self.max_managed_state_bytes
-                )));
-            }
         }
 
-        let live_bytes = self.accounted_state_bytes();
         let mut restored_bytes = 0usize;
         let mut recovered_cut: Option<IntervalHandoffCut> = None;
         for restore in transition.restores {
             let remaining = self
                 .max_managed_state_bytes
-                .checked_sub(
-                    live_bytes
-                        .saturating_add(restore_payload_bytes)
-                        .saturating_add(restored_bytes),
-                )
+                .checked_sub(fixed_transition_bytes)
+                .and_then(|bytes| bytes.checked_sub(restored_bytes))
                 .ok_or_else(|| {
                     DbError::Checkpoint(format!(
                         "interval join [{}] transition state exceeds its {}-byte limit",
@@ -4107,9 +5794,12 @@ impl GraphOperator for IntervalJoinOperator {
             );
             let Some(mut state) = Self::decode_vnode_frame(
                 restore.state,
+                restore.vnode,
                 &self.config,
+                self.ordered_input_spec.as_ref(),
                 &context,
                 remaining,
+                self.max_managed_state_bytes,
                 restore_cut,
             )?
             else {
@@ -4130,15 +5820,24 @@ impl GraphOperator for IntervalJoinOperator {
                     recovered_cut = Some(candidate);
                 }
             }
-            if let Some((left_schema, right_schema)) = &self.input_schemas {
-                state.seed_input_schemas(
-                    left_schema.clone(),
-                    right_schema.clone(),
-                    &self.config,
-                )?;
+            if state.ordered.is_none() {
+                if let Some((left_schema, right_schema)) = &self.input_schemas {
+                    state.seed_input_schemas(
+                        left_schema.clone(),
+                        right_schema.clone(),
+                        &self.config,
+                    )?;
+                }
             }
             state.validate_vnode(restore.vnode, transition.target.vnode_count, &self.config)?;
-            restored_bytes = restored_bytes.saturating_add(state.accounted_state_bytes());
+            restored_bytes = restored_bytes
+                .checked_add(state.accounted_state_bytes())
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "interval join [{}] restored vnode accounting overflow",
+                        self.projection.op_name
+                    ))
+                })?;
             replacements.insert(restore.vnode, Some(Box::new(state)));
         }
         if derive_handoff_cut {
@@ -4152,20 +5851,25 @@ impl GraphOperator for IntervalJoinOperator {
                 .iter()
                 .filter_map(|(vnode, state)| state.as_deref().map(|state| (*vnode, state)))
             {
-                let (left_rows, right_rows) = state.buffered_rows();
-                let (left_evicted_cutoff, right_evicted_cutoff) = state.evicted_cutoffs();
-                Self::validate_handoff_cutoffs(
-                    left_evicted_cutoff,
-                    right_evicted_cutoff,
-                    left_rows != 0,
-                    right_rows != 0,
-                    &self.config,
-                    &format!(
-                        "interval join [{}] vnode {vnode} restore",
-                        self.projection.op_name
-                    ),
-                    cut,
-                )?;
+                let context = format!(
+                    "interval join [{}] vnode {vnode} restore",
+                    self.projection.op_name
+                );
+                if state.ordered.is_some() {
+                    Self::validate_ordered_core_cutoffs(state, &self.config, &context, cut)?;
+                } else {
+                    let (left_rows, right_rows) = state.buffered_rows();
+                    let (left_evicted_cutoff, right_evicted_cutoff) = state.evicted_cutoffs();
+                    Self::validate_handoff_cutoffs(
+                        left_evicted_cutoff,
+                        right_evicted_cutoff,
+                        left_rows != 0,
+                        right_rows != 0,
+                        &self.config,
+                        &context,
+                        cut,
+                    )?;
+                }
             }
             handoff_cut = Some(cut);
         }
@@ -4185,12 +5889,6 @@ impl GraphOperator for IntervalJoinOperator {
                 )));
             }
         }
-        let target_resident_capacity = self.resident_vnodes.len().saturating_add(
-            replacements
-                .values()
-                .filter(|state| state.is_some())
-                .count(),
-        );
         let mut resident_vnodes = Vec::new();
         resident_vnodes
             .try_reserve_exact(target_resident_capacity)
@@ -4218,7 +5916,11 @@ impl GraphOperator for IntervalJoinOperator {
             }
         }
         resident_vnodes.extend_from_slice(&self.resident_vnodes[resident_index..]);
-        let target_peers = Self::remote_owner_peers(&assignment, config.self_id);
+        let target_peers = Self::try_remote_owner_peers(
+            &assignment,
+            config.self_id,
+            "interval join transition target",
+        )?;
         let transition_frontiers = handoff_cut.map_or(self.applied_frontiers(), |cut| {
             [
                 InputFrontier {
@@ -4261,8 +5963,18 @@ impl GraphOperator for IntervalJoinOperator {
             && (fresh_acquirer
                 || peer_incarnation_changed
                 || target_peers.as_slice() != self.cluster_peers.as_ref());
+        let mut replacement_roster = Vec::new();
+        replacement_roster
+            .try_reserve_exact(replacement_capacity)
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] replacement-roster reservation failed: {error}",
+                    self.projection.op_name
+                ))
+            })?;
+        replacement_roster.extend(replacements);
         let prepared = PreparedIntervalJoinTransition {
-            replacements: replacements.into_iter().collect(),
+            replacements: replacement_roster,
             local_assignment: assignment,
             resident_vnodes,
             cluster_peers: target_peers.into(),
@@ -4271,8 +5983,14 @@ impl GraphOperator for IntervalJoinOperator {
             handoff_cut,
         };
         let total_bytes = live_bytes
-            .saturating_add(restore_payload_bytes)
-            .saturating_add(Self::transition_accounted_bytes(&prepared));
+            .checked_add(transition_payload_bytes)
+            .and_then(|bytes| bytes.checked_add(Self::transition_accounted_bytes(&prepared)))
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "interval join [{}] prepared transition accounting overflow",
+                    self.projection.op_name
+                ))
+            })?;
         if total_bytes > self.max_managed_state_bytes {
             return Err(DbError::Checkpoint(format!(
                 "interval join [{}] prepared transition accounts {total_bytes} bytes; limit is {} bytes",
@@ -4354,12 +6072,20 @@ impl GraphOperator for IntervalJoinOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Float64Array, StringArray, TimestampMillisecondArray};
+    use arrow::array::{
+        BinaryArray, Float64Array, StringArray, TimestampMillisecondArray, UInt32Array,
+    };
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use laminar_connectors::connector::{
+        schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,
+        SourceBatch, SourceMutation, SourceRowPositionCapability, SourceRowPositions,
+    };
     use std::time::Duration;
 
     #[cfg(feature = "cluster")]
-    use arrow::array::Int64Array;
+    use arrow::array::{DictionaryArray, Int64Array, Int8Array};
+    #[cfg(feature = "cluster")]
+    use arrow::datatypes::Int8Type;
 
     fn materialize_capture(capture: StateFrameCapture) -> Result<bytes::Bytes, DbError> {
         let mut staged_bytes = capture.retained_bytes();
@@ -4651,6 +6377,87 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn right_dictionary_batch(ids: &[&str], timestamps: &[i64], amounts: &[f64]) -> RecordBatch {
+        assert_eq!(ids.len(), timestamps.len());
+        assert_eq!(ids.len(), amounts.len());
+        let labels = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![0_i8; ids.len()]),
+            Arc::new(StringArray::from(vec!["queued-dictionary"])),
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("amount", DataType::Float64, false),
+            Field::new(
+                "label",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(ids.to_vec())),
+                Arc::new(TimestampMillisecondArray::from(timestamps.to_vec())),
+                Arc::new(Float64Array::from(amounts.to_vec())),
+                Arc::new(labels),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn positioned_input(
+        batch: RecordBatch,
+        partitions: &[&[u8]],
+        orders: &[u64],
+        mutations: Option<Vec<SourceMutation>>,
+    ) -> RecordBatch {
+        let order_bytes = orders
+            .iter()
+            .map(|order| order.to_be_bytes())
+            .collect::<Vec<_>>();
+        let positions = SourceRowPositions::try_new(
+            BinaryArray::from_iter_values(partitions.iter().copied()),
+            BinaryArray::from_iter_values(order_bytes.iter()),
+            UInt32Array::from_iter_values(std::iter::repeat_n(0, batch.num_rows())),
+        )
+        .unwrap();
+        let visible_schema = batch.schema();
+        let positioned_schema = schema_with_source_row_positions(&visible_schema).unwrap();
+        let mutation_schema =
+            schema_with_source_mutations_and_row_positions(&visible_schema).unwrap();
+        let source = SourceBatch::positioned(batch, positions).unwrap();
+        let source = if let Some(mutations) = mutations {
+            source.with_mutations(mutations).unwrap()
+        } else {
+            source
+        };
+        source
+            .into_records_with_metadata(
+                SourceRowPositionCapability::OrderedDeterministic,
+                &positioned_schema,
+                &mutation_schema,
+            )
+            .unwrap()
+    }
+
+    fn configure_keyed_ordered(operator: &mut IntervalJoinOperator) {
+        operator.set_input_schemas(
+            left_batch(&[], &[], &[]).schema(),
+            right_batch(&[], &[], &[]).schema(),
+        );
+        let keyed = || BoundedJoinInputMode::KeyedUpsert {
+            primary_key_indices: vec![0, 1],
+        };
+        operator.configure_ordered_inputs(keyed(), keyed()).unwrap();
     }
 
     fn key_for_vnode(target: u32, vnode_count: u32) -> String {
@@ -5002,7 +6809,7 @@ mod tests {
             .stage_checkpointed_shuffle(
                 "channel_interval::right",
                 crate::operator::RetainedBatch::restored_channel(
-                    right_batch(&[key.as_str()], &[110], &[2.0]),
+                    right_dictionary_batch(&[key.as_str()], &[110], &[2.0]),
                     2,
                     assignment_version,
                     recovery_gen,
@@ -5039,9 +6846,62 @@ mod tests {
             panic!("right channel did not retain its staged data first");
         };
         assert_eq!(queued.row_vnodes.as_ref(), &[0]);
+        let declared_vnodes = queued.retained.routed_vnodes().len();
         operator.remote_side_cursor = 1;
+        let sized_cluster = operator
+            .capture_cluster_checkpoint(usize::MAX)
+            .unwrap()
+            .unwrap();
+        let retained_cluster_bytes = sized_cluster.retained_bytes().unwrap();
+        drop(sized_cluster);
+        let mut coverage_probe = Vec::<u8>::new();
+        coverage_probe.try_reserve_exact(declared_vnodes).unwrap();
+        let coverage_scratch_bytes = coverage_probe
+            .capacity()
+            .checked_mul(std::mem::size_of::<u8>())
+            .and_then(|bytes| bytes.checked_add(HEAP_ALLOCATION_CHARGE))
+            .unwrap();
+        let exact_capture_peak = retained_cluster_bytes
+            .checked_add(coverage_scratch_bytes)
+            .unwrap();
+        assert!(operator
+            .capture_cluster_checkpoint(exact_capture_peak - 1)
+            .is_err());
+        assert!(operator
+            .capture_cluster_checkpoint(exact_capture_peak)
+            .unwrap()
+            .is_some());
         let checkpoint = operator.checkpoint().unwrap().unwrap();
         let checkpoint_data = checkpoint.data.clone();
+        let mut tight_restore = IntervalJoinOperator::new(
+            "channel_interval",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+        );
+        tight_restore.attach_cluster_shuffle(scope.clone());
+        let restore_preflight = tight_restore
+            .preflight_whole_restore_archive(&checkpoint_data)
+            .unwrap();
+        assert!(restore_preflight.decoded_checkpoint > checkpoint_data.len());
+        let exact_restore_peak = tight_restore
+            .accounted_state_bytes()
+            .checked_add(restore_preflight.encoded_frame)
+            .and_then(|bytes| bytes.checked_add(restore_preflight.decoded_checkpoint))
+            .and_then(|bytes| bytes.checked_add(restore_preflight.runtime_scratch))
+            .unwrap();
+        tight_restore.set_managed_state_budget(exact_restore_peak - 1);
+        assert!(matches!(
+            tight_restore.restore(OperatorCheckpoint {
+                data: checkpoint_data.clone(),
+            }),
+            Err(DbError::ManagedStateBudgetExceeded { .. })
+        ));
+        assert_eq!(tight_restore.applied_left_watermark, i64::MIN);
+        assert_eq!(tight_restore.applied_right_watermark, i64::MIN);
+        assert_eq!(tight_restore.queued_remote_events, 0);
+        assert!(tight_restore.vnode_states.iter().all(Option::is_none));
+
         let active_recovery = recovery_gen + 1;
         scope.sender.set_recovery_gen(active_recovery);
         scope.receiver.set_recovery_gen(active_recovery);
@@ -5106,7 +6966,10 @@ mod tests {
             &mut IntervalJoinOutputBudget::default(),
         )
         .unwrap();
-        rejected.vnode_states[0] = Some(Box::new(prior_state));
+        rejected.vnode_states[0] = Some(Box::new(IntervalJoinVnodeState {
+            core: prior_state,
+            ordered: None,
+        }));
         rejected.add_resident_vnode(0);
         let prior_channel_frontiers = [
             InputFrontier {
@@ -5142,7 +7005,7 @@ mod tests {
         else {
             panic!("cluster restore did not reject its projected state budget");
         };
-        assert!(context.contains("cluster checkpoint restore"));
+        assert!(context.contains("whole checkpoint restore preflight"));
         assert_eq!(limit_bytes, baseline);
         assert!(accounted_bytes > baseline);
         assert_eq!(
@@ -5192,6 +7055,23 @@ mod tests {
             panic!("restored right channel lost its staged data order");
         };
         assert_eq!(queued.row_vnodes.as_ref(), &[0]);
+        let dictionary = queued
+            .retained
+            .batch()
+            .column(3)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int8Type>>()
+            .expect("queued dictionary column was not restored as a dictionary");
+        assert_eq!(dictionary.keys().value(0), 0);
+        assert_eq!(
+            dictionary
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "queued-dictionary"
+        );
         assert!(!restored.wants_input());
         assert!(restored
             .checkpoint_vnodes(&[0], 2, u64::MAX)
@@ -5421,7 +7301,10 @@ mod tests {
             &mut output_budget,
         )
         .unwrap();
-        op.vnode_states[1] = Some(Box::new(retained));
+        op.vnode_states[1] = Some(Box::new(IntervalJoinVnodeState {
+            core: retained,
+            ordered: None,
+        }));
         op.add_resident_vnode(1);
 
         let mut routed = BTreeMap::new();
@@ -5462,7 +7345,10 @@ mod tests {
             )
             .unwrap();
         }
-        op.vnode_states[0] = Some(Box::new(retained));
+        op.vnode_states[0] = Some(Box::new(IntervalJoinVnodeState {
+            core: retained,
+            ordered: None,
+        }));
         op.add_resident_vnode(0);
 
         // Force compaction to fail after the sweep has already removed old index entries.
@@ -5640,6 +7526,207 @@ mod tests {
         assert_eq!(state.len(), archive_bytes);
     }
 
+    #[tokio::test]
+    async fn ordered_zero_affinity_vnode_restore_is_exact_and_combined_budget_atomic() {
+        let mut donor = IntervalJoinOperator::new(
+            "ordered-checkpoint",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+        );
+        configure_keyed_ordered(&mut donor);
+        let tombstone = positioned_input(
+            left_batch(&["A"], &[100], &[999.0]),
+            &[b"partition-0"],
+            &[1],
+            Some(vec![SourceMutation::Tombstone]),
+        );
+        assert!(donor
+            .process(&[vec![tombstone], vec![]], &[0, 0])
+            .await
+            .unwrap()
+            .is_empty());
+        let donor_state = donor.vnode_states[0].as_ref().unwrap();
+        assert_eq!(donor_state.buffered_rows(), (0, 0));
+        let normalizer_evidence = |normalizer: &BoundedJoinInputNormalizer| {
+            let checkpoint = normalizer
+                .capture_checkpoint(usize::MAX)
+                .unwrap()
+                .encode(usize::MAX)
+                .unwrap();
+            rkyv::to_bytes::<rkyv::rancor::Error>(&checkpoint)
+                .unwrap()
+                .to_vec()
+        };
+        let ordered = donor_state.ordered.as_ref().unwrap();
+        let expected_left = normalizer_evidence(&ordered.left);
+        let expected_right = normalizer_evidence(&ordered.right);
+        let expected_fingerprints = donor_state.ordered_fingerprints();
+        let vnode_charge = donor_state.accounted_state_bytes();
+
+        let whole = donor.checkpoint().unwrap().unwrap();
+        let frame = donor
+            .checkpoint_vnodes(&[0], 1, u64::MAX)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|captured| captured.state)
+            .map(materialize_capture)
+            .unwrap()
+            .unwrap();
+
+        let mut rejected = IntervalJoinOperator::new(
+            "ordered-checkpoint",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+        );
+        configure_keyed_ordered(&mut rejected);
+        rejected
+            .restore(OperatorCheckpoint {
+                data: whole.data.clone(),
+            })
+            .unwrap();
+        let limit = rejected
+            .accounted_state_bytes()
+            .checked_add(vnode_charge)
+            .unwrap()
+            .saturating_sub(1);
+        rejected.set_managed_state_budget(limit);
+        let error = rejected.restore_vnode(0, 1, &frame).unwrap_err();
+        assert!(
+            error.to_string().contains("limit") || error.to_string().contains("remaining"),
+            "unexpected restore error: {error}"
+        );
+        assert!(rejected.vnode_states[0].is_none());
+        assert!(rejected.resident_vnodes.is_empty());
+
+        let mut restored = IntervalJoinOperator::new(
+            "ordered-checkpoint",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+        );
+        configure_keyed_ordered(&mut restored);
+        restored.restore(whole).unwrap();
+        restored.restore_vnode(0, 1, &frame).unwrap();
+        let state = restored.vnode_states[0].as_ref().unwrap();
+        assert_eq!(state.buffered_rows(), (0, 0));
+        assert_eq!(state.ordered_fingerprints(), expected_fingerprints);
+        let ordered = state.ordered.as_ref().unwrap();
+        assert_eq!(ordered.left.closed_cutoff(), 0);
+        assert_eq!(ordered.right.closed_cutoff(), 0);
+        assert_eq!(normalizer_evidence(&ordered.left), expected_left);
+        assert_eq!(normalizer_evidence(&ordered.right), expected_right);
+    }
+
+    #[tokio::test]
+    async fn ordered_absent_vnode_bootstraps_at_applied_cut_after_frontier_and_restore() {
+        let frontiers = [
+            InputFrontier {
+                watermark: Some(100),
+                idle: false,
+            },
+            InputFrontier {
+                watermark: Some(200),
+                idle: false,
+            },
+        ];
+        let valid = || {
+            positioned_input(
+                left_batch(&["A"], &[100], &[1.0]),
+                &[b"partition-0"],
+                &[1],
+                None,
+            )
+        };
+
+        let mut direct = IntervalJoinOperator::new(
+            "ordered-lazy",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+        );
+        configure_keyed_ordered(&mut direct);
+        direct
+            .process_with_frontiers(&[Vec::new(), Vec::new()], &frontiers)
+            .await
+            .unwrap();
+        assert!(direct.vnode_states[0].is_none());
+        assert!(direct
+            .process_with_frontiers(&[vec![valid()], Vec::new()], &frontiers)
+            .await
+            .unwrap()
+            .is_empty());
+        let state = direct.vnode_states[0].as_ref().unwrap();
+        let ordered = state.ordered.as_ref().unwrap();
+        assert_eq!(ordered.left.closed_cutoff(), 100);
+        assert_eq!(ordered.right.closed_cutoff(), 200);
+        assert_eq!(state.evicted_cutoffs(), (100, 100));
+
+        let mut donor = IntervalJoinOperator::new(
+            "ordered-lazy",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+        );
+        configure_keyed_ordered(&mut donor);
+        donor
+            .process_with_frontiers(&[Vec::new(), Vec::new()], &frontiers)
+            .await
+            .unwrap();
+        let late = positioned_input(
+            left_batch(&["A"], &[99], &[1.0]),
+            &[b"partition-0"],
+            &[1],
+            None,
+        );
+        let error = donor
+            .process_with_frontiers(&[vec![late], Vec::new()], &frontiers)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("below closed cutoff"));
+        assert!(
+            donor.vnode_states[0].is_none(),
+            "failed lazy initialization must not publish an empty ordered vnode"
+        );
+
+        let whole = donor.checkpoint().unwrap().unwrap();
+        donor.force_full_vnode_capture();
+        let absent = donor
+            .checkpoint_vnodes(&[0], 1, u64::MAX)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|captured| captured.state)
+            .map(materialize_capture)
+            .unwrap()
+            .unwrap();
+        assert_eq!(absent.as_ref(), ABSENT_VNODE_FRAME);
+
+        let mut restored = IntervalJoinOperator::new(
+            "ordered-lazy",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+        );
+        configure_keyed_ordered(&mut restored);
+        restored.restore(whole).unwrap();
+        restored.restore_vnode(0, 1, &absent).unwrap();
+        assert!(restored.vnode_states[0].is_none());
+        restored
+            .process_with_frontiers(&[vec![valid()], Vec::new()], &frontiers)
+            .await
+            .unwrap();
+        let state = restored.vnode_states[0].as_ref().unwrap();
+        let ordered = state.ordered.as_ref().unwrap();
+        assert_eq!(ordered.left.closed_cutoff(), 100);
+        assert_eq!(ordered.right.closed_cutoff(), 200);
+        assert_eq!(state.evicted_cutoffs(), (100, 100));
+    }
+
     #[test]
     fn deferred_vnode_frames_share_the_operator_checkpoint_budget() {
         let make_operator = || {
@@ -5651,7 +7738,7 @@ mod tests {
                 KeyGroupCount::try_from(2_u16).unwrap(),
             );
             for state in &mut operator.vnode_states {
-                *state = Some(Box::new(IntervalJoinState::new()));
+                *state = Some(Box::new(IntervalJoinVnodeState::new_append()));
             }
             operator
         };
@@ -5818,47 +7905,85 @@ mod tests {
             },
         ];
         let donor_config = target.config.clone();
-        let encode_whole = |participant_id: u64, right_watermark: i64, left_idle: bool| {
-            let checkpoint = IntervalJoinOperatorCheckpoint {
-                version: OPERATOR_CHECKPOINT_VERSION,
-                join_type: join_type_tag(donor_config.join_type),
-                left_keys: donor_config.left_keys.clone(),
-                right_keys: donor_config.right_keys.clone(),
-                left_time_column: donor_config.left_time_column.clone(),
-                right_time_column: donor_config.right_time_column.clone(),
-                left_table: donor_config.left_table.clone(),
-                right_table: donor_config.right_table.clone(),
-                bound_ms: i64::try_from(donor_config.time_bound.as_millis()).unwrap(),
-                applied_left_watermark: 300,
-                applied_right_watermark: right_watermark,
-                applied_left_idle: left_idle,
-                applied_right_idle: false,
-                cluster: Some(IntervalClusterCheckpoint {
-                    assignment_version: predecessor.assignment_version,
-                    owner_map_digest: predecessor.assignment_digest,
-                    self_id: participant_id,
-                    recovery_gen: 1,
-                    local_frontiers: [
-                        IntervalCheckpointFrontier {
-                            watermark: Some(300),
-                            idle: left_idle,
-                        },
-                        IntervalCheckpointFrontier {
-                            watermark: Some(right_watermark),
-                            idle: false,
-                        },
-                    ],
-                    remote_side_cursor: 0,
-                    remote_peer_cursors: [None; 2],
-                    channels: [Vec::new(), Vec::new()],
-                }),
+        let encode_whole =
+            |participant_id: u64, right_watermark: i64, right_evidence: i64, left_idle: bool| {
+                let peer = if participant_id == 2 { 3 } else { 2 };
+                let left_frontier = IntervalCheckpointFrontier {
+                    watermark: Some(300),
+                    idle: left_idle,
+                };
+                let right_frontier = IntervalCheckpointFrontier {
+                    watermark: Some(right_evidence),
+                    idle: false,
+                };
+                let checkpoint = IntervalJoinOperatorCheckpoint {
+                    version: OPERATOR_CHECKPOINT_VERSION,
+                    ordered_input_fingerprints: None,
+                    join_type: join_type_tag(donor_config.join_type),
+                    left_keys: donor_config.left_keys.clone(),
+                    right_keys: donor_config.right_keys.clone(),
+                    left_time_column: donor_config.left_time_column.clone(),
+                    right_time_column: donor_config.right_time_column.clone(),
+                    left_table: donor_config.left_table.clone(),
+                    right_table: donor_config.right_table.clone(),
+                    bound_ms: i64::try_from(donor_config.time_bound.as_millis()).unwrap(),
+                    applied_left_watermark: 300,
+                    applied_right_watermark: right_watermark,
+                    applied_left_idle: left_idle,
+                    applied_right_idle: false,
+                    cluster: Some(IntervalClusterCheckpoint {
+                        assignment_version: predecessor.assignment_version,
+                        owner_map_digest: predecessor.assignment_digest,
+                        self_id: participant_id,
+                        recovery_gen: 1,
+                        local_frontiers: [left_frontier, right_frontier],
+                        remote_side_cursor: 0,
+                        remote_peer_cursors: [None; 2],
+                        channels: [
+                            vec![IntervalCheckpointChannel {
+                                peer,
+                                applied: left_frontier,
+                                events: Vec::new(),
+                            }],
+                            vec![IntervalCheckpointChannel {
+                                peer,
+                                applied: right_frontier,
+                                events: Vec::new(),
+                            }],
+                        ],
+                    }),
+                };
+                rkyv::to_bytes::<rkyv::rancor::Error>(&checkpoint)
+                    .unwrap()
+                    .to_vec()
             };
-            rkyv::to_bytes::<rkyv::rancor::Error>(&checkpoint)
-                .unwrap()
-                .to_vec()
-        };
-        let donor2 = encode_whole(2, 250, true);
-        let disagreeing_donor3 = encode_whole(3, 251, false);
+        let donor2 = encode_whole(2, 250, 250, true);
+        let corrupt_donor3 = encode_whole(3, 250, 249, true);
+        let corrupt = [
+            ManagedWholeRestore {
+                participant_id: 2,
+                state: &donor2,
+            },
+            ManagedWholeRestore {
+                participant_id: 3,
+                state: &corrupt_donor3,
+            },
+        ];
+        let error = target
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &target_fence,
+                revoked: &rustc_hash::FxHashSet::default(),
+                restores: &restores,
+                whole_restores: &corrupt,
+                mode: ManagedVnodeTransitionMode::Live,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("exact drained-cut evidence"));
+        assert_eq!(target.applied_left_watermark, i64::MIN);
+        assert!(target.vnode_states.iter().all(Option::is_none));
+
+        let disagreeing_donor3 = encode_whole(3, 251, 251, false);
         let disagreeing = [
             ManagedWholeRestore {
                 participant_id: 2,
@@ -5882,7 +8007,7 @@ mod tests {
         assert_eq!(target.applied_left_watermark, i64::MIN);
         assert!(target.vnode_states.iter().all(Option::is_none));
 
-        let donor3 = encode_whole(3, 250, true);
+        let donor3 = encode_whole(3, 250, 250, true);
         let whole_restores = [
             ManagedWholeRestore {
                 participant_id: 2,
@@ -6282,12 +8407,12 @@ mod tests {
         let state = materialize_capture(capture).unwrap();
         assert_eq!(state.first(), Some(&PRESENT_VNODE));
         assert_eq!(state.get(1), Some(&VNODE_FRAME_VERSION));
-        let decoded = rkyv::from_bytes::<JoinStateCheckpoint, rkyv::rancor::Error>(
+        let decoded = rkyv::from_bytes::<IntervalVnodeCheckpoint, rkyv::rancor::Error>(
             &state[VNODE_FRAME_HEADER_LEN..],
         )
         .unwrap();
-        assert_eq!(decoded.left_buffer_rows, 1);
-        assert_eq!(decoded.right_buffer_rows, 1);
+        assert_eq!(decoded.core.left_buffer_rows, 1);
+        assert_eq!(decoded.core.right_buffer_rows, 1);
     }
 
     #[test]
@@ -6305,45 +8430,63 @@ mod tests {
         assert_eq!(encoded[1], VNODE_FRAME_VERSION);
         assert!(IntervalJoinOperator::decode_vnode_frame(
             &ABSENT_VNODE_FRAME,
+            0,
             &config,
+            None,
             "current absent",
+            crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
             crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
             None,
         )
         .unwrap()
         .is_none());
 
+        let previous_version = VNODE_FRAME_VERSION - 1;
         let mut legacy_present = encoded.clone();
-        legacy_present[1] = 0;
+        legacy_present[1] = previous_version;
         let error = IntervalJoinOperator::decode_vnode_frame(
             &legacy_present,
+            0,
             &config,
+            None,
             "legacy present",
+            crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
             crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
             None,
         )
         .err()
         .expect("legacy present vnode frame must fail");
-        assert!(error.to_string().contains("version 0 is unsupported"));
+        assert!(error
+            .to_string()
+            .contains(&format!("version {previous_version} is unsupported")));
 
-        let legacy_absent = vec![0_u8; VNODE_FRAME_HEADER_LEN];
+        let mut legacy_absent = ABSENT_VNODE_FRAME;
+        legacy_absent[1] = previous_version;
         let error = IntervalJoinOperator::decode_vnode_frame(
             &legacy_absent,
+            0,
             &config,
+            None,
             "legacy absent",
+            crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
             crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
             None,
         )
         .err()
         .expect("legacy absent vnode frame must fail");
-        assert!(error.to_string().contains("version 0 is unsupported"));
+        assert!(error
+            .to_string()
+            .contains(&format!("version {previous_version} is unsupported")));
 
         let mut malformed = ABSENT_VNODE_FRAME;
         malformed[2] = 1;
         let error = IntervalJoinOperator::decode_vnode_frame(
             &malformed,
+            0,
             &config,
+            None,
             "malformed current",
+            crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
             crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
             None,
         )

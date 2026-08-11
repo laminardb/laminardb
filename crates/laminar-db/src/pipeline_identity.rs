@@ -501,11 +501,12 @@ mod tests {
 
     #[test]
     fn canonical_identity_digest_changes_with_root_execution_config() {
-        let payload = |partitioning_abi_version,
+        let payload = |state_abi_version,
+                       partitioning_abi_version,
                        source_idle_timeout_ms,
                        event_time_max_future_skew_ms| CanonicalPipeline {
             canonical_version: PIPELINE_IDENTITY_VERSION,
-            state_abi_version: STATE_ABI_VERSION,
+            state_abi_version,
             partitioning_abi_version,
             state_layout: STATE_LAYOUT,
             vnode_count: 1,
@@ -520,14 +521,27 @@ mod tests {
 
         let current = Sha256::digest(
             serde_json::to_vec(&payload(
+                STATE_ABI_VERSION,
                 laminar_core::state::PARTITIONING_ABI_VERSION,
                 None,
                 laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
             ))
             .unwrap(),
         );
+        assert_eq!(STATE_ABI_VERSION, 5);
+        let prior_state_abi = Sha256::digest(
+            serde_json::to_vec(&payload(
+                STATE_ABI_VERSION - 1,
+                laminar_core::state::PARTITIONING_ABI_VERSION,
+                None,
+                laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
+            ))
+            .unwrap(),
+        );
+        assert_ne!(current, prior_state_abi);
         let changed = Sha256::digest(
             serde_json::to_vec(&payload(
+                STATE_ABI_VERSION,
                 laminar_core::state::PARTITIONING_ABI_VERSION + 1,
                 None,
                 laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
@@ -537,6 +551,7 @@ mod tests {
         assert_ne!(current, changed);
         let idle_timeout = Sha256::digest(
             serde_json::to_vec(&payload(
+                STATE_ABI_VERSION,
                 laminar_core::state::PARTITIONING_ABI_VERSION,
                 Some(5_000),
                 laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
@@ -546,6 +561,7 @@ mod tests {
         assert_ne!(current, idle_timeout);
         let future_skew = Sha256::digest(
             serde_json::to_vec(&payload(
+                STATE_ABI_VERSION,
                 laminar_core::state::PARTITIONING_ABI_VERSION,
                 None,
                 30_000,

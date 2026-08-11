@@ -489,6 +489,83 @@ fn validate_source_position_arrays(
     Ok(())
 }
 
+/// One borrowed deterministic source coordinate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceRowPositionRef<'a> {
+    /// Connector-defined partition identity.
+    pub partition: &'a [u8],
+    /// Connector-defined order-preserving cursor.
+    pub order_key: &'a [u8],
+    /// Row ordinal within one source cursor.
+    pub sub_offset: u32,
+}
+
+/// Validated borrowed access to row-aligned deterministic source coordinates.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceRowPositionView<'a> {
+    partition: &'a BinaryArray,
+    order_key: &'a BinaryArray,
+    sub_offset: &'a UInt32Array,
+}
+
+impl<'a> SourceRowPositionView<'a> {
+    /// Number of row positions.
+    #[must_use]
+    pub fn len(self) -> usize {
+        self.partition.len()
+    }
+
+    /// Whether the batch has no row positions.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.partition.is_empty()
+    }
+
+    /// Position for `row`, if it is in bounds.
+    #[must_use]
+    pub fn get(self, row: usize) -> Option<SourceRowPositionRef<'a>> {
+        (row < self.len()).then(|| SourceRowPositionRef {
+            partition: self.partition.value(row),
+            order_key: self.order_key.value(row),
+            sub_offset: self.sub_offset.value(row),
+        })
+    }
+}
+
+/// Borrow optional row-aligned source positions after validating their canonical layout.
+///
+/// # Errors
+/// Returns an error for partial, misplaced, nullable, incorrectly typed, or misaligned metadata.
+pub fn source_row_positions(
+    records: &RecordBatch,
+) -> Result<Option<SourceRowPositionView<'_>>, ConnectorError> {
+    let Some(layout) = source_metadata_layout(records.schema().as_ref())? else {
+        return Ok(None);
+    };
+    validate_source_position_arrays(records, layout)?;
+    let position_start = layout.visible_columns + usize::from(layout.has_mutations);
+    let (Some(partition), Some(order_key), Some(sub_offset)) = (
+        records.columns()[position_start]
+            .as_any()
+            .downcast_ref::<BinaryArray>(),
+        records.columns()[position_start + 1]
+            .as_any()
+            .downcast_ref::<BinaryArray>(),
+        records.columns()[position_start + 2]
+            .as_any()
+            .downcast_ref::<UInt32Array>(),
+    ) else {
+        return Err(ConnectorError::SchemaMismatch(
+            "source row-position metadata arrays have invalid types".into(),
+        ));
+    };
+    Ok(Some(SourceRowPositionView {
+        partition,
+        order_key,
+        sub_offset,
+    }))
+}
+
 fn validate_encoded_source_schema(
     visible: &Schema,
     encoded: &Schema,
@@ -2183,6 +2260,7 @@ mod tests {
     #[test]
     fn source_metadata_round_trip_is_sparse_and_zero_copy() {
         let records = test_batch(2);
+        assert!(source_row_positions(&records).unwrap().is_none());
         let positioned_schema = schema_with_source_row_positions(&records.schema()).unwrap();
         let mutation_schema =
             schema_with_source_mutations_and_row_positions(&records.schema()).unwrap();
@@ -2207,6 +2285,18 @@ mod tests {
         assert!(!mutations.is_empty());
         assert_eq!(mutations.get(0), Some(SourceMutation::Put));
         assert_eq!(mutations.get(1), Some(SourceMutation::Tombstone));
+        let row_positions = source_row_positions(&encoded).unwrap().unwrap();
+        assert_eq!(row_positions.len(), 2);
+        assert!(!row_positions.is_empty());
+        assert_eq!(
+            row_positions.get(1),
+            Some(SourceRowPositionRef {
+                partition: b"p0",
+                order_key: b"1",
+                sub_offset: 0,
+            })
+        );
+        assert_eq!(row_positions.get(2), None);
         assert_eq!(
             encoded.schema().field(records.num_columns()).name(),
             SOURCE_MUTATION_COLUMN

@@ -27,8 +27,10 @@ const MAX_RETAINED_BATCHES: usize = 256;
 
 /// Caps memory on cross-product shapes.
 const EMIT_THRESHOLD: usize = 8_192;
-const MAX_CYCLE_OUTPUT_ROWS: usize = 262_144;
-const MAX_CYCLE_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+/// Hard row bound shared by join emission and its private mutable-input normalization.
+pub(crate) const MAX_CYCLE_OUTPUT_ROWS: usize = 262_144;
+/// Hard transient byte bound shared by join emission and mutable-input normalization.
+pub(crate) const MAX_CYCLE_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 // Null tuples never probe. Keeping them in a regular bucket lets eviction and compaction retain
 // one state path for every row; a real hash collision remains safe because tuple equality follows.
 const NULL_TUPLE_HASH: u64 = u64::MAX;
@@ -90,6 +92,28 @@ fn batch_metadata_charge(batch: &RecordBatch) -> usize {
         }))
 }
 
+fn shallow_batch_clone_charge(
+    batches: &[RecordBatch],
+    outer_capacity: usize,
+) -> Result<usize, DbError> {
+    let outer = outer_capacity
+        .checked_mul(std::mem::size_of::<RecordBatch>())
+        .map(charged_allocation)
+        .ok_or_else(|| {
+            DbError::Checkpoint("interval join batch-clone roster accounting overflow".into())
+        })?;
+    batches.iter().try_fold(outer, |bytes, batch| {
+        batch
+            .num_columns()
+            .checked_mul(std::mem::size_of::<ArrayRef>())
+            .map(charged_allocation)
+            .and_then(|columns| bytes.checked_add(columns))
+            .ok_or_else(|| {
+                DbError::Checkpoint("interval join batch-clone roster accounting overflow".into())
+            })
+    })
+}
+
 fn position_vector_charge(capacity: usize) -> usize {
     HEAP_ALLOCATION_CHARGE
         .saturating_add(capacity.saturating_mul(std::mem::size_of::<(usize, usize)>()))
@@ -141,7 +165,8 @@ fn insert_index_position(
     }
 }
 
-fn logical_row_bytes(batch: &RecordBatch) -> Result<Vec<usize>, DbError> {
+/// Compute checked logical payload bytes for every row without materializing row slices.
+pub(crate) fn logical_row_bytes(batch: &RecordBatch) -> Result<Vec<usize>, DbError> {
     let mut bytes = vec![0usize; batch.num_rows()];
     for column in batch.columns() {
         let fixed = match column.data_type() {
@@ -601,6 +626,39 @@ impl IntervalJoinCheckpointCapture {
                     "interval join {side} checkpoint weight rosters do not match its batch roster"
                 )));
             }
+            let requested_roster_bytes = [
+                batches.len().checked_mul(std::mem::size_of::<Vec<u8>>()),
+                captured_row_weights
+                    .len()
+                    .checked_mul(std::mem::size_of::<Vec<i64>>()),
+                captured_match_flags
+                    .len()
+                    .checked_mul(std::mem::size_of::<Vec<u8>>()),
+                captured_match_weights
+                    .len()
+                    .checked_mul(std::mem::size_of::<Vec<i64>>()),
+            ]
+            .into_iter()
+            .try_fold(0usize, |total, bytes| {
+                let bytes = bytes.ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint roster accounting overflow"
+                    ))
+                })?;
+                total.checked_add(charged_allocation(bytes)).ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint roster accounting overflow"
+                    ))
+                })
+            })?;
+            *remaining = remaining
+                .checked_sub(requested_roster_bytes)
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "interval join {side} checkpoint roster exceeded its cumulative checkpoint byte limit"
+                    ))
+                })?;
+
             let mut encoded = Vec::new();
             encoded.try_reserve_exact(batches.len()).map_err(|_| {
                 DbError::Checkpoint(format!(
@@ -658,11 +716,23 @@ impl IntervalJoinCheckpointCapture {
                     ))
                 })
             })?;
-            *remaining = remaining.checked_sub(roster_bytes).ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "interval join {side} checkpoint roster exceeded its cumulative checkpoint byte limit"
-                ))
-            })?;
+            if roster_bytes > requested_roster_bytes {
+                *remaining = remaining
+                    .checked_sub(roster_bytes - requested_roster_bytes)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint roster exceeded its cumulative checkpoint byte limit"
+                        ))
+                    })?;
+            } else {
+                *remaining = remaining
+                    .checked_add(requested_roster_bytes - roster_bytes)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "interval join {side} checkpoint roster accounting overflow"
+                        ))
+                    })?;
+            }
 
             let mut encoded_rows = 0_u64;
             for (batch_index, batch) in batches.iter().enumerate() {
@@ -1690,8 +1760,78 @@ impl IntervalJoinState {
     }
 
     #[cfg(test)]
-    fn new_weighted() -> Self {
+    pub(crate) fn new_weighted() -> Self {
         Self::new_with_mode(JoinExecutionMode::Weighted)
+    }
+
+    pub(crate) fn new_weighted_at_frontiers(
+        left_watermark: i64,
+        right_watermark: i64,
+        bound_ms: i64,
+    ) -> Self {
+        let mut state = Self::new_with_mode(JoinExecutionMode::Weighted);
+        state.left_evicted_cutoff = right_watermark.saturating_sub(bound_ms);
+        state.right_evicted_cutoff = left_watermark;
+        state
+    }
+
+    pub(crate) fn weighted_empty_state_preflight(
+        left: &Schema,
+        right: &Schema,
+    ) -> Result<usize, DbError> {
+        let schema_bytes = |schema: &Schema| -> Result<usize, DbError> {
+            schema
+                .fields()
+                .iter()
+                .try_fold(BATCH_METADATA_CHARGE, |bytes, field| {
+                    bytes
+                        .checked_add(ARRAY_METADATA_CHARGE)
+                        .and_then(|bytes| bytes.checked_add(field.name().len()))
+                        .ok_or_else(|| {
+                            DbError::BackpressureFail(
+                                "interval join schema preflight accounting overflow".into(),
+                            )
+                        })
+                })
+        };
+        let left_bytes = schema_bytes(left)?;
+        let right_bytes = schema_bytes(right)?;
+        let output_fields = left
+            .fields()
+            .len()
+            .checked_add(right.fields().len())
+            .and_then(|fields| fields.checked_add(1))
+            .ok_or_else(|| {
+                DbError::BackpressureFail("interval join output schema preflight overflow".into())
+            })?;
+        let output_names = left
+            .fields()
+            .iter()
+            .chain(right.fields())
+            .try_fold(
+                laminar_core::changelog::WEIGHT_COLUMN.len(),
+                |bytes, field| bytes.checked_add(field.name().len()),
+            )
+            .ok_or_else(|| {
+                DbError::BackpressureFail("interval join output schema preflight overflow".into())
+            })?;
+        let output_bytes = output_fields
+            .checked_mul(ARRAY_METADATA_CHARGE)
+            .and_then(|bytes| bytes.checked_add(BATCH_METADATA_CHARGE))
+            .and_then(|bytes| bytes.checked_add(output_names))
+            .ok_or_else(|| {
+                DbError::BackpressureFail("interval join output schema preflight overflow".into())
+            })?;
+        std::mem::size_of::<Self>()
+            .checked_add(HEAP_ALLOCATION_CHARGE)
+            .and_then(|bytes| bytes.checked_add(left_bytes))
+            .and_then(|bytes| bytes.checked_add(right_bytes))
+            .and_then(|bytes| bytes.checked_add(output_bytes))
+            .ok_or_else(|| {
+                DbError::BackpressureFail(
+                    "interval join weighted construction preflight overflow".into(),
+                )
+            })
     }
 
     fn new_with_mode(execution_mode: JoinExecutionMode) -> Self {
@@ -2035,9 +2175,75 @@ impl IntervalJoinState {
         Ok(())
     }
 
+    fn capture_preflight_bytes(
+        &self,
+        config: &StreamJoinConfig,
+    ) -> Result<(usize, usize, usize), DbError> {
+        fn roster<T>(len: usize) -> Result<usize, DbError> {
+            len.checked_mul(std::mem::size_of::<T>())
+                .map(charged_allocation)
+                .ok_or_else(|| {
+                    DbError::Checkpoint("interval join capture roster accounting overflow".into())
+                })
+        }
+
+        let config_capture_bytes = config
+            .left_keys
+            .iter()
+            .chain(&config.right_keys)
+            .map(|value| charged_allocation(value.len()))
+            .chain([
+                charged_allocation(config.left_time_column.len()),
+                charged_allocation(config.right_time_column.len()),
+                charged_allocation(config.left_table.len()),
+                charged_allocation(config.right_table.len()),
+            ])
+            .try_fold(0usize, usize::checked_add)
+            .and_then(|bytes| {
+                roster::<String>(config.left_keys.len())
+                    .ok()
+                    .and_then(|left| bytes.checked_add(left))
+            })
+            .and_then(|bytes| {
+                roster::<String>(config.right_keys.len())
+                    .ok()
+                    .and_then(|right| bytes.checked_add(right))
+            })
+            .ok_or_else(|| {
+                DbError::Checkpoint("interval join capture config accounting overflow".into())
+            })?;
+        let left_batch_clones =
+            shallow_batch_clone_charge(&self.left.batches, self.left.batches.len())?;
+        let right_batch_clones =
+            shallow_batch_clone_charge(&self.right.batches, self.right.batches.len())?;
+        let non_batch_side_rosters = [
+            roster::<Arc<[i64]>>(self.left.row_weights.len())?,
+            roster::<Arc<[u8]>>(self.left.match_flags.len())?,
+            roster::<Arc<[i64]>>(self.left.match_weights.len())?,
+            roster::<Arc<[i64]>>(self.right.row_weights.len())?,
+            roster::<Arc<[u8]>>(self.right.match_flags.len())?,
+            roster::<Arc<[i64]>>(self.right.match_weights.len())?,
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .ok_or_else(|| {
+            DbError::Checkpoint("interval join capture roster accounting overflow".into())
+        })?;
+        let fixed_capture_bytes = self
+            .accounted_state_bytes()
+            .checked_add(std::mem::size_of::<IntervalJoinCheckpointCapture>())
+            .and_then(|bytes| bytes.checked_add(config_capture_bytes))
+            .and_then(|bytes| bytes.checked_add(non_batch_side_rosters))
+            .ok_or_else(|| {
+                DbError::Checkpoint("interval join capture accounting overflow".into())
+            })?;
+        Ok((fixed_capture_bytes, left_batch_clones, right_batch_clones))
+    }
+
     pub(crate) fn capture_checkpoint(
         &self,
         config: &StreamJoinConfig,
+        max_capture_bytes: usize,
     ) -> Result<IntervalJoinCheckpointCapture, DbError> {
         type CapturedSide = (
             Vec<RecordBatch>,
@@ -2045,6 +2251,7 @@ impl IntervalJoinState {
             Vec<Arc<[u8]>>,
             Vec<Arc<[i64]>>,
             u64,
+            usize,
         );
 
         fn capture_side(
@@ -2052,6 +2259,7 @@ impl IntervalJoinState {
             state: &SideState,
             track_matches: bool,
             execution_mode: JoinExecutionMode,
+            max_batch_clone_bytes: usize,
         ) -> Result<CapturedSide, DbError> {
             if (execution_mode == JoinExecutionMode::Weighted
                 && state.batches.len() != state.row_weights.len())
@@ -2122,6 +2330,12 @@ impl IntervalJoinState {
                         "interval join {side} checkpoint batch roster cannot be reserved"
                     ))
                 })?;
+            let batch_clone_bytes = shallow_batch_clone_charge(&state.batches, batches.capacity())?;
+            if batch_clone_bytes > max_batch_clone_bytes {
+                return Err(DbError::Checkpoint(format!(
+                    "interval join {side} checkpoint batch clones require {batch_clone_bytes} bytes; remaining shallow-clone limit is {max_batch_clone_bytes} bytes"
+                )));
+            }
             batches.extend(state.batches.iter().cloned());
             let mut row_weights = Vec::new();
             row_weights
@@ -2150,7 +2364,28 @@ impl IntervalJoinState {
                     ))
                 })?;
             match_weights.extend(state.match_weights.iter().cloned());
-            Ok((batches, row_weights, match_flags, match_weights, rows))
+            Ok((
+                batches,
+                row_weights,
+                match_flags,
+                match_weights,
+                rows,
+                batch_clone_bytes,
+            ))
+        }
+
+        let (fixed_capture_bytes, left_batch_clones, right_batch_clones) =
+            self.capture_preflight_bytes(config)?;
+        let projected_capture_bytes = fixed_capture_bytes
+            .checked_add(left_batch_clones)
+            .and_then(|bytes| bytes.checked_add(right_batch_clones))
+            .ok_or_else(|| {
+                DbError::Checkpoint("interval join capture accounting overflow".into())
+            })?;
+        if projected_capture_bytes > max_capture_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "interval join capture requires {projected_capture_bytes} bytes; remaining capture limit is {max_capture_bytes} bytes"
+            )));
         }
 
         let bound_ms = i64::try_from(config.time_bound.as_millis()).map_err(|_| {
@@ -2165,11 +2400,16 @@ impl IntervalJoinState {
             left_match_flags,
             left_match_weights,
             left_buffer_rows,
+            left_batch_clone_bytes,
         ) = capture_side(
             "left",
             &self.left,
             tracks_left_matches(config.join_type),
             execution_mode,
+            max_capture_bytes
+                .checked_sub(fixed_capture_bytes)
+                .and_then(|bytes| bytes.checked_sub(right_batch_clones))
+                .expect("capture preflight validated left shallow-clone headroom"),
         )?;
         let (
             right_batches,
@@ -2177,11 +2417,20 @@ impl IntervalJoinState {
             right_match_flags,
             right_match_weights,
             right_buffer_rows,
+            _right_batch_clone_bytes,
         ) = capture_side(
             "right",
             &self.right,
             tracks_right_matches(config.join_type),
             execution_mode,
+            max_capture_bytes
+                .checked_sub(fixed_capture_bytes)
+                .and_then(|bytes| bytes.checked_sub(left_batch_clone_bytes))
+                .ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "interval join left shallow capture exhausted right-side headroom".into(),
+                    )
+                })?,
         )?;
         let mut capture = IntervalJoinCheckpointCapture {
             execution_mode,
@@ -2204,6 +2453,12 @@ impl IntervalJoinState {
             retained_bytes: 0,
         };
         capture.retained_bytes = capture.calculate_retained_bytes();
+        if capture.retained_bytes > max_capture_bytes {
+            return Err(DbError::Checkpoint(format!(
+                "interval join capture retains {} bytes; remaining capture limit is {max_capture_bytes} bytes",
+                capture.retained_bytes
+            )));
+        }
         Ok(capture)
     }
 
@@ -2213,7 +2468,8 @@ impl IntervalJoinState {
         config: &StreamJoinConfig,
         max_encoded_bytes: usize,
     ) -> Result<JoinStateCheckpoint, DbError> {
-        self.capture_checkpoint(config)?.encode(max_encoded_bytes)
+        self.capture_checkpoint(config, max_encoded_bytes)?
+            .encode(max_encoded_bytes)
     }
 
     /// Restores from a checkpoint, rebuilding the index from deserialized batches.
@@ -2223,6 +2479,15 @@ impl IntervalJoinState {
         max_state_bytes: usize,
     ) -> Result<Self, DbError> {
         Self::from_checkpoint_with_mode(cp, config, max_state_bytes, JoinExecutionMode::AppendOnly)
+    }
+
+    /// Restore the private differential kernel used only behind ordered-input normalization.
+    pub(crate) fn from_weighted_checkpoint(
+        cp: &JoinStateCheckpoint,
+        config: &StreamJoinConfig,
+        max_state_bytes: usize,
+    ) -> Result<Self, DbError> {
+        Self::from_checkpoint_with_mode(cp, config, max_state_bytes, JoinExecutionMode::Weighted)
     }
 
     fn from_checkpoint_with_mode(
@@ -3210,6 +3475,36 @@ pub(crate) fn execute_interval_join_cycle(
         max_state_bytes,
         output_budget,
         JoinExecutionMode::AppendOnly,
+    )
+}
+
+/// Differential cycle for rows already admitted by ordered-input normalizers.
+///
+/// The normalizers own replay and prior-cutoff validation, so this narrow wrapper deliberately
+/// disables the generic kernel's late-row filter while retaining weighted schema validation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_weighted_interval_join_cycle(
+    state: &mut IntervalJoinState,
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    config: &StreamJoinConfig,
+    left_watermark: i64,
+    right_watermark: i64,
+    max_state_bytes: usize,
+    output_budget: &mut IntervalJoinOutputBudget,
+) -> Result<Vec<RecordBatch>, DbError> {
+    execute_interval_join_cycle_with_mode(
+        state,
+        left_batches,
+        right_batches,
+        config,
+        i64::MIN,
+        i64::MIN,
+        left_watermark,
+        right_watermark,
+        max_state_bytes,
+        output_budget,
+        JoinExecutionMode::Weighted,
     )
 }
 
@@ -4423,7 +4718,7 @@ mod tests {
         let first_column = state.left.batches[0].column(0).clone();
 
         let error = state
-            .capture_checkpoint(&config)
+            .capture_checkpoint(&config, usize::MAX)
             .unwrap()
             .encode(1)
             .err()
@@ -4433,7 +4728,7 @@ mod tests {
         assert!(!state.left.is_compact());
         assert!(Arc::ptr_eq(&first_column, state.left.batches[0].column(0)));
 
-        let capture = state.capture_checkpoint(&config).unwrap();
+        let capture = state.capture_checkpoint(&config, usize::MAX).unwrap();
         assert!(Arc::ptr_eq(
             &first_column,
             capture.left_batches[0].column(0)
@@ -4446,6 +4741,55 @@ mod tests {
         assert!(checkpoint.left_match_flags.is_empty());
         assert!(Arc::ptr_eq(&first_column, state.left.batches[0].column(0)));
         assert!(!state.left.is_compact());
+
+        let mut multi_batch = IntervalJoinState::new();
+        execute_interval_join_cycle(
+            &mut multi_batch,
+            &[left_batch(&["A"], &[100], &[1.0])],
+            &[],
+            &config,
+            0,
+            0,
+        )
+        .unwrap();
+        execute_interval_join_cycle(
+            &mut multi_batch,
+            &[left_batch(&["B"], &[101], &[2.0])],
+            &[],
+            &config,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(multi_batch.left.batches.len(), 2);
+        let (fixed_capture_bytes, left_batch_clones, right_batch_clones) =
+            multi_batch.capture_preflight_bytes(&config).unwrap();
+        let expected_batch_clones = charged_allocation(
+            2_usize
+                .checked_mul(std::mem::size_of::<RecordBatch>())
+                .unwrap(),
+        )
+        .checked_add(
+            2_usize
+                .checked_mul(charged_allocation(
+                    3_usize
+                        .checked_mul(std::mem::size_of::<ArrayRef>())
+                        .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(left_batch_clones, expected_batch_clones);
+        assert_eq!(right_batch_clones, 0);
+        let exact_preflight = fixed_capture_bytes
+            .checked_add(left_batch_clones)
+            .and_then(|bytes| bytes.checked_add(right_batch_clones))
+            .unwrap();
+        let error = multi_batch
+            .capture_checkpoint(&config, exact_preflight - 1)
+            .err()
+            .expect("one byte below the shallow-clone preflight must reject capture");
+        assert!(error.to_string().contains("capture requires"));
     }
 
     #[test]
@@ -4462,7 +4806,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let capture = state.capture_checkpoint(&config).unwrap();
+        let capture = state.capture_checkpoint(&config, usize::MAX).unwrap();
 
         execute_interval_join_cycle(
             &mut state,
@@ -5289,7 +5633,7 @@ mod tests {
         .unwrap();
         let row_weights = Arc::clone(&state.left.row_weights[0]);
         let match_weights = Arc::clone(&state.left.match_weights[0]);
-        let capture = state.capture_checkpoint(&config).unwrap();
+        let capture = state.capture_checkpoint(&config, usize::MAX).unwrap();
         assert!(Arc::ptr_eq(&row_weights, &capture.left_row_weights[0]));
         assert!(Arc::ptr_eq(&match_weights, &capture.left_match_weights[0]));
 
@@ -5356,7 +5700,7 @@ mod tests {
         assert!(!state.left.is_compact());
 
         let checkpoint = state
-            .capture_checkpoint(&config)
+            .capture_checkpoint(&config, usize::MAX)
             .unwrap()
             .encode(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES)
             .unwrap();
@@ -5395,7 +5739,7 @@ mod tests {
         assert_eq!(state.buffered_rows(), (1, 0));
 
         let checkpoint = state
-            .capture_checkpoint(&config)
+            .capture_checkpoint(&config, usize::MAX)
             .unwrap()
             .encode(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES)
             .unwrap();

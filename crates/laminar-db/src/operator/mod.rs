@@ -359,6 +359,8 @@ impl LiveSqlCache {
 pub(crate) mod ai_inference;
 pub(crate) mod eowc_query;
 pub(crate) mod interval_join;
+/// Private mutable-input normalization state used only by explicitly configured bounded joins.
+pub(crate) mod interval_join_input;
 pub(crate) mod lookup_enrich;
 pub(crate) mod sql_query;
 pub(crate) mod temporal_filter;

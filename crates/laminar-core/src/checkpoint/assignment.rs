@@ -189,25 +189,45 @@ impl CheckpointAssignmentFence {
     /// Stable digest of the current partitioning ABI and a canonical ordered vnode-owner map.
     #[must_use]
     pub fn owner_map_digest(vnode_count: u32, owners: &[u64]) -> [u8; 32] {
-        Self::owner_map_digest_for_abi(PARTITIONING_ABI_VERSION, vnode_count, owners)
+        Self::owner_map_digest_iter(vnode_count, owners.iter().copied())
     }
 
+    /// Allocation-free stable digest of the current partitioning ABI and an exact-size ordered
+    /// vnode-owner iterator.
+    #[must_use]
+    pub fn owner_map_digest_iter(
+        vnode_count: u32,
+        owners: impl ExactSizeIterator<Item = u64>,
+    ) -> [u8; 32] {
+        Self::owner_map_digest_iter_for_abi(PARTITIONING_ABI_VERSION, vnode_count, owners)
+    }
+
+    #[cfg(test)]
     fn owner_map_digest_for_abi(
         partitioning_abi_version: u16,
         vnode_count: u32,
         owners: &[u64],
     ) -> [u8; 32] {
+        Self::owner_map_digest_iter_for_abi(
+            partitioning_abi_version,
+            vnode_count,
+            owners.iter().copied(),
+        )
+    }
+
+    fn owner_map_digest_iter_for_abi(
+        partitioning_abi_version: u16,
+        vnode_count: u32,
+        owners: impl ExactSizeIterator<Item = u64>,
+    ) -> [u8; 32] {
         use sha2::{Digest, Sha256};
 
+        let owner_count = owners.len();
         let mut hash = Sha256::new();
         hash.update(b"laminardb-vnode-owner-map-v2\0");
         hash.update(partitioning_abi_version.to_le_bytes());
         hash.update(vnode_count.to_le_bytes());
-        hash.update(
-            u64::try_from(owners.len())
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
+        hash.update(u64::try_from(owner_count).unwrap_or(u64::MAX).to_le_bytes());
         for owner in owners {
             hash.update(owner.to_le_bytes());
         }

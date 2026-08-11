@@ -925,7 +925,7 @@ impl OperatorGraph {
             match contract {
                 ManagedStateContract::SqlAggregateV1
                 | ManagedStateContract::CoreWindowV1
-                | ManagedStateContract::BoundedIntervalJoinV2
+                | ManagedStateContract::BoundedIntervalJoinV3
                 | ManagedStateContract::TemporalJoinV1 => {}
                 #[cfg(test)]
                 ManagedStateContract::TestVnodeStateV1 => continue,
@@ -962,7 +962,7 @@ impl OperatorGraph {
             if !frames.whole_restores.is_empty()
                 && !matches!(
                     contract,
-                    ManagedStateContract::BoundedIntervalJoinV2
+                    ManagedStateContract::BoundedIntervalJoinV3
                         | ManagedStateContract::CoreWindowV1
                         | ManagedStateContract::TemporalJoinV1
                 )
@@ -981,7 +981,7 @@ impl OperatorGraph {
                 || matches!(
                     contract,
                     ManagedStateContract::SqlAggregateV1
-                        | ManagedStateContract::BoundedIntervalJoinV2
+                        | ManagedStateContract::BoundedIntervalJoinV3
                         | ManagedStateContract::CoreWindowV1
                         | ManagedStateContract::TemporalJoinV1
                 );
