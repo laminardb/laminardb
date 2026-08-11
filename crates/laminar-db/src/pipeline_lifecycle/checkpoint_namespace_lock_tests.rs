@@ -48,6 +48,43 @@ async fn wait_for_processing_cycle(db: &Arc<crate::db::LaminarDB>) {
 }
 
 #[tokio::test]
+async fn recoverable_reference_tables_reject_process_local_sql_dml() {
+    let root = tempfile::tempdir().unwrap();
+    let db = exact_db(root.path()).await;
+    db.execute("CREATE TABLE dimensions (id BIGINT PRIMARY KEY, label VARCHAR NOT NULL)")
+        .await
+        .unwrap();
+    let error = db
+        .execute("INSERT INTO dimensions VALUES (1, 'process-local')")
+        .await
+        .expect_err("recoverable table state requires versioned snapshot intake");
+    assert!(error.to_string().contains("LDB-6043"), "{error}");
+    assert_eq!(db.table_store.read().table_row_count("dimensions"), 0);
+
+    crate::db::DbState::Stopped.store(&db.state);
+    let error = db
+        .execute("INSERT INTO dimensions VALUES (1, 'stopped')")
+        .await
+        .expect_err("stopping does not make process-local data recoverable");
+    assert!(error.to_string().contains("LDB-6043"), "{error}");
+    db.shutdown().await.unwrap();
+
+    let reopened = exact_db(root.path()).await;
+    reopened
+        .execute("CREATE TABLE dimensions (id BIGINT PRIMARY KEY, label VARCHAR NOT NULL)")
+        .await
+        .unwrap();
+    let error = reopened
+        .execute("INSERT INTO dimensions VALUES (1, 'reopened')")
+        .await
+        .expect_err("a reopened recoverable deployment must keep the same DML fence");
+    assert!(error.to_string().contains("LDB-6043"), "{error}");
+    assert_eq!(reopened.table_store.read().table_row_count("dimensions"), 0);
+
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn second_local_exact_process_cannot_share_checkpoint_namespace() {
     let root = tempfile::tempdir().unwrap();
     let first = exact_db(root.path()).await;

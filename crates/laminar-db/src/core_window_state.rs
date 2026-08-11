@@ -558,36 +558,22 @@ impl CoreWindowState {
         let compile_props = state_ref.execution_props();
         let input_df_schema = &agg_info.input_df_schema;
 
-        // A Projection above the Aggregate makes the top schema differ.
-        let has_projection = {
-            let same = top_schema.fields().len() == agg_schema.fields().len()
-                && top_schema
-                    .fields()
-                    .iter()
-                    .zip(agg_schema.fields())
-                    .all(|(t, a)| t.data_type() == a.data_type());
-            !same
-        };
-
-        let projection_info = if has_projection {
-            fn find_projection(
-                plan: &datafusion_expr::LogicalPlan,
-            ) -> Option<&datafusion_expr::logical_plan::Projection> {
-                match plan {
-                    datafusion_expr::LogicalPlan::Projection(p) => Some(p),
-                    datafusion_expr::LogicalPlan::Sort(s) => find_projection(&s.input),
-                    datafusion_expr::LogicalPlan::Limit(l) => find_projection(&l.input),
-                    datafusion_expr::LogicalPlan::SubqueryAlias(a) => find_projection(&a.input),
-                    _ => None,
-                }
-            }
-            match find_projection(plan) {
-                Some(proj) => Some((proj.expr.as_slice(), proj.input.schema().clone())),
-                None => return Ok(None), // Unknown plan shape — bail
-            }
-        } else {
-            None
-        };
+        // Inspect the logical node itself. A same-arity, same-type expression such as
+        // `COUNT(*) * 2` still requires a post-aggregate projection.
+        let projection_info = crate::aggregate_state::find_post_aggregate_projection(plan)
+            .map_err(|()| {
+                DbError::Unsupported(format!(
+                    "[{}] managed SQL windows require one aggregate stage and at most one post-aggregate projection",
+                    laminar_core::error_codes::SQL_UNSUPPORTED
+                ))
+            })?
+            .map(|projection| {
+                (
+                    projection.expr.as_slice(),
+                    projection.input.schema().clone(),
+                )
+            });
+        let has_projection = projection_info.is_some();
 
         // `now()` in GROUP BY/SELECT/HAVING/aggregate args would freeze at plan time.
         // `Unsupported` (not `Pipeline`) lets the EOWC operator re-propagate.
@@ -788,7 +774,15 @@ impl CoreWindowState {
             output_fields.push(field.clone());
             state_output_fields.push(field);
         }
-        let output_schema = Arc::new(Schema::new(output_fields));
+        let aggregate_output_schema = Arc::new(Schema::new(output_fields));
+        // Without a post-aggregate projection this is the outward stream ABI, so retain the
+        // logical plan's exact names, types, metadata, and nullability. The synthesized aggregate
+        // schema remains internal when a projection still has to run.
+        let output_schema = if has_projection {
+            Arc::clone(&aggregate_output_schema)
+        } else {
+            Arc::clone(&top_schema)
+        };
         let state_output_schema = if logical_num_group_cols == num_group_cols {
             Arc::clone(&output_schema)
         } else {
@@ -4591,6 +4585,130 @@ mod tests {
         assert!(result.is_some(), "Tumbling aggregate should return Some");
         let state = result.unwrap();
         assert!(state.having_filter.is_some());
+    }
+
+    #[tokio::test]
+    async fn window_output_preserves_logical_abi_and_applies_same_arity_projection() {
+        use laminar_sql::{create_session_context, register_streaming_functions};
+        use std::time::Duration;
+
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let input = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![
+                Arc::new(StringArray::from(vec!["west"])),
+                Arc::new(Int64Array::from(vec![7])),
+                Arc::new(Int64Array::from(vec![1_000])),
+            ],
+        )
+        .unwrap();
+        let table =
+            datafusion::datasource::MemTable::try_new(input_schema, vec![vec![input]]).unwrap();
+        ctx.register_table("events", Arc::new(table)).unwrap();
+
+        let config = WindowOperatorConfig {
+            window_type: WindowType::Tumbling,
+            time_column: "ts".to_string(),
+            size: Duration::from_secs(10),
+            slide: None,
+            gap: None,
+            offset_ms: 0,
+            allowed_lateness: Duration::ZERO,
+            emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
+            late_data_side_output: None,
+        };
+        let sql = "SELECT region, TUMBLE(ts, INTERVAL '10' SECOND) AS window_start, \
+                   COUNT(*) AS row_count FROM events \
+                   GROUP BY region, TUMBLE(ts, INTERVAL '10' SECOND)";
+        let expected = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .logical_plan()
+            .schema()
+            .as_arrow()
+            .clone();
+        let mut state = CoreWindowState::try_from_sql(
+            &ctx,
+            sql,
+            &config,
+            Some(&laminar_sql::parser::EmitClause::OnWindowClose),
+            key_groups(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(state.post_projection.is_some());
+
+        let pre_aggregate = ctx
+            .sql(state.pre_agg_sql())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        for batch in &pre_aggregate {
+            state.update_batch(batch).unwrap();
+        }
+        let emitted = state.close_windows(11_000).unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].schema().as_ref(), &expected);
+        let counts = emitted[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(counts.value(0), 1);
+
+        let derived_sql = "SELECT region, TUMBLE(ts, INTERVAL '10' SECOND) AS window_start, \
+                           COUNT(*) * 2 AS doubled FROM events \
+                           GROUP BY region, TUMBLE(ts, INTERVAL '10' SECOND)";
+        let derived_expected = ctx
+            .sql(derived_sql)
+            .await
+            .unwrap()
+            .logical_plan()
+            .schema()
+            .as_arrow()
+            .clone();
+        let mut derived = CoreWindowState::try_from_sql(
+            &ctx,
+            derived_sql,
+            &config,
+            Some(&laminar_sql::parser::EmitClause::OnWindowClose),
+            key_groups(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(derived.post_projection.is_some());
+
+        let pre_aggregate = ctx
+            .sql(derived.pre_agg_sql())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        for batch in &pre_aggregate {
+            derived.update_batch(batch).unwrap();
+        }
+        let emitted = derived.close_windows(11_000).unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].schema().as_ref(), &derived_expected);
+        let doubled = emitted[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(doubled.value(0), 2);
     }
 
     #[tokio::test]

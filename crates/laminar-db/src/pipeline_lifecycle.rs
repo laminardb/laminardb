@@ -267,6 +267,14 @@ pub(crate) enum TemporalSourceRole {
     Right,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OrderedIntervalAdmissions {
+    pub(crate) joins:
+        FxHashMap<String, [crate::operator::interval_join_input::BoundedJoinInputMode; 2]>,
+    /// Only non-append sources are present. Absence means the ordinary append-only route.
+    pub(crate) source_modes: FxHashMap<String, SourceInputMode>,
+}
+
 impl TemporalSourceRole {
     const fn name(self) -> &'static str {
         match self {
@@ -343,6 +351,42 @@ fn has_only_temporal_right_consumers(
             }
         }
         if crate::sql_analysis::extract_table_references(&stream.query_sql).contains(source) {
+            return false;
+        }
+    }
+    consumed
+}
+
+fn has_only_ordered_interval_consumers(
+    source: &str,
+    stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+    sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
+    admitted_joins: &FxHashMap<
+        String,
+        [crate::operator::interval_join_input::BoundedJoinInputMode; 2],
+    >,
+) -> bool {
+    if sink_regs
+        .values()
+        .any(|sink| sink.input == source || sink.query_inputs.iter().any(|input| input == source))
+    {
+        return false;
+    }
+    let mut consumed = false;
+    for stream in stream_regs.values() {
+        let references = crate::sql_analysis::extract_table_references(&stream.query_sql);
+        let configured_input = stream.join_config.as_deref().is_some_and(|joins| {
+            matches!(
+                joins,
+                [laminar_sql::translator::JoinOperatorConfig::StreamStream(config)]
+                    if config.left_table == source || config.right_table == source
+            )
+        });
+        if !configured_input && !references.contains(source) {
+            continue;
+        }
+        consumed = true;
+        if !admitted_joins.contains_key(&stream.name) || !configured_input {
             return false;
         }
     }
@@ -458,6 +502,7 @@ struct PreparedSink {
     filter_expr: Option<String>,
     input: String,
     contract: SinkContract,
+    expects_changelog: bool,
     write_timeout: std::time::Duration,
     flush_interval: std::time::Duration,
     requires_recovery_on_error: bool,
@@ -470,6 +515,7 @@ type PipelineSink = (
     Option<String>,
     String,
     SinkContract,
+    bool,
 );
 
 struct PipelineSinkSetup {
@@ -1079,10 +1125,14 @@ pub(crate) async fn plan_temporal_output_schema(
         .map(|(_, schema)| schema)
 }
 
-async fn resolve_stream_output_schemas(
+pub(crate) async fn resolve_stream_output_schemas(
     ctx: &datafusion::prelude::SessionContext,
     stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
     reference_tables: &rustc_hash::FxHashSet<String>,
+    ordered_interval_joins: &FxHashMap<
+        String,
+        [crate::operator::interval_join_input::BoundedJoinInputMode; 2],
+    >,
 ) -> Result<ResolvedStreamOutputs, DbError> {
     use datafusion::datasource::empty::EmptyTable;
 
@@ -1134,6 +1184,7 @@ async fn resolve_stream_output_schemas(
                         StreamOutputShape {
                             aggregate: false,
                             projection_filter: false,
+                            planned_functions_immutable: true,
                         },
                     )
                 } else {
@@ -1155,6 +1206,8 @@ async fn resolve_stream_output_schemas(
                                 &plan,
                             )
                             .is_some(),
+                            planned_functions_immutable:
+                                crate::sql_analysis::planned_functions_are_immutable(&plan),
                         },
                     )
                 };
@@ -1230,12 +1283,8 @@ async fn resolve_stream_output_schemas(
             }
         }
 
-        let declared_incremental: rustc_hash::FxHashSet<String> = stream_regs
-            .values()
-            .filter(|reg| reg.incremental)
-            .map(|reg| reg.name.clone())
-            .collect();
-        let mut changelog_carrying = rustc_hash::FxHashSet::default();
+        let mut changelog_carrying: rustc_hash::FxHashSet<String> =
+            ordered_interval_joins.keys().cloned().collect();
 
         for reg in stream_regs.values() {
             let shape = shapes.get(&reg.name).ok_or_else(|| {
@@ -1286,6 +1335,14 @@ async fn resolve_stream_output_schemas(
                 {
                     continue;
                 }
+                if reg.order_config.is_some()
+                    || crate::sql_analysis::query_has_order_or_row_limit(&reg.query_sql)
+                {
+                    return Err(DbError::Pipeline(format!(
+                        "stream '{}' cannot apply ordering or row limits to a changelog",
+                        reg.name
+                    )));
+                }
                 if reg.window_config.is_some() {
                     return Err(DbError::Pipeline(format!(
                         "stream '{}' cannot safely consume a changelog with window state; window aggregates do not apply input retractions",
@@ -1293,16 +1350,63 @@ async fn resolve_stream_output_schemas(
                     )));
                 }
                 let shape = shapes.get(&reg.name).expect("resolved above");
+                if crate::sql_analysis::query_references_weight(&reg.query_sql) {
+                    return Err(DbError::Pipeline(format!(
+                        "stream '{}' consumes a changelog by explicitly referencing the engine-owned '{}' column",
+                        reg.name,
+                        crate::aggregate_state::WEIGHT_COLUMN
+                    )));
+                }
+                if !shape.planned_functions_immutable {
+                    return Err(DbError::Pipeline(format!(
+                        "stream '{}' consumes a changelog through a planned function that is not replay-immutable",
+                        reg.name
+                    )));
+                }
                 let temporal_filter = !matches!(
                     crate::sql_analysis::analyze_temporal_filter(&reg.query_sql),
                     crate::sql_analysis::TemporalFilterAnalysis::NotPresent
                 );
                 let changelog_enrich = crate::sql_analysis::detect_changelog_enrich_query(
                     &reg.query_sql,
-                    &declared_incremental,
+                    &changelog_carrying,
                     reference_tables,
-                )
-                .is_some();
+                );
+                if changelog_enrich.is_some() && shape.aggregate {
+                    return Err(DbError::Pipeline(format!(
+                        "stream '{}' cannot combine aggregate state with changelog enrichment",
+                        reg.name
+                    )));
+                }
+                if let Some(enrich) = &changelog_enrich {
+                    let provider = ctx
+                        .table_provider(exact_table_reference(&enrich.static_table))
+                        .await
+                        .map_err(|error| {
+                            DbError::Pipeline(format!(
+                                "stream '{}' cannot resolve static enrich table '{}': {error}",
+                                reg.name, enrich.static_table
+                            ))
+                        })?;
+                    if schema_has_reserved_mutation_columns(provider.schema().as_ref()) {
+                        return Err(DbError::Pipeline(format!(
+                            "stream '{}' static enrich table '{}' declares reserved engine mutation metadata (_op, __op, or __weight)",
+                            reg.name, enrich.static_table
+                        )));
+                    }
+                }
+                let changelog_enrich = changelog_enrich.is_some();
+                if shape.projection_filter
+                    && !shape.aggregate
+                    && !changelog_enrich
+                    && crate::sql_analysis::projection_sql_preserving_weight(&reg.query_sql)
+                        .is_none()
+                {
+                    return Err(DbError::Pipeline(format!(
+                        "stream '{}' changelog projection cannot preserve the engine-owned weight through its exact SQL shape",
+                        reg.name
+                    )));
+                }
 
                 if temporal_filter
                     || (!shape.projection_filter && !shape.aggregate && !changelog_enrich)
@@ -1339,6 +1443,20 @@ async fn resolve_stream_output_schemas(
                 )));
             }
         }
+        for (name, schema) in &schemas {
+            if !changelog_carrying.contains(name)
+                && schema.fields().iter().any(|field| {
+                    field
+                        .name()
+                        .eq_ignore_ascii_case(crate::aggregate_state::WEIGHT_COLUMN)
+                })
+            {
+                return Err(DbError::Pipeline(format!(
+                    "stream '{name}' is not a certified changelog producer but declares the reserved engine-owned '{}' column",
+                    crate::aggregate_state::WEIGHT_COLUMN
+                )));
+            }
+        }
         for name in &changelog_carrying {
             let schema = schemas.get_mut(name).expect("resolved above");
             *schema = advertise_changelog_schema(name, schema)?;
@@ -1359,14 +1477,15 @@ async fn resolve_stream_output_schemas(
 }
 
 #[derive(Debug)]
-struct ResolvedStreamOutputs {
-    schemas: HashMap<String, arrow_schema::SchemaRef>,
-    changelog_carrying: rustc_hash::FxHashSet<String>,
+pub(crate) struct ResolvedStreamOutputs {
+    pub(crate) schemas: HashMap<String, arrow_schema::SchemaRef>,
+    pub(crate) changelog_carrying: rustc_hash::FxHashSet<String>,
 }
 
 struct StreamOutputShape {
     aggregate: bool,
     projection_filter: bool,
+    planned_functions_immutable: bool,
 }
 
 fn advertise_changelog_schema(
@@ -1376,15 +1495,31 @@ fn advertise_changelog_schema(
     use arrow_schema::{DataType, Field, Schema};
 
     let weight = crate::aggregate_state::WEIGHT_COLUMN;
-    if let Some((_, field)) = schema.column_with_name(weight) {
-        if field.data_type() == &DataType::Int64 && !field.is_nullable() {
+    let matching = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.name().eq_ignore_ascii_case(weight))
+        .collect::<Vec<_>>();
+    if let [(index, field)] = matching.as_slice() {
+        if *index + 1 == schema.fields().len()
+            && field.name() == weight
+            && field.data_type() == &DataType::Int64
+            && !field.is_nullable()
+        {
             return Ok(Arc::clone(schema));
         }
         return Err(DbError::Pipeline(format!(
-            "stream '{stream}' exposes reserved changelog column '{weight}' with type {:?} and \
-             nullable={}; expected non-null Int64",
+            "stream '{stream}' exposes reserved changelog column '{}' with type {:?} and \
+             nullable={}; expected sole exact trailing non-null Int64 '{weight}'",
+            field.name(),
             field.data_type(),
             field.is_nullable()
+        )));
+    }
+    if !matching.is_empty() {
+        return Err(DbError::Pipeline(format!(
+            "stream '{stream}' exposes duplicate reserved changelog column '{weight}'"
         )));
     }
 
@@ -3448,6 +3583,530 @@ impl LaminarDB {
         Ok(temporal_source_roles)
     }
 
+    pub(crate) fn resolve_registered_source_contract(
+        &self,
+        source_name: &str,
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+    ) -> Result<Option<(SourceContract, arrow_schema::SchemaRef)>, DbError> {
+        let Some(source_reg) = source_regs
+            .get(source_name)
+            .filter(|registration| registration.connector_type.is_some())
+        else {
+            return Ok(None);
+        };
+        let connector_config = self
+            .build_registered_source_config(source_name, source_reg)
+            .map_err(|error| {
+                DbError::Config(format!(
+                    "source '{source_name}' has invalid connector configuration: {error}"
+                ))
+            })?;
+        let connector = self
+            .connector_registry
+            .create_source(&connector_config, None)
+            .map_err(|error| {
+                DbError::Config(format!(
+                    "cannot construct interval source '{source_name}' for contract validation: {error}"
+                ))
+            })?;
+        let connector_schema = connector.schema();
+        let contract = connector.contract(&connector_config).map_err(|error| {
+            DbError::Config(format!(
+                "source '{source_name}' has an invalid connector contract: {error}"
+            ))
+        })?;
+        Ok(Some((contract, connector_schema)))
+    }
+
+    /// Require every configured mutation source to be owned by exactly one certified stateful
+    /// route. The role-specific validators also prove consumer exclusivity; this closes sources
+    /// that are otherwise absent from both role maps (for example a direct copy or sink).
+    pub(crate) fn validate_registered_mutation_source_admission(
+        &self,
+        source_name: &str,
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+        temporal_source_roles: &FxHashMap<String, TemporalSourceRole>,
+        ordered_interval_admissions: &OrderedIntervalAdmissions,
+    ) -> Result<(), DbError> {
+        let Some((contract, _)) =
+            self.resolve_registered_source_contract(source_name, source_regs)?
+        else {
+            return Ok(());
+        };
+        if contract.input_mode == SourceInputMode::AppendOnly {
+            return Ok(());
+        }
+        let temporal_right = temporal_source_roles.get(source_name)
+            == Some(&TemporalSourceRole::Right)
+            && contract.input_mode == SourceInputMode::KeyedUpsert;
+        let ordered_interval =
+            ordered_interval_admissions.source_modes.get(source_name) == Some(&contract.input_mode);
+        if temporal_right ^ ordered_interval {
+            return Ok(());
+        }
+        Err(DbError::Config(format!(
+            "mutation source '{source_name}' is not exclusive to exactly one admitted temporal-right or bounded interval route"
+        )))
+    }
+
+    fn validate_interval_source_metadata(
+        &self,
+        stream: &str,
+        source_name: &str,
+        time_column: &str,
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+    ) -> Result<Arc<crate::catalog::SourceEntry>, DbError> {
+        let entry = self.catalog.get_source(source_name).ok_or_else(|| {
+            DbError::Config(format!(
+                "interval stream '{stream}' input '{source_name}' is absent from the source catalog"
+            ))
+        })?;
+        let direct = source_regs.get(source_name).is_some_and(|registration| {
+            registration.connector_type.is_some() && registration.name == source_name
+        });
+        if !direct {
+            return Err(DbError::Config(format!(
+                "interval stream '{stream}' input '{source_name}' must be a direct configured source when either input is mutable"
+            )));
+        }
+        if entry
+            .is_processing_time
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(DbError::Config(format!(
+                "interval stream '{stream}' source '{source_name}' must use event time, not processing time"
+            )));
+        }
+        if entry.watermark_column.as_deref() != Some(time_column)
+            || entry.max_out_of_orderness.is_none()
+        {
+            return Err(DbError::Config(format!(
+                "interval stream '{stream}' source '{source_name}' must declare WATERMARK FOR {time_column} with a bounded out-of-orderness policy"
+            )));
+        }
+        let field = entry.schema.field_with_name(time_column).map_err(|_| {
+            DbError::Config(format!(
+                "interval stream '{stream}' source '{source_name}' time column '{time_column}' is absent"
+            ))
+        })?;
+        if field.is_nullable()
+            || !matches!(field.data_type(), arrow_schema::DataType::Timestamp(_, _))
+        {
+            return Err(DbError::Config(format!(
+                "interval stream '{stream}' source '{source_name}' time column '{time_column}' must be a non-null timestamp"
+            )));
+        }
+        Ok(entry)
+    }
+
+    fn bounded_interval_input_mode(
+        stream: &str,
+        source_name: &str,
+        entry: &crate::catalog::SourceEntry,
+        contract: SourceContract,
+        join_keys: &[String],
+        time_column: &str,
+    ) -> Result<crate::operator::interval_join_input::BoundedJoinInputMode, DbError> {
+        use crate::operator::interval_join_input::BoundedJoinInputMode;
+        use arrow_schema::DataType;
+
+        if contract.row_positions != SourceRowPositionCapability::OrderedDeterministic {
+            return Err(DbError::Config(format!(
+                "interval stream '{stream}' source '{source_name}' requires ordered deterministic row positions"
+            )));
+        }
+        laminar_connectors::connector::schema_with_source_row_positions(&entry.schema).map_err(
+            |error| {
+                DbError::Config(format!(
+                    "interval stream '{stream}' source '{source_name}' has an invalid source-position schema: {error}"
+                ))
+            },
+        )?;
+
+        let fields = entry.schema.fields();
+        let reserved = |name: &str| {
+            ["_op", "__op", crate::aggregate_state::WEIGHT_COLUMN]
+                .iter()
+                .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        };
+        match contract.input_mode {
+            SourceInputMode::AppendOnly => {
+                if fields.iter().any(|field| reserved(field.name())) {
+                    return Err(DbError::Config(format!(
+                        "interval stream '{stream}' append-only source '{source_name}' cannot declare mutation metadata"
+                    )));
+                }
+                Ok(BoundedJoinInputMode::AppendOnly)
+            }
+            SourceInputMode::KeyedUpsert => {
+                if fields.iter().any(|field| reserved(field.name())) {
+                    return Err(DbError::Config(format!(
+                        "interval stream '{stream}' keyed-upsert source '{source_name}' cannot declare engine-owned mutation columns"
+                    )));
+                }
+                laminar_connectors::connector::schema_with_source_mutations_and_row_positions(
+                    &entry.schema,
+                )
+                .map_err(|error| {
+                    DbError::Config(format!(
+                        "interval stream '{stream}' source '{source_name}' has an invalid mutation schema: {error}"
+                    ))
+                })?;
+                if entry.primary_key.is_empty() {
+                    return Err(DbError::Config(format!(
+                        "interval stream '{stream}' keyed-upsert source '{source_name}' requires an explicit PRIMARY KEY"
+                    )));
+                }
+                for required in join_keys {
+                    if !entry.primary_key.iter().any(|column| column == required) {
+                        return Err(DbError::Config(format!(
+                            "interval stream '{stream}' keyed-upsert source '{source_name}' PRIMARY KEY must include join/event-time column '{required}'"
+                        )));
+                    }
+                }
+                if !entry.primary_key.iter().any(|column| column == time_column) {
+                    return Err(DbError::Config(format!(
+                        "interval stream '{stream}' keyed-upsert source '{source_name}' PRIMARY KEY must include join/event-time column '{time_column}'"
+                    )));
+                }
+                let primary_key_indices = entry
+                    .primary_key
+                    .iter()
+                    .map(|column| {
+                        entry.schema.index_of(column).map_err(|_| {
+                            DbError::Config(format!(
+                                "interval stream '{stream}' source '{source_name}' PRIMARY KEY column '{column}' is absent"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(BoundedJoinInputMode::KeyedUpsert {
+                    primary_key_indices,
+                })
+            }
+            SourceInputMode::FullChangelog => {
+                let weight = crate::aggregate_state::WEIGHT_COLUMN;
+                let Some((last_index, last)) = fields
+                    .len()
+                    .checked_sub(1)
+                    .map(|index| (index, &fields[index]))
+                else {
+                    return Err(DbError::Config(format!(
+                        "interval stream '{stream}' full-changelog source '{source_name}' requires a trailing '{weight}' column"
+                    )));
+                };
+                let reserved_indices = fields
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, field)| reserved(field.name()))
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                if reserved_indices != [last_index]
+                    || last.name() != weight
+                    || last.data_type() != &DataType::Int64
+                    || last.is_nullable()
+                {
+                    return Err(DbError::Config(format!(
+                        "interval stream '{stream}' full-changelog source '{source_name}' requires the sole reserved column to be exact trailing non-null Int64 '{weight}'"
+                    )));
+                }
+                Ok(BoundedJoinInputMode::FullChangelog)
+            }
+        }
+    }
+
+    pub(crate) async fn validate_persisted_interval_source_contracts(
+        &self,
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+        sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
+        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+        runtime: RuntimeMode,
+    ) -> Result<OrderedIntervalAdmissions, DbError> {
+        use crate::operator::interval_join_input::BoundedJoinInputMode;
+        use laminar_sql::translator::JoinOperatorConfig;
+
+        let mut streams = stream_regs.values().collect::<Vec<_>>();
+        streams.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut contracts = FxHashMap::<String, Option<SourceContract>>::default();
+        let mut connector_schemas = FxHashMap::<String, arrow_schema::SchemaRef>::default();
+        let mut admission = OrderedIntervalAdmissions::default();
+
+        for stream in streams {
+            let Some([JoinOperatorConfig::StreamStream(config)]) = stream.join_config.as_deref()
+            else {
+                continue;
+            };
+            let direct_entry = |source_name: &str| {
+                if source_regs
+                    .get(source_name)
+                    .is_none_or(|registration| registration.connector_type.is_none())
+                {
+                    return Ok(None);
+                }
+                self.catalog.get_source(source_name).map(Some).ok_or_else(|| {
+                    DbError::Config(format!(
+                        "interval stream '{}' configured source '{source_name}' is absent from the source catalog",
+                        stream.name
+                    ))
+                })
+            };
+            let left_entry = direct_entry(&config.left_table)?;
+            let right_entry = direct_entry(&config.right_table)?;
+            let mut resolve = |source_name: &str| {
+                if let Some(contract) = contracts.get(source_name) {
+                    return Ok(*contract);
+                }
+                let contract = self
+                    .resolve_registered_source_contract(source_name, source_regs)?
+                    .map(|(contract, schema)| {
+                        connector_schemas.insert(source_name.to_string(), schema);
+                        contract
+                    });
+                contracts.insert(source_name.to_string(), contract);
+                Ok::<_, DbError>(contract)
+            };
+            let left_contract = left_entry
+                .as_deref()
+                .map(|_| resolve(&config.left_table))
+                .transpose()?
+                .flatten();
+            let right_contract = right_entry
+                .as_deref()
+                .map(|_| resolve(&config.right_table))
+                .transpose()?
+                .flatten();
+            let mutable = [left_contract, right_contract]
+                .into_iter()
+                .flatten()
+                .any(|contract| contract.input_mode != SourceInputMode::AppendOnly);
+            if !mutable {
+                continue;
+            }
+            // Preserve the legacy append-only path. Once either port is mutable, both direct
+            // connector schemas become part of the ordered normalizer ABI and must match the
+            // catalog exactly.
+            for (source_name, entry) in [
+                (config.left_table.as_str(), left_entry.as_deref()),
+                (config.right_table.as_str(), right_entry.as_deref()),
+            ] {
+                let Some(entry) = entry else {
+                    continue;
+                };
+                let connector_schema = connector_schemas.get(source_name).ok_or_else(|| {
+                    DbError::Config(format!(
+                        "interval source '{source_name}' connector contract disappeared during validation"
+                    ))
+                })?;
+                if !connector_schema.fields().is_empty()
+                    && connector_schema.as_ref() != entry.schema.as_ref()
+                {
+                    return Err(DbError::Config(format!(
+                        "interval source '{source_name}' connector schema does not match its catalog schema"
+                    )));
+                }
+            }
+
+            if runtime == RuntimeMode::Cluster
+                && self.config.delivery_guarantee == DeliveryGuarantee::BestEffort
+            {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}': {CLUSTER_BEST_EFFORT}",
+                    stream.name
+                )));
+            }
+            if self.config.delivery_guarantee != DeliveryGuarantee::BestEffort
+                && self.config.checkpoint.is_none()
+            {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' requires checkpointing for at-least-once/exactly-once state and source-offset recovery",
+                    stream.name
+                )));
+            }
+            let detected = crate::sql_analysis::detect_stream_join_query(&stream.query_sql)
+                .ok_or_else(|| {
+                    DbError::Config(format!(
+                        "interval stream '{}' does not map exactly to the bounded interval-join execution path",
+                        stream.name
+                    ))
+                })?;
+            if detected.config.left_table != config.left_table
+                || detected.config.right_table != config.right_table
+                || detected.config.join_type != config.join_type
+                || detected.config.left_keys != config.left_keys
+                || detected.config.right_keys != config.right_keys
+                || detected.config.left_time_column != config.left_time_column
+                || detected.config.right_time_column != config.right_time_column
+                || detected.config.time_bound != config.time_bound
+            {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' planner and bounded execution metadata disagree",
+                    stream.name
+                )));
+            }
+            if detected.left_pre_filter.is_some() || detected.right_pre_filter.is_some() {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' mutable inputs do not support source prefilters",
+                    stream.name
+                )));
+            }
+            if crate::sql_analysis::has_unaliased_projection(&stream.query_sql) {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' mutable output requires every projected expression to have an explicit alias",
+                    stream.name
+                )));
+            }
+            if crate::sql_analysis::has_unqualified_interval_output_column(&stream.query_sql) {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' mutable output requires every projected and filtered column to use its left/right source qualifier",
+                    stream.name
+                )));
+            }
+            if stream.order_config.is_some()
+                || stream.has_analytic
+                || stream.has_frame
+                || crate::sql_analysis::mutable_changelog_has_unsafe_modifiers(&stream.query_sql)
+            {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' mutable output does not support DISTINCT, ordering/row limits, analytic frames, grouping, or other row-set modifiers",
+                    stream.name
+                )));
+            }
+            if crate::sql_analysis::query_references_weight(&stream.query_sql) {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' mutable query cannot reference the engine-owned '{}' input column",
+                    stream.name,
+                    crate::aggregate_state::WEIGHT_COLUMN
+                )));
+            }
+            let dataframe = self.ctx.sql(&stream.query_sql).await.map_err(|error| {
+                DbError::Config(format!(
+                    "interval stream '{}' could not plan its replay contract: {error}",
+                    stream.name
+                ))
+            })?;
+            if crate::ddl::logical_aggregate_stage_count(dataframe.logical_plan()) != 0 {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' mutable output cannot contain an aggregate stage",
+                    stream.name
+                )));
+            }
+            if !crate::sql_analysis::planned_functions_are_immutable(dataframe.logical_plan()) {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' mutable route contains a planned function that is not replay-immutable",
+                    stream.name
+                )));
+            }
+            if dataframe
+                .logical_plan()
+                .schema()
+                .fields()
+                .iter()
+                .any(|field| {
+                    field
+                        .name()
+                        .eq_ignore_ascii_case(crate::aggregate_state::WEIGHT_COLUMN)
+                })
+            {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' mutable projection cannot declare or alias the engine-owned '{}' output column",
+                    stream.name,
+                    crate::aggregate_state::WEIGHT_COLUMN
+                )));
+            }
+
+            let left_entry = self.validate_interval_source_metadata(
+                &stream.name,
+                &config.left_table,
+                &config.left_time_column,
+                source_regs,
+            )?;
+            let right_entry = self.validate_interval_source_metadata(
+                &stream.name,
+                &config.right_table,
+                &config.right_time_column,
+                source_regs,
+            )?;
+            let left_contract = left_contract.ok_or_else(|| {
+                DbError::Config(format!(
+                    "interval stream '{}' left input '{}' must be a direct configured source when either input is mutable",
+                    stream.name, config.left_table
+                ))
+            })?;
+            let right_contract = right_contract.ok_or_else(|| {
+                DbError::Config(format!(
+                    "interval stream '{}' right input '{}' must be a direct configured source when either input is mutable",
+                    stream.name, config.right_table
+                ))
+            })?;
+            let modes = [
+                Self::bounded_interval_input_mode(
+                    &stream.name,
+                    &config.left_table,
+                    left_entry.as_ref(),
+                    left_contract,
+                    &config.left_keys,
+                    &config.left_time_column,
+                )?,
+                Self::bounded_interval_input_mode(
+                    &stream.name,
+                    &config.right_table,
+                    right_entry.as_ref(),
+                    right_contract,
+                    &config.right_keys,
+                    &config.right_time_column,
+                )?,
+            ];
+            for (source_name, contract) in [
+                (config.left_table.as_str(), left_contract),
+                (config.right_table.as_str(), right_contract),
+            ] {
+                admit_source_recovery_contract(
+                    contract,
+                    self.config.delivery_guarantee,
+                    self.config.checkpoint.is_some(),
+                    runtime,
+                )
+                .map_err(|reason| {
+                    DbError::Config(format!(
+                        "interval stream '{}' source '{source_name}' is not recoverable with {} delivery: {reason} (contract: {contract:?})",
+                        stream.name, self.config.delivery_guarantee
+                    ))
+                })?;
+                if contract.input_mode != SourceInputMode::AppendOnly {
+                    match admission
+                        .source_modes
+                        .insert(source_name.to_string(), contract.input_mode)
+                    {
+                        Some(previous) if previous != contract.input_mode => {
+                            return Err(DbError::Config(format!(
+                                "interval mutation source '{source_name}' resolved conflicting input modes"
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            debug_assert!(modes
+                .iter()
+                .any(|mode| !matches!(mode, BoundedJoinInputMode::AppendOnly)));
+            admission.joins.insert(stream.name.clone(), modes);
+        }
+
+        for source in admission.source_modes.keys() {
+            if !has_only_ordered_interval_consumers(
+                source,
+                stream_regs,
+                sink_regs,
+                &admission.joins,
+            ) {
+                return Err(DbError::Config(format!(
+                    "interval mutation source '{source}' has a consumer outside its admitted bounded interval joins"
+                )));
+            }
+        }
+        Ok(admission)
+    }
+
     fn build_registered_source_config(
         &self,
         source_name: &str,
@@ -3497,6 +4156,24 @@ impl LaminarDB {
             &stream_regs,
             startup_runtime,
         )?;
+        let ordered_interval_admissions = self
+            .validate_persisted_interval_source_contracts(
+                &source_regs,
+                &sink_regs,
+                &stream_regs,
+                startup_runtime,
+            )
+            .await?;
+        let mut registered_source_names = source_regs.keys().collect::<Vec<_>>();
+        registered_source_names.sort_unstable();
+        for source_name in registered_source_names {
+            self.validate_registered_mutation_source_admission(
+                source_name,
+                &source_regs,
+                &temporal_source_roles,
+                &ordered_interval_admissions,
+            )?;
+        }
 
         let injected_cluster_checkpoint_store =
             self.validate_startup_durability(startup_runtime)?;
@@ -3529,6 +4206,7 @@ impl LaminarDB {
                 has_external,
                 pipeline_identity,
                 temporal_source_roles,
+                ordered_interval_admissions,
                 runtime_shutdown,
             )
             .await?;
@@ -3578,6 +4256,10 @@ impl LaminarDB {
         stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
         table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
         changelog_carrying: &rustc_hash::FxHashSet<String>,
+        ordered_interval_joins: &FxHashMap<
+            String,
+            [crate::operator::interval_join_input::BoundedJoinInputMode; 2],
+        >,
         pipeline_identity: Option<&laminar_core::checkpoint::PipelineIdentity>,
     ) -> Result<crate::operator_graph::OperatorGraph, DbError> {
         use crate::operator_graph::OperatorGraph;
@@ -3634,12 +4316,16 @@ impl LaminarDB {
                     error = %e,
                     "failed to register lookup table in operator graph context"
                 );
-            } else {
+            } else if !table_regs
+                .get(&name)
+                .is_some_and(|registration| registration.on_demand)
+            {
                 reference_table_names.insert(name);
             }
         }
 
         let mut graph = OperatorGraph::new(ctx);
+        graph.set_ordered_interval_joins(ordered_interval_joins.clone());
         graph.set_key_group_count(self.checkpoint_key_groups());
         graph.set_temporal_join_idle_history_retention(
             self.config.temporal_join_idle_history_retention,
@@ -3733,6 +4419,7 @@ impl LaminarDB {
         &self,
         source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
         temporal_source_roles: &FxHashMap<String, TemporalSourceRole>,
+        ordered_interval_source_modes: &FxHashMap<String, SourceInputMode>,
         checkpointing_enabled: bool,
         runtime_mode: RuntimeMode,
         prom_registry: Option<&Arc<prometheus::Registry>>,
@@ -3784,7 +4471,19 @@ impl LaminarDB {
                 .as_ref()
                 .is_some_and(|entry| schema_has_reserved_mutation_columns(entry.schema.as_ref()));
             let temporal_role = temporal_source_roles.get(name).copied();
-            let admission = if let Some(role) = temporal_role {
+            let ordered_interval_mode = ordered_interval_source_modes.get(name).copied();
+            let admission = if let Some(mode) = ordered_interval_mode {
+                if mode == contract.input_mode {
+                    admit_source_recovery_contract(
+                        contract,
+                        self.config.delivery_guarantee,
+                        checkpointing_enabled,
+                        runtime_mode,
+                    )
+                } else {
+                    Err("bounded interval source contract changed after startup admission")
+                }
+            } else if let Some(role) = temporal_role {
                 admit_temporal_source_contract(
                     contract,
                     role,
@@ -3815,6 +4514,9 @@ impl LaminarDB {
                 && contract.input_mode == SourceInputMode::KeyedUpsert
             {
                 source = source.with_temporal_right_mutations();
+            }
+            if let Some(mode) = ordered_interval_mode {
+                source = source.with_ordered_interval_input_mode(mode)?;
             }
             let assignment_scoped = cfg!(feature = "cluster")
                 && runtime_mode == RuntimeMode::Cluster
@@ -4045,6 +4747,7 @@ impl LaminarDB {
                 filter_expr: reg.filter_expr.clone(),
                 input: reg.input.clone(),
                 contract,
+                expects_changelog: carries_changelog,
                 write_timeout,
                 flush_interval,
                 requires_recovery_on_error: contract.is_checkpoint_committable()
@@ -4092,6 +4795,7 @@ impl LaminarDB {
             Option<String>,
             String, // input stream name (FROM clause target)
             SinkContract,
+            bool, // admitted input is a changelog and must carry canonical weight
         )> = Vec::with_capacity(prepared_sinks.len());
         for prepared in prepared_sinks {
             let PreparedSink {
@@ -4100,6 +4804,7 @@ impl LaminarDB {
                 filter_expr,
                 input,
                 contract,
+                expects_changelog,
                 write_timeout,
                 flush_interval,
                 requires_recovery_on_error,
@@ -4128,7 +4833,14 @@ impl LaminarDB {
                 debug_assert!(!owned.iter().any(|known| known.same_actor(&handle)));
                 owned.push(handle.clone());
             }
-            sinks.push((name, handle, filter_expr, input, contract));
+            sinks.push((
+                name,
+                handle,
+                filter_expr,
+                input,
+                contract,
+                expects_changelog,
+            ));
             task_fence.handoff();
         }
         drop(sink_event_tx);
@@ -4142,7 +4854,7 @@ impl LaminarDB {
                         .filter(|source| source.assignment_scoped)
                         .map(|source| source.name.clone()),
                 );
-                for (name, handle, _, _, _) in &sinks {
+                for (name, handle, _, _, _, _) in &sinks {
                     coord.register_sink(name.clone(), handle.clone());
                 }
             }
@@ -4983,7 +5695,7 @@ impl LaminarDB {
 
         let pending_sink_filter_compiles = sinks
             .iter()
-            .filter(|(_, _, filter_sql, _, _)| filter_sql.is_some())
+            .filter(|(_, _, filter_sql, _, _, _)| filter_sql.is_some())
             .count();
         let source_name_arcs: rustc_hash::FxHashMap<usize, Arc<str>> = source_ids
             .iter()
@@ -5009,7 +5721,7 @@ impl LaminarDB {
 
         let checkpoint_committable_sinks = sinks
             .iter()
-            .any(|(_, handle, _, _, _)| handle.checkpoint_committable());
+            .any(|(_, handle, _, _, _, _)| handle.checkpoint_committable());
         let checkpoint_in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (
             epoch_allocator,
@@ -5460,6 +6172,7 @@ impl LaminarDB {
         has_external: bool,
         pipeline_identity: Option<laminar_core::checkpoint::PipelineIdentity>,
         temporal_source_roles: FxHashMap<String, TemporalSourceRole>,
+        ordered_interval_admissions: OrderedIntervalAdmissions,
         runtime_shutdown: tokio_util::sync::CancellationToken,
     ) -> Result<(), DbError> {
         use crate::pipeline::{CheckpointSchedule, PipelineConfig};
@@ -5510,10 +6223,24 @@ impl LaminarDB {
                 std::time::Duration::from_millis,
             );
 
-        let reference_tables: rustc_hash::FxHashSet<String> =
-            self.table_store.read().table_names().into_iter().collect();
-        let resolved_stream_outputs =
-            resolve_stream_output_schemas(&self.ctx, &stream_regs, &reference_tables).await?;
+        let reference_tables: rustc_hash::FxHashSet<String> = self
+            .table_store
+            .read()
+            .table_names()
+            .into_iter()
+            .filter(|name| {
+                !table_regs
+                    .get(name)
+                    .is_some_and(|registration| registration.on_demand)
+            })
+            .collect();
+        let resolved_stream_outputs = resolve_stream_output_schemas(
+            &self.ctx,
+            &stream_regs,
+            &reference_tables,
+            &ordered_interval_admissions.joins,
+        )
+        .await?;
         let stream_output_schemas = &resolved_stream_outputs.schemas;
         {
             let mut schemas = self.stream_schemas.write();
@@ -5529,6 +6256,7 @@ impl LaminarDB {
             &stream_regs,
             &table_regs,
             &resolved_stream_outputs.changelog_carrying,
+            &ordered_interval_admissions.joins,
             pipeline_identity.as_ref(),
         )?;
         for (name, schema) in stream_output_schemas {
@@ -5545,6 +6273,7 @@ impl LaminarDB {
         let mut sources = self.build_pipeline_sources(
             &source_regs,
             &temporal_source_roles,
+            &ordered_interval_admissions.source_modes,
             checkpointing_enabled,
             runtime_mode,
             prom_registry.as_ref(),

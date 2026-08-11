@@ -3445,7 +3445,7 @@ async fn create_source_rejects_invalid_primary_key_declarations() {
         ),
         (
             "CREATE SOURCE invalid (__weight BIGINT)",
-            "reserved mutation metadata",
+            "full-changelog metadata",
         ),
     ];
 
@@ -4986,6 +4986,40 @@ async fn test_create_source_with_connector_rejected_when_running() {
     );
 }
 
+#[tokio::test]
+async fn insert_into_reference_table_is_fenced_while_pipeline_runs() {
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE seed (id INT)").await.unwrap();
+    db.execute("CREATE TABLE dimensions (id INT PRIMARY KEY, label VARCHAR)")
+        .await
+        .unwrap();
+    db.execute("INSERT INTO dimensions VALUES (1, 'before')")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+
+    let error = db
+        .execute("INSERT INTO dimensions VALUES (1, 'after')")
+        .await
+        .expect_err("a running pipeline must retain its reference-table snapshot");
+    assert!(error.to_string().contains("LDB-6043"), "{error}");
+    let snapshot = db
+        .table_store
+        .read()
+        .to_record_batch("dimensions")
+        .unwrap()
+        .unwrap();
+    let labels = snapshot
+        .column_by_name("label")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(labels.value(0), "before");
+
+    db.shutdown().await.unwrap();
+}
+
 #[cfg(feature = "kafka")]
 #[tokio::test]
 async fn create_source_surfaces_kafka_config_error_in_ddl_message() {
@@ -6417,6 +6451,41 @@ async fn create_table_rejects_invalid_key_contract_before_mutation() {
         assert!(!db.connector_manager.lock().tables().contains_key(name));
         assert!(db.connector_manager.lock().get_ddl(name).is_none());
     }
+}
+
+#[tokio::test]
+async fn reserved_mutation_metadata_cannot_be_spoofed_by_tables_or_plain_streams() {
+    let db = LaminarDB::open().unwrap();
+
+    for column in ["_op", "__op", "__WEIGHT"] {
+        let name = format!("reserved_{}", column.trim_start_matches('_').to_lowercase());
+        let error = db
+            .execute(&format!(
+                "CREATE TABLE {name} (id INT PRIMARY KEY, {column} BIGINT)"
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reserved engine mutation metadata"),
+            "{error}"
+        );
+        assert!(!db.catalog_namespace.lock().contains_key(&name));
+    }
+
+    db.execute("CREATE SOURCE events (id INT)").await.unwrap();
+    let error = db
+        .execute("CREATE STREAM spoofed AS SELECT id AS __WEIGHT FROM events")
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not a certified changelog producer"),
+        "{error}"
+    );
+    assert!(!db.catalog_namespace.lock().contains_key("spoofed"));
 }
 
 #[tokio::test]
@@ -8666,6 +8735,25 @@ async fn test_retracting_temporal_filter_emits_insert_then_retract() {
     );
 }
 
+#[tokio::test]
+async fn first_temporal_filter_mv_uses_multiset_storage() {
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE events (id BIGINT, ts TIMESTAMP)")
+        .await
+        .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW recent_mv AS SELECT * FROM events \
+         WHERE ts > now() - INTERVAL '10' SECOND EMIT CHANGES",
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        db.mv_store.read().storage_mode_for_test("recent_mv"),
+        Some(crate::mv_store::MvStorageMode::Multiset)
+    ));
+}
+
 /// The production path: a `WATERMARK FOR ts` stream where the frontier
 /// advances purely from event-time data (no manual watermark calls). A
 /// later event ages out an earlier one. (A *fully silent* source does
@@ -9190,6 +9278,22 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
                      FROM left_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
                      LIMIT 1 EMIT ON WINDOW CLOSE",
                 ),
+            ] {
+                let error = db
+                    .execute(ddl)
+                    .await
+                    .expect_err("unsupported managed aggregate shape must fail before mutation");
+                let message = error.to_string();
+                assert!(
+                    message.contains("managed SQL windows require one aggregate stage")
+                        || message.contains(
+                            "managed CoreWindow execution requires one direct source",
+                        ),
+                    "unexpected rejection for {name}: {error}"
+                );
+                assert_no_query_residue(&db, name);
+            }
+            for (name, ddl) in [
                 (
                     "rejected_indirect_eowc",
                     "CREATE STREAM rejected_indirect_eowc AS \

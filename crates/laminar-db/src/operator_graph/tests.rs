@@ -84,6 +84,53 @@ impl GraphOperator for BatchProbe {
     }
 }
 
+#[tokio::test]
+async fn intermediate_schema_mismatch_fails_before_downstream_routing() {
+    let mut graph = test_graph();
+    let actual_schema = Arc::new(Schema::new(vec![
+        Field::new("right", DataType::Int64, false),
+        Field::new("left", DataType::Int64, false),
+    ]));
+    let expected_schema = Arc::new(Schema::new(vec![
+        Field::new("left", DataType::Int64, false),
+        Field::new("right", DataType::Int64, false),
+    ]));
+    graph.register_source_schema("raw".to_string(), Arc::clone(&actual_schema));
+    graph.register_intermediate_schema("declared", &expected_schema);
+
+    let source = graph.ensure_source_node("raw");
+    let declared = graph
+        .place_operator_node("declared", Box::new(SourcePassthrough), 1)
+        .unwrap();
+    graph.add_edge(source, declared, 0);
+    let recorded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let downstream = graph
+        .place_operator_node("downstream", Box::new(BatchProbe(Arc::clone(&recorded))), 1)
+        .unwrap();
+    graph.add_edge(declared, downstream, 0);
+
+    let batch = RecordBatch::try_new(
+        actual_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![2])),
+        ],
+    )
+    .unwrap();
+    let sources = FxHashMap::from_iter([(Arc::from("raw"), vec![batch])]);
+    let error = graph
+        .execute_cycle(&sources, i64::MIN, None)
+        .await
+        .expect_err("same-typed reordered fields must fail closed");
+
+    assert!(error.requires_pipeline_halt(), "{error}");
+    assert!(
+        error.to_string().contains("startup resolved fields"),
+        "{error}"
+    );
+    assert!(recorded.lock().is_empty());
+}
+
 #[cfg(feature = "cluster")]
 struct ManagedFrontierProbe {
     capability: OperatorCapability,
@@ -2365,7 +2412,8 @@ fn test_source_passthrough() {
 async fn source_views_share_payloads_but_hide_positions_from_ordinary_queries() {
     use laminar_connectors::connector::{
         schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,
-        SourceBatch, SourceRowPositionCapability, SourceRowPositions, SOURCE_PARTITION_COLUMN,
+        SourceBatch, SourceMutation, SourceRowPositionCapability, SourceRowPositions,
+        SOURCE_MUTATION_COLUMN, SOURCE_PARTITION_COLUMN,
     };
 
     let visible_batch = test_batch();
@@ -2380,6 +2428,8 @@ async fn source_views_share_payloads_but_hide_positions_from_ordinary_queries() 
     )
     .unwrap();
     let positioned_batch = SourceBatch::positioned(visible_batch, positions)
+        .unwrap()
+        .with_mutations(vec![SourceMutation::Put, SourceMutation::Tombstone])
         .unwrap()
         .into_records_with_metadata(
             SourceRowPositionCapability::OrderedDeterministic,
@@ -2430,10 +2480,16 @@ async fn source_views_share_payloads_but_hide_positions_from_ordinary_queries() 
     assert!(ordinary_batches[0]
         .column_by_name(SOURCE_PARTITION_COLUMN)
         .is_none());
-    assert_eq!(positioned_batches[0].schema(), positioned_schema);
+    assert_eq!(positioned_batches[0].schema(), mutation_schema);
     assert!(positioned_batches[0]
         .column_by_name(SOURCE_PARTITION_COLUMN)
         .is_some());
+    assert!(positioned_batches[0]
+        .column_by_name(SOURCE_MUTATION_COLUMN)
+        .is_some());
+    assert!(ordinary_batches[0]
+        .column_by_name(SOURCE_MUTATION_COLUMN)
+        .is_none());
     assert!(Arc::ptr_eq(&visible_values, ordinary_batches[0].column(0)));
     assert!(Arc::ptr_eq(
         &visible_values,
@@ -2484,11 +2540,18 @@ fn managed_temporal_operator_internal_construction_uses_two_positioned_inputs() 
             None,
         )
         .unwrap();
-    graph.ensure_query_source_nodes(None, Some(&config), &FxHashSet::default());
+    graph.ensure_query_source_nodes(None, Some(&config), false, &FxHashSet::default());
     let node = graph
         .place_operator_node("trade_quotes", operator, 2)
         .unwrap();
-    assert!(!graph.wire_query_edges(node, None, None, Some(&config), &FxHashSet::default()));
+    assert!(!graph.wire_query_edges(
+        node,
+        None,
+        None,
+        Some(&config),
+        false,
+        &FxHashSet::default()
+    ));
     assert_eq!(
         graph.nodes[node].capability,
         OperatorCapability::managed_temporal_join()
@@ -2500,6 +2563,82 @@ fn managed_temporal_operator_internal_construction_uses_two_positioned_inputs() 
             graph.positioned_source_map["quotes"],
         ]
     );
+}
+
+#[test]
+fn ordered_interval_admission_builds_weighted_operator_on_positioned_inputs() {
+    use arrow::datatypes::TimeUnit;
+    use laminar_sql::parser::join_parser::JoinType;
+    use laminar_sql::translator::{JoinOperatorConfig, StreamJoinConfig};
+
+    let mut graph = test_graph();
+    let left_schema = Arc::new(Schema::new(vec![
+        Field::new("account", DataType::Utf8, false),
+        Field::new("amount", DataType::Int64, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+    ]));
+    let right_schema = Arc::new(Schema::new(vec![
+        Field::new("account", DataType::Utf8, false),
+        Field::new("receipt_id", DataType::Int64, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+    ]));
+    graph.register_source_schema("orders".into(), left_schema);
+    graph.register_source_schema("receipts".into(), right_schema);
+    graph.set_ordered_interval_joins(FxHashMap::from_iter([(
+        "matched".to_string(),
+        [
+            crate::operator::interval_join_input::BoundedJoinInputMode::KeyedUpsert {
+                primary_key_indices: vec![0, 2],
+            },
+            crate::operator::interval_join_input::BoundedJoinInputMode::AppendOnly,
+        ],
+    )]));
+
+    let mut join_config = StreamJoinConfig::new(
+        JoinType::Inner,
+        vec!["account".into()],
+        vec!["account".into()],
+        std::time::Duration::from_secs(1),
+    );
+    join_config.left_table = "orders".into();
+    join_config.right_table = "receipts".into();
+    join_config.left_time_column = "ts".into();
+    join_config.right_time_column = "ts".into();
+    graph.add_query(
+        "matched".into(),
+        "SELECT o.account AS account, o.amount AS amount FROM orders o JOIN receipts r \
+         ON o.account = r.account \
+         AND r.ts BETWEEN o.ts AND o.ts + INTERVAL '1' SECOND"
+            .into(),
+        None,
+        None,
+        None,
+        Some(vec![JoinOperatorConfig::StreamStream(join_config)]),
+        false,
+    );
+
+    graph.take_build_errors().unwrap();
+    let node = graph.output_map["matched"];
+    assert_eq!(
+        graph.nodes[node].capability,
+        OperatorCapability::bounded_interval_join()
+    );
+    assert_eq!(
+        graph.input_sources[node],
+        [
+            graph.positioned_source_map["orders"],
+            graph.positioned_source_map["receipts"],
+        ]
+    );
+    assert!(graph.changelog_tables.contains("matched"));
 }
 
 #[test]

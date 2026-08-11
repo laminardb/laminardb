@@ -1413,6 +1413,482 @@ async fn checkpoint_graph_drain_waits_for_externally_blocked_work() {
     assert_eq!(process_calls.load(std::sync::atomic::Ordering::Acquire), 2);
 }
 
+struct WriteCountingSink {
+    writes: Arc<std::sync::atomic::AtomicUsize>,
+    schema: arrow_schema::SchemaRef,
+}
+
+#[async_trait::async_trait]
+impl laminar_connectors::connector::SinkConnector for WriteCountingSink {
+    async fn open(
+        &mut self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+
+    async fn write_batch(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> Result<laminar_connectors::connector::WriteResult, laminar_connectors::error::ConnectorError>
+    {
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(laminar_connectors::connector::WriteResult::new(
+            batch.num_rows(),
+            batch.get_array_memory_size() as u64,
+        ))
+    }
+
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+
+    async fn close(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn weighted_input_faults_best_effort_before_any_sink_write() {
+    use laminar_connectors::connector::{
+        DeliveryGuarantee, SinkConsistency, SinkInputMode, SinkTopology,
+    };
+
+    let mut callback = empty_callback_fixture();
+    callback.delivery_guarantee = DeliveryGuarantee::BestEffort;
+    let (event_tx, event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    callback.sink_event_rx = event_rx;
+    let append_contract = SinkContract::new(
+        SinkConsistency::Ephemeral,
+        SinkTopology::MultiWriter,
+        SinkInputMode::AppendOnly,
+    );
+    let changelog_contract = SinkContract::new(
+        SinkConsistency::Ephemeral,
+        SinkTopology::MultiWriter,
+        SinkInputMode::FullChangelog,
+    );
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("value", arrow_schema::DataType::Int64, false),
+        arrow_schema::Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            arrow_schema::DataType::Int64,
+            false,
+        ),
+    ]));
+    let changelog_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let changelog_handle =
+        crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+            name: "changelog".into(),
+            sink_id: Arc::from("changelog"),
+            connector: Box::new(WriteCountingSink {
+                writes: Arc::clone(&changelog_writes),
+                schema: Arc::clone(&schema),
+            }),
+            contract: changelog_contract,
+            requires_recovery_on_error: false,
+            channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+            flush_interval: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(1),
+            event_tx: event_tx.clone(),
+            terminal_tasks: None,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
+        });
+    let append_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let append_handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+        name: "append".into(),
+        sink_id: Arc::from("append"),
+        connector: Box::new(WriteCountingSink {
+            writes: Arc::clone(&append_writes),
+            schema: Arc::clone(&schema),
+        }),
+        contract: append_contract,
+        requires_recovery_on_error: false,
+        channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: Duration::from_secs(5),
+        write_timeout: Duration::from_secs(1),
+        event_tx,
+        terminal_tasks: None,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
+    });
+    callback.sinks.push((
+        "changelog".into(),
+        changelog_handle.clone(),
+        None,
+        "input".into(),
+        changelog_contract,
+        true,
+    ));
+    callback.sinks.push((
+        "append".into(),
+        append_handle.clone(),
+        None,
+        "input".into(),
+        append_contract,
+        false,
+    ));
+    let weighted = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arrow_array::Int64Array::from(vec![7])),
+            Arc::new(arrow_array::Int64Array::from(vec![-1])),
+        ],
+    )
+    .unwrap();
+    let mut results = FxHashMap::default();
+    results.insert(Arc::from("input"), vec![weighted]);
+
+    let error = crate::pipeline::PipelineCallback::write_to_sinks(&mut callback, &results, None)
+        .await
+        .expect_err("weighted input must fault an append-only sink in best-effort mode");
+
+    assert!(matches!(
+        error,
+        crate::pipeline::CycleError::Recovery(ref reason)
+            if reason.contains("FullChangelog")
+    ));
+    tokio::task::yield_now().await;
+    assert_eq!(
+        changelog_writes.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "all-sink preflight must reject before a valid sibling sink writes"
+    );
+    assert_eq!(append_writes.load(std::sync::atomic::Ordering::Acquire), 0);
+    changelog_handle.close().await.unwrap();
+    append_handle.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn admitted_changelog_missing_weight_faults_before_any_sibling_write() {
+    use laminar_connectors::connector::{
+        DeliveryGuarantee, SinkConsistency, SinkInputMode, SinkTopology,
+    };
+
+    let mut callback = empty_callback_fixture();
+    callback.delivery_guarantee = DeliveryGuarantee::BestEffort;
+    let (event_tx, event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    callback.sink_event_rx = event_rx;
+    let append_contract = SinkContract::new(
+        SinkConsistency::Ephemeral,
+        SinkTopology::MultiWriter,
+        SinkInputMode::AppendOnly,
+    );
+    let full_contract = SinkContract::new(
+        SinkConsistency::Ephemeral,
+        SinkTopology::MultiWriter,
+        SinkInputMode::FullChangelog,
+    );
+    let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "value",
+        arrow_schema::DataType::Int64,
+        false,
+    )]));
+    let sibling_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sibling_handle =
+        crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+            name: "plain-sibling".into(),
+            sink_id: Arc::from("plain-sibling"),
+            connector: Box::new(WriteCountingSink {
+                writes: Arc::clone(&sibling_writes),
+                schema: Arc::clone(&schema),
+            }),
+            contract: append_contract,
+            requires_recovery_on_error: false,
+            channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+            flush_interval: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(1),
+            event_tx: event_tx.clone(),
+            terminal_tasks: None,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
+        });
+    let changelog_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let changelog_handle =
+        crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+            name: "missing-weight".into(),
+            sink_id: Arc::from("missing-weight"),
+            connector: Box::new(WriteCountingSink {
+                writes: Arc::clone(&changelog_writes),
+                schema: Arc::clone(&schema),
+            }),
+            contract: full_contract,
+            requires_recovery_on_error: false,
+            channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+            flush_interval: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(1),
+            event_tx,
+            terminal_tasks: None,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
+        });
+    callback.sinks.push((
+        "plain-sibling".into(),
+        sibling_handle.clone(),
+        None,
+        "plain".into(),
+        append_contract,
+        false,
+    ));
+    callback.sinks.push((
+        "missing-weight".into(),
+        changelog_handle.clone(),
+        None,
+        "changes".into(),
+        full_contract,
+        true,
+    ));
+    let plain = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(arrow_array::Int64Array::from(vec![7]))],
+    )
+    .unwrap();
+    let mut results = FxHashMap::default();
+    results.insert(Arc::from("plain"), vec![plain.clone()]);
+    results.insert(Arc::from("changes"), vec![plain]);
+
+    let error = crate::pipeline::PipelineCallback::write_to_sinks(&mut callback, &results, None)
+        .await
+        .expect_err("an admitted changelog must not silently publish a plain batch");
+    assert!(matches!(
+        error,
+        crate::pipeline::CycleError::Recovery(ref reason) if reason.contains("missing")
+    ));
+    tokio::task::yield_now().await;
+    assert_eq!(sibling_writes.load(std::sync::atomic::Ordering::Acquire), 0);
+    assert_eq!(
+        changelog_writes.load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    sibling_handle.close().await.unwrap();
+    changelog_handle.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn weighted_filter_preflight_is_atomic_across_batches_and_sinks() {
+    use laminar_connectors::connector::{
+        DeliveryGuarantee, SinkConsistency, SinkInputMode, SinkTopology,
+    };
+
+    let mut callback = empty_callback_fixture();
+    callback.delivery_guarantee = DeliveryGuarantee::BestEffort;
+    let (event_tx, event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    callback.sink_event_rx = event_rx;
+    let contract = SinkContract::new(
+        SinkConsistency::Ephemeral,
+        SinkTopology::MultiWriter,
+        SinkInputMode::FullChangelog,
+    );
+    let int_schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("value", arrow_schema::DataType::Int64, false),
+        arrow_schema::Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            arrow_schema::DataType::Int64,
+            false,
+        ),
+    ]));
+    let text_schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("value", arrow_schema::DataType::Utf8, false),
+        arrow_schema::Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            arrow_schema::DataType::Int64,
+            false,
+        ),
+    ]));
+    let filtered_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let filtered_handle =
+        crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+            name: "filtered".into(),
+            sink_id: Arc::from("filtered"),
+            connector: Box::new(WriteCountingSink {
+                writes: Arc::clone(&filtered_writes),
+                schema: Arc::clone(&int_schema),
+            }),
+            contract,
+            requires_recovery_on_error: false,
+            channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+            flush_interval: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(1),
+            event_tx: event_tx.clone(),
+            terminal_tasks: None,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
+        });
+    let sibling_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sibling_handle =
+        crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+            name: "sibling".into(),
+            sink_id: Arc::from("sibling"),
+            connector: Box::new(WriteCountingSink {
+                writes: Arc::clone(&sibling_writes),
+                schema: Arc::clone(&int_schema),
+            }),
+            contract,
+            requires_recovery_on_error: false,
+            channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+            flush_interval: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(1),
+            event_tx,
+            terminal_tasks: None,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
+        });
+    callback.sinks.push((
+        "filtered".into(),
+        filtered_handle.clone(),
+        Some("value > 0".into()),
+        "changes".into(),
+        contract,
+        true,
+    ));
+    callback.sinks.push((
+        "sibling".into(),
+        sibling_handle.clone(),
+        None,
+        "changes".into(),
+        contract,
+        true,
+    ));
+    callback.pending_sink_filter_compiles = 1;
+    let first = RecordBatch::try_new(
+        int_schema,
+        vec![
+            Arc::new(arrow_array::Int64Array::from(vec![7])),
+            Arc::new(arrow_array::Int64Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    let second = RecordBatch::try_new(
+        text_schema,
+        vec![
+            Arc::new(arrow_array::StringArray::from(vec!["bad-type"])),
+            Arc::new(arrow_array::Int64Array::from(vec![-1])),
+        ],
+    )
+    .unwrap();
+    let mut results = FxHashMap::default();
+    results.insert(Arc::from("changes"), vec![first, second]);
+
+    let error = crate::pipeline::PipelineCallback::write_to_sinks(&mut callback, &results, None)
+        .await
+        .expect_err("a later filter-evaluation error must abort the whole publication");
+    assert!(
+        error.to_string().contains("filter application failed"),
+        "{error}"
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(
+        filtered_writes.load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    assert_eq!(sibling_writes.load(std::sync::atomic::Ordering::Acquire), 0);
+    filtered_handle.close().await.unwrap();
+    sibling_handle.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn weighted_sink_filters_reject_volatility_and_weight_references_before_write() {
+    use laminar_connectors::connector::{
+        DeliveryGuarantee, SinkConsistency, SinkInputMode, SinkTopology,
+    };
+
+    let contract = SinkContract::new(
+        SinkConsistency::Ephemeral,
+        SinkTopology::MultiWriter,
+        SinkInputMode::FullChangelog,
+    );
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("value", arrow_schema::DataType::Int64, false),
+        arrow_schema::Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            arrow_schema::DataType::Int64,
+            false,
+        ),
+    ]));
+    let weighted = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(arrow_array::Int64Array::from(vec![7])),
+            Arc::new(arrow_array::Int64Array::from(vec![-1])),
+        ],
+    )
+    .unwrap();
+
+    for (filter, expected) in [
+        ("random() > 0.5", "not replay-immutable"),
+        ("__WEIGHT > 0", "must not reference"),
+    ] {
+        let mut callback = empty_callback_fixture();
+        callback.delivery_guarantee = DeliveryGuarantee::BestEffort;
+        let (event_tx, event_rx) = laminar_core::streaming::channel::channel::<
+            crate::sink_task::SinkEvent,
+        >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+        callback.sink_event_rx = event_rx;
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+            name: "filtered-changelog".into(),
+            sink_id: Arc::from("filtered-changelog"),
+            connector: Box::new(WriteCountingSink {
+                writes: Arc::clone(&writes),
+                schema: Arc::clone(&schema),
+            }),
+            contract,
+            requires_recovery_on_error: false,
+            channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+            flush_interval: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(1),
+            event_tx,
+            terminal_tasks: None,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
+        });
+        callback.sinks.push((
+            "filtered-changelog".into(),
+            handle.clone(),
+            Some(filter.into()),
+            "input".into(),
+            contract,
+            true,
+        ));
+        callback.pending_sink_filter_compiles = 1;
+        let mut results = FxHashMap::default();
+        results.insert(Arc::from("input"), vec![weighted.clone()]);
+
+        for (attempt, expected) in [("initial", expected), ("cached", "recovery-required")] {
+            let error =
+                crate::pipeline::PipelineCallback::write_to_sinks(&mut callback, &results, None)
+                    .await
+                    .expect_err(
+                        "unsafe weighted filter must fault even under best-effort delivery",
+                    );
+
+            assert!(
+                error.to_string().contains(expected),
+                "{filter} {attempt}: {error}"
+            );
+            assert!(matches!(
+                callback.compiled_sink_filters.as_slice(),
+                [SinkFilter::Rejected]
+            ));
+            tokio::task::yield_now().await;
+            assert_eq!(writes.load(std::sync::atomic::Ordering::Acquire), 0);
+        }
+        handle.close().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn rejected_sink_filter_faults_replay_guaranteed_publication() {
     use laminar_connectors::connector::{SinkConsistency, SinkInputMode, SinkTopology};
@@ -1447,6 +1923,7 @@ async fn rejected_sink_filter_faults_replay_guaranteed_publication() {
         Some("(".into()),
         "input".into(),
         contract,
+        false,
     ));
     callback.pending_sink_filter_compiles = 1;
     let mut results = FxHashMap::default();

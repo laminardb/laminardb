@@ -1,8 +1,8 @@
 //! Replay-safe, vnode-local input normalization for bounded interval joins.
 //!
-//! This module is deliberately private and has no planner or operator admission. It converts one
-//! ordered source batch into weighted differential rows, then publishes its logical state only
-//! after the caller confirms that the downstream join kernel accepted the delta.
+//! The startup planner admits this private contract only for certified direct source routes. It
+//! converts ordered source batches into weighted differential rows, then publishes its logical
+//! state only after the caller confirms that the downstream join kernel accepted the delta.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
@@ -39,10 +39,6 @@ const NORMALIZATION_CELL_SCRATCH_CHARGE: usize = 128;
 
 /// Source semantics normalized by one bounded-join input.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "planner admission is intentionally closed while the ordered-input modes are staged"
-)]
 pub(crate) enum BoundedJoinInputMode {
     /// Every accepted source row contributes `+1`.
     AppendOnly,

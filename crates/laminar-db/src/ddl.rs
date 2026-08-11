@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::physical_plan::ExecutionPlan;
+use laminar_connectors::connector::{SourceContract, SourceInputMode};
 use laminar_core::catalog::CatalogObjectKind;
 use laminar_sql::parser::StreamingStatement;
 use laminar_sql::translator::streaming_ddl::{self, ColumnDefinition};
@@ -129,6 +130,19 @@ enum IncEmit {
     Multiset,
     /// Full-emit (not incremental): replace-all aggregate or append.
     None,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct IntervalTopologyCandidate {
+    mutable_join: bool,
+    candidate_carries_changelog: bool,
+    changelog_input: Option<ChangelogInputKind>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ChangelogInputKind {
+    Forwarded,
+    StaticEnrich,
 }
 
 struct StreamCreateGuard<'a> {
@@ -1340,6 +1354,16 @@ impl LaminarDB {
             .build_source_definition(create, resolved.as_ref(), has_connector, &source_name)
             .await?;
         source_def.name.clone_from(&source_name);
+        let source_contract = self.validate_source_input_schema_contract(
+            &source_name,
+            resolved.as_ref(),
+            &source_def,
+        )?;
+        if source_contract
+            .is_some_and(|contract| contract.input_mode != SourceInputMode::AppendOnly)
+        {
+            self.validate_new_mutation_source_consumers(&source_name)?;
+        }
 
         {
             let mut planner = self.planner.lock();
@@ -1467,6 +1491,138 @@ impl LaminarDB {
             .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))
     }
 
+    fn validate_source_input_schema_contract(
+        &self,
+        source_name: &str,
+        resolved: Option<&ResolvedConnector>,
+        source_def: &streaming_ddl::SourceDefinition,
+    ) -> Result<Option<SourceContract>, DbError> {
+        let weight = laminar_core::changelog::WEIGHT_COLUMN;
+        let fields = source_def.schema.fields();
+        if let Some(field) = fields.iter().find(|field| {
+            ["_op", "__op"]
+                .iter()
+                .any(|name| field.name().eq_ignore_ascii_case(name))
+        }) {
+            return Err(DbError::InvalidOperation(format!(
+                "CREATE SOURCE column '{}' is reserved engine mutation metadata",
+                field.name()
+            )));
+        }
+        let weight_fields = fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.name().eq_ignore_ascii_case(weight))
+            .collect::<Vec<_>>();
+        let canonical_weight = matches!(weight_fields.as_slice(), [(index, field)]
+            if *index + 1 == fields.len()
+                && field.name() == weight
+                && field.data_type() == &DataType::Int64
+                && !field.is_nullable());
+
+        let contract = if let Some(resolved) = resolved {
+            let registration = crate::connector_manager::SourceRegistration {
+                name: source_name.to_string(),
+                connector_type: resolved.connector_type.clone(),
+                connector_options: resolved.connector_options.clone(),
+                format: resolved.format.clone(),
+                format_options: resolved.format_options.clone(),
+            };
+            let mut config = crate::connector_manager::build_source_config(&registration)?;
+            config.set(
+                "_arrow_schema".to_string(),
+                crate::pipeline_callback::encode_arrow_schema(&source_def.schema),
+            );
+            let connector = self
+                .connector_registry
+                .create_source(&config, None)
+                .map_err(|error| {
+                    DbError::Config(format!(
+                        "cannot construct source '{source_name}' for input-mode validation: {error}"
+                    ))
+                })?;
+            Some(connector.contract(&config).map_err(|error| {
+                DbError::Config(format!(
+                    "source '{source_name}' has an invalid connector contract: {error}"
+                ))
+            })?)
+        } else {
+            None
+        };
+
+        match contract.map(|contract| contract.input_mode) {
+            Some(SourceInputMode::FullChangelog) if canonical_weight => Ok(()),
+            Some(SourceInputMode::FullChangelog) => Err(DbError::InvalidOperation(format!(
+                "full-changelog source '{source_name}' requires exact trailing non-null BIGINT '{weight}'"
+            ))),
+            Some(SourceInputMode::AppendOnly | SourceInputMode::KeyedUpsert) | None
+                if weight_fields.is_empty() =>
+            {
+                Ok(())
+            }
+            Some(mode) => Err(DbError::InvalidOperation(format!(
+                "source '{source_name}' declares '{weight}', but connector input mode is {mode:?}"
+            ))),
+            None => Err(DbError::InvalidOperation(format!(
+                "source '{source_name}' cannot declare engine changelog column '{weight}' without a FullChangelog connector contract"
+            ))),
+        }?;
+        Ok(contract)
+    }
+
+    /// A mutation connector may be declared before its stateful consumer, but it cannot be
+    /// retrofitted underneath an already-persisted ordinary stream or sink. Full contract
+    /// certification is repeated after the stateful route exists and again before startup.
+    fn validate_new_mutation_source_consumers(&self, source_name: &str) -> Result<(), DbError> {
+        use laminar_sql::translator::JoinOperatorConfig;
+
+        let manager = self.connector_manager.lock();
+        if manager.sinks().values().any(|sink| {
+            sink.input == source_name || sink.query_inputs.iter().any(|input| input == source_name)
+        }) {
+            return Err(DbError::Config(format!(
+                "mutation source '{source_name}' cannot be created beneath an existing direct sink; mutable sources are exclusive to admitted stateful routes"
+            )));
+        }
+        for stream in manager.streams().values() {
+            if !crate::sql_analysis::extract_table_references(&stream.query_sql)
+                .contains(source_name)
+            {
+                continue;
+            }
+            let potential_stateful_route = match stream.join_config.as_deref() {
+                Some([JoinOperatorConfig::Temporal(config)]) => {
+                    config.right_table == source_name && config.left_table != source_name
+                }
+                Some([JoinOperatorConfig::StreamStream(config)]) => {
+                    crate::sql_analysis::detect_stream_join_query(&stream.query_sql).is_some_and(
+                        |detected| {
+                            (config.left_table == source_name || config.right_table == source_name)
+                                && detected.left_pre_filter.is_none()
+                                && detected.right_pre_filter.is_none()
+                                && detected.config.left_table == config.left_table
+                                && detected.config.right_table == config.right_table
+                                && detected.config.join_type == config.join_type
+                                && detected.config.left_keys == config.left_keys
+                                && detected.config.right_keys == config.right_keys
+                                && detected.config.left_time_column == config.left_time_column
+                                && detected.config.right_time_column == config.right_time_column
+                                && detected.config.time_bound == config.time_bound
+                        },
+                    )
+                }
+                _ => false,
+            };
+            if !potential_stateful_route {
+                return Err(DbError::Config(format!(
+                    "mutation source '{source_name}' cannot be created beneath ordinary stream '{}'; mutable sources are exclusive to admitted stateful routes",
+                    stream.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// `None` when an existing source was kept (`IF NOT EXISTS`).
     fn register_source_entry(
         &self,
@@ -1554,19 +1710,11 @@ impl LaminarDB {
             laminar_sql::parser::SinkFrom::Table(table) => {
                 (canonical_object_name(table)?, Vec::new())
             }
-            laminar_sql::parser::SinkFrom::Query(query) => {
-                let laminar_sql::parser::StreamingStatement::Standard(statement) = query.as_ref()
-                else {
-                    return Err(DbError::Unsupported(
-                        "sink queries must use an ordinary SELECT".into(),
-                    ));
-                };
-                let mut inputs =
-                    crate::sql_analysis::extract_table_references(&statement.to_string())
-                        .into_iter()
-                        .collect::<Vec<_>>();
-                inputs.sort_unstable();
-                ("query".to_string(), inputs)
+            laminar_sql::parser::SinkFrom::Query(_) => {
+                return Err(DbError::Unsupported(
+                    "sink queries require a named internal stream; CREATE STREAM for the query and sink FROM that stream"
+                        .into(),
+                ));
             }
         };
 
@@ -1621,6 +1769,24 @@ impl LaminarDB {
                 manager.streams().clone(),
             )
         };
+        for input in std::iter::once(candidate.input.as_str()).chain(
+            candidate
+                .query_inputs
+                .iter()
+                .map(std::string::String::as_str),
+        ) {
+            if self.catalog.get_source(input).is_none() {
+                continue;
+            }
+            if self
+                .resolve_registered_source_contract(input, &source_regs)?
+                .is_some_and(|(contract, _)| contract.input_mode != SourceInputMode::AppendOnly)
+            {
+                return Err(DbError::Config(format!(
+                    "sink '{name}' cannot directly consume mutation source '{input}'; mutable sources are exclusive to admitted stateful routes"
+                )));
+            }
+        }
         sink_regs.insert(name.clone(), candidate.clone());
         self.validate_persisted_temporal_source_contracts(
             &source_regs,
@@ -1674,6 +1840,12 @@ impl LaminarDB {
         }
         let (fields, primary_key) = build_table_fields_and_primary_key(create)?;
         let schema = Arc::new(Schema::new(fields));
+        if crate::catalog::schema_has_reserved_mutation_columns(schema.as_ref()) {
+            return Err(DbError::InvalidOperation(
+                "CREATE TABLE columns _op, __op, and __weight are reserved engine mutation metadata"
+                    .into(),
+            ));
+        }
 
         let Some(reservation) =
             self.reserve_catalog_name(&name, CatalogObjectKind::Table, create.if_not_exists)?
@@ -1811,6 +1983,7 @@ impl LaminarDB {
         if crate::sql_analysis::has_temporal_query(query_sql) {
             self.ensure_temporal_stream_offline(&name_str)?;
         }
+        Self::reject_interval_output_subquery(&name_str, query_sql)?;
         let Some(mut reservation) =
             self.reserve_catalog_name(&name_str, CatalogObjectKind::Stream, if_not_exists)?
         else {
@@ -1822,8 +1995,9 @@ impl LaminarDB {
         };
 
         self.validate_cluster_query_shape_before_plan("stream", &name_str, query_sql)?;
-        let planned =
-            self.plan_streaming_query(name, query, emit_clause.cloned(), query_sql, false)?;
+        let planned = self
+            .plan_streaming_query(name, query, emit_clause.cloned(), query_sql)
+            .await?;
         if !self.is_cluster_runtime()
             && (planned.window_config.is_some() || planned.join_config.is_none())
             && query_inputs_registered(&self.ctx, query_sql)
@@ -1841,6 +2015,9 @@ impl LaminarDB {
             .validate_temporal_topology_candidate(&name_str, query_sql, &planned)
             .await?;
         self.validate_interval_join_schema(&name_str, query_sql, &planned)
+            .await?;
+        let _ = self
+            .validate_interval_topology_candidate("stream", &name_str, query_sql, &planned)
             .await?;
         self.validate_cluster_query_shape("stream", &name_str, query_sql, &planned)
             .await?;
@@ -1986,6 +2163,8 @@ impl LaminarDB {
             }));
         }
         let targets = self.build_drop_plan(&name_str, CatalogObjectKind::Stream, cascade)?;
+        self.ensure_mutable_interval_drop_offline("DROP STREAM", &targets)
+            .await?;
         let graph_names: Vec<String> = targets
             .iter()
             .filter(|target| {
@@ -2242,20 +2421,42 @@ impl LaminarDB {
         }))
     }
 
-    fn plan_streaming_query(
+    async fn plan_streaming_query(
         &self,
         name: &sqlparser::ast::ObjectName,
         query: &StreamingStatement,
         emit_clause: Option<laminar_sql::parser::EmitClause>,
         query_sql: &str,
-        certify_changelog_enrich: bool,
     ) -> Result<PlannedStreamingQuery, DbError> {
-        let admission = if certify_changelog_enrich {
-            let incremental_mvs = self.incremental_mv_names();
+        let admission = if crate::sql_analysis::has_join_clause(query_sql) {
+            let (source_regs, sink_regs, stream_regs) = {
+                let manager = self.connector_manager.lock();
+                (
+                    manager.sources().clone(),
+                    manager.sinks().clone(),
+                    manager.streams().clone(),
+                )
+            };
+            let ordered = self
+                .validate_persisted_interval_source_contracts(
+                    &source_regs,
+                    &sink_regs,
+                    &stream_regs,
+                    self.runtime_mode(),
+                )
+                .await?;
+            let static_tables = self.static_table_names();
+            let current = crate::pipeline_lifecycle::resolve_stream_output_schemas(
+                &self.ctx,
+                &stream_regs,
+                &static_tables,
+                &ordered.joins,
+            )
+            .await?;
             if let Some(join) = crate::sql_analysis::detect_changelog_enrich_query(
                 query_sql,
-                &incremental_mvs,
-                &self.static_table_names(),
+                &current.changelog_carrying,
+                &static_tables,
             ) {
                 Some(
                     laminar_sql::planner::ChangelogEnrichAdmission::try_new(
@@ -2389,6 +2590,17 @@ impl LaminarDB {
         )))
     }
 
+    fn reject_interval_output_subquery(name: &str, query_sql: &str) -> Result<(), DbError> {
+        if crate::sql_analysis::detect_stream_join_query(query_sql).is_some()
+            && crate::sql_analysis::interval_output_has_nested_query(query_sql)
+        {
+            return Err(DbError::InvalidOperation(format!(
+                "interval join '{name}' cannot contain a projection or filter subquery"
+            )));
+        }
+        Ok(())
+    }
+
     fn reject_temporal_materialized_view(
         query_sql: &str,
         plan: &PlannedStreamingQuery,
@@ -2406,6 +2618,163 @@ impl LaminarDB {
                 "materialized views cannot directly own managed temporal-join state; create a temporal stream while the pipeline is stopped"
                     .into(),
             ));
+        }
+        Ok(())
+    }
+
+    async fn validate_interval_topology_candidate(
+        &self,
+        object_kind: &str,
+        name: &str,
+        query_sql: &str,
+        plan: &PlannedStreamingQuery,
+    ) -> Result<IntervalTopologyCandidate, DbError> {
+        let (source_regs, sink_regs, mut stream_regs) = {
+            let manager = self.connector_manager.lock();
+            (
+                manager.sources().clone(),
+                manager.sinks().clone(),
+                manager.streams().clone(),
+            )
+        };
+        stream_regs.insert(
+            name.to_string(),
+            crate::connector_manager::StreamRegistration {
+                name: name.to_string(),
+                query_sql: query_sql.to_string(),
+                emit_clause: plan.emit_clause.clone(),
+                window_config: plan.window_config.clone(),
+                order_config: plan.order_config.clone(),
+                join_config: plan.join_config.clone(),
+                has_analytic: plan.has_analytic,
+                has_frame: plan.has_frame,
+                incremental: false,
+            },
+        );
+        let temporal_source_roles = self.validate_persisted_temporal_source_contracts(
+            &source_regs,
+            &sink_regs,
+            &stream_regs,
+            self.runtime_mode(),
+        )?;
+        let admissions = self
+            .validate_persisted_interval_source_contracts(
+                &source_regs,
+                &sink_regs,
+                &stream_regs,
+                self.runtime_mode(),
+            )
+            .await?;
+        let query_references = crate::sql_analysis::extract_table_references(query_sql);
+        for input in &query_references {
+            self.validate_registered_mutation_source_admission(
+                input,
+                &source_regs,
+                &temporal_source_roles,
+                &admissions,
+            )?;
+        }
+        let mutable_interval = admissions.joins.contains_key(name);
+        if crate::sql_analysis::query_references_weight(query_sql) {
+            return Err(DbError::InvalidOperation(format!(
+                "CREATE {object_kind} '{name}' is not a certified changelog producer and cannot explicitly reference or alias the reserved engine-owned '{}' column",
+                crate::aggregate_state::WEIGHT_COLUMN
+            )));
+        }
+        let has_existing_changelog_root = !admissions.joins.is_empty()
+            || stream_regs.values().any(|registration| {
+                registration.incremental
+                    || registration.emit_clause.as_ref().is_some_and(|emit| {
+                        matches!(emit, laminar_sql::parser::EmitClause::Changes)
+                    })
+            });
+        if !has_existing_changelog_root {
+            return Ok(IntervalTopologyCandidate {
+                mutable_join: mutable_interval,
+                ..IntervalTopologyCandidate::default()
+            });
+        }
+        let reference_tables = self.static_table_names();
+        let resolved = crate::pipeline_lifecycle::resolve_stream_output_schemas(
+            &self.ctx,
+            &stream_regs,
+            &reference_tables,
+            &admissions.joins,
+        )
+        .await?;
+        let consumes_ordered_changelog = query_references
+            .iter()
+            .any(|input| resolved.changelog_carrying.contains(input));
+        if consumes_ordered_changelog
+            && (plan.order_config.is_some()
+                || crate::sql_analysis::query_has_order_or_row_limit(query_sql))
+        {
+            return Err(DbError::InvalidOperation(format!(
+                "CREATE {object_kind} '{name}' cannot apply ordering or row limits to a changelog"
+            )));
+        }
+        let candidate_carries_changelog = resolved.changelog_carrying.contains(name);
+        let fixed_ordered_topology = mutable_interval || consumes_ordered_changelog;
+        if fixed_ordered_topology
+            && !crate::db::catalog_manifest_replay_active()
+            && DbState::load(&self.state) != DbState::Created
+        {
+            return Err(DbError::Pipeline(format!(
+                "[LDB-6043] CREATE {object_kind} '{name}' creates or consumes a mutable bounded interval changelog and must be created while the pipeline is stopped so its ordered routing and retained state are initialized before source intake"
+            )));
+        }
+        let changelog_enrich = consumes_ordered_changelog
+            && crate::sql_analysis::detect_changelog_enrich_query(
+                query_sql,
+                &resolved.changelog_carrying,
+                &reference_tables,
+            )
+            .is_some();
+        Ok(IntervalTopologyCandidate {
+            mutable_join: mutable_interval,
+            candidate_carries_changelog,
+            changelog_input: consumes_ordered_changelog.then_some(if changelog_enrich {
+                ChangelogInputKind::StaticEnrich
+            } else {
+                ChangelogInputKind::Forwarded
+            }),
+        })
+    }
+
+    async fn ensure_mutable_interval_drop_offline(
+        &self,
+        operation: &str,
+        targets: &[CatalogDropTarget],
+    ) -> Result<(), DbError> {
+        if crate::db::catalog_manifest_replay_active()
+            || DbState::load(&self.state) != DbState::Running
+        {
+            return Ok(());
+        }
+        let (source_regs, sink_regs, stream_regs) = {
+            let manager = self.connector_manager.lock();
+            (
+                manager.sources().clone(),
+                manager.sinks().clone(),
+                manager.streams().clone(),
+            )
+        };
+        let admissions = self
+            .validate_persisted_interval_source_contracts(
+                &source_regs,
+                &sink_regs,
+                &stream_regs,
+                self.runtime_mode(),
+            )
+            .await?;
+        if let Some(target) = targets
+            .iter()
+            .find(|target| admissions.joins.contains_key(&target.name))
+        {
+            return Err(DbError::Pipeline(format!(
+                "[LDB-6043] {operation} would remove mutable bounded interval join '{}' from a running fixed startup topology; stop the pipeline first",
+                target.name
+            )));
         }
         Ok(())
     }
@@ -2564,6 +2933,11 @@ impl LaminarDB {
             if crate::sql_analysis::has_unaliased_projection(query_sql) {
                 return Err(DbError::InvalidOperation(format!(
                     "interval join '{object_name}' requires every projected expression to have an explicit alias"
+                )));
+            }
+            if crate::sql_analysis::has_unqualified_interval_output_column(query_sql) {
+                return Err(DbError::InvalidOperation(format!(
+                    "interval join '{object_name}' requires every projected or filtered column to use its left or right input qualifier"
                 )));
             }
             let dataframe = self.ctx.sql(query_sql).await.map_err(|error| {
@@ -2797,7 +3171,7 @@ impl LaminarDB {
             if config.time_bound.is_zero() || i64::try_from(config.time_bound.as_millis()).is_err()
             {
                 return reject(
-                    "the distributed join supports only append-only bounded equality joins with a positive finite event-time bound",
+                    "the distributed join supports only certified direct-source bounded equality joins with a positive finite event-time bound",
                 );
             }
             let detected =
@@ -2933,6 +3307,7 @@ impl LaminarDB {
                 "materialized state has no planner-certified distribution and assignment-fenced checkpoint/read lifecycle",
             ));
         }
+        Self::reject_interval_output_subquery(&name_str, query_sql)?;
         let Some(mut reservation) = self.reserve_catalog_name(
             &name_str,
             CatalogObjectKind::MaterializedView,
@@ -2946,7 +3321,9 @@ impl LaminarDB {
             }));
         };
 
-        let planned = self.plan_streaming_query(name, query, emit_clause, query_sql, true)?;
+        let planned = self
+            .plan_streaming_query(name, query, emit_clause, query_sql)
+            .await?;
         if !self.is_cluster_runtime()
             && (planned.window_config.is_some() || planned.join_config.is_none())
             && query_inputs_registered(&self.ctx, query_sql)
@@ -2965,6 +3342,14 @@ impl LaminarDB {
             .validate_temporal_topology_candidate(&name_str, query_sql, &planned)
             .await?;
         self.validate_interval_join_schema(&name_str, query_sql, &planned)
+            .await?;
+        let interval_topology = self
+            .validate_interval_topology_candidate(
+                "materialized view",
+                &name_str,
+                query_sql,
+                &planned,
+            )
             .await?;
         let PlannedStreamingQuery {
             emit_clause: plan_emit,
@@ -3007,9 +3392,12 @@ impl LaminarDB {
 
         // An incremental MV emits a dirty-only changelog into a snapshot store; decide the store once
         // so the operator and MV store agree (keyed upsert for aggregates, Z-set for proj/filter).
-        let (inc, has_aggregate) = self
-            .incremental_emit_mode(&query_sql, plan_window.is_some())
-            .await;
+        let (inc, has_aggregate) = if interval_topology.mutable_join {
+            (IncEmit::Multiset, false)
+        } else {
+            self.incremental_emit_mode(&query_sql, plan_window.is_some(), &interval_topology)
+                .await
+        };
         let incremental = !matches!(inc, IncEmit::None);
 
         {
@@ -3140,7 +3528,20 @@ impl LaminarDB {
 
     /// Static (reference/dimension) table names — valid right sides for a changelog enrich join.
     fn static_table_names(&self) -> rustc_hash::FxHashSet<String> {
-        self.table_store.read().table_names().into_iter().collect()
+        let on_demand: rustc_hash::FxHashSet<String> = self
+            .connector_manager
+            .lock()
+            .tables()
+            .values()
+            .filter(|registration| registration.on_demand)
+            .map(|registration| registration.name.clone())
+            .collect();
+        self.table_store
+            .read()
+            .table_names()
+            .into_iter()
+            .filter(|name| !on_demand.contains(name))
+            .collect()
     }
 
     /// A query reading an incremental MV must net the retraction changelog — a non-windowed
@@ -3187,12 +3588,18 @@ impl LaminarDB {
     /// projection/filter over a changelog, `None` (full-emit) otherwise (incl. global aggregates).
     /// Returns the store mode and whether the query is an aggregate (threaded to
     /// `register_mv_provider` so it needn't re-plan to pick `Aggregate` vs append storage).
-    async fn incremental_emit_mode(&self, query_sql: &str, has_window: bool) -> (IncEmit, bool) {
+    async fn incremental_emit_mode(
+        &self,
+        query_sql: &str,
+        has_window: bool,
+        topology: &IntervalTopologyCandidate,
+    ) -> (IncEmit, bool) {
         if has_window {
             return (IncEmit::None, false);
         }
         let flag = self.config.incremental_emit;
-        let reads_incremental = self.first_incremental_ref(query_sql).is_some();
+        let reads_incremental =
+            topology.changelog_input.is_some() || self.first_incremental_ref(query_sql).is_some();
         let Some(df) = self.ctx.sql(query_sql).await.ok() else {
             return (IncEmit::None, false);
         };
@@ -3209,17 +3616,22 @@ impl LaminarDB {
             return (inc, true);
         }
         // Projection/filter over an incremental MV's changelog → Z-set multiset snapshot.
-        if reads_incremental && crate::sql_analysis::extract_projection_filter(plan).is_some() {
+        if topology.candidate_carries_changelog
+            && crate::sql_analysis::extract_projection_filter(plan).is_some()
+        {
             return (IncEmit::Multiset, false);
         }
         // `changelog ⋈ static dim` enrich join → Z-set multiset snapshot.
-        if reads_incremental
-            && crate::sql_analysis::detect_changelog_enrich_query(
+        if topology.candidate_carries_changelog
+            && (matches!(
+                topology.changelog_input,
+                Some(ChangelogInputKind::StaticEnrich)
+            ) || crate::sql_analysis::detect_changelog_enrich_query(
                 query_sql,
                 &self.incremental_mv_names(),
                 &self.static_table_names(),
             )
-            .is_some()
+            .is_some())
         {
             return (IncEmit::Multiset, false);
         }
@@ -3294,6 +3706,8 @@ impl LaminarDB {
         }
         let targets =
             self.build_drop_plan(&name_str, CatalogObjectKind::MaterializedView, cascade)?;
+        self.ensure_mutable_interval_drop_offline("DROP MATERIALIZED VIEW", &targets)
+            .await?;
         let graph_names: Vec<String> = targets
             .iter()
             .filter(|target| {

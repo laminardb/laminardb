@@ -154,10 +154,18 @@ runtimes own all configured vnodes in process; clusters distribute the same topo
 > The accepted state design is authoritative in-memory `FxHashMap` state per vnode with
 > object-store-only checkpoint durability. The four-mode production soak matrix remains pending.
 > Cluster SQL admits stateless pipelines, supported non-windowed keyed aggregates, and one bounded
-> join stage over direct append-only, watermarked sources. The join supports `INNER`, `LEFT`,
+> join stage over direct, watermarked sources. The join supports `INNER`, `LEFT`,
 > `RIGHT`, `FULL`, `LEFT/RIGHT SEMI`, and `LEFT/RIGHT ANTI` with ordered `VARCHAR`/`BIGINT`
 > equality keys and a positive finite event-time bound. Every join projection needs an explicit
-> alias. Output from any of the eight kinds can feed a separate named keyed aggregate stream;
+> alias, and every projected or filtered column must use its input qualifier. Append-only inputs use
+> the ordinary path. If either input is mutable, both connectors must
+> expose ordered deterministic positions and replayable recovery; keyed-upsert primary keys must
+> include the join keys and event-time column, while full changelogs carry one exact trailing
+> non-null `BIGINT __weight`. Mutable sources are exclusive to their admitted joins, and downstream
+> consumers and sinks must preserve the changelog. Static-table enrichment remains single-node:
+> cluster execution rejects it until reference connectors expose a cluster-agreed snapshot identity
+> that can be rebuilt on reassignment. Output from any of the eight kinds can feed a separate named
+> keyed aggregate stream;
 > fused `JOIN ... GROUP BY` and cluster windowed aggregation remain fail-closed.
 > Cluster materialized views also fail closed regardless of query shape because their
 > retained output lacks a planner-certified distribution and assignment-fenced checkpoint/read
@@ -238,10 +246,14 @@ EMIT ON WINDOW CLOSE;
 
 LaminarDB uses one bounded event-time join machinery in local and cluster execution, under both
 at-least-once and exactly-once delivery. It supports `INNER`, `LEFT`, `RIGHT`, `FULL`, `LEFT SEMI`,
-`RIGHT SEMI`, `LEFT ANTI`, and `RIGHT ANTI` joins over direct append-only sources. Each source needs
-a watermark on a `TIMESTAMP NOT NULL` column. Equality keys may be ordered composites of
-`VARCHAR`/`BIGINT` columns, with the type matching at each position, and the directional time bound
-must be positive and finite. Every projected expression needs an explicit alias.
+`RIGHT SEMI`, `LEFT ANTI`, and `RIGHT ANTI` joins over direct sources. Each source needs a watermark
+on a `TIMESTAMP NOT NULL` column. Append-only inputs use the ordinary path. A mutable join requires
+ordered deterministic source positions on both inputs; keyed-upsert and full-changelog rows are
+normalized after join-key routing, and its output carries a trailing `__weight`. Equality keys may
+be ordered composites of `VARCHAR`/`BIGINT` columns, with the type matching at each position, and
+the directional time bound must be positive and finite. Every projected expression needs an
+explicit alias, every projected or filtered column must use its input qualifier, and nested
+projection/filter subqueries are rejected.
 
 ```sql
 CREATE STREAM order_fills AS

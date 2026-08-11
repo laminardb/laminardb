@@ -4010,7 +4010,7 @@ impl LaminarDB {
                 table_name,
                 columns,
                 values,
-            } => self.handle_insert_into(table_name, columns, values),
+            } => self.handle_insert_into(table_name, columns, values).await,
             StreamingStatement::DropSource {
                 name,
                 if_exists,
@@ -4121,7 +4121,7 @@ impl LaminarDB {
         result
     }
 
-    fn handle_insert_into(
+    async fn handle_insert_into(
         &self,
         table_name: &sqlparser::ast::ObjectName,
         columns: &[sqlparser::ast::Ident],
@@ -4148,6 +4148,19 @@ impl LaminarDB {
             return Ok(ExecuteResult::RowsAffected(values.len() as u64));
         }
 
+        if !self.table_store.read().has_table(&name) {
+            return Err(DbError::InvalidOperation(format!(
+                "INSERT target '{name}' is not a typed mutable source or table"
+            )));
+        }
+
+        // Changelog enrichment must replay against the same dimension snapshot that produced the
+        // original positive row. Linearize reference-table mutation with start/stop and keep it
+        // offline until table versions are checkpoint-bound into the enrich operator.
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        self.ensure_offline_topology_ddl_allowed(&format!("INSERT INTO TABLE '{name}'"))?;
+        self.ensure_reference_table_insert_is_ephemeral(&name)?;
+
         // Single lock scope avoids TOCTOU between has_table/schema/upsert.
         {
             let mut ts = self.table_store.write();
@@ -4164,9 +4177,21 @@ impl LaminarDB {
             }
         }
 
-        Err(DbError::InvalidOperation(format!(
-            "INSERT target '{name}' is not a typed mutable source or table"
-        )))
+        Err(DbError::TableNotFound(name))
+    }
+
+    fn ensure_reference_table_insert_is_ephemeral(&self, table_name: &str) -> Result<(), DbError> {
+        if self.is_cluster_runtime() {
+            return Err(DbError::InvalidOperation(format!(
+                "[LDB-6043] INSERT INTO TABLE '{table_name}' is not coordinated cluster state; load a versioned reference-table snapshot during deployment bootstrap"
+            )));
+        }
+        if self.is_checkpoint_enabled() {
+            return Err(DbError::InvalidOperation(format!(
+                "[LDB-6043] INSERT INTO TABLE '{table_name}' is process-local and cannot be admitted into a recoverable deployment; load a versioned reference-table snapshot through its connector"
+            )));
+        }
+        Ok(())
     }
 
     #[allow(clippy::unused_self)] // will use self when implemented

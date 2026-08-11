@@ -81,8 +81,8 @@ pub struct KafkaSinkConfig {
 /// How the sink encodes an updating (changelog) input to Kafka.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SinkEnvelope {
-    /// Append-only: rows are produced as-is. A changelog's retractions are stripped upstream
-    /// (`prepare_for_sink`), so this cannot faithfully carry an aggregate's deletes.
+    /// Append-only: rows are produced as-is. Weighted changelogs are rejected during sink
+    /// admission and again at the runtime boundary because this envelope cannot carry retractions.
     #[default]
     Append,
     /// Upsert: the Z-set changelog is collapsed per key each batch — a live group becomes a keyed

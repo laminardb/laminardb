@@ -824,6 +824,11 @@ impl MvStore {
         self.entries.contains_key(name)
     }
 
+    #[cfg(test)]
+    pub(crate) fn storage_mode_for_test(&self, name: &str) -> Option<MvStorageMode> {
+        self.entries.get(name).map(|entry| entry.mode.clone())
+    }
+
     #[cfg(feature = "cluster")]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

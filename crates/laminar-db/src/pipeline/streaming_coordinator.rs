@@ -974,7 +974,7 @@ pub(crate) struct TrackedSourceRegistration {
     primary_key: Vec<String>,
     primary_key_indices: Vec<usize>,
     schema_admitted: bool,
-    temporal_right_mutations: bool,
+    admitted_non_append_mode: Option<SourceInputMode>,
     task_fence: ConnectorTaskFenceRegistration,
 }
 
@@ -1046,7 +1046,7 @@ impl TrackedSourceRegistration {
             primary_key: Vec::new(),
             primary_key_indices: Vec::new(),
             schema_admitted: false,
-            temporal_right_mutations: false,
+            admitted_non_append_mode: None,
             task_fence,
         })
     }
@@ -1068,7 +1068,7 @@ impl TrackedSourceRegistration {
             primary_key: Vec::new(),
             primary_key_indices: Vec::new(),
             schema_admitted: false,
-            temporal_right_mutations: false,
+            admitted_non_append_mode: None,
             task_fence,
         })
     }
@@ -1103,8 +1103,32 @@ impl TrackedSourceRegistration {
     }
 
     pub(crate) fn with_temporal_right_mutations(mut self) -> Self {
-        self.temporal_right_mutations = true;
+        debug_assert_eq!(self.contract.input_mode, SourceInputMode::KeyedUpsert);
+        self.admitted_non_append_mode = Some(SourceInputMode::KeyedUpsert);
         self
+    }
+
+    pub(crate) fn with_ordered_interval_input_mode(
+        mut self,
+        mode: SourceInputMode,
+    ) -> Result<Self, DbError> {
+        if mode == SourceInputMode::AppendOnly || self.contract.input_mode != mode {
+            return Err(DbError::Config(format!(
+                "source '{}' lost its admitted bounded-interval input mode",
+                self.name
+            )));
+        }
+        if self
+            .admitted_non_append_mode
+            .is_some_and(|admitted| admitted != mode)
+        {
+            return Err(DbError::Config(format!(
+                "source '{}' has conflicting stateful mutation routes",
+                self.name
+            )));
+        }
+        self.admitted_non_append_mode = Some(mode);
+        Ok(self)
     }
 
     fn has_reserved_mutation_columns(&self) -> bool {
@@ -1188,7 +1212,7 @@ pub struct StreamingCoordinator {
     source_fault_rx: tokio::sync::mpsc::UnboundedReceiver<SourceFault>,
     source_handles: Vec<SourceHandle>,
     source_names: Vec<Arc<str>>,
-    source_mutations_admitted: Vec<bool>,
+    source_input_modes: Vec<Option<SourceInputMode>>,
     shutdown: Arc<tokio::sync::Notify>,
     terminal_shutdown: tokio_util::sync::CancellationToken,
     pending_barrier: PendingBarrier,
@@ -2658,14 +2682,54 @@ impl StreamingCoordinator {
                     source.name
                 )));
             }
-            if source.temporal_right_mutations {
-                if source.contract().input_mode != SourceInputMode::KeyedUpsert
-                    || source.has_reserved_mutation_columns()
+            if let Some(mode) = source.admitted_non_append_mode {
+                if source.contract().input_mode != mode
+                    || source.contract().row_positions
+                        != SourceRowPositionCapability::OrderedDeterministic
                 {
                     return Err(DbError::Config(format!(
-                        "source '{}' lost its admitted temporal-right mutation contract",
+                        "source '{}' lost its admitted stateful mutation contract",
                         source.name
                     )));
+                }
+                match mode {
+                    SourceInputMode::AppendOnly => {
+                        return Err(DbError::Config(format!(
+                            "source '{}' has an invalid append-only mutation admission marker",
+                            source.name
+                        )));
+                    }
+                    SourceInputMode::KeyedUpsert => {
+                        if source.has_reserved_mutation_columns() {
+                            return Err(DbError::Config(format!(
+                                "source '{}' keyed-upsert schema declares reserved mutation metadata",
+                                source.name
+                            )));
+                        }
+                    }
+                    SourceInputMode::FullChangelog => {
+                        let weight = laminar_core::changelog::WEIGHT_COLUMN;
+                        let fields = source.expected_schema.fields();
+                        let valid_weight = fields.last().is_some_and(|field| {
+                            field.name() == weight
+                                && field.data_type() == &arrow_schema::DataType::Int64
+                                && !field.is_nullable()
+                        });
+                        let reserved_count = fields
+                            .iter()
+                            .filter(|field| {
+                                ["_op", "__op", weight]
+                                    .iter()
+                                    .any(|name| field.name().eq_ignore_ascii_case(name))
+                            })
+                            .count();
+                        if !valid_weight || reserved_count != 1 {
+                            return Err(DbError::Config(format!(
+                                "source '{}' full-changelog schema requires exact trailing non-null Int64 '{weight}'",
+                                source.name
+                            )));
+                        }
+                    }
                 }
             } else {
                 admit_append_only_source(
@@ -3217,7 +3281,7 @@ impl StreamingCoordinator {
         let (source_fault_tx, source_fault_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut source_handles = Vec::with_capacity(source_count);
         let mut source_names = Vec::with_capacity(source_count);
-        let mut source_mutations_admitted = Vec::with_capacity(source_count);
+        let mut source_input_modes = Vec::with_capacity(source_count);
         let source_runtime = tokio::runtime::Handle::current();
 
         for (idx, prepared) in prepared_sources.into_iter().enumerate() {
@@ -3231,7 +3295,7 @@ impl StreamingCoordinator {
                 primary_key,
                 primary_key_indices,
                 schema_admitted: _,
-                temporal_right_mutations,
+                admitted_non_append_mode,
                 task_fence,
             } = registration;
             let terminal_tasks = task_fence.tracker();
@@ -4370,7 +4434,7 @@ impl StreamingCoordinator {
                 epoch_committed_tx,
             });
             source_names.push(arc_name);
-            source_mutations_admitted.push(temporal_right_mutations);
+            source_input_modes.push(admitted_non_append_mode);
             task_fence.handoff();
         }
 
@@ -4380,7 +4444,7 @@ impl StreamingCoordinator {
             source_fault_rx,
             source_handles,
             source_names,
-            source_mutations_admitted,
+            source_input_modes,
             shutdown,
             terminal_shutdown: tokio_util::sync::CancellationToken::new(),
             pending_barrier: PendingBarrier::new(),
@@ -5683,13 +5747,13 @@ impl StreamingCoordinator {
             ))
         })?;
         let has_mutations = batch.column_by_name(SOURCE_MUTATION_COLUMN).is_some();
-        let mutations_admitted = self
-            .source_mutations_admitted
+        let input_mode = self
+            .source_input_modes
             .get(source_idx)
             .copied()
             .ok_or_else(|| {
                 CycleError::Recovery(format!(
-                    "source '{name}' has no mutation-admission slot at runtime index {source_idx}"
+                    "source '{name}' has no input-mode admission slot at runtime index {source_idx}"
                 ))
             })?;
         let visible = strip_source_row_positions(batch).map_err(|error| {
@@ -5697,16 +5761,20 @@ impl StreamingCoordinator {
                 "source '{name}' emitted invalid hidden metadata: {error}"
             ))
         })?;
-        if has_mutations && !mutations_admitted {
+        if has_mutations && input_mode != Some(SourceInputMode::KeyedUpsert) {
             return Err(CycleError::Recovery(format!(
-                "source '{name}' emitted mutations on the ordinary append-only route"
+                "source '{name}' emitted keyed mutation metadata outside a keyed-upsert route"
             )));
         }
 
         // Filter against the pre-drain watermark. Extraction is deferred until after all batches
         // are filtered so one batch cannot make the next batch appear late.
         let admission_floor = callback.current_watermark();
-        let filtered = callback.filter_late_rows(&name, batch)?;
+        let filtered = if input_mode.is_some() {
+            Some(batch.clone())
+        } else {
+            callback.filter_late_rows(&name, batch)?
+        };
         if source_idx >= self.pending_offsets.len() || source_idx >= self.committed_offsets.len() {
             return Err(CycleError::Recovery(format!(
                 "source '{name}' has no runtime offset slot at index {source_idx}"

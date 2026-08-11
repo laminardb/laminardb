@@ -1,7 +1,6 @@
 //! Production `PipelineCallback` bridging coordinator to sinks, checkpoints, and watermarks.
 #![allow(clippy::disallowed_types)] // cold path
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1166,6 +1165,7 @@ pub(crate) struct ConnectorPipelineCallback {
         Option<String>,
         String, // input stream name (FROM clause target)
         SinkContract,
+        bool, // admitted input is a changelog and must carry canonical weight
     )>,
     pub(crate) owned_sink_handles: Arc<parking_lot::Mutex<Vec<crate::sink_task::SinkTaskHandle>>>,
     pub(crate) watermark_states: FxHashMap<String, SourceWatermarkState>,
@@ -1949,8 +1949,8 @@ impl ConnectorPipelineCallback {
             attempt,
             self.sinks
                 .iter()
-                .filter(|(_, handle, _, _, _)| handle.checkpoint_committable())
-                .map(|(_, handle, _, _, _)| handle.clone()),
+                .filter(|(_, handle, _, _, _, _)| handle.checkpoint_committable())
+                .map(|(_, handle, _, _, _, _)| handle.clone()),
         )?;
         let tail = FollowerDurableTail {
             in_flight,
@@ -4096,7 +4096,7 @@ impl ConnectorPipelineCallback {
         &mut self,
         attempt_deadline: tokio::time::Instant,
     ) -> Result<(), String> {
-        let sync_futures = self.sinks.iter().map(|(name, handle, _, _, _)| {
+        let sync_futures = self.sinks.iter().map(|(name, handle, _, _, _, _)| {
             let name = name.clone();
             let handle = handle.clone();
             async move { (name, handle.sync_until(attempt_deadline).await) }
@@ -4261,7 +4261,9 @@ impl ConnectorPipelineCallback {
             self.compiled_sink_filters.push(SinkFilter::Pending);
         }
 
-        for (i, (sink_name, _, filter_sql, sink_input, _)) in self.sinks.iter().enumerate() {
+        for (i, (sink_name, _, filter_sql, sink_input, _, expects_changelog)) in
+            self.sinks.iter().enumerate()
+        {
             if filter_sql.is_none() || !matches!(self.compiled_sink_filters[i], SinkFilter::Pending)
             {
                 continue;
@@ -4274,7 +4276,28 @@ impl ConnectorPipelineCallback {
             };
             let schema = batch.schema();
             let sql = filter_sql.as_deref().unwrap();
-            match crate::filter_compile::compile(&self.filter_ctx, sql, &schema).await {
+            let weight = laminar_core::changelog::WEIGHT_COLUMN;
+            let weighted_input = *expects_changelog
+                || batches.iter().any(|batch| {
+                    batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .any(|field| field.name().eq_ignore_ascii_case(weight))
+                });
+            let compiled = if weighted_input {
+                if crate::sql_analysis::predicate_references_weight(sql) {
+                    Err(DbError::Pipeline(format!(
+                        "filter '{sql}' must not reference engine-owned changelog column '{weight}'"
+                    )))
+                } else {
+                    crate::filter_compile::compile_replay_immutable(&self.filter_ctx, sql, &schema)
+                        .await
+                }
+            } else {
+                crate::filter_compile::compile(&self.filter_ctx, sql, &schema).await
+            };
+            match compiled {
                 Ok(compiled) => {
                     self.compiled_sink_filters[i] = SinkFilter::Compiled(compiled);
                 }
@@ -4291,7 +4314,7 @@ impl ConnectorPipelineCallback {
                     self.compiled_sink_filters[i] = SinkFilter::Rejected;
                     self.pending_sink_filter_compiles =
                         self.pending_sink_filter_compiles.saturating_sub(1);
-                    if requires_replay {
+                    if requires_replay || weighted_input {
                         return Err(reason);
                     }
                     continue;
@@ -5100,14 +5123,14 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // drives every actor to a terminal state.
         {
             let mut registered = self.owned_sink_handles.lock();
-            for (_, handle, _, _, _) in &self.sinks {
+            for (_, handle, _, _, _, _) in &self.sinks {
                 if !registered.iter().any(|known| known.same_actor(handle)) {
                     registered.push(handle.clone());
                 }
             }
         }
         let close_results =
-            futures::future::join_all(self.sinks.iter().map(|(name, handle, _, _, _)| {
+            futures::future::join_all(self.sinks.iter().map(|(name, handle, _, _, _, _)| {
                 let name = name.clone();
                 let handle = handle.clone();
                 async move { (name, handle.close().await) }
@@ -5140,21 +5163,162 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<(), crate::pipeline::CycleError> {
+        let sink_input_violation = self.sinks.iter().find_map(
+            |(
+                sink_name,
+                _handle,
+                _filter_sql,
+                sink_input,
+                contract,
+                expects_changelog,
+            )| {
+                let batches = results.get(sink_input.as_str())?;
+                batches.iter().enumerate().find_map(|(batch_index, batch)| {
+                    crate::changelog_filter::validate_sink_input(
+                        batch,
+                        contract.accepts_full_changelog(),
+                        *expects_changelog,
+                    )
+                    .err()
+                    .map(|error| {
+                        format!(
+                            "sink '{sink_name}' rejected input '{sink_input}' batch {batch_index}: {error}"
+                        )
+                    })
+                })
+            },
+        );
+        if let Some(error) = sink_input_violation {
+            // This invariant is independent of delivery mode. Validate the complete publication
+            // before an epoch gate opens or any concurrent sink can observe a partial cycle.
+            self.record_dropped_sink_write(error.clone());
+            return Err(crate::pipeline::CycleError::Recovery(error));
+        }
+        let weighted_publication = self.sinks.iter().any(|(_, _, _, sink_input, _, _)| {
+            results.get(sink_input.as_str()).is_some_and(|batches| {
+                batches.iter().any(|batch| {
+                    batch.schema().fields().iter().any(|field| {
+                        field
+                            .name()
+                            .eq_ignore_ascii_case(laminar_core::changelog::WEIGHT_COLUMN)
+                    })
+                })
+            })
+        });
+
         #[cfg(feature = "cluster")]
         let controller = self.cluster_controller.clone();
-        let has_committable_output = self.sinks.iter().any(|(_, handle, _, sink_input, _)| {
-            handle.checkpoint_committable()
-                && results
-                    .get(sink_input.as_str())
-                    .is_some_and(|batches| !batches.is_empty())
-        });
+
+        let compile = self.compile_pending_sink_filters(results);
+        let compile_result = await_sink_publication(
+            #[cfg(feature = "cluster")]
+            controller.as_deref(),
+            deadline,
+            "sink filter compilation",
+            compile,
+        )
+        .await;
+        let compile_error = match compile_result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) | Err(error) => Some(error),
+        };
+        if let Some(error) = compile_error {
+            self.record_dropped_sink_write(error.clone());
+            return Err(crate::pipeline::CycleError::Recovery(error));
+        }
+
+        // Filter every sink-bound batch before opening any epoch gate or enqueueing any write.
+        // RecordBatch clones are shallow; owned filtered batches are reused by the write phase.
+        let requires_replay = self.sink_publication_requires_replay() || weighted_publication;
+        let mut preflighted_inputs: Vec<Option<Arc<[RecordBatch]>>> =
+            Vec::with_capacity(self.sinks.len());
+        let mut shared_unfiltered: FxHashMap<String, Arc<[RecordBatch]>> = FxHashMap::default();
+        for sink_idx in 0..self.sinks.len() {
+            let (sink_name, sink_input, filter_state) = {
+                let (sink_name, _, _, sink_input, _, _) = &self.sinks[sink_idx];
+                let filter_state = match self.compiled_sink_filters.get(sink_idx).cloned() {
+                    Some(SinkFilter::Compiled(phys)) => SinkFilterDispatch::Compiled(phys),
+                    Some(SinkFilter::Rejected) => SinkFilterDispatch::Rejected,
+                    Some(SinkFilter::Pending) | None => SinkFilterDispatch::None,
+                };
+                (sink_name.clone(), sink_input.clone(), filter_state)
+            };
+            let Some(batches) = results.get(sink_input.as_str()) else {
+                preflighted_inputs.push(None);
+                continue;
+            };
+            if matches!(filter_state, SinkFilterDispatch::None) {
+                let shared = shared_unfiltered
+                    .entry(sink_input)
+                    .or_insert_with(|| Arc::from(batches.as_slice()))
+                    .clone();
+                preflighted_inputs.push(Some(shared));
+                continue;
+            }
+            let mut ready = Vec::with_capacity(batches.len());
+            for batch in batches {
+                match &filter_state {
+                    SinkFilterDispatch::Compiled(phys) => {
+                        match crate::filter_compile::apply(batch, phys.as_ref()) {
+                            Ok(Some(filtered)) => ready.push(filtered),
+                            Ok(None) => {}
+                            Err(error) => {
+                                self.prom
+                                    .sink_filter_rejected_rows
+                                    .with_label_values(&[sink_name.as_str()])
+                                    .inc_by(batch.num_rows() as u64);
+                                tracing::warn!(
+                                    sink = %sink_name,
+                                    error = %error,
+                                    "Compiled sink filter error"
+                                );
+                                if requires_replay {
+                                    let reason = format!(
+                                        "sink '{sink_name}' filter application failed: {error}"
+                                    );
+                                    self.record_dropped_sink_write(reason.clone());
+                                    return Err(crate::pipeline::CycleError::Recovery(reason));
+                                }
+                            }
+                        }
+                    }
+                    SinkFilterDispatch::Rejected => {
+                        self.prom
+                            .sink_filter_rejected_rows
+                            .with_label_values(&[sink_name.as_str()])
+                            .inc_by(batch.num_rows() as u64);
+                        if requires_replay {
+                            let reason = format!(
+                                "sink '{sink_name}' filter is rejected for a recovery-required publication"
+                            );
+                            self.record_dropped_sink_write(reason.clone());
+                            return Err(crate::pipeline::CycleError::Recovery(reason));
+                        }
+                    }
+                    SinkFilterDispatch::None => unreachable!("handled by shared input fast path"),
+                }
+            }
+            preflighted_inputs.push(Some(Arc::from(ready)));
+        }
+
+        let has_committable_output =
+            self.sinks
+                .iter()
+                .enumerate()
+                .any(|(sink_idx, (_, handle, _, _, _, _))| {
+                    handle.checkpoint_committable()
+                        && preflighted_inputs
+                            .get(sink_idx)
+                            .and_then(Option::as_deref)
+                            .is_some_and(|batches| !batches.is_empty())
+                });
         if has_committable_output {
             let gate_result: Result<(), String> = 'gate: {
                 let mut group_admission = None;
-                for (sink_name, handle, _, _, _) in self
+                for (sink_name, handle, _, _, _, _) in self
                     .sinks
                     .iter()
-                    .filter(|(_, handle, _, _, _)| handle.checkpoint_committable())
+                    .filter(|(_, handle, _, _, _, _)| handle.checkpoint_committable())
                 {
                     let gate = handle.wait_for_write_gate_until(deadline);
                     let observed = await_sink_publication(
@@ -5193,138 +5357,58 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 return Err(crate::pipeline::CycleError::Recovery(error));
             }
         }
-        let compile = self.compile_pending_sink_filters(results);
-        let compile_result = await_sink_publication(
-            #[cfg(feature = "cluster")]
-            controller.as_deref(),
-            deadline,
-            "sink filter compilation",
-            compile,
-        )
-        .await;
-        let compile_error = match compile_result {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) | Err(error) => Some(error),
-        };
-        if let Some(error) = compile_error {
-            self.record_dropped_sink_write(error.clone());
-            return Err(crate::pipeline::CycleError::Recovery(error));
-        }
-
-        // Shared Arc per stream so multiple sinks don't each clone the Vec.
-        let mut shared_inputs: FxHashMap<&str, Arc<[RecordBatch]>> = FxHashMap::default();
-        let requires_replay = self.sink_publication_requires_replay();
-
         let sink_futures: Vec<_> = self
             .sinks
             .iter()
             .enumerate()
-            .filter_map(
-                |(sink_idx, (sink_name, handle, _filter_sql, sink_input, contract))| {
-                    let batches = results.get(sink_input.as_str())?;
-                    if batches.is_empty() {
-                        return None;
-                    }
-                    let shared = shared_inputs
-                        .entry(sink_input.as_str())
-                        .or_insert_with(|| Arc::<[RecordBatch]>::from(batches.as_slice()))
-                        .clone();
-                    let sink_name = sink_name.clone();
-                    let handle = handle.clone();
-                    let filter_state = match self.compiled_sink_filters.get(sink_idx).cloned() {
-                        Some(SinkFilter::Compiled(phys)) => SinkFilterDispatch::Compiled(phys),
-                        Some(SinkFilter::Rejected) => SinkFilterDispatch::Rejected,
-                        Some(SinkFilter::Pending) | None => SinkFilterDispatch::None,
-                    };
-                    let accepts_full_changelog = contract.accepts_full_changelog();
-                    let prom = Arc::clone(&self.prom);
-                    #[cfg(feature = "cluster")]
-                    let controller = controller.clone();
-                    Some(async move {
-                        for batch in shared.iter() {
-                            let filtered: Cow<RecordBatch> = match &filter_state {
-                                SinkFilterDispatch::Compiled(phys) => {
-                                    match crate::filter_compile::apply(batch, phys.as_ref()) {
-                                        Ok(Some(fb)) => Cow::Owned(fb),
-                                        Ok(None) => continue,
-                                        Err(e) => {
-                                            let dropped = batch.num_rows() as u64;
-                                            prom.sink_filter_rejected_rows
-                                                .with_label_values(&[sink_name.as_str()])
-                                                .inc_by(dropped);
-                                            tracing::warn!(
-                                                sink = %sink_name,
-                                                error = %e,
-                                                "Compiled sink filter error"
-                                            );
-                                            if requires_replay {
-                                                return Some(format!(
-                                                    "sink '{sink_name}' filter application failed: {e}"
-                                                ));
-                                            }
-                                            continue;
-                                        }
-                                    }
-                                }
-                                SinkFilterDispatch::Rejected => {
-                                    let dropped = batch.num_rows() as u64;
-                                    prom.sink_filter_rejected_rows
-                                        .with_label_values(&[sink_name.as_str()])
-                                        .inc_by(dropped);
-                                    if requires_replay {
-                                        return Some(format!(
-                                            "sink '{sink_name}' filter is rejected for a replay-guaranteed publication"
-                                        ));
-                                    }
-                                    continue;
-                                }
-                                SinkFilterDispatch::None => Cow::Borrowed(batch),
-                            };
-
-                            let prepared = crate::changelog_filter::prepare_for_sink(
-                                &filtered,
-                                accepts_full_changelog,
-                            );
-                            if prepared.num_rows() == 0 {
-                                continue;
-                            }
-                            let boundary = format!("sink '{sink_name}' write enqueue");
-                            let batch = prepared.into_owned();
-                            let write = async {
-                                match deadline {
-                                    Some(deadline) => {
-                                        handle.write_batch_until(batch, deadline).await
-                                    }
-                                    None => handle.write_batch(batch).await,
-                                }
-                            };
-                            let enqueue = await_sink_publication(
-                                #[cfg(feature = "cluster")]
-                                controller.as_deref(),
-                                deadline,
-                                &boundary,
-                                write,
-                            )
-                            .await;
-                            match enqueue {
-                                Ok(Ok(())) => {}
-                                Ok(Err(error)) => {
-                                    tracing::warn!(
-                                        sink = %sink_name,
-                                        %error,
-                                        "Sink write could not be enqueued"
-                                    );
-                                    return Some(format!(
-                                        "sink '{sink_name}' write enqueue failed: {error}"
-                                    ));
-                                }
-                                Err(error) => return Some(error),
-                            }
+            .filter_map(|(sink_idx, (sink_name, handle, _, _, _, _))| {
+                let batches = preflighted_inputs.get(sink_idx)?.as_ref()?.clone();
+                if batches.is_empty() {
+                    return None;
+                }
+                let sink_name = sink_name.clone();
+                let handle = handle.clone();
+                #[cfg(feature = "cluster")]
+                let controller = controller.clone();
+                Some(async move {
+                    for batch in batches.iter() {
+                        if batch.num_rows() == 0 {
+                            continue;
                         }
-                        None
-                    })
-                },
-            )
+                        let boundary = format!("sink '{sink_name}' write enqueue");
+                        let batch = batch.clone();
+                        let write = async {
+                            match deadline {
+                                Some(deadline) => handle.write_batch_until(batch, deadline).await,
+                                None => handle.write_batch(batch).await,
+                            }
+                        };
+                        let enqueue = await_sink_publication(
+                            #[cfg(feature = "cluster")]
+                            controller.as_deref(),
+                            deadline,
+                            &boundary,
+                            write,
+                        )
+                        .await;
+                        match enqueue {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                tracing::warn!(
+                                    sink = %sink_name,
+                                    %error,
+                                    "Sink write could not be enqueued"
+                                );
+                                return Some(format!(
+                                    "sink '{sink_name}' write enqueue failed: {error}"
+                                ));
+                            }
+                            Err(error) => return Some(error),
+                        }
+                    }
+                    None
+                })
+            })
             .collect();
         let direct_failures = futures::future::join_all(sink_futures)
             .await
@@ -6070,8 +6154,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             attempt,
             self.sinks
                 .iter()
-                .filter(|(_, handle, _, _, _)| handle.checkpoint_committable())
-                .map(|(_, handle, _, _, _)| handle.clone()),
+                .filter(|(_, handle, _, _, _, _)| handle.checkpoint_committable())
+                .map(|(_, handle, _, _, _, _)| handle.clone()),
         ) {
             Ok(guard) => guard,
             Err(error) => {

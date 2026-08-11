@@ -14,6 +14,14 @@ fn bounded_join_unaliased_projections_are_detected_for_fail_closed_admission() {
         "SELECT l.id AS left_id, r.id AS right_id FROM left_stream l JOIN right_stream r \
          ON l.id = r.id AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND"
     ));
+    assert!(has_unqualified_interval_output_column(
+        "SELECT right_only AS value FROM left_stream l JOIN right_stream r \
+         ON l.id = r.id AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND"
+    ));
+    assert!(!has_unqualified_interval_output_column(
+        "SELECT r.right_only AS value FROM left_stream l JOIN right_stream r \
+         ON l.id = r.id AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND"
+    ));
 }
 
 #[test]
@@ -38,6 +46,94 @@ fn bounded_join_detection_preserves_kind_and_composite_key_order() {
         assert_eq!(detected.config.left_keys, ["tenant", "id"], "{keyword}");
         assert_eq!(detected.config.right_keys, ["tenant", "id"], "{keyword}");
     }
+}
+
+#[test]
+fn weighted_bounded_join_projection_preserves_weight_inside_the_ast_rendered_select() {
+    let detected = detect_stream_join_query(
+        "SELECT l.id AS left_id, r.amount AS right_amount \
+         FROM left_events l JOIN right_events r \
+         ON l.id = r.id AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '10' SECOND \
+         WHERE r.amount > 0",
+    )
+    .expect("bounded join should be detected");
+
+    assert!(!detected.projection_sql.contains("__weight"));
+    assert!(
+        detected
+            .weighted_projection_sql
+            .contains(", \"__weight\" AS \"__weight\" FROM __interval_tmp WHERE"),
+        "{}",
+        detected.weighted_projection_sql
+    );
+    assert_eq!(
+        detected.weighted_projection_sql.matches("__weight").count(),
+        2,
+        "the weighted projection must select one canonical field exactly once"
+    );
+}
+
+#[test]
+fn bounded_join_projection_quotes_exact_kernel_field_names() {
+    let detected = detect_stream_join_query(
+        r#"SELECT l."order id" AS left_id, "R data"."order id" AS right_id
+           FROM left_events l JOIN right_events AS "R data"
+           ON l."order id" = "R data"."order id"
+           AND "R data".ts BETWEEN l.ts AND l.ts + INTERVAL '10' SECOND"#,
+    )
+    .expect("quoted bounded-join identifiers should be detected");
+
+    assert!(
+        detected.projection_sql.contains(r#""order id" AS left_id"#),
+        "{}",
+        detected.projection_sql
+    );
+    assert!(
+        detected
+            .projection_sql
+            .contains(r#""order id_right_events" AS right_id"#),
+        "{}",
+        detected.projection_sql
+    );
+}
+
+#[test]
+fn bounded_join_projection_rewrites_qualified_leaves_without_changing_expression_semantics() {
+    let detected = detect_stream_join_query(
+        "SELECT CASE WHEN l.name LIKE 'A%' THEN TRY_CAST(r.text AS BIGINT) ELSE 0 END AS parsed \
+         FROM left_events l JOIN right_events r \
+         ON l.id = r.id AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '10' SECOND",
+    )
+    .expect("bounded join expression should be detected");
+
+    assert!(detected.projection_sql.contains(r#""name" LIKE 'A%'"#));
+    assert!(
+        detected
+            .projection_sql
+            .contains(r#"TRY_CAST("text_right_events" AS BIGINT)"#),
+        "{}",
+        detected.projection_sql
+    );
+    assert!(!detected.projection_sql.contains("l."));
+    assert!(!detected.projection_sql.contains("r."));
+
+    assert!(interval_output_has_nested_query(
+        "SELECT EXISTS (SELECT 1 FROM dim d WHERE d.id = l.id) AS present \
+         FROM left_events l JOIN right_events r \
+         ON l.id = r.id AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '10' SECOND"
+    ));
+}
+
+#[test]
+fn weighted_bounded_join_wildcard_does_not_duplicate_the_kernel_weight() {
+    let detected = detect_stream_join_query(
+        "SELECT * FROM left_events l JOIN right_events r \
+         ON l.id = r.id AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '10' SECOND",
+    )
+    .expect("bounded join should be detected");
+
+    assert_eq!(detected.weighted_projection_sql, detected.projection_sql);
+    assert!(!detected.weighted_projection_sql.contains("__weight"));
 }
 
 #[test]

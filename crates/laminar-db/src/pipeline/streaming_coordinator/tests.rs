@@ -120,9 +120,9 @@ fn source_metadata_stays_row_aligned_and_mutations_are_route_admitted() {
         .unwrap_err();
     assert!(error
         .to_string()
-        .contains("emitted mutations on the ordinary append-only route"));
+        .contains("emitted keyed mutation metadata outside a keyed-upsert route"));
 
-    coordinator.source_mutations_admitted[0] = true;
+    coordinator.source_input_modes[0] = Some(SourceInputMode::KeyedUpsert);
     coordinator
         .stage_batch(
             0,
@@ -135,6 +135,59 @@ fn source_metadata_stays_row_aligned_and_mutations_are_route_admitted() {
     assert!(coordinator.source_batches_buf["test_source"][1]
         .column_by_name(SOURCE_MUTATION_COLUMN)
         .is_some());
+    assert_eq!(
+        coordinator.source_batches_buf["test_source"][1].num_rows(),
+        2
+    );
+}
+
+#[test]
+fn full_changelog_route_bypasses_generic_late_filtering() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            DataType::Int64,
+            false,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(Int64Array::from(vec![1, -1])),
+        ],
+    )
+    .unwrap();
+    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+    let mut coordinator = test_coordinator(
+        rx,
+        control_rx,
+        Arc::new(tokio::sync::Notify::new()),
+        DeliveryGuarantee::AtLeastOnce,
+        None,
+    );
+    coordinator.source_input_modes[0] = Some(SourceInputMode::FullChangelog);
+    let mut callback = MockCallback::new();
+    callback.late_filter = MockLateFilter::DropFirst;
+    let mut events = 0;
+
+    coordinator
+        .stage_batch(
+            0,
+            &batch,
+            SourceBatchCursor::Complete(checkpoint_at(1)),
+            &mut callback,
+            &mut events,
+        )
+        .unwrap();
+
+    assert_eq!(
+        coordinator.source_batches_buf["test_source"][0].num_rows(),
+        2
+    );
+    assert_eq!(events, 2);
 }
 
 #[test]
@@ -1500,7 +1553,7 @@ fn test_coordinator(
         source_fault_rx: empty_source_fault_rx(),
         source_handles: Vec::new(),
         source_names: vec![Arc::from("test_source")],
-        source_mutations_admitted: vec![false],
+        source_input_modes: vec![None],
         shutdown,
         terminal_shutdown: tokio_util::sync::CancellationToken::new(),
         pending_barrier: PendingBarrier::new(),
@@ -1846,7 +1899,7 @@ fn admission_coordinator(source_handles: Vec<SourceHandle>) -> StreamingCoordina
     );
     coordinator.source_handles = source_handles;
     coordinator.source_names = source_names;
-    coordinator.source_mutations_admitted = vec![false; source_count];
+    coordinator.source_input_modes = vec![None; source_count];
     coordinator.committed_offsets = vec![None; source_count];
     coordinator.pending_offsets = vec![None; source_count];
     coordinator
@@ -7896,7 +7949,7 @@ async fn test_coordinator_direct_channel() {
         source_fault_rx: empty_source_fault_rx(),
         source_handles: Vec::new(),
         source_names: vec![Arc::from("test_source")],
-        source_mutations_admitted: vec![false],
+        source_input_modes: vec![None],
         shutdown: Arc::clone(&shutdown),
         terminal_shutdown: tokio_util::sync::CancellationToken::new(),
         pending_barrier: PendingBarrier::new(),
@@ -8354,7 +8407,7 @@ async fn shutdown_does_not_synthesize_final_checkpoint() {
         source_fault_rx: empty_source_fault_rx(),
         source_handles: Vec::new(),
         source_names: vec![Arc::from("test_source")],
-        source_mutations_admitted: vec![false],
+        source_input_modes: vec![None],
         shutdown: Arc::clone(&shutdown),
         terminal_shutdown: tokio_util::sync::CancellationToken::new(),
         pending_barrier: PendingBarrier::new(),
@@ -8645,7 +8698,7 @@ async fn test_barrier_excludes_post_barrier_data() {
         source_fault_rx: empty_source_fault_rx(),
         source_handles: Vec::new(),
         source_names: vec![Arc::from("s0"), Arc::from("s1")],
-        source_mutations_admitted: vec![false; 2],
+        source_input_modes: vec![None; 2],
         shutdown: Arc::clone(&shutdown),
         terminal_shutdown: tokio_util::sync::CancellationToken::new(),
         pending_barrier: PendingBarrier::new(),
@@ -8830,7 +8883,7 @@ async fn test_settle_pending_offsets_holds_failed_source() {
         source_fault_rx: empty_source_fault_rx(),
         source_handles: Vec::new(),
         source_names: vec![Arc::from("s0"), Arc::from("s1")],
-        source_mutations_admitted: vec![false; 2],
+        source_input_modes: vec![None; 2],
         shutdown,
         terminal_shutdown: tokio_util::sync::CancellationToken::new(),
         pending_barrier: PendingBarrier::new(),
@@ -9149,7 +9202,7 @@ async fn test_drain_skip_under_backpressure() {
         source_fault_rx: empty_source_fault_rx(),
         source_handles: Vec::new(),
         source_names: vec![Arc::from("src")],
-        source_mutations_admitted: vec![false],
+        source_input_modes: vec![None],
         shutdown: Arc::clone(&shutdown),
         terminal_shutdown: tokio_util::sync::CancellationToken::new(),
         pending_barrier: PendingBarrier::new(),

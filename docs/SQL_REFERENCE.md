@@ -143,8 +143,9 @@ GROUP BY account_id, SESSION(ts, INTERVAL '2' SECOND)
 ## Joins
 
 Local and cluster joins use the same vnode state, checkpoint, recovery, and rebalance lifecycle
-under at-least-once and exactly-once delivery. The bounded append-only path supports `INNER`,
-`LEFT`, `RIGHT`, `FULL`, `LEFT SEMI`, `RIGHT SEMI`, `LEFT ANTI`, and `RIGHT ANTI`.
+under at-least-once and exactly-once delivery. The bounded path supports `INNER`, `LEFT`, `RIGHT`,
+`FULL`, `LEFT SEMI`, `RIGHT SEMI`, `LEFT ANTI`, and `RIGHT ANTI` for append-only inputs and for the
+certified mutable-source route described below.
 
 ### Bounded event-time join
 
@@ -169,12 +170,32 @@ AND o.ts BETWEEN t.ts AND t.ts + INTERVAL '10' SECOND;
 
 **Key points:**
 
-- Both inputs must be direct append-only sources with watermarks on `TIMESTAMP NOT NULL` event-time
-  columns.
+- Both inputs must be direct sources with watermarks on `TIMESTAMP NOT NULL` event-time columns.
+  Append-only pairs use the ordinary path. If either connector is mutable, both connectors must
+  expose ordered deterministic row positions and a replayable recovery contract.
+- Append-only bounded intervals retain live hot-add support in a running local checkpoint-disabled
+  pipeline; their post-projection is initialized before the first cycle can route or retain input.
+  Mutable bounded intervals and consumers of their changelog are fixed startup topology and must be
+  created while stopped.
+- A keyed-upsert input needs an explicit primary key containing every equality key and its
+  event-time column. A full-changelog input needs one exact trailing non-null `BIGINT __weight`;
+  append-only and keyed-upsert source schemas cannot declare that column.
+- A mutable source may feed only its admitted bounded joins. Mutable joins do not admit pushed-down
+  source predicates, volatile projection/filter functions, or explicit references/aliases for the
+  engine-owned `__weight` column. Their output is a full changelog, so every downstream projection
+  preserves the trailing weight and external sinks must declare full-changelog support.
+- In local and single-node recoverable runtime, a changelog may enrich against a static reference
+  table whose snapshot is checkpointed. Process-local `INSERT INTO` is available only when local
+  checkpointing is disabled; recoverable deployments load reference data before intake and restore
+  the checkpointed image. Cluster execution rejects this enrichment until every participant and
+  future owner can bind the same snapshot identity. This ensures a later retraction joins the same
+  dimension values as its original insertion.
 - Equality keys may contain one or more ordered `VARCHAR`/`BIGINT` columns. Types must match at each
   position; SQL `NULL` keys do not match.
 - The directional predicate is `right.ts BETWEEN left.ts AND left.ts + positive_finite_bound`.
-- Every projected expression needs an explicit alias, including columns whose names are unique.
+- Every projected expression needs an explicit alias, including columns whose names are unique;
+  every projected or filtered column must also use its left/right input qualifier. Nested
+  projection/filter subqueries are not supported by the flattened pair projection.
 - Outer and anti unmatched rows become final only when the opposite input watermark closes their
   possible match interval.
 - Cross, unbounded, general non-equality, intermediate-input, and multi-way joins fail closed on
@@ -267,7 +288,9 @@ non-`DISTINCT` aggregates:
 
 `first_value` and `last_value` are available on supported local window paths, not on the distributed
 named-aggregate path. `DISTINCT` aggregates and `MIN`/`MAX` over changelog inputs remain rejected
-because bounded retractable extrema state is not supported; bounded join outputs are append-only.
+because bounded retractable extrema state is not supported. Mutable bounded-join output can feed
+`COUNT`, `SUM`, and `AVG` aggregate stages or a full-changelog sink; append-only join output keeps
+the ordinary row stream.
 
 ### Streaming UDFs
 
@@ -292,6 +315,12 @@ After creating a stream, create a sink and subscribe to get results in Rust:
 ```sql
 CREATE SINK ohlc_sink FROM ohlc
 ```
+
+Sink input must be a named source or stream; inline `CREATE SINK ... FROM (SELECT ...)` queries are
+rejected until they have a named graph node and the same schema/changelog admission. A stream that
+carries `__weight` requires a sink whose connector contract supports full changelogs; the runtime
+passes positive and negative weights through unchanged and fails closed if the weight is missing or
+malformed.
 
 ```rust
 // FromRow struct fields must match SELECT column order exactly

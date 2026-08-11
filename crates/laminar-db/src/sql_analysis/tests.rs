@@ -1,5 +1,120 @@
 use super::*;
 
+#[test]
+fn weighted_projection_rewrite_is_ast_owned_and_wildcard_safe() {
+    let rewritten =
+        projection_sql_preserving_weight("SELECT value + 1 AS adjusted FROM changes WHERE id > 1")
+            .unwrap();
+    assert!(rewritten.contains(", __weight AS __weight FROM changes WHERE"));
+    assert_eq!(rewritten.matches("__weight").count(), 2);
+
+    for wildcard in [
+        "SELECT * FROM changes WHERE id > 1",
+        "SELECT c.* FROM changes AS c WHERE id > 1",
+        "SELECT id AS copy, * FROM changes WHERE id > 1",
+    ] {
+        assert_eq!(
+            projection_sql_preserving_weight(wildcard).as_deref(),
+            Some(wildcard)
+        );
+    }
+    for noncanonical in [
+        "SELECT *, id AS copy FROM changes WHERE id > 1",
+        "SELECT c.*, id AS copy FROM changes AS c WHERE id > 1",
+        "SELECT *, c.* FROM changes AS c WHERE id > 1",
+    ] {
+        assert!(projection_sql_preserving_weight(noncanonical).is_none());
+    }
+    assert!(
+        projection_sql_preserving_weight("SELECT value AS __weight FROM changes WHERE id > 1")
+            .is_none()
+    );
+    assert!(
+        projection_sql_preserving_weight("SELECT value FROM changes WHERE __WEIGHT > 0").is_none()
+    );
+}
+
+#[test]
+fn sink_predicate_weight_reference_is_case_insensitive_and_fail_closed() {
+    for predicate in ["__weight > 0", "row.__WEIGHT < 0", "(__Weight) = 1"] {
+        assert!(predicate_references_weight(predicate), "{predicate}");
+    }
+    assert!(!predicate_references_weight(
+        "value > 0 AND note = '__weight'"
+    ));
+    assert!(predicate_references_weight("("));
+}
+
+#[test]
+fn mutable_changelog_modifier_scan_rejects_row_set_and_ordering_semantics() {
+    assert!(!mutable_changelog_has_unsafe_modifiers(
+        "SELECT l.id AS id FROM left_events l JOIN right_events r ON l.id = r.id WHERE l.id > 0"
+    ));
+    for query in [
+        "SELECT DISTINCT l.id AS id FROM left_events l JOIN right_events r ON l.id = r.id",
+        "SELECT l.id AS id FROM left_events l JOIN right_events r ON l.id = r.id ORDER BY id LIMIT 1",
+        "SELECT l.id AS id FROM left_events l JOIN right_events r ON l.id = r.id FETCH FIRST 1 ROW ONLY",
+        "SELECT ROW_NUMBER() OVER (ORDER BY l.id) AS row_num FROM left_events l JOIN right_events r ON l.id = r.id",
+        "SELECT l.id AS id, EXISTS (SELECT 1 FROM other_events o WHERE o.id = l.id) AS present FROM left_events l JOIN right_events r ON l.id = r.id",
+        "(",
+    ] {
+        assert!(mutable_changelog_has_unsafe_modifiers(query), "{query}");
+    }
+}
+
+#[test]
+fn query_weight_reference_scan_allows_only_implicit_wildcards() {
+    assert!(!query_references_weight(
+        "SELECT l.* FROM left_events l JOIN right_events r ON l.id = r.id"
+    ));
+    for query in [
+        "SELECT l.__weight AS weight_copy FROM left_events l JOIN right_events r ON l.id = r.id",
+        "SELECT l.id AS __WEIGHT FROM left_events l JOIN right_events r ON l.id = r.id",
+        "SELECT l.id FROM left_events l JOIN right_events r ON l.id = r.id WHERE r.__Weight > 0",
+        "(",
+    ] {
+        assert!(query_references_weight(query), "{query}");
+    }
+}
+
+#[test]
+fn changelog_enrich_static_wildcard_still_selects_the_left_weight() {
+    let incremental = FxHashSet::from_iter(["changes".to_string()]);
+    let static_tables = FxHashSet::from_iter(["dimension".to_string()]);
+    let detected = detect_changelog_enrich_query(
+        "SELECT d.* FROM changes c JOIN dimension d ON c.id = d.id",
+        &incremental,
+        &static_tables,
+    )
+    .unwrap();
+
+    assert!(detected.projection_sql.contains("d.*, c.\"__weight\""));
+    for unsupported in [
+        "SELECT * FROM changes c JOIN dimension d ON c.id = d.id",
+        "SELECT c.*, d.name FROM changes c JOIN dimension d ON c.id = d.id",
+        "SELECT d.* EXCLUDE (name) FROM changes c JOIN dimension d ON c.id = d.id",
+        "SELECT d.name AS __WEIGHT FROM changes c JOIN dimension d ON c.id = d.id",
+        "SELECT c.__weight AS copied FROM changes c JOIN dimension d ON c.id = d.id",
+        "SELECT \"c\".* FROM changes c JOIN dimension d ON c.id = d.id",
+        "SELECT d.name FROM changes AS \"left input\" JOIN dimension d ON \"left input\".id = d.id",
+        "SELECT \"C\".* FROM changes AS \"c\" JOIN dimension AS \"C\" ON \"c\".id = \"C\".id",
+        "SELECT c.id AS id, ROW_NUMBER() OVER (ORDER BY c.id) AS row_num FROM changes c JOIN dimension d ON c.id = d.id",
+        "SELECT TOP 1 c.id AS id FROM changes c JOIN dimension d ON c.id = d.id",
+        "SELECT c.id AS id FROM changes c JOIN dimension d ON c.id = d.id QUALIFY ROW_NUMBER() OVER (ORDER BY c.id) = 1",
+        "SELECT c.id AS id, EXISTS (SELECT 1 FROM other_stream o WHERE o.id = c.id) AS present FROM changes c JOIN dimension d ON c.id = d.id",
+    ] {
+        assert!(detect_changelog_enrich_query(unsupported, &incremental, &static_tables).is_none());
+    }
+
+    let left = detect_changelog_enrich_query(
+        "SELECT d.name, c.* FROM changes c JOIN dimension d ON c.id = d.id",
+        &incremental,
+        &static_tables,
+    )
+    .unwrap();
+    assert!(!left.projection_sql.contains("c.\"__weight\""));
+}
+
 fn lookup_fixtures() -> (FxHashMap<String, Vec<String>>, FxHashMap<String, SchemaRef>) {
     use arrow::datatypes::{DataType, Field, Schema};
     let mut partial = FxHashMap::default();

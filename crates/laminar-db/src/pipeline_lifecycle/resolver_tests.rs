@@ -60,7 +60,7 @@ async fn windowed_stream_schema_matches_user_select() {
         ),
     );
 
-    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
+    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default(), &Default::default())
         .await
         .unwrap();
     let names: Vec<&str> = out.schemas["agg"]
@@ -96,7 +96,7 @@ async fn windowed_stream_with_explicit_window_columns() {
         ),
     );
 
-    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
+    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default(), &Default::default())
         .await
         .unwrap();
     let names: Vec<&str> = out.schemas["agg"]
@@ -128,7 +128,7 @@ async fn non_windowed_stream_has_no_prefix() {
         ),
     );
 
-    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
+    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default(), &Default::default())
         .await
         .unwrap();
     let names: Vec<&str> = out.schemas["passthrough"]
@@ -158,7 +158,7 @@ async fn chained_streams_resolve_via_iterative_planning() {
         ),
     );
 
-    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
+    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default(), &Default::default())
         .await
         .unwrap();
     let b_names: Vec<&str> = out.schemas["b"]
@@ -192,7 +192,7 @@ async fn case_distinct_chained_streams_resolve_exactly() {
         ),
     );
 
-    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
+    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default(), &Default::default())
         .await
         .unwrap();
     assert!(out.schemas.contains_key("Foo"));
@@ -230,7 +230,7 @@ async fn changelog_schema_tracks_real_emitters_and_safe_projection() {
     );
     regs.insert(stateless.name.clone(), stateless);
 
-    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
+    let out = resolve_stream_output_schemas(&ctx, &regs, &Default::default(), &Default::default())
         .await
         .unwrap();
 
@@ -244,6 +244,168 @@ async fn changelog_schema_tracks_real_emitters_and_safe_projection() {
     assert!(out.schemas["stateless"]
         .field_with_name(WEIGHT_COLUMN)
         .is_err());
+}
+
+#[tokio::test]
+async fn plain_stream_cannot_spoof_engine_weight() {
+    let ctx = ctx_with_payments();
+    let regs = std::collections::HashMap::from([(
+        "spoofed".to_string(),
+        reg(
+            "spoofed",
+            "SELECT region, CAST(1 AS BIGINT) AS __WEIGHT FROM payments",
+            false,
+        ),
+    )]);
+
+    let error =
+        resolve_stream_output_schemas(&ctx, &regs, &Default::default(), &Default::default())
+            .await
+            .unwrap_err()
+            .to_string();
+    assert!(
+        error.contains("not a certified changelog producer")
+            && error.contains("reserved engine-owned"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn ordered_changelog_enrich_uses_current_provenance_and_reserves_static_metadata() {
+    use crate::operator::interval_join_input::BoundedJoinInputMode;
+
+    let ctx = ctx_with_payments();
+    ctx.register_table(
+        "dimensions",
+        Arc::new(EmptyTable::new(Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+        ])))),
+    )
+    .unwrap();
+    let changes = reg("changes", "SELECT region, amount_usd FROM payments", false);
+    let enriched = reg(
+        "enriched",
+        "SELECT d.category, c.* FROM changes c JOIN dimensions d ON c.region = d.region",
+        false,
+    );
+    let regs = std::collections::HashMap::from([
+        (changes.name.clone(), changes.clone()),
+        (enriched.name.clone(), enriched),
+    ]);
+    let reference_tables = rustc_hash::FxHashSet::from_iter(["dimensions".to_string()]);
+    let ordered = rustc_hash::FxHashMap::from_iter([(
+        "changes".to_string(),
+        [
+            BoundedJoinInputMode::AppendOnly,
+            BoundedJoinInputMode::FullChangelog,
+        ],
+    )]);
+
+    let resolved = resolve_stream_output_schemas(&ctx, &regs, &reference_tables, &ordered)
+        .await
+        .unwrap();
+    assert!(resolved.changelog_carrying.contains("enriched"));
+    assert_eq!(
+        resolved.schemas["enriched"].fields().last().unwrap().name(),
+        laminar_core::changelog::WEIGHT_COLUMN
+    );
+
+    let analytic_regs = std::collections::HashMap::from([
+        (changes.name.clone(), changes.clone()),
+        (
+            "analytic_enrich".to_string(),
+            reg(
+                "analytic_enrich",
+                "SELECT c.region, ROW_NUMBER() OVER (ORDER BY c.region) AS row_num \
+                 FROM changes c JOIN dimensions d ON c.region = d.region",
+                false,
+            ),
+        ),
+    ]);
+    let error = resolve_stream_output_schemas(&ctx, &analytic_regs, &reference_tables, &ordered)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("cannot safely consume a changelog"),
+        "{error}"
+    );
+
+    let ordered_aggregate_regs = std::collections::HashMap::from([
+        (changes.name.clone(), changes.clone()),
+        (
+            "top_aggregate".to_string(),
+            reg(
+                "top_aggregate",
+                "SELECT region, SUM(amount_usd) AS total FROM changes GROUP BY region \
+                 ORDER BY total DESC LIMIT 1",
+                false,
+            ),
+        ),
+    ]);
+    let error =
+        resolve_stream_output_schemas(&ctx, &ordered_aggregate_regs, &reference_tables, &ordered)
+            .await
+            .unwrap_err()
+            .to_string();
+    assert!(
+        error.contains("ordering or row limits")
+            || error.contains("managed streaming aggregates require"),
+        "{error}"
+    );
+
+    let aggregate_enrich_regs = std::collections::HashMap::from([
+        (changes.name.clone(), changes.clone()),
+        (
+            "aggregate_enrich".to_string(),
+            reg(
+                "aggregate_enrich",
+                "SELECT COUNT(c.region) AS row_count FROM changes c \
+                 JOIN dimensions d ON c.region = d.region",
+                false,
+            ),
+        ),
+    ]);
+    let error =
+        resolve_stream_output_schemas(&ctx, &aggregate_enrich_regs, &reference_tables, &ordered)
+            .await
+            .unwrap_err()
+            .to_string();
+    assert!(
+        (error.contains("aggregate state") && error.contains("changelog enrichment"))
+            || error.contains("aggregate could not be certified"),
+        "{error}"
+    );
+
+    ctx.register_table(
+        "bad_dimensions",
+        Arc::new(EmptyTable::new(Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("__WEIGHT", DataType::Int64, false),
+        ])))),
+    )
+    .unwrap();
+    let bad_regs = std::collections::HashMap::from([
+        (changes.name.clone(), changes),
+        (
+            "bad_enriched".to_string(),
+            reg(
+                "bad_enriched",
+                "SELECT d.*, c.* FROM changes c JOIN bad_dimensions d ON c.region = d.region",
+                false,
+            ),
+        ),
+    ]);
+    let bad_reference_tables = rustc_hash::FxHashSet::from_iter(["bad_dimensions".to_string()]);
+    let error = resolve_stream_output_schemas(&ctx, &bad_regs, &bad_reference_tables, &ordered)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("static enrich table") && error.contains("reserved"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -270,12 +432,78 @@ async fn ambiguous_changelog_consumer_fails_closed() {
         ),
     );
 
-    let error = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
-        .await
-        .unwrap_err()
-        .to_string();
+    let error =
+        resolve_stream_output_schemas(&ctx, &regs, &Default::default(), &Default::default())
+            .await
+            .unwrap_err()
+            .to_string();
     assert!(
         error.contains("cannot safely consume a changelog"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn volatile_changelog_consumer_fails_replay_admission() {
+    use laminar_sql::parser::EmitClause;
+
+    let ctx = ctx_with_payments();
+    let mut changes = reg(
+        "changes",
+        "SELECT region, SUM(amount_usd) AS total FROM payments GROUP BY region",
+        false,
+    );
+    changes.emit_clause = Some(EmitClause::Changes);
+    let mut regs = std::collections::HashMap::new();
+    regs.insert(changes.name.clone(), changes);
+    regs.insert(
+        "volatile_projection".to_string(),
+        reg(
+            "volatile_projection",
+            "SELECT region, random() AS sample FROM changes",
+            false,
+        ),
+    );
+
+    let error =
+        resolve_stream_output_schemas(&ctx, &regs, &Default::default(), &Default::default())
+            .await
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("not replay-immutable"), "{error}");
+}
+
+#[tokio::test]
+async fn wildcard_modifier_changelog_projection_fails_startup_admission() {
+    use laminar_sql::parser::EmitClause;
+
+    let ctx = ctx_with_payments();
+    let mut changes = reg(
+        "changes",
+        "SELECT region, SUM(amount_usd) AS total FROM payments GROUP BY region",
+        false,
+    );
+    changes.emit_clause = Some(EmitClause::Changes);
+    let mut regs = std::collections::HashMap::new();
+    regs.insert(changes.name.clone(), changes);
+    regs.insert(
+        "modified_wildcard".to_string(),
+        reg(
+            "modified_wildcard",
+            "SELECT * EXCLUDE(total) FROM changes",
+            false,
+        ),
+    );
+
+    let error =
+        resolve_stream_output_schemas(&ctx, &regs, &Default::default(), &Default::default())
+            .await
+            .unwrap_err()
+            .to_string();
+    assert!(
+        error.contains("cannot preserve")
+            || error.contains("engine-owned")
+            || error.contains("ordering or row limits"),
         "{error}"
     );
 }
@@ -305,10 +533,11 @@ async fn windowed_changelog_consumer_fails_closed() {
         ),
     );
 
-    let error = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
-        .await
-        .unwrap_err()
-        .to_string();
+    let error =
+        resolve_stream_output_schemas(&ctx, &regs, &Default::default(), &Default::default())
+            .await
+            .unwrap_err()
+            .to_string();
     assert!(
         error.contains("cannot safely consume a changelog") && error.contains("window"),
         "{error}"
@@ -323,10 +552,11 @@ async fn windowed_changelog_consumer_fails_closed() {
             false,
         ),
     );
-    let error = resolve_stream_output_schemas(&ctx, &unsupported, &Default::default())
-        .await
-        .unwrap_err()
-        .to_string();
+    let error =
+        resolve_stream_output_schemas(&ctx, &unsupported, &Default::default(), &Default::default())
+            .await
+            .unwrap_err()
+            .to_string();
     assert!(error.contains("DISTINCT aggregates"), "{error}");
 }
 
@@ -338,7 +568,7 @@ async fn unresolvable_streams_surface_planner_error() {
     regs.insert("a".to_string(), reg("a", "SELECT * FROM b", false));
     regs.insert("b".to_string(), reg("b", "SELECT * FROM a", false));
 
-    let err = resolve_stream_output_schemas(&ctx, &regs, &Default::default())
+    let err = resolve_stream_output_schemas(&ctx, &regs, &Default::default(), &Default::default())
         .await
         .unwrap_err()
         .to_string();

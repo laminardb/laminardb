@@ -10,9 +10,9 @@ use arrow::datatypes::SchemaRef;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_expr::{LogicalPlan, Volatility};
 use sqlparser::ast::{
-    visit_expressions, CastKind, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, Ident, ObjectName, ObjectNamePart, SelectFlavor, SelectItem, SetExpr, Statement,
-    TableFactor, TableVersion, Visit, Visitor, WildcardAdditionalOptions,
+    visit_expressions, visit_expressions_mut, CastKind, Expr, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, Ident, ObjectName, ObjectNamePart, SelectFlavor, SelectItem,
+    SetExpr, Statement, TableFactor, TableVersion, Visit, Visitor, WildcardAdditionalOptions,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -246,6 +246,236 @@ pub(crate) fn single_source_table(sql: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Render one single-source projection/filter so every execution path selects the engine-owned
+/// changelog weight inside the SQL AST. A plain wildcard already selects the input weight.
+/// Reserved output aliases and wildcard modifiers are rejected rather than risking a spoofed or
+/// path-dependent weight.
+pub(crate) fn projection_sql_preserving_weight(sql: &str) -> Option<String> {
+    if query_references_weight(sql) {
+        return None;
+    }
+    let mut statements = laminar_sql::parse_streaming_sql(sql).ok()?.into_iter();
+    let laminar_sql::parser::StreamingStatement::Standard(statement) = statements.next()? else {
+        return None;
+    };
+    if statements.next().is_some() {
+        return None;
+    }
+    let mut statement = *statement;
+    let Statement::Query(query) = &mut statement else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return None;
+    };
+    let weight = laminar_core::changelog::WEIGHT_COLUMN;
+    if select.projection.iter().any(|item| match item {
+        SelectItem::Wildcard(options) | SelectItem::QualifiedWildcard(_, options) => {
+            wildcard_has_options(options)
+        }
+        _ => false,
+    }) {
+        return None;
+    }
+    if select.projection.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+        )
+    }) {
+        let mut source_wildcard = None;
+        for (index, item) in select.projection.iter().enumerate() {
+            match item {
+                SelectItem::Wildcard(_)
+                | SelectItem::QualifiedWildcard(
+                    sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(_),
+                    _,
+                ) => {
+                    if source_wildcard.replace(index).is_some() {
+                        return None;
+                    }
+                }
+                SelectItem::QualifiedWildcard(
+                    sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(_),
+                    _,
+                ) => return None,
+                _ => {}
+            }
+        }
+        return source_wildcard
+            .is_some_and(|index| index + 1 == select.projection.len())
+            .then(|| sql.to_string());
+    }
+
+    select.projection.push(SelectItem::ExprWithAlias {
+        expr: Expr::Identifier(Ident::new(weight)),
+        alias: Ident::new(weight),
+    });
+    Some(statement.to_string())
+}
+
+/// Whether a query explicitly names or produces the engine-owned changelog weight. Parse failures
+/// are treated as references so admission cannot mistake an uninspected query for a safe one.
+pub(crate) fn query_references_weight(sql: &str) -> bool {
+    struct WeightReferenceVisitor {
+        found: bool,
+    }
+
+    impl Visitor for WeightReferenceVisitor {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &sqlparser::ast::Query) -> ControlFlow<Self::Break> {
+            let weight = laminar_core::changelog::WEIGHT_COLUMN;
+            if let SetExpr::Select(select) = query.body.as_ref() {
+                self.found |= select.projection.iter().any(|item| {
+                    matches!(
+                        item,
+                        SelectItem::ExprWithAlias { alias, .. }
+                            if alias.value.eq_ignore_ascii_case(weight)
+                    )
+                });
+            }
+            if self.found {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+
+        fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
+            let identifier = match expression {
+                Expr::Identifier(identifier) => Some(identifier),
+                Expr::CompoundIdentifier(identifiers) => identifiers.last(),
+                _ => None,
+            };
+            self.found |= identifier.is_some_and(|identifier| {
+                identifier
+                    .value
+                    .eq_ignore_ascii_case(laminar_core::changelog::WEIGHT_COLUMN)
+            });
+            if self.found {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+
+    let Some(query) = parse_standard_query(sql) else {
+        return true;
+    };
+    let mut visitor = WeightReferenceVisitor { found: false };
+    let _ = query.visit(&mut visitor);
+    visitor.found
+}
+
+/// Whether a SQL predicate explicitly reads the engine-owned changelog weight. Parse failures are
+/// treated as references so a sink filter cannot escape the fail-closed path.
+pub(crate) fn predicate_references_weight(predicate: &str) -> bool {
+    query_references_weight(&format!(
+        "SELECT * FROM __sink_filter_input WHERE {predicate}"
+    ))
+}
+
+/// Whether a query requests row-set, ordering, or analytic semantics that cannot be applied
+/// independently to a stream of weighted differential rows. Parse failures are unsafe.
+#[derive(Default)]
+struct MutableChangelogModifierVisitor {
+    query_count: usize,
+    nested_query: bool,
+    analytic_expression: bool,
+}
+
+impl Visitor for MutableChangelogModifierVisitor {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &sqlparser::ast::Query) -> ControlFlow<Self::Break> {
+        self.query_count += 1;
+        self.nested_query |= self.query_count > 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
+        self.analytic_expression |=
+            matches!(expression, Expr::Function(function) if function.over.is_some());
+        ControlFlow::Continue(())
+    }
+}
+
+fn query_ast_has_order_or_row_limit(query: &sqlparser::ast::Query) -> bool {
+    if query.order_by.is_some() || query.limit_clause.is_some() || query.fetch.is_some() {
+        return true;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return true;
+    };
+    select.top.is_some()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+}
+
+/// Whether a query orders or truncates a differential row set. Parse failures are unsafe.
+pub(crate) fn query_has_order_or_row_limit(sql: &str) -> bool {
+    parse_standard_query(sql).is_none_or(|query| query_ast_has_order_or_row_limit(&query))
+}
+
+pub(crate) fn mutable_changelog_has_unsafe_modifiers(sql: &str) -> bool {
+    let Some(query) = parse_standard_query(sql) else {
+        return true;
+    };
+    let mut visitor = MutableChangelogModifierVisitor::default();
+    let _ = query.visit(&mut visitor);
+    if query.with.is_some()
+        || query_ast_has_order_or_row_limit(&query)
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+        || visitor.analytic_expression
+        || visitor.nested_query
+    {
+        return true;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return true;
+    };
+    let empty_group_by = matches!(
+        &select.group_by,
+        GroupByExpr::Expressions(expressions, modifiers)
+            if expressions.is_empty() && modifiers.is_empty()
+    );
+    select.flavor != SelectFlavor::Standard
+        || select.distinct.is_some()
+        || select.top.is_some()
+        || select.exclude.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || select.prewhere.is_some()
+        || !empty_group_by
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || select.having.is_some()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+        || select.value_table_mode.is_some()
+        || select.connect_by.is_some()
+}
+
+/// A flattened bounded-join projection has only the two outer join inputs in scope. Rewriting
+/// qualified leaves through a nested query would require scope-aware name resolution and could
+/// otherwise capture an inner alias, so the bounded path rejects that shape before graph mutation.
+pub(crate) fn interval_output_has_nested_query(sql: &str) -> bool {
+    let Some(query) = parse_standard_query(sql) else {
+        return true;
+    };
+    let mut visitor = MutableChangelogModifierVisitor::default();
+    let _ = query.visit(&mut visitor);
+    visitor.nested_query
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -880,9 +1110,9 @@ fn build_lookup_projection_sql(
 /// Temp table name the changelog batch is registered under for the enrich-join SQL.
 pub(crate) const CHANGELOG_ENRICH_TMP: &str = "__changelog_enrich_tmp";
 
-/// A `<incremental MV> JOIN <static table>` dimension enrichment.
+/// A `<changelog> JOIN <static table>` dimension enrichment.
 pub(crate) struct ChangelogEnrichConfig {
-    /// The left (incremental MV / changelog) table the operator consumes from `input_bufs`.
+    /// The left changelog table the operator consumes from `input_bufs`.
     pub changelog_table: String,
     /// Static dimension relation on the right side.
     pub static_table: String,
@@ -896,16 +1126,20 @@ pub(crate) struct ChangelogEnrichConfig {
     pub projection_sql: String,
 }
 
-/// Detect a single equi-join of an incremental MV (changelog) left and a static table right; returns
+/// Detect a single equi-join of a changelog left and a static table right; returns
 /// the changelog table and a `__weight`-preserving temp-rewritten join SQL, else `None`.
 pub(crate) fn detect_changelog_enrich_query(
     sql: &str,
-    incremental_mvs: &FxHashSet<String>,
+    changelog_tables: &FxHashSet<String>,
     static_tables: &FxHashSet<String>,
 ) -> Option<ChangelogEnrichConfig> {
     use laminar_sql::parser::join_parser::JoinType;
 
-    if incremental_mvs.is_empty() || static_tables.is_empty() {
+    if changelog_tables.is_empty()
+        || static_tables.is_empty()
+        || query_references_weight(sql)
+        || mutable_changelog_has_unsafe_modifiers(sql)
+    {
         return None;
     }
     let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
@@ -918,17 +1152,18 @@ pub(crate) fn detect_changelog_enrich_query(
     let SetExpr::Select(select) = query.body.as_ref() else {
         return None;
     };
-    let has_group_by = match &select.group_by {
-        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
-        sqlparser::ast::GroupByExpr::All(_) => false,
+    let [from] = select.from.as_slice() else {
+        return None;
     };
-    if select.distinct.is_some()
-        || has_group_by
-        || select.having.is_some()
-        || query.order_by.is_some()
-        || query.limit_clause.is_some()
-        || query.fetch.is_some()
-        || query.with.is_some()
+    let [join] = from.joins.as_slice() else {
+        return None;
+    };
+    // Changelog enrichment rebuilds the join over an internal left relation. The join parser's
+    // string analysis intentionally discards identifier quote style, so accepting quoted relation
+    // names or aliases here could change identifier equality (or produce invalid reconstructed
+    // SQL) after intake. Keep this specialized rewrite on unquoted identifiers only.
+    if table_factor_uses_quoted_identifier(&from.relation)
+        || table_factor_uses_quoted_identifier(&join.relation)
     {
         return None;
     }
@@ -942,7 +1177,7 @@ pub(crate) fn detect_changelog_enrich_query(
     }
     // Only changelog-left to static-right enrichment is supported. Every other changelog join
     // shape is rejected by DDL and graph admission.
-    if !incremental_mvs.contains(&j.left_table) || !static_tables.contains(&j.right_table) {
+    if !changelog_tables.contains(&j.left_table) || !static_tables.contains(&j.right_table) {
         return None;
     }
     let join_kw = match j.join_type {
@@ -971,15 +1206,61 @@ pub(crate) fn detect_changelog_enrich_query(
     let weight = laminar_core::changelog::WEIGHT_COLUMN;
     let lalias = j.left_alias.as_deref().unwrap_or(&j.left_table);
     let ralias = j.right_alias.as_deref().unwrap_or(&j.right_table);
+    if unquoted_identifier_eq(lalias, ralias) {
+        return None;
+    }
 
+    if select.projection.iter().any(|item| match item {
+        SelectItem::Wildcard(options) | SelectItem::QualifiedWildcard(_, options) => {
+            wildcard_has_options(options)
+        }
+        _ => false,
+    }) || select.projection.iter().any(|item| match item {
+        SelectItem::QualifiedWildcard(
+            sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name),
+            _,
+        ) => name.0.iter().any(|part| {
+            part.as_ident()
+                .is_none_or(|identifier| identifier.quote_style.is_some())
+        }),
+        SelectItem::QualifiedWildcard(
+            sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(_),
+            _,
+        ) => true,
+        _ => false,
+    }) || select
+        .projection
+        .iter()
+        .any(|item| matches!(item, SelectItem::Wildcard(_)))
+    {
+        return None;
+    }
     let mut items: Vec<String> = select.projection.iter().map(ToString::to_string).collect();
-    let has_wildcard = select.projection.iter().any(|i| {
-        matches!(
-            i,
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
-        )
-    });
-    if !has_wildcard {
+    let mut left_wildcard = None;
+    for (index, item) in select.projection.iter().enumerate() {
+        if matches!(
+            item,
+            SelectItem::QualifiedWildcard(
+                sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name),
+                _,
+            ) if name
+                .0
+                .last()
+                .and_then(ObjectNamePart::as_ident)
+                .is_some_and(|identifier| {
+                    identifier.quote_style.is_none()
+                        && unquoted_identifier_eq(&identifier.value, lalias)
+                })
+        ) && left_wildcard.replace(index).is_some()
+        {
+            return None;
+        }
+    }
+    if left_wildcard.is_some_and(|index| index + 1 != select.projection.len()) {
+        return None;
+    }
+    let wildcard_preserves_weight = left_wildcard.is_some();
+    if !wildcard_preserves_weight {
         items.push(format!("{lalias}.\"{weight}\""));
     }
 
@@ -1023,6 +1304,18 @@ pub(crate) fn detect_changelog_enrich_query(
         left_outer: j.join_type == JoinType::Left,
         projection_sql,
     })
+}
+
+fn table_factor_uses_quoted_identifier(factor: &TableFactor) -> bool {
+    let TableFactor::Table { name, alias, .. } = factor else {
+        return true;
+    };
+    name.0.iter().any(|part| {
+        part.as_ident()
+            .is_none_or(|identifier| identifier.quote_style.is_some())
+    }) || alias
+        .as_ref()
+        .is_some_and(|alias| alias.name.quote_style.is_some() || !alias.columns.is_empty())
 }
 
 /// `true` if the single join's ON clause is a pure conjunction of `col = col` equalities (or a
@@ -2229,6 +2522,10 @@ fn extract_self_join_pre_filters(
 pub(crate) struct StreamJoinDetection {
     pub config: StreamJoinConfig,
     pub projection_sql: String,
+    /// Projection over the weighted interval-kernel output. The engine-owned trailing
+    /// `__weight` is selected inside the same SQL projection so compiled and cached execution
+    /// apply an identical filter to the row and its weight.
+    pub weighted_projection_sql: String,
     pub left_pre_filter: Option<String>,
     pub right_pre_filter: Option<String>,
 }
@@ -2364,11 +2661,14 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
             .unwrap_or_default(),
     };
     let projection_sql =
-        build_stream_join_projection_sql(select, &stream_analysis, &config, &where_clause);
+        build_stream_join_projection_sql(select, &stream_analysis, &config, &where_clause, false);
+    let weighted_projection_sql =
+        build_stream_join_projection_sql(select, &stream_analysis, &config, &where_clause, true);
 
     Some(StreamJoinDetection {
         config,
         projection_sql,
+        weighted_projection_sql,
         left_pre_filter: pre_filters.as_ref().and_then(|f| f.left_sql.clone()),
         right_pre_filter: pre_filters.as_ref().and_then(|f| f.right_sql.clone()),
     })
@@ -2392,6 +2692,42 @@ pub(crate) fn has_unaliased_projection(sql: &str) -> bool {
         .projection
         .iter()
         .any(|item| !matches!(item, SelectItem::ExprWithAlias { .. }))
+}
+
+/// Whether a bounded-join projection/filter contains a column reference whose input side cannot be
+/// proven from the SQL text alone. The interval kernel renames right-side fields, so accepting an
+/// unqualified reference would make an otherwise unambiguous source column ambiguous after the pair
+/// schema is built. Parse/shape failures are fail-closed; callers invoke this only for planned joins.
+pub(crate) fn has_unqualified_interval_output_column(sql: &str) -> bool {
+    let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
+        return true;
+    };
+    let Some(laminar_sql::parser::StreamingStatement::Standard(statement)) = statements.first()
+    else {
+        return true;
+    };
+    let Statement::Query(query) = statement.as_ref() else {
+        return true;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return true;
+    };
+    let has_unqualified = |expr: &Expr| {
+        visit_expressions(expr, |nested| {
+            if matches!(nested, Expr::Identifier(_)) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .is_break()
+    };
+    select.projection.iter().any(|item| match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            has_unqualified(expr)
+        }
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => false,
+    }) || select.selection.as_ref().is_some_and(has_unqualified)
 }
 
 /// Apply a global Top-K limit across all batches.
@@ -2423,8 +2759,8 @@ pub(crate) fn apply_topk_filter(batches: &[RecordBatch], k: usize) -> Vec<Record
 /// Rewrite an expression to SQL over a flattened join temp table.
 ///
 /// `leaf` resolves qualified column references for the specific join type, returning `None`
-/// to fall through to the shared structural recursion. Shared by temporal,
-/// stream-stream, and lookup rewriters.
+/// to fall through to the shared structural recursion. Shared by temporal and lookup rewriters;
+/// bounded stream joins use an AST-mutating rewrite so every expression variant is preserved.
 fn rewrite_join_expr<F: Fn(&Expr) -> Option<String>>(expr: &Expr, leaf: &F) -> String {
     if let Some(s) = leaf(expr) {
         return s;
@@ -2620,15 +2956,24 @@ fn build_stream_join_projection_sql(
     analysis: &laminar_sql::parser::join_parser::JoinAnalysis,
     config: &StreamJoinConfig,
     where_clause: &str,
+    preserve_weight: bool,
 ) -> String {
     let left_alias = analysis.left_alias.as_deref();
     let right_alias = analysis.right_alias.as_deref();
 
-    let items: Vec<String> = select
+    let mut items: Vec<String> = select
         .projection
         .iter()
         .map(|item| render_join_projection_item(item, left_alias, right_alias, config))
         .collect();
+    let unqualified_wildcard = select
+        .projection
+        .iter()
+        .any(|item| matches!(item, SelectItem::Wildcard(_)));
+    if preserve_weight && !unqualified_wildcard {
+        let weight = laminar_core::changelog::WEIGHT_COLUMN;
+        items.push(format!("\"{weight}\" AS \"{weight}\""));
+    }
 
     format!(
         "SELECT {} FROM __interval_tmp{where_clause}",
@@ -2657,36 +3002,50 @@ fn render_join_projection_item(
     }
 }
 
-// Left columns become bare names; right columns get the _<right_table> suffix from IntervalJoinState.
+// Left columns keep their source names; right columns get the _<right_table> suffix from
+// IntervalJoinState. Rewrite the cloned AST instead of enumerating expression variants so qualified
+// references nested in LIKE, truth tests, function clauses, or future sqlparser expressions cannot
+// leak their source qualifier into the flattened temporary table. Always quote the generated field
+// name: a valid source identifier may contain whitespace, punctuation, or a reserved word, and the
+// temporary pair table exposes that exact Arrow field name.
 fn rewrite_stream_join_expr(
     expr: &sqlparser::ast::Expr,
     left_alias: Option<&str>,
     right_alias: Option<&str>,
     config: &StreamJoinConfig,
 ) -> String {
-    rewrite_join_expr(expr, &|e: &Expr| {
-        let Expr::CompoundIdentifier(parts) = e else {
-            return None;
+    let mut rewritten = expr.clone();
+    let _ = visit_expressions_mut(&mut rewritten, |nested| {
+        let replacement = match nested {
+            Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                let table = &parts[0].value;
+                let column = &parts[1].value;
+                let is_left =
+                    table == &config.left_table || left_alias.is_some_and(|alias| alias == table);
+                let is_right =
+                    table == &config.right_table || right_alias.is_some_and(|alias| alias == table);
+                let right_only =
+                    matches!(config.join_type, JoinType::RightSemi | JoinType::RightAnti);
+                if is_right {
+                    Some(if right_only {
+                        column.clone()
+                    } else {
+                        format!("{column}_{}", config.right_table)
+                    })
+                } else if is_left && !right_only {
+                    Some(column.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
         };
-        if parts.len() != 2 {
-            return None;
+        if let Some(field) = replacement {
+            *nested = Expr::Identifier(Ident::with_quote('"', field));
         }
-        let table = &parts[0].value;
-        let col = &parts[1].value;
-        let is_left = table == &config.left_table || left_alias.is_some_and(|a| a == table);
-        let is_right = table == &config.right_table || right_alias.is_some_and(|a| a == table);
-        Some(if is_left || is_right {
-            let right_only = matches!(config.join_type, JoinType::RightSemi | JoinType::RightAnti);
-            let bare = if is_right && !right_only {
-                format!("{col}_{}", config.right_table)
-            } else {
-                col.clone()
-            };
-            bare
-        } else {
-            e.to_string()
-        })
-    })
+        ControlFlow::<()>::Continue(())
+    });
+    rewritten.to_string()
 }
 
 /// One bound of a `time_col CMP now() ± offset` predicate. `strict` means `>`/`<`.

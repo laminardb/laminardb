@@ -48,6 +48,87 @@ async fn temporal_test_db() -> (
     (db, control)
 }
 
+const ORDERED_FULL_CHANGELOG_CONNECTOR: &str = "ordered-full-changelog-test";
+
+fn ordered_full_changelog_schema() -> SchemaRef {
+    use arrow_schema::{DataType, Field, TimeUnit};
+
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+        Field::new("value", DataType::Int64, false),
+        Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            DataType::Int64,
+            false,
+        ),
+    ]))
+}
+
+struct OrderedFullChangelogSource;
+
+#[async_trait]
+impl SourceConnector for OrderedFullChangelogSource {
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        Ok(SourceContract::new(
+            SourceConsistency::Replayable,
+            SourceTopology::Splittable,
+            SourceInputMode::FullChangelog,
+        )
+        .with_row_positions(SourceRowPositionCapability::OrderedDeterministic))
+    }
+
+    async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
+    async fn poll_batch(
+        &mut self,
+        _max_records: usize,
+    ) -> Result<Option<SourceBatch>, ConnectorError> {
+        Ok(None)
+    }
+
+    fn schema(&self) -> SchemaRef {
+        ordered_full_changelog_schema()
+    }
+
+    fn checkpoint(&self) -> SourceCheckpoint {
+        SourceCheckpoint::new()
+    }
+
+    async fn close(&mut self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+}
+
+async fn ordered_full_changelog_test_db() -> Arc<LaminarDB> {
+    let control = crate::temporal_test_source::TemporalTestSourceControl::new();
+    LaminarDB::builder()
+        .register_connector(move |registry| {
+            crate::temporal_test_source::register(registry, &control)?;
+            registry.register_source(
+                ORDERED_FULL_CHANGELOG_CONNECTOR,
+                laminar_connectors::config::ConnectorInfo {
+                    name: ORDERED_FULL_CHANGELOG_CONNECTOR.into(),
+                    display_name: "Ordered full changelog test source".into(),
+                    version: "1".into(),
+                    is_source: true,
+                    is_sink: false,
+                    config_keys: Vec::new(),
+                },
+                Arc::new(|_| Ok(Box::new(OrderedFullChangelogSource))),
+            )
+        })
+        .build()
+        .await
+        .unwrap()
+}
+
 async fn persistent_temporal_alo_test_db(
     storage_dir: &std::path::Path,
     control: &crate::temporal_test_source::TemporalTestSourceControl,
@@ -929,6 +1010,521 @@ fn mutation_sources_fail_before_connector_io() {
 }
 
 #[test]
+fn mutable_interval_weight_reference_scan_allows_wildcards_only() {
+    assert!(!crate::sql_analysis::query_references_weight(
+        "SELECT l.* FROM left_events l JOIN right_events r ON l.id = r.id"
+    ));
+    assert!(crate::sql_analysis::query_references_weight(
+        "SELECT l.__weight AS weight_copy FROM left_events l JOIN right_events r ON l.id = r.id"
+    ));
+    assert!(crate::sql_analysis::query_references_weight(
+        "SELECT l.id AS __WEIGHT FROM left_events l JOIN right_events r ON l.id = r.id"
+    ));
+    assert!(crate::sql_analysis::query_references_weight(
+        "SELECT l.id AS id FROM left_events l JOIN right_events r ON l.id = r.id WHERE r.__WEIGHT > 0"
+    ));
+}
+
+#[tokio::test]
+async fn append_only_derived_interval_inputs_skip_mutation_admission() {
+    let db = LaminarDB::open().unwrap();
+    let mut config = laminar_sql::translator::StreamJoinConfig::new(
+        laminar_sql::parser::join_parser::JoinType::Inner,
+        vec!["id".into()],
+        vec!["id".into()],
+        Duration::from_secs(1),
+    );
+    config.left_table = "derived_left".into();
+    config.right_table = "derived_right".into();
+    config.left_time_column = "ts".into();
+    config.right_time_column = "ts".into();
+    let streams = HashMap::from([(
+        "joined".into(),
+        crate::connector_manager::StreamRegistration {
+            name: "joined".into(),
+            query_sql: "SELECT l.id AS id FROM derived_left l JOIN derived_right r \
+                        ON l.id = r.id AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND"
+                .into(),
+            emit_clause: None,
+            window_config: None,
+            order_config: None,
+            join_config: Some(vec![
+                laminar_sql::translator::JoinOperatorConfig::StreamStream(config),
+            ]),
+            has_analytic: false,
+            has_frame: false,
+            incremental: false,
+        },
+    )]);
+
+    let admitted = db
+        .validate_persisted_interval_source_contracts(
+            &HashMap::new(),
+            &HashMap::new(),
+            &streams,
+            RuntimeMode::Local,
+        )
+        .await
+        .unwrap();
+    assert!(admitted.joins.is_empty());
+    assert!(admitted.source_modes.is_empty());
+}
+
+#[tokio::test]
+async fn keyed_interval_admission_requires_complete_pk_and_exclusive_consumers() {
+    use crate::operator::interval_join_input::BoundedJoinInputMode;
+
+    let (db, _) = temporal_test_db().await;
+    let connector = crate::temporal_test_source::CONNECTOR_NAME;
+    db.execute(&format!(
+        "CREATE SOURCE interval_left (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, \
+         value BIGINT NOT NULL, WATERMARK FOR ts AS ts) \
+         FROM \"{connector}\" ('mode' = 'append')"
+    ))
+    .await
+    .unwrap();
+    db.execute(&format!(
+        "CREATE SOURCE interval_right (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, \
+         value BIGINT NOT NULL, PRIMARY KEY (id, ts), WATERMARK FOR ts AS ts) \
+         FROM \"{connector}\" ('mode' = 'upsert')"
+    ))
+    .await
+    .unwrap();
+    let error = db
+        .execute(
+            "CREATE STREAM nested_interval AS \
+             SELECT EXISTS (SELECT 1 FROM nested_dim d WHERE d.id = l.id) AS present \
+             FROM interval_left l JOIN interval_left r ON l.id = r.id \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("subquer"), "{error}");
+    assert!(!db.catalog_namespace.lock().contains_key("nested_interval"));
+    db.execute(
+        "CREATE STREAM mutable_join AS \
+         SELECT l.id AS id, l.value AS left_value, r.value AS right_value \
+         FROM interval_left l JOIN interval_right r ON l.id = r.id \
+         AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+    )
+    .await
+    .unwrap();
+
+    let (sources, sinks, streams) = {
+        let manager = db.connector_manager.lock();
+        (
+            manager.sources().clone(),
+            manager.sinks().clone(),
+            manager.streams().clone(),
+        )
+    };
+    let admitted = db
+        .validate_persisted_interval_source_contracts(
+            &sources,
+            &sinks,
+            &streams,
+            RuntimeMode::Local,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        admitted.source_modes.get("interval_right"),
+        Some(&SourceInputMode::KeyedUpsert)
+    );
+    let modes = admitted.joins.get("mutable_join").unwrap();
+    assert!(matches!(&modes[0], BoundedJoinInputMode::AppendOnly));
+    assert!(matches!(
+        &modes[1],
+        BoundedJoinInputMode::KeyedUpsert { primary_key_indices }
+            if primary_key_indices == &[0, 1]
+    ));
+
+    let error = db
+        .execute("CREATE STREAM invalid_copy AS SELECT id AS id FROM interval_right")
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("consumer outside its admitted bounded interval joins"));
+
+    let error = db
+        .execute(
+            "CREATE STREAM volatile_copy AS \
+             SELECT id, random() AS nonce FROM mutable_join",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not replay-immutable"),
+        "{error}"
+    );
+    assert!(!db.catalog_namespace.lock().contains_key("volatile_copy"));
+
+    let error = db
+        .execute(
+            "CREATE MATERIALIZED VIEW rejected_top_snapshot AS \
+             SELECT id, SUM(left_value) AS total FROM mutable_join GROUP BY id \
+             ORDER BY total DESC LIMIT 1",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("ordering or row limits")
+            || error
+                .to_string()
+                .contains("managed streaming aggregates require"),
+        "{error}"
+    );
+    assert!(!db
+        .catalog_namespace
+        .lock()
+        .contains_key("rejected_top_snapshot"));
+
+    db.execute(
+        "CREATE MATERIALIZED VIEW mutable_snapshot AS \
+         SELECT id, left_value, right_value FROM mutable_join",
+    )
+    .await
+    .unwrap();
+    assert!(db
+        .connector_manager
+        .lock()
+        .streams()
+        .get("mutable_snapshot")
+        .is_some_and(|registration| registration.incremental));
+
+    db.start().await.unwrap();
+    db.execute(
+        "CREATE STREAM late_append_interval AS \
+         SELECT l.id AS id FROM interval_left l JOIN interval_left r ON l.id = r.id \
+         AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+    )
+    .await
+    .unwrap();
+    assert!(db
+        .catalog_namespace
+        .lock()
+        .contains_key("late_append_interval"));
+    let error = db
+        .execute("CREATE STREAM late_copy AS SELECT id FROM mutable_join")
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("creates or consumes") && error.to_string().contains("stop"),
+        "{error}"
+    );
+    assert!(!db.catalog_namespace.lock().contains_key("late_copy"));
+    let error = db
+        .execute("DROP STREAM mutable_join CASCADE")
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("running fixed startup topology"),
+        "{error}"
+    );
+    db.shutdown().await.unwrap();
+
+    let (invalid, _) = temporal_test_db().await;
+    invalid
+        .execute(&format!(
+            "CREATE SOURCE invalid_left (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, \
+             value BIGINT NOT NULL, WATERMARK FOR ts AS ts) \
+             FROM \"{connector}\" ('mode' = 'append')"
+        ))
+        .await
+        .unwrap();
+    invalid
+        .execute(&format!(
+            "CREATE SOURCE invalid_right (id BIGINT PRIMARY KEY, ts TIMESTAMP NOT NULL, \
+             value BIGINT NOT NULL, WATERMARK FOR ts AS ts) \
+             FROM \"{connector}\" ('mode' = 'upsert')"
+        ))
+        .await
+        .unwrap();
+    let error = invalid
+        .execute(
+            "CREATE STREAM invalid_pk_join AS \
+             SELECT l.id AS id FROM invalid_left l JOIN invalid_right r ON l.id = r.id \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+        )
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("PRIMARY KEY must include join/event-time column 'ts'"));
+}
+
+#[tokio::test]
+async fn persisted_mutable_enrich_rejects_on_demand_lookup_provenance() {
+    let (db, _) = temporal_test_db().await;
+    let connector = crate::temporal_test_source::CONNECTOR_NAME;
+    db.execute(&format!(
+        "CREATE SOURCE lookup_left (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, \
+         value BIGINT NOT NULL, WATERMARK FOR ts AS ts) \
+         FROM \"{connector}\" ('mode' = 'append')"
+    ))
+    .await
+    .unwrap();
+    db.execute(&format!(
+        "CREATE SOURCE lookup_right (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, \
+         value BIGINT NOT NULL, PRIMARY KEY (id, ts), WATERMARK FOR ts AS ts) \
+         FROM \"{connector}\" ('mode' = 'upsert')"
+    ))
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE STREAM lookup_changes AS \
+         SELECT l.id AS id, l.value AS left_value, r.value AS right_value \
+         FROM lookup_left l JOIN lookup_right r ON l.id = r.id \
+         AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE LOOKUP TABLE dimensions (id BIGINT NOT NULL, label VARCHAR, \
+         PRIMARY KEY (id)) WITH ('connector' = 'static')",
+    )
+    .await
+    .unwrap();
+    db.connector_manager
+        .lock()
+        .register_table(crate::connector_manager::TableRegistration {
+            name: "dimensions".into(),
+            primary_key: "id".into(),
+            connector_type: Some("static".into()),
+            connector_options: HashMap::new(),
+            format: None,
+            format_options: HashMap::new(),
+            on_demand: true,
+            cache_max_bytes: Some(1024),
+            cache_ttl: None,
+        });
+    let unsafe_sql = "SELECT d.label, c.* FROM lookup_changes c \
+                      JOIN dimensions d ON c.id = d.id";
+    let error = db
+        .execute(&format!(
+            "CREATE STREAM rejected_direct_enrich AS {unsafe_sql}"
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot safely consume a changelog"),
+        "{error}"
+    );
+    assert!(!db
+        .catalog_namespace
+        .lock()
+        .contains_key("rejected_direct_enrich"));
+
+    db.connector_manager
+        .lock()
+        .register_stream(crate::connector_manager::StreamRegistration {
+            name: "unsafe_direct_enrich".into(),
+            query_sql: unsafe_sql.into(),
+            emit_clause: None,
+            window_config: None,
+            order_config: None,
+            join_config: None,
+            has_analytic: false,
+            has_frame: false,
+            incremental: false,
+        });
+
+    let error = db.start().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot safely consume a changelog"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn full_changelog_source_and_interval_admission_are_contract_gated() {
+    use crate::operator::interval_join_input::BoundedJoinInputMode;
+
+    let db = ordered_full_changelog_test_db().await;
+    db.execute(&format!(
+        "CREATE SOURCE weighted_left (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, \
+         value BIGINT NOT NULL, __weight BIGINT NOT NULL, WATERMARK FOR ts AS ts) \
+         FROM \"{ORDERED_FULL_CHANGELOG_CONNECTOR}\""
+    ))
+    .await
+    .unwrap();
+    let append_connector = crate::temporal_test_source::CONNECTOR_NAME;
+    db.execute(&format!(
+        "CREATE SOURCE weighted_right (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, \
+         value BIGINT NOT NULL, WATERMARK FOR ts AS ts) \
+         FROM \"{append_connector}\" ('mode' = 'append')"
+    ))
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE STREAM weighted_join AS \
+         SELECT l.id AS id, l.value AS left_value, r.value AS right_value \
+         FROM weighted_left l JOIN weighted_right r ON l.id = r.id \
+         AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+    )
+    .await
+    .unwrap();
+    db.execute("CREATE TABLE weighted_dimensions (id BIGINT PRIMARY KEY, label VARCHAR)")
+        .await
+        .unwrap();
+    db.execute(
+        "CREATE STREAM weighted_enriched AS \
+         SELECT j.id AS id, d.label AS label FROM weighted_join j \
+         JOIN weighted_dimensions d ON j.id = d.id",
+    )
+    .await
+    .unwrap();
+    assert!(db
+        .connector_manager
+        .lock()
+        .streams()
+        .contains_key("weighted_enriched"));
+
+    for (name, query) in [
+        (
+            "weighted_distinct",
+            "SELECT DISTINCT l.id AS id, l.value AS left_value, r.value AS right_value \
+             FROM weighted_left l JOIN weighted_right r ON l.id = r.id \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+        ),
+        (
+            "weighted_top_one",
+            "SELECT l.id AS id, l.value AS left_value, r.value AS right_value \
+             FROM weighted_left l JOIN weighted_right r ON l.id = r.id \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND \
+             ORDER BY id LIMIT 1",
+        ),
+    ] {
+        let error = db
+            .execute(&format!("CREATE STREAM {name} AS {query}"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("row-set modifiers")
+                || error
+                    .to_string()
+                    .contains("cannot contain an aggregate stage"),
+            "{error}"
+        );
+        assert!(!db.catalog_namespace.lock().contains_key(name));
+    }
+
+    let (sources, sinks, streams) = {
+        let manager = db.connector_manager.lock();
+        (
+            manager.sources().clone(),
+            manager.sinks().clone(),
+            manager.streams().clone(),
+        )
+    };
+    let admitted = db
+        .validate_persisted_interval_source_contracts(
+            &sources,
+            &sinks,
+            &streams,
+            RuntimeMode::Local,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        admitted.source_modes.get("weighted_left"),
+        Some(&SourceInputMode::FullChangelog)
+    );
+    let modes = &admitted.joins["weighted_join"];
+    assert!(matches!(
+        (&modes[0], &modes[1]),
+        (
+            BoundedJoinInputMode::FullChangelog,
+            BoundedJoinInputMode::AppendOnly
+        )
+    ));
+
+    let error = db
+        .execute(&format!(
+            "CREATE SOURCE missing_weight (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, \
+             value BIGINT NOT NULL, WATERMARK FOR ts AS ts) \
+             FROM \"{ORDERED_FULL_CHANGELOG_CONNECTOR}\""
+        ))
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("requires exact trailing non-null BIGINT '__weight'"));
+
+    let error = db
+        .execute(&format!(
+            "CREATE SOURCE spoofed_weight (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, \
+             value BIGINT NOT NULL, __weight BIGINT NOT NULL, WATERMARK FOR ts AS ts) \
+             FROM \"{append_connector}\" ('mode' = 'append')"
+        ))
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("connector input mode is AppendOnly"));
+
+    // Persisted metadata is revalidated independently of the DDL path. First prove that an older
+    // row-limiting query is rejected by the same admission method startup invokes.
+    let mut row_limited_streams = streams.clone();
+    row_limited_streams
+        .get_mut("weighted_join")
+        .unwrap()
+        .query_sql = "SELECT l.id AS id, l.value AS left_value, r.value AS right_value \
+         FROM weighted_left l JOIN weighted_right r ON l.id = r.id \
+         AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND \
+         ORDER BY id LIMIT 1"
+        .into();
+    let error = db
+        .validate_persisted_interval_source_contracts(
+            &sources,
+            &sinks,
+            &row_limited_streams,
+            RuntimeMode::Local,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("row-set modifiers"), "{error}");
+
+    let mut aggregate_streams = streams.clone();
+    aggregate_streams
+        .get_mut("weighted_join")
+        .unwrap()
+        .query_sql = "SELECT COUNT(l.id) AS row_count \
+         FROM weighted_left l JOIN weighted_right r ON l.id = r.id \
+         AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND"
+        .into();
+    let error = db
+        .validate_persisted_interval_source_contracts(
+            &sources,
+            &sinks,
+            &aggregate_streams,
+            RuntimeMode::Local,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("aggregate stage"), "{error}");
+
+    // Then inject an unaliased persisted projection and require actual startup to fail before
+    // source intake rather than deferring the schema disagreement to the first data cycle.
+    {
+        let mut manager = db.connector_manager.lock();
+        let mut registration = manager.streams()["weighted_join"].clone();
+        registration.query_sql = "SELECT l.id, l.value AS left_value, r.value AS right_value \
+             FROM weighted_left l JOIN weighted_right r ON l.id = r.id \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND"
+            .into();
+        manager.register_stream(registration);
+    }
+    let error = db.start().await.unwrap_err();
+    assert!(error.to_string().contains("explicit alias"), "{error}");
+}
+
+#[test]
 fn temporal_source_contracts_enforce_recovery_positions_and_input_roles() {
     let positioned = |input_mode| {
         SourceContract::new(
@@ -1293,29 +1889,37 @@ async fn keyed_temporal_right_consumer_admission_is_ddl_order_independent() {
         ),
         ("right_sink", "CREATE SINK right_sink FROM right_events"),
         (
-            "right_query_sink",
-            "CREATE SINK right_query_sink FROM (SELECT id FROM right_events)",
-        ),
-        (
             "right_mv",
             "CREATE MATERIALIZED VIEW right_mv AS SELECT id, ts, value FROM right_events",
         ),
     ] {
         let error = db.execute(sql).await.unwrap_err();
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("non-temporal-right consumer"),
+            message.contains("non-temporal-right consumer")
+                || message.contains("exclusive to admitted stateful routes"),
             "{sql}: {error}"
         );
         assert!(!db.catalog_namespace.lock().contains_key(name));
     }
-    db.execute("CREATE SINK left_query_sink FROM (SELECT id FROM left_events)")
-        .await
-        .unwrap();
-    assert!(db
-        .connector_manager
-        .lock()
-        .get_sink("left_query_sink")
-        .is_some());
+    for (name, sql) in [
+        (
+            "right_query_sink",
+            "CREATE SINK right_query_sink FROM (SELECT id FROM right_events)",
+        ),
+        (
+            "left_query_sink",
+            "CREATE SINK left_query_sink FROM (SELECT id FROM left_events)",
+        ),
+    ] {
+        let error = db.execute(sql).await.unwrap_err();
+        assert!(
+            error.to_string().contains("named internal stream"),
+            "{error}"
+        );
+        assert!(!db.catalog_namespace.lock().contains_key(name));
+        assert!(db.connector_manager.lock().get_sink(name).is_none());
+    }
     assert!(db.catalog.get_stream_entry("right_copy").is_none());
     assert!(db.catalog.get_sink_input("right_sink").is_none());
     assert!(!db
@@ -1331,23 +1935,70 @@ async fn keyed_temporal_right_consumer_admission_is_ddl_order_independent() {
 
     let (db, _) = temporal_test_db().await;
     create_temporal_test_inputs(&db).await.unwrap();
-    db.execute("CREATE SINK right_sink FROM right_events")
-        .await
-        .unwrap();
-    let error = create_temporal_test_stream(&db, "matched")
+    let error = db
+        .execute("CREATE SINK right_sink FROM right_events")
         .await
         .unwrap_err();
     assert!(
-        error.to_string().contains("non-temporal-right consumer"),
+        error
+            .to_string()
+            .contains("exclusive to admitted stateful routes"),
         "{error}"
     );
-    assert!(db.catalog.get_stream_entry("matched").is_none());
-    assert!(!db.catalog_namespace.lock().contains_key("matched"));
-    assert!(!db
+    assert!(db.connector_manager.lock().get_sink("right_sink").is_none());
+    create_temporal_test_stream(&db, "matched").await.unwrap();
+    assert!(db.catalog.get_stream_entry("matched").is_some());
+    db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn mutation_source_creation_revalidates_preexisting_consumers_and_plain_copies() {
+    let connector = crate::temporal_test_source::CONNECTOR_NAME;
+    let (db, _) = temporal_test_db().await;
+    db.execute("CREATE SINK future_sink FROM future_events")
+        .await
+        .unwrap();
+    let error = db
+        .execute(&format!(
+            "CREATE SOURCE future_events (id BIGINT PRIMARY KEY, ts TIMESTAMP NOT NULL, \
+             value BIGINT NOT NULL, WATERMARK FOR ts AS ts) \
+             FROM \"{connector}\" ('mode' = 'upsert')"
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("exclusive to admitted stateful routes"),
+        "{error}"
+    );
+    assert!(db.catalog.get_source("future_events").is_none());
+    assert!(db
         .connector_manager
         .lock()
-        .streams()
-        .contains_key("matched"));
+        .get_source("future_events")
+        .is_none());
+    db.shutdown().await.unwrap();
+
+    let (db, _) = temporal_test_db().await;
+    db.execute(&format!(
+        "CREATE SOURCE keyed_events (id BIGINT PRIMARY KEY, ts TIMESTAMP NOT NULL, \
+         value BIGINT NOT NULL, WATERMARK FOR ts AS ts) \
+         FROM \"{connector}\" ('mode' = 'upsert')"
+    ))
+    .await
+    .unwrap();
+    let error = db
+        .execute("CREATE STREAM keyed_copy AS SELECT * FROM keyed_events")
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("exactly one admitted temporal-right or bounded interval route"),
+        "{error}"
+    );
+    assert!(db.catalog.get_stream_entry("keyed_copy").is_none());
     db.shutdown().await.unwrap();
 }
 
@@ -1635,6 +2286,7 @@ fn prepared_lifecycle_probe_with_error(
             SinkTopology::MultiWriter,
             SinkInputMode::AppendOnly,
         ),
+        expects_changelog: false,
         write_timeout: Duration::from_secs(1),
         flush_interval: Duration::from_secs(5),
         requires_recovery_on_error: true,
@@ -1690,7 +2342,8 @@ async fn source_preplanning_failure_retains_captured_generation_fence() {
                 incremental: false,
             },
         );
-        resolve_stream_output_schemas(&context, &streams, &Default::default()).await?;
+        resolve_stream_output_schemas(&context, &streams, &Default::default(), &Default::default())
+            .await?;
         Ok(())
     }
     .await;

@@ -689,6 +689,12 @@ impl ProjectingJoinState {
         self.cache = cache;
         Ok(())
     }
+
+    pub(crate) fn is_initialized(&self) -> bool {
+        self.projection_sql.is_none()
+            || self.cache.compiled.is_some()
+            || self.cache.sql_cache.is_some()
+    }
 }
 
 pub(crate) async fn apply_post_projection(
@@ -782,6 +788,82 @@ mod post_projection_tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(adjusted.values(), &[21, 31]);
+    }
+
+    #[tokio::test]
+    async fn compiled_and_cached_post_projection_preserve_filtered_weights_identically() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+            Field::new(
+                laminar_core::changelog::WEIGHT_COLUMN,
+                DataType::Int64,
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+                Arc::new(Int64Array::from(vec![1, -1, 2])),
+            ],
+        )
+        .unwrap();
+        let sql = "SELECT value + 1 AS adjusted, \"__weight\" AS \"__weight\" \
+                   FROM __weighted_post_projection WHERE id >= 2";
+
+        let mut compiled_cache = PostProjectionCache::default();
+        let compiled = apply_post_projection(
+            &SessionContext::new(),
+            "weighted_compiled_projection",
+            "__weighted_post_projection",
+            Some(sql),
+            &mut compiled_cache,
+            vec![batch.clone()],
+        )
+        .await
+        .unwrap();
+        assert!(compiled_cache.compiled.is_some());
+        assert!(compiled_cache.sql_cache.is_none());
+
+        let mut cached_sql = PostProjectionCache {
+            compiled: None,
+            compile_failed: true,
+            sql_cache: None,
+        };
+        let interpreted = apply_post_projection(
+            &SessionContext::new(),
+            "weighted_cached_projection",
+            "__weighted_post_projection",
+            Some(sql),
+            &mut cached_sql,
+            vec![batch],
+        )
+        .await
+        .unwrap();
+        assert!(cached_sql.compiled.is_none());
+        assert!(cached_sql.sql_cache.is_some());
+
+        for output in [&compiled, &interpreted] {
+            assert_eq!(output.len(), 1);
+            assert_eq!(
+                output[0].schema().field(1).name(),
+                laminar_core::changelog::WEIGHT_COLUMN
+            );
+            let adjusted = output[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let weights = output[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(adjusted.values(), &[21, 31]);
+            assert_eq!(weights.values(), &[-1, 2]);
+        }
     }
 
     #[tokio::test]

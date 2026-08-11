@@ -43,7 +43,9 @@ use crate::operator_graph::{
     try_evaluate_compiled, CapturedVnodeState, EncodedStateFrame, GraphOperator, InputFrontier,
     ManagedStateAccountingSnapshot, OperatorCheckpoint, StateFrameCapture,
 };
-use crate::sql_analysis::{extract_projection_filter, single_source_table};
+use crate::sql_analysis::{
+    extract_projection_filter, projection_sql_preserving_weight, single_source_table,
+};
 
 // Resolved on first `process()` call by introspecting the SQL.
 enum QueryState {
@@ -832,7 +834,7 @@ impl SqlQueryOperator {
             .sql(&self.sql)
             .await
             .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
-        let plan = df.logical_plan().clone();
+        let mut plan = df.logical_plan().clone();
 
         if crate::aggregate_state::find_aggregate(&plan).is_some() {
             return Err(DbError::Unsupported(format!(
@@ -842,12 +844,51 @@ impl SqlQueryOperator {
             )));
         }
 
-        if single_source_table(&self.sql).is_some() {
+        let single_source = single_source_table(&self.sql).is_some();
+        let weighted_projection = single_source
+            && extract_projection_filter(&plan).is_some_and(|projection| {
+                let schema = projection.input_df_schema.as_arrow();
+                let weight = laminar_core::changelog::WEIGHT_COLUMN;
+                schema.fields().last().is_some_and(|field| {
+                    field.name() == weight
+                        && field.data_type() == &arrow::datatypes::DataType::Int64
+                        && !field.is_nullable()
+                }) && schema
+                    .fields()
+                    .iter()
+                    .filter(|field| field.name().eq_ignore_ascii_case(weight))
+                    .count()
+                    == 1
+            });
+        let execution_sql = if weighted_projection {
+            projection_sql_preserving_weight(&self.sql).ok_or_else(|| {
+                DbError::Pipeline(format!(
+                    "query '{}' cannot preserve its canonical changelog weight through one SQL projection",
+                    self.op_name
+                ))
+            })?
+        } else {
+            self.sql.clone()
+        };
+        if weighted_projection {
+            plan = self
+                .ctx
+                .sql(&execution_sql)
+                .await
+                .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?
+                .logical_plan()
+                .clone();
+        }
+
+        if single_source {
             if let Some(proj) = self.try_build_compiled_projection(&plan) {
                 tracing::debug!(
                     query = %self.op_name,
                     "Non-aggregate single-source query compiled to PhysicalExpr"
                 );
+                if weighted_projection {
+                    self.sql.clone_from(&execution_sql);
+                }
                 self.log_execution_path(true);
                 self.state = QueryState::Compiled(proj);
                 return Ok(());
@@ -858,6 +899,9 @@ impl SqlQueryOperator {
                 .create_physical_plan(&plan)
                 .await
                 .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
+            if weighted_projection {
+                self.sql.clone_from(&execution_sql);
+            }
             self.log_execution_path(false);
             self.state = QueryState::CachedPlan(physical);
         } else {
@@ -902,12 +946,15 @@ impl SqlQueryOperator {
                 datafusion::physical_expr::create_physical_expr(expr, &info.input_df_schema, props)
                     .ok()?;
             let dt = phys.data_type(info.input_df_schema.as_arrow()).ok()?;
+            let nullable = phys
+                .nullable(info.input_df_schema.as_arrow())
+                .unwrap_or(true);
             let name = match expr {
                 datafusion_expr::Expr::Column(col) => col.name.clone(),
                 datafusion_expr::Expr::Alias(alias) => alias.name.clone(),
                 _ => expr.schema_name().to_string(),
             };
-            proj_fields.push(arrow::datatypes::Field::new(name, dt, true));
+            proj_fields.push(arrow::datatypes::Field::new(name, dt, nullable));
             compiled_exprs.push(phys);
         }
 
@@ -919,30 +966,6 @@ impl SqlQueryOperator {
         } else {
             None
         };
-
-        // When the source carries a Z-set weight (it's a changelog), pass `__weight` through so a
-        // chained projection/filter propagates retractions. Skipped if the projection selects it.
-        let weight = laminar_core::changelog::WEIGHT_COLUMN;
-        if info
-            .input_df_schema
-            .as_arrow()
-            .column_with_name(weight)
-            .is_some()
-            && !proj_fields.iter().any(|f| f.name() == weight)
-        {
-            let weight_expr = datafusion::physical_expr::create_physical_expr(
-                &datafusion_expr::col(weight),
-                &info.input_df_schema,
-                props,
-            )
-            .ok()?;
-            proj_fields.push(arrow::datatypes::Field::new(
-                weight,
-                arrow::datatypes::DataType::Int64,
-                false,
-            ));
-            compiled_exprs.push(weight_expr);
-        }
 
         let output_schema = Arc::new(arrow::datatypes::Schema::new(proj_fields));
         Some(CompiledProjection {
@@ -3516,6 +3539,139 @@ mod checkpoint_tests {
             "{error}"
         );
         assert!(matches!(operator.state, QueryState::Uninit));
+    }
+
+    #[tokio::test]
+    async fn weighted_projection_compiled_and_cached_paths_share_one_sql_envelope() {
+        let context = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+            Field::new(
+                laminar_core::changelog::WEIGHT_COLUMN,
+                DataType::Int64,
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+                Arc::new(Int64Array::from(vec![1, -1, 2])),
+            ],
+        )
+        .unwrap();
+        let provider = Arc::new(laminar_sql::datafusion::LiveSourceProvider::new(schema));
+        let handle = provider.handle();
+        context.register_table("changes", provider).unwrap();
+        handle.swap(vec![batch.clone()]);
+        let sql = "SELECT value + 1 AS adjusted FROM changes WHERE id >= 2";
+
+        let mut compiled =
+            SqlQueryOperator::new("weighted-compiled", sql, context.clone(), None, false);
+        compiled.lazy_init().await.unwrap();
+        assert!(matches!(compiled.state, QueryState::Compiled(_)));
+        let compiled_output = compiled
+            .process(&[vec![batch.clone()]], &[i64::MIN])
+            .await
+            .unwrap();
+
+        let mut cached =
+            SqlQueryOperator::new("weighted-cached", sql, context.clone(), None, false);
+        cached.lazy_init().await.unwrap();
+        assert_eq!(cached.sql.matches("__weight").count(), 2);
+        cached.build_and_cache_physical_plan().await.unwrap();
+        assert!(matches!(cached.state, QueryState::CachedPlan(_)));
+        let cached_output = cached
+            .process(&[vec![batch.clone()]], &[i64::MIN])
+            .await
+            .unwrap();
+
+        assert_eq!(compiled_output.len(), 1);
+        assert_eq!(cached_output.len(), 1);
+        assert_eq!(compiled_output[0].schema(), cached_output[0].schema());
+        let weight = laminar_core::changelog::WEIGHT_COLUMN;
+        let weight_field = compiled_output[0].schema().field(1).clone();
+        assert_eq!(weight_field.name(), weight);
+        assert!(!weight_field.is_nullable());
+        for output in [&compiled_output, &cached_output] {
+            let adjusted = output[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let weights = output[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(adjusted.values(), &[21, 31]);
+            assert_eq!(weights.values(), &[-1, 2]);
+        }
+
+        let wildcard_sql = "SELECT id AS copy, * FROM changes WHERE id >= 2";
+        let mut wildcard_compiled = SqlQueryOperator::new(
+            "weighted-wildcard-compiled",
+            wildcard_sql,
+            context.clone(),
+            None,
+            false,
+        );
+        wildcard_compiled.lazy_init().await.unwrap();
+        assert!(matches!(wildcard_compiled.state, QueryState::Compiled(_)));
+        let wildcard_compiled_output = wildcard_compiled
+            .process(&[vec![batch.clone()]], &[i64::MIN])
+            .await
+            .unwrap();
+
+        let mut wildcard_cached = SqlQueryOperator::new(
+            "weighted-wildcard-cached",
+            wildcard_sql,
+            context,
+            None,
+            false,
+        );
+        wildcard_cached.lazy_init().await.unwrap();
+        wildcard_cached
+            .build_and_cache_physical_plan()
+            .await
+            .unwrap();
+        assert!(matches!(wildcard_cached.state, QueryState::CachedPlan(_)));
+        let wildcard_cached_output = wildcard_cached
+            .process(&[vec![batch]], &[i64::MIN])
+            .await
+            .unwrap();
+
+        assert_eq!(wildcard_compiled_output.len(), 1);
+        assert_eq!(wildcard_cached_output.len(), 1);
+        assert_eq!(
+            wildcard_compiled_output[0].schema(),
+            wildcard_cached_output[0].schema()
+        );
+        assert_eq!(
+            wildcard_compiled_output[0]
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            ["copy", "id", "value", weight]
+        );
+        for output in [&wildcard_compiled_output, &wildcard_cached_output] {
+            let copy = output[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let weights = output[0]
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(copy.values(), &[2, 3]);
+            assert_eq!(weights.values(), &[-1, 2]);
+        }
     }
 
     pub(super) fn context_and_batch() -> (SessionContext, RecordBatch) {

@@ -43,17 +43,27 @@ async fn test_try_from_sql_rejects_post_aggregate_projection() {
     let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let error = match try_from_sql_local(
-        &ctx,
-        "SELECT name, SUM(a) / SUM(b) AS ratio FROM events GROUP BY name",
-        false,
-    )
-    .await
-    {
-        Err(error) => error,
-        Ok(_) => panic!("post-aggregate projection was admitted"),
-    };
-    assert!(error.to_string().contains("post-aggregate projection"));
+    for sql in [
+        "SELECT name, SUM(a) * 2 AS doubled FROM events GROUP BY name",
+        "SELECT name, SUM(a) AS total FROM events GROUP BY name \
+         UNION ALL SELECT name, SUM(a) AS total FROM events GROUP BY name",
+        "SELECT name, doubled FROM (SELECT name, SUM(a) * 2 AS doubled \
+         FROM events GROUP BY name) q",
+        "SELECT name, a, total FROM (SELECT name, a, SUM(b) AS total \
+         FROM events GROUP BY name, a) q",
+        "SELECT name, SUM(a) AS total FROM events GROUP BY name \
+         ORDER BY total DESC LIMIT 1",
+    ] {
+        let error = match try_from_sql_local(&ctx, sql, false).await {
+            Err(error) => error,
+            Ok(_) => panic!("unsafe post-aggregate plan was admitted: {sql}"),
+        };
+        assert!(
+            error.to_string().contains("post-aggregate projection")
+                || error.to_string().contains("one aggregate stage"),
+            "{error}"
+        );
+    }
 }
 
 #[test]
@@ -1462,6 +1472,8 @@ async fn test_cascaded_count_star_over_changelog() {
     .unwrap();
 
     assert!(state.weight_col_idx.is_some());
+    assert!(!state.output_schema.field(0).is_nullable());
+    assert!(!state.output_schema.field(1).is_nullable());
 
     // Cycle 1: insert 3 rows.
     // Pre-agg schema for COUNT(*): [region, TRUE (dummy bool), __weight].

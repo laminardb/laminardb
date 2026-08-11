@@ -72,8 +72,9 @@ The following remain production gaps, not alternate state implementations:
   frontiers, checkpoint, recovery, rescale, managed-graph SQL admission, positioned source-role
   contracts, execution limits, and exact output-schema planning. Production certification remains
   pending the final connector, fault, skew, and latency soak.
-- Mutable update/merge joins, materialized-view joins, unbounded retention policy, and the complete
-  cluster window/MV matrix still need planner/runtime certification.
+- General update/merge and unbounded mutable joins, materialized-view joins, unbounded retention
+  policy, and the complete cluster window/MV matrix still need planner/runtime certification. The
+  direct-source bounded interval path described in the SQL reference is the certified exception.
 - Cluster EO remains connector-gated; unsupported source/sink compositions are rejected before I/O.
 - Production readiness remains unclaimed until correctness, recovery, skew, and latency gates pass.
 

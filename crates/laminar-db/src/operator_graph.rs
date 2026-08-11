@@ -8,7 +8,10 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
-use laminar_connectors::connector::{schema_with_source_row_positions, strip_source_row_positions};
+use laminar_connectors::connector::{
+    schema_with_source_row_positions, strip_source_mutations_routed, strip_source_row_positions,
+    SOURCE_MUTATION_COLUMN,
+};
 use laminar_core::state::{KeyGroupCount, DEFAULT_KEY_GROUP_COUNT};
 use laminar_sql::datafusion::live_source::{LiveSourceHandle, LiveSourceProvider};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -830,7 +833,7 @@ impl GraphOperator for SqlFilterOperator {
     }
 }
 
-/// Enriches an incremental MV's changelog with a static dimension, preserving `__weight`. Re-creates
+/// Enriches a changelog with a static dimension, preserving `__weight`. Re-creates
 /// the physical plan each cycle so the hash join's `OnceAsync` build side doesn't freeze on cycle-1 temp.
 struct ChangelogEnrichOperator {
     join_sql: String,
@@ -989,6 +992,13 @@ pub(crate) struct OperatorGraph {
     prom: Option<Arc<EngineMetrics>>,
     lookup_registry: Option<Arc<laminar_sql::datafusion::LookupTableRegistry>>,
     source_schemas: FxHashMap<String, SchemaRef>,
+    // Startup-resolved output ABI for declared streams. Every emitted batch is checked before it
+    // can enter a provider, result map, or downstream edge.
+    intermediate_schemas: FxHashMap<String, SchemaRef>,
+    // Startup-certified bounded joins whose direct positioned inputs are normalized into a
+    // weighted vnode-local stream before the interval kernel runs.
+    ordered_interval_joins:
+        FxHashMap<String, [crate::operator::interval_join_input::BoundedJoinInputMode; 2]>,
     depends_on_stream: FxHashSet<usize>,
     order_configs: FxHashMap<usize, OrderOperatorConfig>,
     // Covers source tables and intermediates (lazily created on first operator output).
@@ -1087,6 +1097,8 @@ impl OperatorGraph {
             prom: None,
             lookup_registry: None,
             source_schemas: FxHashMap::default(),
+            intermediate_schemas: FxHashMap::default(),
+            ordered_interval_joins: FxHashMap::default(),
             depends_on_stream: FxHashSet::default(),
             order_configs: FxHashMap::default(),
             live_handles: FxHashMap::default(),
@@ -1110,6 +1122,20 @@ impl OperatorGraph {
     /// Seed changelog producers before operators are built so admission is build-order independent.
     pub fn set_changelog_tables(&mut self, tables: FxHashSet<String>) {
         self.changelog_tables = tables;
+    }
+
+    /// Install the complete startup-certified mutable interval topology before graph construction.
+    pub(crate) fn set_ordered_interval_joins(
+        &mut self,
+        joins: FxHashMap<String, [crate::operator::interval_join_input::BoundedJoinInputMode; 2]>,
+    ) {
+        if !self.nodes.is_empty() {
+            self.build_errors.push(DbError::Config(
+                "ordered interval topology must be installed before graph operators".into(),
+            ));
+            return;
+        }
+        self.ordered_interval_joins = joins;
     }
 
     /// Install the AI subsystem and main runtime handle for inference workers.
@@ -1661,6 +1687,8 @@ impl OperatorGraph {
     /// are prepared. The normal graph cycle fills the same provider when the upstream emits.
     pub(crate) fn register_intermediate_schema(&mut self, name: &str, schema: &SchemaRef) {
         self.ensure_live_provider(name, schema);
+        self.intermediate_schemas
+            .insert(name.to_string(), Arc::clone(schema));
     }
 
     /// Initialize every declared managed-state participant before checkpoint recovery begins.
@@ -1843,7 +1871,7 @@ impl OperatorGraph {
             return id;
         }
         let source_name: Arc<str> = Arc::from(table_name);
-        let node_name: Arc<str> = Arc::from(format!("__temporal_source::{table_name}"));
+        let node_name: Arc<str> = Arc::from(format!("__positioned_source::{table_name}"));
         let node_id = self.allocate_node(GraphNode::new(node_name, Box::new(SourcePassthrough), 1));
         self.positioned_source_map.insert(source_name, node_id);
         self.source_node_ids.insert(node_id);
@@ -1874,13 +1902,19 @@ impl OperatorGraph {
         &mut self,
         stream_join_config: Option<&laminar_sql::translator::StreamJoinConfig>,
         temporal_config: Option<&TemporalJoinTranslatorConfig>,
+        ordered_interval: bool,
         table_refs: &FxHashSet<String>,
     ) {
         if let Some(sjc) = stream_join_config {
-            self.find_node(&sjc.left_table)
-                .unwrap_or_else(|| self.ensure_source_node(&sjc.left_table));
-            self.find_node(&sjc.right_table)
-                .unwrap_or_else(|| self.ensure_source_node(&sjc.right_table));
+            if ordered_interval {
+                self.ensure_positioned_source_node(&sjc.left_table);
+                self.ensure_positioned_source_node(&sjc.right_table);
+            } else {
+                self.find_node(&sjc.left_table)
+                    .unwrap_or_else(|| self.ensure_source_node(&sjc.left_table));
+                self.find_node(&sjc.right_table)
+                    .unwrap_or_else(|| self.ensure_source_node(&sjc.right_table));
+            }
         } else if let Some(tc) = temporal_config {
             self.ensure_positioned_source_node(&tc.left_table);
             self.ensure_positioned_source_node(&tc.right_table);
@@ -1900,10 +1934,15 @@ impl OperatorGraph {
         stream_join_config: Option<&laminar_sql::translator::StreamJoinConfig>,
         stream_join_detection: Option<&StreamJoinDetection>,
         temporal_config: Option<&TemporalJoinTranslatorConfig>,
+        ordered_interval: bool,
         table_refs: &FxHashSet<String>,
     ) -> bool {
         if let Some(sjc) = stream_join_config {
-            let source_id = self.find_node(&sjc.left_table).expect("source ensured");
+            let source_id = if ordered_interval {
+                self.positioned_source_map[sjc.left_table.as_str()]
+            } else {
+                self.find_node(&sjc.left_table).expect("source ensured")
+            };
 
             let has_pre_filters = stream_join_detection
                 .is_some_and(|d| d.left_pre_filter.is_some() || d.right_pre_filter.is_some());
@@ -1934,7 +1973,11 @@ impl OperatorGraph {
                 self.add_edge(left_input, node_id, 0);
                 self.add_edge(right_input, node_id, 1);
             } else {
-                let right_id = self.find_node(&sjc.right_table).expect("source ensured");
+                let right_id = if ordered_interval {
+                    self.positioned_source_map[sjc.right_table.as_str()]
+                } else {
+                    self.find_node(&sjc.right_table).expect("source ensured")
+                };
                 self.add_edge(source_id, node_id, 0);
                 self.add_edge(right_id, node_id, 1);
             }
@@ -2086,6 +2129,21 @@ impl OperatorGraph {
                 None
             };
         let stream_join_config = stream_join_detection.as_ref().map(|d| d.config.clone());
+        if stream_join_config.is_some()
+            && crate::sql_analysis::interval_output_has_nested_query(&sql)
+        {
+            self.build_errors.push(DbError::InvalidOperation(format!(
+                "streaming interval join '{name}' cannot contain a projection or filter subquery"
+            )));
+            return;
+        }
+        let ordered_interval = self.ordered_interval_joins.contains_key(&name);
+        if ordered_interval && stream_join_config.is_none() {
+            self.build_errors.push(DbError::Config(format!(
+                "ordered interval admission for '{name}' does not resolve to one bounded stream join"
+            )));
+            return;
+        }
         if let Some(config) = &stream_join_config {
             if config.time_bound.is_zero() || i64::try_from(config.time_bound.as_millis()).is_err()
             {
@@ -2095,9 +2153,23 @@ impl OperatorGraph {
                 return;
             }
         }
-        let stream_join_projection_sql = stream_join_detection
-            .as_ref()
-            .map(|d| d.projection_sql.clone());
+        if ordered_interval
+            && stream_join_detection.as_ref().is_some_and(|detection| {
+                detection.left_pre_filter.is_some() || detection.right_pre_filter.is_some()
+            })
+        {
+            self.build_errors.push(DbError::InvalidOperation(format!(
+                "ordered mutable interval join '{name}' cannot push a predicate ahead of input reconciliation"
+            )));
+            return;
+        }
+        let stream_join_projection_sql = stream_join_detection.as_ref().map(|d| {
+            if ordered_interval {
+                d.weighted_projection_sql.clone()
+            } else {
+                d.projection_sql.clone()
+            }
+        });
 
         // Lookup-enrich: only when no other specialized join (incl. changelog-enrich) matched.
         let (lookup_enrich_config, lookup_projection_sql) = if !enrich
@@ -2193,6 +2265,7 @@ impl OperatorGraph {
         self.ensure_query_source_nodes(
             stream_join_config.as_ref(),
             temporal_config.as_ref(),
+            ordered_interval,
             &table_refs,
         );
         let node_id = self.place_prepared_operator_node(name.as_str(), operator, input_port_count);
@@ -2201,6 +2274,7 @@ impl OperatorGraph {
             stream_join_config.as_ref(),
             stream_join_detection.as_ref(),
             temporal_config.as_ref(),
+            ordered_interval,
             &table_refs,
         );
         if depends {
@@ -2210,7 +2284,7 @@ impl OperatorGraph {
             self.order_configs.insert(node_id, oc);
         }
         self.output_map.insert(Arc::from(name.as_str()), node_id);
-        if incremental {
+        if incremental || ordered_interval {
             self.changelog_tables.insert(name.clone());
         }
         self.topo_dirty = true;
@@ -2330,9 +2404,9 @@ impl OperatorGraph {
             (operator, table_refs)
         };
 
-        self.ensure_query_source_nodes(None, None, &table_refs);
+        self.ensure_query_source_nodes(None, None, false, &table_refs);
         let node_id = self.place_prepared_operator_node(name, operator, 1);
-        let depends = self.wire_query_edges(node_id, None, None, None, &table_refs);
+        let depends = self.wire_query_edges(node_id, None, None, None, false, &table_refs);
         if depends {
             self.depends_on_stream.insert(node_id);
         }
@@ -2361,9 +2435,9 @@ impl OperatorGraph {
             ));
         let mut table_refs = FxHashSet::default();
         table_refs.insert(plan.source_table.clone());
-        self.ensure_query_source_nodes(None, None, &table_refs);
+        self.ensure_query_source_nodes(None, None, false, &table_refs);
         let node_id = self.place_prepared_operator_node(name, operator, 1);
-        let depends = self.wire_query_edges(node_id, None, None, None, &table_refs);
+        let depends = self.wire_query_edges(node_id, None, None, None, false, &table_refs);
         if depends {
             self.depends_on_stream.insert(node_id);
         }
@@ -2472,10 +2546,24 @@ impl OperatorGraph {
                 self.ctx.clone(),
                 self.key_group_count,
             );
-            if let (Some(left_schema), Some(right_schema)) = (
-                self.source_schemas.get(&cfg.left_table),
-                self.source_schemas.get(&cfg.right_table),
-            ) {
+            let left_schema = self.source_schemas.get(&cfg.left_table);
+            let right_schema = self.source_schemas.get(&cfg.right_table);
+            if let Some(modes) = self.ordered_interval_joins.get(name) {
+                let left_schema = left_schema.ok_or_else(|| {
+                    DbError::Config(format!(
+                        "ordered interval join [{name}] has no registered schema for left source '{}'",
+                        cfg.left_table
+                    ))
+                })?;
+                let right_schema = right_schema.ok_or_else(|| {
+                    DbError::Config(format!(
+                        "ordered interval join [{name}] has no registered schema for right source '{}'",
+                        cfg.right_table
+                    ))
+                })?;
+                op.set_input_schemas(left_schema.clone(), right_schema.clone());
+                op.configure_ordered_inputs(modes[0].clone(), modes[1].clone())?;
+            } else if let (Some(left_schema), Some(right_schema)) = (left_schema, right_schema) {
                 op.set_input_schemas(left_schema.clone(), right_schema.clone());
             }
             #[cfg(feature = "cluster")]
@@ -2626,6 +2714,7 @@ impl OperatorGraph {
         self.output_map.remove(name);
         self.changelog_tables.remove(name);
         self.live_handles.remove(name);
+        self.intermediate_schemas.remove(name);
         if !ids_to_remove.is_empty() {
             self.topo_dirty = true;
         }
@@ -2809,22 +2898,34 @@ impl OperatorGraph {
     }
 
     fn visible_source_batches(
+        &self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
         let mut visible_sources = FxHashMap::default();
         visible_sources.reserve(source_batches.len());
         for (name, batches) in source_batches {
-            if batches.is_empty() {
+            if batches.is_empty() || !self.source_map.contains_key(name.as_ref()) {
                 continue;
             }
             let visible = batches
                 .iter()
                 .map(|batch| {
-                    strip_source_row_positions(batch).map_err(|error| {
-                        DbError::SchemaMismatch(format!(
-                            "source '{name}' has invalid hidden metadata: {error}"
-                        ))
-                    })
+                    let positioned = if batch.column_by_name(SOURCE_MUTATION_COLUMN).is_some() {
+                        Some(strip_source_mutations_routed(batch).map_err(|error| {
+                            DbError::SchemaMismatch(format!(
+                                "source '{name}' has invalid hidden metadata: {error}"
+                            ))
+                        })?)
+                    } else {
+                        None
+                    };
+                    strip_source_row_positions(positioned.as_ref().unwrap_or(batch)).map_err(
+                        |error| {
+                            DbError::SchemaMismatch(format!(
+                                "source '{name}' has invalid hidden metadata: {error}"
+                            ))
+                        },
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             visible_sources.insert(Arc::clone(name), visible);
@@ -2994,7 +3095,7 @@ impl OperatorGraph {
             batches
         };
 
-        self.route_output(node_id, batches, results);
+        self.route_output(node_id, batches, results)?;
 
         Ok(())
     }
@@ -3027,11 +3128,34 @@ impl OperatorGraph {
         node_id: usize,
         batches: Vec<RecordBatch>,
         results: &mut FxHashMap<Arc<str>, Vec<RecordBatch>>,
-    ) {
+    ) -> Result<(), DbError> {
         if batches.is_empty() {
-            return;
+            return Ok(());
         }
         let node_name = Arc::clone(&self.nodes[node_id].name);
+        if let Some(expected) = self.intermediate_schemas.get(node_name.as_ref()).cloned() {
+            for (batch_index, batch) in batches.iter().enumerate() {
+                let actual = batch.schema();
+                let exact_fields =
+                    expected.fields().len() == actual.fields().len()
+                        && expected.fields().iter().zip(actual.fields()).all(
+                            |(expected, actual)| {
+                                expected.name() == actual.name()
+                                    && expected.data_type() == actual.data_type()
+                                    && expected.is_nullable() == actual.is_nullable()
+                            },
+                        );
+                if !exact_fields {
+                    self.poison_after_terminal_error();
+                    return Err(DbError::PipelineTerminal(format!(
+                        "stream '{}' emitted batch {batch_index} with fields {:?}; startup resolved fields {:?}",
+                        node_name,
+                        actual.fields(),
+                        expected.fields()
+                    )));
+                }
+            }
+        }
         let has_routes = !self.nodes[node_id].output_routes.is_empty();
         let is_output = self.output_node_ids.contains(&node_id);
 
@@ -3064,6 +3188,7 @@ impl OperatorGraph {
             let (target, port) = self.nodes[node_id].output_routes[route_count - 1];
             self.push_to_port(target, port, batches, bytes);
         }
+        Ok(())
     }
 
     pub(crate) async fn execute_cycle(
@@ -3203,7 +3328,7 @@ impl OperatorGraph {
         source_frontiers: Option<&FxHashMap<Arc<str>, InputFrontier>>,
         mode: GraphExecutionMode,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
-        let visible_source_batches = Self::visible_source_batches(source_batches)?;
+        let visible_source_batches = self.visible_source_batches(source_batches)?;
         self.whole_restore_open = false;
 
         #[cfg(feature = "cluster")]

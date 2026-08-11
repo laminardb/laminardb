@@ -37,6 +37,7 @@ pub(crate) use checkpoints::{
 pub(crate) use compile::expr_to_sql;
 pub(crate) use compile::{
     apply_compiled_having, compile_having_filter, extract_clauses, find_aggregate,
+    find_post_aggregate_projection, post_aggregate_projection_is_positional_identity,
     CompiledProjection, PreAggBuilder,
 };
 pub(crate) use concrete::{ConcreteAggregateState, ConcreteInputMode};
@@ -1114,9 +1115,24 @@ impl IncrementalAggState {
             )));
         }
 
-        // Reject a non-trivial projection above the Aggregate
-        // (e.g. SUM(a)/SUM(b) AS ratio). Check field count AND types: a
-        // coincidental count match can still hide a remapping projection.
+        // The running state emits raw aggregate accumulator columns. Only a proven positional
+        // identity projection may be represented by relabelling those columns with `top_schema`.
+        // Arity/type equality alone is insufficient: `SUM(a) * 2` and same-typed reorders retain
+        // both while changing values.
+        let post_aggregate_projection = find_post_aggregate_projection(plan).map_err(|()| {
+            DbError::Unsupported(format!(
+                "[{}] managed streaming aggregates require one aggregate stage and at most one post-aggregate projection",
+                laminar_core::error_codes::SQL_UNSUPPORTED
+            ))
+        })?;
+        if post_aggregate_projection
+            .is_some_and(|projection| !post_aggregate_projection_is_positional_identity(projection))
+        {
+            return Err(DbError::Unsupported(format!(
+                "[{}] post-aggregate projections are not supported by managed streaming state",
+                laminar_core::error_codes::SQL_UNSUPPORTED
+            )));
+        }
         if top_schema.fields().len() != agg_schema.fields().len() {
             return Err(DbError::Unsupported(format!(
                 "[{}] post-aggregate projections are not supported by managed streaming state",
@@ -1134,12 +1150,9 @@ impl IncrementalAggState {
 
         let num_group_cols = group_exprs.len();
 
-        let mut group_col_names = Vec::new();
         let mut group_types = Vec::new();
         for i in 0..num_group_cols {
-            let top_field = top_schema.field(i);
             let agg_field = agg_schema.field(i);
-            group_col_names.push(top_field.name().clone());
             group_types.push(agg_field.data_type().clone());
         }
 
@@ -1263,17 +1276,14 @@ impl IncrementalAggState {
             None
         };
 
-        let mut output_fields: Vec<Field> = Vec::new();
-        for (name, dt) in group_col_names.iter().zip(group_types.iter()) {
-            output_fields.push(Field::new(name, dt.clone(), true));
-        }
-        for spec in &agg_specs {
-            output_fields.push(Field::new(
-                &spec.output_name,
-                spec.return_type.clone(),
-                true,
-            ));
-        }
+        // The logical plan is the declared stream ABI. Preserve its exact names, types, and
+        // nullability; RecordBatch construction below then fails if an accumulator ever violates
+        // that contract instead of silently widening the runtime schema.
+        let mut output_fields: Vec<Field> = top_schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect();
         if emit_changelog {
             output_fields.push(Field::new(WEIGHT_COLUMN, DataType::Int64, false));
         }

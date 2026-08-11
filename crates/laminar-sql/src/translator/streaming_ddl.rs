@@ -107,16 +107,16 @@ pub fn translate_create_source_with_columns(
     mut columns: Vec<ColumnDefinition>,
 ) -> Result<SourceDefinition, ParseError> {
     let config = parse_source_options(&stmt.with_options)?;
-    if let Some(column) = stmt
-        .columns
+    if let Some(column) = columns
         .iter()
-        .find(|column| is_reserved_mutation_column(&column.name.value))
+        .find(|column| is_reserved_operation_column(&column.name))
     {
         return Err(ParseError::ValidationError(format!(
             "CREATE SOURCE column '{}' is reserved mutation metadata",
-            column.name.value
+            column.name
         )));
     }
+    validate_full_changelog_weight(&columns)?;
     let (primary_key, primary_key_indices) = resolve_source_primary_key(&stmt, &columns)?;
     for index in primary_key_indices {
         if stmt.columns.is_empty() && columns[index].nullable {
@@ -232,10 +232,37 @@ fn declared_identifier_matches(
     }
 }
 
-fn is_reserved_mutation_column(column: &str) -> bool {
-    ["_op", "__op", "__weight"]
+fn is_reserved_operation_column(column: &str) -> bool {
+    ["_op", "__op"]
         .iter()
         .any(|reserved| column.eq_ignore_ascii_case(reserved))
+}
+
+fn validate_full_changelog_weight(columns: &[ColumnDefinition]) -> Result<(), ParseError> {
+    let weights = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.name.eq_ignore_ascii_case("__weight"))
+        .collect::<Vec<_>>();
+    let [] = weights.as_slice() else {
+        let [(index, column)] = weights.as_slice() else {
+            return Err(ParseError::ValidationError(
+                "CREATE SOURCE may declare at most one case-insensitive __weight column".into(),
+            ));
+        };
+        if column.name != "__weight"
+            || *index + 1 != columns.len()
+            || column.data_type != DataType::Int64
+            || column.nullable
+        {
+            return Err(ParseError::ValidationError(
+                "CREATE SOURCE full-changelog metadata must be one exact trailing non-null BIGINT __weight column"
+                    .into(),
+            ));
+        }
+        return Ok(());
+    };
+    Ok(())
 }
 
 /// Parses source options from WITH clause.
@@ -547,6 +574,41 @@ mod tests {
         assert!(!def.columns[0].nullable);
         assert_eq!(def.columns[1].name, "name");
         assert!(def.columns[1].nullable);
+    }
+
+    #[test]
+    fn full_changelog_weight_requires_one_canonical_trailing_field() {
+        let definition = parse_and_translate(
+            "CREATE SOURCE changes (id BIGINT NOT NULL, __weight BIGINT NOT NULL)",
+        )
+        .unwrap();
+        let weight = definition.schema.field(1);
+        assert_eq!(weight.name(), "__weight");
+        assert_eq!(weight.data_type(), &DataType::Int64);
+        assert!(!weight.is_nullable());
+
+        for sql in [
+            "CREATE SOURCE changes (__WEIGHT BIGINT NOT NULL)",
+            "CREATE SOURCE changes (__weight BIGINT NOT NULL, id BIGINT)",
+            "CREATE SOURCE changes (id BIGINT, __weight BIGINT)",
+            "CREATE SOURCE changes (id BIGINT, __weight INT NOT NULL)",
+        ] {
+            let error = parse_and_translate(sql).unwrap_err();
+            assert!(
+                error.to_string().contains("full-changelog metadata"),
+                "{error}"
+            );
+        }
+
+        for name in ["_op", "__op"] {
+            let error =
+                parse_and_translate(&format!("CREATE SOURCE changes ({name} BIGINT NOT NULL)"))
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("reserved mutation metadata"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

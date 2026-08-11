@@ -3024,6 +3024,20 @@ fn build_output_schema_for_mode(
     Arc::new(Schema::new_with_metadata(fields, plain.metadata().clone()))
 }
 
+/// Exact private-kernel output schema used to validate a weighted post-projection before intake.
+pub(crate) fn build_weighted_output_schema(
+    left_schema: &SchemaRef,
+    right_schema: &SchemaRef,
+    config: &StreamJoinConfig,
+) -> SchemaRef {
+    build_output_schema_for_mode(
+        left_schema,
+        right_schema,
+        config,
+        JoinExecutionMode::Weighted,
+    )
+}
+
 #[derive(Clone, Copy)]
 struct JoinOutputRow {
     left: Option<(usize, usize)>,

@@ -23,9 +23,9 @@ use laminar_sql::translator::StreamJoinConfig;
 
 use crate::error::DbError;
 use crate::interval_join::{
-    execute_interval_join_cycle, execute_weighted_interval_join_cycle, join_type_tag,
-    IntervalJoinCheckpointCapture, IntervalJoinOutputBudget, IntervalJoinState,
-    JoinStateCheckpoint, HEAP_ALLOCATION_CHARGE,
+    build_output_schema, build_weighted_output_schema, execute_interval_join_cycle,
+    execute_weighted_interval_join_cycle, join_type_tag, IntervalJoinCheckpointCapture,
+    IntervalJoinOutputBudget, IntervalJoinState, JoinStateCheckpoint, HEAP_ALLOCATION_CHARGE,
 };
 #[cfg(feature = "cluster")]
 use crate::operator::interval_join_input::preflight_queued_batch_ipc_restore;
@@ -716,6 +716,7 @@ enum PendingIntervalCompletion {
 #[derive(Clone)]
 struct OrderedIntervalInputSpec {
     input_schema: SchemaRef,
+    visible_schema: SchemaRef,
     event_time_index: usize,
     mode: BoundedJoinInputMode,
     fingerprint: [u8; 32],
@@ -1059,12 +1060,7 @@ impl IntervalJoinOperator {
         self.input_schemas = Some((left, right));
     }
 
-    /// Configure the private ordered-input contract. Planner/DDL admission intentionally does not
-    /// call this until its checkpoint and source-capability contract is admitted separately.
-    #[allow(
-        dead_code,
-        reason = "planner admission is intentionally closed while the ordered-input contract is staged"
-    )]
+    /// Configure the startup-certified ordered-input contract before vnode state is created.
     pub(crate) fn configure_ordered_inputs(
         &mut self,
         left_mode: BoundedJoinInputMode,
@@ -1114,7 +1110,7 @@ impl IntervalJoinOperator {
             }
             let fingerprint =
                 normalizer_config_fingerprint(schema.as_ref(), event_time_index, &mode);
-            BoundedJoinInputNormalizer::try_new(
+            let normalizer = BoundedJoinInputNormalizer::try_new(
                 Arc::clone(schema),
                 BoundedJoinInputConfig {
                     vnode: 0,
@@ -1125,6 +1121,7 @@ impl IntervalJoinOperator {
             )?;
             Ok(OrderedIntervalInputSpec {
                 input_schema: Arc::clone(schema),
+                visible_schema: Arc::clone(normalizer.visible_schema()),
                 event_time_index,
                 mode,
                 fingerprint,
@@ -3258,6 +3255,28 @@ impl IntervalJoinOperator {
         })
     }
 
+    async fn initialize_projection(&mut self) -> Result<(), DbError> {
+        if self.projection.is_initialized() {
+            return Ok(());
+        }
+        let projection_input_schema = if let Some(spec) = &self.ordered_input_spec {
+            build_weighted_output_schema(
+                &spec.left.visible_schema,
+                &spec.right.visible_schema,
+                &self.config,
+            )
+        } else {
+            let (left_schema, right_schema) = self.input_schemas.as_ref().ok_or_else(|| {
+                DbError::Config(format!(
+                    "interval join [{}] requires both input schemas before projection initialization",
+                    self.projection.op_name
+                ))
+            })?;
+            build_output_schema(left_schema, right_schema, &self.config)
+        };
+        self.projection.initialize(&projection_input_schema).await
+    }
+
     fn push_routed_batch(
         routed: &mut BTreeMap<u32, [Vec<RecordBatch>; 2]>,
         vnode: u32,
@@ -4446,7 +4465,7 @@ impl GraphOperator for IntervalJoinOperator {
     }
 
     async fn initialize_managed_state(&mut self) -> Result<(), DbError> {
-        Ok(())
+        self.initialize_projection().await
     }
 
     async fn process(
@@ -4477,6 +4496,10 @@ impl GraphOperator for IntervalJoinOperator {
         inputs: &[Vec<RecordBatch>],
         frontiers: &[InputFrontier],
     ) -> Result<Vec<RecordBatch>, DbError> {
+        // Live local DDL can install an append-only interval operator after graph startup. Compile
+        // its deterministic projection before routing, frontier changes, or any vnode admission.
+        self.initialize_projection().await?;
+
         let left_frontier = frontiers.first().copied().unwrap_or_default();
         let right_frontier = frontiers.get(1).copied().unwrap_or(left_frontier);
         let left_watermark = left_frontier.watermark.unwrap_or(i64::MIN);
@@ -6254,6 +6277,92 @@ mod tests {
             right_table: "right_stream".to_string(),
             time_bound: Duration::from_millis(100),
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_post_projection_fails_before_eager_or_lazy_interval_state() {
+        let mut operator = IntervalJoinOperator::new(
+            "invalid-projection",
+            test_config(),
+            Some(Arc::from("SELECT missing_column FROM __interval_tmp")),
+            SessionContext::new(),
+        );
+        operator.set_input_schemas(
+            left_batch(&[], &[], &[]).schema(),
+            right_batch(&[], &[], &[]).schema(),
+        );
+
+        let error = operator
+            .initialize_managed_state()
+            .await
+            .expect_err("invalid projection must fail during startup initialization");
+
+        assert!(error.to_string().contains("missing_column"), "{error}");
+        assert!(operator.vnode_states.iter().all(Option::is_none));
+        assert!(operator.resident_vnodes.is_empty());
+
+        let mut live_operator = IntervalJoinOperator::new(
+            "invalid-live-projection",
+            test_config(),
+            Some(Arc::from("SELECT missing_column FROM __interval_tmp")),
+            SessionContext::new(),
+        );
+        live_operator.set_input_schemas(
+            left_batch(&[], &[], &[]).schema(),
+            right_batch(&[], &[], &[]).schema(),
+        );
+        let error = live_operator
+            .process_with_frontiers(
+                &[Vec::new(), Vec::new()],
+                &[
+                    InputFrontier {
+                        watermark: Some(100),
+                        idle: true,
+                    },
+                    InputFrontier {
+                        watermark: Some(200),
+                        idle: true,
+                    },
+                ],
+            )
+            .await
+            .expect_err("live projection must initialize before an empty cycle can advance state");
+
+        assert!(error.to_string().contains("missing_column"), "{error}");
+        assert!(live_operator.vnode_states.iter().all(Option::is_none));
+        assert!(live_operator.resident_vnodes.is_empty());
+        assert_eq!(live_operator.applied_left_watermark, i64::MIN);
+        assert_eq!(live_operator.applied_right_watermark, i64::MIN);
+    }
+
+    #[tokio::test]
+    async fn lazy_projection_initializes_before_first_interval_cycle() {
+        let mut operator = IntervalJoinOperator::new(
+            "live-projection",
+            test_config(),
+            Some(Arc::from("SELECT id AS projected_id FROM __interval_tmp")),
+            laminar_sql::create_session_context(),
+        );
+        operator.set_input_schemas(
+            left_batch(&[], &[], &[]).schema(),
+            right_batch(&[], &[], &[]).schema(),
+        );
+
+        let output = operator
+            .process(
+                &[
+                    vec![left_batch(&["A"], &[100], &[10.0])],
+                    vec![right_batch(&["A"], &[110], &[1.0])],
+                ],
+                &[0, 0],
+            )
+            .await
+            .unwrap();
+
+        assert!(operator.projection.is_initialized());
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert_eq!(output[0].schema().field(0).name(), "projected_id");
+        assert!(operator.vnode_states.iter().any(Option::is_some));
     }
 
     fn unconstrained_frontier() -> InputFrontier {
@@ -8371,48 +8480,6 @@ mod tests {
             .is_empty());
         let state = restored.vnode_states[vnode as usize].as_ref().unwrap();
         assert_eq!(state.buffered_rows(), (0, 0));
-    }
-
-    #[tokio::test]
-    async fn post_projection_fault_requires_recovery_after_state_admission() {
-        let ctx = laminar_sql::create_session_context();
-        let mut op = IntervalJoinOperator::new(
-            "test_interval",
-            test_config(),
-            Some(Arc::from("SELECT missing FROM __interval_tmp")),
-            ctx,
-        );
-
-        let error = op
-            .process(
-                &[
-                    vec![left_batch(&["A"], &[100], &[10.0])],
-                    vec![right_batch(&["A"], &[110], &[1.0])],
-                ],
-                &[0, 0],
-            )
-            .await
-            .unwrap_err();
-
-        assert!(matches!(&error, DbError::StatefulOperatorPartialApply(_)));
-        assert!(error.requires_pipeline_recovery());
-        let capture = op
-            .checkpoint_vnodes(&[0], 1, u64::MAX)
-            .unwrap()
-            .unwrap()
-            .into_iter()
-            .next()
-            .and_then(|captured| captured.state)
-            .expect("state admitted before projection failure remains checkpointable");
-        let state = materialize_capture(capture).unwrap();
-        assert_eq!(state.first(), Some(&PRESENT_VNODE));
-        assert_eq!(state.get(1), Some(&VNODE_FRAME_VERSION));
-        let decoded = rkyv::from_bytes::<IntervalVnodeCheckpoint, rkyv::rancor::Error>(
-            &state[VNODE_FRAME_HEADER_LEN..],
-        )
-        .unwrap();
-        assert_eq!(decoded.core.left_buffer_rows, 1);
-        assert_eq!(decoded.core.right_buffer_rows, 1);
     }
 
     #[test]

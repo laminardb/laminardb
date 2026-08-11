@@ -282,6 +282,73 @@ pub(crate) fn find_aggregate(plan: &LogicalPlan) -> Option<AggregateInfo> {
     find_aggregate_inner(plan, None)
 }
 
+/// Returns the sole logical projection on the unary path above the sole aggregate.
+///
+/// Schema equality cannot prove that a projection is an identity: a derived expression or a
+/// same-typed reorder can retain the aggregate's arity and types. Callers use the actual plan node
+/// to either compile the projection or prove that it is a positional identity. Branching plans or
+/// stacked projections are rejected because neither managed state implementation can represent
+/// their composition safely.
+pub(crate) fn find_post_aggregate_projection(
+    plan: &LogicalPlan,
+) -> Result<Option<&datafusion_expr::logical_plan::Projection>, ()> {
+    fn aggregate_stage_count(plan: &LogicalPlan) -> usize {
+        usize::from(matches!(plan, LogicalPlan::Aggregate(_)))
+            + plan
+                .inputs()
+                .into_iter()
+                .map(aggregate_stage_count)
+                .sum::<usize>()
+    }
+
+    if aggregate_stage_count(plan) != 1 {
+        return Err(());
+    }
+    match plan {
+        LogicalPlan::Aggregate(_) => Ok(None),
+        LogicalPlan::Filter(filter)
+            if matches!(filter.input.as_ref(), LogicalPlan::Aggregate(_)) =>
+        {
+            Ok(None)
+        }
+        LogicalPlan::Projection(projection) => match projection.input.as_ref() {
+            LogicalPlan::Aggregate(_) => Ok(Some(projection)),
+            LogicalPlan::Filter(filter)
+                if matches!(filter.input.as_ref(), LogicalPlan::Aggregate(_)) =>
+            {
+                Ok(Some(projection))
+            }
+            _ => Err(()),
+        },
+        _ => Err(()),
+    }
+}
+
+/// Proves that a post-aggregate projection only forwards each input column in place, optionally
+/// through aliases. This is the only projection shape the running aggregate state can execute.
+pub(crate) fn post_aggregate_projection_is_positional_identity(
+    projection: &datafusion_expr::logical_plan::Projection,
+) -> bool {
+    if projection.expr.len() != projection.input.schema().fields().len() {
+        return false;
+    }
+
+    projection.expr.iter().enumerate().all(|(index, expr)| {
+        let mut expr = expr;
+        while let datafusion_expr::Expr::Alias(alias) = expr {
+            expr = alias.expr.as_ref();
+        }
+        let datafusion_expr::Expr::Column(column) = expr else {
+            return false;
+        };
+        projection
+            .input
+            .schema()
+            .index_of_column(column)
+            .is_ok_and(|resolved| resolved == index)
+    })
+}
+
 fn find_aggregate_inner(
     plan: &LogicalPlan,
     parent_filter: Option<&datafusion_expr::Expr>,
