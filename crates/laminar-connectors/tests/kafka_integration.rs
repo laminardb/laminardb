@@ -52,6 +52,12 @@ fn initial_source_start(config: &ConnectorConfig) -> SourceStart {
     .unwrap()
 }
 
+fn connector_start_config(source_name: &str) -> ConnectorConfig {
+    let mut config = ConnectorConfig::new("kafka");
+    config.set("laminar.source.name", source_name);
+    config
+}
+
 async fn produce_messages(brokers: &str, topic: &str, count: usize) {
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
@@ -260,7 +266,7 @@ async fn roundtrip(brokers: &str) {
 
     let cfg = make_config(brokers, "test-roundtrip-group", topic);
     let mut source = KafkaSource::new(test_schema(), cfg, None);
-    let connector_cfg = ConnectorConfig::new("kafka");
+    let connector_cfg = connector_start_config("test_roundtrip");
     source
         .start(initial_source_start(&connector_cfg))
         .await
@@ -301,7 +307,7 @@ async fn checkpoint_restore(brokers: &str) {
 
     let mut cfg = make_config(brokers, "test-checkpoint-group", topic);
     cfg.startup_mode = laminar_connectors::kafka::StartupMode::Earliest;
-    let connector_cfg = ConnectorConfig::new("kafka");
+    let connector_cfg = connector_start_config("test_checkpoint");
 
     let mut source = KafkaSource::new(test_schema(), cfg.clone(), None);
     source
@@ -385,7 +391,7 @@ async fn checkpoint_restore(brokers: &str) {
     let error = changed
         .start(
             SourceStart::new(
-                ConnectorConfig::new("kafka"),
+                connector_start_config("test_checkpoint"),
                 SourcePosition::Resume {
                     attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
                     checkpoint,
@@ -435,7 +441,7 @@ async fn poison_pill(brokers: &str) {
     };
 
     let mut source = KafkaSource::new(test_schema(), cfg, None);
-    let connector_cfg = ConnectorConfig::new("kafka");
+    let connector_cfg = connector_start_config("test_poison");
     source
         .start(initial_source_start(&connector_cfg))
         .await
