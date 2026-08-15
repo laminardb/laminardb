@@ -3775,8 +3775,9 @@ async fn recovery_start_and_clear_require_the_identical_prepared_round() {
     let c = ctl(1, vec![]);
     c.publish_recovery_incarnation().await.unwrap();
     let (_authority, proof) = install_recovery_authority(&c, 1_000).await;
-    let round = recovery_round(&c, 11, &proof, &[1]);
-    let other = recovery_round(&c, 12, &proof, &[1]);
+    report_new_local_fault(&c).await;
+    let round = recovery_round_from_current_faults(&c, 11, &proof, &[1]).await;
+    let other = recovery_round_from_current_faults(&c, 12, &proof, &[1]).await;
     c.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
 
     c.announce_recover_prepare(&round).await.unwrap();
