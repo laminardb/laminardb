@@ -1474,6 +1474,7 @@ impl AuditedRecoveryCheckpoint {
         matches!(self, Self::Consumed { .. })
     }
 
+    #[cfg(test)]
     const fn was_propagated(&self) -> bool {
         matches!(self, Self::Propagated { .. })
     }
@@ -1557,6 +1558,7 @@ impl AuditedAssignmentAuthority {
             .is_some_and(AuditedRecoveryCheckpoint::was_consumed)
     }
 
+    #[cfg(test)]
     pub(crate) fn recovery_checkpoint_was_propagated(&self) -> bool {
         self.recovery_checkpoint
             .as_ref()
@@ -1989,115 +1991,114 @@ fn audit_materialized_recovery_with_authority<'a>(
                 checkpoint: pinned,
                 origin,
             }
+        } else if committed_head.assignment_fence.as_ref() == Some(&decision.target) {
+            // A Commit under the recovery target atomically consumes its handoff pin. The older
+            // decision checkpoint may then be garbage-collected; validate and recover from the
+            // exact target-fenced head instead of reopening that retired artifact.
+            let (observed_outcome, observed_index) = authority
+                .cluster_outcome_with_committed_checkpoint(head_reference.epoch)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "assignment {} consumed recovery Commit disappeared",
+                        snapshot.version
+                    )
+                })?;
+            if observed_outcome != committed_head {
+                return Err(format!(
+                    "assignment {} recovery checkpoint head changed during authority audit",
+                    snapshot.version
+                ));
+            }
+            let observed_index = observed_index.ok_or_else(|| {
+                format!(
+                    "assignment {} consumed recovery Commit has no checkpoint index",
+                    snapshot.version
+                )
+            })?;
+            let origin = validate_portable_recovery_cut(
+                &observed_outcome,
+                &observed_index,
+                &head_reference,
+                &decision.target,
+                "consumed assignment recovery",
+            )?;
+            AuditedRecoveryCheckpoint::Consumed {
+                checkpoint: head_reference,
+                origin,
+            }
         } else {
-            if committed_head.assignment_fence.as_ref() == Some(&decision.target) {
-                // A Commit under the recovery target atomically consumes its handoff pin. The older
-                // decision checkpoint may then be garbage-collected; validate and recover from the
-                // exact target-fenced head instead of reopening that retired artifact.
-                let (observed_outcome, observed_index) = authority
-                    .cluster_outcome_with_committed_checkpoint(head_reference.epoch)
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .ok_or_else(|| {
-                        format!(
-                            "assignment {} consumed recovery Commit disappeared",
-                            snapshot.version
-                        )
-                    })?;
-                if observed_outcome != committed_head {
-                    return Err(format!(
-                        "assignment {} recovery checkpoint head changed during authority audit",
-                        snapshot.version
-                    ));
-                }
-                let observed_index = observed_index.ok_or_else(|| {
+            // Recording the exact next recovery decision moves the unresolved pin from this
+            // materialized target to its successor before that successor proposal is installed.
+            // Retain authority for this transient head only when all four immutable edges agree:
+            // D(n), D(n+1), the successor-keyed pin, and the unchanged committed cut.
+            let successor_version = snapshot
+                .version
+                .checked_add(1)
+                .ok_or_else(|| "assignment version exhausted during recovery audit".to_string())?;
+            let successor = authority
+                .assignment_recovery_decision(successor_version)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
                     format!(
-                        "assignment {} consumed recovery Commit has no checkpoint index",
+                        "assignment {} recovery checkpoint was superseded before the target committed",
                         snapshot.version
                     )
                 })?;
-                let origin = validate_portable_recovery_cut(
-                    &observed_outcome,
-                    &observed_index,
-                    &head_reference,
-                    &decision.target,
-                    "consumed assignment recovery",
-                )?;
-                AuditedRecoveryCheckpoint::Consumed {
-                    checkpoint: head_reference,
-                    origin,
-                }
-            } else {
-                // Recording the exact next recovery decision moves the unresolved pin from this
-                // materialized target to its successor before that successor proposal is installed.
-                // Retain authority for this transient head only when all four immutable edges agree:
-                // D(n), D(n+1), the successor-keyed pin, and the unchanged committed cut.
-                let successor_version = snapshot.version.checked_add(1).ok_or_else(|| {
-                    "assignment version exhausted during recovery audit".to_string()
-                })?;
-                let successor = authority
-                    .assignment_recovery_decision(successor_version)
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .ok_or_else(|| {
-                        format!(
-                            "assignment {} recovery checkpoint was superseded before the target committed",
-                            snapshot.version
-                        )
-                    })?;
-                if successor.predecessor != decision.target
-                    || successor.recovery_checkpoint != decision.recovery_checkpoint
-                    || successor.recovery_checkpoint != head_reference
-                {
-                    return Err(format!(
-                        "assignment {} recovery checkpoint does not continue through its exact successor decision",
-                        snapshot.version
-                    ));
-                }
-                let successor_pin = authority
-                    .assignment_handoff_checkpoint(&successor.target)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if successor_pin.as_ref() != Some(&head_reference) {
-                    return Err(format!(
-                        "assignment {} recovery checkpoint is not pinned to its exact pending successor",
-                        snapshot.version
-                    ));
-                }
-                let (observed_outcome, observed_index) = authority
-                    .cluster_outcome_with_committed_checkpoint(head_reference.epoch)
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .ok_or_else(|| {
-                        format!(
-                            "assignment {} propagated recovery Commit disappeared",
-                            snapshot.version
-                        )
-                    })?;
-                if observed_outcome != committed_head {
-                    return Err(format!(
-                        "assignment {} recovery checkpoint head changed during authority audit",
-                        snapshot.version
-                    ));
-                }
-                let observed_index = observed_index.ok_or_else(|| {
+            if successor.predecessor != decision.target
+                || successor.recovery_checkpoint != decision.recovery_checkpoint
+                || successor.recovery_checkpoint != head_reference
+            {
+                return Err(format!(
+                    "assignment {} recovery checkpoint does not continue through its exact successor decision",
+                    snapshot.version
+                ));
+            }
+            let successor_pin = authority
+                .assignment_handoff_checkpoint(&successor.target)
+                .await
+                .map_err(|error| error.to_string())?;
+            if successor_pin.as_ref() != Some(&head_reference) {
+                return Err(format!(
+                    "assignment {} recovery checkpoint is not pinned to its exact pending successor",
+                    snapshot.version
+                ));
+            }
+            let (observed_outcome, observed_index) = authority
+                .cluster_outcome_with_committed_checkpoint(head_reference.epoch)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
                     format!(
-                        "assignment {} propagated recovery Commit has no checkpoint index",
+                        "assignment {} propagated recovery Commit disappeared",
                         snapshot.version
                     )
                 })?;
-                let origin = validate_portable_recovery_cut(
-                    &observed_outcome,
-                    &observed_index,
-                    &head_reference,
-                    &decision.predecessor,
-                    "propagated assignment recovery",
-                )?;
-                AuditedRecoveryCheckpoint::Propagated {
-                    checkpoint: head_reference,
-                    origin,
-                    successor: successor.target,
-                }
+            if observed_outcome != committed_head {
+                return Err(format!(
+                    "assignment {} recovery checkpoint head changed during authority audit",
+                    snapshot.version
+                ));
+            }
+            let observed_index = observed_index.ok_or_else(|| {
+                format!(
+                    "assignment {} propagated recovery Commit has no checkpoint index",
+                    snapshot.version
+                )
+            })?;
+            let origin = validate_portable_recovery_cut(
+                &observed_outcome,
+                &observed_index,
+                &head_reference,
+                &decision.predecessor,
+                "propagated assignment recovery",
+            )?;
+            AuditedRecoveryCheckpoint::Propagated {
+                checkpoint: head_reference,
+                origin,
+                successor: successor.target,
             }
         };
         Ok((decision.predecessor, recovery_checkpoint))
@@ -2406,14 +2407,11 @@ fn prepare_recovery_assignment_adoption<'a>(
     deadline: tokio::time::Instant,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
     Box::pin(async move {
-        match try_suspend_recovery_assignment_authority(db, controller, deadline).await? {
-            true => {}
-            false => {
-                return Err(format!(
-                    "recovery assignment {} waits for a local vnode transition",
-                    snapshot.version
-                ));
-            }
+        if !try_suspend_recovery_assignment_authority(db, controller, deadline).await? {
+            return Err(format!(
+                "recovery assignment {} waits for a local vnode transition",
+                snapshot.version
+            ));
         }
         if local_recovery_assignment_scope(snapshot, controller)?
             == LocalRecoveryAssignmentScope::Ownerless
@@ -3544,7 +3542,7 @@ fn execute_graceful_rotation_owned(
                     .map_err(|error| error.to_string())?;
                 match controller.checkpoint_drain_transition() {
                     None => {
-                        controller.publish_checkpoint_drain_transition(Some(transition.clone()))
+                        controller.publish_checkpoint_drain_transition(Some(transition.clone()));
                     }
                     Some(installed) if installed == transition => {}
                     Some(_) => {
@@ -4566,6 +4564,7 @@ async fn finalize_drain_snapshot(
 
 /// Settle a durable drain before coordinated recovery freezes a new process-local source cut.
 /// Recovery restarts source tasks, so a pre-restart receipt can never authorize a later Release.
+#[cfg(test)]
 pub(crate) async fn settle_source_drain_before_recovery(
     db: &Arc<LaminarDB>,
     controller: &ClusterController,

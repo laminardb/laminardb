@@ -893,7 +893,6 @@ impl ForceCheckpointReservationClaim {
 
         let attachment = match self.state.load(std::sync::atomic::Ordering::Acquire) {
             FORCE_CHECKPOINT_RESERVATION_CLAIMED => Attached,
-            FORCE_CHECKPOINT_RESERVATION_CANCELLED => Cancelled,
             FORCE_CHECKPOINT_RESERVATION_WAITING if now >= deadline => {
                 match self.state.compare_exchange(
                     FORCE_CHECKPOINT_RESERVATION_WAITING,
@@ -1128,7 +1127,7 @@ impl SourceWatermarkState {
     /// committed cluster cut may legitimately originate from a peer clock and must be reproduced
     /// exactly by both aggregate and per-channel checkpoint state.
     pub(crate) fn install_committed_watermark_floor(&mut self, watermark: i64) -> Option<i64> {
-        if watermark <= i64::MIN {
+        if watermark == i64::MIN {
             return None;
         }
         if let Some(state) = self.partitioned.as_mut() {
@@ -4207,12 +4206,12 @@ impl LaminarDB {
             // coordinator whose pipeline identity was rechecked above is still the stopped graph's
             // coordinator, not a same-identity successor generation.
             let stopped_startup_attempt_is_same = lifecycle_claim.as_ref().is_some_and(|owned| {
-                match (owned.as_ref(), prepared_startup_attempt.as_ref()) {
-                    (Some(current), Some(prepared)) => {
-                        Arc::ptr_eq(current, prepared) && current.is_complete()
-                    }
-                    (None, None) | (None, Some(_)) | (Some(_), None) => false,
-                }
+                let (Some(current), Some(prepared)) =
+                    (owned.as_ref(), prepared_startup_attempt.as_ref())
+                else {
+                    return false;
+                };
+                Arc::ptr_eq(current, prepared) && current.is_complete()
             });
             let stopped_topology_shape_is_same = (stopped_committed_topology_shape
                 && prepared_recovery_fault != 0

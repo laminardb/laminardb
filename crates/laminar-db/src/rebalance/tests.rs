@@ -602,6 +602,7 @@ async fn dead_predecessor_fixture() -> (
     .await
 }
 
+#[allow(clippy::fn_params_excessive_bools)]
 async fn stopped_recovery_drain_fixture(
     predecessor_owns_local: bool,
     target_owns_local: bool,

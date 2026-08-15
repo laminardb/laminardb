@@ -749,9 +749,7 @@ fn validate_source_watermarks(
             ));
         }
     }
-    for (source, current) in
-        channel_progress_frontiers_by_source(channels).map_err(|error| error.to_string())?
-    {
+    for (source, current) in channel_progress_frontiers_by_source(channels)? {
         let Some(current) = current else {
             continue;
         };

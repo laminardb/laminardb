@@ -773,7 +773,7 @@ struct VnodeAcquisitionProbe {
     live: Arc<parking_lot::Mutex<std::collections::BTreeMap<u32, Vec<u8>>>>,
     prepared: Option<std::collections::BTreeMap<u32, Vec<u8>>>,
     whole: Arc<parking_lot::Mutex<Option<Vec<u8>>>>,
-    prepared_whole: Option<Option<Vec<u8>>>,
+    prepared_whole: Option<Vec<u8>>,
     prepare_count: Arc<std::sync::atomic::AtomicUsize>,
     publish_count: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -801,7 +801,7 @@ impl crate::operator_graph::GraphOperator for VnodeAcquisitionProbe {
         &mut self,
         transition: crate::operator_graph::ManagedVnodeTransition<'_>,
     ) -> Result<(), DbError> {
-        if self.prepared.is_some() || self.prepared_whole.is_some() {
+        if self.prepared.is_some() {
             return Err(DbError::Checkpoint(
                 "acquisition probe received an invalid prepared transition".into(),
             ));
@@ -825,7 +825,7 @@ impl crate::operator_graph::GraphOperator for VnodeAcquisitionProbe {
             }
         };
         self.prepared = Some(prepared);
-        self.prepared_whole = Some(prepared_whole);
+        self.prepared_whole = prepared_whole;
         self.prepare_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -841,10 +841,7 @@ impl crate::operator_graph::GraphOperator for VnodeAcquisitionProbe {
             .prepared
             .take()
             .expect("acquisition probe transition must be prepared");
-        *self.whole.lock() = self
-            .prepared_whole
-            .take()
-            .expect("acquisition probe whole transition must be prepared");
+        *self.whole.lock() = self.prepared_whole.take();
         self.publish_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
@@ -928,7 +925,7 @@ async fn record_two_vnode_acquisition_checkpoint(
             },
             chunk: manifest.node_data.chunk,
             range: ByteRange {
-                offset: whole.map_or(0, |whole| whole.len()) as u64,
+                offset: whole.map_or(0, <[u8]>::len) as u64,
                 length: state.len() as u64,
             },
             sha256: checkpoint_sha256(state),

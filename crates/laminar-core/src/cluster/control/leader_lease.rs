@@ -2997,30 +2997,30 @@ impl LeaderLeaseStore {
     async fn load_published_authority_head(
         &self,
     ) -> Result<Option<PublishedAuthorityHead>, LeaseError> {
-        let pointer = match read_authority_head_pointer(self.store.as_ref()).await? {
-            Some(pointer) => pointer,
-            None => {
-                let Some(discovered) = self.discover_authority_head().await? else {
-                    let Some(pointer) = read_authority_head_pointer(self.store.as_ref()).await?
-                    else {
-                        return Ok(None);
-                    };
-                    return self.load_authority_head_target(pointer).await.map(Some);
+        let pointer = if let Some(pointer) =
+            read_authority_head_pointer(self.store.as_ref()).await?
+        {
+            pointer
+        } else {
+            let Some(discovered) = self.discover_authority_head().await? else {
+                let Some(pointer) = read_authority_head_pointer(self.store.as_ref()).await? else {
+                    return Ok(None);
                 };
-                let discovered_sequence = discovered.lease.seq;
-                let published_sequence = self
-                    .publish_authority_head(discovered_sequence, None)
-                    .await?;
-                let pointer = self
-                    .reload_authority_head_pointer(published_sequence)
-                    .await?;
-                if published_sequence > discovered_sequence
-                    || pointer.pointer.sequence > published_sequence
-                {
-                    return self.load_authority_head_target(pointer).await.map(Some);
-                }
-                pointer
+                return self.load_authority_head_target(pointer).await.map(Some);
+            };
+            let discovered_sequence = discovered.lease.seq;
+            let published_sequence = self
+                .publish_authority_head(discovered_sequence, None)
+                .await?;
+            let pointer = self
+                .reload_authority_head_pointer(published_sequence)
+                .await?;
+            if published_sequence > discovered_sequence
+                || pointer.pointer.sequence > published_sequence
+            {
+                return self.load_authority_head_target(pointer).await.map(Some);
             }
+            pointer
         };
 
         let sequence = pointer.pointer.sequence;

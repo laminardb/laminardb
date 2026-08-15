@@ -3527,6 +3527,7 @@ impl LaminarDB {
     /// A startup owner outlives callers that time out while awaiting it. Terminalization therefore
     /// belongs here, before the sticky attempt result is published, rather than in a recovery
     /// monitor that may already have dropped its receiver.
+    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_async))]
     async fn terminalize_start_attempt_if_needed(
         &self,
         authority: PipelineLifecycleAuthority,
@@ -6776,9 +6777,11 @@ impl LaminarDB {
                 };
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     #[cfg(all(test, feature = "cluster"))]
-                    if compute_before_ready_panic.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                        panic!("injected cluster compute panic before readiness");
-                    }
+                    assert!(
+                        !compute_before_ready_panic
+                            .swap(false, std::sync::atomic::Ordering::SeqCst),
+                        "injected cluster compute panic before readiness"
+                    );
                     rt.block_on(async move {
                         Box::pin(coordinator.run_with_ready(callback, startup_tx)).await
                     })
@@ -7062,7 +7065,6 @@ impl LaminarDB {
                             watcher_pending_compute_fault,
                         )
                         .await;
-                        return;
                     }
                     // A permanent halt is operator-owned. Do not invoke the local supervisor.
                 }

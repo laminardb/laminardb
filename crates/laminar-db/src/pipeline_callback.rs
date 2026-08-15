@@ -3215,7 +3215,7 @@ impl ConnectorPipelineCallback {
     fn shuffle_flush_attempt_advanced(
         wave: u64,
         local_activity: bool,
-        aligned: &crate::operator_graph::ShuffleFlushWaveOutcome,
+        aligned: crate::operator_graph::ShuffleFlushWaveOutcome,
     ) -> bool {
         wave != 0 || local_activity || aligned.graph_state_staged
     }
@@ -3295,7 +3295,7 @@ impl ConnectorPipelineCallback {
                 "checkpoint distributed shuffle fixed-point wave settled"
             );
             if aligned.outcome != ShuffleAlignmentOutcome::Aligned {
-                if Self::shuffle_flush_attempt_advanced(wave, local_activity, &aligned) {
+                if Self::shuffle_flush_attempt_advanced(wave, local_activity, aligned) {
                     return Err(DbError::Checkpoint(format!(
                         "shuffle flush observed {:?} after distributed replay had already advanced; coordinated recovery is required",
                         aligned.outcome
@@ -4379,7 +4379,7 @@ impl ConnectorPipelineCallback {
                                 .source_watermark(source_id)
                                 .filter(|watermark| *watermark != i64::MIN),
                             idle: tracker.is_idle(source_id),
-                        })
+                        });
                     }
                 }
             }
@@ -6364,7 +6364,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             )
             .await
             .map_err(|_| {
-                format!("checkpoint Prepare publication exhausted its end-to-end deadline")
+                "checkpoint Prepare publication exhausted its end-to-end deadline".to_string()
             })?
             .map_err(|error| format!("checkpoint Prepare publication failed: {error}"))?;
             Ok(())
@@ -6417,18 +6417,15 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 assignment_guard: None,
             };
         };
-        let assignment_guard = match tokio::time::timeout_at(
+        let Ok(assignment_guard) = tokio::time::timeout_at(
             deadline,
             Arc::clone(&self.assignment_adoption_lock).lock_owned(),
         )
         .await
-        {
-            Ok(guard) => guard,
-            Err(_) => {
-                return CheckpointAssignmentAdmission::Deferred(
-                    "checkpoint admission timed out waiting for assignment serialization".into(),
-                );
-            }
+        else {
+            return CheckpointAssignmentAdmission::Deferred(
+                "checkpoint admission timed out waiting for assignment serialization".into(),
+            );
         };
         let Some(registry) = self.vnode_registry.clone() else {
             tracing::error!(

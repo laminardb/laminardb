@@ -448,16 +448,16 @@ impl RecoveryMonitor {
                     continue;
                 }
             };
-            let reported = inventory.faults().to_vec();
+            let fault_snapshot = inventory.faults().to_vec();
             if inventory.has_terminal_fault() {
-                let reporter = reported
+                let reporter = fault_snapshot
                     .iter()
                     .copied()
                     .find(|fault| fault.is_terminal())
                     .map(|fault| fault.reporter);
                 self.latch_durable_terminal_fault(&db, &controller, reporter);
             }
-            let pending = self.unhandled_faults(&reported);
+            let pending = self.unhandled_faults(&fault_snapshot);
             self.hold_for_visible_or_queued_fault(&db, &controller, &pending);
 
             // `drive_round` owns every nonterminal local Prepare/Start synchronously. Seeing one
@@ -548,7 +548,7 @@ impl RecoveryMonitor {
                         match active.phase {
                             RecoverPhase::Release { .. }
                                 if active.round.fault_revision() == inventory.revision()
-                                    && active.round.faults == reported =>
+                                    && active.round.faults == fault_snapshot =>
                             {
                                 // `observe` owns retrying the retained prepare/commit barrier. Do
                                 // not overwrite the exact still-active pre-commit fault inventory.
@@ -583,7 +583,7 @@ impl RecoveryMonitor {
                     &db,
                     &controller,
                     inventory.revision(),
-                    reported,
+                    fault_snapshot,
                     required_prepare_fence.as_ref(),
                 )
                 .await;
@@ -1662,16 +1662,17 @@ impl RecoveryMonitor {
                     && required_prepare_fence.is_none_or(|required| required == fence)
         );
         if !prepare_fence_matches {
-            match prepare_fence {
-                Err(error) => tracing::warn!(
+            if let Err(error) = prepare_fence {
+                tracing::warn!(
                     gen = gen_id,
                     %error,
                     "recovery assignment audit failed before Prepare; deferring round"
-                ),
-                _ => tracing::warn!(
+                );
+            } else {
+                tracing::warn!(
                     gen = gen_id,
                     "recovery assignment changed before Prepare; deferring round"
-                ),
+                );
             }
             return;
         }
@@ -1804,26 +1805,22 @@ impl RecoveryMonitor {
         // it from the post-cleanup drain inspection through Start publication so recovery observes
         // every earlier terminal, while every later terminal is ordered after this exact Start.
         let selection_deadline = tokio::time::Instant::now() + DECISION_IO_TIMEOUT;
-        let selection_guard =
-            match tokio::time::timeout_at(selection_deadline, db.assignment_adoption_lock.lock())
-                .await
-            {
-                Ok(guard) => guard,
-                Err(_) => {
-                    tracing::error!(
-                        gen = gen_id,
-                        "recovery target selection timed out waiting for assignment serialization"
-                    );
-                    handle_failed_recovery_boundary(
-                        db,
-                        controller,
-                        &round,
-                        "assignment serialization timeout",
-                    )
-                    .await;
-                    return;
-                }
-            };
+        let Ok(selection_guard) =
+            tokio::time::timeout_at(selection_deadline, db.assignment_adoption_lock.lock()).await
+        else {
+            tracing::error!(
+                gen = gen_id,
+                "recovery target selection timed out waiting for assignment serialization"
+            );
+            handle_failed_recovery_boundary(
+                db,
+                controller,
+                &round,
+                "assignment serialization timeout",
+            )
+            .await;
+            return;
+        };
         let ownership = driver_owns_prepare(db, controller, &round).await;
         if ownership != PrepareOwnership::Owned {
             drop(selection_guard);
@@ -3692,7 +3689,7 @@ pub(crate) async fn recovery_prepare_supersession_fence_after_assignment_settlem
     )
     .await
     .map_err(|_| "recovery Prepare retirement target-roster read timed out".to_string())?
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.clone())?;
     if live_target_participants != target.participants {
         return Err("materialized assignment target process roster is no longer exact".into());
     }
@@ -3729,7 +3726,7 @@ pub(crate) async fn recovery_prepare_supersession_fence_after_assignment_settlem
     )
     .await
     .map_err(|_| "recovery Prepare retirement target-roster recheck timed out".to_string())?
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.clone())?;
     if confirmed_target_participants != target.participants {
         return Err(
             "materialized assignment target process roster changed during retirement".into(),

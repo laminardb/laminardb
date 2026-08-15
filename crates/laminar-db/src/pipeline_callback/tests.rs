@@ -1781,7 +1781,7 @@ fn shuffle_flush_terminal_after_wave_zero_staging_requires_recovery() {
         graph_state_staged: false,
     };
     assert!(!ConnectorPipelineCallback::shuffle_flush_attempt_advanced(
-        0, false, &pristine
+        0, false, pristine
     ));
 
     let staged = crate::operator_graph::ShuffleFlushWaveOutcome {
@@ -1789,7 +1789,7 @@ fn shuffle_flush_terminal_after_wave_zero_staging_requires_recovery() {
         ..pristine
     };
     assert!(ConnectorPipelineCallback::shuffle_flush_attempt_advanced(
-        0, false, &staged
+        0, false, staged
     ));
 }
 
@@ -2225,21 +2225,24 @@ async fn sink_publication_preserves_preflighted_batch_boundaries() {
             false,
         ),
     ]);
-    let plain = (0..BATCH_COUNT)
+    let batch_values = 0..i64::try_from(BATCH_COUNT).expect("batch count fits in i64");
+    let plain = batch_values
+        .clone()
         .map(|value| {
             RecordBatch::try_new(
                 Arc::clone(&plain_schema),
-                vec![Arc::new(arrow_array::Int64Array::from(vec![value as i64]))],
+                vec![Arc::new(arrow_array::Int64Array::from(vec![value]))],
             )
             .unwrap()
         })
         .collect();
-    let weighted = (0..BATCH_COUNT)
+    let weighted = batch_values
+        .clone()
         .map(|value| {
             RecordBatch::try_new(
                 Arc::clone(&weighted_schema),
                 vec![
-                    Arc::new(arrow_array::Int64Array::from(vec![value as i64])),
+                    Arc::new(arrow_array::Int64Array::from(vec![value])),
                     Arc::new(arrow_array::Int64Array::from(vec![1])),
                 ],
             )
@@ -2270,7 +2273,7 @@ async fn sink_publication_preserves_preflighted_batch_boundaries() {
     assert_eq!(append_b_written.len(), BATCH_COUNT);
     assert_eq!(
         recorded_i64_values(&append_a_written),
-        (0..BATCH_COUNT as i64).collect::<Vec<_>>()
+        batch_values.collect::<Vec<_>>()
     );
     assert_eq!(
         recorded_i64_values(&append_b_written),

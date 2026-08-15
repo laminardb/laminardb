@@ -3796,7 +3796,7 @@ mod core_tests {
         let mut transport = vec![0_u8; bytes.len() + CHECKPOINT_ARCHIVE_ALIGNMENT];
         let base = transport.as_ptr() as usize;
         let offset = (0..CHECKPOINT_ARCHIVE_ALIGNMENT)
-            .find(|offset| (base + offset) % CHECKPOINT_ARCHIVE_ALIGNMENT != 0)
+            .find(|offset| !(base + offset).is_multiple_of(CHECKPOINT_ARCHIVE_ALIGNMENT))
             .expect("an archive transport offset must be unaligned");
         transport[offset..offset + bytes.len()].copy_from_slice(bytes);
         let bytes = bytes::Bytes::from(transport).slice(offset..offset + bytes.len());

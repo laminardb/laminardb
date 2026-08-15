@@ -7318,7 +7318,7 @@ impl CheckpointCoordinator {
                 .await;
             };
             let rollback = self.rollback_sinks_until(epoch, cleanup_deadline);
-            let (_, rollback) = tokio::join!(notify, rollback);
+            let ((), rollback) = tokio::join!(notify, rollback);
             self.phase = CheckpointPhase::Idle;
             if let Err(rollback) = rollback {
                 self.failure_requires_recovery = true;
@@ -7798,6 +7798,7 @@ pub struct CheckpointStats {
 }
 
 impl CheckpointCoordinator {
+    #[cfg(any(feature = "cluster", test))]
     pub(crate) fn last_committed_ref(&self) -> Option<&CommittedCheckpointRef> {
         self.last_committed_ref.as_ref()
     }

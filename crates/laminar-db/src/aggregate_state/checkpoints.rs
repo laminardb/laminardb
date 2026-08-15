@@ -379,6 +379,7 @@ impl AggStateArchiveRestoreProfile {
 }
 
 impl PreflightedAggStateArchive<'_> {
+    #[cfg(test)]
     pub(crate) const fn group_count(&self) -> usize {
         self.restore.group_count
     }
@@ -402,10 +403,12 @@ impl PreflightedAggStateArchive<'_> {
 }
 
 impl AggStateRestorePreflight {
+    #[cfg(any(feature = "cluster", test))]
     pub(crate) const fn group_count(self) -> usize {
         self.group_count
     }
 
+    #[cfg(test)]
     pub(crate) const fn owned_state_bytes(self) -> usize {
         self.owned_state_bytes
     }
@@ -414,6 +417,7 @@ impl AggStateRestorePreflight {
         self.final_state_upper_bytes
     }
 
+    #[cfg(test)]
     pub(crate) const fn decode_scratch_bytes(self) -> usize {
         self.decode_scratch_bytes
     }
@@ -538,7 +542,10 @@ fn ipc_field_shape(
         arrow_ipc::Type::Int => {
             let width = field.type_as_int().ok_or_else(missing_type)?.bitWidth();
             match width {
-                8 | 16 | 32 | 64 => IpcPhysicalShape::Fixed(width as usize / 8),
+                8 => IpcPhysicalShape::Fixed(1),
+                16 => IpcPhysicalShape::Fixed(2),
+                32 => IpcPhysicalShape::Fixed(4),
+                64 => IpcPhysicalShape::Fixed(8),
                 _ => return Err(invalid_ipc_shape(context, "integer width is unsupported")),
             }
         }
@@ -596,8 +603,8 @@ fn ipc_field_shape(
             };
             if precision == 0
                 || precision > maximum
-                || scale > maximum as i8
-                || (scale > 0 && scale as u8 > precision)
+                || scale > maximum.cast_signed()
+                || (scale > 0 && scale.cast_unsigned() > precision)
             {
                 return Err(invalid_ipc_shape(
                     context,
@@ -691,7 +698,10 @@ fn ipc_field_shape(
                 .indexType()
                 .ok_or_else(|| invalid_ipc_shape(context, "dictionary index type is missing"))?;
             let index_width = match index.bitWidth() {
-                8 | 16 | 32 | 64 => index.bitWidth() as usize / 8,
+                8 => 1,
+                16 => 2,
+                32 => 4,
+                64 => 8,
                 _ => {
                     return Err(invalid_ipc_shape(
                         context,
@@ -825,7 +835,7 @@ where
         .ok_or_else(|| invalid_ipc_shape(context, "buffer descriptors are missing"))?;
 
     let mut cursor = 0usize;
-    for buffer in buffers.iter() {
+    for buffer in buffers {
         let offset = usize::try_from(buffer.offset())
             .map_err(|_| invalid_ipc_shape(context, "buffer offset is invalid"))?;
         let length = usize::try_from(buffer.length())

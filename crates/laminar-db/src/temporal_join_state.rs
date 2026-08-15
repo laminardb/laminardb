@@ -3457,14 +3457,13 @@ fn compact_detached_rows(
     let columns = compacted
         .columns()
         .iter()
-        .cloned()
         .map(|column| detach_compacted_buffers(column, side))
         .collect::<Result<Vec<_>, _>>()?;
     RecordBatch::try_new(Arc::new(schema.clone()), columns)
         .map_err(|error| DbError::Checkpoint(format!("temporal {side} compaction: {error}")))
 }
 
-fn detach_compacted_buffers(array: ArrayRef, side: &str) -> Result<ArrayRef, DbError> {
+fn detach_compacted_buffers(array: &ArrayRef, side: &str) -> Result<ArrayRef, DbError> {
     fn detach_data(data: ArrayData) -> Result<ArrayData, arrow::error::ArrowError> {
         // Dictionary and nested interleave paths may return zero-copy slices of their inputs.
         // Retained temporal state must not keep any allocation owned by the expanded legacy IPC
@@ -4086,7 +4085,7 @@ mod tests {
             key_refs,
             (0..200).map(|value| Some(i64::from(value))).collect(),
             (0..200).map(|time| Some(1_000 + i64::from(time))).collect(),
-            (0..200).map(|order| order as u8).collect(),
+            (0_u8..200).collect(),
         );
         state.apply_right_batch(&input, None).unwrap();
         let live_limit = state.accounted_state_bytes();

@@ -2068,7 +2068,11 @@ impl ManagedTemporalJoinOperator {
                 })?;
                 Ok(())
             };
+            #[cfg(feature = "cluster")]
             let mut runtime_scratch = 0usize;
+            #[cfg(not(feature = "cluster"))]
+            let runtime_scratch = 0usize;
+            #[cfg(feature = "cluster")]
             let mut add_runtime = |charge: usize| -> Result<(), DbError> {
                 runtime_scratch = runtime_scratch.checked_add(charge).ok_or_else(|| {
                     DbError::Checkpoint(format!(
@@ -6373,7 +6377,9 @@ mod tests {
         let mut transport = vec![0_u8; bytes.len() + CHECKPOINT_ARCHIVE_ALIGNMENT];
         let base = transport.as_ptr() as usize;
         let offset = (0..CHECKPOINT_ARCHIVE_ALIGNMENT)
-            .find(|offset| (base + offset + archive_offset) % CHECKPOINT_ARCHIVE_ALIGNMENT != 0)
+            .find(|offset| {
+                !(base + offset + archive_offset).is_multiple_of(CHECKPOINT_ARCHIVE_ALIGNMENT)
+            })
             .expect("a temporal archive transport offset must be unaligned");
         transport[offset..offset + bytes.len()].copy_from_slice(bytes);
         let bytes = bytes::Bytes::from(transport).slice(offset..offset + bytes.len());

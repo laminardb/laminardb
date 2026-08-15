@@ -368,6 +368,9 @@ struct MatrixAggregateOutput {
 }
 
 #[cfg(feature = "kafka")]
+type DeltaAggregateRows = Vec<(String, MatrixAggregateOutput, i64)>;
+
+#[cfg(feature = "kafka")]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct CoreWindowOutput {
     kind: String,
@@ -6702,7 +6705,7 @@ impl DeltaOutputOracle {
         })
     }
 
-    fn aggregate_rows(&self) -> Result<(i64, Vec<(String, MatrixAggregateOutput, i64)>), String> {
+    fn aggregate_rows(&self) -> Result<(i64, DeltaAggregateRows), String> {
         self.runtime.block_on(async {
             let uri = deltalake::ensure_table_uri(&self.table_uri)
                 .map_err(|error| format!("invalid Delta aggregate table URI: {error}"))?;

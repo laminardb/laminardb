@@ -703,7 +703,7 @@ async fn terminal_halt_stays_fenced_and_refuses_coordinated_recovery_start() {
     let error = db.start_for_coordinated_recovery().await.unwrap_err();
     match error {
         DbError::PipelineTerminal(message) => {
-            assert!(message.contains(terminal_reason), "{message}")
+            assert!(message.contains(terminal_reason), "{message}");
         }
         other => panic!("expected a permanent pipeline halt, got {other}"),
     }

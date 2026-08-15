@@ -587,6 +587,7 @@ enum MockLateFilter {
     DropFirst,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct MockCallback {
     cycle_count: u32,
     attempt_to_reserve: CheckpointAttempt,

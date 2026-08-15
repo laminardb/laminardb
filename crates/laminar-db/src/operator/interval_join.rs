@@ -6237,7 +6237,7 @@ mod tests {
         let mut transport = vec![0_u8; bytes.len() + CHECKPOINT_ARCHIVE_ALIGNMENT];
         let base = transport.as_ptr() as usize;
         let offset = (0..CHECKPOINT_ARCHIVE_ALIGNMENT)
-            .find(|offset| (base + offset + archive_offset) % archive_alignment != 0)
+            .find(|offset| !(base + offset + archive_offset).is_multiple_of(archive_alignment))
             .expect("an unaligned checkpoint transport offset exists");
         transport[offset..offset + bytes.len()].copy_from_slice(bytes);
         let bytes = bytes::Bytes::from(transport).slice(offset..offset + bytes.len());

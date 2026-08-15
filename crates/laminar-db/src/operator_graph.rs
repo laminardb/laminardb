@@ -5342,7 +5342,7 @@ impl OperatorGraph {
 
     /// Run one legacy single-cut shuffle alignment. This wrapper intentionally rejects tagged
     /// fixed-point markers so tests and non-portable callers cannot silently weaken their cut.
-    #[cfg(feature = "cluster")]
+    #[cfg(all(feature = "cluster", test))]
     pub(crate) async fn align_shuffle_barriers(
         &mut self,
         attempt: laminar_core::checkpoint::CheckpointAttempt,

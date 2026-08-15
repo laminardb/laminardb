@@ -1278,6 +1278,9 @@ pub struct StreamingCoordinator {
     public_generation: Option<StreamingCoordinatorGeneration>,
 }
 
+// These flags describe independent protocol state and cannot be combined without obscuring the
+// coordinator's transition invariants.
+#[allow(clippy::struct_excessive_bools)]
 struct CoordinatorRunState {
     batch_window: Duration,
     checkpoint_control_wake: Option<CheckpointControlWake>,

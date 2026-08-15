@@ -104,27 +104,6 @@ fn coalesce_local_aggregate_batches(
     op_name: &str,
     batches: Vec<RecordBatch>,
 ) -> Result<Vec<RecordBatch>, DbError> {
-    // Retraction validity is checked at each weighted batch boundary. For example, [-1] then
-    // [+1] must reject the invalid prefix rather than being merged into a valid-looking zero.
-    if batches.iter().any(|batch| {
-        batch
-            .schema()
-            .index_of(laminar_core::changelog::WEIGHT_COLUMN)
-            .is_ok()
-    }) {
-        return Ok(batches);
-    }
-
-    if batches.iter().any(|batch| {
-        batch
-            .schema()
-            .fields()
-            .iter()
-            .any(|field| !certifies_local_aggregate_concat_type(field.data_type()))
-    }) {
-        return Ok(batches);
-    }
-
     fn flush_group(
         op_name: &str,
         group: &mut Vec<RecordBatch>,
@@ -169,6 +148,27 @@ fn coalesce_local_aggregate_batches(
                 Ok(())
             }
         }
+    }
+
+    // Retraction validity is checked at each weighted batch boundary. For example, [-1] then
+    // [+1] must reject the invalid prefix rather than being merged into a valid-looking zero.
+    if batches.iter().any(|batch| {
+        batch
+            .schema()
+            .index_of(laminar_core::changelog::WEIGHT_COLUMN)
+            .is_ok()
+    }) {
+        return Ok(batches);
+    }
+
+    if batches.iter().any(|batch| {
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .any(|field| !certifies_local_aggregate_concat_type(field.data_type()))
+    }) {
+        return Ok(batches);
     }
 
     let mut output = Vec::new();
@@ -4944,7 +4944,7 @@ mod checkpoint_tests {
         let mut transport = vec![0_u8; bytes.len() + AGG_CHECKPOINT_ARCHIVE_ALIGNMENT];
         let base = transport.as_ptr() as usize;
         let offset = (0..AGG_CHECKPOINT_ARCHIVE_ALIGNMENT)
-            .find(|offset| (base + offset) % AGG_CHECKPOINT_ARCHIVE_ALIGNMENT != 0)
+            .find(|offset| !(base + offset).is_multiple_of(AGG_CHECKPOINT_ARCHIVE_ALIGNMENT))
             .expect("an aggregate archive transport offset must be unaligned");
         transport[offset..offset + bytes.len()].copy_from_slice(bytes);
         let bytes = bytes::Bytes::from(transport).slice(offset..offset + bytes.len());

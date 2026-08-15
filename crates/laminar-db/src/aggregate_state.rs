@@ -28,11 +28,13 @@ mod concrete;
 mod keys;
 mod scalar_ipc;
 mod vnode_state;
+pub(crate) use checkpoints::AggStateArchiveRestoreProfile;
+#[cfg(any(feature = "cluster", test))]
+pub(crate) use checkpoints::AggStateRestorePreflight;
 pub(crate) use checkpoints::{
     query_fingerprint, query_fingerprint_with_config, AggStateCheckpoint, EmittedCheckpoint,
     GroupCheckpoint, WindowCheckpoint,
 };
-pub(crate) use checkpoints::{AggStateArchiveRestoreProfile, AggStateRestorePreflight};
 #[cfg(test)]
 pub(crate) use compile::expr_to_sql;
 pub(crate) use compile::{
