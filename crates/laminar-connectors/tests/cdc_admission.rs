@@ -16,7 +16,8 @@ fn postgres_cdc_admission_rejects_unexecuted_options_and_reference_use() {
     config.set("ssl.mode", "disable");
 
     let source = registry.create_source(&config, None).unwrap();
-    source.contract(&config).unwrap();
+    let error = source.contract(&config).unwrap_err();
+    assert!(error.to_string().contains("raw JSON change envelope"));
 
     let mut removed = config.clone();
     removed.set("snapshot.mode", "initial");
@@ -42,7 +43,8 @@ fn mongodb_cdc_admission_uses_runtime_options_and_rejects_removed_ones() {
     config.set("max.buffered.bytes", "33554432");
 
     let source = registry.create_source(&config, None).unwrap();
-    source.contract(&config).unwrap();
+    let error = source.contract(&config).unwrap_err();
+    assert!(error.to_string().contains("raw JSON change envelope"));
 
     let mut removed = config;
     removed.set("max.buffered.events", "4096");
