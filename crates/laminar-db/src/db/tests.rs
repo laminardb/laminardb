@@ -12147,6 +12147,18 @@ async fn open_subscription_resolves_named_stream() {
     .expect("portal must produce a Batch within 2s")
     .expect("batch frame");
     assert_eq!(batch.num_rows(), 1);
+
+    // Publication appends to the subscription log before updating metrics. A receiver on another
+    // worker can therefore observe the batch in the narrow interval between those operations.
+    // Wait boundedly for the post-publication accounting instead of requiring the independent
+    // metric atomics to be transactionally visible with the portal frame.
+    let metrics_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while (db.stream_metrics("all_trades").unwrap().total_events != 1
+        || prom.events_emitted.get() != 1)
+        && std::time::Instant::now() < metrics_deadline
+    {
+        tokio::task::yield_now().await;
+    }
     assert_eq!(db.stream_metrics("all_trades").unwrap().total_events, 1);
     assert_eq!(prom.events_emitted.get(), 1);
     assert_eq!(prom.events_dropped.get(), 0);
