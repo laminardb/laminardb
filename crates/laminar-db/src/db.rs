@@ -100,9 +100,10 @@ impl DbState {
 }
 
 const DB_IO_WORKER_THREADS: usize = 2;
-// Cluster recovery has a finite, non-recursive async call chain that exceeds Tokio's 2 MiB
-// default worker stack. Keep the larger stack out of embedded and single-node runtimes.
-const CLUSTER_IO_WORKER_STACK_BYTES: usize = 4 * 1024 * 1024;
+// Checkpoint and recovery ownership have finite, non-recursive async call chains that exceed
+// Tokio's 2 MiB default worker stack in debug builds. Both local and clustered runtimes execute
+// those paths, so keep the allocation explicit and bounded for the fixed two-worker executor.
+const DB_IO_WORKER_STACK_BYTES: usize = 4 * 1024 * 1024;
 
 struct DbControlRuntimeInner {
     handle: tokio::runtime::Handle,
@@ -115,16 +116,14 @@ struct DbControlRuntimeInner {
 /// blocks on Tokio shutdown. The fixed two-worker size keeps control and feedback traffic live
 /// while one connector future is temporarily busy without adding a public tuning dimension.
 pub(crate) struct DbControlRuntime {
-    worker_stack_bytes: Option<usize>,
+    worker_stack_bytes: usize,
     inner: parking_lot::Mutex<Option<DbControlRuntimeInner>>,
 }
 
 impl DbControlRuntime {
-    fn new(runtime_mode: RuntimeMode) -> Self {
+    fn new() -> Self {
         Self {
-            worker_stack_bytes: runtime_mode
-                .is_cluster()
-                .then_some(CLUSTER_IO_WORKER_STACK_BYTES),
+            worker_stack_bytes: DB_IO_WORKER_STACK_BYTES,
             inner: parking_lot::Mutex::new(None),
         }
     }
@@ -145,10 +144,8 @@ impl DbControlRuntime {
                 builder
                     .worker_threads(DB_IO_WORKER_THREADS)
                     .thread_name("laminar-io")
+                    .thread_stack_size(worker_stack_bytes)
                     .enable_all();
-                if let Some(bytes) = worker_stack_bytes {
-                    builder.thread_stack_size(bytes);
-                }
                 let runtime = match builder.build() {
                     Ok(runtime) => runtime,
                     Err(error) => {
@@ -1855,7 +1852,7 @@ impl LaminarDB {
             supervisor_self: Arc::new(parking_lot::Mutex::new(std::sync::Weak::new())),
             restart_history: Arc::new(parking_lot::Mutex::new(Vec::new())),
             lifecycle_lock: tokio::sync::Mutex::new(()),
-            control_runtime: DbControlRuntime::new(runtime_mode),
+            control_runtime: DbControlRuntime::new(),
             startup_attempt: parking_lot::Mutex::new(None),
             topology_ddl_lock: tokio::sync::RwLock::new(()),
             catalog_namespace: parking_lot::Mutex::new(HashMap::new()),

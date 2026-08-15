@@ -33,14 +33,10 @@ fn zero_managed_state_budget_is_rejected_as_configuration() {
 }
 
 #[test]
-fn control_runtime_stack_override_is_cluster_only() {
+fn control_runtime_stack_is_explicit_and_bounded() {
     assert_eq!(
-        DbControlRuntime::new(RuntimeMode::Local).worker_stack_bytes,
-        None
-    );
-    assert_eq!(
-        DbControlRuntime::new(RuntimeMode::Cluster).worker_stack_bytes,
-        Some(CLUSTER_IO_WORKER_STACK_BYTES)
+        DbControlRuntime::new().worker_stack_bytes,
+        DB_IO_WORKER_STACK_BYTES
     );
 }
 
