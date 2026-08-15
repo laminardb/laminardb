@@ -4129,7 +4129,8 @@ async fn durable_recovery_state_survives_fast_kv_reconstruction() {
     );
     controller.publish_recovery_incarnation().await.unwrap();
     let (authority, proof) = install_recovery_authority(&controller, 1_000).await;
-    let round = recovery_round(&controller, 51, &proof, &[1]);
+    report_new_local_fault(&controller).await;
+    let round = recovery_round_from_current_faults(&controller, 51, &proof, &[1]).await;
     controller.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
     controller.adopt_recovery_generation(51).await.unwrap();
     controller.announce_recover_prepare(&round).await.unwrap();
@@ -4196,8 +4197,25 @@ async fn delayed_old_phase_cannot_clobber_same_process_new_leader_term() {
         .unwrap();
     controller.set_leader_lease_store(Arc::clone(&authority));
 
+    assert_eq!(
+        authority
+            .record_recovery_fault(
+                RecoveryFaultPublisher {
+                    participant: CheckpointParticipant {
+                        node_id: node.0,
+                        boot_incarnation: controller.recovery_incarnation(),
+                    },
+                    process_term: owner.process_term,
+                },
+                1,
+            )
+            .await
+            .unwrap(),
+        super::super::leader_lease::RecordRecoveryFaultResult::Active
+    );
+
     let old_proof = old_lease.proof();
-    let old_round = recovery_round(&controller, 61, &old_proof, &[1]);
+    let old_round = recovery_round_from_current_faults(&controller, 61, &old_proof, &[1]).await;
     controller.publish_checkpoint_assignment_fence(Some(old_round.assignment_fence.clone()));
     controller
         .announce_recover_prepare(&old_round)
@@ -4239,7 +4257,8 @@ async fn delayed_old_phase_cannot_clobber_same_process_new_leader_term() {
     assert!(current_lease.token > old_lease.token);
     lease_tx.send_replace(Some(current_lease.clone()));
 
-    let current_round = recovery_round(&controller, 62, &current_lease.proof(), &[1]);
+    let current_round =
+        recovery_round_from_current_faults(&controller, 62, &current_lease.proof(), &[1]).await;
     controller.publish_checkpoint_assignment_fence(Some(current_round.assignment_fence.clone()));
     let current_prepare = {
         let controller = Arc::clone(&controller);
