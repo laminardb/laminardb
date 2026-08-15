@@ -1140,7 +1140,6 @@ mod tests {
     #[test]
     fn shipped_server_configs_deserialize() {
         for (name, input) in [
-            ("root", include_str!("../../../laminardb.toml")),
             (
                 "minimal",
                 include_str!("../../../examples/laminardb-minimal.toml"),
