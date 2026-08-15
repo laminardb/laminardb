@@ -52,12 +52,10 @@ wal/
 !/tools/independent-soak-contract/
 !/tools/kafka-transaction-probe/
 
-# Private configs (symlinked from private repo)
+# Private configs and engineering context (linked from laminardb-claude-context)
 CLAUDE.md
 .claude/
-docs/features/
-docs/research/
-docs/audits/
+docs/architecture/
 docs/adr/
 .desloppify/
 /examples/microstructure/target

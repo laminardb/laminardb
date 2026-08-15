@@ -142,7 +142,7 @@ runtimes own all configured vnodes in process; clusters distribute the same topo
 
 * **Membership & Discovery**: Nodes discover one another using either a gossip-based protocol (Chitchat peer-to-peer membership over a configured `gossip_port`) or a static seeds list.
 * **Coordination**: Membership selects a leader candidate, while a renewable shared-store lease fences leader-only control paths. Vnode assignments are CAS-published through `AssignmentSnapshotStore`; there is no embedded Raft service.
-* **VNode Assignments**: Stable key groups (256 by default) are distributed across active cluster nodes. Exact-fenced revoke-only changes are supported. A live assignment that would acquire state fails before publication until direct v7 range transfer is complete.
+* **VNode Assignments**: Stable key groups (256 by default) are distributed across active cluster nodes. Live assignment changes range-load exact committed donor frames behind the rotation fence and publish only after acquired and revoked vnode state, source drain, replay frontiers, target assignment, and shuffle authority agree.
 * **Distributed Checkpoints**: Each participant writes one immutable node-data object with manifest-indexed state-frame ranges and digests. One committed index binds the complete cluster cut.
 * **Checkpoint Store**: Cluster execution requires a shared `object_store` URL. Local and remote stores must pass the bounded conditional-write probe used by checkpoint publication.
 
@@ -152,7 +152,8 @@ runtimes own all configured vnodes in process; clusters distribute the same topo
 > append-mode Delta Lake. Kafka output remains at-least-once. Other exact combinations fail closed with `[LDB-5035]`
 > before connector I/O.
 > The accepted state design is authoritative in-memory `FxHashMap` state per vnode with
-> object-store-only checkpoint durability. The four-mode production soak matrix remains pending.
+> object-store-only checkpoint durability. The strict three-node cluster at-least-once fault profile
+> passed on 2026-08-15; single-node and exactly-once release profiles remain separately gated.
 > Cluster SQL admits stateless pipelines, supported non-windowed keyed aggregates, and one bounded
 > join stage over direct, watermarked sources. The join supports `INNER`, `LEFT`,
 > `RIGHT`, `FULL`, `LEFT/RIGHT SEMI`, and `LEFT/RIGHT ANTI` with ordered `VARCHAR`/`BIGINT`
@@ -169,8 +170,7 @@ runtimes own all configured vnodes in process; clusters distribute the same topo
 > fused `JOIN ... GROUP BY` and cluster windowed aggregation remain fail-closed.
 > Cluster materialized views also fail closed regardless of query shape because their
 > retained output lacks a planner-certified distribution and assignment-fenced checkpoint/read
-> lifecycle. See the [current distributed-state status](docs/DISTRIBUTED_STATE.md) for the exact
-> boundary and validation gate.
+> lifecycle. Unsupported state and connector compositions fail closed before external I/O.
 
 ### Cluster Configuration Example
 
@@ -476,9 +476,6 @@ LaminarDB standalone server supports environment variable interpolation inside t
 
 ---
 
-Runtime, checkpoint, and deployment internals are kept in [Architecture](docs/ARCHITECTURE.md)
-and [Distributed State](docs/DISTRIBUTED_STATE.md).
-
 ## Benchmarks
 
 Criterion suites live under `crates/laminar-core/benches/`, `crates/laminar-db/benches/`, and `crates/laminar-connectors/benches/`. Run `cargo bench` to measure on your own hardware. The numbers in the docs are from a developer laptop on minimal operator chains; they are not continuously validated and do not represent p99 under load.
@@ -557,7 +554,6 @@ examples/
 
 ## Documentation
 
-- [Architecture Guide](docs/ARCHITECTURE.md): design overview, data flow, state management.
 - [SQL Reference](docs/SQL_REFERENCE.md): streaming SQL dialect, tested patterns.
 - [API Reference](https://docs.rs/laminar-db): rustdoc.
 

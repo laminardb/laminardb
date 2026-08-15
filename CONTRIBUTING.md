@@ -40,8 +40,6 @@ LaminarDB is a Rust workspace with 6 crates. Here's what each one does:
 | **laminar-derive** | Proc macros: `Record`, `FromRecordBatch`, `FromRow`, `ConnectorConfig`. |
 | **laminar-server** | Standalone server binary with TOML config, Axum HTTP API, hot reload, Prometheus metrics. |
 
-For the full architecture, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
 ## Where things live
 
 A few common starting points:
@@ -172,7 +170,7 @@ Check out issues labeled [`good first issue`](https://github.com/laminardb/lamin
 Some areas that are especially welcoming to new contributors:
 
 - **Tests** -- We can always use more. Property tests, integration tests, edge cases.
-- **Documentation** -- Config options, connector setup guides, architecture docs.
+- **Documentation** -- Config options, connector setup guides, SQL examples, and API docs.
 - **Connectors** -- Adding a new source or sink is self-contained. The `SourceConnector` and `SinkConnector` traits in `connector.rs` are the interface.
 - **Language bindings** -- Java, Node.js, .NET bindings are all open for contribution. The Python bindings and C FFI layer are the reference implementations.
 

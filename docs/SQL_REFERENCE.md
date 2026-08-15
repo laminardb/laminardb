@@ -354,8 +354,8 @@ fused join-and-aggregate and windowed-join statements remain rejected.
 
 Cluster materialized-view creation is rejected with `[LDB-4007]` regardless of query shape because
 retained output and reads do not yet have a planner-certified distributed lifecycle. Consequently,
-the materialized-view form of `SUBSCRIBE` below applies to embedded and single-node runtimes. See
-[distributed state](DISTRIBUTED_STATE.md) for the exact boundary and validation gate.
+the materialized-view form of `SUBSCRIBE` below applies to embedded and single-node runtimes. The
+cluster admission path rejects unsupported state before connector I/O.
 
 ### SUBSCRIBE over the Postgres wire protocol
 
